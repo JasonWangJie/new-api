@@ -55,6 +55,11 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 		return input, err
 	}
 	body := map[string]any{"model": request.Model, "n": topLevelCount, "size": request.Size, "quality": request.Quality}
+	if facts, exists := c.Get("async_image_billing_facts"); exists {
+		if scalars, ok := facts.(map[string]any); ok {
+			maps.Copy(body, scalars)
+		}
+	}
 	if request.BillingParameters != nil {
 		body["parameters"] = request.BillingParameters
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -126,6 +127,28 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		requestBody = body
 	}
 
+	// Native Gemini image requests share the synchronous image circuit only.
+	// Ordinary Gemini chat and the independent async worker retain their paths.
+	imageRequest := false
+	for _, modality := range request.GenerationConfig.ResponseModalities {
+		if strings.EqualFold(modality, "IMAGE") {
+			imageRequest = true
+			break
+		}
+	}
+	if imageRequest && model.DB != nil {
+		circuit, err := service.GetImageRuntimeConfig(c.Request.Context())
+		if err != nil {
+			return types.NewErrorWithStatusCode(fmt.Errorf("image runtime configuration is unavailable"), types.ErrorCodeModelPriceError, http.StatusServiceUnavailable)
+		}
+		allowed, err := service.ImageCircuitAllows(c.Request.Context(), "sync", info.ChannelId, circuit)
+		if err != nil || !allowed {
+			return types.NewErrorWithStatusCode(fmt.Errorf("image channel circuit is unavailable"), types.ErrorCodeDoRequestFailed, http.StatusServiceUnavailable)
+		}
+		defer func() {
+			_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, newAPIError == nil, circuit)
+		}()
+	}
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		logger.LogError(c, "Do gemini request failed: "+err.Error())

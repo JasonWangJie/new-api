@@ -18,6 +18,8 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   Activity,
+  Images,
+  ImagePlus,
   Box,
   ClipboardList,
   CreditCard,
@@ -40,7 +42,9 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import type { SidebarData } from '@/components/layout/types'
+import { hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -50,6 +54,7 @@ import { ROLE } from '@/lib/roles'
  */
 export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
+  const user = useAuthStore((state) => state.auth.user)
 
   return {
     navGroups: [
@@ -62,6 +67,17 @@ export function useSidebarData(): SidebarData {
             url: '/playground',
             icon: FlaskConical,
           },
+          {
+            title: t('Image Workbench'),
+            url: '/image-workbench',
+            icon: ImagePlus,
+          },
+          {
+            title: t('Local Image Library'),
+            url: '/image-library',
+            icon: Images,
+          },
+          { title: t('Image Plaza'), url: '/image-plaza', icon: Images },
           {
             title: t('Chat'),
             icon: MessageSquare,
@@ -87,6 +103,16 @@ export function useSidebarData(): SidebarData {
             title: t('API Keys'),
             url: '/keys',
             icon: Key,
+          },
+          {
+            title: t('Async Image Tasks'),
+            url: '/async-image-tasks',
+            icon: ListTodo,
+          },
+          {
+            title: t('Async Image API Guide'),
+            url: '/guide/async-image-api',
+            icon: FileText,
           },
           {
             title: t('Usage Logs'),
@@ -132,6 +158,26 @@ export function useSidebarData(): SidebarData {
         id: 'admin',
         title: t('Admin'),
         items: [
+          ...(hasPermission(user, 'async_image', 'read')
+            ? [
+                {
+                  title: t('Admin Image Tasks'),
+                  url: '/admin/async-image-tasks',
+                  icon: ListTodo,
+                  requiredRole: ROLE.ADMIN,
+                },
+              ]
+            : []),
+          ...(hasPermission(user, 'image_moderation', 'read')
+            ? [
+                {
+                  title: t('Image Moderation'),
+                  url: '/admin/image-moderation',
+                  icon: ShieldCheck,
+                  requiredRole: ROLE.ADMIN,
+                },
+              ]
+            : []),
           {
             title: t('Channels'),
             url: '/channels',

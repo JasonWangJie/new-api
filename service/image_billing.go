@@ -19,6 +19,34 @@ import (
 // before each attempt, including channel retries and parameter overrides. The
 // client request body stays frozen; only the independent quantity is refreshed.
 func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, count int, promptExtend bool) *types.NewAPIError {
+	if err := EstimateImageBillingForRequest(info, count, promptExtend); err != nil {
+		return err
+	}
+	if snap := info.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" && snap.EstimatedImageCount == nil {
+		return nil
+	}
+	quota := info.PriceData.QuotaToPreConsume
+	if quota == 0 && info.Billing == nil {
+		return nil
+	}
+	info.PriceData.FreeModel = false
+	if info.Billing == nil {
+		return PreConsumeBilling(c, quota, info)
+	}
+	if err := info.Billing.Reserve(quota); err != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
+	info.FinalPreConsumedQuota = info.Billing.GetPreConsumedQuota()
+	return nil
+}
+
+// EstimateImageBillingForRequest shares quantity and expression validation with
+// synchronous relay without creating a financial reservation.
+func EstimateImageBillingForRequest(info *relaycommon.RelayInfo, count int, promptExtend bool) *types.NewAPIError {
 	if count < 1 || count > dto.MaxImageN {
 		return types.NewErrorWithStatusCode(fmt.Errorf("image_count must be an integer between 1 and %d", dto.MaxImageN), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -75,20 +103,5 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 		return types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	info.PriceData.QuotaToPreConsume = quota
-	if quota == 0 && info.Billing == nil {
-		return nil
-	}
-	info.PriceData.FreeModel = false
-	if info.Billing == nil {
-		return PreConsumeBilling(c, quota, info)
-	}
-	if err := info.Billing.Reserve(quota); err != nil {
-		var apiErr *types.NewAPIError
-		if errors.As(err, &apiErr) {
-			return apiErr
-		}
-		return types.NewErrorWithStatusCode(err, types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry())
-	}
-	info.FinalPreConsumedQuota = info.Billing.GetPreConsumedQuota()
 	return nil
 }

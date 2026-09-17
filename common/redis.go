@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -38,6 +39,9 @@ func InitRedisClient() (err error) {
 	}
 	opt.PoolSize = GetEnvOrDefault("REDIS_POOL_SIZE", 10)
 	RDB = redis.NewClient(opt)
+	if prefix := strings.TrimSpace(os.Getenv("REDIS_KEY_PREFIX")); prefix != "" {
+		RDB.AddHook(RedisNamespaceHook{Prefix: prefix})
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

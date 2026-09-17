@@ -62,6 +62,7 @@ import {
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { TokenImageGroups } from '@/features/images/token-groups'
 import { useStatus } from '@/hooks/use-status'
 import { getUserModels, getUserGroups } from '@/lib/api'
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
@@ -753,6 +754,13 @@ export function ApiKeysMutateDrawer({
             </Collapsible>
           </form>
         </Form>
+        {open && currentRowId !== undefined && (
+          <TokenImageGroups
+            key={currentRowId}
+            tokenId={currentRowId}
+            groups={groups}
+          />
+        )}
         <SheetFooter className={sideDrawerFooterClassName()}>
           <SheetClose
             render={<Button variant='outline' className='w-full sm:w-auto' />}

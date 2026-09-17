@@ -440,6 +440,7 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		path := t.TempDir() + "/audit.db"
 		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 		require.NoError(t, err)
+		registerAuditDatabaseCleanup(t, db)
 		return db, path
 	}
 	require.NotEmpty(t, dsn)
@@ -492,6 +493,13 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		}
 	})
 	return db, newDSN
+}
+
+func registerAuditDatabaseCleanup(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
 }
 
 func verifyAuditRoleStorage(t *testing.T) {
@@ -589,6 +597,7 @@ func verifyAuditJSONStorage(t *testing.T) {
 	assert.JSONEq(t, `{}`, string(empty))
 	for range 2 {
 		require.NoError(t, model.InitLogDB())
+		registerAuditDatabaseCleanup(t, model.LOG_DB)
 	}
 	entries, total, err = model.GetAuditLogs(filter, 0, 20, common.RoleRootUser)
 	require.NoError(t, err)
@@ -682,7 +691,9 @@ func TestAuditDatabaseMatrix(t *testing.T) {
 					}
 					for range 2 {
 						require.NoError(t, model.InitDB())
+						registerAuditDatabaseCleanup(t, model.DB)
 						require.NoError(t, model.InitLogDB())
+						registerAuditDatabaseCleanup(t, model.LOG_DB)
 					}
 					if !upgrade {
 						require.NoError(t, db.Create(&model.User{Username: "fresh-owner", Password: "placeholder", AffCode: "fresh-aff"}).Error)

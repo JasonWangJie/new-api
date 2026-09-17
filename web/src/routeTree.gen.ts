@@ -34,11 +34,16 @@ import { Route as PricingIndexRouteImport } from './routes/pricing/index'
 import { Route as RankingsIndexRouteImport } from './routes/rankings/index'
 import { Route as SetupIndexRouteImport } from './routes/setup/index'
 import { Route as authUserResetRouteImport } from './routes/(auth)/user/reset'
+import { Route as AuthenticatedAsyncImageTasksIndexRouteImport } from './routes/_authenticated/async-image-tasks/index'
 import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authenticated/channels/index'
 import { Route as AuthenticatedChatChatIdRouteImport } from './routes/_authenticated/chat/$chatId'
 import { Route as AuthenticatedDashboardIndexRouteImport } from './routes/_authenticated/dashboard/index'
 import { Route as AuthenticatedDashboardSectionRouteImport } from './routes/_authenticated/dashboard/$section'
 import { Route as AuthenticatedErrorsErrorRouteImport } from './routes/_authenticated/errors/$error'
+import { Route as AuthenticatedGuideAsyncImageApiRouteImport } from './routes/_authenticated/guide/async-image-api'
+import { Route as AuthenticatedImageLibraryIndexRouteImport } from './routes/_authenticated/image-library/index'
+import { Route as AuthenticatedImagePlazaIndexRouteImport } from './routes/_authenticated/image-plaza/index'
+import { Route as AuthenticatedImageWorkbenchIndexRouteImport } from './routes/_authenticated/image-workbench/index'
 import { Route as AuthenticatedKeysIndexRouteImport } from './routes/_authenticated/keys/index'
 import { Route as AuthenticatedModelsIndexRouteImport } from './routes/_authenticated/models/index'
 import { Route as AuthenticatedModelsSectionRouteImport } from './routes/_authenticated/models/$section'
@@ -56,6 +61,8 @@ import { Route as AuthenticatedUsageLogsAuditRouteImport } from './routes/_authe
 import { Route as AuthenticatedUsersIndexRouteImport } from './routes/_authenticated/users/index'
 import { Route as AuthenticatedWalletIndexRouteImport } from './routes/_authenticated/wallet/index'
 import { Route as PricingModelIdIndexRouteImport } from './routes/pricing/$modelId/index'
+import { Route as AuthenticatedAdminAsyncImageTasksIndexRouteImport } from './routes/_authenticated/admin/async-image-tasks/index'
+import { Route as AuthenticatedAdminImageModerationIndexRouteImport } from './routes/_authenticated/admin/image-moderation/index'
 import { Route as AuthenticatedSystemSettingsAuthIndexRouteImport } from './routes/_authenticated/system-settings/auth/index'
 import { Route as AuthenticatedSystemSettingsAuthSectionRouteImport } from './routes/_authenticated/system-settings/auth/$section'
 import { Route as AuthenticatedSystemSettingsBillingIndexRouteImport } from './routes/_authenticated/system-settings/billing/index'
@@ -195,6 +202,12 @@ const authUserResetRoute = authUserResetRouteImport.update({
   path: '/user/reset',
   getParentRoute: () => authRouteRoute,
 } as any)
+const AuthenticatedAsyncImageTasksIndexRoute =
+  AuthenticatedAsyncImageTasksIndexRouteImport.update({
+    id: '/async-image-tasks/',
+    path: '/async-image-tasks/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedChannelsIndexRoute =
   AuthenticatedChannelsIndexRouteImport.update({
     id: '/channels/',
@@ -222,6 +235,30 @@ const AuthenticatedErrorsErrorRoute =
   AuthenticatedErrorsErrorRouteImport.update({
     id: '/errors/$error',
     path: '/errors/$error',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedGuideAsyncImageApiRoute =
+  AuthenticatedGuideAsyncImageApiRouteImport.update({
+    id: '/guide/async-image-api',
+    path: '/guide/async-image-api',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedImageLibraryIndexRoute =
+  AuthenticatedImageLibraryIndexRouteImport.update({
+    id: '/image-library/',
+    path: '/image-library/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedImagePlazaIndexRoute =
+  AuthenticatedImagePlazaIndexRouteImport.update({
+    id: '/image-plaza/',
+    path: '/image-plaza/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedImageWorkbenchIndexRoute =
+  AuthenticatedImageWorkbenchIndexRouteImport.update({
+    id: '/image-workbench/',
+    path: '/image-workbench/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedKeysIndexRoute = AuthenticatedKeysIndexRouteImport.update({
@@ -323,6 +360,18 @@ const PricingModelIdIndexRoute = PricingModelIdIndexRouteImport.update({
   path: '/pricing/$modelId/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthenticatedAdminAsyncImageTasksIndexRoute =
+  AuthenticatedAdminAsyncImageTasksIndexRouteImport.update({
+    id: '/admin/async-image-tasks/',
+    path: '/admin/async-image-tasks/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedAdminImageModerationIndexRoute =
+  AuthenticatedAdminImageModerationIndexRouteImport.update({
+    id: '/admin/image-moderation/',
+    path: '/admin/image-moderation/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedSystemSettingsAuthIndexRoute =
   AuthenticatedSystemSettingsAuthIndexRouteImport.update({
     id: '/auth/',
@@ -435,11 +484,16 @@ export interface FileRoutesByFullPath {
   '/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/errors/$error': typeof AuthenticatedErrorsErrorRoute
+  '/guide/async-image-api': typeof AuthenticatedGuideAsyncImageApiRoute
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/channels/': typeof AuthenticatedChannelsIndexRoute
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
+  '/image-library/': typeof AuthenticatedImageLibraryIndexRoute
+  '/image-plaza/': typeof AuthenticatedImagePlazaIndexRoute
+  '/image-workbench/': typeof AuthenticatedImageWorkbenchIndexRoute
   '/keys/': typeof AuthenticatedKeysIndexRoute
   '/models/': typeof AuthenticatedModelsIndexRoute
   '/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -461,6 +515,8 @@ export interface FileRoutesByFullPath {
   '/system-settings/operations/$section': typeof AuthenticatedSystemSettingsOperationsSectionRoute
   '/system-settings/security/$section': typeof AuthenticatedSystemSettingsSecuritySectionRoute
   '/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
+  '/admin/async-image-tasks/': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
+  '/admin/image-moderation/': typeof AuthenticatedAdminImageModerationIndexRoute
   '/system-settings/auth/': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/system-settings/billing/': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/system-settings/content/': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -495,11 +551,16 @@ export interface FileRoutesByTo {
   '/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/errors/$error': typeof AuthenticatedErrorsErrorRoute
+  '/guide/async-image-api': typeof AuthenticatedGuideAsyncImageApiRoute
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/async-image-tasks': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
+  '/image-library': typeof AuthenticatedImageLibraryIndexRoute
+  '/image-plaza': typeof AuthenticatedImagePlazaIndexRoute
+  '/image-workbench': typeof AuthenticatedImageWorkbenchIndexRoute
   '/keys': typeof AuthenticatedKeysIndexRoute
   '/models': typeof AuthenticatedModelsIndexRoute
   '/playground': typeof AuthenticatedPlaygroundIndexRoute
@@ -521,6 +582,8 @@ export interface FileRoutesByTo {
   '/system-settings/operations/$section': typeof AuthenticatedSystemSettingsOperationsSectionRoute
   '/system-settings/security/$section': typeof AuthenticatedSystemSettingsSecuritySectionRoute
   '/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
+  '/admin/async-image-tasks': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
+  '/admin/image-moderation': typeof AuthenticatedAdminImageModerationIndexRoute
   '/system-settings/auth': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/system-settings/billing': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/system-settings/content': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -559,11 +622,16 @@ export interface FileRoutesById {
   '/_authenticated/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/_authenticated/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/_authenticated/errors/$error': typeof AuthenticatedErrorsErrorRoute
+  '/_authenticated/guide/async-image-api': typeof AuthenticatedGuideAsyncImageApiRoute
   '/_authenticated/models/$section': typeof AuthenticatedModelsSectionRoute
   '/_authenticated/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/_authenticated/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/_authenticated/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
+  '/_authenticated/image-library/': typeof AuthenticatedImageLibraryIndexRoute
+  '/_authenticated/image-plaza/': typeof AuthenticatedImagePlazaIndexRoute
+  '/_authenticated/image-workbench/': typeof AuthenticatedImageWorkbenchIndexRoute
   '/_authenticated/keys/': typeof AuthenticatedKeysIndexRoute
   '/_authenticated/models/': typeof AuthenticatedModelsIndexRoute
   '/_authenticated/playground/': typeof AuthenticatedPlaygroundIndexRoute
@@ -585,6 +653,8 @@ export interface FileRoutesById {
   '/_authenticated/system-settings/operations/$section': typeof AuthenticatedSystemSettingsOperationsSectionRoute
   '/_authenticated/system-settings/security/$section': typeof AuthenticatedSystemSettingsSecuritySectionRoute
   '/_authenticated/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
+  '/_authenticated/admin/async-image-tasks/': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
+  '/_authenticated/admin/image-moderation/': typeof AuthenticatedAdminImageModerationIndexRoute
   '/_authenticated/system-settings/auth/': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/_authenticated/system-settings/billing/': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/_authenticated/system-settings/content/': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -622,11 +692,16 @@ export interface FileRouteTypes {
     | '/chat/$chatId'
     | '/dashboard/$section'
     | '/errors/$error'
+    | '/guide/async-image-api'
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/async-image-tasks/'
     | '/channels/'
     | '/dashboard/'
+    | '/image-library/'
+    | '/image-plaza/'
+    | '/image-workbench/'
     | '/keys/'
     | '/models/'
     | '/playground/'
@@ -648,6 +723,8 @@ export interface FileRouteTypes {
     | '/system-settings/operations/$section'
     | '/system-settings/security/$section'
     | '/system-settings/site/$section'
+    | '/admin/async-image-tasks/'
+    | '/admin/image-moderation/'
     | '/system-settings/auth/'
     | '/system-settings/billing/'
     | '/system-settings/content/'
@@ -682,11 +759,16 @@ export interface FileRouteTypes {
     | '/chat/$chatId'
     | '/dashboard/$section'
     | '/errors/$error'
+    | '/guide/async-image-api'
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/async-image-tasks'
     | '/channels'
     | '/dashboard'
+    | '/image-library'
+    | '/image-plaza'
+    | '/image-workbench'
     | '/keys'
     | '/models'
     | '/playground'
@@ -708,6 +790,8 @@ export interface FileRouteTypes {
     | '/system-settings/operations/$section'
     | '/system-settings/security/$section'
     | '/system-settings/site/$section'
+    | '/admin/async-image-tasks'
+    | '/admin/image-moderation'
     | '/system-settings/auth'
     | '/system-settings/billing'
     | '/system-settings/content'
@@ -745,11 +829,16 @@ export interface FileRouteTypes {
     | '/_authenticated/chat/$chatId'
     | '/_authenticated/dashboard/$section'
     | '/_authenticated/errors/$error'
+    | '/_authenticated/guide/async-image-api'
     | '/_authenticated/models/$section'
     | '/_authenticated/usage-logs/$section'
     | '/_authenticated/usage-logs/audit'
+    | '/_authenticated/async-image-tasks/'
     | '/_authenticated/channels/'
     | '/_authenticated/dashboard/'
+    | '/_authenticated/image-library/'
+    | '/_authenticated/image-plaza/'
+    | '/_authenticated/image-workbench/'
     | '/_authenticated/keys/'
     | '/_authenticated/models/'
     | '/_authenticated/playground/'
@@ -771,6 +860,8 @@ export interface FileRouteTypes {
     | '/_authenticated/system-settings/operations/$section'
     | '/_authenticated/system-settings/security/$section'
     | '/_authenticated/system-settings/site/$section'
+    | '/_authenticated/admin/async-image-tasks/'
+    | '/_authenticated/admin/image-moderation/'
     | '/_authenticated/system-settings/auth/'
     | '/_authenticated/system-settings/billing/'
     | '/_authenticated/system-settings/content/'
@@ -976,6 +1067,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof authUserResetRouteImport
       parentRoute: typeof authRouteRoute
     }
+    '/_authenticated/async-image-tasks/': {
+      id: '/_authenticated/async-image-tasks/'
+      path: '/async-image-tasks'
+      fullPath: '/async-image-tasks/'
+      preLoaderRoute: typeof AuthenticatedAsyncImageTasksIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/channels/': {
       id: '/_authenticated/channels/'
       path: '/channels'
@@ -1009,6 +1107,34 @@ declare module '@tanstack/react-router' {
       path: '/errors/$error'
       fullPath: '/errors/$error'
       preLoaderRoute: typeof AuthenticatedErrorsErrorRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/guide/async-image-api': {
+      id: '/_authenticated/guide/async-image-api'
+      path: '/guide/async-image-api'
+      fullPath: '/guide/async-image-api'
+      preLoaderRoute: typeof AuthenticatedGuideAsyncImageApiRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/image-library/': {
+      id: '/_authenticated/image-library/'
+      path: '/image-library'
+      fullPath: '/image-library/'
+      preLoaderRoute: typeof AuthenticatedImageLibraryIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/image-plaza/': {
+      id: '/_authenticated/image-plaza/'
+      path: '/image-plaza'
+      fullPath: '/image-plaza/'
+      preLoaderRoute: typeof AuthenticatedImagePlazaIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/image-workbench/': {
+      id: '/_authenticated/image-workbench/'
+      path: '/image-workbench'
+      fullPath: '/image-workbench/'
+      preLoaderRoute: typeof AuthenticatedImageWorkbenchIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/keys/': {
@@ -1129,6 +1255,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/pricing/$modelId/'
       preLoaderRoute: typeof PricingModelIdIndexRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/_authenticated/admin/async-image-tasks/': {
+      id: '/_authenticated/admin/async-image-tasks/'
+      path: '/admin/async-image-tasks'
+      fullPath: '/admin/async-image-tasks/'
+      preLoaderRoute: typeof AuthenticatedAdminAsyncImageTasksIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/admin/image-moderation/': {
+      id: '/_authenticated/admin/image-moderation/'
+      path: '/admin/image-moderation'
+      fullPath: '/admin/image-moderation/'
+      preLoaderRoute: typeof AuthenticatedAdminImageModerationIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/system-settings/auth/': {
       id: '/_authenticated/system-settings/auth/'
@@ -1320,11 +1460,16 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedChatChatIdRoute: typeof AuthenticatedChatChatIdRoute
   AuthenticatedDashboardSectionRoute: typeof AuthenticatedDashboardSectionRoute
   AuthenticatedErrorsErrorRoute: typeof AuthenticatedErrorsErrorRoute
+  AuthenticatedGuideAsyncImageApiRoute: typeof AuthenticatedGuideAsyncImageApiRoute
   AuthenticatedModelsSectionRoute: typeof AuthenticatedModelsSectionRoute
   AuthenticatedUsageLogsSectionRoute: typeof AuthenticatedUsageLogsSectionRoute
   AuthenticatedUsageLogsAuditRoute: typeof AuthenticatedUsageLogsAuditRoute
+  AuthenticatedAsyncImageTasksIndexRoute: typeof AuthenticatedAsyncImageTasksIndexRoute
   AuthenticatedChannelsIndexRoute: typeof AuthenticatedChannelsIndexRoute
   AuthenticatedDashboardIndexRoute: typeof AuthenticatedDashboardIndexRoute
+  AuthenticatedImageLibraryIndexRoute: typeof AuthenticatedImageLibraryIndexRoute
+  AuthenticatedImagePlazaIndexRoute: typeof AuthenticatedImagePlazaIndexRoute
+  AuthenticatedImageWorkbenchIndexRoute: typeof AuthenticatedImageWorkbenchIndexRoute
   AuthenticatedKeysIndexRoute: typeof AuthenticatedKeysIndexRoute
   AuthenticatedModelsIndexRoute: typeof AuthenticatedModelsIndexRoute
   AuthenticatedPlaygroundIndexRoute: typeof AuthenticatedPlaygroundIndexRoute
@@ -1337,6 +1482,8 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedUsageLogsIndexRoute: typeof AuthenticatedUsageLogsIndexRoute
   AuthenticatedUsersIndexRoute: typeof AuthenticatedUsersIndexRoute
   AuthenticatedWalletIndexRoute: typeof AuthenticatedWalletIndexRoute
+  AuthenticatedAdminAsyncImageTasksIndexRoute: typeof AuthenticatedAdminAsyncImageTasksIndexRoute
+  AuthenticatedAdminImageModerationIndexRoute: typeof AuthenticatedAdminImageModerationIndexRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
@@ -1346,11 +1493,17 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedChatChatIdRoute: AuthenticatedChatChatIdRoute,
   AuthenticatedDashboardSectionRoute: AuthenticatedDashboardSectionRoute,
   AuthenticatedErrorsErrorRoute: AuthenticatedErrorsErrorRoute,
+  AuthenticatedGuideAsyncImageApiRoute: AuthenticatedGuideAsyncImageApiRoute,
   AuthenticatedModelsSectionRoute: AuthenticatedModelsSectionRoute,
   AuthenticatedUsageLogsSectionRoute: AuthenticatedUsageLogsSectionRoute,
   AuthenticatedUsageLogsAuditRoute: AuthenticatedUsageLogsAuditRoute,
+  AuthenticatedAsyncImageTasksIndexRoute:
+    AuthenticatedAsyncImageTasksIndexRoute,
   AuthenticatedChannelsIndexRoute: AuthenticatedChannelsIndexRoute,
   AuthenticatedDashboardIndexRoute: AuthenticatedDashboardIndexRoute,
+  AuthenticatedImageLibraryIndexRoute: AuthenticatedImageLibraryIndexRoute,
+  AuthenticatedImagePlazaIndexRoute: AuthenticatedImagePlazaIndexRoute,
+  AuthenticatedImageWorkbenchIndexRoute: AuthenticatedImageWorkbenchIndexRoute,
   AuthenticatedKeysIndexRoute: AuthenticatedKeysIndexRoute,
   AuthenticatedModelsIndexRoute: AuthenticatedModelsIndexRoute,
   AuthenticatedPlaygroundIndexRoute: AuthenticatedPlaygroundIndexRoute,
@@ -1364,6 +1517,10 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedUsageLogsIndexRoute: AuthenticatedUsageLogsIndexRoute,
   AuthenticatedUsersIndexRoute: AuthenticatedUsersIndexRoute,
   AuthenticatedWalletIndexRoute: AuthenticatedWalletIndexRoute,
+  AuthenticatedAdminAsyncImageTasksIndexRoute:
+    AuthenticatedAdminAsyncImageTasksIndexRoute,
+  AuthenticatedAdminImageModerationIndexRoute:
+    AuthenticatedAdminImageModerationIndexRoute,
 }
 
 const AuthenticatedRouteRouteWithChildren =

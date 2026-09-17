@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -80,7 +81,7 @@ func main() {
 		}
 	}()
 
-	if common.RedisEnabled {
+	if common.RedisEnabled && os.Getenv("MEMORY_CACHE_ENABLED") == "" {
 		// for compatibility with old versions
 		common.MemoryCacheEnabled = true
 	}
@@ -138,6 +139,10 @@ func main() {
 	// Report this process as a system instance so the System Info page can show
 	// all currently alive nodes in multi-instance deployments.
 	service.StartSystemInstanceReporter()
+	service.ExecuteAsyncImageFunc = relay.ExecuteAsyncImage
+	service.EstimateAsyncImageQuotaFunc = relay.EstimateAsyncImageQuota
+	stopImageWorkers := service.StartAsyncImageWorkers(context.Background())
+	defer stopImageWorkers()
 
 	// Wire task polling adaptor factory (breaks service -> relay import cycle).
 	// Must run before the system task runner starts: the async_task_poll handler
@@ -230,6 +235,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	common.SysLog(fmt.Sprintf("received signal: %v, shutting down...", sig))
+	stopImageWorkers()
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
@@ -350,6 +356,15 @@ func InitResources() error {
 	err = common.InitRedisClient()
 	if err != nil {
 		return err
+	}
+	if common.IsMasterNode {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		if err := service.EnsureDefaultImageStorage(context.Background(), filepath.Dir(executable)); err != nil {
+			return err
+		}
 	}
 
 	perfmetrics.Init()

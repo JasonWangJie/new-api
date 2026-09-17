@@ -15,10 +15,13 @@ func TestSSRFProtectionRejectsLiteralPrivateAndReservedIPs(t *testing.T) {
 	}
 
 	tests := []string{
+		"0.0.0.0",
+		"0.1.2.3",
 		"127.0.0.1",
 		"10.0.0.1",
 		"169.254.169.254",
 		"fc00::1",
+		"::",
 		"::ffff:127.0.0.1",
 	}
 	for _, host := range tests {
