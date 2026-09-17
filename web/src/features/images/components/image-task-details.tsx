@@ -32,15 +32,27 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 import { getImageTask, imageRequest } from '../api'
-import { imageLabel } from '../lib/image-labels'
+import {
+  imageLabel,
+  imageTimelineDotClass,
+  imageTimelineLabel,
+} from '../lib/image-labels'
 import { terminalImageStatus } from '../lib/image-request'
 import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
 } from '../lib/task-presentation'
+import { imageDetailHeaderClass } from '../lib/image-visuals'
+import {
+  ImagePlatformBadge,
+  ImageRequestTypeBadge,
+  ImageStatusBadge,
+} from './image-badges'
 import { ImageResults } from './image-results'
 
 function TaskDetailFields(props: {
@@ -49,7 +61,10 @@ function TaskDetailFields(props: {
 }) {
   return (
     <dl
-      className={`grid grid-cols-2 gap-x-6 gap-y-5 text-sm md:grid-cols-4 ${props.className || ''}`}
+      className={cn(
+        'grid grid-cols-2 gap-x-6 gap-y-5 text-sm md:grid-cols-4',
+        props.className
+      )}
     >
       {props.items.map((item) => (
         <div key={item.label} className='min-w-0 space-y-1.5'>
@@ -63,6 +78,28 @@ function TaskDetailFields(props: {
   )
 }
 
+function DetailSection(props: {
+  title: string
+  accentClassName?: string
+  children: ReactNode
+  action?: ReactNode
+}) {
+  return (
+    <section
+      className={cn(
+        'bg-card/70 space-y-4 rounded-xl border p-4 shadow-sm',
+        props.accentClassName
+      )}
+    >
+      <div className='flex items-center justify-between gap-3'>
+        <h3 className='text-sm font-semibold'>{props.title}</h3>
+        {props.action}
+      </div>
+      {props.children}
+    </section>
+  )
+}
+
 export function ImageTaskDetails(props: {
   id: string
   admin: boolean
@@ -72,6 +109,7 @@ export function ImageTaskDetails(props: {
   onManage: (action: 'resume' | 'terminate') => void
 }) {
   const { t } = useTranslation()
+  const { copyToClipboard } = useCopyToClipboard()
   const task = useQuery({
     queryKey: ['image-task-details', props.userId, props.admin, props.id],
     queryFn: ({ signal }) => getImageTask(props.admin, props.id, signal),
@@ -163,16 +201,20 @@ export function ImageTaskDetails(props: {
       )}
       {data && task.data && (
         <>
-          <section className='space-y-4'>
+          <section
+            className={cn(
+              'space-y-4 rounded-xl border bg-gradient-to-br p-4 shadow-sm',
+              imageDetailHeaderClass(data.status)
+            )}
+          >
             <div className='flex flex-wrap items-center justify-between gap-3'>
-              <div className='flex flex-wrap items-center gap-3'>
-                <Badge variant={data.error_code ? 'warning' : 'outline'}>
-                  {t(imageLabel(data.status))}
-                </Badge>
-                <span className='text-muted-foreground text-xs'>
-                  {t(imageLabel(data.platform))} ·{' '}
-                  {t(imageLabel(data.request_type))}
-                </span>
+              <div className='flex flex-wrap items-center gap-2'>
+                <ImageStatusBadge
+                  status={data.status}
+                  errorCode={data.error_code}
+                />
+                <ImagePlatformBadge platform={data.platform} />
+                <ImageRequestTypeBadge requestType={data.request_type} />
               </div>
               {props.canManage && (
                 <div className='flex gap-2'>
@@ -214,18 +256,24 @@ export function ImageTaskDetails(props: {
               </p>
             )}
             {data.error_message && (
-              <p
+              <div
                 role='status'
-                className='text-destructive bg-destructive/5 rounded-lg p-3 text-sm break-words'
+                className='text-destructive border-destructive/20 bg-destructive/5 space-y-1 rounded-lg border p-3 text-sm'
               >
-                {data.error_message}
-              </p>
+                <p className='text-xs font-medium'>{t('Failure reason')}</p>
+                <p className='break-words'>{data.error_message}</p>
+              </div>
             )}
             {references.length > 0 && (
               <div className='space-y-2'>
-                <h3 className='text-muted-foreground text-xs'>
+                <h3 className='text-muted-foreground text-xs font-medium'>
                   {t('Reference images')}
                 </h3>
+                <p className='text-muted-foreground text-xs'>
+                  {t(
+                    'Click the URL to copy it. Use the button on the right to open the reference image in a new tab.'
+                  )}
+                </p>
                 {references.map((url, index) => {
                   if (!/^https?:\/\//i.test(url)) {
                     return (
@@ -236,68 +284,85 @@ export function ImageTaskDetails(props: {
                     )
                   }
                   return (
-                    <a
+                    <div
                       key={url}
-                      href={url}
-                      target='_blank'
-                      rel='noopener noreferrer'
-                      className='bg-muted/30 hover:bg-muted/60 flex min-h-10 max-w-3xl items-center gap-3 rounded-md border px-3 py-2 text-xs'
+                      className='bg-background/70 flex min-h-10 max-w-3xl items-center gap-2 rounded-md border px-3 py-2 text-xs'
                     >
                       <span className='text-primary shrink-0'>
                         {t('Reference image {{index}}', { index: index + 1 })}
                       </span>
-                      <span
-                        className='min-w-0 flex-1 truncate font-mono'
+                      <button
+                        type='button'
+                        className='hover:text-primary min-w-0 flex-1 truncate text-left font-mono'
                         title={url}
+                        aria-label={`${t('Copy URL')} · ${t('Reference image {{index}}', { index: index + 1 })}`}
+                        onClick={() => void copyToClipboard(url)}
                       >
                         {url}
-                      </span>
-                      <ArrowUpRight
-                        className='text-primary size-4 shrink-0'
-                        aria-hidden
-                      />
-                    </a>
+                      </button>
+                      <Button
+                        type='button'
+                        size='icon'
+                        variant='ghost'
+                        className='size-8 shrink-0'
+                        aria-label={`${t('Open in new tab')} · ${t('Reference image {{index}}', { index: index + 1 })}`}
+                        onClick={() =>
+                          window.open(url, '_blank', 'noopener,noreferrer')
+                        }
+                      >
+                        <ArrowUpRight className='size-4' aria-hidden />
+                      </Button>
+                    </div>
                   )
                 })}
               </div>
             )}
           </section>
-          <TaskDetailFields
-            className='border-b pb-6 xl:grid-cols-6'
-            items={[
-              {
-                label: t('Submitted at'),
-                value: formatTimestampToDate(data.created_at),
-              },
-              {
-                label: t('Started at'),
-                value: formatTimestampToDate(data.started_at),
-              },
-              {
-                label: t('Finished at'),
-                value: formatTimestampToDate(data.finished_at),
-              },
-              {
-                label: t('Time spent'),
-                value: data.created_at
-                  ? formatUseTime(imageTaskElapsedSeconds(data) || 0)
-                  : '—',
-              },
-              {
-                label: t('Actual cost'),
-                value: ['succeeded', 'not_billable'].includes(
-                  data.billing_status
-                )
-                  ? `US$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
-                  : '—',
-              },
-              { label: t('Retries'), value: String(data.retry_count) },
-            ]}
-          />
-          <section className='space-y-4'>
-            <h3 className='text-muted-foreground text-sm font-semibold'>
-              {t('Request and billing')}
-            </h3>
+          <DetailSection
+            title={t('Task time')}
+            accentClassName='border-l-4 border-l-cyan-500/70'
+          >
+            <TaskDetailFields
+              className='xl:grid-cols-6'
+              items={[
+                {
+                  label: t('Submitted at'),
+                  value: formatTimestampToDate(data.created_at),
+                },
+                {
+                  label: t('Started at'),
+                  value: formatTimestampToDate(data.started_at),
+                },
+                {
+                  label: t('Finished at'),
+                  value: formatTimestampToDate(data.finished_at),
+                },
+                {
+                  label: t('Time spent'),
+                  value: data.created_at
+                    ? formatUseTime(imageTaskElapsedSeconds(data) || 0)
+                    : '—',
+                },
+                {
+                  label: t('Actual cost'),
+                  value: ['succeeded', 'not_billable'].includes(
+                    data.billing_status
+                  ) ? (
+                    <span className='text-emerald-700 dark:text-emerald-400'>
+                      {`US$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
+                    </span>
+                  ) : (
+                    '—'
+                  ),
+                },
+                { label: t('Retries'), value: String(data.retry_count) },
+              ]}
+            />
+          </DetailSection>
+          <DetailSection
+            title={t('Request and billing')}
+            accentClassName='border-l-4 border-l-violet-500/70'
+          >
             <TaskDetailFields
               items={[
                 {
@@ -330,11 +395,11 @@ export function ImageTaskDetails(props: {
                 },
               ]}
             />
-          </section>
-          <section className='space-y-4'>
-            <h3 className='text-muted-foreground text-sm font-semibold'>
-              {t('Scheduling context')}
-            </h3>
+          </DetailSection>
+          <DetailSection
+            title={t('Scheduling context')}
+            accentClassName='border-l-4 border-l-sky-500/70'
+          >
             <TaskDetailFields
               items={[
                 ...(props.admin
@@ -364,19 +429,19 @@ export function ImageTaskDetails(props: {
                   : []),
               ]}
             />
-          </section>
+          </DetailSection>
           {props.admin && (
-            <section className='space-y-4'>
-              <div className='flex items-center justify-between gap-3'>
-                <h3 className='text-muted-foreground text-sm font-semibold'>
-                  {t('Account attempts and reconciliation')}
-                </h3>
+            <DetailSection
+              title={t('Account attempts and reconciliation')}
+              accentClassName='border-l-4 border-l-orange-500/70'
+              action={
                 <Badge variant='outline'>
                   {data.reconciliation_status
                     ? t(imageLabel(data.reconciliation_status))
                     : '—'}
                 </Badge>
-              </div>
+              }
+            >
               <TaskDetailFields
                 items={[
                   { label: t('Attempts'), value: String(attempts.length) },
@@ -449,6 +514,11 @@ export function ImageTaskDetails(props: {
                                 variant={
                                   attempt.error_code ? 'warning' : 'outline'
                                 }
+                                className={
+                                  attempt.finished_at && !attempt.error_code
+                                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                                    : undefined
+                                }
                               >
                                 {status}
                               </Badge>
@@ -488,17 +558,17 @@ export function ImageTaskDetails(props: {
                   </CollapsibleContent>
                 </Collapsible>
               )}
-            </section>
+            </DetailSection>
           )}
-          <section className='space-y-4'>
-            <div className='flex items-center justify-between gap-3'>
-              <h3 className='text-muted-foreground text-sm font-semibold'>
-                {t('Generated images')}
-              </h3>
+          <DetailSection
+            title={t('Generated images')}
+            accentClassName='border-l-4 border-l-emerald-500/70'
+            action={
               <span className='text-muted-foreground text-xs'>
                 {data.storage_providers?.join(', ')}
               </span>
-            </div>
+            }
+          >
             {images.isLoading && (
               <p role='status' className='text-muted-foreground text-sm'>
                 {t('Loading...')}
@@ -512,7 +582,6 @@ export function ImageTaskDetails(props: {
             {images.data?.length ? (
               <div className='max-w-3xl'>
                 <ImageResults
-                  previewMode='original'
                   images={images.data}
                   actions={
                     !props.admin
@@ -537,11 +606,11 @@ export function ImageTaskDetails(props: {
                 </p>
               )
             )}
-          </section>
-          <section className='space-y-4'>
-            <h3 className='text-muted-foreground text-sm font-semibold'>
-              {t('Stage timeline')}
-            </h3>
+          </DetailSection>
+          <DetailSection
+            title={t('Stage timeline')}
+            accentClassName='border-l-4 border-l-blue-500/70'
+          >
             <ol className='space-y-0'>
               {task.data.events.map((event) => (
                 <li
@@ -549,12 +618,15 @@ export function ImageTaskDetails(props: {
                   className='relative ml-1 border-l pb-5 pl-5 last:border-l-transparent last:pb-0'
                 >
                   <span
-                    className='bg-primary absolute top-1.5 -left-[5px] size-2 rounded-full'
+                    className={cn(
+                      'absolute top-1.5 -left-[5px] size-2 rounded-full',
+                      imageTimelineDotClass(event)
+                    )}
                     aria-hidden
                   />
                   <div className='flex flex-wrap items-center justify-between gap-2'>
                     <span className='text-sm font-medium'>
-                      {t(imageLabel(event.status))}
+                      {t(imageTimelineLabel(event))}
                     </span>
                     <time
                       className='text-muted-foreground text-xs tabular-nums'
@@ -565,13 +637,13 @@ export function ImageTaskDetails(props: {
                   </div>
                   {props.admin && event.message && (
                     <p className='text-muted-foreground mt-1 text-xs break-words'>
-                      {event.message}
+                      {t(event.message)}
                     </p>
                   )}
                 </li>
               ))}
             </ol>
-          </section>
+          </DetailSection>
         </>
       )}
     </Dialog>

@@ -44,6 +44,10 @@ vi.mock('../api', () => ({
   getImageTask: vi.fn(),
   imageRequest: vi.fn(),
 }))
+vi.mock('@/lib/lobe-icon', () => ({
+  getLobeIcon: () => null,
+}))
+vi.mock('@lobehub/icons', () => ({}))
 const clients: QueryClient[] = []
 const task: ImageTask = {
   id: 'asyncimg_display_contract',
@@ -244,20 +248,50 @@ test('admin details show named attempts and generated images without rendering r
     screen.queryByText('secret-fingerprint-canary')
   ).not.toBeInTheDocument()
   expect(
-    screen.getByRole('link', { name: /Reference image 1/ })
-  ).toHaveAttribute('href', 'https://example.com/reference.png')
+    screen.getByRole('button', { name: /Copy URL.*Reference image 1/ })
+  ).toHaveTextContent('https://example.com/reference.png')
+  expect(
+    screen.getByRole('button', { name: /Open in new tab.*Reference image 1/ })
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('img', { name: /reference/i })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByText(
+      'Click the URL to copy it. Use the button on the right to open the reference image in a new tab.'
+    )
+  ).toBeVisible()
+  const openWindow = vi.spyOn(window, 'open').mockImplementation(() => null)
+  await user.click(
+    screen.getByRole('button', { name: /Copy URL.*Reference image 1/ })
+  )
+  expect(await navigator.clipboard.readText()).toBe(
+    'https://example.com/reference.png'
+  )
+  await user.click(
+    screen.getByRole('button', { name: /Open in new tab.*Reference image 1/ })
+  )
+  expect(openWindow).toHaveBeenCalledWith(
+    'https://example.com/reference.png',
+    '_blank',
+    'noopener,noreferrer'
+  )
+  openWindow.mockRestore()
   await user.click(
     await screen.findByRole('button', { name: 'Image Preview: 1' })
   )
   const preview = await screen.findByRole('dialog', { name: 'Image Preview' })
   const image = within(preview).getByAltText('Generated image')
-  expect(within(preview).getByRole('status')).toHaveTextContent('Loading...')
+  expect(image).toHaveAttribute('src', 'https://example.com/result.png')
+  expect(
+    within(preview).getByText('https://example.com/result.png')
+  ).toBeVisible()
   fireEvent.error(image)
-  expect(within(preview).getByRole('alert')).toHaveTextContent(
-    'Failed to load image'
-  )
+  expect(within(preview).getByText('Failed to load image')).toBeVisible()
   fireEvent.load(image)
-  expect(within(preview).queryByRole('alert')).not.toBeInTheDocument()
+  expect(
+    within(preview).queryByText('Failed to load image')
+  ).not.toBeInTheDocument()
   await user.keyboard('{Escape}')
   await waitFor(() =>
     expect(
@@ -292,7 +326,10 @@ test('user details hide admin routing, references and account history even if a 
     expect(screen.queryByText(text)).not.toBeInTheDocument()
   }
   expect(
-    screen.queryByRole('link', { name: /Reference image/ })
+    screen.queryByRole('button', { name: /Copy URL.*Reference image/ })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: /Open in new tab.*Reference image/ })
   ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Terminate' })

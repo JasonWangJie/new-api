@@ -37,7 +37,6 @@ import {
 } from '@/components/data-table'
 import { DataTableMobileFilterPanel } from '@/components/data-table/toolbar/mobile-filter-panel'
 import { SectionPageLayout } from '@/components/layout'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -47,6 +46,11 @@ import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { getImageTasks, imageRequest, imageTasksPath } from './api'
+import {
+  ImagePlatformBadge,
+  ImageRequestTypeBadge,
+  ImageStatusBadge,
+} from './components/image-badges'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { imageLabel } from './lib/image-labels'
@@ -125,7 +129,7 @@ function TaskCenterSession({
   ])
   const [selection, setSelection] = useState<RowSelectionState>({})
   const [detail, setDetail] = useState('')
-  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [autoRefresh, setAutoRefresh] = useState(false)
   const [operation, setOperation] = useState<{
     ids: string[]
     action: 'resume' | 'terminate' | 'batch-terminate'
@@ -239,17 +243,16 @@ function TaskCenterSession({
         id: 'platform',
         header: t('Platform'),
         cell: ({ row }) => (
-          <div className='space-y-1 text-xs'>
-            <p className='font-medium'>
-              {t(imageLabel(row.original.platform))}
-            </p>
-            <p className='text-muted-foreground'>
-              {t(imageLabel(row.original.request_type))}
-            </p>
+          <div className='space-y-1.5 text-xs'>
+            <ImagePlatformBadge platform={row.original.platform} />
+            <ImageRequestTypeBadge
+              requestType={row.original.request_type}
+              className='font-normal'
+            />
           </div>
         ),
         enableSorting: false,
-        size: 82,
+        size: 128,
       },
       {
         id: 'model',
@@ -279,16 +282,10 @@ function TaskCenterSession({
         ),
         cell: ({ row }) => (
           <div className='space-y-1'>
-            <Badge
-              variant={row.original.error_code ? 'warning' : 'outline'}
-              className={
-                row.original.status === 'succeeded'
-                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
-                  : undefined
-              }
-            >
-              {t(imageLabel(row.original.status))}
-            </Badge>
+            <ImageStatusBadge
+              status={row.original.status}
+              errorCode={row.original.error_code}
+            />
             <p className='text-muted-foreground text-xs'>
               {row.original.progress}% ·{' '}
               {t(imageLabel(row.original.billing_status))}
@@ -357,7 +354,15 @@ function TaskCenterSession({
           <DataTableColumnHeader column={column} title={t('Actual cost')} />
         ),
         cell: ({ row }) => (
-          <span className='font-mono text-xs'>
+          <span
+            className={
+              ['succeeded', 'not_billable'].includes(
+                row.original.billing_status
+              )
+                ? 'font-mono text-xs text-emerald-700 dark:text-emerald-400'
+                : 'text-muted-foreground font-mono text-xs'
+            }
+          >
             {['succeeded', 'not_billable'].includes(row.original.billing_status)
               ? `US$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
               : '—'}
@@ -493,21 +498,29 @@ function TaskCenterSession({
       label: t('Processing'),
       value: (stats?.queued || 0) + (stats?.processing || 0),
       color: 'text-amber-700 dark:text-amber-400',
+      shell: 'border-amber-500/20 bg-amber-500/10',
+      dot: 'bg-amber-500',
     },
     {
       label: t('Succeeded'),
       value: stats?.succeeded || 0,
       color: 'text-emerald-700 dark:text-emerald-400',
+      shell: 'border-emerald-500/20 bg-emerald-500/10',
+      dot: 'bg-emerald-500',
     },
     {
       label: t('Failed'),
       value: stats?.failed || 0,
       color: 'text-rose-700 dark:text-rose-400',
+      shell: 'border-rose-500/20 bg-rose-500/10',
+      dot: 'bg-rose-500',
     },
     {
       label: t('Success rate'),
       value: successRate === null ? '—' : `${successRate.toFixed(1)}%`,
       color: 'text-emerald-700 dark:text-emerald-400',
+      shell: 'border-emerald-500/20 bg-emerald-500/10',
+      dot: 'bg-emerald-500',
     },
     {
       label: t('Average duration'),
@@ -516,6 +529,8 @@ function TaskCenterSession({
           ? '—'
           : formatUseTime(stats.average_duration_ms / 1000),
       color: 'text-cyan-700 dark:text-cyan-400',
+      shell: 'border-cyan-500/20 bg-cyan-500/10',
+      dot: 'bg-cyan-500',
     },
   ]
   return (
@@ -583,8 +598,12 @@ function TaskCenterSession({
             {statistics.map((item) => (
               <div
                 key={item.label}
-                className={`bg-muted/20 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${item.color}`}
+                className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs shadow-sm ${item.shell} ${item.color}`}
               >
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${item.dot}`}
+                  aria-hidden
+                />
                 <dt>{item.label}</dt>
                 <dd className='font-semibold tabular-nums'>{item.value}</dd>
               </div>

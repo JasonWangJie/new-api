@@ -75,7 +75,67 @@ export const IMAGE_LABELS: Record<string, string> = {
   passthrough: 'Upstream URL fetch',
   local: 'Server download',
   passthrough_fallback_local: 'Upstream fetch with local fallback',
+  accepted: 'Queued',
+  claimed: 'Task claimed',
+  channel_selected: 'Channel selected',
+  upstream_dispatched: 'Dispatched to upstream',
+  invocation_failed: 'Invocation failed',
+  storage_confirmed: 'Storage confirmed',
+  billing_retry: 'Billing retry',
+  completed: 'Succeeded',
+  recovered: 'Recovered to queue',
+  resumed: 'Resumed',
+  terminated: 'Terminated',
+  postprocessing_failed: 'Post-processing failed',
+  settled: 'Settled',
 }
 export function imageLabel(value: string): string {
   return IMAGE_LABELS[value] || value
+}
+
+export function imageTimelineLabel(event: {
+  event_type?: string
+  status: string
+}): string {
+  const eventType = event.event_type?.trim()
+  if (eventType && IMAGE_LABELS[eventType]) {
+    return IMAGE_LABELS[eventType]
+  }
+  return imageLabel(event.status)
+}
+
+export function imageTimelineDotClass(event: {
+  event_type?: string
+  status: string
+}): string {
+  const keys = [event.event_type, event.status]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value))
+  if (
+    keys.some((key) =>
+      ['queued', 'accepted', 'recovered'].includes(key)
+    )
+  ) {
+    return 'bg-warning'
+  }
+  if (keys.some((key) => ['succeeded', 'completed', 'settled'].includes(key))) {
+    return 'bg-success'
+  }
+  if (
+    keys.some((key) =>
+      [
+        'failed',
+        'expired',
+        'execution_unknown',
+        'invocation_failed',
+        'terminated',
+        'postprocessing_failed',
+        'storage_failed',
+        'billing_failed',
+      ].includes(key)
+    )
+  ) {
+    return 'bg-destructive'
+  }
+  return 'bg-blue-500'
 }

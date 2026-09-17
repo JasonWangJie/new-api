@@ -1,0 +1,12 @@
+When Cursor auto-generates a Git commit message for this repository:
+
+- Write the message in Simplified Chinese (简体中文)
+- Use Conventional Commits format:
+  - feat: 新功能
+  - fix: 修复
+  - docs: 文档
+  - style: 格式
+  - refactor: 重构
+  - test: 测试
+  - chore: 构建/工具
+- Keep the subject line concise; add a body only when needed
