@@ -110,7 +110,8 @@ const detail: ImageTaskDetail = {
       content_type: 'image/png',
       byte_size: 1048576,
       checksum: '',
-      view_url: '/signed-view',
+      view_url: '/api/admin/async-image-tasks/asyncimg_display_contract/results/0/view',
+      url: 'https://example.com/result.png',
       expires_at: 1789686400,
     },
   ],
@@ -286,8 +287,7 @@ test('admin details show named attempts and generated images without rendering r
   )
   const preview = await screen.findByRole('dialog', { name: 'Image Preview' })
   const image = within(preview).getByAltText('Generated image')
-  expect(image).toHaveAttribute('src', '/signed-view')
-  expect(within(preview).getByText('/signed-view')).toBeVisible()
+  expect(image).toHaveAttribute('src', 'https://example.com/result.png')
   expect(imageRequest).not.toHaveBeenCalled()
   fireEvent.error(image)
   expect(within(preview).getByText('Failed to load image')).toBeVisible()

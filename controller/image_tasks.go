@@ -317,6 +317,7 @@ func GetImageTask(c *gin.Context, admin bool) {
 		if admin {
 			base = "/api/admin/async-image-tasks/"
 		}
+		cfg, cfgErr := service.GetImageRuntimeConfig(c.Request.Context())
 		for _, result := range saved {
 			object, ok := objectsByID[result.ObjectId]
 			if !ok {
@@ -324,7 +325,13 @@ func GetImageTask(c *gin.Context, admin bool) {
 				return
 			}
 			view := base + task.TaskId + "/results/" + strconv.Itoa(result.ImageIndex) + "/view"
-			results = append(results, gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt})
+			item := gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt}
+			if cfgErr == nil {
+				if link, signErr := service.ImageObjectURL(c.Request.Context(), object, AsyncImageGatewayBase(), cfg.SignedURLExpiry); signErr == nil {
+					item["url"] = link
+				}
+			}
+			results = append(results, item)
 		}
 	}
 	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)

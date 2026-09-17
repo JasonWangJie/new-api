@@ -123,13 +123,38 @@ export function ImageTaskDetails(props: {
         ? false
         : 5000,
   })
-  // Use gateway view_url directly in <img>; browsers follow the redirect with
-  // session cookies. Avoids an N+1 signed-URL waterfall before first paint.
-  const images = (task.data?.results || []).map((result) => ({
-    id: String(result.image_index),
-    url: result.view_url,
-    description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
-  }))
+  const results = task.data?.results || []
+  const images = useQuery({
+    queryKey: [
+      'image-task-detail-results',
+      props.userId,
+      props.admin,
+      props.id,
+      results.map((result) => `${result.image_index}:${result.url || result.view_url}`).join('|'),
+    ],
+    queryFn: async ({ signal }) =>
+      Promise.all(
+        results.map(async (result) => {
+          const url =
+            result.url ||
+            (
+              await imageRequest<{ url: string }>(
+                result.view_url,
+                'GET',
+                undefined,
+                signal
+              )
+            ).url
+          return {
+            id: String(result.image_index),
+            url,
+            description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
+          }
+        })
+      ),
+    enabled: results.length > 0,
+    staleTime: 60_000,
+  })
   const archive = async (index: string) => {
     try {
       await imageRequest('/api/user/image-library/from-task', 'POST', {
@@ -551,29 +576,41 @@ export function ImageTaskDetails(props: {
               </span>
             }
           >
-            {images.length ? (
-              <div className='max-w-3xl'>
-                <ImageResults
-                  images={images}
-                  actions={
-                    !props.admin
-                      ? (index) => (
-                          <Button
-                            size='sm'
-                            variant='outline'
-                            onClick={() => void archive(index)}
-                          >
-                            {t('Archive to server')}
-                          </Button>
-                        )
-                      : undefined
-                  }
-                />
-              </div>
-            ) : (
-              <p className='text-muted-foreground text-sm'>
-                {t('No generated images yet')}
+            {images.isLoading && (
+              <p role='status' className='text-muted-foreground text-sm'>
+                {t('Loading...')}
               </p>
+            )}
+            {images.isError && (
+              <p role='alert' className='text-destructive text-sm'>
+                {images.error.message}
+              </p>
+            )}
+            {images.data?.length ? (
+              <ImageResults
+                images={images.data}
+                previewMode='original'
+                actions={
+                  !props.admin
+                    ? (index) => (
+                        <Button
+                          size='sm'
+                          variant='outline'
+                          onClick={() => void archive(index)}
+                        >
+                          {t('Archive to server')}
+                        </Button>
+                      )
+                    : undefined
+                }
+              />
+            ) : (
+              !images.isLoading &&
+              !images.isError && (
+                <p className='text-muted-foreground text-sm'>
+                  {t('No generated images yet')}
+                </p>
+              )
             )}
           </DetailSection>
           <DetailSection

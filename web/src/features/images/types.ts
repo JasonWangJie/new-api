@@ -107,6 +107,8 @@ export type ImageResult = {
   byte_size: number
   checksum: string
   view_url: string
+  /** Signed object URL when the detail API could mint one. */
+  url?: string
   expires_at: number
 }
 export type ImageTaskDetail = {

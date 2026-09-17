@@ -88,24 +88,28 @@ export function ImageDialog({
       }
       contentClassName={
         presentation === 'original'
-          ? 'h-dvh max-h-dvh w-screen max-w-none gap-0 rounded-none bg-black p-0 ring-0 sm:max-w-none sm:p-0 [&>[data-slot=dialog-close]]:z-10 [&>[data-slot=dialog-close]]:bg-background/90'
+          ? 'h-dvh max-h-dvh w-screen max-w-none gap-0 rounded-none border-0 bg-black p-0 shadow-none ring-0 sm:max-w-none sm:p-0 [&>[data-slot=dialog-close]]:z-10 [&>[data-slot=dialog-close]]:bg-background/90'
           : 'sm:max-w-3xl'
       }
       contentHeight='auto'
       headerClassName={presentation === 'original' ? 'sr-only' : undefined}
       scrollAreaClassName={
         presentation === 'original'
-          ? 'm-0 h-dvh max-h-none overflow-auto'
+          ? 'm-0 h-dvh max-h-none overflow-hidden'
           : undefined
       }
       bodyClassName={
         presentation === 'original'
-          ? 'flex min-h-dvh w-max min-w-full items-center justify-center p-0'
+          ? 'flex h-dvh w-full items-center justify-center overflow-hidden p-0'
           : 'space-y-4'
       }
     >
       <div
-        className={presentation === 'original' ? 'relative' : undefined}
+        className={
+          presentation === 'original'
+            ? 'relative flex h-full w-full items-center justify-center'
+            : undefined
+        }
         onKeyDown={(event) => {
           if (sources.length < 2) return
           if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -157,7 +161,7 @@ export function ImageDialog({
               key={source}
               src={source}
               alt={t('Generated image')}
-              className={`block h-auto w-auto max-w-none rounded-none ${isLoading || hasError ? 'hidden' : ''}`}
+              className={`block max-h-dvh max-w-[100vw] object-contain ${isLoading || hasError ? 'hidden' : ''}`}
               onLoad={handleImageLoad}
               onError={handleImageError}
             />
