@@ -113,6 +113,7 @@ export function ImageTaskDetails(props: {
   const task = useQuery({
     queryKey: ['image-task-details', props.userId, props.admin, props.id],
     queryFn: ({ signal }) => getImageTask(props.admin, props.id, signal),
+    staleTime: 10_000,
     refetchInterval: (query) =>
       query.state.data &&
       terminalImageStatus(
@@ -122,32 +123,13 @@ export function ImageTaskDetails(props: {
         ? false
         : 5000,
   })
-  const images = useQuery({
-    queryKey: [
-      'image-task-detail-results',
-      props.userId,
-      props.admin,
-      props.id,
-      task.data?.results,
-    ],
-    queryFn: ({ signal }) =>
-      Promise.all(
-        (task.data?.results || []).map(async (result) => ({
-          id: String(result.image_index),
-          url: (
-            await imageRequest<{ url: string }>(
-              result.view_url,
-              'GET',
-              undefined,
-              signal
-            )
-          ).url,
-          description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
-        }))
-      ),
-    enabled: !!task.data?.results.length,
-    staleTime: 30000,
-  })
+  // Use gateway view_url directly in <img>; browsers follow the redirect with
+  // session cookies. Avoids an N+1 signed-URL waterfall before first paint.
+  const images = (task.data?.results || []).map((result) => ({
+    id: String(result.image_index),
+    url: result.view_url,
+    description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
+  }))
   const archive = async (index: string) => {
     try {
       await imageRequest('/api/user/image-library/from-task', 'POST', {
@@ -464,7 +446,7 @@ export function ImageTaskDetails(props: {
               )}
               {attempts.length > 0 && (
                 <Collapsible
-                  defaultOpen
+                  defaultOpen={false}
                   className='overflow-hidden rounded-lg border'
                 >
                   <CollapsibleTrigger
@@ -569,20 +551,10 @@ export function ImageTaskDetails(props: {
               </span>
             }
           >
-            {images.isLoading && (
-              <p role='status' className='text-muted-foreground text-sm'>
-                {t('Loading...')}
-              </p>
-            )}
-            {images.isError && (
-              <p role='alert' className='text-destructive text-sm'>
-                {images.error.message}
-              </p>
-            )}
-            {images.data?.length ? (
+            {images.length ? (
               <div className='max-w-3xl'>
                 <ImageResults
-                  images={images.data}
+                  images={images}
                   actions={
                     !props.admin
                       ? (index) => (
@@ -599,12 +571,9 @@ export function ImageTaskDetails(props: {
                 />
               </div>
             ) : (
-              !images.isLoading &&
-              !images.isError && (
-                <p className='text-muted-foreground text-sm'>
-                  {t('No generated images yet')}
-                </p>
-              )
+              <p className='text-muted-foreground text-sm'>
+                {t('No generated images yet')}
+              </p>
             )}
           </DetailSection>
           <DetailSection

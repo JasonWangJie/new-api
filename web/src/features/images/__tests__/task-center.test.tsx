@@ -241,7 +241,11 @@ test('admin details show named attempts and generated images without rendering r
       onManage={vi.fn()}
     />
   )
-  await screen.findByText('Previous upstream')
+  await screen.findByText('Studio key')
+  await user.click(
+    screen.getByRole('button', { name: /Attempt history/ })
+  )
+  expect(await screen.findByText('Previous upstream')).toBeVisible()
   expect(screen.getByText('Account slot 3')).toBeVisible()
   expect(screen.getByText('Studio key')).toBeVisible()
   expect(
@@ -282,10 +286,9 @@ test('admin details show named attempts and generated images without rendering r
   )
   const preview = await screen.findByRole('dialog', { name: 'Image Preview' })
   const image = within(preview).getByAltText('Generated image')
-  expect(image).toHaveAttribute('src', 'https://example.com/result.png')
-  expect(
-    within(preview).getByText('https://example.com/result.png')
-  ).toBeVisible()
+  expect(image).toHaveAttribute('src', '/signed-view')
+  expect(within(preview).getByText('/signed-view')).toBeVisible()
+  expect(imageRequest).not.toHaveBeenCalled()
   fireEvent.error(image)
   expect(within(preview).getByText('Failed to load image')).toBeVisible()
   fireEvent.load(image)

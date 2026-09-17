@@ -298,15 +298,30 @@ func GetImageTask(c *gin.Context, admin bool) {
 			imageManagementError(c, 503, err)
 			return
 		}
+		objectIDs := make([]string, 0, len(saved))
 		for _, result := range saved {
-			var object model.ImageStorageObject
-			if err := model.DB.WithContext(c.Request.Context()).Where("object_id = ?", result.ObjectId).Take(&object).Error; err != nil {
+			objectIDs = append(objectIDs, result.ObjectId)
+		}
+		objectsByID := make(map[string]model.ImageStorageObject, len(objectIDs))
+		if len(objectIDs) > 0 {
+			var objects []model.ImageStorageObject
+			if err := model.DB.WithContext(c.Request.Context()).Where("object_id IN ?", objectIDs).Find(&objects).Error; err != nil {
 				imageManagementError(c, 503, err)
 				return
 			}
-			base := "/api/user/async-image-tasks/"
-			if admin {
-				base = "/api/admin/async-image-tasks/"
+			for _, object := range objects {
+				objectsByID[object.ObjectId] = object
+			}
+		}
+		base := "/api/user/async-image-tasks/"
+		if admin {
+			base = "/api/admin/async-image-tasks/"
+		}
+		for _, result := range saved {
+			object, ok := objectsByID[result.ObjectId]
+			if !ok {
+				imageManagementError(c, 503, errors.New("Image storage object is unavailable"))
+				return
 			}
 			view := base + task.TaskId + "/results/" + strconv.Itoa(result.ImageIndex) + "/view"
 			results = append(results, gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt})

@@ -37,7 +37,6 @@ import {
   getImageTask,
   imageBlob,
   imageRelayRequest,
-  imageRequest,
 } from './api'
 import { ImageResults } from './components/image-results'
 import { ImageSelect } from './components/image-select'
@@ -116,6 +115,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
     queryKey: ['workbench-image-task', userId, taskId],
     queryFn: ({ signal }) => getImageTask(false, taskId, signal),
     enabled: !!taskId,
+    staleTime: 10_000,
     refetchInterval: (query) =>
       query.state.data &&
       terminalImageStatus(
@@ -126,25 +126,10 @@ function WorkbenchSession({ userId }: { userId: number }) {
         : Math.min(30000, 3000 * 2 ** query.state.fetchFailureCount),
     retry: false,
   })
-  const taskImages = useQuery({
-    queryKey: ['workbench-image-results', userId, taskId, task.data?.results],
-    queryFn: ({ signal }) =>
-      Promise.all(
-        (task.data?.results || []).map(async (result) => ({
-          id: String(result.image_index),
-          url: (
-            await imageRequest<{ url: string }>(
-              result.view_url,
-              'GET',
-              undefined,
-              signal
-            )
-          ).url,
-        }))
-      ),
-    enabled: !!task.data?.results.length,
-    staleTime: 30000,
-  })
+  const taskImages = (task.data?.results || []).map((result) => ({
+    id: String(result.image_index),
+    url: result.view_url,
+  }))
   const activeTask =
     !!taskId &&
     (!task.data ||
@@ -333,7 +318,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
   }
   const options = (values: string[]) =>
     values.map((value) => ({ value, label: value }))
-  const shownImages = taskId ? taskImages.data || [] : results
+  const shownImages = taskId ? taskImages : results
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Image Workbench')}</SectionPageLayout.Title>

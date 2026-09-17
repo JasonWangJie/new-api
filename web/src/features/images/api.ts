@@ -101,7 +101,21 @@ export async function imageBlob(
   url: string,
   signal?: AbortSignal
 ): Promise<Blob> {
-  const response = await fetch(url, {
+  // Gateway view paths need a signed URL; browsers can load them via <img>,
+  // but download fetch must use the resolved object URL without session cookies.
+  let target = url
+  if (url.startsWith('/') || url.startsWith(`${window.location.origin}/`)) {
+    const resolved = new URL(url, window.location.origin)
+    target = (
+      await imageRequest<{ url: string }>(
+        `${resolved.pathname}${resolved.search}`,
+        'GET',
+        undefined,
+        signal
+      )
+    ).url
+  }
+  const response = await fetch(target, {
     signal,
     credentials: 'omit',
     cache: 'no-store',

@@ -24,7 +24,7 @@ import type {
   SortingState,
 } from '@tanstack/react-table'
 import { Ban, Eye, RefreshCw } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { startTransition, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -45,7 +45,7 @@ import { hasPermission } from '@/lib/admin-permissions'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getImageTasks, imageRequest, imageTasksPath } from './api'
+import { getImageTask, getImageTasks, imageRequest, imageTasksPath } from './api'
 import {
   ImagePlatformBadge,
   ImageRequestTypeBadge,
@@ -190,7 +190,20 @@ function TaskCenterSession({
                 variant='link'
                 className='h-auto min-w-0 flex-1 justify-start overflow-hidden p-0 font-mono text-[11px]'
                 title={row.original.id}
-                onClick={() => setDetail(row.original.id)}
+                onClick={() => startTransition(() => setDetail(row.original.id))}
+                onMouseEnter={() => {
+                  void queryClient.prefetchQuery({
+                    queryKey: [
+                      'image-task-details',
+                      userId,
+                      admin,
+                      row.original.id,
+                    ],
+                    queryFn: ({ signal }) =>
+                      getImageTask(admin, row.original.id, signal),
+                    staleTime: 10_000,
+                  })
+                }}
               >
                 <span className='truncate'>{row.original.id}</span>
               </Button>
@@ -378,7 +391,20 @@ function TaskCenterSession({
             <Button
               size='xs'
               variant='ghost'
-              onClick={() => setDetail(row.original.id)}
+              onClick={() => startTransition(() => setDetail(row.original.id))}
+              onMouseEnter={() => {
+                void queryClient.prefetchQuery({
+                  queryKey: [
+                    'image-task-details',
+                    userId,
+                    admin,
+                    row.original.id,
+                  ],
+                  queryFn: ({ signal }) =>
+                    getImageTask(admin, row.original.id, signal),
+                  staleTime: 10_000,
+                })
+              }}
             >
               <Eye className='size-3.5' aria-hidden />
               {t('View')}
@@ -413,7 +439,7 @@ function TaskCenterSession({
         size: 118,
       },
     ],
-    [admin, canManage, t]
+    [admin, canManage, queryClient, t, userId]
   )
   const { table } = useDataTable({
     data: tasks.data?.items || [],
