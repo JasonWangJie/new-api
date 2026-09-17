@@ -821,4 +821,10 @@ export const STATIC_I18N_KEYS = [
   'Vendor name and icon must not exceed 128 characters.',
   'Shown',
   'Not shown',
+  // Async image request and billing labels are resolved dynamically.
+  'Text to image',
+  'Image to image',
+  'Text to video',
+  'Image to video',
+  'Settled',
 ] as const

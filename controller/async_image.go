@@ -119,6 +119,14 @@ func SubmitAsyncImage(c *gin.Context) {
 		return
 	}
 	task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: token.UserId, TokenId: token.Id, Group: policy.Group, Platform: request.Platform, Dialect: request.Dialect, Model: request.Model, RequestType: request.Kind, SourcePath: request.SourcePath, RequestedSize: request.Size, RequestedResolution: request.Resolution, AspectRatio: request.AspectRatio, RequestHash: fingerprint, ExpiresAt: time.Now().Unix() + int64(cfg.TaskRetentionDays)*86400}
+	if urls := request.ReferenceURLs(); len(urls) > 0 {
+		preview, err := common.Marshal(urls)
+		if err != nil {
+			AsyncImagePublicError(c, 400, "invalid_request", "Image references could not be encoded")
+			return
+		}
+		task.ReferenceUrls = string(preview)
+	}
 	if cfg.PromptPreview {
 		characters := []rune(request.Prompt)
 		task.PromptSummary = string(characters[:min(len(characters), cfg.PromptPreviewChars)])

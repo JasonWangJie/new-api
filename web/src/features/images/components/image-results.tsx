@@ -31,10 +31,12 @@ export function ImageResults({
   images,
   actions,
   empty,
+  previewMode = 'standard',
 }: {
   images: { url: string; id: string; title?: string; description?: string }[]
   actions?: (id: string) => ReactNode
   empty?: string
+  previewMode?: 'standard' | 'original'
 }) {
   const { t } = useTranslation()
   const [preview, setPreview] = useState<number | null>(null)
@@ -121,6 +123,7 @@ export function ImageResults({
           images={images.map((image) => image.url)}
           initialIndex={preview}
           open
+          presentation={previewMode}
           onOpenChange={(open) => {
             if (!open) setPreview(null)
           }}

@@ -41,6 +41,7 @@ type DialogProps = React.ComponentProps<typeof DialogRoot> & {
   titleClassName?: string
   descriptionClassName?: string
   bodyClassName?: string
+  scrollAreaClassName?: string
   footerClassName?: string
   initialFocus?: boolean
   showCloseButton?: boolean
@@ -61,6 +62,7 @@ export function Dialog({
   titleClassName,
   descriptionClassName,
   bodyClassName,
+  scrollAreaClassName,
   footerClassName,
   initialFocus,
   showCloseButton,
@@ -97,7 +99,8 @@ export function Dialog({
         <div
           className={cn(
             '-mx-1 min-h-0 overflow-x-hidden overflow-y-auto overscroll-contain',
-            'h-[var(--dialog-content-height)] max-h-[calc(100vh-14rem)]'
+            'h-[var(--dialog-content-height)] max-h-[calc(100vh-14rem)]',
+            scrollAreaClassName
           )}
         >
           <div

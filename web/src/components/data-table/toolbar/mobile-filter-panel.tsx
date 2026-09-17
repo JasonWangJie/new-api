@@ -30,6 +30,8 @@ import { cn } from '@/lib/utils'
 
 type DataTableMobileFilterPanelProps = {
   children: ReactNode
+  summary?: ReactNode
+  defaultOpen?: boolean
   actions: ReactNode
   compact?: boolean
   className?: string
@@ -39,7 +41,7 @@ export function DataTableMobileFilterPanel(
   props: DataTableMobileFilterPanelProps
 ) {
   const { t } = useTranslation()
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(props.defaultOpen ?? true)
 
   return (
     <Collapsible
@@ -51,6 +53,7 @@ export function DataTableMobileFilterPanel(
         props.className
       )}
     >
+      {props.summary}
       <CollapsibleContent>{props.children}</CollapsibleContent>
       <div
         className={cn(

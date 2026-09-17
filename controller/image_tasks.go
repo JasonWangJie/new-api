@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"math"
 	"net/http"
@@ -149,11 +150,108 @@ AVG(CASE WHEN status = 'succeeded' AND finished_at >= created_at THEN (finished_
 		imageManagementError(c, 503, err)
 		return
 	}
-	items := make([]gin.H, 0, len(tasks))
-	for _, task := range tasks {
-		items = append(items, imageTaskDTO(task, admin))
+	items, err := imageTasksToDTO(c.Request.Context(), tasks, admin, false)
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
 	}
 	imageManagementData(c, gin.H{"items": items, "total": total, "page": page, "page_size": size, "pages": (total + int64(size) - 1) / int64(size), "stats": stats})
+}
+
+// imageTasksToDTO resolves display metadata in batches and keeps routing
+// identities and account history confined to the administrator response.
+func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, includeAttempts bool) ([]gin.H, error) {
+	items := make([]gin.H, 0, len(tasks))
+	if len(tasks) == 0 {
+		return items, nil
+	}
+	taskIDs := make([]string, 0, len(tasks))
+	tokenIDs, userIDs, channelIDs := make([]int, 0, len(tasks)), make([]int, 0, len(tasks)), make([]int, 0, len(tasks))
+	histories := make(map[string][]service.ImageChannelAttempt)
+	for _, task := range tasks {
+		taskIDs = append(taskIDs, task.TaskId)
+		tokenIDs = append(tokenIDs, task.TokenId)
+		if admin {
+			userIDs = append(userIDs, task.UserId)
+			channelIDs = append(channelIDs, task.ChannelId)
+			if includeAttempts && task.Attempts != "" {
+				var history []service.ImageChannelAttempt
+				if common.UnmarshalJsonStr(task.Attempts, &history) == nil && history != nil {
+					histories[task.TaskId] = history
+					for _, attempt := range history {
+						channelIDs = append(channelIDs, attempt.ChannelId)
+					}
+				}
+			}
+		}
+	}
+	var tokens []model.Token
+	if err := model.DB.WithContext(ctx).Select("id", "user_id", "name").Where("id IN ?", tokenIDs).Find(&tokens).Error; err != nil {
+		return nil, err
+	}
+	tokenNames := make(map[int]model.Token, len(tokens))
+	for _, token := range tokens {
+		tokenNames[token.Id] = token
+	}
+	userNames, channelNames := make(map[int]string), make(map[int]string)
+	if admin {
+		var users []model.User
+		if err := model.DB.WithContext(ctx).Select("id", "username", "display_name").Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+			return nil, err
+		}
+		for _, user := range users {
+			name := user.DisplayName
+			if name == "" {
+				name = user.Username
+			}
+			userNames[user.Id] = name
+		}
+		var channels []model.Channel
+		if err := model.DB.WithContext(ctx).Select("id", "name").Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+		for _, channel := range channels {
+			channelNames[channel.Id] = channel.Name
+		}
+	}
+	var storage []struct {
+		TaskId   string
+		Provider string
+	}
+	if err := model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).
+		Select("async_image_results.task_id, image_storage_profiles.provider").
+		Joins("JOIN image_storage_objects ON image_storage_objects.object_id = async_image_results.object_id").
+		Joins("JOIN image_storage_profiles ON image_storage_profiles.profile_id = image_storage_objects.profile_id").
+		Where("async_image_results.task_id IN ?", taskIDs).Distinct().Scan(&storage).Error; err != nil {
+		return nil, err
+	}
+	providers := make(map[string][]string)
+	for _, object := range storage {
+		providers[object.TaskId] = append(providers[object.TaskId], object.Provider)
+	}
+	for _, task := range tasks {
+		data := imageTaskDTO(task, admin)
+		data["api_key_name"] = ""
+		if token, found := tokenNames[task.TokenId]; found && token.UserId == task.UserId {
+			data["api_key_name"] = token.Name
+		}
+		data["storage_providers"] = providers[task.TaskId]
+		if admin {
+			data["user_name"] = userNames[task.UserId]
+			data["channel_name"] = channelNames[task.ChannelId]
+			if includeAttempts {
+				history := make([]gin.H, 0, len(histories[task.TaskId]))
+				for _, attempt := range histories[task.TaskId] {
+					history = append(history, gin.H{"channel_name": channelNames[attempt.ChannelId], "key_index": attempt.KeyIndex, "started_at": attempt.StartedAt, "finished_at": attempt.FinishedAt, "dispatched": attempt.Dispatched, "reference_mode": attempt.ReferenceMode, "error_code": attempt.Code})
+				}
+				data["attempt_history"] = history
+				_, historyAvailable := histories[task.TaskId]
+				data["attempt_history_unavailable"] = task.Attempts != "" && !historyAvailable
+			}
+		}
+		items = append(items, data)
+	}
+	return items, nil
 }
 
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
@@ -188,6 +286,11 @@ func GetImageTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 503, err)
 		return
 	}
+	if !admin {
+		for i := range events {
+			events[i].Message = ""
+		}
+	}
 	results := make([]gin.H, 0)
 	if task.ResultsAvailable() {
 		var saved []model.AsyncImageResult
@@ -209,7 +312,12 @@ func GetImageTask(c *gin.Context, admin bool) {
 			results = append(results, gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt})
 		}
 	}
-	imageManagementData(c, gin.H{"task": imageTaskDTO(task, admin), "results": results, "events": events})
+	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	imageManagementData(c, gin.H{"task": items[0], "results": results, "events": events})
 }
 
 func ViewImageTaskResult(c *gin.Context, admin bool) {

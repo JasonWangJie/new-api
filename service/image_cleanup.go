@@ -157,7 +157,7 @@ func MaintainImageStorage(ctx context.Context, cfg ImageRuntimeConfig) error {
 	failures = append(failures, ReapUnconfirmedImageIntents(ctx, cfg))
 	// Accounting and idempotency tombstones remain durable. Expired task
 	// content is erased without making an old request eligible for execution.
-	failures = append(failures, model.DB.WithContext(ctx).Model(&model.AsyncImageTask{}).Where("expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL)", time.Now().Unix(), []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}).Updates(map[string]any{"prompt_summary": "", "request_cipher": nil}).Error)
+	failures = append(failures, model.EraseExpiredAsyncImageTaskContent(ctx))
 	failures = append(failures, model.DB.WithContext(ctx).Where("action = ? AND created_at < ?", "import_attempt", time.Now().Unix()-86400).Delete(&model.ImageModerationEvent{}).Error)
 	return errors.Join(failures...)
 }

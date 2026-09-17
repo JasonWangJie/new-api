@@ -10,6 +10,14 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// EraseExpiredAsyncImageTaskContent preserves accounting and idempotency
+// tombstones while removing expired prompt, payload and reference content.
+func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
+	return DB.WithContext(ctx).Model(&AsyncImageTask{}).
+		Where("expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", time.Now().Unix(), []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
+		Updates(map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}).Error
+}
+
 // AcceptAsyncImageTask serializes admission on its Token and commits the task,
 // idempotency binding, input references, event and queue command together.
 func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash string, inputIds []string) (AsyncImageTask, bool, error) {

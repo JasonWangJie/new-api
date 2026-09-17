@@ -63,13 +63,30 @@ export type ImageTask = {
   cost: number
   prompt_summary: string
   requested_size: string
+  requested_resolution?: string
   actual_size: string
   aspect_ratio: string
   group: string
   api_key_id: number
+  api_key_name?: string
+  user_name?: string
+  channel_name?: string
+  storage_providers?: string[] | null
   user_id?: number
   channel_id?: number
   attempts?: string
+  reference_urls?: string
+  reconciliation_status?: string
+  attempt_history?: {
+    channel_name: string
+    key_index: number
+    started_at: number
+    finished_at: number
+    dispatched: boolean
+    reference_mode: string
+    error_code: number
+  }[]
+  attempt_history_unavailable?: boolean
   retry_count: number
   created_at: number
   started_at: number
@@ -106,7 +123,7 @@ export type ImageTaskDetail = {
 export type ImageTaskList = {
   items: ImageTask[]
   total: number
-  stats: Record<string, number>
+  stats: Record<string, number | null>
   pages: number
 }
 export type ImageMetadata = {

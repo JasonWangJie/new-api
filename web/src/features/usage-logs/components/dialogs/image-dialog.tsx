@@ -32,6 +32,7 @@ interface ImageDialogProps {
   taskId?: string
   open: boolean
   onOpenChange: (open: boolean) => void
+  presentation?: 'standard' | 'original'
 }
 
 export function ImageDialog({
@@ -41,6 +42,7 @@ export function ImageDialog({
   taskId,
   open,
   onOpenChange,
+  presentation = 'standard',
 }: ImageDialogProps) {
   const { t } = useTranslation()
   const [isLoading, setIsLoading] = useState(true)
@@ -84,11 +86,26 @@ export function ImageDialog({
       description={
         taskId ? `${t('Task ID:')} ${taskId}` : t('View the generated image')
       }
-      contentClassName='sm:max-w-3xl'
+      contentClassName={
+        presentation === 'original'
+          ? 'h-dvh max-h-dvh w-screen max-w-none gap-0 rounded-none bg-black p-0 ring-0 sm:max-w-none sm:p-0 [&>[data-slot=dialog-close]]:z-10 [&>[data-slot=dialog-close]]:bg-background/90'
+          : 'sm:max-w-3xl'
+      }
       contentHeight='auto'
-      bodyClassName='space-y-4'
+      headerClassName={presentation === 'original' ? 'sr-only' : undefined}
+      scrollAreaClassName={
+        presentation === 'original'
+          ? 'm-0 h-dvh max-h-none overflow-auto'
+          : undefined
+      }
+      bodyClassName={
+        presentation === 'original'
+          ? 'flex min-h-dvh w-max min-w-full items-center justify-center p-0'
+          : 'space-y-4'
+      }
     >
       <div
+        className={presentation === 'original' ? 'relative' : undefined}
         onKeyDown={(event) => {
           if (sources.length < 2) return
           if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -98,7 +115,13 @@ export function ImageDialog({
         }}
       >
         {sources.length > 1 && (
-          <div className='flex items-center justify-between gap-3'>
+          <div
+            className={
+              presentation === 'original'
+                ? 'bg-background/90 fixed bottom-4 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-lg p-2'
+                : 'flex items-center justify-between gap-3'
+            }
+          >
             <Button
               variant='outline'
               onClick={() => changeImage(-1)}
@@ -118,50 +141,73 @@ export function ImageDialog({
             </Button>
           </div>
         )}
-        <ScrollArea className='max-h-[600px]'>
-          <div className='py-4'>
-            <div className='bg-muted/50 relative flex min-h-[300px] items-center justify-center rounded-lg border'>
-              {/* Skeleton - show when loading or error */}
-              {(isLoading || hasError) && (
-                <Skeleton className='absolute inset-0 h-full w-full rounded-lg' />
-              )}
-
-              {/* Actual Image */}
-              <img
-                key={source}
-                src={source}
-                alt={t('Generated image')}
-                className={`max-h-[550px] w-full rounded-lg object-contain ${
-                  isLoading || hasError ? 'opacity-0' : 'opacity-100'
-                }`}
-                onLoad={handleImageLoad}
-                onError={handleImageError}
-                loading='lazy'
-              />
-
-              {/* Error text overlay (shown on skeleton) */}
-              {hasError && (
-                <div className='absolute inset-0 flex items-center justify-center'>
-                  <p className='text-muted-foreground text-sm'>
-                    {t('Failed to load image')}
-                  </p>
-                </div>
-              )}
-            </div>
-
-            {/* Image URL */}
-            <div className='bg-muted mt-4 rounded-md p-3'>
-              <p className='text-muted-foreground font-mono text-xs break-all'>
-                {source?.startsWith('data:') ? t('Embedded image') : source}
+        {presentation === 'original' ? (
+          <>
+            {isLoading && !hasError && (
+              <p role='status' className='bg-background/90 rounded-lg p-4'>
+                {t('Loading...')}
               </p>
-              {source && (
-                <CopyButton value={source} size='sm'>
-                  {t('Copy URL')}
-                </CopyButton>
-              )}
+            )}
+            {hasError && (
+              <p role='alert' className='bg-background/90 rounded-lg p-4'>
+                {t('Failed to load image')}
+              </p>
+            )}
+            <img
+              key={source}
+              src={source}
+              alt={t('Generated image')}
+              className={`block h-auto w-auto max-w-none rounded-none ${isLoading || hasError ? 'hidden' : ''}`}
+              onLoad={handleImageLoad}
+              onError={handleImageError}
+            />
+          </>
+        ) : (
+          <ScrollArea className='max-h-[600px]'>
+            <div className='py-4'>
+              <div className='bg-muted/50 relative flex min-h-[300px] items-center justify-center rounded-lg border'>
+                {/* Skeleton - show when loading or error */}
+                {(isLoading || hasError) && (
+                  <Skeleton className='absolute inset-0 h-full w-full rounded-lg' />
+                )}
+
+                {/* Actual Image */}
+                <img
+                  key={source}
+                  src={source}
+                  alt={t('Generated image')}
+                  className={`max-h-[550px] w-full rounded-lg object-contain ${
+                    isLoading || hasError ? 'opacity-0' : 'opacity-100'
+                  }`}
+                  onLoad={handleImageLoad}
+                  onError={handleImageError}
+                  loading='lazy'
+                />
+
+                {/* Error text overlay (shown on skeleton) */}
+                {hasError && (
+                  <div className='absolute inset-0 flex items-center justify-center'>
+                    <p className='text-muted-foreground text-sm'>
+                      {t('Failed to load image')}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Image URL */}
+              <div className='bg-muted mt-4 rounded-md p-3'>
+                <p className='text-muted-foreground font-mono text-xs break-all'>
+                  {source?.startsWith('data:') ? t('Embedded image') : source}
+                </p>
+                {source && (
+                  <CopyButton value={source} size='sm'>
+                    {t('Copy URL')}
+                  </CopyButton>
+                )}
+              </div>
             </div>
-          </div>
-        </ScrollArea>
+          </ScrollArea>
+        )}
       </div>
     </Dialog>
   )

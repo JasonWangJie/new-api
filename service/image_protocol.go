@@ -40,6 +40,23 @@ type AsyncImageRequest struct {
 	Native       map[string]common.RawMessage `json:"native,omitempty"`
 }
 
+// ReferenceURLs retains external image references for the administrator task
+// view without copying embedded image data or internal input handles.
+func (request AsyncImageRequest) ReferenceURLs() []string {
+	urls := make([]string, 0)
+	for _, part := range request.Parts {
+		if part.Type != "image_url" {
+			continue
+		}
+		value := strings.TrimSpace(part.URL)
+		lower := strings.ToLower(value)
+		if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
+			urls = append(urls, value)
+		}
+	}
+	return urls
+}
+
 func AsyncImageRequestHash(platform, dialect, path string, raw []byte) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(strings.TrimSpace(platform) + "\x00" + strings.TrimSpace(dialect) + "\x00" + strings.TrimSpace(path) + "\x00"))

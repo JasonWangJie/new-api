@@ -23,6 +23,7 @@ import type {
   RowSelectionState,
   SortingState,
 } from '@tanstack/react-table'
+import { Ban, Eye, RefreshCw } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -35,7 +36,6 @@ import {
   useDataTable,
 } from '@/components/data-table'
 import { DataTableMobileFilterPanel } from '@/components/data-table/toolbar/mobile-filter-panel'
-import { Dialog } from '@/components/dialog'
 import { SectionPageLayout } from '@/components/layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -43,18 +43,18 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { hasPermission } from '@/lib/admin-permissions'
+import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
-import {
-  getImageTask,
-  getImageTasks,
-  imageRequest,
-  imageTasksPath,
-} from './api'
-import { ImageResults } from './components/image-results'
+import { getImageTasks, imageRequest, imageTasksPath } from './api'
 import { ImageSelect } from './components/image-select'
+import { ImageTaskDetails } from './components/image-task-details'
 import { imageLabel } from './lib/image-labels'
-import { terminalImageStatus } from './lib/image-request'
+import {
+  imageTaskElapsedSeconds,
+  imageTaskSpecifications,
+  imageTaskSuccessRate,
+} from './lib/task-presentation'
 import type { ImageTask } from './types'
 
 const TASK_STATES = [
@@ -74,7 +74,6 @@ const TASK_FILTER_FIELDS = [
   { key: 'model', label: 'Model' },
   { key: 'group', label: 'Group' },
   { key: 'api_key_id', label: 'API Key ID' },
-  { key: 'storage_provider', label: 'Storage provider' },
   { key: 'task_id', label: 'Task ID' },
 ] as const
 
@@ -113,6 +112,8 @@ function TaskCenterSession({
     platform: '',
     protocol: '',
     billing_status: '',
+    request_type: '',
+    storage_provider: '',
   })
   const [filters, setFilters] = useState(draft)
   const [pagination, setPagination] = useState<PaginationState>({
@@ -124,6 +125,7 @@ function TaskCenterSession({
   ])
   const [selection, setSelection] = useState<RowSelectionState>({})
   const [detail, setDetail] = useState('')
+  const [autoRefresh, setAutoRefresh] = useState(true)
   const [operation, setOperation] = useState<{
     ids: string[]
     action: 'resume' | 'terminate' | 'batch-terminate'
@@ -144,11 +146,11 @@ function TaskCenterSession({
   const tasks = useQuery({
     queryKey: ['image-task-center', userId, admin, params.toString()],
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
-    refetchInterval: 10000,
+    refetchInterval: autoRefresh ? 10000 : false,
   })
   const columns = useMemo<ColumnDef<ImageTask, unknown>[]>(
     () => [
-      ...(admin
+      ...(canManage
         ? [
             {
               id: 'select',
@@ -170,7 +172,7 @@ function TaskCenterSession({
                 />
               ),
               enableSorting: false,
-              size: 44,
+              size: 36,
             } as ColumnDef<ImageTask, unknown>,
           ]
         : []),
@@ -178,20 +180,96 @@ function TaskCenterSession({
         id: 'task_id',
         header: t('Task ID'),
         cell: ({ row }) => (
-          <div className='max-w-64'>
-            <Button
-              variant='link'
-              className='h-auto max-w-full truncate p-0 font-mono text-xs'
-              onClick={() => setDetail(row.original.id)}
-            >
-              {row.original.id}
-            </Button>
+          <div className='w-32 space-y-1'>
+            <div className='flex min-w-0 items-center gap-1'>
+              <Button
+                variant='link'
+                className='h-auto min-w-0 flex-1 justify-start overflow-hidden p-0 font-mono text-[11px]'
+                title={row.original.id}
+                onClick={() => setDetail(row.original.id)}
+              >
+                <span className='truncate'>{row.original.id}</span>
+              </Button>
+              <CopyButton
+                value={row.original.id}
+                tooltip={t('Copy Task ID')}
+                className='size-7 shrink-0'
+                iconClassName='size-3'
+              />
+            </div>
             <p className='text-muted-foreground truncate text-xs'>
-              {row.original.model}
+              {t(imageLabel(row.original.protocol))}
             </p>
           </div>
         ),
         enableSorting: false,
+        size: 152,
+      },
+      {
+        id: 'created_at',
+        accessorKey: 'created_at',
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} title={t('Task time')} />
+        ),
+        cell: ({ row }) => (
+          <dl className='space-y-1 text-[11px] tabular-nums'>
+            {[
+              { label: t('Submitted at'), value: row.original.created_at },
+              { label: t('Started at'), value: row.original.started_at },
+              { label: t('Finished at'), value: row.original.finished_at },
+            ].map((item) => (
+              <div key={item.label} className='flex gap-1.5'>
+                <dt className='text-muted-foreground'>{item.label}</dt>
+                <dd>{formatTimestampToDate(item.value)}</dd>
+              </div>
+            ))}
+            <div className='flex gap-1.5 font-medium'>
+              <dt>{t('Time spent')}</dt>
+              <dd>
+                {row.original.created_at
+                  ? formatUseTime(imageTaskElapsedSeconds(row.original) || 0)
+                  : '—'}
+              </dd>
+            </div>
+          </dl>
+        ),
+        size: 212,
+      },
+      {
+        id: 'platform',
+        header: t('Platform'),
+        cell: ({ row }) => (
+          <div className='space-y-1 text-xs'>
+            <p className='font-medium'>
+              {t(imageLabel(row.original.platform))}
+            </p>
+            <p className='text-muted-foreground'>
+              {t(imageLabel(row.original.request_type))}
+            </p>
+          </div>
+        ),
+        enableSorting: false,
+        size: 82,
+      },
+      {
+        id: 'model',
+        header: t('Model / specifications'),
+        cell: ({ row }) => (
+          <div className='w-36 space-y-1 text-xs'>
+            <p
+              className='truncate font-mono font-medium'
+              title={row.original.model}
+            >
+              {row.original.model}
+            </p>
+            <p className='text-muted-foreground whitespace-normal'>
+              {imageTaskSpecifications(row.original)}{' '}
+              {row.original.aspect_ratio}
+            </p>
+          </div>
+        ),
+        enableSorting: false,
+        size: 166,
       },
       {
         id: 'status',
@@ -201,7 +279,14 @@ function TaskCenterSession({
         ),
         cell: ({ row }) => (
           <div className='space-y-1'>
-            <Badge variant={row.original.error_code ? 'warning' : 'outline'}>
+            <Badge
+              variant={row.original.error_code ? 'warning' : 'outline'}
+              className={
+                row.original.status === 'succeeded'
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                  : undefined
+              }
+            >
               {t(imageLabel(row.original.status))}
             </Badge>
             <p className='text-muted-foreground text-xs'>
@@ -210,83 +295,88 @@ function TaskCenterSession({
             </p>
           </div>
         ),
-      },
-      {
-        id: 'platform',
-        header: t('Platform'),
-        cell: ({ row }) => (
-          <div className='text-xs'>
-            {row.original.platform} · {row.original.protocol}
-            <p className='text-muted-foreground'>
-              {row.original.request_type} · {row.original.group}
-            </p>
-          </div>
-        ),
-        enableSorting: false,
+        size: 108,
       },
       {
         id: 'image_count',
         accessorKey: 'image_count',
         header: ({ column }) => (
-          <DataTableColumnHeader column={column} title={t('Images')} />
+          <DataTableColumnHeader
+            column={column}
+            title={t('Images / storage')}
+          />
         ),
         cell: ({ row }) => (
           <span className='text-xs tabular-nums'>
             {row.original.result_count} / {row.original.image_count}
             <span className='text-muted-foreground block'>
-              {row.original.actual_size || row.original.requested_size}
+              {row.original.storage_providers?.join(', ') || t('Not stored')}
             </span>
           </span>
         ),
-      },
-      {
-        id: 'quota',
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} title={t('Cost')} />
-        ),
-        cell: ({ row }) => (
-          <span className='font-mono text-xs'>
-            ${row.original.cost.toFixed(6)}
-          </span>
-        ),
-      },
-      {
-        id: 'created_at',
-        accessorKey: 'created_at',
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} title={t('Created At')} />
-        ),
-        cell: ({ row }) => (
-          <span className='text-xs'>
-            {new Date(row.original.created_at * 1000).toLocaleString()}
-          </span>
-        ),
+        size: 88,
       },
       ...(admin
         ? [
             {
-              id: 'channel',
-              header: t('Channel / User'),
+              id: 'user',
+              header: t('User'),
               cell: ({ row }) => (
-                <span className='text-xs'>
-                  {row.original.channel_id || '—'} / {row.original.user_id}
-                </span>
+                <p
+                  className='w-30 truncate text-xs'
+                  title={row.original.user_name}
+                >
+                  {row.original.user_name || t('User unavailable')}
+                </p>
               ),
               enableSorting: false,
+              size: 138,
+            } as ColumnDef<ImageTask, unknown>,
+            {
+              id: 'channel',
+              header: t('Channel'),
+              cell: ({ row }) => (
+                <p
+                  className='w-32 truncate text-xs'
+                  title={row.original.channel_name}
+                >
+                  {row.original.channel_name ||
+                    (row.original.channel_id
+                      ? t('Channel unavailable')
+                      : t('Not selected'))}
+                </p>
+              ),
+              enableSorting: false,
+              size: 150,
             } as ColumnDef<ImageTask, unknown>,
           ]
         : []),
+      {
+        id: 'quota',
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} title={t('Actual cost')} />
+        ),
+        cell: ({ row }) => (
+          <span className='font-mono text-xs'>
+            {['succeeded', 'not_billable'].includes(row.original.billing_status)
+              ? `US$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
+              : '—'}
+          </span>
+        ),
+        size: 86,
+      },
       {
         id: 'actions',
         header: t('Actions'),
         cell: ({ row }) => (
           <div className='flex flex-wrap gap-1'>
             <Button
-              size='sm'
-              variant='outline'
+              size='xs'
+              variant='ghost'
               onClick={() => setDetail(row.original.id)}
             >
-              {t('Details')}
+              <Eye className='size-3.5' aria-hidden />
+              {t('View')}
             </Button>
             {canManage && row.original.can_resume && (
               <Button
@@ -301,18 +391,21 @@ function TaskCenterSession({
             )}
             {canManage && row.original.can_terminate && (
               <Button
-                size='sm'
+                size='icon-sm'
                 variant='ghost'
+                aria-label={t('Terminate')}
+                title={t('Terminate')}
                 onClick={() =>
                   setOperation({ ids: [row.original.id], action: 'terminate' })
                 }
               >
-                {t('Terminate')}
+                <Ban className='size-3.5' aria-hidden />
               </Button>
             )}
           </div>
         ),
         enableSorting: false,
+        size: 118,
       },
     ],
     [admin, canManage, t]
@@ -328,7 +421,7 @@ function TaskCenterSession({
     onPaginationChange: setPagination,
     sorting,
     onSortingChange: setSorting,
-    enableRowSelection: admin,
+    enableRowSelection: canManage,
     rowSelection: selection,
     onRowSelectionChange: setSelection,
     getRowId: (row) => row.id,
@@ -377,6 +470,9 @@ function TaskCenterSession({
       await queryClient.invalidateQueries({
         queryKey: ['image-task-center', userId, admin],
       })
+      await queryClient.invalidateQueries({
+        queryKey: ['image-task-details', userId, admin],
+      })
       setSelection({})
       setOperation(null)
     } catch (error) {
@@ -387,12 +483,56 @@ function TaskCenterSession({
       setBusy(false)
     }
   }
+  const successRate = imageTaskSuccessRate(tasks.data?.stats)
+  const currentPending = (tasks.data?.items || []).filter(
+    (task) => task.can_terminate
+  )
+  const stats = tasks.data?.stats
+  const statistics = [
+    {
+      label: t('Processing'),
+      value: (stats?.queued || 0) + (stats?.processing || 0),
+      color: 'text-amber-700 dark:text-amber-400',
+    },
+    {
+      label: t('Succeeded'),
+      value: stats?.succeeded || 0,
+      color: 'text-emerald-700 dark:text-emerald-400',
+    },
+    {
+      label: t('Failed'),
+      value: stats?.failed || 0,
+      color: 'text-rose-700 dark:text-rose-400',
+    },
+    {
+      label: t('Success rate'),
+      value: successRate === null ? '—' : `${successRate.toFixed(1)}%`,
+      color: 'text-emerald-700 dark:text-emerald-400',
+    },
+    {
+      label: t('Average duration'),
+      value:
+        stats?.average_duration_ms == null
+          ? '—'
+          : formatUseTime(stats.average_duration_ms / 1000),
+      color: 'text-cyan-700 dark:text-cyan-400',
+    },
+  ]
   return (
-    <SectionPageLayout fixedContent>
+    <SectionPageLayout fixedContent stackActionsOnMobile>
       <SectionPageLayout.Title>
         {t(admin ? 'Admin Image Tasks' : 'Async Image Tasks')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Actions>
+        <Button
+          size='sm'
+          variant={autoRefresh ? 'secondary' : 'outline'}
+          aria-pressed={autoRefresh}
+          onClick={() => setAutoRefresh((previous) => !previous)}
+        >
+          <RefreshCw className='size-3.5' aria-hidden />
+          {t('Auto refresh')}
+        </Button>
         <Button
           variant='outline'
           size='sm'
@@ -401,25 +541,55 @@ function TaskCenterSession({
           {t('Refresh')}
         </Button>
         {canManage && (
-          <Button
-            size='sm'
-            variant='destructive'
-            disabled={!table.getSelectedRowModel().rows.length}
-            onClick={() =>
-              setOperation({
-                ids: table
-                  .getSelectedRowModel()
-                  .rows.map((row) => row.original.id),
-                action: 'batch-terminate',
-              })
-            }
-          >
-            {t('Terminate selected')}
-          </Button>
+          <>
+            <Button
+              size='sm'
+              variant='destructive'
+              disabled={!currentPending.length || busy}
+              onClick={() =>
+                setOperation({
+                  ids: currentPending.map((task) => task.id),
+                  action: 'batch-terminate',
+                })
+              }
+            >
+              <Ban className='size-3.5' aria-hidden />
+              {t('Terminate current page')} ({currentPending.length})
+            </Button>
+            <Button
+              size='sm'
+              variant='destructive'
+              disabled={!table.getSelectedRowModel().rows.length}
+              onClick={() =>
+                setOperation({
+                  ids: table
+                    .getSelectedRowModel()
+                    .rows.map((row) => row.original.id),
+                  action: 'batch-terminate',
+                })
+              }
+            >
+              {t('Terminate selected')}
+            </Button>
+          </>
         )}
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
         <div className='flex h-full min-h-0 flex-col gap-3'>
+          <dl
+            aria-label={t('Task statistics')}
+            className='flex shrink-0 flex-wrap gap-2'
+          >
+            {statistics.map((item) => (
+              <div
+                key={item.label}
+                className={`bg-muted/20 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${item.color}`}
+              >
+                <dt>{item.label}</dt>
+                <dd className='font-semibold tabular-nums'>{item.value}</dd>
+              </div>
+            ))}
+          </dl>
           <form
             id='image-task-filter-form'
             className='shrink-0'
@@ -431,32 +601,101 @@ function TaskCenterSession({
             }}
           >
             <DataTableMobileFilterPanel
+              compact
+              defaultOpen={false}
+              summary={
+                <div className='grid grid-cols-2 gap-3 xl:grid-cols-6'>
+                  <div className='col-span-2'>{field('q', 'Search tasks')}</div>
+                  <ImageSelect
+                    label={t('Status')}
+                    value={draft.status}
+                    options={choices(TASK_STATES)}
+                    onChange={(value) =>
+                      setDraft((previous) => ({ ...previous, status: value }))
+                    }
+                  />
+                  <ImageSelect
+                    label={t('Platform')}
+                    value={draft.platform}
+                    options={choices(['openai', 'gemini'])}
+                    onChange={(value) =>
+                      setDraft((previous) => ({ ...previous, platform: value }))
+                    }
+                  />
+                  <ImageSelect
+                    label={t('Request type')}
+                    value={draft.request_type}
+                    options={choices([
+                      'text_to_image',
+                      'image_to_image',
+                      'text_to_video',
+                      'image_to_video',
+                      'video',
+                    ])}
+                    onChange={(value) =>
+                      setDraft((previous) => ({
+                        ...previous,
+                        request_type: value,
+                      }))
+                    }
+                  />
+                  <ImageSelect
+                    label={t('Storage provider')}
+                    value={draft.storage_provider}
+                    options={choices([
+                      'local',
+                      'aws',
+                      'aliyun',
+                      'tencent',
+                      'qiniu',
+                      'r2',
+                      'custom_s3',
+                    ])}
+                    onChange={(value) =>
+                      setDraft((previous) => ({
+                        ...previous,
+                        storage_provider: value,
+                      }))
+                    }
+                  />
+                </div>
+              }
               actions={
-                <Button type='submit' form='image-task-filter-form'>
-                  {t('Apply filters')}
-                </Button>
+                <>
+                  <span className='text-muted-foreground mr-auto hidden text-xs sm:block'>
+                    {filters.start_date} — {filters.end_date}
+                  </span>
+                  <Button
+                    type='button'
+                    variant='outline'
+                    onClick={() => {
+                      const reset = Object.fromEntries(
+                        Object.keys(draft).map((key) => [key, ''])
+                      )
+                      reset.start_date = today
+                      reset.end_date = today
+                      reset.timezone =
+                        Intl.DateTimeFormat().resolvedOptions().timeZone
+                      setDraft(reset)
+                      setFilters(reset)
+                      setPagination((previous) => ({
+                        ...previous,
+                        pageIndex: 0,
+                      }))
+                      setSelection({})
+                    }}
+                  >
+                    {t('Reset')}
+                  </Button>
+                  <Button type='submit' form='image-task-filter-form'>
+                    {t('Apply filters')}
+                  </Button>
+                </>
               }
             >
-              <div className='grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto p-1 sm:grid-cols-3 xl:grid-cols-5'>
-                {field('q', 'Search tasks')}
+              <div className='mt-3 grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto border-t p-1 pt-3 sm:grid-cols-3 xl:grid-cols-5'>
                 {field('start_date', 'Start date', 'date')}
                 {field('end_date', 'End date', 'date')}
-                <ImageSelect
-                  label={t('Status')}
-                  value={draft.status}
-                  options={choices(TASK_STATES)}
-                  onChange={(value) =>
-                    setDraft((previous) => ({ ...previous, status: value }))
-                  }
-                />
-                <ImageSelect
-                  label={t('Platform')}
-                  value={draft.platform}
-                  options={choices(['openai', 'gemini'])}
-                  onChange={(value) =>
-                    setDraft((previous) => ({ ...previous, platform: value }))
-                  }
-                />
                 <ImageSelect
                   label={t('Protocol')}
                   value={draft.protocol}
@@ -491,25 +730,6 @@ function TaskCenterSession({
               </div>
             </DataTableMobileFilterPanel>
           </form>
-          <div className='grid shrink-0 grid-cols-3 gap-2 sm:grid-cols-6'>
-            {[
-              'total',
-              'queued',
-              'processing',
-              'succeeded',
-              'failed',
-              'image_count',
-            ].map((name) => (
-              <div key={name} className='rounded-lg border px-3 py-2'>
-                <p className='text-muted-foreground text-xs'>
-                  {t(imageLabel(name))}
-                </p>
-                <p className='text-lg font-semibold tabular-nums'>
-                  {tasks.data?.stats[name] || 0}
-                </p>
-              </div>
-            ))}
-          </div>
           {tasks.isError && (
             <p role='alert' className='text-destructive shrink-0 text-sm'>
               {tasks.error.message}
@@ -539,8 +759,12 @@ function TaskCenterSession({
                 'Adjust filters or create an image from the workbench.'
               )}
               applyHeaderSize
+              pinnedColumns={[{ columnId: 'actions', side: 'right' }]}
               showMobileBulkActions
-              mobileProps={{ enableRowSelection: admin }}
+              mobileProps={{ enableRowSelection: canManage }}
+              getColumnClassName={(_id, section) =>
+                section === 'cell' ? 'py-4 align-middle' : undefined
+              }
             />
           </div>
           {detail && (
@@ -550,6 +774,8 @@ function TaskCenterSession({
               admin={admin}
               userId={userId}
               onClose={() => setDetail('')}
+              canManage={canManage}
+              onManage={(action) => setOperation({ ids: [detail], action })}
             />
           )}
           <ConfirmDialog
@@ -574,160 +800,5 @@ function TaskCenterSession({
         </div>
       </SectionPageLayout.Content>
     </SectionPageLayout>
-  )
-}
-
-function ImageTaskDetails({
-  id,
-  admin,
-  userId,
-  onClose,
-}: {
-  id: string
-  admin: boolean
-  userId: number
-  onClose: () => void
-}) {
-  const { t } = useTranslation()
-  const task = useQuery({
-    queryKey: ['image-task-details', userId, admin, id],
-    queryFn: ({ signal }) => getImageTask(admin, id, signal),
-    refetchInterval: (query) =>
-      query.state.data &&
-      terminalImageStatus(
-        query.state.data.task.status,
-        query.state.data.task.next_attempt_at
-      )
-        ? false
-        : 5000,
-  })
-  const images = useQuery({
-    queryKey: [
-      'image-task-detail-results',
-      userId,
-      admin,
-      id,
-      task.data?.results,
-    ],
-    queryFn: ({ signal }) =>
-      Promise.all(
-        (task.data?.results || []).map(async (result) => ({
-          id: String(result.image_index),
-          url: (
-            await imageRequest<{ url: string }>(
-              result.view_url,
-              'GET',
-              undefined,
-              signal
-            )
-          ).url,
-          description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
-        }))
-      ),
-    enabled: !!task.data?.results.length,
-    staleTime: 30000,
-  })
-  const archive = async (index: string) => {
-    try {
-      await imageRequest('/api/user/image-library/from-task', 'POST', {
-        task_id: id,
-        image_index: Number(index),
-      })
-      toast.success(t('Archived to server storage'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    }
-  }
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose()
-      }}
-      title={t('Image task details')}
-      description={id}
-      contentClassName='sm:max-w-5xl'
-    >
-      <div className='space-y-5'>
-        {task.isLoading && <p>{t('Loading...')}</p>}
-        {task.isError && <p role='alert'>{task.error.message}</p>}
-        {task.data && (
-          <>
-            <div className='flex flex-wrap items-center gap-3'>
-              <Badge variant='outline'>
-                {t(imageLabel(task.data.task.status))}
-              </Badge>
-              <span className='text-sm'>
-                {task.data.task.model} · {task.data.task.platform}
-              </span>
-              <CopyButton value={id} size='sm'>
-                {t('Copy Task ID')}
-              </CopyButton>
-            </div>
-            {task.data.task.error_message && (
-              <p className='text-destructive text-sm'>
-                {task.data.task.error_message}
-              </p>
-            )}
-            <ImageResults
-              images={images.data || []}
-              actions={
-                !admin
-                  ? (index) => (
-                      <Button
-                        size='sm'
-                        variant='outline'
-                        onClick={() => void archive(index)}
-                      >
-                        {t('Archive to server')}
-                      </Button>
-                    )
-                  : undefined
-              }
-            />
-            <dl className='grid grid-cols-2 gap-3 rounded-xl border p-3 text-sm'>
-              {[
-                { key: 'billing_status', label: 'Billing status' },
-                { key: 'group', label: 'Group' },
-                { key: 'api_key_id', label: 'API Key ID' },
-                { key: 'retry_count', label: 'Retries' },
-              ].map(({ key, label }) => (
-                <div key={key}>
-                  <dt className='text-muted-foreground'>{t(label)}</dt>
-                  <dd>
-                    {key === 'billing_status'
-                      ? t(imageLabel(task.data.task.billing_status))
-                      : String(task.data.task[key as keyof ImageTask] ?? '')}
-                  </dd>
-                </div>
-              ))}
-            </dl>
-            {admin && task.data.task.attempts && (
-              <pre className='bg-muted overflow-auto rounded-lg p-3 text-xs'>
-                {task.data.task.attempts}
-              </pre>
-            )}
-            <section className='space-y-2'>
-              <h4 className='text-sm font-semibold'>{t('Task events')}</h4>
-              {task.data.events.map((event) => (
-                <div key={event.id} className='border-l-2 pl-3 text-xs'>
-                  <span className='text-muted-foreground'>
-                    {new Date(event.created_at * 1000).toLocaleString()}
-                  </span>
-                  <p>
-                    {t(imageLabel(event.status))} · {event.event_type}
-                  </p>
-                  {event.message && (
-                    <p className='text-muted-foreground'>{event.message}</p>
-                  )}
-                </div>
-              ))}
-            </section>
-          </>
-        )}
-      </div>
-    </Dialog>
   )
 }
