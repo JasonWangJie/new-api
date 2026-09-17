@@ -65,25 +65,25 @@ export function CyberLanding(props: CyberLandingProps) {
     {
       icon: Workflow,
       code: '01',
-      title: t('One gateway. Every model.'),
+      title: t('Connect a universe of models.'),
       desc: t(
-        'Connect OpenAI, Claude, Gemini and more through a unified gateway. Keep your preferred API format.'
+        'OpenAI, Claude, Gemini and more, connected in one gateway. Give every request its own path through your model universe.'
       ),
     },
     {
       icon: Image,
       code: '02',
-      title: t('Beyond conversation.'),
+      title: t('Make imagination visible.'),
       desc: t(
-        'Bring chat, image generation and audio workflows together. Create more from the same infrastructure.'
+        'Think in conversation, create in images, express through audio. Push the boundaries of your ideas with one shared infrastructure.'
       ),
     },
     {
       icon: ShieldCheck,
       code: '03',
-      title: t('Stay in control.'),
+      title: t('Your rules. Your creative freedom.'),
       desc: t(
-        'Manage channels, access tokens, usage and billing from one dashboard. Your infrastructure, your rules.'
+        'Channels, tokens, usage and billing in one dashboard. Give the system your rules and give your ideas your full attention.'
       ),
     },
   ]
@@ -121,16 +121,17 @@ export function CyberLanding(props: CyberLandingProps) {
           <div className='cyber-hero-copy'>
             <div className='cyber-kicker cyber-hero-entry'>
               <span className='cyber-signal' aria-hidden />
-              {t('AI Application Infrastructure Foundation')}
+              {t('A launchpad for AI imagination')}
             </div>
             <h1 id='cyber-hero-title' className='cyber-hero-entry'>
-              {t('Connect intelligence.')}
-              <br />
-              <span>{t('Build the future.')}</span>
+              {t('Let imagination')} <br />
+              <span className='cyber-title-accent'>
+                {t('break new dimensions.')}
+              </span>
             </h1>
             <p className='cyber-hero-description cyber-hero-entry'>
               {t(
-                'One entry point for your AI universe. Connect models, route requests and turn ideas into applications.'
+                'From a spark in your mind to a moment on screen. Connect models, awaken creativity and give every idea a way to shine.'
               )}
             </p>
             <div className='cyber-hero-actions cyber-hero-entry'>
@@ -153,10 +154,6 @@ export function CyberLanding(props: CyberLandingProps) {
                 <Braces aria-hidden />
                 {t('Explore the API')}
               </Button>
-            </div>
-            <div className='cyber-hero-footnote cyber-hero-entry'>
-              <Command size={14} aria-hidden />
-              <span>{t('Open source. Built for your stack.')}</span>
             </div>
           </div>
 
@@ -327,14 +324,15 @@ export function CyberLanding(props: CyberLandingProps) {
               {t('The control layer')}
             </span>
             <h2 id='cyber-capabilities-title'>
-              {t('Less complexity.')}
-              <br />
-              <span>{t('More possibility.')}</span>
+              {t('Less friction.')} <br />
+              <span className='cyber-title-accent'>
+                {t('More room to create.')}
+              </span>
             </h2>
           </div>
           <p>
             {t(
-              'Everything between your application and AI, connected in one place.'
+              'Keep the complexity behind the scenes. Put your next creation in the spotlight.'
             )}
           </p>
         </AnimateInView>
@@ -343,24 +341,36 @@ export function CyberLanding(props: CyberLandingProps) {
             <AnimateInView
               key={capability.code}
               delay={index * 90}
-              className='cyber-capability'
+              className='cyber-capability-reveal'
             >
-              <div className='cyber-capability-top'>
-                <capability.icon strokeWidth={1.3} size={28} aria-hidden />
-                <span>{capability.code}</span>
-              </div>
-              <div
-                className={`cyber-capability-art cyber-capability-art-${capability.code}`}
-                aria-hidden
+              <article
+                className={`cyber-capability cyber-capability-${capability.code}`}
+                aria-labelledby={`cyber-capability-title-${capability.code}`}
               >
-                <span />
-                <span />
-                <span />
-                <span />
-                <span />
-              </div>
-              <h3>{capability.title}</h3>
-              <p>{capability.desc}</p>
+                <div
+                  className='auto-group-flow-border cyber-capability-border'
+                  aria-hidden
+                />
+                <div className='cyber-capability-scan' aria-hidden />
+                <div className='cyber-capability-top'>
+                  <capability.icon strokeWidth={1.3} size={28} aria-hidden />
+                  <span>{capability.code}</span>
+                </div>
+                <div
+                  className={`cyber-capability-art cyber-capability-art-${capability.code}`}
+                  aria-hidden
+                >
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                </div>
+                <h3 id={`cyber-capability-title-${capability.code}`}>
+                  {capability.title}
+                </h3>
+                <p>{capability.desc}</p>
+              </article>
             </AnimateInView>
           ))}
         </div>
@@ -378,9 +388,10 @@ export function CyberLanding(props: CyberLandingProps) {
               {t('Made for developers')}
             </span>
             <h2 id='cyber-protocol-title'>
-              {t('Your protocol.')}
-              <br />
-              <span>{t('Your next breakthrough.')}</span>
+              {t('Familiar code.')} <br />
+              <span className='cyber-title-accent'>
+                {t('Unfamiliar possibilities.')}
+              </span>
             </h2>
             <p>
               {t(
@@ -459,10 +470,12 @@ export function CyberLanding(props: CyberLandingProps) {
           <div className='cyber-cta-grid' aria-hidden />
           <div className='cyber-cta-copy'>
             <span className='cyber-kicker'>
-              {t('The next chapter starts here')}
+              {t('Your next idea deserves a debut')}
             </span>
-            <h2>{t('Bring your ideas online.')}</h2>
-            <p>{t('Connect your stack to the intelligence it deserves.')}</p>
+            <h2 className='cyber-title-accent'>
+              {t('Give your imagination a stage.')}
+            </h2>
+            <p>{t('From a passing thought to something worth sharing.')}</p>
           </div>
           <Button
             size='lg'

@@ -76,6 +76,24 @@ describe('cyber landing interactions', () => {
     expect(screen.getByRole('main')).toHaveAttribute('data-motion', 'paused')
     const resume = screen.getByRole('button', { name: 'Resume animations' })
     expect(resume).toHaveAttribute('aria-pressed', 'true')
+    expect(
+      screen.getByRole('heading', {
+        level: 1,
+        name: 'Let imagination break new dimensions.',
+      })
+    ).toBeVisible()
+    expect(
+      screen.queryByText('Open source. Built for your stack.')
+    ).not.toBeInTheDocument()
+    for (const title of [
+      'Connect a universe of models.',
+      'Make imagination visible.',
+      'Your rules. Your creative freedom.',
+    ]) {
+      const card = screen.getByRole('article', { name: title })
+      expect(card).toBeVisible()
+      expect(card.querySelector('p')).toBeVisible()
+    }
     await user.keyboard('{Enter}')
     expect(screen.getByRole('main')).toHaveAttribute('data-motion', 'running')
     expect(

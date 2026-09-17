@@ -1,0 +1,27 @@
+When Cursor auto-generates a Git commit message for this repository:
+
+- Write the message in Simplified Chinese (简体中文)
+- Use Conventional Commits format:
+  - feat: 新功能
+  - fix: 修复
+  - docs: 文档
+  - style: 格式
+  - refactor: 重构
+  - test: 测试
+  - chore: 构建/工具
+- Keep the subject line concise; add a body only when needed
+
+# Fork 发行版（JasonWangJie/sub2api）
+
+本仓库是可一键安装的软件发行版 Fork。完整强制约定：
+
+- `.cursor/rules/fork-release-deploy.mdc`（alwaysApply）
+- `deploy/FORK_RELEASE.md`
+
+摘要：
+
+- 仓库身份恒为 `JasonWangJie/sub2api`，不要改回 `Wei-Shaw/sub2api`
+- 保留原 `deploy/install.sh`、systemd、GoReleaser 结构；用户只 `curl | bash`
+- 必须保留 `deploy/upgrade.sh`；配置目录 `/etc/sub2api`（`DATA_DIR`）
+- tag Release 默认完整二进制；禁止静默 SIMPLE_RELEASE
+- 合并 `upstream` 时不得用上游版本覆盖上述 Fork 身份；冲突后按 `deploy/FORK_RELEASE.md` 检查清单自检

@@ -171,14 +171,6 @@ For commercial licensing, please contact support@quantumnous.com
   background: #182722;
   border-color: #8da584;
 }
-.cyber-hero-footnote {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin-top: 23px;
-  font-size: 11px;
-  color: #8c9b92;
-}
 .cyber-hero-entry {
   animation: cyber-enter 0.8s both;
 }
@@ -191,8 +183,39 @@ For commercial licensing, please contact support@quantumnous.com
 .cyber-hero-actions {
   animation-delay: 0.24s;
 }
-.cyber-hero-footnote {
-  animation-delay: 0.3s;
+.cyber-landing .cyber-title-accent {
+  position: relative;
+  color: var(--cyber-acid);
+  background-image: linear-gradient(
+    110deg,
+    #c4f76a 15%,
+    #66e5d5 40%,
+    #e8ffc5 55%,
+    #c4f76a 80%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  animation: cyber-title-flow 9s ease-in-out infinite;
+}
+@supports (background-clip: text) {
+  .cyber-landing .cyber-title-accent {
+    color: transparent;
+  }
+}
+.cyber-hero .cyber-title-accent::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: -12px;
+  width: 32%;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--cyber-cyan),
+    transparent
+  );
+  animation: cyber-title-signal 8s ease-in-out infinite;
 }
 .cyber-network {
   position: relative;
@@ -536,25 +559,97 @@ For commercial licensing, please contact support@quantumnous.com
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
 }
+.cyber-capability-reveal {
+  min-width: 0;
+}
 .cyber-capability {
+  --capability-glow: var(--cyber-acid);
+  --primary: var(--capability-glow);
+  position: relative;
+  isolation: isolate;
+  height: 100%;
   padding: 28px;
-  background: linear-gradient(140deg, #15201b80, #0a100d);
+  background:
+    radial-gradient(
+      ellipse at 50% 30%,
+      color-mix(in srgb, var(--capability-glow) 6%, transparent),
+      transparent 70%
+    ),
+    linear-gradient(140deg, #15201b80, #0a100d);
   border: 1px solid var(--cyber-line);
   border-radius: 8px;
   overflow: hidden;
   transition:
+    transform 0.3s,
     border-color 0.25s,
     box-shadow 0.25s;
 }
+.cyber-capability-02 {
+  --capability-glow: var(--cyber-cyan);
+}
+.cyber-capability-03 {
+  --capability-glow: #a6b5ff;
+}
+.cyber-capability-border {
+  position: absolute;
+  inset: -1px;
+  pointer-events: none;
+  animation-duration: 6s;
+  opacity: 0.65;
+}
+.cyber-capability-02 .cyber-capability-border {
+  animation-delay: -2s;
+}
+.cyber-capability-03 .cyber-capability-border {
+  animation-delay: -4s;
+}
+.cyber-capability::after {
+  content: '';
+  position: absolute;
+  inset: 12px;
+  pointer-events: none;
+  background:
+    linear-gradient(var(--capability-glow), var(--capability-glow)) top left /
+      12px 1px,
+    linear-gradient(var(--capability-glow), var(--capability-glow)) top left /
+      1px 12px,
+    linear-gradient(var(--capability-glow), var(--capability-glow)) bottom right
+      / 12px 1px,
+    linear-gradient(var(--capability-glow), var(--capability-glow)) bottom right
+      / 1px 12px;
+  background-repeat: no-repeat;
+  opacity: 0.35;
+}
+.cyber-capability-scan {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 80px;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(
+    transparent,
+    color-mix(in srgb, var(--capability-glow) 5%, transparent) 96%,
+    color-mix(in srgb, var(--capability-glow) 20%, transparent)
+  );
+  animation: cyber-card-scan 10s linear infinite;
+}
+.cyber-capability-02 .cyber-capability-scan {
+  animation-delay: -3s;
+}
+.cyber-capability-03 .cyber-capability-scan {
+  animation-delay: -6s;
+}
 .cyber-capability:hover {
-  border-color: #789854;
-  box-shadow: 0 8px 40px #c4f76a08;
+  transform: translateY(-5px);
+  border-color: color-mix(in srgb, var(--capability-glow) 55%, #324437);
+  box-shadow: 0 16px 42px
+    color-mix(in srgb, var(--capability-glow) 7%, transparent);
 }
 .cyber-capability-top {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  color: var(--cyber-acid);
+  color: var(--capability-glow);
 }
 .cyber-capability-top > span {
   color: #849786;
@@ -566,6 +661,7 @@ For commercial licensing, please contact support@quantumnous.com
   letter-spacing: -0.025em;
   font-weight: 500;
   margin-bottom: 12px;
+  text-wrap: balance;
 }
 .cyber-capability p {
   font-size: 12px;
@@ -596,6 +692,21 @@ For commercial licensing, please contact support@quantumnous.com
   border-radius: 5px;
   background: #21321b;
   transform: rotate(45deg);
+  animation: cyber-model-pulse 4s ease-in-out infinite;
+}
+.cyber-capability-art-01::after {
+  content: '';
+  position: absolute;
+  height: 1px;
+  width: 100%;
+  z-index: -1;
+  background: linear-gradient(90deg, transparent, #c4f76a70, transparent);
+}
+.cyber-capability-art-01 span:nth-child(2n) {
+  animation-delay: -1.3s;
+}
+.cyber-capability-art-01 span:nth-child(3) {
+  animation-delay: -2.6s;
 }
 .cyber-capability-art-01 span + span {
   margin-left: 17px;
@@ -615,6 +726,13 @@ For commercial licensing, please contact support@quantumnous.com
   border: 1px solid #66e5d580;
   background: #66e5d510;
   border-radius: 3px;
+  animation: cyber-spectrum 2.6s ease-in-out infinite alternate;
+}
+.cyber-capability-art-02 span:nth-child(2n) {
+  animation-delay: -1.7s;
+}
+.cyber-capability-art-02 span:nth-child(3) {
+  animation-delay: -0.8s;
 }
 .cyber-capability-art-02 span:nth-child(2n) {
   height: 54px;
@@ -627,28 +745,40 @@ For commercial licensing, please contact support@quantumnous.com
   position: absolute;
   width: 74px;
   height: 74px;
-  border: 1px solid #c4f76a60;
+  border: 1px solid #a6b5ff80;
   border-radius: 17px;
   transform: rotate(45deg);
+  animation: cyber-control-ring 18s linear infinite;
 }
 .cyber-capability-art-03 span:nth-child(2) {
   width: 56px;
   height: 56px;
-  border-color: #c4f76a40;
+  border-color: #a6b5ff60;
+  animation-duration: 14s;
+  animation-direction: reverse;
 }
 .cyber-capability-art-03 span:nth-child(3) {
   width: 38px;
   height: 38px;
-  border-color: #c4f76a40;
+  border-color: #a6b5ff90;
+  animation-duration: 10s;
 }
 .cyber-capability-art-03 span:nth-child(4) {
   width: 16px;
   height: 16px;
-  background: var(--cyber-acid);
+  background: var(--capability-glow);
   border-radius: 4px;
+  animation: cyber-model-pulse 4s ease-in-out infinite;
 }
 .cyber-capability-art-03 span:nth-child(5) {
-  display: none;
+  width: 5px;
+  height: 5px;
+  border: 0;
+  background: var(--capability-glow);
+  border-radius: 50%;
+  box-shadow: 0 0 12px #a6b5ff90;
+  transform: rotate(45deg) translateX(48px);
+  animation: cyber-control-satellite 12s linear infinite;
 }
 .cyber-protocol-section {
   background: #0d1411;
@@ -846,7 +976,17 @@ For commercial licensing, please contact support@quantumnous.com
   color: var(--cyber-acid);
 }
 .cyber-landing[data-motion='paused']
-  :is(.cyber-hero-entry, .cyber-data-line, .cyber-orbit, .cyber-core-bars i) {
+  :is(
+    .cyber-hero-entry,
+    .cyber-data-line,
+    .cyber-orbit,
+    .cyber-core-bars i,
+    .cyber-title-accent,
+    .cyber-capability-border,
+    .cyber-capability-scan,
+    .cyber-capability-art span
+  ),
+.cyber-landing[data-motion='paused'] .cyber-title-accent::after {
   animation-play-state: paused;
 }
 .cyber-landing[data-motion='paused'] .cyber-hero-entry {
@@ -883,6 +1023,65 @@ For commercial licensing, please contact support@quantumnous.com
   to {
     transform: scaleY(1.4);
     opacity: 1;
+  }
+}
+@keyframes cyber-title-flow {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+@keyframes cyber-title-signal {
+  0%,
+  100% {
+    transform: translateX(0);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translateX(200%);
+    opacity: 0.8;
+  }
+}
+@keyframes cyber-card-scan {
+  from {
+    transform: translateY(-80px);
+  }
+  to {
+    transform: translateY(450px);
+  }
+}
+@keyframes cyber-model-pulse {
+  0%,
+  100% {
+    transform: rotate(45deg) scale(0.88);
+    opacity: 0.5;
+  }
+  50% {
+    transform: rotate(45deg) scale(1.06);
+    opacity: 1;
+  }
+}
+@keyframes cyber-spectrum {
+  from {
+    transform: scaleY(0.45);
+    opacity: 0.45;
+  }
+  to {
+    transform: scaleY(1.12);
+    opacity: 1;
+  }
+}
+@keyframes cyber-control-ring {
+  to {
+    transform: rotate(405deg);
+  }
+}
+@keyframes cyber-control-satellite {
+  to {
+    transform: rotate(405deg) translateX(48px);
   }
 }
 @media (min-width: 1600px) {
