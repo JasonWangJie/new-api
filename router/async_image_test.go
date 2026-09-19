@@ -3,7 +3,9 @@ package router
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/png"
@@ -30,14 +32,17 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -124,6 +129,29 @@ func (hook imageRedisTestHook) AfterProcessPipeline(context.Context, []redis.Cmd
 
 func imageRouterDatabase(t *testing.T, name string) *gorm.DB {
 	t.Helper()
+
+	if dsn := os.Getenv("ASYNC_IMAGE_TEST_MYSQL_DSN"); dsn != "" {
+		cfg, err := mysqlDriver.ParseDSN(dsn)
+		require.NoError(t, err)
+		require.True(t, strings.HasPrefix(cfg.DBName, "new_api_image_test_"))
+		cfg.DBName = ""
+		admin, err := sql.Open("mysql", cfg.FormatDSN())
+		require.NoError(t, err)
+		database := "new_api_image_test_" + strings.ToLower(common.GetUUID())
+		_, err = admin.ExecContext(t.Context(), "CREATE DATABASE `"+database+"` CHARACTER SET utf8mb4")
+		require.NoError(t, err)
+		cfg.DBName = database
+		db, err := gorm.Open(mysql.Open(cfg.FormatDSN()), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			connection, _ := db.DB()
+			_ = connection.Close()
+			_, err := admin.ExecContext(context.Background(), "DROP DATABASE `"+database+"`")
+			assert.NoError(t, err)
+			_ = admin.Close()
+		})
+		return db
+	}
 	dsn := os.Getenv("ASYNC_IMAGE_TEST_PG_DSN")
 	if dsn == "" {
 		db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), name+".db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -189,6 +217,9 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	model.LOG_DB = imageRouterDatabase(t, "logs")
 	imageLogs := model.LOG_DB
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	if os.Getenv("ASYNC_IMAGE_TEST_MYSQL_DSN") != "" {
+		common.SetDatabaseTypes(common.DatabaseTypeMySQL, common.DatabaseTypeMySQL)
+	}
 	if os.Getenv("ASYNC_IMAGE_TEST_PG_DSN") != "" {
 		common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
 	}
@@ -355,6 +386,8 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	require.NoError(t, model.DB.Create(&geminiPolicy).Error)
 	geminiChannel := channel
 	geminiChannel.Id, geminiChannel.Type = 0, constant.ChannelTypeGemini
+	geminiMapping := `{"image-model":"gemini-2.5-flash-image"}`
+	geminiChannel.ModelMapping = &geminiMapping
 	require.NoError(t, model.DB.Create(&geminiChannel).Error)
 	require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "image-model", ChannelId: geminiChannel.Id, Enabled: true}).Error)
 	assert.Equal(t, 403, request("POST", "/v1/uploads/images_sc", "{}", "disabled-upload", token.Key).Code)
@@ -540,7 +573,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		assert.Equal(t, 990000, user.Quota, "ambiguous generation does not invent a local debit")
 		// Gemini uses its native protocol and the same durable settlement chain.
 		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", geminiChannel.Id).Update("base_url", upstream.URL).Error)
-		expectedPath.Store("/v1beta/models/image-model:generateContent")
+		expectedPath.Store("/v1beta/models/gemini-2.5-flash-image:generateContent")
 		inline := map[string]any{"inlineData": map[string]string{"mimeType": "image/png", "data": base64.StdEncoding.EncodeToString(valid.Data)}}
 		geminiResponse, err := common.Marshal(map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"role": "model", "parts": []any{inline, inline}}}}, "usageMetadata": map[string]int{"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30}})
 		require.NoError(t, err)
@@ -619,6 +652,198 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&token).Error)
 		assert.Equal(t, 969820, user.Quota)
 		assert.Equal(t, 969820, token.RemainQuota)
+	})
+
+	t.Run("async-video-local-recovery-and-range", func(t *testing.T) {
+		require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
+		previousSubmit, previousPersist, previousAdaptor := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc
+		service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = controller.ExecuteAsyncVideo, controller.PersistAsyncVideo
+		service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
+		t.Cleanup(func() {
+			service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc = previousSubmit, previousPersist, previousAdaptor
+		})
+		originalFetch := *system_setting.GetFetchSetting()
+		system_setting.GetFetchSetting().AllowPrivateIp = true
+		system_setting.GetFetchSetting().AllowedPorts = []string{"1-65535"}
+		t.Cleanup(func() { *system_setting.GetFetchSetting() = originalFetch })
+		oldSecret := common.CryptoSecret
+		common.CryptoSecret = "video-end-to-end-signing-secret"
+		t.Cleanup(func() { common.CryptoSecret = oldSecret })
+		mediaCfg := service.DefaultMediaRuntimeConfig()
+		mediaCfg.VideoAsyncEnabled, mediaCfg.LocalPath, mediaCfg.MaxFileBytes = true, t.TempDir(), 4096
+		require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), mediaCfg))
+		box := func(kind string, payload []byte) []byte {
+			result := make([]byte, 8+len(payload))
+			binary.BigEndian.PutUint32(result, uint32(len(result)))
+			copy(result[4:8], kind)
+			copy(result[8:], payload)
+			return result
+		}
+		handler := make([]byte, 25)
+		copy(handler[8:12], "vide")
+		video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
+		video = append(video, box("moov", box("trak", box("mdia", box("hdlr", handler))))...)
+		video = append(video, box("mdat", []byte("local-video-sample"))...)
+		var submits, downloads atomic.Int32
+		upper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer frozen-video-key", r.Header.Get("Authorization"))
+			switch {
+			case r.Method == "POST" && r.URL.Path == "/v1/videos":
+				submits.Add(1)
+				var sent map[string]any
+				if !assert.NoError(t, common.DecodeJson(r.Body, &sent)) {
+					w.WriteHeader(400)
+					return
+				}
+				assert.Equal(t, "sora-2", sent["model"])
+				assert.NotContains(t, sent, "provider")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"upstream-video","status":"queued","model":"sora-2"}`))
+			case r.URL.Path == "/v1/videos/upstream-video":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"upstream-video","status":"completed","model":"sora-2"}`))
+			case r.URL.Path == "/v1/videos/upstream-video/content":
+				if downloads.Add(1) == 1 {
+					_, _ = w.Write([]byte("<html>temporary download failure</html>"))
+					return
+				}
+				w.Header().Set("Content-Type", "video/mp4")
+				_, _ = w.Write(video)
+			default:
+				w.WriteHeader(404)
+			}
+		}))
+		defer upper.Close()
+		base, setting := upper.URL, `{"task_plugin_key":"sora"}`
+		videoChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "frozen-video-key", BaseURL: &base, Setting: &setting, Status: common.ChannelStatusEnabled, Models: "sora-2", Group: "default"}
+		require.NoError(t, model.DB.Create(&videoChannel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "sora-2", ChannelId: videoChannel.Id, Enabled: true}).Error)
+		originalPrices := ratio_setting.GetModelPriceCopy()
+		originalPriceJSON, err := common.Marshal(originalPrices)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = ratio_setting.UpdateModelPriceByJSONString(string(originalPriceJSON))
+		})
+		originalPrices["sora-2"] = 0.001
+		encoded, err := common.Marshal(originalPrices)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+		videoBody := `{"model":"sora-2","provider":"sora","prompt":"a river","seconds":4,"size":"1280x720"}`
+		response := request("POST", "/v1/videos/generations_async", videoBody, "video-local-1", token.Key)
+		require.Equal(t, 202, response.Code, response.Body.String())
+		require.Zero(t, submits.Load(), "HTTP admission must not wait for generation")
+		var accepted struct {
+			TaskId string `json:"task_id"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &accepted))
+		assert.Equal(t, 202, request("POST", "/v1/videos/generations_async", videoBody, "video-local-1", token.Key).Code)
+		assert.Equal(t, 409, request("POST", "/v1/videos/generations_async", videoBody+" ", "video-local-1", token.Key).Code)
+		assert.Equal(t, 404, request("GET", "/v1/media/tasks_async/"+accepted.TaskId, "", "", other.Key).Code)
+		multipartTaskID := ""
+		for range 2 {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			for _, field := range [][2]string{{"model", "sora-2"}, {"provider", "sora"}, {"prompt", "a river"}, {"seconds", "4"}, {"size", "1280x720"}} {
+				require.NoError(t, writer.WriteField(field[0], field[1]))
+			}
+			require.NoError(t, writer.Close())
+			req := httptest.NewRequest("POST", "/v1/videos/generations_async", &body)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			req.Header.Set("Idempotency-Key", "multipart-video-replay")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, req)
+			require.Equal(t, 202, response.Code, response.Body.String())
+			var replay struct {
+				TaskID string `json:"task_id"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &replay))
+			if multipartTaskID == "" {
+				multipartTaskID = replay.TaskID
+			} else {
+				assert.Equal(t, multipartTaskID, replay.TaskID, "multipart boundary changes do not create a new task")
+			}
+		}
+		var job model.AsyncMediaJob
+		require.NoError(t, model.DB.Where("task_id = ?", accepted.TaskId).Take(&job).Error)
+		frozenRequest, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+		require.NoError(t, err)
+		var frozen service.AsyncVideoRequest
+		require.NoError(t, common.Unmarshal(frozenRequest, &frozen))
+		originalPrices["sora-2"] = 10
+		encoded, err = common.Marshal(originalPrices)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+		run := func() error {
+			require.NoError(t, model.DB.Model(&job).Update("next_attempt_at", 0).Error)
+			job = model.AsyncMediaJob{}
+			require.NoError(t, model.DB.Where("task_id = ?", accepted.TaskId).Take(&job).Error)
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 30)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			return service.ProcessAsyncMediaJob(t.Context(), job, mediaCfg)
+		}
+		require.NoError(t, run())
+		assert.EqualValues(t, 1, submits.Load())
+		var generated model.Task
+		require.NoError(t, model.DB.Where("task_id = ?", accepted.TaskId).Take(&generated).Error)
+		require.NotEmpty(t, generated.GetUpstreamTaskID())
+		assert.Equal(t, frozen.Billing.Price.Quota, generated.Quota, "admission freezes the price before a later price change")
+		// Changing live credentials cannot redirect a task already submitted.
+		require.NoError(t, model.DB.Delete(&videoChannel).Error)
+		tasks := map[string]*model.Task{generated.GetUpstreamTaskID(): &generated}
+		require.NoError(t, service.UpdateVideoTasks(t.Context(), generated.Platform, map[int][]string{videoChannel.Id: {generated.GetUpstreamTaskID()}}, tasks))
+		generated = model.Task{}
+		require.NoError(t, model.DB.Where("task_id = ?", accepted.TaskId).Take(&generated).Error)
+		require.EqualValues(t, model.TaskStatusSuccess, generated.Status)
+		var wallet model.User
+		var chargedToken model.Token
+		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&wallet).Error)
+		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&chargedToken).Error)
+		quota, remaining := wallet.Quota, chargedToken.RemainQuota
+		require.Error(t, run(), "damaged content must not be published")
+		pending := request("GET", "/v1/media/tasks_async/"+accepted.TaskId, "", "", token.Key)
+		assert.Contains(t, pending.Body.String(), `"storage_status":"failed"`)
+		require.NoError(t, run())
+		assert.EqualValues(t, 1, submits.Load(), "storage retry must not submit a new generation")
+		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&wallet).Error)
+		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&chargedToken).Error)
+		assert.Equal(t, quota, wallet.Quota)
+		assert.Equal(t, remaining, chargedToken.RemainQuota)
+		upper.Close()
+		complete := request("GET", "/v1/media/tasks_async/"+accepted.TaskId, "", "", token.Key)
+		require.Equal(t, 200, complete.Code, complete.Body.String())
+		var result struct {
+			Status string `json:"status"`
+			Data   []struct {
+				URL string `json:"url"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(complete.Body.Bytes(), &result))
+		require.Equal(t, "succeeded", result.Status)
+		require.Len(t, result.Data, 1)
+		parsed, err := url.Parse(result.Data[0].URL)
+		require.NoError(t, err)
+		local := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", parsed.RequestURI(), nil)
+		req.Header.Set("Range", "bytes=8-15")
+		engine.ServeHTTP(local, req)
+		require.Equal(t, 206, local.Code, local.Body.String())
+		assert.Equal(t, video[8:16], local.Body.Bytes())
+		head := request("HEAD", parsed.RequestURI(), "", "", "")
+		assert.Equal(t, 200, head.Code)
+		assert.Empty(t, head.Body.Bytes())
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"expired_time": time.Now().Unix() - 1}).Error)
+		assert.Equal(t, 404, request("GET", parsed.RequestURI(), "", "", "").Code)
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"expired_time": -1, "allow_ips": "127.0.0.1"}).Error)
+		assert.Equal(t, 404, request("GET", parsed.RequestURI(), "", "", "").Code)
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("allow_ips", nil).Error)
+		mediaCfg.VideoAsyncEnabled = false
+		require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), mediaCfg))
+		assert.Equal(t, 202, request("POST", "/v1/videos/generations_async", videoBody, "video-local-1", token.Key).Code, "replay does not depend on a deleted channel")
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusDisabled).Error)
+		assert.Equal(t, 404, request("GET", parsed.RequestURI(), "", "", "").Code)
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusEnabled).Error)
 	})
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("status", common.UserStatusDisabled).Error)
 	assert.Equal(t, 401, request("GET", "/v1/images/tasks_async/"+payload.TaskId, "", "", token.Key).Code)

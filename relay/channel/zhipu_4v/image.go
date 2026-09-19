@@ -52,6 +52,7 @@ type openAIImagePayload struct {
 
 type openAIImageData struct {
 	B64Json string `json:"b64_json"`
+	URL     string `json:"url,omitempty"`
 }
 
 func zhipu4vImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
@@ -97,6 +98,10 @@ func zhipu4vImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		case data.B64Image != "":
 			b64 = data.B64Image
 		default:
+			if c.GetBool("async_image_execution") {
+				payload.Data = append(payload.Data, openAIImageData{URL: url})
+				continue
+			}
 			_, downloaded, err := service.GetImageFromUrl(url)
 			if err != nil {
 				logger.LogError(c, "zhipu_image_get_b64_failed: "+err.Error())

@@ -140,3 +140,7 @@ func (a *Adaptor) GetModelList() []string {
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"grok-2-image*", "grok-imagine-image*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "xai", Protocol: "openai_images", Generate: true, Edit: false}
+}

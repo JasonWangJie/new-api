@@ -47,7 +47,7 @@ const options = {
   background: 'opaque',
 }
 describe('capability-driven image request contracts', () => {
-  it('provides legal standalone JSON and curl examples for all seven public paths', () => {
+  it('documents every asynchronous media path with valid standalone examples', () => {
     for (const chinese of [true, false]) {
       const examples = asyncImageGuide(
         chinese,
@@ -62,10 +62,20 @@ describe('capability-driven image request contracts', () => {
         if (body) expect(() => JSON.parse(body)).not.toThrow()
       }
       for (const [, path] of ASYNC_IMAGE_ENDPOINTS) {
-        expect(examples.join('\n')).toContain(
-          path.replace('{task_id}', 'YOUR_TASK_ID')
-        )
+        const examplePath = path
+          .replace('{task_id}', 'YOUR_TASK_ID')
+          .replace('{object_id}', 'YOUR_OBJECT_ID')
+        expect(examples.join('\n')).toContain(examplePath)
       }
+      const video = examples
+        .filter((example) => example.startsWith('{'))
+        .map((example) => JSON.parse(example))
+        .find((example) => example.media_type === 'video')
+      expect(video).toMatchObject({
+        protocol: 'openai_video',
+        storage_status: 'succeeded',
+        data: [{ content_type: 'video/mp4', url: expect.any(String) }],
+      })
       const failed = examples
         .filter((example) => example.startsWith('{'))
         .map((example) => JSON.parse(example))

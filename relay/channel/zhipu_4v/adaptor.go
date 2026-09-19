@@ -133,3 +133,7 @@ func (a *Adaptor) GetModelList() []string {
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"cogview*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "zhipu_v4", Protocol: "openai_images", Generate: true, Edit: false}
+}

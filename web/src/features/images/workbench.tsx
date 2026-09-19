@@ -28,6 +28,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
 import { useAuthStore } from '@/stores/auth-store'
@@ -50,6 +51,7 @@ import {
 } from './lib/image-request'
 import { imageChecksum, saveLocalImage } from './lib/local-images'
 import type { ImageMetadata } from './types'
+import { VideoWorkbench } from './video-workbench'
 
 type ReferencePart = { id: string; type: 'text' | 'image'; value: string }
 type SubmissionSnapshot = {
@@ -62,7 +64,23 @@ type SubmissionSnapshot = {
 
 export function ImageWorkbench() {
   const userId = useAuthStore((state) => state.auth.user?.id)
-  return userId ? <WorkbenchSession key={userId} userId={userId} /> : null
+  const { t } = useTranslation()
+  const [media, setMedia] = useState('image')
+  return userId ? (
+    <div className='space-y-4'>
+      <Tabs value={media} onValueChange={(value) => setMedia(String(value))}>
+        <TabsList>
+          <TabsTrigger value='image'>{t('Image')}</TabsTrigger>
+          <TabsTrigger value='video'>{t('Video')}</TabsTrigger>
+        </TabsList>
+      </Tabs>
+      {media === 'image' ? (
+        <WorkbenchSession key={userId} userId={userId} />
+      ) : (
+        <VideoWorkbench key={userId} userId={userId} />
+      )}
+    </div>
+  ) : null
 }
 
 function WorkbenchSession({ userId }: { userId: number }) {
@@ -133,7 +151,9 @@ function WorkbenchSession({ userId }: { userId: number }) {
       userId,
       taskId,
       (task.data?.results || [])
-        .map((result) => `${result.image_index}:${result.url || result.view_url}`)
+        .map(
+          (result) => `${result.image_index}:${result.url || result.view_url}`
+        )
         .join('|'),
     ],
     queryFn: async ({ signal }) =>

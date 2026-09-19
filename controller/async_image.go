@@ -119,6 +119,42 @@ func SubmitAsyncImage(c *gin.Context) {
 		return
 	}
 	task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: token.UserId, TokenId: token.Id, Group: policy.Group, Platform: request.Platform, Dialect: request.Dialect, Model: request.Model, RequestType: request.Kind, SourcePath: request.SourcePath, RequestedSize: request.Size, RequestedResolution: request.Resolution, AspectRatio: request.AspectRatio, RequestHash: fingerprint, ExpiresAt: time.Now().Unix() + int64(cfg.TaskRetentionDays)*86400}
+	if request.Dialect == "async" {
+		request.PolicyPlatform = policy.Platform
+		request.ClientIP = c.ClientIP()
+		selected, _, err := service.PickImageChannel(ctx, policy, request, service.ImageAccountRouting{})
+		if err != nil {
+			AsyncImagePublicError(c, 503, "channel_unavailable", err.Error())
+			return
+		}
+		capability := service.ImageChannelCapability(*selected, request.Model)
+		task.Provider, task.ExecutionProtocol, task.ChannelId = capability.Provider, capability.Protocol, selected.Id
+		request.Provider = capability.Provider
+		if capability.Protocol == "gemini_native" {
+			request.Platform = "gemini"
+		} else {
+			request.Platform = "openai"
+		}
+		channelData, err := common.Marshal(selected)
+		if err == nil {
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelData, "image-channel:"+task.TaskId)
+		}
+		if err != nil {
+			AsyncImagePublicError(c, 503, "encryption_unavailable", "Image channel could not be frozen")
+			return
+		}
+		if service.FreezeAsyncImageBillingFunc == nil {
+			AsyncImagePublicError(c, 503, "pricing_unavailable", "Image pricing is unavailable")
+			return
+		}
+		billing, err := service.FreezeAsyncImageBillingFunc(ctx, token, request, task.Group, selected)
+		if err != nil {
+			AsyncImagePublicError(c, 400, "pricing_unavailable", err.Error())
+			return
+		}
+		request.Billing = &billing
+		task.Platform = request.Platform
+	}
 	if urls := request.ReferenceURLs(); len(urls) > 0 {
 		preview, err := common.Marshal(urls)
 		if err != nil {
@@ -155,6 +191,9 @@ func SubmitAsyncImage(c *gin.Context) {
 
 func respondAsyncImageAccepted(c *gin.Context, task model.AsyncImageTask, reused bool) {
 	queryURL := AsyncImageGatewayBase() + "/v1/images/tasks_async/" + url.PathEscape(task.TaskId)
+	if task.Dialect == "async" {
+		queryURL = AsyncImageGatewayBase() + "/v1/media/tasks_async/" + url.PathEscape(task.TaskId)
+	}
 	c.Header("Cache-Control", "no-store")
 	c.Header("Location", queryURL)
 	c.Header("Retry-After", "3")
@@ -188,6 +227,17 @@ func QueryAsyncImage(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "no-store")
 	response := gin.H{"task_id": task.TaskId}
+	if strings.Contains(c.Request.URL.Path, "/media/") {
+		response["media_type"], response["provider"], response["protocol"] = "image", task.Provider, task.ExecutionProtocol
+		response["stage"], response["progress"], response["billing_status"], response["quota"] = mediaStage(task.Status), task.Progress, task.BillingStatus, task.Quota
+		response["storage_status"] = "pending"
+		if task.ResultsAvailable() {
+			response["storage_status"] = "succeeded"
+		}
+		if task.Status == model.ImageTaskStorageFailed {
+			response["storage_status"] = "failed"
+		}
+	}
 	if task.ResultsAvailable() {
 		cfg, err := service.GetImageRuntimeConfig(ctx)
 		if err != nil {

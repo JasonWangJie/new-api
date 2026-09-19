@@ -43,17 +43,18 @@ import {
   imageTimelineLabel,
 } from '../lib/image-labels'
 import { terminalImageStatus } from '../lib/image-request'
+import { imageDetailHeaderClass } from '../lib/image-visuals'
 import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
 } from '../lib/task-presentation'
-import { imageDetailHeaderClass } from '../lib/image-visuals'
 import {
   ImagePlatformBadge,
   ImageRequestTypeBadge,
   ImageStatusBadge,
 } from './image-badges'
 import { ImageResults } from './image-results'
+import { VideoResults } from './video-results'
 
 function TaskDetailFields(props: {
   items: { label: string; value: ReactNode }[]
@@ -130,7 +131,11 @@ export function ImageTaskDetails(props: {
       props.userId,
       props.admin,
       props.id,
-      results.map((result) => `${result.image_index}:${result.url || result.view_url}`).join('|'),
+      results
+        .map(
+          (result) => `${result.image_index}:${result.url || result.view_url}`
+        )
+        .join('|'),
     ],
     queryFn: async ({ signal }) =>
       Promise.all(
@@ -152,7 +157,7 @@ export function ImageTaskDetails(props: {
           }
         })
       ),
-    enabled: results.length > 0,
+    enabled: results.length > 0 && task.data?.task.media_type !== 'video',
     staleTime: 60_000,
   })
   const archive = async (index: string) => {
@@ -185,13 +190,20 @@ export function ImageTaskDetails(props: {
     }
   }
   const attempts = props.admin ? data?.attempt_history || [] : []
+  const canResume = Boolean(
+    data?.can_resume && (props.canManage || !props.admin)
+  )
+  const canTerminate = Boolean(
+    data?.can_terminate &&
+    (props.canManage || (!props.admin && data.media_type === 'video'))
+  )
   return (
     <Dialog
       open
       onOpenChange={(open) => {
         if (!open) props.onClose()
       }}
-      title={t('Image task details')}
+      title={t('Media task details')}
       description={t(
         'Task timing, request specifications and generated results.'
       )}
@@ -223,9 +235,9 @@ export function ImageTaskDetails(props: {
                 <ImagePlatformBadge platform={data.platform} />
                 <ImageRequestTypeBadge requestType={data.request_type} />
               </div>
-              {props.canManage && (
+              {(canResume || canTerminate) && (
                 <div className='flex gap-2'>
-                  {data.can_resume && (
+                  {canResume && (
                     <Button
                       size='sm'
                       variant='outline'
@@ -234,7 +246,7 @@ export function ImageTaskDetails(props: {
                       {t('Resume')}
                     </Button>
                   )}
-                  {data.can_terminate && (
+                  {canTerminate && (
                     <Button
                       size='sm'
                       variant='destructive'
@@ -352,9 +364,12 @@ export function ImageTaskDetails(props: {
                 },
                 {
                   label: t('Actual cost'),
-                  value: ['succeeded', 'not_billable'].includes(
-                    data.billing_status
-                  ) ? (
+                  value: [
+                    'succeeded',
+                    'not_billable',
+                    'settled',
+                    'reserved',
+                  ].includes(data.billing_status) ? (
                     <span className='text-emerald-700 dark:text-emerald-400'>
                       {`US$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
                     </span>
@@ -568,7 +583,11 @@ export function ImageTaskDetails(props: {
             </DetailSection>
           )}
           <DetailSection
-            title={t('Generated images')}
+            title={t(
+              data.media_type === 'video'
+                ? 'Generated videos'
+                : 'Generated images'
+            )}
             accentClassName='border-l-4 border-l-emerald-500/70'
             action={
               <span className='text-muted-foreground text-xs'>
@@ -576,42 +595,51 @@ export function ImageTaskDetails(props: {
               </span>
             }
           >
-            {images.isLoading && (
+            {data.media_type === 'video' && (
+              <VideoResults
+                results={results}
+                onRefresh={() => {
+                  void task.refetch()
+                }}
+              />
+            )}
+            {data.media_type !== 'video' && images.isLoading && (
               <p role='status' className='text-muted-foreground text-sm'>
                 {t('Loading...')}
               </p>
             )}
-            {images.isError && (
+            {data.media_type !== 'video' && images.isError && (
               <p role='alert' className='text-destructive text-sm'>
                 {images.error.message}
               </p>
             )}
-            {images.data?.length ? (
-              <ImageResults
-                images={images.data}
-                previewMode='original'
-                actions={
-                  !props.admin
-                    ? (index) => (
-                        <Button
-                          size='sm'
-                          variant='outline'
-                          onClick={() => void archive(index)}
-                        >
-                          {t('Archive to server')}
-                        </Button>
-                      )
-                    : undefined
-                }
-              />
-            ) : (
-              !images.isLoading &&
-              !images.isError && (
-                <p className='text-muted-foreground text-sm'>
-                  {t('No generated images yet')}
-                </p>
-              )
-            )}
+            {data.media_type !== 'video' &&
+              (images.data?.length ? (
+                <ImageResults
+                  images={images.data}
+                  previewMode='original'
+                  actions={
+                    !props.admin
+                      ? (index) => (
+                          <Button
+                            size='sm'
+                            variant='outline'
+                            onClick={() => void archive(index)}
+                          >
+                            {t('Archive to server')}
+                          </Button>
+                        )
+                      : undefined
+                  }
+                />
+              ) : (
+                !images.isLoading &&
+                !images.isError && (
+                  <p className='text-muted-foreground text-sm'>
+                    {t('No generated images yet')}
+                  </p>
+                )
+              ))}
           </DetailSection>
           <DetailSection
             title={t('Stage timeline')}

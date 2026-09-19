@@ -231,6 +231,33 @@ func TestAsyncImageOutputAndTerminalCAS(t *testing.T) {
 	assert.ErrorIs(t, HeartbeatAsyncImageTask(context.Background(), crashed.TaskId, crashed.LeaseToken, 120), ErrImageConflict)
 }
 
+func TestRecoverAsyncImageTaskContinuesKnownUpstreamPolling(t *testing.T) {
+	db, task, _ := imageDatabaseFixture(t)
+	now := time.Now().Unix()
+	task.Id = 0
+	task.TaskId = "known-upstream-recovery"
+	task.StartedAt = now - 120
+	task.DispatchedAt = now - 120
+	task.UpstreamTaskId = "upstream-image-task"
+	task.LeaseExpiresAt = now - 1
+	require.NoError(t, db.Create(&task).Error)
+
+	require.NoError(t, RecoverAsyncImageTasks(context.Background(), 100, 60))
+
+	var recovered AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&recovered).Error)
+	assert.Equal(t, ImageTaskQueued, recovered.Status)
+	assert.Equal(t, task.UpstreamTaskId, recovered.UpstreamTaskId)
+	assert.Equal(t, task.RequestCipher, recovered.RequestCipher)
+	assert.Empty(t, recovered.LeaseToken)
+	assert.Zero(t, recovered.LeaseExpiresAt)
+	assert.Equal(t, now, recovered.NextAttemptAt)
+
+	var outbox ImageOutbox
+	require.NoError(t, db.Where("aggregate_id = ? AND kind = ?", task.TaskId, "execute").Take(&outbox).Error)
+	assert.Equal(t, "pending", outbox.Status)
+}
+
 func TestAsyncImageSubscriptionSettlement(t *testing.T) {
 	db, task, bill := imageDatabaseFixture(t)
 	plan := SubscriptionPlan{Title: "Image test plan"}

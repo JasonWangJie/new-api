@@ -77,7 +77,7 @@ export function AsyncImageGuide() {
           <article className='min-w-0 space-y-9 pb-8'>
             <header className='border-b pb-6'>
               <p className='text-muted-foreground mb-2 text-xs font-semibold tracking-widest'>
-                new-api · IMAGE API
+                new-api · IMAGE &amp; VIDEO API
               </p>
               <h1 className='font-serif text-3xl'>
                 {t('Async Image API Guide')}

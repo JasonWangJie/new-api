@@ -16,8 +16,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export type ImagePlatform = 'openai' | 'gemini'
+export type ImagePlatform = string
+export type VideoModel = {
+  id: string
+  label: string
+  provider: string
+  available: boolean
+  protocol: string
+  supported_parameters: string[]
+  max_duration_seconds: number
+}
 export type ImageModel = {
+  provider?: string
+  media_type?: 'image'
+  supports_edit?: boolean
+  supports_reference_generation?: boolean
+  supported_parameters?: string[]
   id: string
   label: string
   platform: ImagePlatform
@@ -39,6 +53,8 @@ export type ImageCapabilities = {
   capability_version: string
   gateway_base_url: string
   models: ImageModel[]
+  video_models?: VideoModel[]
+  image_providers?: string[]
   platforms: {
     platform: ImagePlatform
     mode: string
@@ -49,6 +65,10 @@ export type ImageCapabilities = {
   }[]
 }
 export type ImageTask = {
+  media_type?: 'image' | 'video'
+  provider?: string
+  stage?: string
+  storage_status?: string
   id: string
   task_id: string
   platform: ImagePlatform

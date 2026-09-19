@@ -33,6 +33,14 @@ type Adaptor interface {
 	ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error)
 }
 
+type ImageCapabilityProvider interface {
+	ImageCapability(model string) dto.ImageCapability
+}
+
+type AsyncImagePollingProvider interface {
+	PollImage(c *gin.Context, info *relaycommon.RelayInfo, taskId string) (*http.Response, error)
+}
+
 type TaskAdaptor interface {
 	Init(info *relaycommon.RelayInfo)
 

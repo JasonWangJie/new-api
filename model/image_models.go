@@ -28,21 +28,22 @@ var ErrImageConflict = errors.New("image operation conflict")
 // ImageGroupPolicy is separate from the legacy group and channel settings.
 // PolicyKey hashes the case-sensitive group/platform pair for portable indexes.
 type ImageGroupPolicy struct {
-	Id           int    `json:"id"`
-	PolicyKey    string `json:"-" gorm:"size:64;uniqueIndex"`
-	Group        string `json:"group" gorm:"size:255"`
-	Platform     string `json:"platform" gorm:"size:16"`
-	Enabled      bool   `json:"enabled"`
-	AsyncEnabled bool   `json:"async_enabled"`
-	PoolMode     string `json:"pool_mode" gorm:"size:32"`
-	Models       string `json:"models" gorm:"type:text"`
-	Version      int64  `json:"version"`
+	AsyncProvider string `json:"-" gorm:"-"`
+	Id            int    `json:"id"`
+	PolicyKey     string `json:"-" gorm:"size:64;uniqueIndex"`
+	Group         string `json:"group" gorm:"size:255"`
+	Platform      string `json:"platform" gorm:"size:32"`
+	Enabled       bool   `json:"enabled"`
+	AsyncEnabled  bool   `json:"async_enabled"`
+	PoolMode      string `json:"pool_mode" gorm:"size:32"`
+	Models        string `json:"models" gorm:"type:text"`
+	Version       int64  `json:"version"`
 }
 
 type TokenImagePlatformMapping struct {
 	Id       int    `json:"id"`
 	TokenId  int    `json:"token_id" gorm:"uniqueIndex:idx_image_token_platform,priority:1"`
-	Platform string `json:"platform" gorm:"size:16;uniqueIndex:idx_image_token_platform,priority:2"`
+	Platform string `json:"platform" gorm:"size:32;uniqueIndex:idx_image_token_platform,priority:2"`
 	Group    string `json:"group" gorm:"size:255"`
 }
 
@@ -50,7 +51,7 @@ type ImageChannelPool struct {
 	Id         int    `json:"id"`
 	BindingKey string `json:"binding_key" gorm:"size:64;uniqueIndex:idx_image_pool_channel,priority:1"`
 	Group      string `json:"group" gorm:"size:255"`
-	Platform   string `json:"platform" gorm:"size:16"`
+	Platform   string `json:"platform" gorm:"size:32"`
 	Mode       string `json:"mode" gorm:"size:32"`
 	Model      string `json:"model" gorm:"size:255"`
 	Resolution string `json:"resolution" gorm:"size:16"`
@@ -59,54 +60,58 @@ type ImageChannelPool struct {
 }
 
 type AsyncImageTask struct {
-	Id                   int    `json:"-"`
-	TaskId               string `json:"task_id" gorm:"size:64;uniqueIndex"`
-	UserId               int    `json:"user_id" gorm:"index:idx_image_user_created,priority:1"`
-	TokenId              int    `json:"api_key_id" gorm:"index"`
-	Group                string `json:"group" gorm:"size:255"`
-	Dialect              string `json:"dialect" gorm:"size:16"`
-	Platform             string `json:"platform" gorm:"size:16"`
-	RequestType          string `json:"request_type" gorm:"size:32"`
-	Model                string `json:"model" gorm:"size:255"`
-	SourcePath           string `json:"source_path" gorm:"size:255"`
-	Status               string `json:"status" gorm:"size:32;index:idx_image_status_due,priority:1"`
-	BillingStatus        string `json:"billing_status" gorm:"size:32"`
-	Version              int64  `json:"version"`
-	Progress             int    `json:"progress"`
-	RequestCipher        []byte `json:"-"`
-	RequestHash          string `json:"-" gorm:"size:64"`
-	PromptSummary        string `json:"prompt_summary" gorm:"type:text"`
-	ReferenceUrls        string `json:"-" gorm:"type:text"`
-	ChannelId            int    `json:"-" gorm:"index"`
-	Attempts             string `json:"-" gorm:"type:text"`
-	RequestedSize        string `json:"requested_size" gorm:"size:64"`
-	RequestedResolution  string `json:"requested_resolution" gorm:"size:16"`
-	AspectRatio          string `json:"aspect_ratio" gorm:"size:32"`
-	ActualSize           string `json:"actual_size" gorm:"size:255"`
-	ImageCount           int    `json:"image_count"`
-	ResultCount          int    `json:"result_count"`
-	Quota                int    `json:"quota"`
-	RetryCount           int    `json:"retry_count"`
-	StorageRetryCount    int    `json:"storage_retry_count"`
-	BillingRetryCount    int    `json:"billing_retry_count"`
-	ReferenceRetryCount  int    `json:"reference_retry_count"`
-	TransientRetryCount  int    `json:"transient_retry_count"`
-	CapacityRetryCount   int    `json:"capacity_retry_count"`
-	ErrorCode            string `json:"error_code" gorm:"size:64"`
-	ErrorMessage         string `json:"error_message" gorm:"type:text"`
-	PublicErrorCode      int    `json:"-"`
-	ReconciliationStatus string `json:"reconciliation_status" gorm:"size:32"`
-	LeaseToken           string `json:"-" gorm:"size:64"`
-	HeartbeatAt          int64  `json:"-" gorm:"type:bigint"`
-	LeaseExpiresAt       int64  `json:"-" gorm:"type:bigint"`
-	DispatchedAt         int64  `json:"-" gorm:"type:bigint"`
-	NextAttemptAt        int64  `json:"next_attempt_at" gorm:"type:bigint;index:idx_image_status_due,priority:2"`
-	CreatedAt            int64  `json:"created_at" gorm:"type:bigint;index:idx_image_user_created,priority:2"`
-	UpdatedAt            int64  `json:"updated_at" gorm:"type:bigint"`
-	StartedAt            int64  `json:"started_at" gorm:"type:bigint"`
-	UpstreamSucceededAt  int64  `json:"upstream_succeeded_at" gorm:"type:bigint"`
-	FinishedAt           int64  `json:"finished_at" gorm:"type:bigint"`
-	ExpiresAt            int64  `json:"expires_at" gorm:"type:bigint;index"`
+	Provider              string `json:"provider,omitempty" gorm:"size:32"`
+	ExecutionProtocol     string `json:"protocol,omitempty" gorm:"size:32"`
+	UpstreamTaskId        string `json:"-" gorm:"size:191"`
+	SelectedChannelCipher []byte `json:"-"`
+	Id                    int    `json:"-"`
+	TaskId                string `json:"task_id" gorm:"size:64;uniqueIndex"`
+	UserId                int    `json:"user_id" gorm:"index:idx_image_user_created,priority:1"`
+	TokenId               int    `json:"api_key_id" gorm:"index"`
+	Group                 string `json:"group" gorm:"size:255"`
+	Dialect               string `json:"dialect" gorm:"size:16"`
+	Platform              string `json:"platform" gorm:"size:16"`
+	RequestType           string `json:"request_type" gorm:"size:32"`
+	Model                 string `json:"model" gorm:"size:255"`
+	SourcePath            string `json:"source_path" gorm:"size:255"`
+	Status                string `json:"status" gorm:"size:32;index:idx_image_status_due,priority:1"`
+	BillingStatus         string `json:"billing_status" gorm:"size:32"`
+	Version               int64  `json:"version"`
+	Progress              int    `json:"progress"`
+	RequestCipher         []byte `json:"-"`
+	RequestHash           string `json:"-" gorm:"size:64"`
+	PromptSummary         string `json:"prompt_summary" gorm:"type:text"`
+	ReferenceUrls         string `json:"-" gorm:"type:text"`
+	ChannelId             int    `json:"-" gorm:"index"`
+	Attempts              string `json:"-" gorm:"type:text"`
+	RequestedSize         string `json:"requested_size" gorm:"size:64"`
+	RequestedResolution   string `json:"requested_resolution" gorm:"size:16"`
+	AspectRatio           string `json:"aspect_ratio" gorm:"size:32"`
+	ActualSize            string `json:"actual_size" gorm:"size:255"`
+	ImageCount            int    `json:"image_count"`
+	ResultCount           int    `json:"result_count"`
+	Quota                 int    `json:"quota"`
+	RetryCount            int    `json:"retry_count"`
+	StorageRetryCount     int    `json:"storage_retry_count"`
+	BillingRetryCount     int    `json:"billing_retry_count"`
+	ReferenceRetryCount   int    `json:"reference_retry_count"`
+	TransientRetryCount   int    `json:"transient_retry_count"`
+	CapacityRetryCount    int    `json:"capacity_retry_count"`
+	ErrorCode             string `json:"error_code" gorm:"size:64"`
+	ErrorMessage          string `json:"error_message" gorm:"type:text"`
+	PublicErrorCode       int    `json:"-"`
+	ReconciliationStatus  string `json:"reconciliation_status" gorm:"size:32"`
+	LeaseToken            string `json:"-" gorm:"size:64"`
+	HeartbeatAt           int64  `json:"-" gorm:"type:bigint"`
+	LeaseExpiresAt        int64  `json:"-" gorm:"type:bigint"`
+	DispatchedAt          int64  `json:"-" gorm:"type:bigint"`
+	NextAttemptAt         int64  `json:"next_attempt_at" gorm:"type:bigint;index:idx_image_status_due,priority:2"`
+	CreatedAt             int64  `json:"created_at" gorm:"type:bigint;index:idx_image_user_created,priority:2"`
+	UpdatedAt             int64  `json:"updated_at" gorm:"type:bigint"`
+	StartedAt             int64  `json:"started_at" gorm:"type:bigint"`
+	UpstreamSucceededAt   int64  `json:"upstream_succeeded_at" gorm:"type:bigint"`
+	FinishedAt            int64  `json:"finished_at" gorm:"type:bigint"`
+	ExpiresAt             int64  `json:"expires_at" gorm:"type:bigint;index"`
 }
 
 func (t AsyncImageTask) DisplayStatus() string {

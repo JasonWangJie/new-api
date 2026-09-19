@@ -816,3 +816,7 @@ func (a *Adaptor) GetChannelName() string {
 		return ChannelName
 	}
 }
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"dall-e*", "gpt-image-*", "flux*", "qwen-image*", "z-image*", "imagen-*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "openai", Protocol: "openai_images", Generate: true, Edit: true}
+}

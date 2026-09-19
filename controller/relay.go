@@ -594,6 +594,10 @@ func executeTaskSubmissionWith(
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	if c.GetBool("async_media_execution") {
+		task.PrivateData.Key = relayInfo.ApiKey
+	}
+	task.PrivateData.AsyncMedia = c.GetBool("async_media_execution")
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
@@ -629,6 +633,16 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
+	if c.GetBool("async_media_execution") && task.Status == model.TaskStatusSuccess {
+		if _, err := service.CaptureAsyncMediaOutput(c.Request.Context(), task); err != nil {
+			common.SysError("media output capture: " + err.Error())
+		}
+		task.Data = service.RedactAsyncMediaData(task.Data)
+		task.PrivateData.PluginState = service.RedactAsyncMediaData(task.PrivateData.PluginState)
+		if strings.HasPrefix(task.PrivateData.ResultURL, "data:") {
+			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
+		}
+	}
 	if insertErr := task.InsertWithContext(c.Request.Context()); insertErr != nil {
 		common.SysError("insert task error: " + insertErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
@@ -722,6 +736,9 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 }
 
 func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *taskdto.TaskError, retryTimes int) bool {
+	if c.GetBool("async_media_execution") {
+		return false
+	}
 	if taskErr == nil || taskErr.NoRetry {
 		return false
 	}

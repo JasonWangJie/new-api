@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -51,13 +53,13 @@ func (writer *asyncImageResponseWriter) Write(data []byte) (int, error) {
 
 // EstimateAsyncImageQuota checks the configured price using validated request
 // scalars. It does not select a channel, download references or reserve funds.
-func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request service.AsyncImageRequest, group string) (int, error) {
+func FreezeAsyncImageBilling(ctx context.Context, token model.Token, request service.AsyncImageRequest, group string, selected *model.Channel) (service.MediaBillingSnapshot, error) {
 	if request.Count < 1 || request.Count > dto.MaxImageN {
-		return 0, errors.New("invalid image count")
+		return service.MediaBillingSnapshot{}, errors.New("invalid image count")
 	}
 	var user model.User
 	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", token.UserId, common.UserStatusEnabled).Take(&user).Error; err != nil {
-		return 0, err
+		return service.MediaBillingSnapshot{}, err
 	}
 	writer := &asyncImageResponseWriter{Headers: make(http.Header), Limit: 1 << 20}
 	c, _ := gin.CreateTestContext(writer)
@@ -78,18 +80,25 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 		delete(native, "image")
 		body, err := common.Marshal(native)
 		if err != nil {
-			return 0, err
+			return service.MediaBillingSnapshot{}, err
 		}
 		image := &dto.ImageRequest{}
 		if err := common.Unmarshal(body, image); err != nil {
-			return 0, err
+			return service.MediaBillingSnapshot{}, err
+		}
+		if raw, ok := request.Native["parameters"]; ok {
+			parameters := &dto.ImageBillingParameters{}
+			if err := common.Unmarshal(raw, parameters); err != nil {
+				return service.MediaBillingSnapshot{}, fmt.Errorf("invalid image billing parameters: %w", err)
+			}
+			image.BillingParameters = parameters
 		}
 		image.Model, image.Prompt, image.Size, image.N = request.Model, request.Prompt, request.Size, common.GetPointer(uint(request.Count))
 		parsed = image
 	} else {
 		config, err := common.Marshal(map[string]string{"imageSize": request.Resolution, "aspectRatio": request.AspectRatio})
 		if err != nil {
-			return 0, err
+			return service.MediaBillingSnapshot{}, err
 		}
 		parsed = &dto.GeminiChatRequest{Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: request.Prompt}}}}, GenerationConfig: dto.GeminiChatGenerationConfig{ResponseModalities: []string{"TEXT", "IMAGE"}, ImageConfig: config}}
 	}
@@ -100,30 +109,47 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 		info = relaycommon.GenRelayInfoGemini(c, parsed)
 	}
 	info.ChannelMeta = &relaycommon.ChannelMeta{}
+	if selected != nil {
+		if setupErr := middleware.SetupContextForSelectedChannel(c, selected, request.Model); setupErr != nil {
+			return service.MediaBillingSnapshot{}, setupErr
+		}
+		info.InitChannelMeta(c)
+		if err := helper.ModelMappedHelper(c, info, parsed); err != nil {
+			return service.MediaBillingSnapshot{}, err
+		}
+	}
 	facts := service.ImageBillingSpecifications(request, []service.ImageBytes{{Width: 1024, Height: 1024}})[0]
 	encoded, err := common.Marshal(facts)
 	if err != nil {
-		return 0, err
+		return service.MediaBillingSnapshot{}, err
 	}
 	info.BillingRequestInput = &billingexpr.RequestInput{Body: encoded}
 	c.Set("async_image_billing_facts", facts)
 	meta := parsed.GetTokenCountMeta()
 	estimated, err := service.EstimateRequestToken(c, meta, info)
 	if err != nil {
-		return 0, err
+		return service.MediaBillingSnapshot{}, err
 	}
 	info.SetEstimatePromptTokens(estimated)
 	price, err := helper.ModelPriceHelper(c, info, estimated, meta)
 	if err != nil {
-		return 0, err
+		return service.MediaBillingSnapshot{}, err
 	}
 	info.PriceData = price
 	if request.Platform == "openai" {
-		if err := service.EstimateImageBillingForRequest(info, request.Count, false); err != nil {
-			return 0, err
+		if err := service.EstimateImageBillingForRequest(info, request.Count, parsed.(*dto.ImageRequest).BillingParameters != nil && parsed.(*dto.ImageRequest).BillingParameters.PromptExtend != nil && *parsed.(*dto.ImageRequest).BillingParameters.PromptExtend); err != nil {
+			return service.MediaBillingSnapshot{}, err
 		}
 	}
-	return info.PriceData.QuotaToPreConsume, nil
+	return service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup}, nil
+}
+
+func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request service.AsyncImageRequest, group string) (int, error) {
+	if request.Billing != nil {
+		return request.Billing.Price.QuotaToPreConsume, nil
+	}
+	snapshot, err := FreezeAsyncImageBilling(ctx, token, request, group, nil)
+	return snapshot.Price.QuotaToPreConsume, err
 }
 
 func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) ([]service.ImageBytes, model.AsyncImageBill, error) {
@@ -131,16 +157,42 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
+	if limits := token.GetIpLimits(); len(limits) > 0 && request.ClientIP != "" {
+		ip := net.ParseIP(request.ClientIP)
+		if ip == nil || !common.IsIpInCIDRList(ip, limits) {
+			return nil, model.AsyncImageBill{}, errors.New("client address is outside Token permissions")
+		}
+	}
 	var user model.User
-	if err := model.DB.WithContext(ctx).Where("id = ?", task.UserId).Take(&user).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", task.UserId, common.UserStatusEnabled).Take(&user).Error; err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
 	limit := int64(dto.MaxImageN) * cfg.DownloadMaxBytes * 2
 	writer := &asyncImageResponseWriter{Headers: make(http.Header), Limit: limit}
 	c, _ := gin.CreateTestContext(writer)
 	c.Set("async_image_response_limit", limit)
+	c.Set("async_image_execution", true)
+	c.Set("async_image_resume_task", task.UpstreamTaskId)
+	c.Set("async_image_upstream_job", func(id string) error {
+		if id == "" || len(id) > 191 {
+			return errors.New("invalid upstream image task id")
+		}
+		if task.UpstreamTaskId == id {
+			return nil
+		}
+		if err := model.TransitionImageTask(ctx, task, map[string]any{"upstream_task_id": id}, "upstream_accepted", "", ""); err != nil {
+			return err
+		}
+		return model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(&task).Error
+	})
+	if task.ExecutionProtocol == "openai_images" {
+		request.Platform = "openai"
+	}
+	if task.ExecutionProtocol == "gemini_native" && request.Platform != "gemini" {
+		request.Platform = "gemini"
+	}
 	upstreamPath := "/v1/images/generations"
-	if request.Kind == "image_to_image" {
+	if request.Kind == "image_to_image" && !(service.ImageChannelCapability(*channel, request.Model).ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async")) {
 		upstreamPath = "/v1/images/edits"
 	}
 	if request.Platform == "gemini" {
@@ -169,6 +221,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			mode = "local"
 		}
 		for _, part := range request.Parts {
+			if task.UpstreamTaskId != "" {
+				break
+			}
 			if part.Type != "image_url" && part.Type != "mask" {
 				continue
 			}
@@ -200,11 +255,25 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			images = append(images, map[string]string{"image_url": reference})
 		}
 		if len(images) > 0 {
-			data, err := common.Marshal(images)
-			if err != nil {
-				return nil, model.AsyncImageBill{}, err
+			capability := service.ImageChannelCapability(*channel, request.Model)
+			if capability.ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async") {
+				urls := make([]string, 0, len(images))
+				for _, image := range images {
+					urls = append(urls, image["image_url"])
+				}
+				data, err := common.Marshal(urls)
+				if err != nil {
+					return nil, model.AsyncImageBill{}, err
+				}
+				request.Native[capability.ReferenceField] = data
+				delete(request.Native, "images")
+			} else {
+				data, err := common.Marshal(images)
+				if err != nil {
+					return nil, model.AsyncImageBill{}, err
+				}
+				request.Native["images"] = data
 			}
-			request.Native["images"] = data
 		}
 		var err error
 		nativeBody, err = common.Marshal(request.Native)
@@ -214,6 +283,13 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		imageRequest := &dto.ImageRequest{}
 		if err := common.Unmarshal(nativeBody, imageRequest); err != nil {
 			return nil, model.AsyncImageBill{}, err
+		}
+		if raw, ok := request.Native["parameters"]; ok {
+			parameters := &dto.ImageBillingParameters{}
+			if err := common.Unmarshal(raw, parameters); err != nil {
+				return nil, model.AsyncImageBill{}, fmt.Errorf("invalid image billing parameters: %w", err)
+			}
+			imageRequest.BillingParameters = parameters
 		}
 		parsed = imageRequest
 	} else {
@@ -257,6 +333,48 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, err
 		}
 	}
+	contentType := "application/json"
+	if request.Platform == "openai" && request.Kind == "image_to_image" && service.ImageChannelCapability(*channel, request.Model).EditFormat == "multipart" && task.UpstreamTaskId == "" {
+		var encoded bytes.Buffer
+		form := multipart.NewWriter(&encoded)
+		for key, raw := range request.Native {
+			if key == "images" || key == "mask" {
+				continue
+			}
+			var value string
+			if common.Unmarshal(raw, &value) != nil {
+				value = string(raw)
+			}
+			if err := form.WriteField(key, value); err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+		}
+		for index, part := range request.Parts {
+			if part.Type != "image_url" && part.Type != "mask" {
+				continue
+			}
+			image, _, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+			field := "image[]"
+			if part.Type == "mask" {
+				field = "mask"
+			}
+			output, err := form.CreateFormFile(field, fmt.Sprintf("reference-%d.png", index))
+			if err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+			if _, err := output.Write(image.Data); err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+		}
+		if err := form.Close(); err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
+		nativeBody, contentType = encoded.Bytes(), form.FormDataContentType()
+	}
+	c.Request.Header.Set("Content-Type", contentType)
 	c.Request.Body = io.NopCloser(bytes.NewReader(nativeBody))
 	c.Request.ContentLength = int64(len(nativeBody))
 	storage, err := common.CreateBodyStorage(nativeBody)
@@ -285,9 +403,19 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		return nil, model.AsyncImageBill{}, err
 	}
 	info.SetEstimatePromptTokens(estimated)
-	price, err := helper.ModelPriceHelper(c, info, estimated, meta)
-	if err != nil {
-		return nil, model.AsyncImageBill{}, err
+	price := info.PriceData
+	if request.Billing != nil {
+		price = request.Billing.Price
+		for key, ratio := range request.Billing.Ratios {
+			price.AddOtherRatio(key, ratio)
+		}
+		info.TieredBillingSnapshot, info.QuotaClamp, info.ImageQuotaBeforeGroup = request.Billing.Tiered, request.Billing.Clamp, request.Billing.ImageQuotaBeforeGroup
+	} else {
+		var err error
+		price, err = helper.ModelPriceHelper(c, info, estimated, meta)
+		if err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
 	}
 	info.PriceData = price
 	funding, err := model.SelectImageFunding(ctx, user.Id, price.QuotaToPreConsume, user.GetSetting().BillingPreference)
@@ -313,6 +441,14 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		result, apiErr := ExecuteImageRequest(c, info, false, upstreamBeforeInvoke)
 		if apiErr != nil {
 			failure := service.ClassifyAsyncImageFailure(apiErr, apiErr.StatusCode)
+			var pending *service.AsyncImagePending
+			if errors.As(apiErr, &pending) {
+				return nil, model.AsyncImageBill{}, pending
+			}
+			var terminal *service.AsyncImageFailure
+			if errors.As(apiErr, &terminal) {
+				return nil, model.AsyncImageBill{}, terminal
+			}
 			failure.RetryAfter = service.ImageRetryAfter(c.GetString("async_image_retry_after"), time.Now())
 			if dispatched {
 				switch apiErr.GetErrorCode() {
@@ -340,6 +476,23 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		body, err := common.Marshal(converted)
 		if err != nil {
 			return nil, model.AsyncImageBill{}, err
+		}
+		if request.Dialect == "async" {
+			var native map[string]common.RawMessage
+			if err := common.Unmarshal(body, &native); err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+			for key, value := range request.Native {
+				switch key {
+				case "model", "prompt", "n", "size", "images", "mask", "quality", "output_format", "background", "response_format", "resolution", "aspect_ratio":
+					continue
+				}
+				native[key] = value
+			}
+			body, err = common.Marshal(native)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
 		}
 		if len(info.ParamOverride) > 0 {
 			body, err = relaycommon.ApplyParamOverrideWithRelayInfo(body, info)

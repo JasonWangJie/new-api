@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"regexp"
@@ -110,14 +111,15 @@ type Options struct {
 }
 
 type Engine struct {
-	key       string
-	version   string
-	timeout   time.Duration
-	now       func() time.Time
-	log       func(string)
-	module    *sobek.SourceTextModuleRecord
-	pool      chan *runtimeInstance
-	semaphore chan struct{}
+	sourceHash [sha256.Size]byte
+	key        string
+	version    string
+	timeout    time.Duration
+	now        func() time.Time
+	log        func(string)
+	module     *sobek.SourceTextModuleRecord
+	pool       chan *runtimeInstance
+	semaphore  chan struct{}
 }
 
 type runtimeInstance struct {
@@ -164,14 +166,15 @@ func Compile(source string, options Options) (*Engine, error) {
 	}
 
 	engine := &Engine{
-		key:       options.Key,
-		version:   options.Version,
-		timeout:   timeout,
-		now:       now,
-		log:       options.Log,
-		module:    module,
-		semaphore: make(chan struct{}, concurrency),
-		pool:      make(chan *runtimeInstance, concurrency),
+		sourceHash: sha256.Sum256([]byte(source)),
+		key:        options.Key,
+		version:    options.Version,
+		timeout:    timeout,
+		now:        now,
+		log:        options.Log,
+		module:     module,
+		semaphore:  make(chan struct{}, concurrency),
+		pool:       make(chan *runtimeInstance, concurrency),
 	}
 	instance, err := engine.newRuntime(context.Background())
 	if err != nil {
@@ -181,6 +184,9 @@ func Compile(source string, options Options) (*Engine, error) {
 	engine.putRuntime(instance)
 	return engine, nil
 }
+
+// SourceFingerprint pins deferred submissions to the exact compiled driver.
+func (engine *Engine) SourceFingerprint() string { return fmt.Sprintf("%x", engine.sourceHash) }
 
 // Export returns one module export without exposing Sobek values outside the
 // engine boundary. It is used for declarative exports such as meta.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -268,8 +269,31 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 602, InternalCode: "reference_accounts_exhausted", Message: "Upstream reference-image fetch retries are exhausted"}, cfg)
 	}
 	channel, account, err := PickImageChannel(ctx, policy, request, routing)
+	if len(task.SelectedChannelCipher) > 0 {
+		data, decodeErr := DecryptImagePayload(task.SelectedChannelCipher, "image-channel:"+task.TaskId)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		channel = &model.Channel{}
+		if decodeErr := common.Unmarshal(data, channel); decodeErr != nil {
+			return decodeErr
+		}
+		account = ImageAccount{Fingerprint: ImageIdentityHash("image-account", strconv.Itoa(channel.Id), channel.Key)}
+		err = nil
+	}
 	if err != nil {
 		return failAsyncImageInvocation(ctx, *task, ClassifyAsyncImageFailure(err, 0), cfg)
+	}
+	if task.DispatchedAt == 0 {
+		eligible, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
+		if err != nil {
+			return err
+		}
+		if !slices.ContainsFunc(eligible, func(candidate model.Channel) bool {
+			return candidate.Id == channel.Id && ImageCapabilitySupportsRequest(ImageChannelCapability(candidate, request.Model), request)
+		}) {
+			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Selected image channel is no longer eligible"}, cfg)
+		}
 	}
 	now := time.Now().Unix()
 	slotKey := ImageRedisKey("invoke-slots")
@@ -291,6 +315,23 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	}
 	defer common.RDB.ZRem(context.WithoutCancel(ctx), channelSlotKey, task.LeaseToken)
 	task.ChannelId = channel.Id
+	capability := ImageChannelCapability(*channel, request.Model)
+	if task.Provider == "" && (task.Dialect == "async" || capability.Provider == "ali" || capability.Provider == "replicate") {
+		encodedChannel, err := common.Marshal(channel)
+		if err != nil {
+			return err
+		}
+		cipher, err := EncryptImagePayload(encodedChannel, "image-channel:"+task.TaskId)
+		if err != nil {
+			return err
+		}
+		if err := model.TransitionImageTask(ctx, *task, map[string]any{"provider": capability.Provider, "execution_protocol": capability.Protocol, "selected_channel_cipher": cipher}, "provider_selected", "", ""); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
+			return err
+		}
+	}
 	mode := cfg.OpenAIReferenceMode
 	if request.Platform == "gemini" {
 		mode = cfg.GeminiReferenceMode
@@ -311,7 +352,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	}
 	remaining := int64(cfg.ExecutionTimeout) - (time.Now().Unix() - task.StartedAt)
 	if remaining <= 0 {
-		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 608, InternalCode: "execution_deadline", Message: "Image execution deadline expired", ExecutionUnknown: task.DispatchedAt > 0}, cfg)
+		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 608, InternalCode: "execution_deadline", Message: "Image execution deadline expired", ExecutionUnknown: task.DispatchedAt > 0 && task.UpstreamTaskId == ""}, cfg)
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(min(int64(cfg.AttemptTimeout), remaining))*time.Second)
 	defer cancel()
@@ -325,10 +366,23 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return model.DB.WithContext(attemptCtx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error
 	}
 	images, bill, err := ExecuteAsyncImageFunc(attemptCtx, *task, request, channel, cfg, beforeInvoke)
+	if reloadErr := model.DB.WithContext(context.WithoutCancel(ctx)).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; reloadErr != nil {
+		return reloadErr
+	}
 	if err != nil {
+		var pending *AsyncImagePending
+		if errors.As(err, &pending) {
+			if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
+				return err
+			}
+			return model.TransitionImageTask(context.WithoutCancel(ctx), *task, map[string]any{"status": model.ImageTaskQueued, "next_attempt_at": time.Now().Unix() + 10}, "upstream_pending", "", "execute")
+		}
 		failure := ClassifyAsyncImageFailure(err, 0)
 		if task.DispatchedAt > 0 && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 			failure.ExecutionUnknown = true
+		}
+		if task.UpstreamTaskId != "" && (failure.ExecutionUnknown || failure.Code == 605 || failure.Code == 606) {
+			return model.TransitionImageTask(context.WithoutCancel(ctx), *task, map[string]any{"status": model.ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": time.Now().Unix() + 10}, "recovered", "Upstream image task polling will continue", "execute")
 		}
 		if task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
@@ -406,8 +460,10 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			updates[key] = count + 1
 			updates["retry_count"] = task.RetryCount + 1
 			updates["next_attempt_at"] = time.Now().Unix() + int64(delay)
-			updates["channel_id"] = 0
-			updates["dispatched_at"] = 0
+			if task.UpstreamTaskId == "" {
+				updates["channel_id"] = 0
+				updates["dispatched_at"] = 0
+			}
 		}
 	}
 	updates["status"] = status

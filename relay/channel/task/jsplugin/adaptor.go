@@ -601,18 +601,26 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	return a.FetchTaskContext(context.Background(), baseURL, key, task, proxy)
+}
+
+func (a *TaskAdaptor) FetchTaskContext(requestContext context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "buildQueryRequest", ctx)
+	value, err := a.plugin.Engine.Call(requestContext, "buildQueryRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, proxy, value)
+	return a.doFetchDescriptorContext(requestContext, baseURL, proxy, value)
 }
 
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http.Response, error) {
+	return a.doFetchDescriptorContext(context.Background(), baseURL, proxy, value)
+}
+
+func (a *TaskAdaptor) doFetchDescriptorContext(ctx context.Context, baseURL, proxy string, value any) (*http.Response, error) {
 	var descriptor requestDescriptor
 	if err := convert(value, &descriptor); err != nil {
 		return nil, err
@@ -636,7 +644,7 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http
 	if method == "" {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequest(method, descriptor.URL, requestBody)
+	req, err := http.NewRequestWithContext(ctx, method, descriptor.URL, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -960,7 +968,8 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 			return nil, fmt.Errorf("credentialless artifact requests cannot contain headers or a body")
 		}
 		parsedURL, parseErr := url.Parse(descriptor.URL)
-		if parseErr != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		inlineVideo := strings.HasPrefix(descriptor.URL, "data:video/") && strings.Contains(descriptor.URL, ";base64,")
+		if !inlineVideo && (parseErr != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https")) {
 			return nil, fmt.Errorf("credentialless artifact request URL must be absolute HTTP(S)")
 		}
 	} else if err = pluginruntime.ValidateRequestURL(descriptor.URL, a.info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts); err != nil {

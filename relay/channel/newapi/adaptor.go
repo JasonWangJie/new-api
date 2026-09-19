@@ -119,3 +119,7 @@ func (a *Adaptor) GetModelList() []string {
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"dall-e*", "gpt-image-*", "flux*", "qwen-image*", "z-image*", "imagen-*", "gemini-2.0-flash-preview-image-generation", "gemini-2.5-flash-image*", "gemini-3-pro-image*", "gemini-3.1-flash-image*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "newapi", Protocol: "openai_images", Generate: true, Edit: true}
+}

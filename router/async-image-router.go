@@ -42,10 +42,9 @@ func (writer *asyncImageAuthWriter) Status() int {
 func (writer *asyncImageAuthWriter) Size() int     { return writer.Body.Len() }
 func (writer *asyncImageAuthWriter) Written() bool { return writer.Code != 0 || writer.Body.Len() > 0 }
 
-func asyncImagePublicAuth() gin.HandlerFunc {
+func asyncImagePublicAuth(auth gin.HandlerFunc) gin.HandlerFunc {
 	// Quota is evaluated by the image price/funding check. The following
 	// policy handler adds expiry, revocation and IP checks for every path.
-	auth := middleware.TokenAuthReadOnly()
 	return func(c *gin.Context) {
 		original := c.Writer
 		writer := &asyncImageAuthWriter{ResponseWriter: original}
@@ -53,7 +52,7 @@ func asyncImagePublicAuth() gin.HandlerFunc {
 		defer func() { c.Writer = original }()
 		auth(c)
 		body := writer.Body.Bytes()
-		if c.IsAborted() {
+		if c.IsAborted() && !c.GetBool("async_public_success") {
 			var payload struct {
 				Message string `json:"message"`
 				Error   struct {
@@ -116,10 +115,14 @@ func asyncImageTokenPermissions(readOnly bool) gin.HandlerFunc {
 func SetAsyncImagePublicRouter(router *gin.Engine) {
 	api := router.Group("/v1")
 	api.Use(middleware.RouteTag("relay"))
-	for _, path := range []string{"/images/generations_oa", "/images/edits_oa", "/chat/completions_gm", "/images/generations_sc"} {
-		api.POST(path, asyncImagePublicAuth(), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
+	for _, path := range []string{"/images/generations_oa", "/images/edits_oa", "/chat/completions_gm", "/images/generations_sc", "/images/generations_async", "/images/edits_async"} {
+		api.POST(path, asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
 	}
-	api.POST("/uploads/images_sc", asyncImagePublicAuth(), asyncImageTokenPermissions(false), controller.UploadAsyncImageInput)
-	api.GET("/images/tasks_async/:task_id", asyncImagePublicAuth(), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
-	api.GET("/tasks_sc/:task_id", asyncImagePublicAuth(), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
+	api.POST("/videos/generations_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideo, middleware.PinTaskPluginEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	api.GET("/media/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncMedia)
+	api.GET("/media/objects/:object_id", controller.MediaObjectContent)
+	api.HEAD("/media/objects/:object_id", controller.MediaObjectContent)
+	api.POST("/uploads/images_sc", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.UploadAsyncImageInput)
+	api.GET("/images/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
+	api.GET("/tasks_sc/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
 }

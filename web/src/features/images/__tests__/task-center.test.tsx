@@ -37,6 +37,8 @@ import { ImageTaskCenter } from '../task-center'
 import type { ImageTask, ImageTaskDetail } from '../types'
 
 vi.mock('../api', () => ({
+  mediaTasksPath: (admin: boolean) =>
+    `/api/${admin ? 'admin' : 'user'}/media-tasks`,
   imageTasksPath: (admin: boolean) =>
     `/api/${admin ? 'admin' : 'user'}/async-image-tasks`,
   imageBlob: vi.fn(),
@@ -110,7 +112,8 @@ const detail: ImageTaskDetail = {
       content_type: 'image/png',
       byte_size: 1048576,
       checksum: '',
-      view_url: '/api/admin/async-image-tasks/asyncimg_display_contract/results/0/view',
+      view_url:
+        '/api/admin/async-image-tasks/asyncimg_display_contract/results/0/view',
       url: 'https://example.com/result.png',
       expires_at: 1789686400,
     },
@@ -223,7 +226,7 @@ test('terminates one fixed task after confirmation and retains the dialog when t
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   )
   expect(imageRequest).toHaveBeenLastCalledWith(
-    '/api/admin/async-image-tasks/asyncimg_display_contract/terminate',
+    '/api/admin/media-tasks/asyncimg_display_contract/terminate',
     'POST',
     {}
   )
@@ -243,9 +246,7 @@ test('admin details show named attempts and generated images without rendering r
     />
   )
   await screen.findByText('Studio key')
-  await user.click(
-    screen.getByRole('button', { name: /Attempt history/ })
-  )
+  await user.click(screen.getByRole('button', { name: /Attempt history/ }))
   expect(await screen.findByText('Previous upstream')).toBeVisible()
   expect(screen.getByText('Account slot 3')).toBeVisible()
   expect(screen.getByText('Studio key')).toBeVisible()
@@ -302,7 +303,7 @@ test('admin details show named attempts and generated images without rendering r
     ).not.toBeInTheDocument()
   )
   expect(
-    screen.getByRole('dialog', { name: 'Image task details' })
+    screen.getByRole('dialog', { name: 'Media task details' })
   ).toBeVisible()
 })
 
@@ -399,4 +400,47 @@ test('existing standard image previews retain their image URL and copy action', 
   expect(await navigator.clipboard.readText()).toBe(
     'https://example.com/standard.png'
   )
+})
+
+test('video task details play local results and refresh an expired link', async () => {
+  const user = userEvent.setup()
+  const link = '/v1/media/objects/local-video?expires=1789690000&access=example'
+  const video = {
+    ...task,
+    media_type: 'video' as const,
+    provider: 'sora',
+    platform: 'sora',
+    request_type: 'text_to_video',
+    status: 'succeeded',
+    billing_status: 'settled',
+    storage_status: 'succeeded',
+    cost: 0.5,
+  }
+  vi.mocked(getImageTask).mockResolvedValue({
+    task: video,
+    events: [],
+    results: [{ ...detail.results[0], url: link, view_url: link }],
+  })
+  mount(
+    <ImageTaskDetails
+      id={video.task_id}
+      admin={false}
+      userId={101}
+      onClose={() => {}}
+      canManage={false}
+      onManage={() => {}}
+    />
+  )
+  await screen.findByText('Generated videos')
+  expect(document.querySelector('video')).toHaveAttribute('src', link)
+  expect(screen.getByText('Download').closest('a')).toHaveAttribute(
+    'href',
+    link
+  )
+  const calls = vi.mocked(getImageTask).mock.calls.length
+  await user.click(screen.getByRole('button', { name: 'Refresh link' }))
+  await waitFor(() =>
+    expect(vi.mocked(getImageTask).mock.calls.length).toBeGreaterThan(calls)
+  )
+  expect(document.body).not.toHaveTextContent('secret-fingerprint-canary')
 })

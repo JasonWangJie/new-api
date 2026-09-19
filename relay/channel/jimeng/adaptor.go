@@ -1,9 +1,9 @@
 package jimeng
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/QuantumNous/new-api/common"
 	"io"
 	"net/http"
 
@@ -79,7 +79,7 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 	}
 
 	if len(request.ExtraFields) > 0 {
-		if err := json.Unmarshal(request.ExtraFields, &payload); err != nil {
+		if err := common.Unmarshal(request.ExtraFields, &payload); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal extra fields: %w", err)
 		}
 	}
@@ -141,4 +141,8 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
+}
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"jimeng_high_aes_general*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "jimeng", Protocol: "openai_images", Generate: true, Edit: false}
 }

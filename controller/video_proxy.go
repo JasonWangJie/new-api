@@ -17,6 +17,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
@@ -82,6 +83,32 @@ func VideoProxy(c *gin.Context) {
 		return
 	}
 
+	var mediaJob model.AsyncMediaJob
+	if task.PrivateData.AsyncMedia {
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&mediaJob).Error; err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		if middleware.IsTaskArtifactAccess(c) || mediaJob.StorageStatus != "succeeded" {
+			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+			return
+		}
+		var objects []model.MediaArtifactObject
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND status = ? AND expires_at > ?", task.TaskID, "active", time.Now().Unix()).Order("artifact_key").Limit(1).Find(&objects).Error; err != nil || len(objects) == 0 {
+			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+			return
+		}
+		store := service.GetTaskArtifactStore()
+		ref, err := store.Resolve(task, objects[0].ArtifactKey)
+		if err != nil || ref == nil {
+			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+			return
+		}
+		if err := store.Serve(c, task, ref); err != nil && !c.Writer.Written() {
+			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+		}
+		return
+	}
 	var descriptor *relaychannel.TaskContentRequest
 	if taskHasPluginExecution(task) {
 		artifacts, projectionErr := projectTaskArtifacts(task)
@@ -144,7 +171,11 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 	}
 	if strings.HasPrefix(rawURL, "data:") {
-		if len(rawURL) > taskMediaDataURLMaxEncodedBytes {
+		limit := int64(taskMediaDataURLMaxEncodedBytes)
+		if configured, ok := c.Get("async_media_inline_limit"); ok {
+			limit = configured.(int64)
+		}
+		if int64(len(rawURL)) > limit {
 			return &taskMediaProxyError{
 				status: http.StatusBadGateway, code: "artifact_request_rejected",
 				message: "Artifact request was rejected", err: errTaskMediaRequestRejected,
@@ -208,6 +239,11 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 	}
 
 	channel, err := model.CacheGetChannel(task.ChannelId)
+	if frozen, freezeErr := service.FrozenAsyncMediaChannel(c.Request.Context(), task); freezeErr != nil {
+		return &taskMediaProxyError{status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable", message: "Artifact channel is unavailable", err: freezeErr}
+	} else if frozen != nil {
+		channel, err = frozen, nil
+	}
 	if err != nil {
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_plugin_unavailable",
@@ -290,6 +326,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
 			logger.LogError(c.Request.Context(), fmt.Sprintf("Failed to stream task media: %v", err))
+			return err
 		}
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -572,7 +609,11 @@ func writeTaskMediaProxyError(c *gin.Context, err error) {
 }
 
 func writeVideoDataURL(c *gin.Context, dataURL string) error {
-	if len(dataURL) > taskMediaDataURLMaxEncodedBytes {
+	limit := int64(taskMediaDataURLMaxEncodedBytes)
+	if configured, ok := c.Get("async_media_inline_limit"); ok {
+		limit = configured.(int64)
+	}
+	if int64(len(dataURL)) > limit {
 		return errTaskMediaRequestRejected
 	}
 	parts := strings.SplitN(dataURL, ",", 2)

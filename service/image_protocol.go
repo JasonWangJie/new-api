@@ -25,19 +25,23 @@ type AsyncImageInputPart struct {
 }
 
 type AsyncImageRequest struct {
-	Platform     string                       `json:"platform"`
-	Dialect      string                       `json:"dialect"`
-	SourcePath   string                       `json:"source_path"`
-	Model        string                       `json:"model"`
-	Prompt       string                       `json:"prompt"`
-	Kind         string                       `json:"kind"`
-	Size         string                       `json:"size,omitempty"`
-	Resolution   string                       `json:"resolution,omitempty"`
-	AspectRatio  string                       `json:"aspect_ratio,omitempty"`
-	ExplicitTier bool                         `json:"explicit_tier"`
-	Count        int                          `json:"count"`
-	Parts        []AsyncImageInputPart        `json:"parts"`
-	Native       map[string]common.RawMessage `json:"native,omitempty"`
+	Billing        *MediaBillingSnapshot        `json:"billing,omitempty"`
+	Provider       string                       `json:"provider,omitempty"`
+	PolicyPlatform string                       `json:"policy_platform,omitempty"`
+	ClientIP       string                       `json:"client_ip,omitempty"`
+	Platform       string                       `json:"platform"`
+	Dialect        string                       `json:"dialect"`
+	SourcePath     string                       `json:"source_path"`
+	Model          string                       `json:"model"`
+	Prompt         string                       `json:"prompt"`
+	Kind           string                       `json:"kind"`
+	Size           string                       `json:"size,omitempty"`
+	Resolution     string                       `json:"resolution,omitempty"`
+	AspectRatio    string                       `json:"aspect_ratio,omitempty"`
+	ExplicitTier   bool                         `json:"explicit_tier"`
+	Count          int                          `json:"count"`
+	Parts          []AsyncImageInputPart        `json:"parts"`
+	Native         map[string]common.RawMessage `json:"native,omitempty"`
 }
 
 // ReferenceURLs retains external image references for the administrator task
@@ -221,6 +225,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		request.Platform, request.Dialect = "gemini", "sc"
 	}
 	fields := make(map[string]common.RawMessage)
+	if strings.HasSuffix(path, "_async") {
+		request.Dialect = "async"
+	}
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return request, errors.New("invalid content type")
@@ -242,7 +249,14 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				return request, errors.New("multipart image byte limit exceeded")
 			}
 			if part.FileName() != "" {
-				if name != "image" && name != "image[]" && name != "mask" {
+				indexedImage := false
+				if index, ok := strings.CutPrefix(name, "image["); ok {
+					if index, ok = strings.CutSuffix(index, "]"); ok {
+						_, indexErr := strconv.ParseUint(index, 10, 32)
+						indexedImage = indexErr == nil
+					}
+				}
+				if name != "image" && name != "image[]" && name != "mask" && !indexedImage {
 					return request, errors.New("unsupported multipart file field")
 				}
 				if len(request.Parts) >= cfg.MaxReferences {
@@ -267,6 +281,13 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				return request, errors.New("multipart field limit exceeded")
 			}
 			value := strings.TrimSpace(string(data))
+			if request.Dialect == "async" && !slices.Contains([]string{"model", "prompt", "provider", "size", "quality", "response_format", "output_format", "background", "user", "aspect_ratio", "resolution"}, name) {
+				var decoded any
+				if common.Unmarshal(data, &decoded) == nil {
+					fields[name] = common.RawMessage(data)
+					continue
+				}
+			}
 			if name == "n" || name == "stream" || name == "output_compression" || name == "partial_images" {
 				fields[name] = common.RawMessage(data)
 			} else {
@@ -286,6 +307,12 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 	}
 	var stream *bool
+	if value, ok := fields["provider"]; ok {
+		if common.Unmarshal(value, &request.Provider) != nil || !RegisteredImageProvider(request.Provider) {
+			return request, errors.New("invalid image provider")
+		}
+		delete(fields, "provider")
+	}
 	if value, ok := fields["stream"]; ok && request.Dialect != "sc" {
 		if err := common.Unmarshal(value, &stream); err != nil {
 			return request, errors.New("stream must be a boolean")
@@ -300,7 +327,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 	}
 	request.Model = strings.TrimSpace(request.Model)
-	if request.Model == "" && request.Platform == "openai" {
+	if request.Model == "" && request.Platform == "openai" && request.Dialect != "async" {
 		request.Model = "gpt-image-2"
 	}
 	if err := ValidateImageModelName(request.Model); err != nil {
@@ -387,6 +414,17 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				return request, errors.New("image_urls must be an array")
 			}
 		}
+		if value, present := fields["image"]; present && request.Dialect == "async" {
+			var one string
+			var multiple []string
+			if common.Unmarshal(value, &one) == nil {
+				multiple = []string{one}
+			} else if common.Unmarshal(value, &multiple) != nil {
+				return request, errors.New("image must be a URL or array of URLs")
+			}
+			urls = append(urls, multiple...)
+			delete(fields, "image")
+		}
 		for _, value := range urls {
 			value = strings.TrimSpace(value)
 			if value == "" {
@@ -420,6 +458,57 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 					return request, fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
 				}
 			}
+			if request.Dialect == "async" {
+				quantities := make(map[string]common.RawMessage)
+				for _, key := range []string{"batch_size", "num_outputs"} {
+					if raw, exists := fields[key]; exists {
+						quantities[key] = raw
+					}
+				}
+				if raw, exists := fields["input"]; exists {
+					var input map[string]common.RawMessage
+					if err := common.Unmarshal(raw, &input); err != nil {
+						return request, errors.New("invalid provider image input")
+					}
+					if count, exists := input["num_outputs"]; exists {
+						quantities["input.num_outputs"] = count
+					}
+				}
+				if raw, exists := fields["sequential_image_generation_options"]; exists {
+					var options map[string]common.RawMessage
+					if err := common.Unmarshal(raw, &options); err != nil {
+						return request, errors.New("invalid sequential image options")
+					}
+					if count, exists := options["max_images"]; exists {
+						quantities["sequential_image_generation_options.max_images"] = count
+					}
+				}
+				for name, raw := range quantities {
+					var count uint
+					if common.Unmarshal(raw, &count) != nil || count < 1 || count > dto.MaxImageN {
+						return request, fmt.Errorf("%s must be an integer between 1 and %d", name, dto.MaxImageN)
+					}
+					if _, exists := fields["n"]; exists && int(count) != request.Count {
+						return request, fmt.Errorf("%s conflicts with image n", name)
+					}
+					if request.Count != 1 && int(count) != request.Count {
+						return request, errors.New("conflicting image quantities")
+					}
+					request.Count = int(count)
+				}
+			}
+			if value, present := fields["parameters"]; present {
+				var parameters dto.ImageBillingParameters
+				if err := common.Unmarshal(value, &parameters); err != nil {
+					return request, errors.New("invalid image parameters")
+				}
+				quantity := dto.ImageRequest{N: common.GetPointer(uint(request.Count)), BillingParameters: &parameters}
+				count, err := quantity.ImageCount(true)
+				if err != nil {
+					return request, err
+				}
+				request.Count = int(count)
+			}
 			request.Native = fields
 		}
 		request.Prompt = strings.TrimSpace(request.Prompt)
@@ -444,7 +533,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	if references > 0 {
 		request.Kind = "image_to_image"
 	}
-	if strings.HasSuffix(path, "edits_oa") && references == 0 {
+	if (strings.HasSuffix(path, "edits_oa") || strings.HasSuffix(path, "edits_async")) && references == 0 {
 		return request, errors.New("reference images are required for edits")
 	}
 	if _, ok := fields["mask"]; ok && references == 0 {
@@ -454,7 +543,13 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		var mask struct {
 			URL string `json:"image_url"`
 		}
-		if err := common.Unmarshal(raw, &mask); err != nil || mask.URL == "" {
+		var maskURL string
+		if request.Dialect == "async" && common.Unmarshal(raw, &maskURL) == nil {
+			mask.URL = maskURL
+		} else if err := common.Unmarshal(raw, &mask); err != nil {
+			return request, errors.New("mask.image_url is required")
+		}
+		if mask.URL == "" {
 			return request, errors.New("mask.image_url is required")
 		}
 		request.Parts = append(request.Parts, AsyncImageInputPart{Type: "mask", URL: mask.URL})
@@ -484,13 +579,23 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 	}
 	if request.Platform == "openai" {
-		if err := normalizeAsyncOpenAIDimensions(&request); err != nil {
-			return request, err
+		if request.Dialect != "async" || request.Size == "" {
+			if err := normalizeAsyncOpenAIDimensions(&request); err != nil {
+				return request, err
+			}
 		}
-		delete(request.Native, "resolution")
-		delete(request.Native, "aspect_ratio")
+		if request.Dialect != "async" {
+			delete(request.Native, "resolution")
+			delete(request.Native, "aspect_ratio")
+		}
 		delete(request.Native, "image_urls")
 		delete(request.Native, "images")
+		if request.Count != 1 {
+			request.Native["n"], err = common.Marshal(request.Count)
+			if err != nil {
+				return request, err
+			}
+		}
 		for name, value := range map[string]string{"model": request.Model, "prompt": request.Prompt, "size": request.Size} {
 			if value != "" {
 				data, err := common.Marshal(value)

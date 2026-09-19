@@ -255,7 +255,7 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 }
 
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
-	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": task.DisplayStatus(), "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": false, "can_terminate": false}
+	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(task.Status), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": task.DisplayStatus(), "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
 	if task.FinishedAt > 0 {
 		data["duration_ms"] = max(0, task.FinishedAt-task.CreatedAt) * 1000
 	}
@@ -264,7 +264,6 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 		data["channel_id"] = task.ChannelId
 		data["attempts"] = task.Attempts
 		data["reference_urls"] = task.ReferenceUrls
-		data["can_resume"] = task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed
 		data["can_terminate"] = !task.Terminal()
 		data["reconciliation_status"] = task.ReconciliationStatus
 	}

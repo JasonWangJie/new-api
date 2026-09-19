@@ -17,6 +17,48 @@ func TestVertexAIResponsesProtocol(t *testing.T) {
 	registry := jsplugin.NewRegistry()
 	plugin, err := registry.RegisterFactory(source, jsplugin.Options{Key: "vertex-ai"})
 	require.NoError(t, err)
+	t.Run("projects every video for authenticated or inline content storage", func(t *testing.T) {
+		google, found := jsplugin.DefaultRegistry.Get("google")
+		require.True(t, found)
+		for _, item := range []struct {
+			provider   *jsplugin.LoadedPlugin
+			data       map[string]any
+			keys, urls []string
+		}{
+			{plugin, map[string]any{"response": map[string]any{"videos": []any{map[string]any{"bytesBase64Encoded": "AA==", "mimeType": "video/mp4"}, map[string]any{"uri": "https://cdn.example/second.mp4"}}}}, []string{"video-0", "video-1"}, []string{"data:video/mp4;base64,AA==", "https://cdn.example/second.mp4"}},
+			{google, map[string]any{"response": map[string]any{"generateVideoResponse": map[string]any{"generatedVideos": []any{map[string]any{"video": map[string]any{"uri": "https://generativelanguage.googleapis.com/first.mp4"}}, map[string]any{"video": map[string]any{"uri": "https://generativelanguage.googleapis.com/second.mp4"}}}}}}, []string{"video", "video-1"}, []string{"https://generativelanguage.googleapis.com/first.mp4", "https://generativelanguage.googleapis.com/second.mp4"}},
+		} {
+			value, err := item.provider.Engine.Call(t.Context(), "listArtifacts", map[string]any{"status": "SUCCESS", "data": item.data})
+			require.NoError(t, err)
+			var artifacts []struct {
+				Key  string
+				Type string
+			}
+			encoded, err := common.Marshal(value)
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(encoded, &artifacts))
+			require.Len(t, artifacts, 2)
+			for i, key := range item.keys {
+				assert.Equal(t, key, artifacts[i].Key)
+				value, err = item.provider.Engine.Call(t.Context(), "buildContentRequest", map[string]any{"data": item.data, "artifactKey": key, "apiKey": "test-only-key", "clientRequest": map[string]any{"method": "GET"}})
+				require.NoError(t, err)
+				var content struct {
+					URL            string
+					Headers        map[string]string
+					Credentialless bool
+				}
+				encoded, err = common.Marshal(value)
+				require.NoError(t, err)
+				require.NoError(t, common.Unmarshal(encoded, &content))
+				assert.Equal(t, item.urls[i], content.URL)
+				if item.provider == google {
+					assert.Equal(t, "test-only-key", content.Headers["x-goog-api-key"])
+				} else {
+					assert.True(t, content.Credentialless)
+				}
+			}
+		}
+	})
 
 	t.Run("claims every model", func(t *testing.T) {
 		for _, model := range plugin.Meta.Models {

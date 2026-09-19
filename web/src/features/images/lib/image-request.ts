@@ -103,14 +103,65 @@ export function buildImageRequest(options: ImageRequestOptions): {
   ) {
     throw new Error('Invalid image request')
   }
-  if (model.platform === 'gemini' && count !== 1) {
+  if (
+    (model.protocol === 'gemini_native' ||
+      (!model.provider && model.platform === 'gemini')) &&
+    count !== 1
+  ) {
     throw new Error('Gemini accepts one request at a time')
+  }
+  if (model.provider && model.mode === 'async') {
+    if (
+      references.length &&
+      model.supports_edit === false &&
+      !model.supports_reference_generation
+    ) {
+      throw new Error('Invalid image request')
+    }
+    const size =
+      ratio === 'auto'
+        ? 'auto'
+        : OPENAI_SIZES[ratio]?.[['1K', '2K', '4K'].indexOf(resolution)]
+    return {
+      url:
+        references.length && !model.supports_reference_generation
+          ? '/v1/images/edits_async'
+          : '/v1/images/generations_async',
+      body: JSON.stringify({
+        model: model.id,
+        provider: model.provider,
+        prompt: [
+          prompt.trim(),
+          ...parts
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text),
+        ].join('\n'),
+        n: count,
+        ...(model.protocol === 'gemini_native'
+          ? { resolution, ...(ratio === 'auto' ? {} : { aspect_ratio: ratio }) }
+          : { size }),
+        ...(quality ? { quality } : {}),
+        ...(format ? { output_format: format } : {}),
+        ...(background ? { background } : {}),
+        ...(references.length
+          ? {
+              images: references.map((part) => ({
+                image_url: part.image_url.url,
+              })),
+            }
+          : {}),
+      }),
+    }
   }
   const ordered: ImageRequestPart[] = [
     { type: 'text', text: prompt.trim() },
     ...parts,
   ]
-  if (model.platform === 'gemini' && model.mode === 'realtime') {
+  if (
+    (model.protocol === 'gemini_native' ||
+      (!model.provider && model.platform === 'gemini')) &&
+    model.mode === 'realtime'
+  ) {
     return {
       url: `/v1beta/models/${encodeURIComponent(model.id)}:generateContent`,
       body: JSON.stringify({
@@ -146,7 +197,7 @@ export function buildImageRequest(options: ImageRequestOptions): {
       }),
     }
   }
-  if (model.platform === 'gemini') {
+  if (model.platform === 'gemini' && !model.provider) {
     if (model.protocol !== 'gemini_bb') {
       return {
         url: '/v1/images/generations_sc',

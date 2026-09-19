@@ -127,9 +127,30 @@ export const meta = {
     },
   ],
   routes: [
-    { method: "POST", path: "/ali/api/v1/services/aigc/multimodal-generation/generation", type: "submit", models: ["wan2.7-image-pro", "wan2.7-image", "wan2.6-image", "wan2.6-t2i"], decode: "createImageTask", render: "imageCreated" },
-    { method: "POST", path: "/ali/api/v1/services/aigc/image-generation/generation", type: "submit", models: ["wan2.7-image-pro", "wan2.7-image", "wan2.6-image", "wan2.6-t2i"], decode: "createImageTask", render: "taskCreated" },
-    { method: "POST", path: "/ali/api/v1/services/aigc/text2image/image-synthesis", type: "submit", models: ["wan2.5-t2i-preview", "wan2.2-t2i-flash", "wan2.2-t2i-plus", "wanx2.1-t2i-turbo", "wanx2.1-t2i-plus", "wanx2.0-t2i-turbo"], decode: "createImageTask", render: "taskCreated" },
+    {
+      method: "POST",
+      path: "/ali/api/v1/services/aigc/multimodal-generation/generation",
+      type: "submit",
+      models: ["wan2.7-image-pro", "wan2.7-image", "wan2.6-image", "wan2.6-t2i"],
+      decode: "createImageTask",
+      render: "imageCreated",
+    },
+    {
+      method: "POST",
+      path: "/ali/api/v1/services/aigc/image-generation/generation",
+      type: "submit",
+      models: ["wan2.7-image-pro", "wan2.7-image", "wan2.6-image", "wan2.6-t2i"],
+      decode: "createImageTask",
+      render: "taskCreated",
+    },
+    {
+      method: "POST",
+      path: "/ali/api/v1/services/aigc/text2image/image-synthesis",
+      type: "submit",
+      models: ["wan2.5-t2i-preview", "wan2.2-t2i-flash", "wan2.2-t2i-plus", "wanx2.1-t2i-turbo", "wanx2.1-t2i-plus", "wanx2.0-t2i-turbo"],
+      decode: "createImageTask",
+      render: "taskCreated",
+    },
     { method: "POST", path: "/ali/api/v1/services/aigc/video-generation/video-synthesis", type: "submit", decode: "createVideoTask", render: "taskCreated" },
     { method: "POST", path: "/ali/api/v1/services/aigc/image2video/video-synthesis", type: "submit", decode: "createVideoTask", render: "taskCreated" },
     { method: "GET", path: "/ali/api/v1/tasks/:task_id", type: "query", render: "taskStatus" },
@@ -174,7 +195,9 @@ const MODERN_SIZES = {
 };
 
 function modelKey(model) {
-  return String(model || "").replace(/-\d{4}-\d{2}-\d{2}$/, "").replace(/^wan2\.1-/, "wanx2.1-");
+  return String(model || "")
+    .replace(/-\d{4}-\d{2}-\d{2}$/, "")
+    .replace(/^wan2\.1-/, "wanx2.1-");
 }
 
 function modelProfile(model) {
@@ -199,7 +222,20 @@ function convertImage(ctx) {
   if (mode !== "sync" && mode !== "async") throw new Error("upstream_mode must be sync or async");
   if (profile === "legacy" && mode === "sync") throw new Error("this image model only supports asynchronous HTTP calls");
   const parameters = {};
-  for (const key of ["n", "size", "negative_prompt", "prompt_extend", "watermark", "seed", "enable_interleave", "max_images", "enable_sequential", "thinking_mode", "bbox_list", "color_palette"]) {
+  for (const key of [
+    "n",
+    "size",
+    "negative_prompt",
+    "prompt_extend",
+    "watermark",
+    "seed",
+    "enable_interleave",
+    "max_images",
+    "enable_sequential",
+    "thinking_mode",
+    "bbox_list",
+    "color_palette",
+  ]) {
     if (req[key] !== undefined) parameters[key] = req[key];
   }
   Object.assign(parameters, objectValue(metadata.parameters, "metadata.parameters"));
@@ -240,7 +276,13 @@ function convertImage(ctx) {
   }
   let imageCount = 0;
   if (profile !== "legacy") {
-    if (!Array.isArray(input.messages) || input.messages.length !== 1 || !input.messages[0] || input.messages[0].role !== "user" || !Array.isArray(input.messages[0].content))
+    if (
+      !Array.isArray(input.messages) ||
+      input.messages.length !== 1 ||
+      !input.messages[0] ||
+      input.messages[0].role !== "user" ||
+      !Array.isArray(input.messages[0].content)
+    )
       throw new Error("input.messages must contain one user message with a content array");
     let texts = 0;
     for (const part of input.messages[0].content) {
@@ -257,7 +299,8 @@ function convertImage(ctx) {
     if (texts !== 1) throw new Error("input.messages must contain exactly one text prompt");
     const maxInput = profile === "image27" ? 9 : profile === "image26" ? (parameters.enable_interleave ? 1 : 4) : 0;
     if (imageCount > maxInput) throw new Error("too many input images for this model");
-    if (profile === "image26" && !parameters.enable_interleave && imageCount === 0) throw new Error("wan2.6-image editing requires a reference image; use wan2.6-t2i for text-to-image");
+    if (profile === "image26" && !parameters.enable_interleave && imageCount === 0)
+      throw new Error("wan2.6-image editing requires a reference image; use wan2.6-t2i for text-to-image");
   }
   if (parameters.size !== undefined) {
     if (typeof parameters.size !== "string") throw new Error("size must be a string");
@@ -269,14 +312,29 @@ function convertImage(ctx) {
     } else {
       const match = /^(\d+)\*(\d+)$/.exec(parameters.size);
       if (!match) throw new Error("size must be width*height or a supported resolution preset");
-      const width = Number(match[1]), height = Number(match[2]);
+      const width = Number(match[1]),
+        height = Number(match[2]);
       const legacySize = profile === "legacy" && modelKey(model) !== "wan2.5-t2i-preview";
-      const maxPixels = profile === "image27" ? (supports4K ? 4096 * 4096 : 2048 * 2048)
-        : profile === "image26" ? (parameters.enable_interleave ? 1280 * 1280 : 2048 * 2048) : 1440 * 1440;
+      const maxPixels =
+        profile === "image27"
+          ? supports4K
+            ? 4096 * 4096
+            : 2048 * 2048
+          : profile === "image26"
+            ? parameters.enable_interleave
+              ? 1280 * 1280
+              : 2048 * 2048
+            : 1440 * 1440;
       const ratio = profile === "image27" ? 8 : 4;
-      if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0
-        || (legacySize ? width < 512 || height < 512 || width > 1440 || height > 1440
-          : width * height > maxPixels || width / height > ratio || height / width > ratio))
+      if (
+        !Number.isSafeInteger(width) ||
+        !Number.isSafeInteger(height) ||
+        width <= 0 ||
+        height <= 0 ||
+        (legacySize
+          ? width < 512 || height < 512 || width > 1440 || height > 1440
+          : width * height > maxPixels || width / height > ratio || height / width > ratio)
+      )
         throw new Error("size is outside the model's pixel and aspect-ratio limits");
     }
   }
@@ -296,7 +354,7 @@ function imageContent(body) {
     if (result && typeof result.url === "string" && result.url) content.push({ image: result.url });
   }
   for (const choice of Array.isArray(output.choices) ? output.choices : []) {
-    for (const part of (choice && choice.message && Array.isArray(choice.message.content)) ? choice.message.content : []) {
+    for (const part of choice && choice.message && Array.isArray(choice.message.content) ? choice.message.content : []) {
       if (part && typeof part.image === "string" && part.image) content.push({ image: part.image });
       else if (part && typeof part.text === "string") content.push({ text: part.text });
     }
@@ -307,7 +365,9 @@ function imageContent(body) {
 function imageUsage(body) {
   const count = (body.usage || {}).image_count;
   const content = imageContent(body);
-  const images = content.filter(function (part) { return part.image; });
+  const images = content.filter(function (part) {
+    return part.image;
+  });
   if (count !== undefined) {
     // Do not let fractional, negative or oversized upstream counts change billing.
     if (!Number.isInteger(count) || count < 0 || count > 12 || (images.length && count === 0)) throw new Error("invalid upstream image_count");
@@ -372,7 +432,13 @@ function videoSize(value) {
 function videoAction(req) {
   const input = objectValue((req.metadata || {}).input, "metadata.input");
   for (const source of [req, input]) {
-    if (firstImage(source) || trimmed(source.img_url) || trimmed(source.image_url) || trimmed(source.first_frame_url) || (Array.isArray(source.media) && source.media.length))
+    if (
+      firstImage(source) ||
+      trimmed(source.img_url) ||
+      trimmed(source.image_url) ||
+      trimmed(source.first_frame_url) ||
+      (Array.isArray(source.media) && source.media.length)
+    )
       return "image_to_video";
   }
   return "text_to_video";
@@ -437,7 +503,8 @@ function convert(ctx) {
   const duration = rawDuration == null ? 5 : Number(rawDuration);
   if (duration === -1 && profile.kind !== "all") throw new Error("duration -1 (smart duration) is only supported by wan3.0 models");
   if (profile.kind === "speech") {
-    if (rawDuration != null && (!Number.isFinite(duration) || duration <= 0 || duration >= 20)) throw new Error("wan2.2-s2v duration must be positive and less than 20 seconds; output follows the audio");
+    if (rawDuration != null && (!Number.isFinite(duration) || duration <= 0 || duration >= 20))
+      throw new Error("wan2.2-s2v duration must be positive and less than 20 seconds; output follows the audio");
     delete parameters.duration;
   } else {
     if (profile.durations) {
@@ -474,7 +541,8 @@ function convert(ctx) {
     } else {
       const frames = counts.first_frame || counts.last_frame;
       const references = counts.reference_image || counts.reference_video || counts.reference_audio || counts.file || counts.link;
-      if ((frames && references) || (counts.file && counts.link) || (counts.last_frame && !counts.first_frame)) throw new Error("unsupported wan3.0 input.media combination");
+      if ((frames && references) || (counts.file && counts.link) || (counts.last_frame && !counts.first_frame))
+        throw new Error("unsupported wan3.0 input.media combination");
       if (!trimmed(input.prompt) && !input.media.length) throw new Error("wan3.0-video requires prompt or input.media");
     }
     if (!input.media.length) delete input.media;
@@ -560,7 +628,11 @@ function responsesVideoText(ctx) {
   const artifact = ctx && ctx.artifacts && ctx.artifacts.video;
   const url = trimmed(artifact && artifact.url);
   if (!url) throw new Error("video artifact is unavailable");
-  const escaped = url.replace(/&/g, "&amp;").replace(/\u0022/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const escaped = url
+    .replace(/&/g, "&amp;")
+    .replace(/\u0022/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
   return '<video controls src="' + escaped + '"></video>';
 }
 
@@ -571,7 +643,7 @@ function responsesOutputText(ctx, task) {
   let index = 0;
   for (const part of content) {
     if (part.image) {
-      const key = "image-" + (++index);
+      const key = "image-" + ++index;
       const artifact = (ctx.artifacts || {})[key];
       if (!artifact || !artifact.url) throw new Error("image artifact is unavailable");
       parts.push("![Image " + index + "](<" + artifact.url + ">)");
@@ -587,7 +659,14 @@ export function buildSubmitRequest(ctx) {
     if (!converted.synchronous) headers["X-DashScope-Async"] = "enable";
     const streaming = converted.synchronous && converted.body.parameters.enable_interleave === true;
     if (streaming) headers["X-DashScope-Sse"] = "enable";
-    return { url: ctx.baseUrl + "/api/v1/services/aigc/" + converted.service, method: "POST", headers: headers, body: converted.body, action: converted.action, responseType: streaming ? "sse" : "json" };
+    return {
+      url: ctx.baseUrl + "/api/v1/services/aigc/" + converted.service,
+      method: "POST",
+      headers: headers,
+      body: converted.body,
+      action: converted.action,
+      responseType: streaming ? "sse" : "json",
+    };
   }
   const body = convert(ctx);
   const kind = modelProfile(body.model).kind;
@@ -658,7 +737,9 @@ export function parseSubmitResponse(ctx, resp) {
   if (body.code) throw new Error(body.code + ": " + (body.message || ""));
   if (imageModel(ctx) && convertImage(ctx).synchronous) {
     const content = imageContent(body);
-    const images = content.filter(function (part) { return part.image; });
+    const images = content.filter(function (part) {
+      return part.image;
+    });
     const interleaved = convertImage(ctx).body.parameters.enable_interleave === true;
     if ((!images.length && !(interleaved && content.length)) || (body.output || {}).finished === false)
       throw new Error("synchronous image response has no completed output");
@@ -738,9 +819,17 @@ export function parseTaskResult(ctx, body) {
   if (output.task_status === "SUCCEEDED") {
     if (imageModel(ctx)) {
       const content = imageContent(body);
-      const images = content.filter(function (part) { return part.image; });
+      const images = content.filter(function (part) {
+        return part.image;
+      });
       if (!images.length) {
-        if (imageModel(ctx) === "image26" && content.some(function (part) { return trimmed(part.text); })) return { status: "SUCCESS" };
+        if (
+          imageModel(ctx) === "image26" &&
+          content.some(function (part) {
+            return trimmed(part.text);
+          })
+        )
+          return { status: "SUCCESS" };
         return { status: "FAILURE", reason: "image task succeeded without any images" };
       }
       return { status: "SUCCESS", url: images[0].image };
@@ -770,8 +859,13 @@ function videoURL(body) {
 export function listArtifacts(task) {
   if (task.status !== "SUCCESS") return [];
   const body = artifactData(task);
-  const images = imageContent(body).filter(function (part) { return part.image; });
-  if (images.length) return images.map(function (_, index) { return { key: "image-" + (index + 1), type: "image" }; });
+  const images = imageContent(body).filter(function (part) {
+    return part.image;
+  });
+  if (images.length)
+    return images.map(function (_, index) {
+      return { key: "image-" + (index + 1), type: "image" };
+    });
   return videoURL(body) ? [{ key: "video", type: "video" }] : [];
 }
 
@@ -779,8 +873,12 @@ export function buildContentRequest(ctx) {
   let url;
   if (ctx.artifactKey === "video") url = videoURL(artifactData(ctx));
   else {
-    const images = imageContent(artifactData(ctx)).filter(function (part) { return part.image; });
-    const index = images.findIndex(function (_, index) { return ctx.artifactKey === "image-" + (index + 1); });
+    const images = imageContent(artifactData(ctx)).filter(function (part) {
+      return part.image;
+    });
+    const index = images.findIndex(function (_, imageIndex) {
+      return ctx.artifactKey === "image-" + (imageIndex + 1);
+    });
     url = index >= 0 ? images[index].image : "";
   }
   if (!url) throw new Error("artifact_not_found");
@@ -789,9 +887,11 @@ export function buildContentRequest(ctx) {
 
 export const native = {
   createImageTask: function (ctx) {
-    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value))
+      throw new Error("JSON object required");
     const req = ctx.body.value;
-    if (req.stream !== undefined && req.stream !== false) throw new Error("native task responses are aggregated JSON; configure upstream streaming in parameters");
+    if (req.stream !== undefined && req.stream !== false)
+      throw new Error("native task responses are aggregated JSON; configure upstream streaming in parameters");
     const requestBody = {
       model: req.model,
       metadata: {
@@ -806,7 +906,8 @@ export const native = {
     return task.data || {};
   },
   createVideoTask: function (ctx) {
-    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+    if (!ctx.body || ctx.body.kind !== "json" || !ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value))
+      throw new Error("JSON object required");
     const req = ctx.body.value,
       input = objectValue(req.input, "input"),
       parameters = objectValue(req.parameters, "parameters");
@@ -858,9 +959,25 @@ export const protocols = {
       if (images.length) requestBody.images = images;
       if (trimmed(req.input_reference)) requestBody.input_reference = trimmed(req.input_reference);
       for (const key of [
-        "size", "resolution", "ratio", "duration", "seconds", "auto_duration",
-        "prompt_extend", "watermark", "audio", "seed", "shot_type", "negative_prompt",
-        "img_url", "image_url", "first_frame_url", "last_frame_url", "audio_url", "template", "media",
+        "size",
+        "resolution",
+        "ratio",
+        "duration",
+        "seconds",
+        "auto_duration",
+        "prompt_extend",
+        "watermark",
+        "audio",
+        "seed",
+        "shot_type",
+        "negative_prompt",
+        "img_url",
+        "image_url",
+        "first_frame_url",
+        "last_frame_url",
+        "audio_url",
+        "template",
+        "media",
       ]) {
         if (Object.prototype.hasOwnProperty.call(req, key)) requestBody[key] = req[key];
       }
@@ -942,7 +1059,7 @@ export const protocols = {
           let parsed;
           try {
             parsed = JSON.parse(req.metadata);
-          } catch (e) {
+          } catch {
             throw new Error("metadata must be a JSON object string");
           }
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("metadata must be a JSON object string");

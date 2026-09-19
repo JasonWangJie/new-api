@@ -2,13 +2,13 @@ package replicate
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -111,12 +111,15 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 
 	if len(request.OutputFormat) > 0 {
 		var outputFormat string
-		if err := json.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
+		if err := common.Unmarshal(request.OutputFormat, &outputFormat); err == nil && strings.TrimSpace(outputFormat) != "" {
 			inputPayload["output_format"] = outputFormat
 		}
 	}
 
 	if imageN := lo.FromPtrOr(request.N, uint(0)); imageN > 0 {
+		if imageN > dto.MaxImageN {
+			return nil, errors.New("invalid image output count")
+		}
 		inputPayload["num_outputs"] = int(imageN)
 	}
 
@@ -165,6 +168,19 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 		}
 		inputPayload[key] = val
 	}
+	if value, present := inputPayload["num_outputs"]; present {
+		raw, err := common.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		var count uint
+		if err := common.Unmarshal(raw, &count); err != nil || count < 1 || count > dto.MaxImageN {
+			return nil, errors.New("invalid image output count")
+		}
+		if request.N != nil && *request.N != count {
+			return nil, errors.New("num_outputs conflicts with image n")
+		}
+	}
 
 	return map[string]any{
 		"input": inputPayload,
@@ -191,7 +207,20 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return nil, types.NewError(fmt.Errorf("replicate adaptor: failed to decode response: %w", err), types.ErrorCodeBadResponseBody)
 	}
 
+	if c.GetBool("async_image_execution") && prediction.ID != "" {
+		hook, _ := c.Get("async_image_upstream_job")
+		record, ok := hook.(func(string) error)
+		if !ok {
+			return nil, types.NewError(errors.New("image job persistence is unavailable"), types.ErrorCodeBadResponse)
+		}
+		if err := record(prediction.ID); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponse)
+		}
+	}
 	if prediction.Error != nil {
+		if c.GetBool("async_image_execution") {
+			return nil, types.NewError(&service.AsyncImageFailure{Code: 610, InternalCode: "upstream_job_failed", Message: "Upstream image task failed"}, types.ErrorCodeBadResponse)
+		}
 		errMsg := prediction.Error.Message
 		if errMsg == "" {
 			errMsg = prediction.Error.Detail
@@ -205,7 +234,25 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return nil, types.NewError(errors.New(errMsg), types.ErrorCodeBadResponse)
 	}
 
+	if c.GetBool("async_image_execution") && (prediction.Status == "starting" || prediction.Status == "processing") {
+		id := prediction.ID
+		if id == "" {
+			id = c.GetString("async_image_resume_task")
+		}
+		hook, _ := c.Get("async_image_upstream_job")
+		record, ok := hook.(func(string) error)
+		if !ok || id == "" {
+			return nil, types.NewError(errors.New("prediction task ID is missing"), types.ErrorCodeBadResponse)
+		}
+		if err := record(id); err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponse)
+		}
+		return nil, types.NewError(&service.AsyncImagePending{TaskId: id}, types.ErrorCodeBadResponse)
+	}
 	if prediction.Status != "" && !strings.EqualFold(prediction.Status, "succeeded") {
+		if c.GetBool("async_image_execution") && (prediction.Status == "failed" || prediction.Status == "canceled") {
+			return nil, types.NewError(&service.AsyncImageFailure{Code: 610, InternalCode: "upstream_job_failed", Message: "Upstream image task failed"}, types.ErrorCodeBadResponse)
+		}
 		return nil, types.NewError(fmt.Errorf("replicate adaptor: prediction status %q", prediction.Status), types.ErrorCodeBadResponse)
 	}
 
@@ -247,7 +294,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		}
 	}
 
-	wantsBase64 := imageReq != nil && strings.EqualFold(imageReq.ResponseFormat, "b64_json")
+	wantsBase64 := !c.GetBool("async_image_execution") && imageReq != nil && strings.EqualFold(imageReq.ResponseFormat, "b64_json")
 
 	imageResponse := dto.ImageResponse{
 		Created: common.GetTimestamp(),
@@ -528,4 +575,25 @@ func (a *Adaptor) ConvertClaudeRequest(*gin.Context, *relaycommon.RelayInfo, *dt
 
 func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
 	return nil, errors.New("replicate adaptor: ConvertGeminiRequest is not implemented")
+}
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"black-forest-labs/flux*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, EditFormat: "multipart", Provider: "replicate", Protocol: "openai_images", Generate: true, Edit: true}
+}
+
+func (a *Adaptor) PollImage(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (*http.Response, error) {
+	base := info.ChannelBaseUrl
+	if base == "" {
+		base = constant.GetChannelBaseURL(constant.ChannelTypeReplicate)
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, strings.TrimRight(base, "/")+"/v1/predictions/"+url.PathEscape(taskID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
+	client, err := service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
 }

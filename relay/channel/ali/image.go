@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -297,6 +298,9 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 	if imageReq, ok := info.Request.(*dto.ImageRequest); ok {
 		responseFormat = imageReq.ResponseFormat
 	}
+	if c.GetBool("async_image_execution") {
+		responseFormat = "url"
+	}
 
 	var aliTaskResponse AliResponse
 	responseBody, err := io.ReadAll(resp.Body)
@@ -319,7 +323,7 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 		originRespBody []byte
 	)
 
-	if a.IsSyncImageModel {
+	if a.IsSyncImageModel || c.GetBool("async_image_execution") {
 		aliResponse = &aliTaskResponse
 		originRespBody = responseBody
 	} else {
@@ -338,6 +342,30 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 		}
 	}
 
+	if !a.IsSyncImageModel && c.GetBool("async_image_execution") {
+		id := aliTaskResponse.Output.TaskId
+		if id == "" {
+			id = c.GetString("async_image_resume_task")
+		}
+		if id == "" {
+			return types.NewError(errors.New("Ali image task ID is missing"), types.ErrorCodeBadResponse), nil
+		}
+		hook, _ := c.Get("async_image_upstream_job")
+		record, ok := hook.(func(string) error)
+		if !ok {
+			return types.NewError(errors.New("image job persistence is unavailable"), types.ErrorCodeBadResponse), nil
+		}
+		if err := record(id); err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponse), nil
+		}
+		switch aliTaskResponse.Output.TaskStatus {
+		case "PENDING", "RUNNING", "":
+			return types.NewError(&service.AsyncImagePending{TaskId: id}, types.ErrorCodeBadResponse), nil
+		case "SUCCEEDED":
+		default:
+			return types.NewError(&service.AsyncImageFailure{Code: 610, InternalCode: "upstream_job_failed", Message: "Upstream image task failed"}, types.ErrorCodeBadResponse), nil
+		}
+	}
 	if a.IsSyncImageModel {
 		logger.LogDebug(c, "ali_sync_image_result: %s", originRespBody)
 	} else {
@@ -365,4 +393,21 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 	service.IOCopyBytesGracefully(c, resp, jsonResponse)
 
 	return nil, &dto.Usage{}
+}
+
+func (a *Adaptor) PollImage(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (*http.Response, error) {
+	base := info.ChannelBaseUrl
+	if base == "" {
+		base = "https://dashscope.aliyuncs.com"
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, strings.TrimRight(base, "/")+"/api/v1/tasks/"+url.PathEscape(taskID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
+	client, err := service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
 }

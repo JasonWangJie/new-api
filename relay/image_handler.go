@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -83,7 +84,12 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			}
 		}
 	} else {
-		convertedRequest, err := adaptor.ConvertImageRequest(c, info, *request)
+		var convertedRequest any
+		if c.GetString("async_image_resume_task") != "" {
+			convertedRequest = request
+		} else {
+			convertedRequest, err = adaptor.ConvertImageRequest(c, info, *request)
+		}
 		if err != nil {
 			return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
 		}
@@ -96,6 +102,21 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			jsonData, err = common.Marshal(convertedRequest)
 			if err != nil {
 				return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
+			if c.GetBool("async_image_execution") {
+				if info.ApiType != constant.APITypeAli && info.ApiType != constant.APITypeReplicate && info.ApiType != constant.APITypeGemini && info.ApiType != constant.APITypeVertexAi {
+					var fields map[string]common.RawMessage
+					if err := common.Unmarshal(jsonData, &fields); err != nil {
+						return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
+					}
+					for key, value := range request.Extra {
+						fields[key] = value
+					}
+					jsonData, err = common.Marshal(fields)
+					if err != nil {
+						return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
+					}
+				}
 			}
 
 			// apply param override
@@ -118,6 +139,42 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		if err := common.Unmarshal(jsonData, &outbound); err != nil {
 			return nil, types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
+		if c.GetBool("async_image_execution") {
+			var fields map[string]common.RawMessage
+			if err := common.Unmarshal(jsonData, &fields); err != nil {
+				return nil, types.NewError(err, types.ErrorCodeInvalidRequest)
+			}
+			quantities := make(map[string]common.RawMessage)
+			for _, key := range []string{"batch_size", "num_outputs"} {
+				if raw, ok := fields[key]; ok {
+					quantities[key] = raw
+				}
+			}
+			if raw, ok := fields["input"]; ok {
+				var input map[string]common.RawMessage
+				if err := common.Unmarshal(raw, &input); err != nil {
+					return nil, types.NewErrorWithStatusCode(fmt.Errorf("invalid provider image input: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				if count, exists := input["num_outputs"]; exists {
+					quantities["input.num_outputs"] = count
+				}
+			}
+			if raw, ok := fields["sequential_image_generation_options"]; ok {
+				var options map[string]common.RawMessage
+				if err := common.Unmarshal(raw, &options); err != nil {
+					return nil, types.NewErrorWithStatusCode(fmt.Errorf("invalid sequential image options: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				if count, exists := options["max_images"]; exists {
+					quantities["sequential_image_generation_options.max_images"] = count
+				}
+			}
+			for name, raw := range quantities {
+				var count uint
+				if common.Unmarshal(raw, &count) != nil || count < 1 || count > dto.MaxImageN || int(count) != imageCount {
+					return nil, types.NewErrorWithStatusCode(fmt.Errorf("%s conflicts with the validated image count", name), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+			}
+		}
 		quantityRequest := dto.ImageRequest{N: outbound.N, BillingParameters: outbound.Parameters}
 		if quantityRequest.N == nil {
 			quantityRequest.N = common.GetPointer(uint(imageCount))
@@ -126,7 +183,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		if err != nil {
 			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		promptExtend = outbound.Parameters != nil && outbound.Parameters.PromptExtend != nil && *outbound.Parameters.PromptExtend
+		if outbound.Parameters != nil {
+			promptExtend = outbound.Parameters.PromptExtend != nil && *outbound.Parameters.PromptExtend
+		} else if c.GetString("async_image_resume_task") == "" {
+			promptExtend = false
+		}
 		if info.ChannelType == constant.ChannelTypeAli {
 			// Always send the same explicit quantity that is reserved, including
 			// when an empty parameters object accompanies a top-level n.
@@ -159,13 +220,22 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	if err := c.Request.Context().Err(); err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 	}
-	if beforeInvoke != nil {
+	if beforeInvoke != nil && c.GetString("async_image_resume_task") == "" {
 		if err := beforeInvoke(); err != nil {
 			return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 		}
 	}
 
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	var resp any
+	if taskId := c.GetString("async_image_resume_task"); taskId != "" {
+		if provider, ok := adaptor.(channel.AsyncImagePollingProvider); ok {
+			resp, err = provider.PollImage(c, info, taskId)
+		} else {
+			err = fmt.Errorf("image adaptor cannot resume upstream jobs")
+		}
+	} else {
+		resp, err = adaptor.DoRequest(c, info, requestBody)
+	}
 	if err != nil {
 		if reserve {
 			_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, false, circuit)
@@ -185,7 +255,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		}
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
-			if httpResp.StatusCode == http.StatusCreated && info.ApiType == constant.APITypeReplicate {
+			if (httpResp.StatusCode == http.StatusCreated && info.ApiType == constant.APITypeReplicate) || (c.GetBool("async_image_execution") && httpResp.StatusCode == http.StatusAccepted && info.ApiType == constant.APITypeAli) {
 				// replicate channel returns 201 Created when using Prefer: wait, treat it as success.
 				httpResp.StatusCode = http.StatusOK
 			} else {

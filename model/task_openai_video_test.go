@@ -91,3 +91,13 @@ func TestTaskToOpenAIVideoStatusAndCompletedAt(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskPrivateDataPersistsAsyncMediaMarker(t *testing.T) {
+	value, err := (TaskPrivateData{AsyncMedia: true}).Value()
+	require.NoError(t, err)
+	require.NotNil(t, value)
+
+	var decoded TaskPrivateData
+	require.NoError(t, common.UnmarshalJsonStr(value.(string), &decoded))
+	assert.True(t, decoded.AsyncMedia)
+}

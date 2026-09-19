@@ -145,7 +145,7 @@ function LegacyAudioPreview(props: { data: unknown }) {
   )
 }
 
-function ArtifactMedia(props: {
+export function ArtifactMedia(props: {
   artifact: TaskArtifact
   mediaUrl: string
   onError: () => void

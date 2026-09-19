@@ -17,6 +17,10 @@ type AsyncImageFailure struct {
 	ExecutionUnknown bool
 }
 
+type AsyncImagePending struct{ TaskId string }
+
+func (pending *AsyncImagePending) Error() string { return "upstream image job is pending" }
+
 func (failure *AsyncImageFailure) Error() string { return failure.Message }
 
 func ImageRetryAfter(value string, now time.Time) time.Duration {

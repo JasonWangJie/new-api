@@ -45,7 +45,12 @@ import { hasPermission } from '@/lib/admin-permissions'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getImageTask, getImageTasks, imageRequest, imageTasksPath } from './api'
+import {
+  getImageTask,
+  getImageTasks,
+  imageRequest,
+  mediaTasksPath,
+} from './api'
 import {
   ImagePlatformBadge,
   ImageRequestTypeBadge,
@@ -118,6 +123,9 @@ function TaskCenterSession({
     billing_status: '',
     request_type: '',
     storage_provider: '',
+    provider: '',
+    media_type: '',
+    stage: '',
   })
   const [filters, setFilters] = useState(draft)
   const [pagination, setPagination] = useState<PaginationState>({
@@ -190,7 +198,9 @@ function TaskCenterSession({
                 variant='link'
                 className='h-auto min-w-0 flex-1 justify-start overflow-hidden p-0 font-mono text-[11px]'
                 title={row.original.id}
-                onClick={() => startTransition(() => setDetail(row.original.id))}
+                onClick={() =>
+                  startTransition(() => setDetail(row.original.id))
+                }
                 onMouseEnter={() => {
                   void queryClient.prefetchQuery({
                     queryKey: [
@@ -257,7 +267,9 @@ function TaskCenterSession({
         header: t('Platform'),
         cell: ({ row }) => (
           <div className='space-y-1.5 text-xs'>
-            <ImagePlatformBadge platform={row.original.platform} />
+            <ImagePlatformBadge
+              platform={row.original.provider || row.original.platform}
+            />
             <ImageRequestTypeBadge
               requestType={row.original.request_type}
               className='font-normal'
@@ -311,10 +323,7 @@ function TaskCenterSession({
         id: 'image_count',
         accessorKey: 'image_count',
         header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t('Images / storage')}
-          />
+          <DataTableColumnHeader column={column} title={t('Media / storage')} />
         ),
         cell: ({ row }) => (
           <span className='text-xs tabular-nums'>
@@ -376,7 +385,9 @@ function TaskCenterSession({
                 : 'text-muted-foreground font-mono text-xs'
             }
           >
-            {['succeeded', 'not_billable'].includes(row.original.billing_status)
+            {['succeeded', 'not_billable', 'settled', 'reserved'].includes(
+              row.original.billing_status
+            )
               ? `US$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
               : '—'}
           </span>
@@ -409,7 +420,7 @@ function TaskCenterSession({
               <Eye className='size-3.5' aria-hidden />
               {t('View')}
             </Button>
-            {canManage && row.original.can_resume && (
+            {(canManage || !admin) && row.original.can_resume && (
               <Button
                 size='sm'
                 variant='outline'
@@ -420,19 +431,23 @@ function TaskCenterSession({
                 {t('Resume')}
               </Button>
             )}
-            {canManage && row.original.can_terminate && (
-              <Button
-                size='icon-sm'
-                variant='ghost'
-                aria-label={t('Terminate')}
-                title={t('Terminate')}
-                onClick={() =>
-                  setOperation({ ids: [row.original.id], action: 'terminate' })
-                }
-              >
-                <Ban className='size-3.5' aria-hidden />
-              </Button>
-            )}
+            {(canManage || (!admin && row.original.media_type === 'video')) &&
+              row.original.can_terminate && (
+                <Button
+                  size='icon-sm'
+                  variant='ghost'
+                  aria-label={t('Terminate')}
+                  title={t('Terminate')}
+                  onClick={() =>
+                    setOperation({
+                      ids: [row.original.id],
+                      action: 'terminate',
+                    })
+                  }
+                >
+                  <Ban className='size-3.5' aria-hidden />
+                </Button>
+              )}
           </div>
         ),
         enableSorting: false,
@@ -479,21 +494,27 @@ function TaskCenterSession({
     setBusy(true)
     try {
       if (operation.action === 'batch-terminate') {
-        const response = await imageRequest<{
-          items: { task_id: string; status: string; message?: string }[]
-        }>(`${imageTasksPath(true)}/batch-terminate`, 'POST', {
-          task_ids: operation.ids,
-        })
-        setFeedback(
-          response.items.map((item) => ({
-            id: item.task_id,
-            status: item.status,
-            reason: item.message,
-          }))
-        )
+        const items: { id: string; status: string; reason?: string }[] = []
+        for (const id of operation.ids) {
+          try {
+            await imageRequest(
+              `${mediaTasksPath(true)}/${id}/terminate`,
+              'POST'
+            )
+            items.push({ id, status: 'terminated' })
+          } catch (error) {
+            items.push({
+              id,
+              status: 'failed',
+              reason:
+                error instanceof Error ? error.message : t('Operation failed'),
+            })
+          }
+        }
+        setFeedback(items)
       } else {
         await imageRequest(
-          `${imageTasksPath(true)}/${operation.ids[0]}/${operation.action}`,
+          `${mediaTasksPath(admin)}/${operation.ids[0]}/${operation.action}`,
           'POST',
           {}
         )
@@ -562,7 +583,7 @@ function TaskCenterSession({
   return (
     <SectionPageLayout fixedContent stackActionsOnMobile>
       <SectionPageLayout.Title>
-        {t(admin ? 'Admin Image Tasks' : 'Async Image Tasks')}
+        {t('Media task center')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Actions>
         <Button
@@ -660,13 +681,36 @@ function TaskCenterSession({
                     }
                   />
                   <ImageSelect
-                    label={t('Platform')}
-                    value={draft.platform}
-                    options={choices(['openai', 'gemini'])}
+                    label={t('Media type')}
+                    value={draft.media_type}
+                    options={[
+                      { value: '', label: t('All') },
+                      { value: 'image', label: t('Image') },
+                      { value: 'video', label: t('Video') },
+                    ]}
                     onChange={(value) =>
-                      setDraft((previous) => ({ ...previous, platform: value }))
+                      setDraft((previous) => ({
+                        ...previous,
+                        media_type: value,
+                      }))
                     }
                   />
+                  <ImageSelect
+                    label={t('Phase')}
+                    value={draft.stage}
+                    options={[
+                      { value: '', label: t('All') },
+                      { value: 'queued', label: t('Queued') },
+                      { value: 'generating', label: t('Generating') },
+                      { value: 'saving', label: t('Saving') },
+                      { value: 'completed', label: t('Completed') },
+                      { value: 'failed', label: t('Failed') },
+                    ]}
+                    onChange={(value) =>
+                      setDraft((previous) => ({ ...previous, stage: value }))
+                    }
+                  />
+                  {field('provider', 'Provider')}
                   <ImageSelect
                     label={t('Request type')}
                     value={draft.request_type}

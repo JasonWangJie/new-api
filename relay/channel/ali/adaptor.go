@@ -275,3 +275,7 @@ func (a *Adaptor) GetModelList() []string {
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
+
+func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
+	return dto.ImageCapability{Models: []string{"qwen-image*", "z-image*", "wan2.7-image*", "wan2.6-image*", "wan2.6-t2i*", "wan2.5-t2i*", "wan2.2-t2i*", "wanx*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, EditFormat: "multipart", Provider: "ali", Protocol: "openai_images", Generate: true, Edit: true}
+}

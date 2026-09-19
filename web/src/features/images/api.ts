@@ -45,13 +45,15 @@ export const getImageCapabilities = (id: number, signal?: AbortSignal) =>
   )
 export const imageTasksPath = (admin: boolean) =>
   `/api/${admin ? 'admin' : 'user'}/async-image-tasks`
+export const mediaTasksPath = (admin: boolean) =>
+  `/api/${admin ? 'admin' : 'user'}/media-tasks`
 export const getImageTasks = (
   admin: boolean,
   params: URLSearchParams,
   signal?: AbortSignal
 ) =>
   imageRequest<ImageTaskList>(
-    `${imageTasksPath(admin)}?${params}`,
+    `${mediaTasksPath(admin)}?${params}`,
     'GET',
     undefined,
     signal
@@ -62,7 +64,7 @@ export const getImageTask = (
   signal?: AbortSignal
 ) =>
   imageRequest<ImageTaskDetail>(
-    `${imageTasksPath(admin)}/${encodeURIComponent(id)}`,
+    `${id.startsWith('asyncimg_') ? imageTasksPath(admin) : mediaTasksPath(admin)}/${encodeURIComponent(id)}`,
     'GET',
     undefined,
     signal
@@ -73,7 +75,7 @@ export const getImageTask = (
 export async function imageRelayRequest(
   url: string,
   token: string,
-  body?: string,
+  body?: string | FormData,
   key?: string,
   signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
@@ -84,7 +86,9 @@ export async function imageRelayRequest(
     signal,
     headers: {
       Authorization: `Bearer ${token.startsWith('sk-') ? token : `sk-${token}`}`,
-      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...(body === undefined || body instanceof FormData
+        ? {}
+        : { 'Content-Type': 'application/json' }),
       ...(key ? { 'Idempotency-Key': key } : {}),
     },
     body,

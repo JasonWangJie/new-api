@@ -48,7 +48,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			previousDB := model.DB
 			model.DB = db
-			entities := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}}
+			entities := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
 				assert.NoError(t, db.Migrator().DropTable(entities...))
@@ -57,6 +57,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					assert.NoError(t, connection.Close())
 				}
 			})
+			require.NoError(t, db.AutoMigrate(entities...))
 			require.NoError(t, db.AutoMigrate(entities...))
 			var version string
 			versionQuery := "SELECT VERSION()"
@@ -159,6 +160,69 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			GetImageTask(denied, false)
 			assert.Equal(t, http.StatusNotFound, deniedRecorder.Code)
 			assert.False(t, strings.Contains(deniedRecorder.Body.String(), "Studio Key"))
+
+			recoverable := model.AsyncImageTask{TaskId: "asyncimg_recoverable", UserId: 101, TokenId: 201, Status: model.ImageTaskStorageFailed, ImageCount: 1, CreatedAt: now}
+			require.NoError(t, db.Create(&recoverable).Error)
+			require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: recoverable.TaskId, BillingRequestId: "recoverable-bill", UserId: 101, TokenId: 201, CreatedAt: now}).Error)
+			deniedRecorder = httptest.NewRecorder()
+			denied, _ = gin.CreateTestContext(deniedRecorder)
+			denied.Set("id", 102)
+			denied.Params = gin.Params{{Key: "task_id", Value: recoverable.TaskId}}
+			denied.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			ManageMediaTask(denied, false, "resume")
+			assert.Equal(t, http.StatusNotFound, deniedRecorder.Code)
+			ownerRecorder := httptest.NewRecorder()
+			owner, _ := gin.CreateTestContext(ownerRecorder)
+			owner.Set("id", 101)
+			owner.Params = gin.Params{{Key: "task_id", Value: recoverable.TaskId}}
+			owner.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			ManageMediaTask(owner, false, "resume")
+			require.Equal(t, http.StatusOK, ownerRecorder.Code, ownerRecorder.Body.String())
+			require.NoError(t, db.Where("task_id = ?", recoverable.TaskId).Take(&recoverable).Error)
+			assert.Equal(t, model.ImageTaskUpstreamSucceeded, recoverable.Status)
+
+			video := model.AsyncMediaJob{TaskId: "task-matrix-video", IdentityHash: "matrix-video", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", Group: "default", Status: "submitted", StorageStatus: "failed", BillingStatus: "settled", Quota: 500, CreatedAt: now, ExpiresAt: now + 3600}
+			video, reused, err := model.AcceptAsyncMediaJob(t.Context(), video)
+			require.NoError(t, err)
+			assert.False(t, reused)
+			same, reused, err := model.AcceptAsyncMediaJob(t.Context(), video)
+			require.NoError(t, err)
+			assert.True(t, reused)
+			assert.Equal(t, video.TaskId, same.TaskId)
+			conflict := video
+			conflict.RequestHash = "different"
+			_, _, err = model.AcceptAsyncMediaJob(t.Context(), conflict)
+			assert.ErrorIs(t, err, model.ErrImageConflict)
+			require.NoError(t, db.Model(&video).Updates(map[string]any{"status": "submitted", "storage_status": "failed", "billing_status": "settled"}).Error)
+			for _, owner := range []int{101, 102} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", owner)
+				c.Request = httptest.NewRequest("GET", "/?media_type=video&provider=sora&stage=saving", nil)
+				ListMediaTasks(c, false)
+				require.Equal(t, 200, recorder.Code, recorder.Body.String())
+				var response struct {
+					Data struct {
+						Items []gin.H
+						Total int
+					}
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				if owner == 101 {
+					require.Len(t, response.Data.Items, 1)
+					assert.Equal(t, "video", response.Data.Items[0]["media_type"])
+				} else {
+					assert.Empty(t, response.Data.Items)
+				}
+				assert.NotContains(t, recorder.Body.String(), "token-secret-canary")
+			}
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &video, "matrix-lease", 30)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			duplicate, err := model.ClaimAsyncMediaJob(t.Context(), &video, "other-lease", 30)
+			require.NoError(t, err)
+			assert.False(t, duplicate)
+			require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), video, map[string]any{"lease_token": "", "lease_expires_at": 0}))
 			// A mismatched token owner must never expose another user's key name.
 			task.TokenId = 202
 			items, err := imageTasksToDTO(t.Context(), []model.AsyncImageTask{task}, false, false)

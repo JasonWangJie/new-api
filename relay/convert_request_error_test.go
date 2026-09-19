@@ -46,6 +46,9 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 	for _, tc := range []struct {
 		name, body                                       string
 		tiered, passThrough, insufficient, retryToOpenAI bool
+		async                                            bool
+		channel                                          int
+		overridePath                                     string
 		override                                         any
 		count, status                                    int
 	}{
@@ -56,6 +59,8 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 		{name: "pass-through quantity", body: `{"model":"z-image","n":2,"parameters":{}}`, count: 2, passThrough: true},
 		{name: "zero override rejected", body: `{"model":"z-image","n":1}`, override: 0, status: http.StatusBadRequest},
 		{name: "oversized override rejected", body: `{"model":"z-image","n":1}`, override: 129, status: http.StatusBadRequest},
+		{name: "async nested Replicate override rejected", body: `{"model":"black-forest-labs/flux-schnell","prompt":"a river","n":1}`, async: true, channel: constant.ChannelTypeReplicate, overridePath: "input.num_outputs", override: 129, status: http.StatusBadRequest},
+		{name: "async nested Seedream override rejected", body: `{"model":"doubao-seedream-4-0-250828","n":1,"sequential_image_generation_options":{"max_images":1}}`, async: true, channel: constant.ChannelTypeVolcEngine, overridePath: "sequential_image_generation_options.max_images", override: 129, status: http.StatusBadRequest},
 		{name: "insufficient reservation blocks upstream", body: `{"model":"z-image","n":1}`, override: 4, count: 4, insufficient: true, status: http.StatusForbidden},
 		{name: "retry drops Ali quantity and surcharge", body: `{"model":"z-image","n":1,"parameters":{"n":4,"prompt_extend":true}}`, count: 1, retryToOpenAI: true},
 	} {
@@ -74,7 +79,10 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(tc.body))
 			c.Request.Header.Set("Content-Type", "application/json")
-			channel := constant.ChannelTypeAli
+			channel := tc.channel
+			if channel == 0 {
+				channel = constant.ChannelTypeAli
+			}
 			if tc.retryToOpenAI {
 				channel = constant.ChannelTypeOpenAI
 			}
@@ -82,8 +90,13 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
 			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
 			if tc.override != nil {
-				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"operations": []any{map[string]any{"path": "parameters.n", "mode": "set", "value": tc.override}}})
+				overridePath := tc.overridePath
+				if overridePath == "" {
+					overridePath = "parameters.n"
+				}
+				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"operations": []any{map[string]any{"path": overridePath, "mode": "set", "value": tc.override}}})
 			}
+			c.Set("async_image_execution", tc.async)
 			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
 			require.NoError(t, err)
 			reservation := &imageReservation{held: 20000, limit: 500000}
@@ -109,7 +122,7 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			apiErr := ImageHelper(c, info)
 			require.NotNil(t, apiErr)
 			if tc.status != 0 {
-				assert.Equal(t, tc.status, apiErr.StatusCode)
+				assert.Equal(t, tc.status, apiErr.StatusCode, apiErr.ErrorWithStatusCode())
 				assert.Empty(t, received, "no upstream submission before quantity validation and reservation")
 				return
 			}
@@ -130,6 +143,55 @@ func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAsyncAliResumePreservesFrozenPromptExtensionBilling(t *testing.T) {
+	service.InitHttpClient()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/v1/tasks/job-1", r.URL.Path)
+		assert.Equal(t, "Bearer frozen-key", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := io.WriteString(w, `{"output":{"task_id":"job-1","task_status":"SUCCEEDED","results":[{"url":"https://example.com/result.png"}]},"usage":{"image_count":1}}`)
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader("{}"))
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeAli)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "frozen-key")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "z-image")
+	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{})
+	c.Set("async_image_execution", true)
+	c.Set("async_image_resume_task", "job-1")
+	c.Set("async_image_upstream_job", func(string) error { return nil })
+
+	n, promptExtend := uint(1), true
+	request := &dto.ImageRequest{
+		Model: "z-image",
+		N:     &n,
+		BillingParameters: &dto.ImageBillingParameters{
+			PromptExtend: &promptExtend,
+		},
+	}
+	info := &relaycommon.RelayInfo{
+		Request:         request,
+		OriginModelName: "z-image",
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+		PriceData: hosttypes.PriceData{
+			UsePrice:       true,
+			ModelPrice:     0.04,
+			GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+	result, apiErr := ExecuteImageRequest(c, info, false, nil)
+	require.Nil(t, apiErr)
+	require.NotNil(t, result)
+	assert.Equal(t, float64(common.ZImagePromptExtendMultiplier), info.PriceData.OtherRatios()["prompt_extend"])
+	assert.Equal(t, 40000, info.PriceData.QuotaToPreConsume)
 }
 
 func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T) {

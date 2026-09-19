@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,10 @@ type TaskPollingAdaptor interface {
 	// AdjustBillingOnComplete 在任务到达终态（成功/失败）时由轮询循环调用。
 	// 返回正数触发差额结算（补扣/退还），返回 0 保持预扣费金额不变。
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
+}
+
+type TaskContextPollingAdaptor interface {
+	FetchTaskContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
 }
 
 type BatchTaskPollingAdaptor interface {
@@ -358,6 +363,19 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		if responseItem.TaskInfo.Url != "" {
 			task.PrivateData.ResultURL = responseItem.TaskInfo.Url
 		}
+		if task.Status == model.TaskStatusSuccess {
+			captured, captureErr := CaptureAsyncMediaOutput(ctx, task)
+			if captureErr != nil {
+				logger.LogWarn(ctx, "Async media result spooling failed; storage will retry the completed result")
+			}
+			if captured {
+				task.Data = RedactAsyncMediaData(task.Data)
+				task.PrivateData.PluginState = RedactAsyncMediaData(task.PrivateData.PluginState)
+				if strings.HasPrefix(task.PrivateData.ResultURL, "data:") {
+					task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
+				}
+			}
+		}
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
@@ -421,6 +439,20 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
+		// Accepted media tasks retain their channel credentials independently of
+		// later channel deletion. Only legacy tasks require a live channel here.
+		for _, upstreamID := range taskIds {
+			if task := taskM[upstreamID]; task != nil && task.PrivateData.AsyncMedia {
+				frozen, freezeErr := FrozenAsyncMediaChannel(ctx, task)
+				if freezeErr != nil {
+					return freezeErr
+				}
+				cacheGetChannel, err = frozen, nil
+				break
+			}
+		}
+	}
+	if err != nil {
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
@@ -453,6 +485,11 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if task := taskM[taskId]; task != nil && !task.PrivateData.AsyncMedia {
+			if _, err := model.CacheGetChannel(channelId); err != nil {
+				continue
+			}
+		}
 		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
 		}
@@ -474,6 +511,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if task := taskM[taskId]; task != nil {
+		frozen, err := FrozenAsyncMediaChannel(ctx, task)
+		if err != nil {
+			return err
+		}
+		if frozen != nil {
+			ch = frozen
+		}
+	}
 	baseURL := constant.GetChannelBaseURL(ch.Type)
 	if ch.GetBaseURL() != "" {
 		baseURL = ch.GetBaseURL()
@@ -492,17 +538,40 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	snap := task.Snapshot()
-	resp, err := adaptor.FetchTask(baseURL, key, task, proxy)
+	var resp *http.Response
+	var err error
+	responseLimit := int64(64 << 20)
+	if task.PrivateData.AsyncMedia {
+		cfg, configErr := GetMediaRuntimeConfig(ctx)
+		if configErr != nil {
+			return configErr
+		}
+		pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
+		defer cancel()
+		poller, ok := adaptor.(TaskContextPollingAdaptor)
+		if !ok {
+			return errors.New("video provider does not support bounded polling")
+		}
+		responseLimit = cfg.MaxFileBytes*4 + (1 << 20)
+		resp, err = poller.FetchTaskContext(pollContext, baseURL, key, task, proxy)
+	} else {
+		resp, err = adaptor.FetchTask(baseURL, key, task, proxy)
+	}
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, responseLimit+1))
 	if err != nil {
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
 	}
+	if int64(len(responseBody)) > responseLimit {
+		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "video result metadata byte limit exceeded")
+	}
 
-	logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	if !task.PrivateData.AsyncMedia {
+		logger.LogDebug(ctx, "updateVideoSingleTask response: %s", responseBody)
+	}
 
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
@@ -530,7 +599,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
 	}
 
-	logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
+	if !task.PrivateData.AsyncMedia {
+		logger.LogDebug(ctx, "updateVideoSingleTask taskResult: %+v", taskResult)
+	}
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
 	if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
@@ -540,7 +611,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
 	}
 
-	task.Data = redactVideoResponseBody(responseBody)
+	task.Data = responseBody
 	if len(taskResult.PluginState) > 0 {
 		task.PrivateData.PluginState = taskResult.PluginState
 	}
@@ -593,6 +664,17 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
 	}
+	if task.Status == model.TaskStatusSuccess {
+		captured, captureErr := CaptureAsyncMediaOutput(ctx, task)
+		if captureErr != nil {
+			logger.LogWarn(ctx, "Async media output spooling failed; storage will fetch the completed result again")
+		}
+		if captured {
+			task.Data = RedactAsyncMediaData(task.Data)
+			task.PrivateData.PluginState = RedactAsyncMediaData(task.PrivateData.PluginState)
+		}
+	}
+	task.Data = redactVideoResponseBody(task.Data)
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {

@@ -257,7 +257,7 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
 	for _, task := range tasks {
 		updates := map[string]any{"status": ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": now}
 		event, kind := "recovered", "execute"
-		if task.DispatchedAt > 0 {
+		if task.DispatchedAt > 0 && task.UpstreamTaskId == "" {
 			updates["status"] = ImageTaskExecutionUnknown
 			updates["request_cipher"] = nil
 			updates["public_error_code"] = 608

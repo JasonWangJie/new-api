@@ -11,17 +11,17 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/go-redis/redis/v8"
 )
 
-func ImageChannelSupportsPlatform(channel model.Channel, platform string) bool {
+func ImageChannelSupportsPlatform(channel model.Channel, modelName, platform string) bool {
+	capability := ImageChannelCapability(channel, modelName)
 	if platform == "gemini" {
-		return channel.Type == constant.ChannelTypeGemini || channel.Type == constant.ChannelTypeVertexAi
+		return capability.Generate && capability.Protocol == "gemini_native"
 	}
-	return slices.Contains([]int{constant.ChannelTypeOpenAI, constant.ChannelTypeAzure, constant.ChannelTypeOpenRouter, constant.ChannelTypeSiliconFlow}, channel.Type)
+	return capability.Generate && (platform == "openai" && capability.Protocol == "openai_images" || capability.Provider == platform)
 }
 
 func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution string) string {
@@ -65,7 +65,8 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 	}
 	eligible := make([]model.Channel, 0, len(channels))
 	for _, channel := range channels {
-		if !ImageChannelSupportsPlatform(channel, policy.Platform) {
+		capability := ImageChannelCapability(channel, modelName)
+		if !capability.Generate || !ImageChannelSupportsPlatform(channel, modelName, policy.Platform) {
 			continue
 		}
 		if len(bindings) > 0 {
@@ -122,11 +123,18 @@ func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []
 }
 
 func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, request AsyncImageRequest, routing ImageAccountRouting) (*model.Channel, ImageAccount, error) {
+	if request.Provider == "" {
+		request.Provider = policy.AsyncProvider
+	}
 	channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
 	if err != nil {
 		return nil, ImageAccount{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return len(ImageChannelAccounts(channel, routing)) == 0 })
+	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
+		capability := ImageChannelCapability(channel, request.Model)
+		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
+	})
 	cfg, err := GetImageRuntimeConfig(ctx)
 	if err != nil {
 		return nil, ImageAccount{}, err
@@ -298,13 +306,13 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	if !cfg.AsyncEnabled || !common.RedisEnabled || common.RDB == nil {
 		return model.ImageGroupPolicy{}, model.ImageFundingSelection{}, errors.New("async image service is disabled or Redis is unavailable")
 	}
-	if token.Status != common.TokenStatusEnabled || token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp() {
+	if token.Status != common.TokenStatusEnabled || token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp() {
 		return model.ImageGroupPolicy{}, model.ImageFundingSelection{}, errors.New("Token is unavailable")
 	}
 	if token.ModelLimitsEnabled && !token.GetModelLimitsMap()[request.Model] {
 		return model.ImageGroupPolicy{}, model.ImageFundingSelection{}, errors.New("image model is outside Token permissions")
 	}
-	policy, catalog, err := ResolveImagePolicy(ctx, token, request.Platform)
+	policy, catalog, err := ResolveAsyncImagePolicy(ctx, token, request)
 	if err != nil {
 		return policy, model.ImageFundingSelection{}, err
 	}
@@ -312,7 +320,7 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 		return policy, model.ImageFundingSelection{}, errors.New("async images are disabled for the selected platform group")
 	}
 	var user model.User
-	if err := model.DB.WithContext(ctx).Where("id = ?", token.UserId).Take(&user).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", token.UserId, common.UserStatusEnabled).Take(&user).Error; err != nil {
 		return policy, model.ImageFundingSelection{}, err
 	}
 	if _, allowed := GetUserUsableGroups(user.Group)[policy.Group]; !allowed {
@@ -362,6 +370,10 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	if err != nil {
 		return policy, model.ImageFundingSelection{}, err
 	}
+	channels = slices.DeleteFunc(channels, func(ch model.Channel) bool {
+		capability := ImageChannelCapability(ch, request.Model)
+		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
+	})
 	if len(channels) == 0 {
 		return policy, model.ImageFundingSelection{}, errors.New("no eligible image channel in the selected pool")
 	}

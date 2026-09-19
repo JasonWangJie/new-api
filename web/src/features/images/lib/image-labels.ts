@@ -21,7 +21,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   invoking: 'Processing',
   processing: 'Processing',
   upstream_succeeded: 'Output received',
-  uploading: 'Saving images',
+  uploading: 'Saving media',
   billing_pending: 'Confirming billing',
   storage_failed: 'Storage failed',
   billing_failed: 'Billing failed',
@@ -63,6 +63,15 @@ export const IMAGE_LABELS: Record<string, string> = {
   text_to_video: 'Text to video',
   image_to_video: 'Image to video',
   video: 'Video',
+  image: 'Images',
+  generating: 'Generating',
+  saving: 'Saving media',
+  reserved: 'Reserved',
+  reserving: 'Confirming billing',
+  refunded: 'Refunded',
+  openai_images: 'OpenAI',
+  openai_video: 'Video',
+  gemini_native: 'Gemini',
   not_charged: 'No charge',
   settled: 'Settled',
   bb: 'BB',
@@ -82,12 +91,10 @@ export const IMAGE_LABELS: Record<string, string> = {
   invocation_failed: 'Invocation failed',
   storage_confirmed: 'Storage confirmed',
   billing_retry: 'Billing retry',
-  completed: 'Succeeded',
   recovered: 'Recovered to queue',
   resumed: 'Resumed',
   terminated: 'Terminated',
   postprocessing_failed: 'Post-processing failed',
-  settled: 'Settled',
 }
 export function imageLabel(value: string): string {
   return IMAGE_LABELS[value] || value
@@ -111,11 +118,7 @@ export function imageTimelineDotClass(event: {
   const keys = [event.event_type, event.status]
     .map((value) => value?.trim())
     .filter((value): value is string => Boolean(value))
-  if (
-    keys.some((key) =>
-      ['queued', 'accepted', 'recovered'].includes(key)
-    )
-  ) {
+  if (keys.some((key) => ['queued', 'accepted', 'recovered'].includes(key))) {
     return 'bg-warning'
   }
   if (keys.some((key) => ['succeeded', 'completed', 'settled'].includes(key))) {

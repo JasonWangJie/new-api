@@ -48,7 +48,7 @@ func GetImageConfiguration(c *gin.Context) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	imageManagementData(c, gin.H{"runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}})
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}})
 }
 
 func UpdateImageRuntime(c *gin.Context) {
@@ -70,7 +70,7 @@ func SaveImagePolicy(c *gin.Context) {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if policy.Group == "" || len(policy.Group) > 64 || policy.Platform != "openai" && policy.Platform != "gemini" || policy.PoolMode != "resolution" && policy.PoolMode != "model" && policy.PoolMode != "model_resolution" {
+	if policy.Group == "" || len(policy.Group) > 64 || !service.RegisteredMediaProvider(policy.Platform) || policy.PoolMode != "resolution" && policy.PoolMode != "model" && policy.PoolMode != "model_resolution" {
 		imageManagementError(c, 400, errors.New("Invalid image platform group or pool mode"))
 		return
 	}
@@ -151,7 +151,7 @@ func SaveImageChannelPool(c *gin.Context) {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if input.Group == "" || len(input.Group) > 64 || input.Platform != "openai" && input.Platform != "gemini" || input.Mode != "resolution" && input.Mode != "model" && input.Mode != "model_resolution" {
+	if input.Group == "" || len(input.Group) > 64 || !service.RegisteredMediaProvider(input.Platform) || input.Mode != "resolution" && input.Mode != "model" && input.Mode != "model_resolution" {
 		imageManagementError(c, 400, errors.New("Invalid image channel pool"))
 		return
 	}
@@ -302,7 +302,7 @@ func UpdateTokenImageMappings(c *gin.Context) {
 	}
 	allowed := service.GetUserUsableGroups(user.Group)
 	for platform, group := range input {
-		if platform != "openai" && platform != "gemini" {
+		if !service.RegisteredMediaProvider(platform) {
 			imageManagementError(c, 400, errors.New("Invalid image platform"))
 			return
 		}

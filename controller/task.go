@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -91,6 +92,41 @@ func GetDashboardTaskArtifacts(c *gin.Context) {
 
 func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 	c.Header("Cache-Control", "private, no-store")
+	var mediaJob model.AsyncMediaJob
+	if task.PrivateData.AsyncMedia {
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&mediaJob).Error; err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		items := make([]taskArtifactResponse, 0)
+		if mediaJob.StorageStatus == "succeeded" {
+			cfg, err := service.GetMediaRuntimeConfig(c.Request.Context())
+			if err != nil {
+				writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
+				return
+			}
+			var objects []model.MediaArtifactObject
+			if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND status = ? AND expires_at > ?", task.TaskID, task.UserId, "active", common.GetTimestamp()).Order("artifact_key").Find(&objects).Error; err != nil {
+				writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
+				return
+			}
+			for _, object := range objects {
+				link, err := service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+				if err != nil {
+					writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
+					return
+				}
+				items = append(items, taskArtifactResponse{Key: object.ArtifactKey, Type: "video", MimeType: object.MimeType, ContentURL: link})
+			}
+		}
+		response := gin.H{"task_id": task.TaskID, "artifacts": items}
+		if dashboard {
+			common.ApiSuccess(c, response)
+		} else {
+			c.JSON(http.StatusOK, response)
+		}
+		return
+	}
 	artifacts, err := projectTaskArtifacts(task)
 	if err != nil {
 		writeTaskArtifactProjectionError(c, err)
@@ -179,6 +215,11 @@ func initTaskArtifactAdaptor(task *model.Task) (relaychannel.TaskAdaptor, error)
 		return nil, errTaskArtifactPluginUnavailable
 	}
 	channelModel, err := model.CacheGetChannel(task.ChannelId)
+	if frozen, freezeErr := service.FrozenAsyncMediaChannel(context.Background(), task); freezeErr != nil {
+		return nil, fmt.Errorf("%w: frozen channel unavailable", errTaskArtifactPluginUnavailable)
+	} else if frozen != nil {
+		channelModel, err = frozen, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: channel unavailable", errTaskArtifactPluginUnavailable)
 	}
@@ -293,6 +334,27 @@ func TaskArtifactContent(c *gin.Context) {
 	}
 	if task.Status != model.TaskStatusSuccess {
 		writeTaskArtifactError(c, http.StatusConflict, "artifact_not_ready", "Task artifacts are not ready")
+		return
+	}
+	var mediaJob model.AsyncMediaJob
+	if task.PrivateData.AsyncMedia {
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&mediaJob).Error; err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		if middleware.IsTaskArtifactAccess(c) || mediaJob.StorageStatus != "succeeded" {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		store := service.GetTaskArtifactStore()
+		ref, err := store.Resolve(task, artifactKey)
+		if err != nil || ref == nil {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if err := store.Serve(c, task, ref); err != nil && !c.Writer.Written() {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+		}
 		return
 	}
 	if !taskHasPluginExecution(task) {

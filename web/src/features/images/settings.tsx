@@ -35,6 +35,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { imageRequest } from './api'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
+import { MediaSettingsCard } from './media-settings'
 
 type StorageProfile = {
   profile_id: string
@@ -50,6 +51,8 @@ type StorageProfile = {
   path_style: boolean
 }
 type ImageConfiguration = {
+  image_providers?: string[]
+  media_providers?: string[]
   runtime: Record<string, string | number | boolean>
   storage_profiles: StorageProfile[]
   policies: {
@@ -136,6 +139,7 @@ export function ImageSettings() {
           ))}
         </TabsList>
       </Tabs>
+      {tab === 'runtime' && <MediaSettingsCard />}
       {tab === 'runtime' && (
         <ImageRuntimeForm
           key={JSON.stringify(config.runtime)}
@@ -611,7 +615,10 @@ function ImagePolicyForm({
           <ImageSelect
             label={t('Platform')}
             value={platform}
-            options={['openai', 'gemini'].map((value) => ({
+            options={(
+              config?.media_providers ||
+              config?.image_providers || ['openai', 'gemini']
+            ).map((value) => ({
               value,
               label: value,
             }))}
@@ -782,7 +789,10 @@ function ImagePoolForm({
         <ImageSelect
           label={t('Platform')}
           value={platform}
-          options={['openai', 'gemini'].map((value) => ({
+          options={(
+            config?.media_providers ||
+            config?.image_providers || ['openai', 'gemini']
+          ).map((value) => ({
             value,
             label: value,
           }))}

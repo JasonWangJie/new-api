@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -220,4 +221,112 @@ func ResolveImagePolicy(ctx context.Context, token model.Token, platform string)
 		}
 	}
 	return policy, models, nil
+}
+
+func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request AsyncImageRequest) (model.ImageGroupPolicy, []ImageModelCapability, error) {
+	if request.PolicyPlatform != "" {
+		request.Platform = request.PolicyPlatform
+		return resolveInheritedImagePolicy(ctx, token, request)
+	}
+	if request.Dialect != "async" {
+		return resolveInheritedImagePolicy(ctx, token, request)
+	}
+	var owner model.User
+	if err := model.DB.WithContext(ctx).Where("id = ?", token.UserId).Take(&owner).Error; err != nil {
+		return model.ImageGroupPolicy{}, nil, err
+	}
+	providers := RegisteredImageProviders()
+	if request.Provider != "" {
+		providers = []string{request.Provider}
+	}
+	var best model.ImageGroupPolicy
+	var bestCatalog []ImageModelCapability
+	var priority int64
+	found := false
+	for _, provider := range providers {
+		for _, family := range []string{"openai", "gemini"} {
+			candidate := request
+			candidate.Provider, candidate.Platform = provider, family
+			policy, catalog, err := resolveInheritedImagePolicy(ctx, token, candidate)
+			if err != nil {
+				return policy, nil, err
+			}
+			if !policy.Enabled || !policy.AsyncEnabled {
+				continue
+			}
+			if !IsUserSelectableGroup(owner.Group, policy.Group) {
+				continue
+			}
+			if !slices.ContainsFunc(catalog, func(capability ImageModelCapability) bool { return capability.Id == request.Model }) {
+				continue
+			}
+			channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
+			if err != nil {
+				return policy, nil, err
+			}
+			for _, channel := range channels {
+				capability := ImageChannelCapability(channel, request.Model)
+				if capability.Provider != provider || !ImageCapabilitySupportsRequest(capability, request) {
+					continue
+				}
+				if !found || channel.GetPriority() > priority {
+					best, bestCatalog, priority, found = policy, catalog, channel.GetPriority(), true
+					best.AsyncProvider = provider
+				}
+			}
+		}
+	}
+	if found {
+		return best, bestCatalog, nil
+	}
+	return resolveInheritedImagePolicy(ctx, token, request)
+}
+
+func resolveInheritedImagePolicy(ctx context.Context, token model.Token, request AsyncImageRequest) (model.ImageGroupPolicy, []ImageModelCapability, error) {
+	if request.Provider == "" || request.Provider == "openai" || request.Provider == "gemini" {
+		return ResolveImagePolicy(ctx, token, request.Platform)
+	}
+	provider, catalog, err := ResolveImagePolicy(ctx, token, request.Provider)
+	if err != nil || provider.Id != 0 {
+		return provider, catalog, err
+	}
+	defaults, catalog, err := ResolveImagePolicy(ctx, token, request.Platform)
+	if err != nil {
+		return defaults, catalog, err
+	}
+	// A provider Token mapping can override its group even when it inherits the
+	// protocol-family catalog. Look for that family's policy in the mapped group.
+	var mapping model.TokenImagePlatformMapping
+	lookupErr := model.DB.WithContext(ctx).Where("token_id = ? AND platform = ?", token.Id, request.Provider).Take(&mapping).Error
+	if lookupErr == nil {
+		// Resolve the defaults directly so a family Token mapping cannot override it.
+		var policy model.ImageGroupPolicy
+		lookupErr = model.DB.WithContext(ctx).Where("policy_key = ?", ImageIdentityHash(mapping.Group, request.Platform)).Take(&policy).Error
+		if lookupErr == nil {
+			if err := common.UnmarshalJsonStr(policy.Models, &catalog); err != nil {
+				return policy, nil, err
+			}
+			defaults = policy
+			for i := range catalog {
+				if catalog[i].Label == "" {
+					catalog[i].Label = catalog[i].Id
+				}
+				if catalog[i].MaxOutputImages == 0 {
+					catalog[i].MaxOutputImages = dto.MaxImageN
+				}
+				if len(catalog[i].Resolutions) == 0 {
+					catalog[i].Resolutions = []string{"1K", "2K", "4K"}
+				}
+			}
+		} else if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			defaults.Group = mapping.Group
+			defaults.Enabled = false
+			defaults.AsyncEnabled = false
+		} else {
+			return defaults, nil, lookupErr
+		}
+	} else if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		return defaults, nil, lookupErr
+	}
+	return defaults, catalog, nil
 }

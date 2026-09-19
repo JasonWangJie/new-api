@@ -231,11 +231,29 @@ export function parseTaskResult(ctx, body) {
   const url = dataVideo(body.response || {});
   return { status: "SUCCESS", progress: "100%", url: url, remoteUrl: url };
 }
-export function listArtifacts() {
-  return [];
+function artifactVideos(task) {
+  const data = task.data || {};
+  const response = data.response || {};
+  if (Array.isArray(response.videos) && response.videos.length) return response.videos;
+  return response.bytesBase64Encoded || response.video || response.uri ? [response] : [];
 }
-export function buildContentRequest() {
-  throw new Error("artifact_not_found");
+
+export function listArtifacts(task) {
+  if (task.status !== "SUCCESS") return [];
+  return artifactVideos(task).map((video, index) => ({ key: "video-" + index, type: "video", mimeType: "video/mp4" }));
+}
+
+export function buildContentRequest(ctx) {
+  const videos = artifactVideos(ctx);
+  const index = videos.findIndex((video, position) => "video-" + position === ctx.artifactKey);
+  if (index < 0) throw new Error("artifact_not_found");
+  const video = videos[index];
+  const value = String(video.bytesBase64Encoded || video.video || video.uri || "");
+  if (!value) throw new Error("artifact_not_found");
+  const mime = video.mimeType || video.encoding || "video/mp4";
+  const url =
+    value.startsWith("data:") || value.startsWith("https:") ? value : "data:" + (String(mime).includes("/") ? mime : "video/" + mime) + ";base64," + value;
+  return { url: url, method: ctx.clientRequest.method, credentialless: true };
 }
 function completionMessage(ctx, task) {
   const request = (ctx && ctx.requestBody) || {};

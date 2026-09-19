@@ -12,13 +12,14 @@ import (
 )
 
 // StoredArtifactRef describes a persisted artifact object. No reference is
-// produced until a concrete storage backend is implemented.
+// produced until the local bytes and manifest have been durably published.
 type StoredArtifactRef struct {
 	Backend   string
 	Bucket    string
 	ObjectKey string
 	MimeType  string
 	Size      int64
+	Checksum  string
 }
 
 // TaskArtifactStore is the persistence boundary for generated artifact bytes.
@@ -50,14 +51,14 @@ func (disabledArtifactStore) Serve(*gin.Context, *model.Task, *StoredArtifactRef
 	return ErrTaskArtifactStoreDisabled
 }
 
-var taskArtifactStore TaskArtifactStore = &disabledArtifactStore{}
+var taskArtifactStore TaskArtifactStore = &localMediaStore{}
 
 func init() {
 	_ = system_setting.LoadTaskArtifactStoreConfig()
 }
 
 // GetTaskArtifactStore returns the process-wide artifact storage backend. This
-// release always returns the disabled implementation.
+// backend only persists artifacts belonging to newly accepted media jobs.
 func GetTaskArtifactStore() TaskArtifactStore {
 	return taskArtifactStore
 }

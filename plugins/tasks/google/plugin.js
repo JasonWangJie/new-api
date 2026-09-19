@@ -222,18 +222,21 @@ function artifactData(ctx) {
   return data;
 }
 
-function artifactVideoURL(ctx) {
+function artifactVideos(ctx) {
   const videos = ((artifactData(ctx).response || {}).generateVideoResponse || {}).generatedVideos || [];
-  return videos.length && videos[0].video ? String(videos[0].video.uri || "").trim() : "";
+  return videos.filter((item) => item.video && item.video.uri);
 }
 
 export function listArtifacts(task) {
-  return task.status === "SUCCESS" && artifactVideoURL(task) ? [{ key: "video", type: "video" }] : [];
+  if (task.status !== "SUCCESS") return [];
+  return artifactVideos(task).map((item, index) => ({ key: index === 0 ? "video" : "video-" + index, type: "video", mimeType: "video/mp4" }));
 }
 
 export function buildContentRequest(ctx) {
-  if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
-  const url = artifactVideoURL(ctx);
+  const videos = artifactVideos(ctx);
+  const index = videos.findIndex((item, position) => (position === 0 ? "video" : "video-" + position) === ctx.artifactKey);
+  if (index < 0) throw new Error("artifact_not_found");
+  const url = String(videos[index].video.uri).trim();
   if (!url) throw new Error("artifact_not_found");
   return { url: url, method: ctx.clientRequest.method, headers: { "x-goog-api-key": ctx.apiKey } };
 }
