@@ -358,14 +358,26 @@ For commercial licensing, please contact support@quantumnous.com
   margin-bottom: 8px;
 }
 .cyber-core strong {
-  font-size: clamp(18px, 2vw, 26px);
-  font-weight: 500;
-  letter-spacing: -0.05em;
+  max-width: 88%;
+  padding-inline: 6px;
+  font-size: clamp(22px, 2.8vw, 34px);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1.15;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .cyber-core > span {
-  font-size: 8px;
-  color: #accb9a;
-  margin-top: 4px;
+  max-width: 90%;
+  margin-top: 6px;
+  font-size: clamp(11px, 1.2vw, 14px);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  line-height: 1.35;
+  color: #c5e3b4;
+  text-align: center;
 }
 .cyber-core-bars {
   display: flex;
@@ -815,17 +827,6 @@ For commercial licensing, please contact support@quantumnous.com
   border-radius: 4px;
   color: #b3c4b4;
 }
-.cyber-home .cyber-docs-link {
-  color: var(--cyber-acid);
-  padding-inline: 0;
-  margin-top: 22px;
-  font-size: 12px;
-  min-height: 44px;
-}
-.cyber-home .cyber-docs-link:hover {
-  background: transparent;
-  color: #e1ffb6;
-}
 .cyber-protocol-demo {
   min-width: 0;
 }
@@ -1172,7 +1173,10 @@ For commercial licensing, please contact support@quantumnous.com
     margin-block: 16px 6px;
   }
   .cyber-core strong {
-    font-size: 22px;
+    font-size: 26px;
+  }
+  .cyber-core > span {
+    font-size: 12px;
   }
   .cyber-node {
     font-size: 11px;

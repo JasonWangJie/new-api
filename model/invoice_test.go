@@ -184,6 +184,32 @@ func TestInvoiceWorkflow(t *testing.T) {
 		assert.Equal(t, "details do not match", storedFirst.RejectReason)
 	})
 
+	t.Run("latest user application supplies the remembered profile", func(t *testing.T) {
+		truncateTables(t)
+		firstOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-first", 10)
+		secondOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-second", 20)
+		historyOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-history", 30)
+
+		_, err := CreateUserInvoiceRequest(91, []int{firstOrder.Id}, "First Co.", "TAX-OLD", "old@example.com", 0)
+		require.NoError(t, err)
+		_, err = CreateUserInvoiceRequest(91, []int{secondOrder.Id}, "Latest Co.", "TAX-NEW", "latest@example.com", 0)
+		require.NoError(t, err)
+		_, err = CreateHistoricalInvoiceRequest(91, []int{historyOrder.Id}, "later admin record", InvoiceOperator{Id: 9, Username: "admin"})
+		require.NoError(t, err)
+
+		profile, err := GetLatestUserInvoiceProfile(91)
+		require.NoError(t, err)
+		assert.Equal(t, InvoiceProfile{
+			CompanyName: "Latest Co.",
+			TaxId:       "TAX-NEW",
+			Email:       "latest@example.com",
+		}, profile)
+
+		emptyProfile, err := GetLatestUserInvoiceProfile(92)
+		require.NoError(t, err)
+		assert.Equal(t, InvoiceProfile{}, emptyProfile)
+	})
+
 	t.Run("historical supplement bypasses threshold and records operator", func(t *testing.T) {
 		truncateTables(t)
 		order := createInvoiceTestTopUp(t, 41, "invoice-history", 0.01)

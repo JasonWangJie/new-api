@@ -10,9 +10,16 @@ License, or (at your option) any later version.
 export type InvoiceStatus = 'pending' | 'completed' | 'rejected'
 export type InvoiceSource = 'user' | 'admin_history'
 
+export type InvoiceProfile = {
+  company_name: string
+  tax_id: string
+  email: string
+}
+
 export type InvoiceConfig = {
   enabled: boolean
   min_amount_cents: number
+  last_invoice_profile: InvoiceProfile
 }
 
 export type InvoiceEligibleOrder = {

@@ -84,6 +84,12 @@ type InvoiceOperator struct {
 	Username string
 }
 
+type InvoiceProfile struct {
+	CompanyName string `json:"company_name"`
+	TaxId       string `json:"tax_id"`
+	Email       string `json:"email"`
+}
+
 func topUpInvoiceAmountCents(money float64) (int64, error) {
 	if math.IsNaN(money) || math.IsInf(money, 0) || money <= 0 {
 		return 0, ErrInvoiceAmountInvalid
@@ -310,6 +316,17 @@ func CreateUserInvoiceRequest(userId int, orderIDs []int, companyName, taxId, em
 
 func CreateHistoricalInvoiceRequest(userId int, orderIDs []int, note string, operator InvoiceOperator) (*InvoiceRequest, error) {
 	return createInvoiceRequest(userId, InvoiceSourceAdminHistory, orderIDs, "", "", "", note, 0, operator)
+}
+
+func GetLatestUserInvoiceProfile(userId int) (InvoiceProfile, error) {
+	var profile InvoiceProfile
+	err := DB.Model(&InvoiceRequest{}).
+		Select("company_name", "tax_id", "email").
+		Where("user_id = ? AND source = ?", userId, InvoiceSourceUser).
+		Order("id DESC").
+		Limit(1).
+		Scan(&profile).Error
+	return profile, err
 }
 
 func populateInvoiceRequests(requests []InvoiceRequest) error {

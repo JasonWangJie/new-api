@@ -351,11 +351,16 @@ describe('invoice components', () => {
     )
   })
 
-  it('opens and submits the user invoice application from the page', async () => {
+  it('prefills the last invoice profile and remembers submitted edits', async () => {
     const selectedOrder = order(4)
     apiMocks.getInvoiceConfig.mockResolvedValue({
       enabled: true,
       min_amount_cents: 0,
+      last_invoice_profile: {
+        company_name: 'Previous Co.',
+        tax_id: 'TAX-OLD',
+        email: 'old-billing@example.com',
+      },
     })
     apiMocks.getEligibleInvoiceOrders.mockResolvedValue({
       page: 1,
@@ -373,21 +378,45 @@ describe('invoice components', () => {
     )
     await user.click(screen.getByRole('button', { name: 'Apply for invoice' }))
     await screen.findByText('Apply for enterprise invoice')
-    await user.type(screen.getByLabelText('Company name'), 'Example Co.')
-    await user.type(screen.getByLabelText('Enterprise tax ID'), 'TAX-001')
-    await user.type(
-      screen.getByLabelText('Invoice email'),
-      'billing@example.com'
-    )
+    const companyName = screen.getByLabelText('Company name')
+    const taxID = screen.getByLabelText('Enterprise tax ID')
+    const email = screen.getByLabelText('Invoice email')
+    expect(companyName).toHaveValue('Previous Co.')
+    expect(taxID).toHaveValue('TAX-OLD')
+    expect(email).toHaveValue('old-billing@example.com')
+
+    await user.clear(companyName)
+    await user.type(companyName, 'Updated Co.')
+    await user.clear(taxID)
+    await user.type(taxID, 'TAX-NEW')
+    await user.clear(email)
+    await user.type(email, 'new-billing@example.com')
     await user.click(screen.getByRole('button', { name: 'Submit application' }))
 
     await waitFor(() =>
       expect(apiMocks.createInvoice).toHaveBeenCalledWith({
-        company_name: 'Example Co.',
-        tax_id: 'TAX-001',
-        email: 'billing@example.com',
+        company_name: 'Updated Co.',
+        tax_id: 'TAX-NEW',
+        email: 'new-billing@example.com',
         order_ids: [selectedOrder.top_up_id],
       })
+    )
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Apply for enterprise invoice')
+      ).not.toBeInTheDocument()
+    )
+
+    await user.click(
+      await screen.findByRole('checkbox', { name: 'Select order order-4' })
+    )
+    await user.click(screen.getByRole('button', { name: 'Apply for invoice' }))
+    expect(await screen.findByLabelText('Company name')).toHaveValue(
+      'Updated Co.'
+    )
+    expect(screen.getByLabelText('Enterprise tax ID')).toHaveValue('TAX-NEW')
+    expect(screen.getByLabelText('Invoice email')).toHaveValue(
+      'new-billing@example.com'
     )
   })
 

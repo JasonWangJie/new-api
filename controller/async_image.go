@@ -228,8 +228,9 @@ func QueryAsyncImage(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	response := gin.H{"task_id": task.TaskId}
 	if strings.Contains(c.Request.URL.Path, "/media/") {
+		displayStatus := task.DisplayStatus()
 		response["media_type"], response["provider"], response["protocol"] = "image", task.Provider, task.ExecutionProtocol
-		response["stage"], response["progress"], response["billing_status"], response["quota"] = mediaStage(task.Status), task.Progress, task.BillingStatus, task.Quota
+		response["stage"], response["progress"], response["billing_status"], response["quota"] = mediaStage(displayStatus), task.Progress, task.BillingStatus, task.Quota
 		response["storage_status"] = "pending"
 		if task.ResultsAvailable() {
 			response["storage_status"] = "succeeded"

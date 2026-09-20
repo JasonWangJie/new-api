@@ -113,14 +113,17 @@ export function UserInvoicesPage() {
         </SectionPageLayout.Content>
       </SectionPageLayout>
 
-      <InvoiceApplicationDialog
-        open={applicationOpen}
-        onOpenChange={setApplicationOpen}
-        selectedOrders={selectedOrders}
-        totalAmountCents={totalAmountCents}
-        minAmountCents={minAmountCents}
-        onSelectionReset={() => setSelectedOrders(new Map())}
-      />
+      {applicationOpen ? (
+        <InvoiceApplicationDialog
+          open
+          onOpenChange={setApplicationOpen}
+          selectedOrders={selectedOrders}
+          totalAmountCents={totalAmountCents}
+          minAmountCents={minAmountCents}
+          onSelectionReset={() => setSelectedOrders(new Map())}
+          initialValues={config.data?.last_invoice_profile}
+        />
+      ) : null}
     </>
   )
 }

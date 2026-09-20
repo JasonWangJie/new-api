@@ -115,6 +115,9 @@ type AsyncImageTask struct {
 }
 
 func (t AsyncImageTask) DisplayStatus() string {
+	if t.UpstreamTaskId != "" && (t.Status == ImageTaskQueued || t.Status == ImageTaskInvoking) {
+		return ImageTaskInvoking
+	}
 	if t.Status == ImageTaskInvoking && t.ChannelId == 0 {
 		return ImageTaskQueued
 	}
@@ -462,5 +465,9 @@ func transitionImageTaskTx(tx *gorm.DB, task AsyncImageTask, updates map[string]
 	if outboxKind == "" {
 		return nil
 	}
-	return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: outboxKind, AggregateId: task.TaskId, Status: "pending", NextAttemptAt: now, CreatedAt: now}).Error
+	nextAttemptAt := now
+	if value, ok := updates["next_attempt_at"].(int64); ok && value > nextAttemptAt {
+		nextAttemptAt = value
+	}
+	return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: outboxKind, AggregateId: task.TaskId, Status: "pending", NextAttemptAt: nextAttemptAt, CreatedAt: now}).Error
 }

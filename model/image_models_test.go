@@ -246,7 +246,7 @@ func TestRecoverAsyncImageTaskContinuesKnownUpstreamPolling(t *testing.T) {
 
 	var recovered AsyncImageTask
 	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&recovered).Error)
-	assert.Equal(t, ImageTaskQueued, recovered.Status)
+	assert.Equal(t, ImageTaskInvoking, recovered.Status)
 	assert.Equal(t, task.UpstreamTaskId, recovered.UpstreamTaskId)
 	assert.Equal(t, task.RequestCipher, recovered.RequestCipher)
 	assert.Empty(t, recovered.LeaseToken)

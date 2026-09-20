@@ -19,9 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 import { Link, useSearch } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
+import {
+  StaggerContainer,
+  StaggerItem,
+} from '@/components/page-transition'
 import { useStatus } from '@/hooks/use-status'
+import { CARD_ITEM_VARIANTS, CARD_STAGGER_VARIANTS } from '@/lib/motion'
 
 import { AuthLayout } from '../auth-layout'
+import { AuthPageHeader } from '../components/auth-page-header'
 import { TermsFooter } from '../components/terms-footer'
 import { UserAuthForm } from './components/user-auth-form'
 
@@ -32,34 +38,39 @@ export function SignIn() {
 
   return (
     <AuthLayout>
-      <div className='w-full space-y-8'>
-        <div className='space-y-2'>
-          <h2 className='text-center text-2xl font-semibold tracking-tight sm:text-left'>
-            {t('Sign in')}
-          </h2>
-          {!status?.self_use_mode_enabled &&
-            status?.register_enabled !== false && (
-              <p className='text-muted-foreground text-left text-sm sm:text-base'>
-                {t("Don't have an account?")}{' '}
-                <Link
-                  to='/sign-up'
-                  className='hover:text-primary font-medium underline underline-offset-4'
-                >
-                  {t('Sign up')}
-                </Link>
-                .
-              </p>
-            )}
-        </div>
+      <StaggerContainer
+        className='w-full space-y-8'
+        variants={CARD_STAGGER_VARIANTS}
+      >
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <AuthPageHeader
+            accentTitle
+            title={t('Sign in')}
+            kicker={t('Welcome back')}
+            description={
+              !status?.self_use_mode_enabled &&
+              status?.register_enabled !== false ? (
+                <>
+                  {t("Don't have an account?")}{' '}
+                  <Link to='/sign-up'>{t('Sign up')}</Link>.
+                </>
+              ) : undefined
+            }
+          />
+        </StaggerItem>
 
-        <UserAuthForm redirectTo={redirect} />
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <UserAuthForm redirectTo={redirect} />
+        </StaggerItem>
 
-        <TermsFooter
-          variant='sign-in'
-          status={status}
-          className='text-center'
-        />
-      </div>
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <TermsFooter
+            variant='sign-in'
+            status={status}
+            className='text-center'
+          />
+        </StaggerItem>
+      </StaggerContainer>
     </AuthLayout>
   )
 }

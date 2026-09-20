@@ -44,9 +44,15 @@ func invoiceRequestID(c *gin.Context) (int, bool) {
 
 func GetInvoiceConfig(c *gin.Context) {
 	setting := operation_setting.GetPaymentSetting()
+	profile, err := model.GetLatestUserInvoiceProfile(c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	common.ApiSuccess(c, gin.H{
-		"enabled":          setting.InvoiceEnabled,
-		"min_amount_cents": setting.InvoiceMinAmountCents,
+		"enabled":              setting.InvoiceEnabled,
+		"min_amount_cents":     setting.InvoiceMinAmountCents,
+		"last_invoice_profile": profile,
 	})
 }
 

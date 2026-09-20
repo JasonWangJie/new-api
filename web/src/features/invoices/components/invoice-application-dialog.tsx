@@ -30,7 +30,11 @@ import {
   invoiceApplicationSchema,
   type InvoiceApplicationValues,
 } from '../lib/schemas'
-import type { InvoiceEligibleOrder } from '../types'
+import type {
+  InvoiceConfig,
+  InvoiceEligibleOrder,
+  InvoiceProfile,
+} from '../types'
 
 type InvoiceApplicationDialogProps = {
   open: boolean
@@ -39,6 +43,7 @@ type InvoiceApplicationDialogProps = {
   totalAmountCents: number
   minAmountCents: number
   onSelectionReset: () => void
+  initialValues?: InvoiceProfile
 }
 
 const formId = 'invoice-application-form'
@@ -48,7 +53,9 @@ export function InvoiceApplicationDialog(props: InvoiceApplicationDialogProps) {
   const queryClient = useQueryClient()
   const form = useForm<InvoiceApplicationValues>({
     resolver: zodResolver(invoiceApplicationSchema),
-    defaultValues: { company_name: '', tax_id: '', email: '' },
+    defaultValues: props.initialValues
+      ? { ...props.initialValues }
+      : { company_name: '', tax_id: '', email: '' },
   })
   const mutation = useMutation({
     mutationFn: (values: InvoiceApplicationValues) =>
@@ -56,15 +63,18 @@ export function InvoiceApplicationDialog(props: InvoiceApplicationDialogProps) {
         ...values,
         order_ids: [...props.selectedOrders.keys()],
       }),
-    onSuccess: async () => {
+    onSuccess: async (_created, values) => {
       toast.success(t('Invoice application submitted'))
+      queryClient.setQueryData<InvoiceConfig>(['invoice-config'], (current) =>
+        current ? { ...current, last_invoice_profile: { ...values } } : current
+      )
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['invoice-requests'] }),
         queryClient.invalidateQueries({
           queryKey: ['invoice-eligible-orders'],
         }),
       ])
-      form.reset()
+      form.reset(values)
       props.onSelectionReset()
       props.onOpenChange(false)
     },

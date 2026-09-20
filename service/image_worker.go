@@ -53,6 +53,14 @@ func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 	workers.Go(func() {
 		defer func() {
 			if recover() != nil {
+				common.SysError("image outbox dispatcher stopped after an unexpected failure")
+			}
+		}()
+		asyncImageOutboxLoop(ctx)
+	})
+	workers.Go(func() {
+		defer func() {
+			if recover() != nil {
 				common.SysError("image recovery stopped after an unexpected failure")
 			}
 		}()
@@ -66,6 +74,27 @@ func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 		case <-done:
 		case <-time.After(10 * time.Second):
 			common.SysError("image workers are stopping; durable leases will recover unfinished work")
+		}
+	}
+}
+
+func asyncImageOutboxLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	failing := false
+	for {
+		if err := deliverAsyncImageOutbox(ctx); err != nil {
+			if !failing && ctx.Err() == nil {
+				common.SysError("image outbox dispatcher is waiting for database or Redis availability")
+			}
+			failing = true
+		} else {
+			failing = false
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -120,6 +149,26 @@ func RebuildAsyncImageQueue(ctx context.Context) error {
 	if err := model.RecoverAsyncImageTasks(ctx, 100, cfg.ExecutionTimeout); err != nil {
 		return err
 	}
+	if err := deliverAsyncImageOutbox(ctx); err != nil {
+		return err
+	}
+	var tasks []model.AsyncImageTask
+	statuses := []string{model.ImageTaskQueued, model.ImageTaskInvoking, model.ImageTaskUpstreamSucceeded, model.ImageTaskUploading, model.ImageTaskBillingPending, model.ImageTaskStorageFailed, model.ImageTaskBillingFailed}
+	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at > 0", statuses, time.Now().Unix()).Order("next_attempt_at,id").Limit(100).Find(&tasks).Error; err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if err := common.RDB.ZAdd(ctx, ImageRedisKey("queue"), &redis.Z{Score: float64(task.NextAttemptAt), Member: task.TaskId}).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deliverAsyncImageOutbox(ctx context.Context) error {
+	if common.RDB == nil {
+		return errors.New("Redis is required for image scheduling")
+	}
 	var commands []model.ImageOutbox
 	if err := model.DB.WithContext(ctx).Where("status = ? AND kind IN ? AND next_attempt_at <= ?", "pending", []string{"execute", "postprocess"}, time.Now().Unix()).Order("id").Limit(100).Find(&commands).Error; err != nil {
 		return err
@@ -129,16 +178,6 @@ func RebuildAsyncImageQueue(ctx context.Context) error {
 			return err
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.ImageOutbox{}).Where("id = ? AND status = ?", command.Id, "pending").Update("status", "delivered").Error; err != nil {
-			return err
-		}
-	}
-	var tasks []model.AsyncImageTask
-	statuses := []string{model.ImageTaskQueued, model.ImageTaskUpstreamSucceeded, model.ImageTaskUploading, model.ImageTaskBillingPending, model.ImageTaskStorageFailed, model.ImageTaskBillingFailed}
-	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at > 0", statuses, time.Now().Unix()).Order("next_attempt_at,id").Limit(100).Find(&tasks).Error; err != nil {
-		return err
-	}
-	for _, task := range tasks {
-		if err := common.RDB.ZAdd(ctx, ImageRedisKey("queue"), &redis.Z{Score: float64(task.NextAttemptAt), Member: task.TaskId}).Err(); err != nil {
 			return err
 		}
 	}
@@ -375,14 +414,14 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
 				return err
 			}
-			return model.TransitionImageTask(context.WithoutCancel(ctx), *task, map[string]any{"status": model.ImageTaskQueued, "next_attempt_at": time.Now().Unix() + 10}, "upstream_pending", "", "execute")
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "upstream_pending", "")
 		}
 		failure := ClassifyAsyncImageFailure(err, 0)
 		if task.DispatchedAt > 0 && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 			failure.ExecutionUnknown = true
 		}
 		if task.UpstreamTaskId != "" && (failure.ExecutionUnknown || failure.Code == 605 || failure.Code == 606) {
-			return model.TransitionImageTask(context.WithoutCancel(ctx), *task, map[string]any{"status": model.ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": time.Now().Unix() + 10}, "recovered", "Upstream image task polling will continue", "execute")
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
 		if task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
@@ -455,6 +494,9 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		if key != "" && count < maximum {
 			delay := ImageRetryDelay(base, maxDelay, count, cfg.RetryJitter, failure.RetryAfter, cfg.RetryAfterMax)
 			status, kind = model.ImageTaskQueued, "execute"
+			if task.UpstreamTaskId != "" {
+				status = model.ImageTaskInvoking
+			}
 			updates["request_cipher"] = task.RequestCipher
 			updates["finished_at"] = 0
 			updates[key] = count + 1

@@ -19,9 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 import { Link } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
+import {
+  StaggerContainer,
+  StaggerItem,
+} from '@/components/page-transition'
 import { useStatus } from '@/hooks/use-status'
+import { CARD_ITEM_VARIANTS, CARD_STAGGER_VARIANTS } from '@/lib/motion'
 
 import { AuthLayout } from '../auth-layout'
+import { AuthPageHeader } from '../components/auth-page-header'
 import { TermsFooter } from '../components/terms-footer'
 import { SignUpForm } from './components/sign-up-form'
 
@@ -31,31 +37,36 @@ export function SignUp() {
 
   return (
     <AuthLayout>
-      <div className='w-full space-y-8'>
-        <div className='space-y-2'>
-          <h2 className='text-center text-2xl font-semibold tracking-tight sm:text-left'>
-            {t('Create an account')}
-          </h2>
-          <p className='text-muted-foreground text-left text-sm sm:text-base'>
-            {t('Already have an account?')}{' '}
-            <Link
-              to='/sign-in'
-              className='hover:text-primary font-medium underline underline-offset-4'
-            >
-              {t('Sign in')}
-            </Link>
-            .
-          </p>
-        </div>
+      <StaggerContainer
+        className='w-full space-y-8'
+        variants={CARD_STAGGER_VARIANTS}
+      >
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <AuthPageHeader
+            accentTitle
+            title={t('Create an account')}
+            kicker={t('Join the network')}
+            description={
+              <>
+                {t('Already have an account?')}{' '}
+                <Link to='/sign-in'>{t('Sign in')}</Link>.
+              </>
+            }
+          />
+        </StaggerItem>
 
-        <SignUpForm />
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <SignUpForm />
+        </StaggerItem>
 
-        <TermsFooter
-          variant='sign-up'
-          status={status}
-          className='text-center'
-        />
-      </div>
+        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+          <TermsFooter
+            variant='sign-up'
+            status={status}
+            className='text-center'
+          />
+        </StaggerItem>
+      </StaggerContainer>
     </AuthLayout>
   )
 }

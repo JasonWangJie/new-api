@@ -34,12 +34,14 @@ import { CyberLanding } from '../components/cyber-landing'
 
 async function renderLanding(
   isAuthenticated = false,
-  docsLink = 'https://docs.example.com/guide'
+  systemName = 'Acme Gateway'
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  client.setQueryData(STATUS_QUERY_KEY, { docs_link: docsLink })
+  client.setQueryData(STATUS_QUERY_KEY, {
+    system_name: systemName,
+  })
   const root = createRootRoute()
   const home = createRoute({
     getParentRoute: () => root,
@@ -67,6 +69,23 @@ describe('cyber landing interactions', () => {
   beforeEach(() => {
     vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
   })
+
+  it('fills the cyber core brand from the configured site name', async () => {
+    await renderLanding(false, 'Nebula API')
+    const core = document.querySelector('.cyber-core')
+    expect(core).not.toBeNull()
+    expect(core?.querySelector('strong')).toHaveTextContent('Nebula API')
+    expect(core?.querySelector('span')).toHaveTextContent(
+      'Unified API Gateway'
+    )
+  })
+
+  it('falls back to the default site name when status omits system_name', async () => {
+    await renderLanding(false, '')
+    const core = document.querySelector('.cyber-core')
+    expect(core?.querySelector('strong')).toHaveTextContent('New API')
+  })
+
   it('supports pausing and resuming the decorative motion with the keyboard', async () => {
     const user = userEvent.setup()
     await renderLanding()
@@ -123,12 +142,12 @@ describe('cyber landing interactions', () => {
     ).not.toBeInTheDocument()
   })
 
-  it('switches protocol examples manually and respects the configured documentation address', async () => {
+  it('switches protocol examples manually without a documentation entry', async () => {
     const user = userEvent.setup()
     await renderLanding()
     expect(
-      screen.getByRole('link', { name: 'Read the documentation' })
-    ).toHaveAttribute('href', 'https://docs.example.com/guide')
+      screen.queryByRole('link', { name: 'Read the documentation' })
+    ).not.toBeInTheDocument()
     expect(
       screen.getByRole('link', { name: 'Explore the API' })
     ).toHaveAttribute('href', '#protocols')

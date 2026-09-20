@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,7 +33,10 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func asyncImageBytesFixture(t *testing.T) ImageBytes {
@@ -44,6 +48,105 @@ func asyncImageBytesFixture(t *testing.T) ImageBytes {
 	valid, err := ValidateImageBytes(output.Bytes(), "image/png", 1<<20, 100)
 	require.NoError(t, err)
 	return valid
+}
+
+func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T) {
+	ctx := context.Background()
+	previousDB, previousRedis := model.DB, common.RDB
+	dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "polling.db")))
+	databaseVersionQuery := "SELECT sqlite_version()"
+	if dsn := os.Getenv("IMAGE_WORKER_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_worker_test", "use the dedicated disposable image worker database")
+		dialector = mysql.Open(dsn)
+		databaseVersionQuery = "SELECT VERSION()"
+	} else if dsn := os.Getenv("IMAGE_WORKER_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_worker_test") || strings.Contains(dsn, "/new_api_image_worker_test"), "use the dedicated disposable image worker database")
+		dialector = postgres.Open(dsn)
+		databaseVersionQuery = "SELECT VERSION()"
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	common.RDB = client
+	t.Setenv("ASYNC_IMAGE_REDIS_PREFIX", "image-poll-test")
+	t.Cleanup(func() {
+		model.DB, common.RDB = previousDB, previousRedis
+		_ = client.Close()
+		assert.NoError(t, db.Migrator().DropTable(&model.ImageOutbox{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}))
+		sqlDB, openErr := db.DB()
+		if openErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+	var databaseVersion string
+	require.NoError(t, db.Raw(databaseVersionQuery).Scan(&databaseVersion).Error)
+	t.Logf("Database version: %s", databaseVersion)
+
+	now := time.Now().Unix()
+	task := model.AsyncImageTask{
+		TaskId:         "asyncimg_known_upstream_poll",
+		Status:         model.ImageTaskInvoking,
+		Version:        1,
+		UpstreamTaskId: "upstream-job-1",
+		ChannelId:      7,
+		DispatchedAt:   now - 5,
+		StartedAt:      now - 5,
+		NextAttemptAt:  now,
+		LeaseToken:     "active-worker",
+		LeaseExpiresAt: now + 120,
+		CreatedAt:      now - 5,
+	}
+	require.NoError(t, db.Create(&task).Error)
+	due := now + 10
+	require.NoError(t, model.ScheduleAsyncImagePoll(ctx, task, due, "upstream_pending", ""))
+
+	var scheduled model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&scheduled).Error)
+	assert.Equal(t, model.ImageTaskInvoking, scheduled.Status)
+	assert.Equal(t, model.ImageTaskInvoking, scheduled.DisplayStatus(), "an accepted upstream job is processing, not waiting for generation capacity")
+	assert.Empty(t, scheduled.LeaseToken)
+	assert.Zero(t, scheduled.LeaseExpiresAt, "the completed worker turn must not block the next poll for the full lease TTL")
+	assert.Equal(t, task.ChannelId, scheduled.ChannelId)
+	assert.Equal(t, task.DispatchedAt, scheduled.DispatchedAt)
+	scheduledVersion := scheduled.Version
+	require.NoError(t, model.RecoverAsyncImageTasks(ctx, 100, 1200))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&scheduled).Error)
+	assert.Equal(t, scheduledVersion, scheduled.Version, "an intentionally idle poll must not be treated as a crashed invocation")
+	assert.Equal(t, due, scheduled.NextAttemptAt)
+
+	var command model.ImageOutbox
+	require.NoError(t, db.Where("aggregate_id = ? AND kind = ?", task.TaskId, "execute").Take(&command).Error)
+	assert.Equal(t, due, command.NextAttemptAt, "the outbox must not deliver a delayed poll before the task is due")
+	require.NoError(t, deliverAsyncImageOutbox(ctx))
+	count, err := client.ZCard(ctx, ImageRedisKey("queue")).Result()
+	require.NoError(t, err)
+	assert.Zero(t, count)
+
+	require.NoError(t, db.Model(&model.ImageOutbox{}).Where("id = ?", command.Id).Update("next_attempt_at", now).Error)
+	require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("next_attempt_at", now).Error)
+	require.NoError(t, deliverAsyncImageOutbox(ctx))
+	score, err := client.ZScore(ctx, ImageRedisKey("queue"), task.TaskId).Result()
+	require.NoError(t, err)
+	assert.Equal(t, float64(now), score)
+	require.NoError(t, db.Where("id = ?", command.Id).Take(&command).Error)
+	assert.Equal(t, "delivered", command.Status)
+
+	claimed, err := model.ClaimAsyncImageTask(ctx, task.TaskId, "poll-worker", 120)
+	require.NoError(t, err)
+	assert.Equal(t, model.ImageTaskInvoking, claimed.Status)
+	assert.Equal(t, task.ChannelId, claimed.ChannelId, "polling must retain the frozen upstream channel")
+	assert.Equal(t, task.DispatchedAt, claimed.DispatchedAt, "polling must not look like a fresh generation dispatch")
+	require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("lease_expires_at", now-1).Error)
+	require.NoError(t, model.RecoverAsyncImageTasks(ctx, 100, 1200))
+	var recovered model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&recovered).Error)
+	assert.Equal(t, model.ImageTaskInvoking, recovered.Status)
+	assert.Empty(t, recovered.LeaseToken)
+	assert.Zero(t, recovered.LeaseExpiresAt)
 }
 
 func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {

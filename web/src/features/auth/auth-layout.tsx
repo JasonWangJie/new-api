@@ -17,10 +17,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Link } from '@tanstack/react-router'
+import { Pause, Play } from 'lucide-react'
+import { motion, useReducedMotion } from 'motion/react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSystemConfig } from '@/hooks/use-system-config'
+import { MOTION_TRANSITION, MOTION_VARIANTS } from '@/lib/motion'
+
+import { AuthBackdrop } from './components/auth-backdrop'
+
+import '@/styles/auth-cyber.css'
 
 type AuthLayoutProps = {
   children: React.ReactNode
@@ -29,35 +38,90 @@ type AuthLayoutProps = {
 export function AuthLayout({ children }: AuthLayoutProps) {
   const { t } = useTranslation()
   const { systemName, logo, loading } = useSystemConfig()
+  const shouldReduce = useReducedMotion()
+  const [motionPaused, setMotionPaused] = useState(false)
+  const motionLabel = motionPaused
+    ? t('Resume animations')
+    : t('Pause animations')
+  const MotionIcon = motionPaused ? Play : Pause
 
   return (
-    <div className='relative grid h-svh max-w-none'>
-      <Link
-        to='/'
-        className='absolute top-4 left-4 z-10 flex items-center gap-2 transition-opacity hover:opacity-80 sm:top-8 sm:left-8'
-      >
-        <div className='relative h-8 w-8'>
-          {loading ? (
-            <Skeleton className='absolute inset-0 rounded-full' />
-          ) : (
-            <img
-              src={logo}
-              alt={t('Logo')}
-              className='h-8 w-8 rounded-full object-cover'
-            />
-          )}
-        </div>
-        {loading ? (
-          <Skeleton className='h-6 w-24' />
+    <div
+      className='auth-cyber auth-cyber-shell dark'
+      data-motion={motionPaused ? 'paused' : 'running'}
+    >
+      <AuthBackdrop />
+
+      <header className='auth-cyber-header'>
+        <Link to='/' className='auth-cyber-brand'>
+          <div className='auth-cyber-brand-mark'>
+            {loading ? (
+              <Skeleton className='absolute inset-0 rounded-full' />
+            ) : (
+              <img src={logo} alt={t('Logo')} />
+            )}
+          </div>
+          <div className='auth-cyber-brand-copy'>
+            <span className='auth-cyber-brand-kicker'>
+              {t('Identity gateway')}
+            </span>
+            {loading ? (
+              <Skeleton className='h-6 w-28' />
+            ) : (
+              <span className='auth-cyber-brand-name'>{systemName}</span>
+            )}
+          </div>
+        </Link>
+
+        <Button
+          type='button'
+          variant='ghost'
+          size='sm'
+          className='auth-cyber-motion-toggle'
+          aria-pressed={motionPaused}
+          aria-label={motionLabel}
+          onClick={() => setMotionPaused((paused) => !paused)}
+        >
+          <MotionIcon size={14} aria-hidden='true' />
+          <span className='hidden sm:inline'>{motionLabel}</span>
+        </Button>
+      </header>
+
+      <main className='auth-cyber-main'>
+        {shouldReduce ? (
+          <div className='auth-cyber-panel'>
+            <div className='auth-cyber-panel-corners' aria-hidden='true'>
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+            <div className='auth-cyber-panel-body'>{children}</div>
+          </div>
         ) : (
-          <h1 className='text-xl font-medium'>{systemName}</h1>
+          <motion.div
+            className='auth-cyber-panel'
+            initial={MOTION_VARIANTS.pageEnter.initial}
+            animate={MOTION_VARIANTS.pageEnter.animate}
+            transition={{ ...MOTION_TRANSITION.slow, delay: 0.08 }}
+          >
+            <div className='auth-cyber-panel-corners' aria-hidden='true'>
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+            <div className='auth-cyber-panel-body'>{children}</div>
+          </motion.div>
         )}
-      </Link>
-      <div className='container flex items-center pt-16 sm:pt-0'>
-        <div className='mx-auto flex w-full flex-col justify-center space-y-2 px-4 py-8 sm:w-[480px] sm:p-8'>
-          {children}
-        </div>
-      </div>
+      </main>
+
+      <footer className='auth-cyber-footer' aria-hidden='true'>
+        <span className='auth-cyber-footer-live'>
+          {t('Secure channel online')}
+        </span>
+        <span>AUTH / TLS · GATEWAY</span>
+      </footer>
     </div>
   )
 }

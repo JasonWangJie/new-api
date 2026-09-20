@@ -76,6 +76,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			task := model.AsyncImageTask{TaskId: "asyncimg_success", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "bb", RequestType: "image_to_image", Model: "gpt-image-2.5-sunburst", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 1, ResultCount: 1, CreatedAt: now - 50, StartedAt: now - 40, FinishedAt: now - 10, Attempts: string(attempts), ReferenceUrls: `["https://example.com/private-reference"]`, RequestedResolution: "2K", ActualSize: "2048x1186"}
 			require.NoError(t, db.Create(&task).Error)
+			polling := model.AsyncImageTask{TaskId: "asyncimg_upstream_polling", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "async", RequestType: "text_to_image", Model: "async-image-model", Status: model.ImageTaskQueued, UpstreamTaskId: "private-upstream-job", DispatchedAt: now - 20, StartedAt: now - 20, NextAttemptAt: now + 10, CreatedAt: now - 20}
+			require.NoError(t, db.Create(&polling).Error)
 			require.NoError(t, db.Create(&model.AsyncImageTask{TaskId: "asyncimg_other", UserId: 102, TokenId: 202, Status: model.ImageTaskQueued, CreatedAt: now - 50}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageEvent{TaskId: task.TaskId, EventKey: "presentation-event", EventType: "settled", Status: model.ImageTaskSucceeded, Message: "routing-event-canary", CreatedAt: now - 10}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
@@ -99,13 +101,18 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					}
 					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &list))
 					assert.Equal(t, float64(1), list.Data.Stats["succeeded"])
+					assert.Equal(t, float64(1), list.Data.Stats["processing"])
 					if admin {
-						assert.Len(t, list.Data.Items, 2)
+						assert.Len(t, list.Data.Items, 3)
 					} else {
-						require.Len(t, list.Data.Items, 1)
+						require.Len(t, list.Data.Items, 2)
 						assert.Equal(t, float64(0), list.Data.Stats["queued"])
 					}
 					for _, item := range list.Data.Items {
+						if item["id"] == polling.TaskId {
+							assert.Equal(t, model.ImageTaskInvoking, item["status"])
+							assert.Equal(t, "generating", item["stage"])
+						}
 						if item["id"] != task.TaskId {
 							continue
 						}
@@ -123,6 +130,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					for _, secret := range []string{"password-secret-canary", "token-secret-canary", "channel-secret-canary", "private-storage-canary", "private-object-canary"} {
 						assert.NotContains(t, recorder.Body.String(), secret)
 					}
+					assert.NotContains(t, recorder.Body.String(), polling.UpstreamTaskId)
 					detailRecorder := httptest.NewRecorder()
 					detailContext, _ := gin.CreateTestContext(detailRecorder)
 					detailContext.Set("id", 101)
@@ -151,6 +159,22 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.NotContains(t, detailRecorder.Body.String(), "fingerprint-canary")
 					}
 				})
+			}
+			for status, expected := range map[string]int{model.ImageTaskQueued: 0, model.ImageTaskInvoking: 1} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", 101)
+				date := time.Now().UTC().Format("2006-01-02")
+				c.Request = httptest.NewRequest(http.MethodGet, "/?status="+status+"&start_date="+date+"&end_date="+date+"&timezone=UTC", nil)
+				ListImageTasks(c, false)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var response struct {
+					Data struct {
+						Items []gin.H
+					}
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				assert.Len(t, response.Data.Items, expected)
 			}
 			deniedRecorder := httptest.NewRecorder()
 			denied, _ := gin.CreateTestContext(deniedRecorder)

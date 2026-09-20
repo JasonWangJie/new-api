@@ -43,9 +43,9 @@ func imageTaskListQuery(c *gin.Context, admin bool) (*gorm.DB, error) {
 	}
 	if status := c.Query("status"); status != "" {
 		if status == model.ImageTaskQueued {
-			query = query.Where("status = ? OR (status = ? AND channel_id = 0)", model.ImageTaskQueued, model.ImageTaskInvoking)
+			query = query.Where("(status = ? AND COALESCE(upstream_task_id, '') = '') OR (status = ? AND channel_id = 0 AND COALESCE(upstream_task_id, '') = '')", model.ImageTaskQueued, model.ImageTaskInvoking)
 		} else if status == model.ImageTaskInvoking {
-			query = query.Where("status = ? AND channel_id > 0", status)
+			query = query.Where("(status = ? AND channel_id > 0) OR (status = ? AND COALESCE(upstream_task_id, '') <> '')", status, model.ImageTaskQueued)
 		} else {
 			query = query.Where("status = ?", status)
 		}
@@ -123,8 +123,8 @@ func ListImageTasks(c *gin.Context, admin bool) {
 		AverageDuration *float64 `json:"average_duration_ms"`
 	}
 	selection := `COUNT(*) AS total,
-COALESCE(SUM(CASE WHEN status = 'queued' OR (status = 'invoking' AND channel_id = 0) THEN 1 ELSE 0 END),0) AS queued,
-COALESCE(SUM(CASE WHEN status IN ('invoking','upstream_succeeded','uploading','billing_pending') AND NOT (status = 'invoking' AND channel_id = 0) THEN 1 ELSE 0 END),0) AS processing,
+COALESCE(SUM(CASE WHEN (status = 'queued' AND COALESCE(upstream_task_id, '') = '') OR (status = 'invoking' AND channel_id = 0 AND COALESCE(upstream_task_id, '') = '') THEN 1 ELSE 0 END),0) AS queued,
+COALESCE(SUM(CASE WHEN (status = 'queued' AND COALESCE(upstream_task_id, '') <> '') OR (status IN ('invoking','upstream_succeeded','uploading','billing_pending') AND NOT (status = 'invoking' AND channel_id = 0 AND COALESCE(upstream_task_id, '') = '')) THEN 1 ELSE 0 END),0) AS processing,
 COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END),0) AS succeeded,
 COALESCE(SUM(CASE WHEN status IN ('failed','expired','execution_unknown','storage_failed','billing_failed') THEN 1 ELSE 0 END),0) AS failed,
 COALESCE(SUM(CASE WHEN status = 'succeeded' THEN image_count ELSE 0 END),0) AS image_count,
@@ -255,7 +255,8 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 }
 
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
-	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(task.Status), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": task.DisplayStatus(), "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
+	displayStatus := task.DisplayStatus()
+	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(displayStatus), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": displayStatus, "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
 	if task.FinishedAt > 0 {
 		data["duration_ms"] = max(0, task.FinishedAt-task.CreatedAt) * 1000
 	}

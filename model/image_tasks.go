@@ -89,14 +89,16 @@ func ClaimAsyncImageTask(ctx context.Context, id, lease string, seconds int) (As
 		return task, err
 	}
 	now := time.Now().Unix()
-	if task.Terminal() || task.Status == ImageTaskInvoking || task.NextAttemptAt <= 0 || task.NextAttemptAt > now || task.LeaseExpiresAt > now {
+	if task.Terminal() || (task.Status == ImageTaskInvoking && task.UpstreamTaskId == "") || task.NextAttemptAt <= 0 || task.NextAttemptAt > now || task.LeaseExpiresAt > now {
 		return task, ErrImageConflict
 	}
 	updates := map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds), "heartbeat_at": now}
 	if task.Status == ImageTaskQueued {
 		updates["status"] = ImageTaskInvoking
-		updates["channel_id"] = 0
-		updates["dispatched_at"] = 0
+		if task.UpstreamTaskId == "" {
+			updates["channel_id"] = 0
+			updates["dispatched_at"] = 0
+		}
 		if task.StartedAt == 0 {
 			updates["started_at"] = now
 		}
@@ -105,6 +107,22 @@ func ClaimAsyncImageTask(ctx context.Context, id, lease string, seconds int) (As
 		return task, err
 	}
 	return task, DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", id, lease).Take(&task).Error
+}
+
+// ScheduleAsyncImagePoll releases the current execution lease after an
+// upstream asynchronous job has been accepted and durably schedules its next
+// status poll. The upstream channel and dispatch marker stay pinned so the
+// task cannot be mistaken for a fresh generation request.
+func ScheduleAsyncImagePoll(ctx context.Context, task AsyncImageTask, nextAttemptAt int64, eventType, message string) error {
+	if task.UpstreamTaskId == "" || nextAttemptAt <= 0 {
+		return ErrImageConflict
+	}
+	return TransitionImageTask(ctx, task, map[string]any{
+		"status":           ImageTaskInvoking,
+		"lease_token":      "",
+		"lease_expires_at": 0,
+		"next_attempt_at":  nextAttemptAt,
+	}, eventType, message, "execute")
 }
 
 func HeartbeatAsyncImageTask(ctx context.Context, id, lease string, seconds int) error {
@@ -251,13 +269,15 @@ func TerminateAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
 func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
 	now := time.Now().Unix()
 	var tasks []AsyncImageTask
-	if err := DB.WithContext(ctx).Where("status = ? AND (lease_expires_at <= ? OR (started_at > 0 AND started_at <= ?))", ImageTaskInvoking, now, now-int64(timeout)).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
+	if err := DB.WithContext(ctx).Where("status = ? AND ((lease_token <> '' AND lease_expires_at <= ?) OR (started_at > 0 AND started_at <= ?))", ImageTaskInvoking, now, now-int64(timeout)).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
 		return err
 	}
 	for _, task := range tasks {
 		updates := map[string]any{"status": ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": now}
 		event, kind := "recovered", "execute"
-		if task.DispatchedAt > 0 && task.UpstreamTaskId == "" {
+		if task.UpstreamTaskId != "" {
+			updates["status"] = ImageTaskInvoking
+		} else if task.DispatchedAt > 0 {
 			updates["status"] = ImageTaskExecutionUnknown
 			updates["request_cipher"] = nil
 			updates["public_error_code"] = 608

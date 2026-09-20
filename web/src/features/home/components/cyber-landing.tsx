@@ -40,6 +40,7 @@ import { useTranslation } from 'react-i18next'
 import { AnimateInView } from '@/components/animate-in-view'
 import { Button } from '@/components/ui/button'
 import { useStatus } from '@/hooks/use-status'
+import { DEFAULT_SYSTEM_NAME } from '@/lib/constants'
 
 import { HeroTerminalDemo } from './hero-terminal-demo'
 
@@ -51,8 +52,7 @@ export function CyberLanding(props: CyberLandingProps) {
   const { t } = useTranslation()
   const { status } = useStatus()
   const [motionPaused, setMotionPaused] = useState(false)
-  const docsUrl =
-    (status?.docs_link as string | undefined) || 'https://docs.newapi.pro'
+  const systemName = status?.system_name?.trim() || DEFAULT_SYSTEM_NAME
   const primaryLabel = props.isAuthenticated
     ? t('Go to Dashboard')
     : t('Get Started')
@@ -205,7 +205,7 @@ export function CyberLanding(props: CyberLandingProps) {
             </svg>
             <div className='cyber-core' aria-hidden>
               <CircuitBoard strokeWidth={1} />
-              <strong>new-api</strong>
+              <strong>{systemName}</strong>
               <span>{t('Unified API Gateway')}</span>
               <div className='cyber-core-bars'>
                 {Array.from({ length: 12 }, (_, index) => (
@@ -404,21 +404,6 @@ export function CyberLanding(props: CyberLandingProps) {
               <span>Gemini</span>
               <span>SSE</span>
             </div>
-            <Button
-              variant='ghost'
-              role='link'
-              className='cyber-docs-link'
-              render={
-                docsUrl.startsWith('http') ? (
-                  <a href={docsUrl} target='_blank' rel='noopener noreferrer' />
-                ) : (
-                  <Link to={docsUrl} />
-                )
-              }
-            >
-              {t('Read the documentation')}
-              <ArrowUpRight size={17} aria-hidden />
-            </Button>
           </AnimateInView>
           <AnimateInView className='cyber-protocol-demo' delay={120}>
             <div className='cyber-terminal-caption'>
