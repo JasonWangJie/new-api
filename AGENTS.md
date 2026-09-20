@@ -156,6 +156,9 @@ Inside `relaykit/`, use `kitutil.*` from `relaykit/relayconvert/kitutil/json.go`
 
 - Do NOT add new files under `docs/` or any of its subdirectories unless the user explicitly requests it.
 - Do NOT create or generate documentation files in this repository's plugin directories under `plugins/`, including `plugins/tasks/<plugin>/` and their subdirectories. This includes README files, changelogs, usage guides, and other documentation files, regardless of format.
+- Supplemental project documentation is maintained in the root `readmenew.md` and the root `wiki/` directory. Every feature addition, feature removal, or user-visible behavior change MUST update `readmenew.md`, the applicable page under `wiki/`, and the current monthly code-change ledger under `wiki/` in the same change. Each changelog entry must include the commit date, commit hash, affected scope, and a concise description of the final behavior.
+- Every Markdown file directly under `wiki/` MUST use a two-digit sequence number followed by a hyphen and a Chinese title, in the form `NN-中文名称.md`. Keep link targets and the Wiki directory page synchronized whenever a Wiki file is added, renamed, or removed.
+- Do NOT modify the pre-existing documentation set, including `README*.md`, existing component `README.md` files, or existing files under `docs/`, unless the user explicitly requests a specific legacy documentation file. Add new documentation to `readmenew.md` and `wiki/` instead.
 
 ### Frontend Rules
 
