@@ -212,6 +212,13 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	}
+	if option.Key == "payment_setting.invoice_min_amount_cents" {
+		value, parseErr := strconv.ParseInt(option.Value.(string), 10, 64)
+		if parseErr != nil || value < 0 {
+			common.ApiErrorMsg(c, "最低开票金额必须是非负整数分")
+			return
+		}
+	}
 	if option.Key == "TaskPublicAddress" && option.Value.(string) != "" {
 		if err := service.ValidateTaskArtifactBaseURL(option.Value.(string)); err != nil {
 			common.ApiErrorMsg(c, err.Error())

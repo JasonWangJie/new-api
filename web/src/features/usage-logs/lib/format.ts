@@ -495,6 +495,11 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'option.payment_compliance': 'Confirmed payment compliance',
   'option.reset_ratio': 'Reset model ratios',
   'option.clear_affinity_cache': 'Cleared channel affinity cache',
+  // Enterprise invoices
+  'invoice.complete': 'Completed invoice request {{request_id}}',
+  'invoice.reject': 'Rejected invoice request {{request_id}}',
+  'invoice.history':
+    'Recorded historical invoice {{request_id}} for user {{target_user_id}}',
   // Custom OAuth
   'custom_oauth.create': 'Created a custom OAuth provider',
   'custom_oauth.update': 'Updated a custom OAuth provider',

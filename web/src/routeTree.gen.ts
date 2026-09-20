@@ -60,9 +60,11 @@ import { Route as AuthenticatedUsageLogsSectionRouteImport } from './routes/_aut
 import { Route as AuthenticatedUsageLogsAuditRouteImport } from './routes/_authenticated/usage-logs/audit'
 import { Route as AuthenticatedUsersIndexRouteImport } from './routes/_authenticated/users/index'
 import { Route as AuthenticatedWalletIndexRouteImport } from './routes/_authenticated/wallet/index'
+import { Route as AuthenticatedWalletInvoicesRouteImport } from './routes/_authenticated/wallet/invoices'
 import { Route as PricingModelIdIndexRouteImport } from './routes/pricing/$modelId/index'
 import { Route as AuthenticatedAdminAsyncImageTasksIndexRouteImport } from './routes/_authenticated/admin/async-image-tasks/index'
 import { Route as AuthenticatedAdminImageModerationIndexRouteImport } from './routes/_authenticated/admin/image-moderation/index'
+import { Route as AuthenticatedAdminInvoicesIndexRouteImport } from './routes/_authenticated/admin/invoices/index'
 import { Route as AuthenticatedSystemSettingsAuthIndexRouteImport } from './routes/_authenticated/system-settings/auth/index'
 import { Route as AuthenticatedSystemSettingsAuthSectionRouteImport } from './routes/_authenticated/system-settings/auth/$section'
 import { Route as AuthenticatedSystemSettingsBillingIndexRouteImport } from './routes/_authenticated/system-settings/billing/index'
@@ -355,6 +357,12 @@ const AuthenticatedWalletIndexRoute =
     path: '/wallet/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
+const AuthenticatedWalletInvoicesRoute =
+  AuthenticatedWalletInvoicesRouteImport.update({
+    id: '/wallet/invoices',
+    path: '/wallet/invoices',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const PricingModelIdIndexRoute = PricingModelIdIndexRouteImport.update({
   id: '/pricing/$modelId/',
   path: '/pricing/$modelId/',
@@ -370,6 +378,12 @@ const AuthenticatedAdminImageModerationIndexRoute =
   AuthenticatedAdminImageModerationIndexRouteImport.update({
     id: '/admin/image-moderation/',
     path: '/admin/image-moderation/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedAdminInvoicesIndexRoute =
+  AuthenticatedAdminInvoicesIndexRouteImport.update({
+    id: '/admin/invoices/',
+    path: '/admin/invoices/',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedSystemSettingsAuthIndexRoute =
@@ -488,6 +502,7 @@ export interface FileRoutesByFullPath {
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/channels/': typeof AuthenticatedChannelsIndexRoute
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
@@ -517,6 +532,7 @@ export interface FileRoutesByFullPath {
   '/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
   '/admin/async-image-tasks/': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
   '/admin/image-moderation/': typeof AuthenticatedAdminImageModerationIndexRoute
+  '/admin/invoices/': typeof AuthenticatedAdminInvoicesIndexRoute
   '/system-settings/auth/': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/system-settings/billing/': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/system-settings/content/': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -555,6 +571,7 @@ export interface FileRoutesByTo {
   '/models/$section': typeof AuthenticatedModelsSectionRoute
   '/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/async-image-tasks': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
@@ -584,6 +601,7 @@ export interface FileRoutesByTo {
   '/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
   '/admin/async-image-tasks': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
   '/admin/image-moderation': typeof AuthenticatedAdminImageModerationIndexRoute
+  '/admin/invoices': typeof AuthenticatedAdminInvoicesIndexRoute
   '/system-settings/auth': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/system-settings/billing': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/system-settings/content': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -626,6 +644,7 @@ export interface FileRoutesById {
   '/_authenticated/models/$section': typeof AuthenticatedModelsSectionRoute
   '/_authenticated/usage-logs/$section': typeof AuthenticatedUsageLogsSectionRoute
   '/_authenticated/usage-logs/audit': typeof AuthenticatedUsageLogsAuditRoute
+  '/_authenticated/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/_authenticated/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
@@ -655,6 +674,7 @@ export interface FileRoutesById {
   '/_authenticated/system-settings/site/$section': typeof AuthenticatedSystemSettingsSiteSectionRoute
   '/_authenticated/admin/async-image-tasks/': typeof AuthenticatedAdminAsyncImageTasksIndexRoute
   '/_authenticated/admin/image-moderation/': typeof AuthenticatedAdminImageModerationIndexRoute
+  '/_authenticated/admin/invoices/': typeof AuthenticatedAdminInvoicesIndexRoute
   '/_authenticated/system-settings/auth/': typeof AuthenticatedSystemSettingsAuthIndexRoute
   '/_authenticated/system-settings/billing/': typeof AuthenticatedSystemSettingsBillingIndexRoute
   '/_authenticated/system-settings/content/': typeof AuthenticatedSystemSettingsContentIndexRoute
@@ -696,6 +716,7 @@ export interface FileRouteTypes {
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/wallet/invoices'
     | '/async-image-tasks/'
     | '/channels/'
     | '/dashboard/'
@@ -725,6 +746,7 @@ export interface FileRouteTypes {
     | '/system-settings/site/$section'
     | '/admin/async-image-tasks/'
     | '/admin/image-moderation/'
+    | '/admin/invoices/'
     | '/system-settings/auth/'
     | '/system-settings/billing/'
     | '/system-settings/content/'
@@ -763,6 +785,7 @@ export interface FileRouteTypes {
     | '/models/$section'
     | '/usage-logs/$section'
     | '/usage-logs/audit'
+    | '/wallet/invoices'
     | '/async-image-tasks'
     | '/channels'
     | '/dashboard'
@@ -792,6 +815,7 @@ export interface FileRouteTypes {
     | '/system-settings/site/$section'
     | '/admin/async-image-tasks'
     | '/admin/image-moderation'
+    | '/admin/invoices'
     | '/system-settings/auth'
     | '/system-settings/billing'
     | '/system-settings/content'
@@ -833,6 +857,7 @@ export interface FileRouteTypes {
     | '/_authenticated/models/$section'
     | '/_authenticated/usage-logs/$section'
     | '/_authenticated/usage-logs/audit'
+    | '/_authenticated/wallet/invoices'
     | '/_authenticated/async-image-tasks/'
     | '/_authenticated/channels/'
     | '/_authenticated/dashboard/'
@@ -862,6 +887,7 @@ export interface FileRouteTypes {
     | '/_authenticated/system-settings/site/$section'
     | '/_authenticated/admin/async-image-tasks/'
     | '/_authenticated/admin/image-moderation/'
+    | '/_authenticated/admin/invoices/'
     | '/_authenticated/system-settings/auth/'
     | '/_authenticated/system-settings/billing/'
     | '/_authenticated/system-settings/content/'
@@ -1249,6 +1275,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedWalletIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/wallet/invoices': {
+      id: '/_authenticated/wallet/invoices'
+      path: '/wallet/invoices'
+      fullPath: '/wallet/invoices'
+      preLoaderRoute: typeof AuthenticatedWalletInvoicesRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/pricing/$modelId/': {
       id: '/pricing/$modelId/'
       path: '/pricing/$modelId'
@@ -1268,6 +1301,13 @@ declare module '@tanstack/react-router' {
       path: '/admin/image-moderation'
       fullPath: '/admin/image-moderation/'
       preLoaderRoute: typeof AuthenticatedAdminImageModerationIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/admin/invoices/': {
+      id: '/_authenticated/admin/invoices/'
+      path: '/admin/invoices'
+      fullPath: '/admin/invoices/'
+      preLoaderRoute: typeof AuthenticatedAdminInvoicesIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/system-settings/auth/': {
@@ -1464,6 +1504,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedModelsSectionRoute: typeof AuthenticatedModelsSectionRoute
   AuthenticatedUsageLogsSectionRoute: typeof AuthenticatedUsageLogsSectionRoute
   AuthenticatedUsageLogsAuditRoute: typeof AuthenticatedUsageLogsAuditRoute
+  AuthenticatedWalletInvoicesRoute: typeof AuthenticatedWalletInvoicesRoute
   AuthenticatedAsyncImageTasksIndexRoute: typeof AuthenticatedAsyncImageTasksIndexRoute
   AuthenticatedChannelsIndexRoute: typeof AuthenticatedChannelsIndexRoute
   AuthenticatedDashboardIndexRoute: typeof AuthenticatedDashboardIndexRoute
@@ -1484,6 +1525,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedWalletIndexRoute: typeof AuthenticatedWalletIndexRoute
   AuthenticatedAdminAsyncImageTasksIndexRoute: typeof AuthenticatedAdminAsyncImageTasksIndexRoute
   AuthenticatedAdminImageModerationIndexRoute: typeof AuthenticatedAdminImageModerationIndexRoute
+  AuthenticatedAdminInvoicesIndexRoute: typeof AuthenticatedAdminInvoicesIndexRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
@@ -1497,6 +1539,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedModelsSectionRoute: AuthenticatedModelsSectionRoute,
   AuthenticatedUsageLogsSectionRoute: AuthenticatedUsageLogsSectionRoute,
   AuthenticatedUsageLogsAuditRoute: AuthenticatedUsageLogsAuditRoute,
+  AuthenticatedWalletInvoicesRoute: AuthenticatedWalletInvoicesRoute,
   AuthenticatedAsyncImageTasksIndexRoute:
     AuthenticatedAsyncImageTasksIndexRoute,
   AuthenticatedChannelsIndexRoute: AuthenticatedChannelsIndexRoute,
@@ -1521,6 +1564,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
     AuthenticatedAdminAsyncImageTasksIndexRoute,
   AuthenticatedAdminImageModerationIndexRoute:
     AuthenticatedAdminImageModerationIndexRoute,
+  AuthenticatedAdminInvoicesIndexRoute: AuthenticatedAdminInvoicesIndexRoute,
 }
 
 const AuthenticatedRouteRouteWithChildren =

@@ -36,6 +36,8 @@ type DataTableBulkActionsProps<TData> = {
   placement?: 'floating' | 'inline'
   entityName: string
   children: React.ReactNode
+  selectedCount?: number
+  onClearSelection?: () => void
 }
 
 /**
@@ -53,10 +55,12 @@ export function DataTableBulkActions<TData>({
   entityName,
   placement = 'floating',
   children,
+  selectedCount: selectedCountProp,
+  onClearSelection,
 }: DataTableBulkActionsProps<TData>): React.ReactNode | null {
   const { t } = useTranslation()
   const selectedRows = table.getFilteredSelectedRowModel().rows
-  const selectedCount = selectedRows.length
+  const selectedCount = selectedCountProp ?? selectedRows.length
   const toolbarRef = useRef<HTMLDivElement>(null)
   const buttonsRef = useRef<HTMLButtonElement[]>([])
   const [announcement, setAnnouncement] = useState('')
@@ -84,6 +88,10 @@ export function DataTableBulkActions<TData>({
   }, [selectedCount, entityName, t])
 
   const handleClearSelection = () => {
+    if (onClearSelection) {
+      onClearSelection()
+      return
+    }
     table.resetRowSelection()
   }
 

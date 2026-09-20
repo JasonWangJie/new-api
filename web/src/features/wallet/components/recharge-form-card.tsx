@@ -1,3 +1,4 @@
+import { Link } from '@tanstack/react-router'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -16,7 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Gift, ExternalLink, Loader2, Receipt, WalletCards } from 'lucide-react'
+import {
+  Gift,
+  ExternalLink,
+  FileText,
+  Loader2,
+  Receipt,
+  WalletCards,
+} from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -202,17 +210,28 @@ export function RechargeFormCard({
       iconTone='success'
       disableHoverEffect
       action={
-        onOpenBilling ? (
+        <div className='flex w-full flex-col gap-2 sm:w-auto sm:flex-row'>
           <Button
             variant='outline'
             size='sm'
-            onClick={onOpenBilling}
+            render={<Link to='/wallet/invoices' />}
             className='w-full gap-2 sm:w-auto'
           >
-            <Receipt className='h-4 w-4' />
-            {t('Order History')}
+            <FileText className='h-4 w-4' />
+            {t('Enterprise Invoices')}
           </Button>
-        ) : null
+          {onOpenBilling ? (
+            <Button
+              variant='outline'
+              size='sm'
+              onClick={onOpenBilling}
+              className='w-full gap-2 sm:w-auto'
+            >
+              <Receipt className='h-4 w-4' />
+              {t('Order History')}
+            </Button>
+          ) : null}
+        </div>
       }
       contentClassName='space-y-4 sm:space-y-6'
     >

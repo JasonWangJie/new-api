@@ -199,6 +199,26 @@ func SetApiRouter(router *gin.Engine) {
 			}
 		}
 
+		invoiceRoute := apiRouter.Group("/invoice")
+		invoiceRoute.Use(middleware.UserAuth(), middleware.DisableCache())
+		{
+			invoiceRoute.GET("/config", controller.GetInvoiceConfig)
+			invoiceRoute.GET("/orders", controller.GetInvoiceEligibleOrders)
+			invoiceRoute.POST("/requests", middleware.CriticalRateLimit(), controller.CreateInvoiceRequest)
+			invoiceRoute.GET("/requests", controller.ListMyInvoiceRequests)
+			invoiceRoute.GET("/requests/:id", controller.GetMyInvoiceRequest)
+		}
+		invoiceAdminRoute := apiRouter.Group("/invoice/admin")
+		invoiceAdminRoute.Use(middleware.AdminAuth(), middleware.DisableCache())
+		{
+			invoiceAdminRoute.GET("/requests", middleware.RequirePermission(authz.InvoiceRead), controller.AdminListInvoiceRequests)
+			invoiceAdminRoute.GET("/requests/:id", middleware.RequirePermission(authz.InvoiceRead), controller.AdminGetInvoiceRequest)
+			invoiceAdminRoute.GET("/orders", middleware.RequirePermission(authz.InvoiceRead), controller.AdminGetInvoiceEligibleOrders)
+			invoiceAdminRoute.POST("/requests/:id/complete", middleware.RequirePermission(authz.InvoiceManage), controller.AdminCompleteInvoiceRequest)
+			invoiceAdminRoute.POST("/requests/:id/reject", middleware.RequirePermission(authz.InvoiceManage), controller.AdminRejectInvoiceRequest)
+			invoiceAdminRoute.POST("/history", middleware.RequirePermission(authz.InvoiceManage), controller.AdminCreateHistoricalInvoice)
+		}
+
 		// Subscription billing (plans, purchase, admin management)
 		subscriptionRoute := apiRouter.Group("/subscription")
 		subscriptionRoute.Use(middleware.UserAuth())

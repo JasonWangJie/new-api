@@ -161,6 +161,7 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceAsyncImageTask:  {ActionRead: true, ActionManage: true},
 		ResourceImageModeration: {ActionRead: true, ActionManage: true},
 		ResourceImageConfig:     {ActionRead: false, ActionManage: false},
+		ResourceInvoice:         {ActionRead: true, ActionManage: true},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
 		ResourceChannel: {
@@ -196,6 +197,7 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceAsyncImageTask:  {ActionRead: true, ActionManage: true},
 		ResourceImageModeration: {ActionRead: true, ActionManage: true},
 		ResourceImageConfig:     {ActionRead: false, ActionManage: false},
+		ResourceInvoice:         {ActionRead: true, ActionManage: true},
 	}, ExplicitUserPermissions(42))
 	assert.Empty(t, ExplicitUserOverrides(42))
 }

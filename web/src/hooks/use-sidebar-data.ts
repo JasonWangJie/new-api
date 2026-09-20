@@ -143,6 +143,11 @@ export function useSidebarData(): SidebarData {
             icon: Wallet,
           },
           {
+            title: t('Enterprise Invoices'),
+            url: '/wallet/invoices',
+            icon: FileText,
+          },
+          {
             title: t('Profile'),
             url: '/profile',
             icon: User,
@@ -174,6 +179,16 @@ export function useSidebarData(): SidebarData {
                   title: t('Image Moderation'),
                   url: '/admin/image-moderation',
                   icon: ShieldCheck,
+                  requiredRole: ROLE.ADMIN,
+                },
+              ]
+            : []),
+          ...(hasPermission(user, 'invoice', 'read')
+            ? [
+                {
+                  title: t('Invoice Management'),
+                  url: '/admin/invoices',
+                  icon: FileText,
                   requiredRole: ROLE.ADMIN,
                 },
               ]

@@ -279,6 +279,26 @@ export const STATIC_I18N_KEYS = [
   'Failed to delete user',
   'No user selected',
 
+  // Enterprise invoices (dynamic validation, permission and audit labels)
+  'Invoices',
+  'View invoice requests',
+  "View users' invoice requests and invoice history",
+  'Manage invoice requests',
+  'Complete or reject invoice requests and record historical invoices',
+  'Company name is required',
+  'Company name must be 200 characters or fewer',
+  'Tax ID is required',
+  'Tax ID must be 64 characters or fewer',
+  'Email is required',
+  'Enter a valid email address',
+  'Email must be 254 characters or fewer',
+  'Minimum invoice amount cannot be negative',
+  'Invoice amount supports at most two decimal places',
+  'Save enterprise invoice settings',
+  'Completed invoice request {{request_id}}',
+  'Rejected invoice request {{request_id}}',
+  'Recorded historical invoice {{request_id}} for user {{target_user_id}}',
+
   // Redemption codes
   'Unused',
   'Disabled',
