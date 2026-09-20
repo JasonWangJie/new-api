@@ -102,136 +102,139 @@ export function AdminInvoicesPage() {
   }
 
   return (
-    <SectionPageLayout>
-      <SectionPageLayout.Title>
-        {t('Invoice Management')}
-      </SectionPageLayout.Title>
-      <SectionPageLayout.Content>
-        <div className='space-y-4'>
-          <p className='text-muted-foreground text-sm'>
-            {t(
-              'Process invoice applications or record invoices issued before this feature was enabled.'
-            )}
-          </p>
-          <Tabs defaultValue='requests' className='gap-4'>
-            <TabsList>
-              <TabsTrigger value='requests'>
-                <ScrollText aria-hidden='true' />
-                {t('Application records')}
-              </TabsTrigger>
-              <TabsTrigger value='history'>
-                <FileClock aria-hidden='true' />
-                {t('Historical supplement')}
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value='requests'>
-              <InvoiceRequestsTable admin canManage={canManage} />
-            </TabsContent>
-
-            <TabsContent value='history' className='space-y-4'>
-              {!canManage ? (
-                <Alert>
-                  <AlertDescription>
-                    {t('You have read-only access to invoice records.')}
-                  </AlertDescription>
-                </Alert>
-              ) : null}
-              <Card size='sm'>
-                <CardContent className='space-y-3'>
-                  <div className='flex flex-col gap-2 sm:flex-row'>
-                    <div className='relative flex-1'>
-                      <Search
-                        aria-hidden='true'
-                        className='text-muted-foreground absolute top-2 left-2.5 size-4'
-                      />
-                      <Input
-                        value={userKeyword}
-                        className='pl-8'
-                        placeholder={t(
-                          'Search by user ID, username, name or email...'
-                        )}
-                        onChange={(event) =>
-                          setUserKeyword(event.currentTarget.value)
-                        }
-                      />
-                    </div>
-                  </div>
-                  {userKeyword.trim() ? (
-                    <div className='divide-y rounded-lg border'>
-                      {users.isLoading ? (
-                        <p className='text-muted-foreground px-3 py-3 text-sm'>
-                          {t('Searching...')}
-                        </p>
-                      ) : null}
-                      {users.data?.map((user) => (
-                        <Button
-                          key={user.id}
-                          type='button'
-                          variant='ghost'
-                          className='h-auto w-full justify-between gap-3 rounded-none px-3 py-2 text-left'
-                          onClick={() => selectUser(user)}
-                        >
-                          <span className='min-w-0'>
-                            <span className='block truncate font-medium'>
-                              {user.display_name || user.username}
-                            </span>
-                            <span className='text-muted-foreground block truncate text-xs'>
-                              #{user.id} · {user.username} · {user.email || '-'}
-                            </span>
-                          </span>
-                          <span className='text-primary shrink-0 text-xs'>
-                            {t('Select')}
-                          </span>
-                        </Button>
-                      ))}
-                      {!users.isLoading && users.data?.length === 0 ? (
-                        <p className='text-muted-foreground px-3 py-3 text-sm'>
-                          {t('No users found')}
-                        </p>
-                      ) : null}
-                    </div>
-                  ) : null}
-                  {selectedUser ? (
-                    <div className='bg-muted/40 rounded-lg border px-3 py-2 text-sm'>
-                      <span className='text-muted-foreground'>
-                        {t('Selected user')}:{' '}
-                      </span>
-                      <span className='font-medium'>
-                        {selectedUser.display_name || selectedUser.username}
-                      </span>
-                      <span className='text-muted-foreground'>
-                        {' '}
-                        (#{selectedUser.id} · {selectedUser.username})
-                      </span>
-                    </div>
-                  ) : null}
-                </CardContent>
-              </Card>
-
-              {selectedUser ? (
-                <EligibleOrdersTable
-                  key={selectedUser.id}
-                  adminUserId={selectedUser.id}
-                  selectedOrders={selectedOrders}
-                  onSelectedOrdersChange={setSelectedOrders}
-                  actionLabel={t('Mark as invoiced')}
-                  actionDisabled={!canManage || selectedOrders.size === 0}
-                  onAction={() => setHistoryOpen(true)}
-                />
-              ) : (
-                <Alert>
-                  <AlertDescription>
-                    {t(
-                      'Search for and select a user to view invoiceable recharge orders.'
-                    )}
-                  </AlertDescription>
-                </Alert>
+    <>
+      <SectionPageLayout>
+        <SectionPageLayout.Title>
+          {t('Invoice Management')}
+        </SectionPageLayout.Title>
+        <SectionPageLayout.Content>
+          <div className='space-y-4'>
+            <p className='text-muted-foreground text-sm'>
+              {t(
+                'Process invoice applications or record invoices issued before this feature was enabled.'
               )}
-            </TabsContent>
-          </Tabs>
-        </div>
-      </SectionPageLayout.Content>
+            </p>
+            <Tabs defaultValue='requests' className='gap-4'>
+              <TabsList>
+                <TabsTrigger value='requests'>
+                  <ScrollText aria-hidden='true' />
+                  {t('Application records')}
+                </TabsTrigger>
+                <TabsTrigger value='history'>
+                  <FileClock aria-hidden='true' />
+                  {t('Historical supplement')}
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value='requests'>
+                <InvoiceRequestsTable admin canManage={canManage} />
+              </TabsContent>
+
+              <TabsContent value='history' className='space-y-4'>
+                {!canManage ? (
+                  <Alert>
+                    <AlertDescription>
+                      {t('You have read-only access to invoice records.')}
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
+                <Card size='sm'>
+                  <CardContent className='space-y-3'>
+                    <div className='flex flex-col gap-2 sm:flex-row'>
+                      <div className='relative flex-1'>
+                        <Search
+                          aria-hidden='true'
+                          className='text-muted-foreground absolute top-2 left-2.5 size-4'
+                        />
+                        <Input
+                          value={userKeyword}
+                          className='pl-8'
+                          placeholder={t(
+                            'Search by user ID, username, name or email...'
+                          )}
+                          onChange={(event) =>
+                            setUserKeyword(event.currentTarget.value)
+                          }
+                        />
+                      </div>
+                    </div>
+                    {userKeyword.trim() ? (
+                      <div className='divide-y rounded-lg border'>
+                        {users.isLoading ? (
+                          <p className='text-muted-foreground px-3 py-3 text-sm'>
+                            {t('Searching...')}
+                          </p>
+                        ) : null}
+                        {users.data?.map((user) => (
+                          <Button
+                            key={user.id}
+                            type='button'
+                            variant='ghost'
+                            className='h-auto w-full justify-between gap-3 rounded-none px-3 py-2 text-left'
+                            onClick={() => selectUser(user)}
+                          >
+                            <span className='min-w-0'>
+                              <span className='block truncate font-medium'>
+                                {user.display_name || user.username}
+                              </span>
+                              <span className='text-muted-foreground block truncate text-xs'>
+                                #{user.id} · {user.username} ·{' '}
+                                {user.email || '-'}
+                              </span>
+                            </span>
+                            <span className='text-primary shrink-0 text-xs'>
+                              {t('Select')}
+                            </span>
+                          </Button>
+                        ))}
+                        {!users.isLoading && users.data?.length === 0 ? (
+                          <p className='text-muted-foreground px-3 py-3 text-sm'>
+                            {t('No users found')}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {selectedUser ? (
+                      <div className='bg-muted/40 rounded-lg border px-3 py-2 text-sm'>
+                        <span className='text-muted-foreground'>
+                          {t('Selected user')}:{' '}
+                        </span>
+                        <span className='font-medium'>
+                          {selectedUser.display_name || selectedUser.username}
+                        </span>
+                        <span className='text-muted-foreground'>
+                          {' '}
+                          (#{selectedUser.id} · {selectedUser.username})
+                        </span>
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
+                {selectedUser ? (
+                  <EligibleOrdersTable
+                    key={selectedUser.id}
+                    adminUserId={selectedUser.id}
+                    selectedOrders={selectedOrders}
+                    onSelectedOrdersChange={setSelectedOrders}
+                    actionLabel={t('Mark as invoiced')}
+                    actionDisabled={!canManage || selectedOrders.size === 0}
+                    onAction={() => setHistoryOpen(true)}
+                  />
+                ) : (
+                  <Alert>
+                    <AlertDescription>
+                      {t(
+                        'Search for and select a user to view invoiceable recharge orders.'
+                      )}
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </TabsContent>
+            </Tabs>
+          </div>
+        </SectionPageLayout.Content>
+      </SectionPageLayout>
 
       <ConfirmDialog
         open={historyOpen}
@@ -268,6 +271,6 @@ export function AdminInvoicesPage() {
           />
         </div>
       </ConfirmDialog>
-    </SectionPageLayout>
+    </>
   )
 }

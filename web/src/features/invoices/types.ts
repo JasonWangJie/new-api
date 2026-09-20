@@ -18,6 +18,7 @@ export type InvoiceConfig = {
 export type InvoiceEligibleOrder = {
   top_up_id: number
   trade_no: string
+  payment_method: string
   amount_cents: number
   create_time: number
   complete_time: number
@@ -28,6 +29,7 @@ export type InvoiceRequestItem = {
   request_id: number
   top_up_id: number
   trade_no: string
+  payment_method: string
   amount_cents: number
   create_time: number
   complete_time: number

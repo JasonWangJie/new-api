@@ -99,6 +99,32 @@ func TestInvoiceWorkflow(t *testing.T) {
 		assert.EqualValues(t, 1013, created.Items[0].AmountCents)
 	})
 
+	t.Run("payment method is exposed in eligible orders and request details", func(t *testing.T) {
+		truncateTables(t)
+		order := createInvoiceTestTopUp(t, 13, "invoice-payment-method", 13)
+
+		eligible, total, err := ListInvoiceEligibleOrders(13, "", &common.PageInfo{Page: 1, PageSize: 20})
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, total)
+		require.Len(t, eligible, 1)
+		eligibleJSON, err := common.Marshal(eligible[0])
+		require.NoError(t, err)
+		var eligibleFields map[string]any
+		require.NoError(t, common.Unmarshal(eligibleJSON, &eligibleFields))
+		assert.Equal(t, "alipay", eligibleFields["payment_method"])
+
+		created, err := CreateUserInvoiceRequest(13, []int{order.Id}, "Payment", "TAX-PAY", "payment@example.com", 0)
+		require.NoError(t, err)
+		loaded, err := GetInvoiceRequest(created.Id, 13)
+		require.NoError(t, err)
+		require.Len(t, loaded.Items, 1)
+		itemJSON, err := common.Marshal(loaded.Items[0])
+		require.NoError(t, err)
+		var itemFields map[string]any
+		require.NoError(t, common.Unmarshal(itemJSON, &itemFields))
+		assert.Equal(t, "alipay", itemFields["payment_method"])
+	})
+
 	t.Run("large cross-page selections are processed in database-safe batches", func(t *testing.T) {
 		truncateTables(t)
 		topUps := make([]TopUp, 101)

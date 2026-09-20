@@ -27,6 +27,7 @@ import {
 } from '@/components/data-table'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { getPaymentMethodName } from '@/features/wallet/lib/billing'
 
 import { getEligibleInvoiceOrders } from '../api'
 import {
@@ -130,6 +131,18 @@ export function EligibleOrdersTable(props: EligibleOrdersTableProps) {
           </div>
         ),
         meta: { mobileTitle: true, label: t('Recharge order number') },
+      },
+      {
+        accessorKey: 'payment_method',
+        header: t('Payment Method'),
+        cell: ({ row }) => (
+          <span>
+            {row.original.payment_method
+              ? getPaymentMethodName(row.original.payment_method, t)
+              : '-'}
+          </span>
+        ),
+        meta: { label: t('Payment Method') },
       },
       {
         accessorKey: 'amount_cents',

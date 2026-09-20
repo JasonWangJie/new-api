@@ -55,13 +55,14 @@ type InvoiceRequest struct {
 }
 
 type InvoiceRequestItem struct {
-	Id           int    `json:"id"`
-	RequestId    int    `json:"request_id" gorm:"index;uniqueIndex:idx_invoice_request_topup,priority:1"`
-	TopUpId      int    `json:"top_up_id" gorm:"index;uniqueIndex:idx_invoice_request_topup,priority:2"`
-	TradeNo      string `json:"trade_no" gorm:"type:varchar(255)"`
-	AmountCents  int64  `json:"amount_cents" gorm:"type:bigint;not null"`
-	CreateTime   int64  `json:"create_time"`
-	CompleteTime int64  `json:"complete_time"`
+	Id            int    `json:"id"`
+	RequestId     int    `json:"request_id" gorm:"index;uniqueIndex:idx_invoice_request_topup,priority:1"`
+	TopUpId       int    `json:"top_up_id" gorm:"index;uniqueIndex:idx_invoice_request_topup,priority:2"`
+	TradeNo       string `json:"trade_no" gorm:"type:varchar(255)"`
+	PaymentMethod string `json:"payment_method" gorm:"-:all"`
+	AmountCents   int64  `json:"amount_cents" gorm:"type:bigint;not null"`
+	CreateTime    int64  `json:"create_time"`
+	CompleteTime  int64  `json:"complete_time"`
 }
 
 type InvoiceOrderClaim struct {
@@ -70,11 +71,12 @@ type InvoiceOrderClaim struct {
 }
 
 type InvoiceEligibleOrder struct {
-	TopUpId      int    `json:"top_up_id"`
-	TradeNo      string `json:"trade_no"`
-	AmountCents  int64  `json:"amount_cents"`
-	CreateTime   int64  `json:"create_time"`
-	CompleteTime int64  `json:"complete_time"`
+	TopUpId       int    `json:"top_up_id"`
+	TradeNo       string `json:"trade_no"`
+	PaymentMethod string `json:"payment_method"`
+	AmountCents   int64  `json:"amount_cents"`
+	CreateTime    int64  `json:"create_time"`
+	CompleteTime  int64  `json:"complete_time"`
 }
 
 type InvoiceOperator struct {
@@ -166,7 +168,7 @@ func ListInvoiceEligibleOrders(userId int, keyword string, pageInfo *common.Page
 			continue
 		}
 		eligible = append(eligible, InvoiceEligibleOrder{
-			TopUpId: topUps[i].Id, TradeNo: topUps[i].TradeNo, AmountCents: amountCents,
+			TopUpId: topUps[i].Id, TradeNo: topUps[i].TradeNo, PaymentMethod: topUps[i].PaymentMethod, AmountCents: amountCents,
 			CreateTime: topUps[i].CreateTime, CompleteTime: topUps[i].CompleteTime,
 		})
 	}
@@ -259,7 +261,7 @@ func createInvoiceRequest(userId int, source string, orderIDs []int, companyName
 			}
 			total += amountCents
 			items = append(items, InvoiceRequestItem{
-				TopUpId: topUp.Id, TradeNo: topUp.TradeNo, AmountCents: amountCents,
+				TopUpId: topUp.Id, TradeNo: topUp.TradeNo, PaymentMethod: topUp.PaymentMethod, AmountCents: amountCents,
 				CreateTime: topUp.CreateTime, CompleteTime: topUp.CompleteTime,
 			})
 		}
@@ -324,9 +326,29 @@ func populateInvoiceRequests(requests []InvoiceRequest) error {
 	if err := DB.Where("request_id IN ?", requestIDs).Order("id").Find(&items).Error; err != nil {
 		return err
 	}
+	topUpIDs := make([]int, 0, len(items))
+	seenTopUpIDs := make(map[int]struct{}, len(items))
+	for i := range items {
+		if _, exists := seenTopUpIDs[items[i].TopUpId]; exists {
+			continue
+		}
+		seenTopUpIDs[items[i].TopUpId] = struct{}{}
+		topUpIDs = append(topUpIDs, items[i].TopUpId)
+	}
+	paymentMethods := make(map[int]string, len(topUpIDs))
+	for idBatch := range slices.Chunk(topUpIDs, invoiceSQLBatchSize) {
+		var topUps []TopUp
+		if err := DB.Select("id", "payment_method").Where("id IN ?", idBatch).Find(&topUps).Error; err != nil {
+			return err
+		}
+		for i := range topUps {
+			paymentMethods[topUps[i].Id] = topUps[i].PaymentMethod
+		}
+	}
 	itemsByRequest := make(map[int][]InvoiceRequestItem, len(requestIDs))
-	for _, item := range items {
-		itemsByRequest[item.RequestId] = append(itemsByRequest[item.RequestId], item)
+	for i := range items {
+		items[i].PaymentMethod = paymentMethods[items[i].TopUpId]
+		itemsByRequest[items[i].RequestId] = append(itemsByRequest[items[i].RequestId], items[i])
 	}
 	var users []User
 	if err := DB.Unscoped().Select("id", "username", "display_name").Where("id IN ?", userIDs).Find(&users).Error; err != nil {

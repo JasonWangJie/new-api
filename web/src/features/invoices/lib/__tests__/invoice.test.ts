@@ -21,6 +21,7 @@ function order(id: number, amountCents: number): InvoiceEligibleOrder {
   return {
     top_up_id: id,
     trade_no: `order-${id}`,
+    payment_method: 'alipay',
     amount_cents: amountCents,
     create_time: 1,
     complete_time: 2,

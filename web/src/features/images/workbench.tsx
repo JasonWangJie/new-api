@@ -67,8 +67,12 @@ export function ImageWorkbench() {
   const { t } = useTranslation()
   const [media, setMedia] = useState('image')
   return userId ? (
-    <div className='space-y-4'>
-      <Tabs value={media} onValueChange={(value) => setMedia(String(value))}>
+    <div className='flex min-h-0 flex-1 flex-col gap-4 overflow-hidden'>
+      <Tabs
+        className='shrink-0'
+        value={media}
+        onValueChange={(value) => setMedia(String(value))}
+      >
         <TabsList>
           <TabsTrigger value='image'>{t('Image')}</TabsTrigger>
           <TabsTrigger value='video'>{t('Video')}</TabsTrigger>

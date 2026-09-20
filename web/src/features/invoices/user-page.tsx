@@ -38,78 +38,80 @@ export function UserInvoicesPage() {
   const belowMinimum = totalAmountCents < minAmountCents
 
   return (
-    <SectionPageLayout>
-      <SectionPageLayout.Title>
-        {t('Enterprise Invoices')}
-      </SectionPageLayout.Title>
-      <SectionPageLayout.Content>
-        <div className='space-y-4'>
-          <p className='text-muted-foreground text-sm'>
-            {t(
-              'Apply for enterprise invoices for paid CNY Epay recharge orders and review processing records.'
-            )}
-          </p>
-          <Tabs defaultValue='apply' className='gap-4'>
-            <TabsList>
-              <TabsTrigger value='apply'>
-                <FileText aria-hidden='true' />
-                {t('Apply for invoice')}
-              </TabsTrigger>
-              <TabsTrigger value='records'>
-                <History aria-hidden='true' />
-                {t('Invoice records')}
-              </TabsTrigger>
-            </TabsList>
+    <>
+      <SectionPageLayout>
+        <SectionPageLayout.Title>
+          {t('Enterprise Invoices')}
+        </SectionPageLayout.Title>
+        <SectionPageLayout.Content>
+          <div className='space-y-4'>
+            <p className='text-muted-foreground text-sm'>
+              {t(
+                'Apply for enterprise invoices for paid CNY Epay recharge orders and review processing records.'
+              )}
+            </p>
+            <Tabs defaultValue='apply' className='gap-4'>
+              <TabsList>
+                <TabsTrigger value='apply'>
+                  <FileText aria-hidden='true' />
+                  {t('Apply for invoice')}
+                </TabsTrigger>
+                <TabsTrigger value='records'>
+                  <History aria-hidden='true' />
+                  {t('Invoice records')}
+                </TabsTrigger>
+              </TabsList>
 
-            <TabsContent value='apply' className='space-y-4'>
-              {!config.isLoading && !enabled ? (
+              <TabsContent value='apply' className='space-y-4'>
+                {!config.isLoading && !enabled ? (
+                  <Alert>
+                    <AlertTitle>
+                      {t('Invoice applications are currently disabled')}
+                    </AlertTitle>
+                    <AlertDescription>
+                      {t(
+                        'Existing invoice records remain available in the Invoice records tab.'
+                      )}
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
                 <Alert>
-                  <AlertTitle>
-                    {t('Invoice applications are currently disabled')}
-                  </AlertTitle>
+                  <AlertTitle>{t('Invoice selection')}</AlertTitle>
                   <AlertDescription>
                     {t(
-                      'Existing invoice records remain available in the Invoice records tab.'
+                      '{{count}} orders selected, totaling {{amount}}. Minimum application amount: {{minimum}}.',
+                      {
+                        count: selectedOrders.size,
+                        amount: formatInvoiceAmount(
+                          totalAmountCents,
+                          i18n.resolvedLanguage
+                        ),
+                        minimum: formatInvoiceAmount(
+                          minAmountCents,
+                          i18n.resolvedLanguage
+                        ),
+                      }
                     )}
                   </AlertDescription>
                 </Alert>
-              ) : null}
-              <Alert>
-                <AlertTitle>{t('Invoice selection')}</AlertTitle>
-                <AlertDescription>
-                  {t(
-                    '{{count}} orders selected, totaling {{amount}}. Minimum application amount: {{minimum}}.',
-                    {
-                      count: selectedOrders.size,
-                      amount: formatInvoiceAmount(
-                        totalAmountCents,
-                        i18n.resolvedLanguage
-                      ),
-                      minimum: formatInvoiceAmount(
-                        minAmountCents,
-                        i18n.resolvedLanguage
-                      ),
-                    }
-                  )}
-                </AlertDescription>
-              </Alert>
-              <EligibleOrdersTable
-                selectedOrders={selectedOrders}
-                onSelectedOrdersChange={setSelectedOrders}
-                actionLabel={t('Apply for invoice')}
-                actionDisabled={
-                  !enabled || selectedOrders.size === 0 || belowMinimum
-                }
-                onAction={() => setApplicationOpen(true)}
-              />
-            </TabsContent>
+                <EligibleOrdersTable
+                  selectedOrders={selectedOrders}
+                  onSelectedOrdersChange={setSelectedOrders}
+                  actionLabel={t('Apply for invoice')}
+                  actionDisabled={
+                    !enabled || selectedOrders.size === 0 || belowMinimum
+                  }
+                  onAction={() => setApplicationOpen(true)}
+                />
+              </TabsContent>
 
-            <TabsContent value='records'>
-              <InvoiceRequestsTable />
-            </TabsContent>
-          </Tabs>
-        </div>
-      </SectionPageLayout.Content>
+              <TabsContent value='records'>
+                <InvoiceRequestsTable />
+              </TabsContent>
+            </Tabs>
+          </div>
+        </SectionPageLayout.Content>
+      </SectionPageLayout>
 
       <InvoiceApplicationDialog
         open={applicationOpen}
@@ -119,6 +121,6 @@ export function UserInvoicesPage() {
         minAmountCents={minAmountCents}
         onSelectionReset={() => setSelectedOrders(new Map())}
       />
-    </SectionPageLayout>
+    </>
   )
 }

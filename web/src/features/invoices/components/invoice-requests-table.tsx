@@ -25,6 +25,7 @@ import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusVariant } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
+import { getPaymentMethodName } from '@/features/wallet/lib/billing'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { completeInvoice, getInvoiceRequests, rejectInvoice } from '../api'
@@ -137,15 +138,25 @@ function InvoiceDetailsDialog(props: {
                 key={item.id}
                 className='flex flex-col gap-1 px-3 py-2 sm:flex-row sm:items-center sm:justify-between'
               >
-                <div className='flex min-w-0 items-center gap-1'>
-                  <span className='truncate font-mono text-xs'>
-                    {item.trade_no}
-                  </span>
-                  <CopyButton
-                    value={item.trade_no}
-                    className='size-7'
-                    tooltip={t('Copy order number')}
-                  />
+                <div className='min-w-0'>
+                  <div className='flex min-w-0 items-center gap-1'>
+                    <span className='truncate font-mono text-xs'>
+                      {item.trade_no}
+                    </span>
+                    <CopyButton
+                      value={item.trade_no}
+                      className='size-7'
+                      tooltip={t('Copy order number')}
+                    />
+                  </div>
+                  <p className='text-muted-foreground text-xs'>
+                    <span>{t('Payment Method')}</span>:{' '}
+                    <span>
+                      {item.payment_method
+                        ? getPaymentMethodName(item.payment_method, t)
+                        : '-'}
+                    </span>
+                  </p>
                 </div>
                 <span className='font-medium tabular-nums'>
                   {formatInvoiceAmount(
