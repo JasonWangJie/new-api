@@ -9,7 +9,11 @@ License, or (at your option) any later version.
 import { describe, expect, it } from 'vitest'
 
 import type { InvoiceEligibleOrder } from '../../types'
-import { sumInvoiceOrders } from '../format'
+import {
+  formatInvoiceAmount,
+  formatInvoiceDateTime,
+  sumInvoiceOrders,
+} from '../format'
 import { invoiceApplicationSchema } from '../schemas'
 import { reconcileInvoiceOrderSelection } from '../selection'
 
@@ -24,6 +28,24 @@ function order(id: number, amountCents: number): InvoiceEligibleOrder {
 }
 
 describe('invoice application helpers', () => {
+  it.each([
+    ['zhCN', 'zh-CN'],
+    ['zhTW', 'zh-TW'],
+  ])('formats invoice values for the project locale %s', (language, locale) => {
+    const expected = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency: 'CNY',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(12.34)
+    const timestamp = 1_700_000_000
+
+    expect(formatInvoiceAmount(1234, language)).toBe(expected)
+    expect(formatInvoiceDateTime(timestamp, language)).toBe(
+      new Date(timestamp * 1000).toLocaleString(locale)
+    )
+  })
+
   it('preserves off-page orders while updating the visible page selection', () => {
     const offPage = order(1, 100)
     const pageOrders = [order(2, 200), order(3, 300)]

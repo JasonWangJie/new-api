@@ -28,7 +28,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { completeInvoice, getInvoiceRequests, rejectInvoice } from '../api'
-import { formatInvoiceAmount } from '../lib/format'
+import { formatInvoiceAmount, formatInvoiceDateTime } from '../lib/format'
 import type { InvoiceRequest, InvoiceStatus } from '../types'
 
 type InvoiceRequestsTableProps = {
@@ -163,7 +163,8 @@ function InvoiceDetailsDialog(props: {
             <p className='mt-1'>
               {request.operator_username || `#${request.operator_id}`}
               {' · '}
-              {new Date(request.processed_time * 1000).toLocaleString(
+              {formatInvoiceDateTime(
+                request.processed_time,
                 i18n.resolvedLanguage
               )}
             </p>
@@ -337,7 +338,8 @@ export function InvoiceRequestsTable(props: InvoiceRequestsTableProps) {
         cell: ({ row }) => (
           <div className='text-xs'>
             <p className='whitespace-nowrap tabular-nums'>
-              {new Date(row.original.create_time * 1000).toLocaleString(
+              {formatInvoiceDateTime(
+                row.original.create_time,
                 i18n.resolvedLanguage
               )}
             </p>
@@ -345,7 +347,8 @@ export function InvoiceRequestsTable(props: InvoiceRequestsTableProps) {
               <>
                 <p className='text-muted-foreground mt-1 whitespace-nowrap'>
                   {t('Processed')}:{' '}
-                  {new Date(row.original.processed_time * 1000).toLocaleString(
+                  {formatInvoiceDateTime(
+                    row.original.processed_time,
                     i18n.resolvedLanguage
                   )}
                 </p>

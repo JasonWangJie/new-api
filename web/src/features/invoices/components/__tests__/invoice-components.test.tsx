@@ -9,6 +9,7 @@ License, or (at your option) any later version.
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import i18next from 'i18next'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -52,9 +53,11 @@ function order(id: number, amountCents = 1234): InvoiceEligibleOrder {
   }
 }
 
-afterEach(() => {
+afterEach(async () => {
   client?.clear()
   vi.clearAllMocks()
+  await i18next.changeLanguage('en')
+  i18next.removeResourceBundle('zhCN', 'translation')
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
     value: originalMatchMedia,
@@ -62,6 +65,53 @@ afterEach(() => {
 })
 
 describe('invoice components', () => {
+  it('renders invoice dates with the project Chinese locale code', async () => {
+    i18next.addResourceBundle(
+      'zhCN',
+      'translation',
+      { Pending: '待处理' },
+      true,
+      true
+    )
+    await i18next.changeLanguage('zhCN')
+    expect(i18next.resolvedLanguage).toBe('zhCN')
+    const createdAt = 1_700_000_000
+    apiMocks.getInvoiceRequests.mockResolvedValue({
+      page: 1,
+      page_size: 20,
+      total: 1,
+      items: [
+        {
+          id: 10,
+          user_id: 1,
+          username: 'user',
+          display_name: 'User',
+          source: 'user',
+          status: 'pending',
+          company_name: 'Example Co.',
+          tax_id: 'TAX-001',
+          email: 'billing@example.com',
+          total_amount_cents: 1234,
+          create_time: createdAt,
+          processed_time: 0,
+          operator_id: 0,
+          operator_username: '',
+          reject_reason: '',
+          note: '',
+          items: [],
+        } satisfies InvoiceRequest,
+      ],
+    })
+
+    renderWithQueryClient(<InvoiceRequestsTable />)
+
+    expect(
+      await screen.findByText(
+        new Date(createdAt * 1000).toLocaleString('zh-CN')
+      )
+    ).toBeInTheDocument()
+  })
+
   it('supports mobile selection and clears the selection when searching', async () => {
     Object.defineProperty(window, 'matchMedia', {
       configurable: true,

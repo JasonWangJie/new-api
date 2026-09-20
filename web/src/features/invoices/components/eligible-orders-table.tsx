@@ -29,7 +29,11 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 
 import { getEligibleInvoiceOrders } from '../api'
-import { formatInvoiceAmount, sumInvoiceOrders } from '../lib/format'
+import {
+  formatInvoiceAmount,
+  formatInvoiceDateTime,
+  sumInvoiceOrders,
+} from '../lib/format'
 import { reconcileInvoiceOrderSelection } from '../lib/selection'
 import type { InvoiceEligibleOrder } from '../types'
 
@@ -145,7 +149,8 @@ export function EligibleOrdersTable(props: EligibleOrdersTableProps) {
         header: t('Payment completed at'),
         cell: ({ row }) => (
           <time className='text-sm whitespace-nowrap tabular-nums'>
-            {new Date(row.original.complete_time * 1000).toLocaleString(
+            {formatInvoiceDateTime(
+              row.original.complete_time,
               i18n.resolvedLanguage
             )}
           </time>
