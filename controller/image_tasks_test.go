@@ -72,7 +72,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.Token{Id: 201, UserId: 101, Name: "Studio Key", Key: "token-secret-canary"}).Error)
 			require.NoError(t, db.Create(&model.Token{Id: 202, UserId: 102, Name: "Other user key", Key: "other-token-secret"}).Error)
 			require.NoError(t, db.Create(&model.Channel{Id: 301, Name: "Sunburst upstream", Key: "channel-secret-canary"}).Error)
-			attempts, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, KeyFingerprint: "fingerprint-canary", KeyIndex: 2, StartedAt: now - 40, FinishedAt: now - 10, Dispatched: true}})
+			attempts, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, KeyFingerprint: "fingerprint-canary", KeyIndex: 2, StartedAt: now - 40, FinishedAt: now - 10, Dispatched: true, HTTPStatus: http.StatusBadRequest, ErrorMessage: "sanitized provider detail", ProviderCode: "invalid_request", ProviderStatus: "INVALID_ARGUMENT", UpstreamRequestID: "provider-request-1"}})
 			require.NoError(t, err)
 			task := model.AsyncImageTask{TaskId: "asyncimg_success", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "bb", RequestType: "image_to_image", Model: "gpt-image-2.5-sunburst", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 1, ResultCount: 1, CreatedAt: now - 50, StartedAt: now - 40, FinishedAt: now - 10, Attempts: string(attempts), ReferenceUrls: `["https://example.com/private-reference"]`, RequestedResolution: "2K", ActualSize: "2048x1186"}
 			require.NoError(t, db.Create(&task).Error)
@@ -152,11 +152,17 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Contains(t, detailRecorder.Body.String(), "routing-event-canary")
 						require.NoError(t, historyErr)
 						assert.Contains(t, string(history), "Sunburst upstream")
+						assert.Contains(t, string(history), `"http_status":400`)
+						assert.Contains(t, string(history), `"error_message":"sanitized provider detail"`)
+						assert.Contains(t, string(history), `"provider_code":"invalid_request"`)
+						assert.Contains(t, string(history), `"provider_status":"INVALID_ARGUMENT"`)
+						assert.Contains(t, string(history), `"upstream_request_id":"provider-request-1"`)
 						assert.NotContains(t, string(history), "fingerprint-canary")
 					} else {
 						assert.NotContains(t, detailRecorder.Body.String(), "Sunburst upstream")
 						assert.NotContains(t, detailRecorder.Body.String(), "routing-event-canary")
 						assert.NotContains(t, detailRecorder.Body.String(), "fingerprint-canary")
+						assert.NotContains(t, detailRecorder.Body.String(), "provider-request-1")
 					}
 				})
 			}

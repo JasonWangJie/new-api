@@ -242,7 +242,20 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 			if includeAttempts {
 				history := make([]gin.H, 0, len(histories[task.TaskId]))
 				for _, attempt := range histories[task.TaskId] {
-					history = append(history, gin.H{"channel_name": channelNames[attempt.ChannelId], "key_index": attempt.KeyIndex, "started_at": attempt.StartedAt, "finished_at": attempt.FinishedAt, "dispatched": attempt.Dispatched, "reference_mode": attempt.ReferenceMode, "error_code": attempt.Code})
+					history = append(history, gin.H{
+						"channel_name":        channelNames[attempt.ChannelId],
+						"key_index":           attempt.KeyIndex,
+						"started_at":          attempt.StartedAt,
+						"finished_at":         attempt.FinishedAt,
+						"dispatched":          attempt.Dispatched,
+						"reference_mode":      attempt.ReferenceMode,
+						"error_code":          attempt.Code,
+						"http_status":         attempt.HTTPStatus,
+						"error_message":       attempt.ErrorMessage,
+						"provider_code":       attempt.ProviderCode,
+						"provider_status":     attempt.ProviderStatus,
+						"upstream_request_id": attempt.UpstreamRequestID,
+					})
 				}
 				data["attempt_history"] = history
 				_, historyAvailable := histories[task.TaskId]

@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -254,6 +255,127 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	var failure *AsyncImageFailure
 	require.ErrorAs(t, err, &failure)
 	assert.Equal(t, 603, failure.Code, "another Token cannot reuse private cached bytes")
+}
+
+func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *testing.T) {
+	testCases := []struct {
+		name         string
+		body         string
+		header       http.Header
+		expectedCode int
+		providerCode string
+		requestID    string
+		message      string
+	}{
+		{
+			name:         "reference image limit from provider code",
+			body:         `{"error":{"code":"too_many_reference_images","message":"Invalid request","status":"INVALID_ARGUMENT"},"request_id":"gemini-body-request"}`,
+			header:       http.Header{"X-Goog-Request-Id": []string{"gemini-header-request"}},
+			expectedCode: 611,
+			providerCode: "too_many_reference_images",
+			requestID:    "gemini-body-request",
+			message:      "Invalid request",
+		},
+		{
+			name:         "missing reference image from original message",
+			body:         `{"error":{"code":"invalid_request","message":"请上传参考图，未检测到参考图"}}`,
+			header:       http.Header{"X-Request-Id": []string{"gemini-missing-reference"}},
+			expectedCode: 612,
+			providerCode: "invalid_request",
+			requestID:    "gemini-missing-reference",
+			message:      "请上传参考图，未检测到参考图",
+		},
+		{
+			name:         "unprocessable prompt keeps a redacted original message",
+			body:         `{"error":{"code":400,"message":"prompt or input images could not be processed; Bearer private-key; https://signed.example/path?secret=token; ` + strings.Repeat("x", asyncImageProviderMessageLimit+20) + `","status":"INVALID_ARGUMENT"}}`,
+			header:       http.Header{"X-Goog-Request-Id": []string{"gemini-unprocessable"}},
+			expectedCode: 613,
+			providerCode: "400",
+			requestID:    "gemini-unprocessable",
+			message:      "prompt or input images could not be processed",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     testCase.header,
+				Body:       io.NopCloser(strings.NewReader(testCase.body)),
+			}
+
+			failure := ClassifyGeminiAsyncImageHTTPFailure(t.Context(), response)
+
+			require.NotNil(t, failure)
+			assert.Equal(t, testCase.expectedCode, failure.Code)
+			assert.Equal(t, http.StatusBadRequest, failure.HTTPStatus)
+			assert.Equal(t, testCase.providerCode, failure.ProviderCode)
+			assert.Equal(t, testCase.requestID, failure.UpstreamRequestID)
+			assert.Contains(t, failure.Message, testCase.message)
+			assert.NotContains(t, failure.Message, "private-key")
+			assert.NotContains(t, failure.Message, "signed.example")
+			assert.LessOrEqual(t, len([]rune(failure.Message)), asyncImageProviderMessageLimit)
+		})
+	}
+}
+
+func TestFailAsyncImageInvocationPersistsSanitizedProviderDiagnostics(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "provider-diagnostics.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		connection, openErr := db.DB()
+		if openErr == nil {
+			_ = connection.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+
+	now := time.Now().Unix()
+	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1, Dispatched: true}})
+	require.NoError(t, err)
+	task := model.AsyncImageTask{
+		TaskId:         "asyncimg_provider_diagnostics",
+		Status:         model.ImageTaskInvoking,
+		Version:        1,
+		LeaseToken:     "provider-diagnostics-lease",
+		LeaseExpiresAt: now + 60,
+		DispatchedAt:   now - 1,
+		Attempts:       string(attempts),
+		CreatedAt:      now - 1,
+	}
+	require.NoError(t, db.Create(&task).Error)
+	cfg := DefaultImageRuntimeConfig()
+	cfg.TotalRetries = 0
+	failure := &AsyncImageFailure{
+		Code:              611,
+		InternalCode:      "upstream_failed",
+		Message:           "image: at most 8 images are allowed; Bearer private-key; https://signed.example/path?secret=token",
+		HTTPStatus:        http.StatusBadRequest,
+		ProviderCode:      "too_many_reference_images",
+		ProviderStatus:    "INVALID_ARGUMENT",
+		UpstreamRequestID: "gemini-request-611",
+	}
+
+	require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, cfg))
+
+	var stored model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, model.ImageTaskFailed, stored.Status)
+	assert.Equal(t, 611, stored.PublicErrorCode)
+	assert.Contains(t, stored.ErrorMessage, "image: at most 8 images are allowed")
+	assert.NotContains(t, stored.ErrorMessage, "private-key")
+	assert.NotContains(t, stored.ErrorMessage, "signed.example")
+	var storedAttempts []ImageChannelAttempt
+	require.NoError(t, common.UnmarshalJsonStr(stored.Attempts, &storedAttempts))
+	require.Len(t, storedAttempts, 1)
+	assert.Equal(t, http.StatusBadRequest, storedAttempts[0].HTTPStatus)
+	assert.Equal(t, "too_many_reference_images", storedAttempts[0].ProviderCode)
+	assert.Equal(t, "INVALID_ARGUMENT", storedAttempts[0].ProviderStatus)
+	assert.Equal(t, "gemini-request-611", storedAttempts[0].UpstreamRequestID)
+	assert.Equal(t, stored.ErrorMessage, storedAttempts[0].ErrorMessage)
 }
 
 func asyncImageKeyFixture(t *testing.T) {

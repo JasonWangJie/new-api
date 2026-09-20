@@ -213,15 +213,20 @@ func RecordImageCircuit(ctx context.Context, scope string, channelId int, succes
 }
 
 type ImageChannelAttempt struct {
-	ChannelId        int    `json:"channel_id"`
-	KeyFingerprint   string `json:"key_fingerprint,omitempty"`
-	KeyIndex         int    `json:"key_index"`
-	StartedAt        int64  `json:"started_at"`
-	FinishedAt       int64  `json:"finished_at,omitempty"`
-	Dispatched       bool   `json:"dispatched"`
-	ReferenceMode    string `json:"reference_mode"`
-	Code             int    `json:"error_code,omitempty"`
-	ReferenceFailure bool   `json:"upstream_reference_failure,omitempty"`
+	ChannelId         int    `json:"channel_id"`
+	KeyFingerprint    string `json:"key_fingerprint,omitempty"`
+	KeyIndex          int    `json:"key_index"`
+	StartedAt         int64  `json:"started_at"`
+	FinishedAt        int64  `json:"finished_at,omitempty"`
+	Dispatched        bool   `json:"dispatched"`
+	ReferenceMode     string `json:"reference_mode"`
+	Code              int    `json:"error_code,omitempty"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	ErrorMessage      string `json:"error_message,omitempty"`
+	ProviderCode      string `json:"provider_code,omitempty"`
+	ProviderStatus    string `json:"provider_status,omitempty"`
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
+	ReferenceFailure  bool   `json:"upstream_reference_failure,omitempty"`
 }
 
 func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, platform string, maxSwitches int) ImageAccountRouting {
