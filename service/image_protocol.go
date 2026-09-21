@@ -44,6 +44,16 @@ type AsyncImageRequest struct {
 	Native         map[string]common.RawMessage `json:"native,omitempty"`
 }
 
+func (request AsyncImageRequest) ReferenceImageCount() int {
+	count := 0
+	for _, part := range request.Parts {
+		if part.Type == "image_url" {
+			count++
+		}
+	}
+	return count
+}
+
 // ReferenceURLs retains external image references for the administrator task
 // view without copying embedded image data or internal input handles.
 func (request AsyncImageRequest) ReferenceURLs() []string {
@@ -517,12 +527,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	if request.Prompt == "" || len(request.Prompt) > 64<<10 {
 		return request, errors.New("prompt is required and must not exceed 64 KiB")
 	}
-	references := 0
-	for _, part := range request.Parts {
-		if part.Type == "image_url" {
-			references++
-		}
-	}
+	references := request.ReferenceImageCount()
 	limit := cfg.MaxReferences
 	if request.Platform == "gemini" && strings.Contains(request.Model, "flash") && strings.Contains(request.Model, "image") {
 		limit = min(limit, 3)

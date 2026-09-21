@@ -268,6 +268,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	if len(channels) == 0 {
 		return nil, ImageAccount{}, errors.New("no eligible image account in the selected pool")
 	}
+	channels = preferImageChannelsForReferenceCount(channels, request.ReferenceImageCount())
 	slices.SortFunc(channels, func(a, b model.Channel) int { return cmp.Compare(b.GetPriority(), a.GetPriority()) })
 	priority := channels[0].GetPriority()
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return channel.GetPriority() != priority })
@@ -295,6 +296,24 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		}
 	}
 	return nil, ImageAccount{}, errors.New("image channel selection failed")
+}
+
+func preferImageChannelsForReferenceCount(channels []model.Channel, referenceCount int) []model.Channel {
+	if referenceCount <= model.DefaultImageChannelMaxReferenceImages {
+		return channels
+	}
+	preferred := slices.DeleteFunc(slices.Clone(channels), func(channel model.Channel) bool {
+		return !imageChannelSupportsReferenceCount(channel, referenceCount)
+	})
+	if len(preferred) == 0 {
+		return channels
+	}
+	return preferred
+}
+
+func imageChannelSupportsReferenceCount(channel model.Channel, referenceCount int) bool {
+	return referenceCount <= model.DefaultImageChannelMaxReferenceImages ||
+		channel.GetImageMaxReferenceImages() >= referenceCount
 }
 
 var imageCircuitRecord = redis.NewScript(`if ARGV[1] == 'success' then redis.call('DEL',KEYS[1],KEYS[2]); return 0 end; local count=redis.call('INCR',KEYS[1]); redis.call('EXPIRE',KEYS[1],ARGV[3]); if count >= tonumber(ARGV[2]) then redis.call('SET',KEYS[2],'open','EX',ARGV[3]); end; return count`)
@@ -475,12 +494,7 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 			}
 		}
 	}
-	references := 0
-	for _, part := range request.Parts {
-		if part.Type == "image_url" {
-			references++
-		}
-	}
+	references := request.ReferenceImageCount()
 	if references > capability.MaxReferenceImages {
 		return invalid("too_many_reference_images_for_model")
 	}

@@ -14,6 +14,7 @@ type ChannelSettings struct {
 	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
 	ForceFormat               bool   `json:"force_format,omitempty"`
 	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
+	ImageMaxReferenceImages   *int   `json:"image_max_reference_images,omitempty"`
 	Proxy                     string `json:"proxy"`
 	PassThroughBodyEnabled    bool   `json:"pass_through_body_enabled,omitempty"`
 	ResponsesWebSocketEnabled bool   `json:"responses_websocket_enabled,omitempty"`
@@ -25,6 +26,17 @@ type ChannelSettings struct {
 	// HTTP2ConnectionShards spreads HTTP/2 traffic across N independent transports
 	// (1-8). Zero/unset means 1. Ignored when HTTPProtocol is "http1".
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
+}
+
+// ValidateImageGeneration validates save-time image generation channel settings.
+func (s *ChannelSettings) ValidateImageGeneration() error {
+	if s == nil || s.ImageMaxReferenceImages == nil {
+		return nil
+	}
+	if *s.ImageMaxReferenceImages < 0 || *s.ImageMaxReferenceImages > MaxImageN {
+		return fmt.Errorf("invalid image_max_reference_images: %d", *s.ImageMaxReferenceImages)
+	}
+	return nil
 }
 
 const (

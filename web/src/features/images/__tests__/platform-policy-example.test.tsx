@@ -33,6 +33,7 @@ test('shows the model capability template for the selected platform', async () =
   )
   const openAIDialog = screen.getByRole('dialog')
   expect(openAIDialog).toHaveTextContent('gpt-image-2')
+  expect(openAIDialog).toHaveTextContent('"max_reference_images": 14')
 
   await user.click(within(openAIDialog).getByRole('button', { name: 'Close' }))
   await waitFor(() =>

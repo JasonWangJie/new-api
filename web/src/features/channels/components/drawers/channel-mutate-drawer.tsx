@@ -159,6 +159,7 @@ import { useChannelMutateForm } from '../../hooks/use-channel-mutate-form'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
   CHANNEL_TYPE_ADVANCED_CUSTOM,
+  MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   channelFormSchema,
   channelsQueryKeys,
   getAdvancedCustomStats,
@@ -274,6 +275,7 @@ const SENSITIVE_FORM_FIELDS = [
   'proxy',
   'http_protocol',
   'http2_connection_shards',
+  'image_max_reference_images',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
   'system_prompt',
@@ -1907,6 +1909,34 @@ export function ChannelMutateDrawer({
                 />
               </FormControl>
               <FormDescription>{t(FIELD_DESCRIPTIONS.WEIGHT)}</FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name='image_max_reference_images'
+          render={({ field }) => (
+            <FormItem className='sm:col-span-2'>
+              <FormLabel>{t('Maximum reference images')}</FormLabel>
+              <FormControl>
+                <Input
+                  type='number'
+                  min={0}
+                  max={MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES}
+                  {...field}
+                  disabled={sensitiveLocked}
+                  onChange={(event) =>
+                    field.onChange(Number(event.target.value))
+                  }
+                />
+              </FormControl>
+              <FormDescription>
+                {t(
+                  'Async image tasks with more than 8 reference images prefer channels whose limit covers the request.'
+                )}
+              </FormDescription>
               <FormMessage />
             </FormItem>
           )}

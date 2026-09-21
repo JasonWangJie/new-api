@@ -80,6 +80,8 @@ function isOptionalProxyURL(value: string | undefined): boolean {
 export const HTTP_PROTOCOL_AUTO = 'auto'
 export const HTTP_PROTOCOL_HTTP1 = 'http1'
 export const MAX_HTTP2_CONNECTION_SHARDS = 8
+export const DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES = 8
+export const MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES = 128
 
 export function normalizeHttpProtocol(
   value: string | undefined | null
@@ -104,6 +106,20 @@ export function normalizeHttp2ConnectionShards(
   }
   if (value > MAX_HTTP2_CONNECTION_SHARDS) {
     return MAX_HTTP2_CONNECTION_SHARDS
+  }
+  return value
+}
+
+export function normalizeImageMaxReferenceImages(
+  value: number | undefined | null
+): number {
+  if (
+    value == null ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES
+  ) {
+    return DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES
   }
   return value
 }
@@ -266,6 +282,12 @@ export const channelFormSchema = z
       .refine(isOptionalProxyURL, ERROR_MESSAGES.INVALID_PROXY),
     http_protocol: z.enum(['auto', 'http1']).optional(),
     http2_connection_shards: z.number().int().optional(),
+    image_max_reference_images: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES)
+      .optional(),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
@@ -456,6 +478,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   proxy: '',
   http_protocol: HTTP_PROTOCOL_AUTO,
   http2_connection_shards: 1,
+  image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   pass_through_body_enabled: false,
   responses_websocket_enabled: false,
   system_prompt: '',
@@ -499,6 +522,7 @@ export function transformChannelToFormDefaults(
     proxy: '',
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
     http2_connection_shards: 1,
+    image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
     pass_through_body_enabled: false,
     responses_websocket_enabled: false,
     system_prompt: '',
@@ -519,6 +543,9 @@ export function transformChannelToFormDefaults(
         proxy: parsed.proxy || '',
         http_protocol: protocol,
         http2_connection_shards: protocol === HTTP_PROTOCOL_HTTP1 ? 1 : shards,
+        image_max_reference_images: normalizeImageMaxReferenceImages(
+          parsed.image_max_reference_images
+        ),
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         responses_websocket_enabled:
           parsed.responses_websocket_enabled === true,
@@ -660,12 +687,18 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
     protocol === HTTP_PROTOCOL_HTTP1
       ? 1
       : normalizeHttp2ConnectionShards(formData.http2_connection_shards)
+  const imageMaxReferenceImages = normalizeImageMaxReferenceImages(
+    formData.image_max_reference_images
+  )
 
   // Omit defaults so unchanged channels keep equivalent JSON.
   if (protocol === HTTP_PROTOCOL_HTTP1) {
     settingObj.http_protocol = HTTP_PROTOCOL_HTTP1
   } else if (shards > 1) {
     settingObj.http2_connection_shards = shards
+  }
+  if (imageMaxReferenceImages !== DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES) {
+    settingObj.image_max_reference_images = imageMaxReferenceImages
   }
 
   return JSON.stringify(settingObj)

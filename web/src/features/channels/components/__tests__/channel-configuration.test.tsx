@@ -1296,6 +1296,34 @@ test('restoring routing defaults clears the configured indicator for both the bl
   expect(within(block).getByRole('img', { name: 'Configured' })).toBeVisible()
 })
 
+test('edits and saves the image channel reference capacity from routing settings', async () => {
+  editingChannel = {
+    ...editingChannel,
+    setting: '{"image_max_reference_images":14}',
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  const tab = screen.getByRole('tab', { name: /Routing & Mapping/ })
+  expect(tab).toHaveAccessibleName(/Configured/)
+  await user.click(tab)
+  const capacity = screen.getByRole('spinbutton', {
+    name: 'Maximum reference images',
+  })
+  expect(capacity).toHaveValue(14)
+  await user.clear(capacity)
+  await user.type(capacity, '12')
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { setting: string }
+  expect(JSON.parse(payload.setting).image_max_reference_images).toBe(12)
+})
+
 test('request processing configuration does not mark the network category as configured', async () => {
   editingChannel = {
     ...editingChannel,
@@ -1775,6 +1803,9 @@ test('an operator without sensitive write permission can discover saved models a
   await user.click(screen.getByRole('tab', { name: /Other Settings/ }))
   expect(screen.getByLabelText('Proxy Address')).toBeDisabled()
   await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.getByRole('spinbutton', { name: 'Maximum reference images' })
+  ).toBeDisabled()
   fireEvent.change(screen.getByLabelText('Priority'), {
     target: { value: '8' },
   })

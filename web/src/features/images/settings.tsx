@@ -562,7 +562,7 @@ function ImagePolicyForm({
           formats: ['png', 'jpeg', 'webp'],
           backgrounds: ['auto', 'opaque', 'transparent'],
           max_output_images: 128,
-          max_reference_images: 8,
+          max_reference_images: 14,
         },
       ],
       null,

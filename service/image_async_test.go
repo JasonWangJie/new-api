@@ -257,6 +257,83 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	assert.Equal(t, 603, failure.Code, "another Token cannot reuse private cached bytes")
 }
 
+func TestAsyncImageChannelReferenceCapacityRouting(t *testing.T) {
+	assert.Equal(t, 14, DefaultImageRuntimeConfig().MaxReferences)
+
+	legacyPriority, capablePriority := int64(100), int64(10)
+	legacy := model.Channel{
+		Id:       1,
+		Type:     1,
+		Key:      "legacy-key",
+		Status:   common.ChannelStatusEnabled,
+		Name:     "legacy-reference-limit",
+		Models:   "image-model",
+		Group:    "default",
+		Priority: &legacyPriority,
+	}
+	capable := model.Channel{
+		Id:       2,
+		Type:     1,
+		Key:      "extended-key",
+		Status:   common.ChannelStatusEnabled,
+		Name:     "extended-reference-limit",
+		Models:   "image-model",
+		Group:    "default",
+		Priority: &capablePriority,
+	}
+	maxReferences := 14
+	capable.SetSetting(dto.ChannelSettings{ImageMaxReferenceImages: &maxReferences})
+	assert.Equal(t, model.DefaultImageChannelMaxReferenceImages, legacy.GetImageMaxReferenceImages())
+	assert.Equal(t, maxReferences, capable.GetImageMaxReferenceImages())
+
+	invalidLimit := dto.MaxImageN + 1
+	invalid := model.Channel{}
+	invalid.SetSetting(dto.ChannelSettings{ImageMaxReferenceImages: &invalidLimit})
+	require.EqualError(t, invalid.ValidateSettings(), "invalid image_max_reference_images: 129")
+
+	previousDB, previousCapability := model.DB, ImageChannelCapabilityFunc
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "reference-capacity.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+		return dto.ImageCapability{Provider: "openai", Protocol: "openai_images", Generate: true, Edit: true}
+	}
+	t.Cleanup(func() {
+		model.DB, ImageChannelCapabilityFunc = previousDB, previousCapability
+		connection, openErr := db.DB()
+		if openErr == nil {
+			_ = connection.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ImageChannelPool{}, &model.Option{}))
+	require.NoError(t, db.Create(&[]model.Channel{legacy, capable}).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: "default", Model: "image-model", ChannelId: legacy.Id, Enabled: true},
+		{Group: "default", Model: "image-model", ChannelId: capable.Id, Enabled: true},
+	}).Error)
+
+	policy := model.ImageGroupPolicy{Group: "default", Platform: "openai", AsyncProvider: "openai", PoolMode: "resolution"}
+	request := AsyncImageRequest{Provider: "openai", Platform: "openai", Model: "image-model", Kind: "image_to_image"}
+	for range 9 {
+		request.Parts = append(request.Parts, AsyncImageInputPart{Type: "image_url", URL: "https://example.com/reference.png"})
+	}
+	selected, _, err := PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, capable.Id, selected.Id, "an extended-capacity channel must outrank a higher-priority legacy channel")
+
+	request.Parts = request.Parts[:8]
+	selected, _, err = PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, legacy.Id, selected.Id, "requests within the legacy limit keep priority-based routing")
+
+	for range 7 {
+		request.Parts = append(request.Parts, AsyncImageInputPart{Type: "image_url", URL: "https://example.com/reference.png"})
+	}
+	selected, _, err = PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, legacy.Id, selected.Id, "routing falls back to the original priority order when no channel covers the request")
+}
+
 func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *testing.T) {
 	testCases := []struct {
 		name         string

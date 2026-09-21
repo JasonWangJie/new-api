@@ -1002,6 +1002,9 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelParams.ValidateHTTPTransport(); err != nil {
 		return err
 	}
+	if err := channelParams.ValidateImageGeneration(); err != nil {
+		return err
+	}
 	channelOtherSettings := &dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, channelOtherSettings)
@@ -1031,6 +1034,18 @@ func (channel *Channel) ValidateSettings() error {
 		}
 	}
 	return nil
+}
+
+const DefaultImageChannelMaxReferenceImages = 8
+
+// GetImageMaxReferenceImages returns the channel's declared reference-image
+// capacity. Channels saved before this setting existed retain the legacy limit.
+func (channel *Channel) GetImageMaxReferenceImages() int {
+	setting := channel.GetSetting()
+	if setting.ImageMaxReferenceImages == nil {
+		return DefaultImageChannelMaxReferenceImages
+	}
+	return *setting.ImageMaxReferenceImages
 }
 
 func (channel *Channel) GetSetting() dto.ChannelSettings {

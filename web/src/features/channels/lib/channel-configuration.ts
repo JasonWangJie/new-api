@@ -25,7 +25,11 @@ import {
   OPENAI_FIELD_PASSTHROUGH_TYPES,
 } from '../constants'
 import { CHANNEL_TYPE_ADVANCED_CUSTOM } from './advanced-custom'
-import { channelFormSchema, type ChannelFormValues } from './channel-form'
+import {
+  DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
+  channelFormSchema,
+  type ChannelFormValues,
+} from './channel-form'
 
 export type ChannelProviderTarget =
   | { kind: 'builtin'; type: number }
@@ -47,7 +51,13 @@ const CONFIGURATION_BLOCKS = {
   modelMapping: { section: 'routing', fields: ['model_mapping'] },
   routingStrategy: {
     section: 'routing',
-    fields: ['priority', 'weight', 'test_model', 'auto_ban'],
+    fields: [
+      'priority',
+      'weight',
+      'image_max_reference_images',
+      'test_model',
+      'auto_ban',
+    ],
   },
   overrideRules: {
     section: 'request',
@@ -141,6 +151,9 @@ export function getChannelConfigurationState(
     routingStrategy: Boolean(
       values.priority ||
       values.weight ||
+      (values.image_max_reference_images ??
+        DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES) !==
+        DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES ||
       values.test_model?.trim() ||
       (values.auto_ban ?? 1) !== 1
     ),

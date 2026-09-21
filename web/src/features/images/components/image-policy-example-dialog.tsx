@@ -46,7 +46,7 @@ const OPENAI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
     formats: ['png', 'jpeg', 'webp'],
     backgrounds: ['auto', 'opaque', 'transparent'],
     max_output_images: 128,
-    max_reference_images: 8,
+    max_reference_images: 14,
     allow_half_k: false,
   },
 ]
@@ -57,7 +57,7 @@ const GEMINI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
     label: 'Gemini 3 Pro Image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
-    max_reference_images: 8,
+    max_reference_images: 14,
     allow_half_k: false,
   },
   {
@@ -65,7 +65,7 @@ const GEMINI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
     label: 'Gemini 2.5 Flash Image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
-    max_reference_images: 8,
+    max_reference_images: 14,
     allow_half_k: false,
   },
 ]
@@ -76,7 +76,7 @@ const VERTEX_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
     label: 'Gemini 2.5 Flash Image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
-    max_reference_images: 8,
+    max_reference_images: 14,
     allow_half_k: false,
   },
   {
@@ -142,7 +142,7 @@ function imagePolicyExample(platform: string): string {
       resolutions: ['1K', '2K', '4K'],
       max_output_images: 1,
       max_reference_images: REFERENCE_IMAGE_PROVIDERS.has(normalizedPlatform)
-        ? 8
+        ? 14
         : 0,
       allow_half_k: false,
     },
