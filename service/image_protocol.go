@@ -244,6 +244,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	}
 	if mediaType == "multipart/form-data" && request.Platform == "openai" {
 		reader := multipart.NewReader(bytes.NewReader(raw), params["boundary"])
+		multipartReferenceIndex := 0
 		for {
 			part, err := reader.NextPart()
 			if errors.Is(err, io.EOF) {
@@ -255,10 +256,11 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 			name := part.FormName()
 			data, readErr := io.ReadAll(io.LimitReader(part, cfg.DownloadMaxBytes+1))
 			_ = part.Close()
-			if readErr != nil || int64(len(data)) > cfg.DownloadMaxBytes {
-				return request, errors.New("multipart image byte limit exceeded")
-			}
 			if part.FileName() != "" {
+				multipartReferenceIndex++
+				if readErr != nil || int64(len(data)) > cfg.DownloadMaxBytes {
+					return request, fmt.Errorf("Reference image %d: multipart image byte limit exceeded", multipartReferenceIndex)
+				}
 				indexedImage := false
 				if index, ok := strings.CutPrefix(name, "image["); ok {
 					if index, ok = strings.CutSuffix(index, "]"); ok {
@@ -274,7 +276,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				}
 				image, err := ValidateImageBytes(data, "", cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 				if err != nil {
-					return request, err
+					return request, fmt.Errorf("Reference image %d: %w", multipartReferenceIndex, err)
 				}
 				if name == "mask" {
 					mask, err := common.Marshal(map[string]string{"image_url": image.DataURL()})
@@ -286,6 +288,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 					request.Parts = append(request.Parts, AsyncImageInputPart{Type: "image_url", URL: image.DataURL()})
 				}
 				continue
+			}
+			if readErr != nil {
+				return request, errors.New("multipart field could not be read")
 			}
 			if len(data) > 64<<10 {
 				return request, errors.New("multipart field limit exceeded")
@@ -528,11 +533,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		return request, errors.New("prompt is required and must not exceed 64 KiB")
 	}
 	references := request.ReferenceImageCount()
-	limit := cfg.MaxReferences
-	if request.Platform == "gemini" && strings.Contains(request.Model, "flash") && strings.Contains(request.Model, "image") {
-		limit = min(limit, 3)
-	}
-	if references > limit {
+	if references > cfg.MaxReferences {
 		return request, errors.New("too_many_reference_images_for_model")
 	}
 	if references > 0 {
@@ -559,28 +560,23 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 		request.Parts = append(request.Parts, AsyncImageInputPart{Type: "mask", URL: mask.URL})
 	}
-	var inlineBytes, inlinePixels int64
+	referenceIndex := 0
 	for _, part := range request.Parts {
 		if part.Type != "image_url" && part.Type != "mask" {
 			continue
 		}
+		referenceIndex++
 		if !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
 			if IsGatewayImageReference(part.URL) {
 				continue
 			}
 			if _, err := ValidateImageReferenceURL(part.URL); err != nil {
-				return request, err
+				return request, fmt.Errorf("Reference image %d: %w", referenceIndex, err)
 			}
 			continue
 		}
-		image, err := DownloadImageReference(context.Background(), part.URL, cfg)
-		if err != nil {
-			return request, err
-		}
-		inlineBytes += int64(len(image.Data))
-		inlinePixels += int64(image.Width) * int64(image.Height)
-		if inlineBytes > cfg.ReferenceTotalBytes || inlinePixels > cfg.ReferenceTotalPixels {
-			return request, errors.New("reference images exceed the combined byte or pixel budget")
+		if _, err := DownloadImageReference(context.Background(), part.URL, cfg); err != nil {
+			return request, fmt.Errorf("Reference image %d: %w", referenceIndex, err)
 		}
 	}
 	if request.Platform == "openai" {

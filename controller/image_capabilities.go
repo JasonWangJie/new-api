@@ -154,6 +154,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			if len(channels) == 0 {
 				continue
 			}
+			capability.MaxReferenceImages = min(capability.MaxReferenceImages, cfg.MaxReferences)
 			declared := service.ImageChannelCapability(channels[0], capability.Id)
 			if !declared.Edit && declared.ReferenceField == "" {
 				capability.MaxReferenceImages = 0

@@ -61,7 +61,9 @@ func SubmitAsyncImage(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_idempotency_key", err.Error())
 		return
 	}
-	maxBody := cfg.ReferenceTotalBytes/3*4 + 1<<20
+	// The body ceiling is derived from the independently bounded image count and
+	// per-image byte limit; there is no separate combined reference-image quota.
+	maxBody := int64(cfg.MaxReferences+1)*cfg.DownloadMaxBytes/3*4 + 1<<20
 	raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxBody))
 	if err != nil {
 		AsyncImagePublicError(c, 413, "request_too_large", "Image request exceeds the byte limit")

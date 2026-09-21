@@ -455,6 +455,54 @@ func TestFailAsyncImageInvocationPersistsSanitizedProviderDiagnostics(t *testing
 	assert.Equal(t, stored.ErrorMessage, storedAttempts[0].ErrorMessage)
 }
 
+func TestInvalidImageReferenceFailureIsIndexedAndNotRetried(t *testing.T) {
+	previousDB := model.DB
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "invalid-reference.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		connection, openErr := db.DB()
+		if openErr == nil {
+			_ = connection.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+
+	now := time.Now().Unix()
+	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1}})
+	require.NoError(t, err)
+	task := model.AsyncImageTask{
+		TaskId:         "asyncimg_invalid_reference",
+		Status:         model.ImageTaskInvoking,
+		Version:        1,
+		LeaseToken:     "invalid-reference-lease",
+		LeaseExpiresAt: now + 60,
+		Attempts:       string(attempts),
+		CreatedAt:      now - 1,
+	}
+	require.NoError(t, db.Create(&task).Error)
+	_, validationErr := ValidateImageBytes([]byte("oversized"), "", 1, 1)
+	require.Error(t, validationErr)
+	failure := NewImageReferenceFailure(3, validationErr)
+	assert.Equal(t, 604, failure.Code)
+	assert.Equal(t, "invalid_reference_image", failure.InternalCode)
+	assert.Equal(t, "Reference image 3: image byte limit exceeded", failure.Message)
+	sanitized := NewImageReferenceFailure(4, errors.New("download failed for https://signed.example/path/image.png?secret=private-token"))
+	assert.NotContains(t, sanitized.Message, "signed.example")
+	assert.NotContains(t, sanitized.Message, "private-token")
+
+	require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, DefaultImageRuntimeConfig()))
+
+	var stored model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, model.ImageTaskFailed, stored.Status)
+	assert.Zero(t, stored.RetryCount)
+	assert.Zero(t, stored.ReferenceRetryCount)
+	assert.Zero(t, stored.NextAttemptAt)
+	assert.Equal(t, failure.Message, stored.ErrorMessage)
+}
+
 func asyncImageKeyFixture(t *testing.T) {
 	t.Helper()
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
@@ -696,6 +744,10 @@ func TestAsyncImageGeminiOrderedParts(t *testing.T) {
 	assert.Empty(t, request.AspectRatio)
 	_, err = ParseAsyncImageRequest([]byte(`{"model":"gemini-image","prompt":"x","size":"2048x1152"}`), "application/json", "/v1/images/generations_sc", DefaultImageRuntimeConfig())
 	assert.NoError(t, err)
+	body = `{"model":"gemini-2.5-flash-image","messages":[{"role":"user","content":[{"type":"text","text":"edit"},{"type":"image_url","image_url":{"url":"https://example.com/1.png"}},{"type":"image_url","image_url":{"url":"https://example.com/2.png"}},{"type":"image_url","image_url":{"url":"https://example.com/3.png"}},{"type":"image_url","image_url":{"url":"https://example.com/4.png"}}]}]}`
+	request, err = ParseAsyncImageRequest([]byte(body), "application/json", "/v1/chat/completions_gm", DefaultImageRuntimeConfig())
+	require.NoError(t, err)
+	assert.Equal(t, 4, request.ReferenceImageCount(), "model capability policy, not a hard-coded model-name heuristic, sets the model limit")
 }
 
 func TestAsyncImageValidationContainerMIMEAndPublicAddress(t *testing.T) {
@@ -704,12 +756,18 @@ func TestAsyncImageValidationContainerMIMEAndPublicAddress(t *testing.T) {
 	assert.Error(t, err)
 	_, err = ValidateImageBytes(valid.Data, "image/png", 1<<20, 5)
 	assert.Error(t, err)
-	_, err = ValidateImageBytes(append(bytes.Clone(valid.Data), []byte("trailing")...), "image/png", 1<<20, 100)
-	assert.Error(t, err)
+	normalizedPNG, err := ValidateImageBytes(append(bytes.Clone(valid.Data), []byte("trailing")...), "image/png", 1<<20, 100)
+	require.NoError(t, err)
+	assert.Equal(t, valid.Data, normalizedPNG.Data)
 	var encoded bytes.Buffer
 	require.NoError(t, jpeg.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2)), nil))
-	_, err = ValidateImageBytes(append(encoded.Bytes(), 0xff, 0xd9), "image/jpeg", 1<<20, 100)
+	jpegBytes := bytes.Clone(encoded.Bytes())
+	normalizedJPEG, err := ValidateImageBytes(append(bytes.Clone(jpegBytes), bytes.Repeat([]byte{0x5a}, 24)...), "image/jpeg", 1<<20, 100)
+	require.NoError(t, err)
+	assert.Equal(t, jpegBytes, normalizedJPEG.Data)
+	_, err = ValidateImageBytes(append(bytes.Clone(jpegBytes), bytes.Repeat([]byte{0x5a}, maxNormalizedImageTrailingBytes+1)...), "image/jpeg", 1<<20, 100)
 	assert.Error(t, err)
+	assert.True(t, IsImageValidationError(err))
 	for _, address := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "fc00::1", "2001:db8::1"} {
 		assert.False(t, ImagePublicIP(netip.MustParseAddr(address)), address)
 	}
@@ -723,6 +781,13 @@ func TestAsyncImageValidationContainerMIMEAndPublicAddress(t *testing.T) {
 	decoded, err := DownloadImageReference(context.Background(), valid.DataURL(), DefaultImageRuntimeConfig())
 	require.NoError(t, err)
 	assert.Equal(t, valid.Checksum, decoded.Checksum)
+}
+
+func TestResolveImageReferenceTransportMode(t *testing.T) {
+	assert.Equal(t, "passthrough_fallback_local", ResolveImageReferenceTransportMode("passthrough_fallback_local", 0))
+	assert.Equal(t, "local", ResolveImageReferenceTransportMode("passthrough_fallback_local", 1))
+	assert.Equal(t, "passthrough", ResolveImageReferenceTransportMode("passthrough", 2))
+	assert.Equal(t, "local", ResolveImageReferenceTransportMode("local", 2))
 }
 
 func TestAsyncImageLocalStorageAndDurableIntentRetry(t *testing.T) {

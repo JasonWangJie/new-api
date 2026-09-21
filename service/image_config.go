@@ -51,8 +51,6 @@ type ImageRuntimeConfig struct {
 	DownloadMaxBytes      int64  `json:"download_max_bytes"`
 	DownloadMaxPixels     int64  `json:"download_max_pixels"`
 	MaxReferences         int    `json:"max_reference_images"`
-	ReferenceTotalBytes   int64  `json:"max_reference_total_bytes"`
-	ReferenceTotalPixels  int64  `json:"max_reference_total_pixels"`
 	DownloadTimeout       int    `json:"download_timeout_seconds"`
 	DownloadRedirects     int    `json:"download_max_redirects"`
 	ReferenceConcurrency  int    `json:"reference_fetch_concurrency"`
@@ -78,7 +76,7 @@ type ImageRuntimeConfig struct {
 }
 
 func DefaultImageRuntimeConfig() ImageRuntimeConfig {
-	return ImageRuntimeConfig{Workers: 4, WorkerLease: 120, RecoveryInterval: 30, ExecutionTimeout: 1200, AttemptTimeout: 300, ImageConcurrency: 4, StorageRetries: 5, BillingRetries: 10, RetryBackoff: 30, OpenAIReferenceMode: "passthrough_fallback_local", GeminiReferenceMode: "passthrough", GeminiAccountSwitches: 3, FailureThreshold: 5, Cooldown: 300, ReferenceRetries: 2, ReferenceRetryBase: 15, ReferenceRetryMax: 60, TransientRetries: 3, TransientRetryBase: 15, TransientRetryMax: 60, CapacityRetries: 5, CapacityRetryBase: 30, CapacityRetryMax: 300, TotalRetries: 16, RetryJitter: 20, RetryAfterMax: 900, DownloadMaxBytes: 32 << 20, DownloadMaxPixels: 80_000_000, MaxReferences: 14, ReferenceTotalBytes: 64 << 20, ReferenceTotalPixels: 80_000_000, DownloadTimeout: 30, DownloadRedirects: 3, ReferenceConcurrency: 8, ReferenceCacheTTL: 60, ReferenceCacheBytes: 128 << 20, UploadTimeout: 300, UploadsPerMinute: 20, InputBytesPerKey: 1 << 30, SingleUploadBytes: 32 << 20, SignedURLExpiry: 3600, InputRetentionHours: 24, TaskRetentionDays: 90, ResultRetentionDays: 90, PromptPreview: true, PromptPreviewChars: 160, LibraryRetentionDays: 90, LibraryItems: 1000, LibraryBytes: 5 << 30, LibraryImageBytes: 20 << 20, LibraryImagePixels: 40_000_000, ImportsPerMinute: 20, SubmissionsPerMinute: 10}
+	return ImageRuntimeConfig{Workers: 4, WorkerLease: 120, RecoveryInterval: 30, ExecutionTimeout: 1200, AttemptTimeout: 300, ImageConcurrency: 4, StorageRetries: 5, BillingRetries: 10, RetryBackoff: 30, OpenAIReferenceMode: "passthrough_fallback_local", GeminiReferenceMode: "passthrough", GeminiAccountSwitches: 3, FailureThreshold: 5, Cooldown: 300, ReferenceRetries: 2, ReferenceRetryBase: 15, ReferenceRetryMax: 60, TransientRetries: 3, TransientRetryBase: 15, TransientRetryMax: 60, CapacityRetries: 5, CapacityRetryBase: 30, CapacityRetryMax: 300, TotalRetries: 16, RetryJitter: 20, RetryAfterMax: 900, DownloadMaxBytes: 32 << 20, DownloadMaxPixels: 80_000_000, MaxReferences: 14, DownloadTimeout: 30, DownloadRedirects: 3, ReferenceConcurrency: 8, ReferenceCacheTTL: 60, ReferenceCacheBytes: 128 << 20, UploadTimeout: 300, UploadsPerMinute: 20, InputBytesPerKey: 1 << 30, SingleUploadBytes: 32 << 20, SignedURLExpiry: 3600, InputRetentionHours: 24, TaskRetentionDays: 90, ResultRetentionDays: 90, PromptPreview: true, PromptPreviewChars: 160, LibraryRetentionDays: 90, LibraryItems: 1000, LibraryBytes: 5 << 30, LibraryImageBytes: 20 << 20, LibraryImagePixels: 40_000_000, ImportsPerMinute: 20, SubmissionsPerMinute: 10}
 }
 
 func GetImageRuntimeConfig(ctx context.Context) (ImageRuntimeConfig, error) {
@@ -110,12 +108,12 @@ func (cfg ImageRuntimeConfig) Validate() error {
 	if cfg.UploadsPerMinute > 1000 || cfg.InputBytesPerKey <= 0 || cfg.InputBytesPerKey > 100<<30 || cfg.SingleUploadBytes <= 0 || cfg.SingleUploadBytes > 64<<20 || cfg.UploadTimeout > 600 || cfg.InputRetentionHours > 720 {
 		return errors.New("SC upload limits exceed supported bounds")
 	}
-	if cfg.DownloadMaxBytes <= 0 || cfg.DownloadMaxPixels <= 0 || cfg.ReferenceTotalBytes <= 0 || cfg.ReferenceTotalPixels <= 0 || cfg.LibraryBytes <= 0 || cfg.LibraryImageBytes <= 0 || cfg.LibraryImagePixels <= 0 || cfg.MaxReferences > 128 {
+	if cfg.DownloadMaxBytes <= 0 || cfg.DownloadMaxPixels <= 0 || cfg.LibraryBytes <= 0 || cfg.LibraryImageBytes <= 0 || cfg.LibraryImagePixels <= 0 || cfg.MaxReferences > 128 {
 		return errors.New("invalid image storage limits")
 	}
 	// Bound administrator values before duration, exponential backoff and
 	// response-size arithmetic; configurations can also arrive from the DB.
-	if cfg.Workers > 10000 || cfg.ImageConcurrency > 10000 || cfg.ReferenceConcurrency > 10000 || cfg.WorkerLease > 86400 || cfg.ExecutionTimeout > 86400 || cfg.AttemptTimeout > cfg.ExecutionTimeout || cfg.RecoveryInterval > 86400 || cfg.RetryBackoff > 86400 || cfg.Cooldown > 86400 || cfg.DownloadTimeout > 600 || cfg.DownloadRedirects > 10 || cfg.SignedURLExpiry > 604800 || cfg.TaskRetentionDays > 36500 || cfg.ResultRetentionDays > 36500 || cfg.LibraryRetentionDays > 36500 || cfg.ReferenceCacheTTL > 86400 || cfg.ReferenceCacheBytes > 1<<30 || cfg.DownloadMaxBytes > 64<<20 || cfg.DownloadMaxPixels > 320_000_000 || cfg.ReferenceTotalBytes > 1<<30 || cfg.ReferenceTotalPixels > 1_000_000_000 || cfg.LibraryImageBytes > 64<<20 || cfg.LibraryImagePixels > 320_000_000 || cfg.LibraryBytes > 1<<40 {
+	if cfg.Workers > 10000 || cfg.ImageConcurrency > 10000 || cfg.ReferenceConcurrency > 10000 || cfg.WorkerLease > 86400 || cfg.ExecutionTimeout > 86400 || cfg.AttemptTimeout > cfg.ExecutionTimeout || cfg.RecoveryInterval > 86400 || cfg.RetryBackoff > 86400 || cfg.Cooldown > 86400 || cfg.DownloadTimeout > 600 || cfg.DownloadRedirects > 10 || cfg.SignedURLExpiry > 604800 || cfg.TaskRetentionDays > 36500 || cfg.ResultRetentionDays > 36500 || cfg.LibraryRetentionDays > 36500 || cfg.ReferenceCacheTTL > 86400 || cfg.ReferenceCacheBytes > 1<<30 || cfg.DownloadMaxBytes > 64<<20 || cfg.DownloadMaxPixels > 320_000_000 || cfg.LibraryImageBytes > 64<<20 || cfg.LibraryImagePixels > 320_000_000 || cfg.LibraryBytes > 1<<40 {
 		return errors.New("image runtime limits exceed supported arithmetic bounds")
 	}
 	for _, value := range []int{cfg.StorageRetries, cfg.BillingRetries, cfg.ReferenceRetries, cfg.TransientRetries, cfg.CapacityRetries, cfg.TotalRetries, cfg.GeminiAccountSwitches, cfg.FailureThreshold} {

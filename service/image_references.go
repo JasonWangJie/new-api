@@ -39,7 +39,7 @@ func IsBoundImageReference(ctx context.Context, tokenId int, raw string) (bool, 
 	err := model.DB.WithContext(ctx).Where("url_hash = ?", ImageIdentityHash(raw)).Take(&alias).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		if IsGatewayImageReference(raw) {
-			return true, errors.New("SC input alias is unavailable")
+			return true, newImageValidationError("SC input alias is unavailable")
 		}
 		return false, nil
 	}
@@ -47,7 +47,7 @@ func IsBoundImageReference(ctx context.Context, tokenId int, raw string) (bool, 
 		return false, err
 	}
 	if alias.TokenId != tokenId {
-		return true, errors.New("SC input belongs to another Token")
+		return true, newImageValidationError("SC input belongs to another Token")
 	}
 	var count int64
 	err = model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Where("input_id = ? AND token_id = ? AND status = ? AND expires_at > ?", alias.InputId, tokenId, "active", time.Now().Unix()).Count(&count).Error
@@ -55,7 +55,7 @@ func IsBoundImageReference(ctx context.Context, tokenId int, raw string) (bool, 
 		return true, err
 	}
 	if count != 1 {
-		return true, errors.New("SC input has expired or is unavailable")
+		return true, newImageValidationError("SC input has expired or is unavailable")
 	}
 	return true, nil
 }
@@ -65,11 +65,11 @@ func ResolveImageReference(ctx context.Context, tokenId int, raw string, cfg Ima
 	err := model.DB.WithContext(ctx).Where("url_hash = ?", ImageIdentityHash(raw)).Take(&alias).Error
 	if err == nil {
 		if alias.TokenId != tokenId {
-			return ImageBytes{}, true, errors.New("SC input belongs to another Token")
+			return ImageBytes{}, true, newImageValidationError("SC input belongs to another Token")
 		}
 		var input model.ImageInputObject
 		if err := model.DB.WithContext(ctx).Where("input_id = ? AND token_id = ? AND status = ? AND expires_at > ?", alias.InputId, tokenId, "active", time.Now().Unix()).Take(&input).Error; err != nil {
-			return ImageBytes{}, true, errors.New("SC input has expired or is unavailable")
+			return ImageBytes{}, true, newImageValidationError("SC input has expired or is unavailable")
 		}
 		var object model.ImageStorageObject
 		if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ?", input.ObjectId, "active").Take(&object).Error; err != nil {
@@ -93,10 +93,17 @@ func ResolveImageReference(ctx context.Context, tokenId int, raw string, cfg Ima
 		return ImageBytes{}, false, err
 	}
 	if IsGatewayImageReference(raw) {
-		return ImageBytes{}, true, errors.New("SC input alias is unavailable")
+		return ImageBytes{}, true, newImageValidationError("SC input alias is unavailable")
 	}
 	image, err := DownloadImageReferenceCached(ctx, tokenId, raw, cfg)
 	return image, false, err
+}
+
+func ResolveImageReferenceTransportMode(configured string, referenceRetryCount int) string {
+	if configured == "passthrough_fallback_local" && referenceRetryCount > 0 {
+		return "local"
+	}
+	return configured
 }
 
 var imageReferenceCacheWrite = redis.NewScript(`local expired=redis.call('ZRANGEBYSCORE',KEYS[2],'-inf',ARGV[1],'LIMIT',0,100); local used=tonumber(redis.call('GET',KEYS[4]) or '0'); for _,id in ipairs(expired) do used=used-tonumber(redis.call('HGET',KEYS[3],id) or '0'); redis.call('HDEL',KEYS[1],id); redis.call('HDEL',KEYS[3],id); redis.call('ZREM',KEYS[2],id); end; used=math.max(0,used); local old=tonumber(redis.call('HGET',KEYS[3],ARGV[2]) or '0'); local size=tonumber(ARGV[4]); if used-old+size>tonumber(ARGV[5]) then redis.call('SET',KEYS[4],used,'EX',ARGV[7]);return 0 end; redis.call('HSET',KEYS[1],ARGV[2],ARGV[6]); redis.call('HSET',KEYS[3],ARGV[2],size);redis.call('ZADD',KEYS[2],ARGV[3],ARGV[2]);redis.call('SET',KEYS[4],used-old+size,'EX',ARGV[7]);for i=1,3 do redis.call('EXPIRE',KEYS[i],ARGV[7]);end;return 1`)
@@ -109,7 +116,7 @@ func DownloadImageReferenceCached(ctx context.Context, tokenId int, raw string, 
 		return DownloadImageReference(ctx, raw, cfg)
 	}
 	if _, err := ValidateImageReferenceURL(raw); err != nil {
-		return ImageBytes{}, err
+		return ImageBytes{}, newImageValidationError(err.Error())
 	}
 	if common.RDB == nil {
 		return ImageBytes{}, errors.New("Redis is required for reference download admission")
@@ -171,7 +178,7 @@ func AsyncImageInputReferences(ctx context.Context, tokenId int, request AsyncIm
 		err := model.DB.WithContext(ctx).Where("url_hash = ?", ImageIdentityHash(part.URL)).Take(&alias).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			if IsGatewayImageReference(part.URL) {
-				return nil, errors.New("SC input alias is unavailable")
+				return nil, newImageValidationError("SC input alias is unavailable")
 			}
 			continue
 		}
@@ -179,11 +186,11 @@ func AsyncImageInputReferences(ctx context.Context, tokenId int, request AsyncIm
 			return nil, err
 		}
 		if alias.TokenId != tokenId {
-			return nil, errors.New("SC input belongs to another Token")
+			return nil, newImageValidationError("SC input belongs to another Token")
 		}
 		var input model.ImageInputObject
 		if err := model.DB.WithContext(ctx).Where("input_id = ? AND token_id = ? AND status = ? AND expires_at > ?", alias.InputId, tokenId, "active", time.Now().Unix()).Take(&input).Error; err != nil {
-			return nil, errors.New("SC input has expired or is unavailable")
+			return nil, newImageValidationError("SC input has expired or is unavailable")
 		}
 		ids = append(ids, input.InputId)
 	}

@@ -46,6 +46,21 @@ func (pending *AsyncImagePending) Error() string { return "upstream image job is
 
 func (failure *AsyncImageFailure) Error() string { return failure.Message }
 
+func NewImageReferenceFailure(index int, err error) *AsyncImageFailure {
+	diagnostic := sanitizeAsyncImageProviderDiagnostic(err.Error(), asyncImageProviderMessageLimit)
+	message := fmt.Sprintf("Reference image %d: %s", max(1, index), diagnostic)
+	var existing *AsyncImageFailure
+	if errors.As(err, &existing) {
+		failure := *existing
+		failure.Message = message
+		return &failure
+	}
+	if IsImageValidationError(err) {
+		return &AsyncImageFailure{Code: 604, InternalCode: "invalid_reference_image", Message: message}
+	}
+	return &AsyncImageFailure{Code: 602, InternalCode: "reference_download_failed", Message: message}
+}
+
 func ImageRetryAfter(value string, now time.Time) time.Duration {
 	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 32); err == nil {
 		return time.Duration(max(0, min(seconds, 86400))) * time.Second

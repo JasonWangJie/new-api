@@ -215,11 +215,8 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	var nativeBody []byte
 	if request.Platform == "openai" {
 		var images []map[string]string
-		var totalBytes, totalPixels int64
-		mode := cfg.OpenAIReferenceMode
-		if task.ReferenceRetryCount > 0 && mode == "passthrough_fallback_local" {
-			mode = "local"
-		}
+		mode := service.ResolveImageReferenceTransportMode(cfg.OpenAIReferenceMode, task.ReferenceRetryCount)
+		referenceIndex := 0
 		for _, part := range request.Parts {
 			if task.UpstreamTaskId != "" {
 				break
@@ -227,20 +224,16 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			if part.Type != "image_url" && part.Type != "mask" {
 				continue
 			}
+			referenceIndex++
 			reference := part.URL
 			bound, err := service.IsBoundImageReference(ctx, task.TokenId, reference)
 			if err != nil {
-				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, Message: "SC input has expired or is unavailable"}
+				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
 			if bound || mode == "local" || strings.HasPrefix(strings.ToLower(reference), "data:") {
 				image, _, err := service.ResolveImageReference(ctx, task.TokenId, reference, cfg)
 				if err != nil {
-					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 602, InternalCode: "reference_download_failed", Message: err.Error()}
-				}
-				totalBytes += int64(len(image.Data))
-				totalPixels += int64(image.Width) * int64(image.Height)
-				if totalBytes > cfg.ReferenceTotalBytes || totalPixels > cfg.ReferenceTotalPixels {
-					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, Message: "Reference images exceed the combined byte or pixel budget"}
+					return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 				}
 				reference = image.DataURL()
 			}
@@ -293,27 +286,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		parsed = imageRequest
 	} else {
-		parts := make([]dto.GeminiPart, 0, len(request.Parts))
-		var totalBytes, totalPixels int64
-		for _, part := range request.Parts {
-			if part.Type == "text" {
-				parts = append(parts, dto.GeminiPart{Text: part.Text})
-				continue
-			}
-			image, bound, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
-			if err != nil {
-				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 602, InternalCode: "reference_download_failed", Message: err.Error()}
-			}
-			totalBytes += int64(len(image.Data))
-			totalPixels += int64(image.Width) * int64(image.Height)
-			if totalBytes > cfg.ReferenceTotalBytes || totalPixels > cfg.ReferenceTotalPixels {
-				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "reference_budget_exceeded", Message: "Reference images exceed the combined byte or pixel budget"}
-			}
-			if !bound && cfg.GeminiReferenceMode != "local" && !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
-				parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{MimeType: image.ContentType, FileUri: part.URL}})
-			} else {
-				parts = append(parts, dto.GeminiPart{InlineData: &dto.GeminiInlineData{MimeType: image.ContentType, Data: base64.StdEncoding.EncodeToString(image.Data)}})
-			}
+		parts, err := buildGeminiAsyncImageParts(ctx, task, request, cfg)
+		if err != nil {
+			return nil, model.AsyncImageBill{}, err
 		}
 		imageConfig := map[string]string{}
 		if request.Resolution != "" {
@@ -349,13 +324,15 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				return nil, model.AsyncImageBill{}, err
 			}
 		}
+		referenceIndex := 0
 		for index, part := range request.Parts {
 			if part.Type != "image_url" && part.Type != "mask" {
 				continue
 			}
+			referenceIndex++
 			image, _, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
 			if err != nil {
-				return nil, model.AsyncImageBill{}, err
+				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
 			field := "image[]"
 			if part.Type == "mask" {
@@ -545,6 +522,33 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "bill_preparation_failed", Message: err.Error(), ExecutionUnknown: true}
 	}
 	return images, bill, nil
+}
+
+func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, cfg service.ImageRuntimeConfig) ([]dto.GeminiPart, error) {
+	parts := make([]dto.GeminiPart, 0, len(request.Parts))
+	mode := service.ResolveImageReferenceTransportMode(cfg.GeminiReferenceMode, task.ReferenceRetryCount)
+	referenceIndex := 0
+	for _, part := range request.Parts {
+		if part.Type == "text" {
+			parts = append(parts, dto.GeminiPart{Text: part.Text})
+			continue
+		}
+		referenceIndex++
+		bound, err := service.IsBoundImageReference(ctx, task.TokenId, part.URL)
+		if err != nil {
+			return nil, service.NewImageReferenceFailure(referenceIndex, err)
+		}
+		if !bound && mode != "local" && !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
+			parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{FileUri: part.URL}})
+			continue
+		}
+		image, _, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
+		if err != nil {
+			return nil, service.NewImageReferenceFailure(referenceIndex, err)
+		}
+		parts = append(parts, dto.GeminiPart{InlineData: &dto.GeminiInlineData{MimeType: image.ContentType, Data: base64.StdEncoding.EncodeToString(image.Data)}})
+	}
+	return parts, nil
 }
 
 func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string, cfg service.ImageRuntimeConfig) ([]service.ImageBytes, error) {

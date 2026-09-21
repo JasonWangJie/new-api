@@ -32,16 +32,34 @@ type ImageBytes struct {
 	Height      int
 }
 
+const maxNormalizedImageTrailingBytes = 4 << 10
+
+type imageValidationError struct{ message string }
+
+func (err *imageValidationError) Error() string { return err.message }
+
+func newImageValidationError(message string) error {
+	return &imageValidationError{message: message}
+}
+
+func IsImageValidationError(err error) bool {
+	var validationError *imageValidationError
+	return errors.As(err, &validationError)
+}
+
 func ValidateImageBytes(data []byte, declared string, maxBytes, maxPixels int64) (ImageBytes, error) {
-	if len(data) == 0 || maxBytes <= 0 || int64(len(data)) > maxBytes {
-		return ImageBytes{}, errors.New("image byte limit exceeded or empty image")
+	if len(data) == 0 {
+		return ImageBytes{}, newImageValidationError("empty image")
+	}
+	if maxBytes <= 0 || int64(len(data)) > maxBytes {
+		return ImageBytes{}, newImageValidationError("image byte limit exceeded")
 	}
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
-		return ImageBytes{}, errors.New("invalid image header")
+		return ImageBytes{}, newImageValidationError("invalid image header")
 	}
 	if maxPixels <= 0 || int64(cfg.Height) > maxPixels || int64(cfg.Width) > maxPixels/int64(cfg.Height) {
-		return ImageBytes{}, errors.New("image pixel limit exceeded")
+		return ImageBytes{}, newImageValidationError("image pixel limit exceeded")
 	}
 	contentType := ""
 	switch format {
@@ -52,77 +70,98 @@ func ValidateImageBytes(data []byte, declared string, maxBytes, maxPixels int64)
 	case "webp":
 		contentType = "image/webp"
 	default:
-		return ImageBytes{}, errors.New("only PNG, JPEG and WebP images are supported")
+		return ImageBytes{}, newImageValidationError("only PNG, JPEG and WebP images are supported")
 	}
-	if !validImageContainer(data, format) {
-		return ImageBytes{}, errors.New("invalid image container or trailing data")
+	canonical, ok := canonicalImageContainer(data, format)
+	if !ok {
+		return ImageBytes{}, newImageValidationError("invalid image container or excessive trailing data")
+	}
+	if len(canonical) != len(data) {
+		canonical = bytes.Clone(canonical)
 	}
 	if declared != "" {
 		actual, _, err := mime.ParseMediaType(declared)
 		if err != nil || !strings.EqualFold(actual, contentType) {
-			return ImageBytes{}, errors.New("declared image MIME does not match its bytes")
+			return ImageBytes{}, newImageValidationError("declared image MIME does not match its bytes")
 		}
 	}
-	decoded, decodedFormat, err := image.Decode(bytes.NewReader(data))
+	decoded, decodedFormat, err := image.Decode(bytes.NewReader(canonical))
 	if err != nil || decodedFormat != format || decoded.Bounds().Dx() != cfg.Width || decoded.Bounds().Dy() != cfg.Height {
-		return ImageBytes{}, errors.New("image could not be fully decoded")
+		return ImageBytes{}, newImageValidationError("image could not be fully decoded")
 	}
-	sum := sha256.Sum256(data)
-	return ImageBytes{Data: data, ContentType: contentType, Checksum: hex.EncodeToString(sum[:]), Width: cfg.Width, Height: cfg.Height}, nil
+	sum := sha256.Sum256(canonical)
+	return ImageBytes{Data: canonical, ContentType: contentType, Checksum: hex.EncodeToString(sum[:]), Width: cfg.Width, Height: cfg.Height}, nil
 }
 
-func validImageContainer(data []byte, format string) bool {
+// canonicalImageContainer only removes a short suffix after a fully parsed
+// terminal marker. The normalized bytes are decoded again before acceptance,
+// so appended payloads are discarded instead of becoming part of stored or
+// upstream image data.
+func canonicalImageContainer(data []byte, format string) ([]byte, bool) {
 	if format == "webp" {
-		return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" && uint64(binary.LittleEndian.Uint32(data[4:8]))+8 == uint64(len(data))
+		if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+			return nil, false
+		}
+		end := uint64(binary.LittleEndian.Uint32(data[4:8])) + 8
+		if end < 12 || end > uint64(len(data)) || uint64(len(data))-end > maxNormalizedImageTrailingBytes {
+			return nil, false
+		}
+		return data[:int(end)], true
 	}
 	if format == "png" {
 		if len(data) < 20 || string(data[:8]) != "\x89PNG\r\n\x1a\n" {
-			return false
+			return nil, false
 		}
 		for offset := 8; offset+12 <= len(data); {
 			length := uint64(binary.BigEndian.Uint32(data[offset : offset+4]))
 			if length > uint64(len(data)-offset-12) {
-				return false
+				return nil, false
 			}
 			end := offset + 12 + int(length)
 			if string(data[offset+4:offset+8]) == "IEND" {
-				return length == 0 && end == len(data)
+				if length != 0 || len(data)-end > maxNormalizedImageTrailingBytes {
+					return nil, false
+				}
+				return data[:end], true
 			}
 			offset = end
 		}
-		return false
+		return nil, false
 	}
 	if format != "jpeg" || len(data) < 4 || data[0] != 0xff || data[1] != 0xd8 {
-		return false
+		return nil, false
 	}
 	position := 2
 	for position < len(data) {
 		if data[position] != 0xff {
-			return false
+			return nil, false
 		}
 		for position < len(data) && data[position] == 0xff {
 			position++
 		}
 		if position >= len(data) {
-			return false
+			return nil, false
 		}
 		marker := data[position]
 		position++
 		if marker == 0xd9 {
-			return position == len(data)
+			if len(data)-position > maxNormalizedImageTrailingBytes {
+				return nil, false
+			}
+			return data[:position], true
 		}
 		if marker == 0x00 || marker == 0xd8 {
-			return false
+			return nil, false
 		}
 		if marker == 0x01 || marker >= 0xd0 && marker <= 0xd7 {
 			continue
 		}
 		if position+2 > len(data) {
-			return false
+			return nil, false
 		}
 		length := int(binary.BigEndian.Uint16(data[position : position+2]))
 		if length < 2 || length > len(data)-position {
-			return false
+			return nil, false
 		}
 		position += length
 		if marker != 0xda {
@@ -138,7 +177,7 @@ func validImageContainer(data []byte, format string) bool {
 				position++
 			}
 			if position >= len(data) {
-				return false
+				return nil, false
 			}
 			if data[position] == 0x00 || data[position] >= 0xd0 && data[position] <= 0xd7 {
 				position++
@@ -148,7 +187,7 @@ func validImageContainer(data []byte, format string) bool {
 			break
 		}
 	}
-	return false
+	return nil, false
 }
 
 var imageBlockedNetworks = []netip.Prefix{
@@ -230,11 +269,11 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 	if strings.HasPrefix(strings.ToLower(raw), "data:") {
 		meta, payload, ok := strings.Cut(raw, ",")
 		if !ok || !strings.HasSuffix(strings.ToLower(meta), ";base64") || base64.StdEncoding.DecodedLen(len(payload)) > int(cfg.DownloadMaxBytes)+2 {
-			return ImageBytes{}, errors.New("invalid or oversized image data URI")
+			return ImageBytes{}, newImageValidationError("invalid or oversized image data URI")
 		}
 		data, err := base64.StdEncoding.Strict().DecodeString(payload)
 		if err != nil {
-			return ImageBytes{}, errors.New("invalid base64 image")
+			return ImageBytes{}, newImageValidationError("invalid base64 image")
 		}
 		return ValidateImageBytes(data, meta[5:len(meta)-7], cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 	}
@@ -258,7 +297,7 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 		return ImageBytes{}, fmt.Errorf("image reference returned HTTP %d", response.StatusCode)
 	}
 	if response.ContentLength > cfg.DownloadMaxBytes {
-		return ImageBytes{}, errors.New("image reference byte limit exceeded")
+		return ImageBytes{}, newImageValidationError("image reference byte limit exceeded")
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, cfg.DownloadMaxBytes+1))
 	if err != nil {

@@ -375,9 +375,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	if request.Platform == "gemini" {
 		mode = cfg.GeminiReferenceMode
 	}
-	if task.ReferenceRetryCount > 0 && mode == "passthrough_fallback_local" {
-		mode = "local"
-	}
+	mode = ResolveImageReferenceTransportMode(mode, task.ReferenceRetryCount)
 	attempts = append(attempts, ImageChannelAttempt{ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode})
 	encoded, err := common.Marshal(attempts)
 	if err != nil {

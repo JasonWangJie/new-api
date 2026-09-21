@@ -84,23 +84,48 @@ type ImagePoolSelectionOptions = {
   models: { id: string; label: string; channel_ids: number[] }[]
   channels: { id: number; name: string }[]
 }
-const RUNTIME_FIELDS = [
-  { key: 'worker_concurrency', label: 'Workers' },
-  { key: 'image_concurrency', label: 'Image concurrency' },
-  { key: 'worker_lease_seconds', label: 'Lease duration (seconds)' },
-  { key: 'execution_timeout_seconds', label: 'Execution timeout (seconds)' },
+type RuntimeField = {
+  key: string
+  label: string
+  min?: number
+  max?: number
+}
+const RUNTIME_FIELDS: readonly RuntimeField[] = [
+  { key: 'worker_concurrency', label: 'Workers', min: 1 },
+  { key: 'image_concurrency', label: 'Image concurrency', min: 1 },
+  {
+    key: 'max_reference_images',
+    label: 'Maximum reference images',
+    min: 1,
+    max: 128,
+  },
+  {
+    key: 'worker_lease_seconds',
+    label: 'Lease duration (seconds)',
+    min: 1,
+  },
+  {
+    key: 'execution_timeout_seconds',
+    label: 'Execution timeout (seconds)',
+    min: 1,
+  },
   {
     key: 'account_attempt_timeout_seconds',
     label: 'Attempt timeout (seconds)',
+    min: 1,
   },
-  { key: 'signed_url_expiry_seconds', label: 'Signed URL lifetime (seconds)' },
-  { key: 'input_retention_hours', label: 'Input retention (hours)' },
-  { key: 'task_retention_days', label: 'Task retention (days)' },
-  { key: 'result_retention_days', label: 'Result retention (days)' },
-  { key: 'reference_fetch_max_retries', label: 'Reference retries' },
-  { key: 'storage_retry_attempts', label: 'Storage retries' },
-  { key: 'billing_retry_attempts', label: 'Billing retries' },
-] as const
+  {
+    key: 'signed_url_expiry_seconds',
+    label: 'Signed URL lifetime (seconds)',
+    min: 1,
+  },
+  { key: 'input_retention_hours', label: 'Input retention (hours)', min: 1 },
+  { key: 'task_retention_days', label: 'Task retention (days)', min: 1 },
+  { key: 'result_retention_days', label: 'Result retention (days)', min: 1 },
+  { key: 'reference_fetch_max_retries', label: 'Reference retries', min: 0 },
+  { key: 'storage_retry_attempts', label: 'Storage retries', min: 0 },
+  { key: 'billing_retry_attempts', label: 'Billing retries', min: 0 },
+]
 
 export function ImageSettings() {
   const { t } = useTranslation()
@@ -176,7 +201,7 @@ export function ImageSettings() {
   )
 }
 
-function ImageRuntimeForm({
+export function ImageRuntimeForm({
   initial,
   onSuccess,
 }: {
@@ -246,15 +271,14 @@ function ImageRuntimeForm({
           ))}
         </div>
         <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
-          {RUNTIME_FIELDS.map(({ key, label }) => (
+          {RUNTIME_FIELDS.map(({ key, label, min, max }) => (
             <div key={key} className='space-y-2'>
               <Label htmlFor={key}>{t(label)}</Label>
               <Input
                 id={key}
                 type='number'
-                min={
-                  key.includes('retries') || key.includes('attempts') ? 0 : 1
-                }
+                min={min}
+                max={max}
                 value={Number(values[key])}
                 onChange={(event) => {
                   setValues((previous) => ({
