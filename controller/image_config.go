@@ -51,6 +51,21 @@ func GetImageConfiguration(c *gin.Context) {
 	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}})
 }
 
+func GetImageChannelPoolOptions(c *gin.Context) {
+	group := c.Query("group")
+	platform := c.Query("platform")
+	if strings.TrimSpace(group) == "" || len(group) > 64 || !service.RegisteredMediaProvider(platform) {
+		imageManagementError(c, 400, errors.New("Invalid image channel pool selection"))
+		return
+	}
+	options, err := service.GetImagePoolSelectionOptions(c.Request.Context(), group, platform)
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	imageManagementData(c, options)
+}
+
 func UpdateImageRuntime(c *gin.Context) {
 	var cfg service.ImageRuntimeConfig
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &cfg); err != nil {
@@ -183,6 +198,41 @@ func SaveImageChannelPool(c *gin.Context) {
 		}
 		seen[channel.Id] = true
 		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution, ChannelId: channel.Id, Priority: channel.Priority})
+	}
+	if input.Mode != "resolution" || len(input.Channels) > 0 {
+		options, err := service.GetImagePoolSelectionOptions(c.Request.Context(), input.Group, input.Platform)
+		if err != nil {
+			imageManagementError(c, 503, err)
+			return
+		}
+		eligible := make(map[int]bool)
+		if input.Mode == "resolution" {
+			for _, channel := range options.Channels {
+				eligible[channel.Id] = true
+			}
+		} else {
+			modelAvailable := false
+			for _, modelOption := range options.Models {
+				if modelOption.Id != input.Model {
+					continue
+				}
+				modelAvailable = true
+				for _, channelId := range modelOption.ChannelIds {
+					eligible[channelId] = true
+				}
+				break
+			}
+			if !modelAvailable {
+				imageManagementError(c, 400, errors.New("Pool model is not enabled for the selected group and platform"))
+				return
+			}
+		}
+		for _, channel := range input.Channels {
+			if !eligible[channel.Id] {
+				imageManagementError(c, 400, errors.New("Pool channel is not enabled for the selected group, platform, and model"))
+				return
+			}
+		}
 	}
 	// An explicit empty binding remains closed rather than losing its identity.
 	if len(rows) == 0 {

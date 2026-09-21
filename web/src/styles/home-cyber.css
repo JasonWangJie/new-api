@@ -88,14 +88,54 @@ For commercial licensing, please contact support@quantumnous.com
   content: '';
   position: absolute;
   inset: 0;
-  z-index: -1;
+  z-index: 0;
   background:
     radial-gradient(ellipse at 76% 50%, #234c3030, transparent 55%),
     linear-gradient(90deg, #080c0e, transparent 80%),
     repeating-linear-gradient(0deg, transparent 0 79px, #91a59b08 80px),
     repeating-linear-gradient(90deg, transparent 0 79px, #91a59b08 80px);
+  animation: cyber-grid-pan 28s linear infinite;
+}
+.cyber-hero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    #c4f76a22 46%,
+    #66e5d555 50%,
+    transparent 54%
+  );
+  background-size: 100% 240%;
+  animation: cyber-hero-scan 7.5s linear infinite;
+}
+.cyber-hero-dust {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.7;
+  background-image:
+    radial-gradient(circle, #c4f76acc 0 1px, transparent 1.8px),
+    radial-gradient(circle, #66e5d5bb 0 1.2px, transparent 2px),
+    radial-gradient(circle, #e8ffc599 0 1px, transparent 1.6px);
+  background-size:
+    72px 96px,
+    110px 84px,
+    54px 128px;
+  background-position:
+    12px 20px,
+    70px 40px,
+    30px 8px;
+  mask-image: linear-gradient(#000 0%, #000 72%, transparent 96%);
+  animation: cyber-dust 18s linear infinite;
 }
 .cyber-hero-grid {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: 1.04fr 1fr;
   align-items: center;
@@ -108,11 +148,20 @@ For commercial licensing, please contact support@quantumnous.com
   padding-block: 32px 52px;
 }
 .cyber-signal {
+  position: relative;
   width: 6px;
   height: 6px;
   background: var(--cyber-acid);
   box-shadow: 0 0 12px #c4f76a90;
   border-radius: 50%;
+}
+.cyber-signal::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border: 1px solid #c4f76a;
+  border-radius: 50%;
+  animation: cyber-ping 2.4s ease-out infinite;
 }
 .cyber-hero h1 {
   margin-block: 26px;
@@ -286,6 +335,51 @@ For commercial licensing, please contact support@quantumnous.com
 .cyber-network-ring-outer {
   stroke: #c4f76a14;
   stroke-dasharray: 2 6;
+  animation: cyber-ring-spin 22s linear infinite;
+}
+.cyber-network::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 78%;
+  aspect-ratio: 1;
+  margin-left: -39%;
+  margin-top: -39%;
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0 72%,
+    #66e5d514 86%,
+    #c4f76a38 96%,
+    transparent 100%
+  );
+  mask-image: radial-gradient(
+    circle,
+    transparent 34%,
+    #000 48%,
+    #000 72%,
+    transparent 78%
+  );
+  animation: cyber-radar 7s linear infinite;
+}
+.cyber-network::after {
+  content: '';
+  position: absolute;
+  inset: 1.5% 0.5%;
+  z-index: 1;
+  pointer-events: none;
+  background:
+    linear-gradient(#c4f76a, #c4f76a) left top / 16px 1px no-repeat,
+    linear-gradient(#c4f76a, #c4f76a) left top / 1px 16px no-repeat,
+    linear-gradient(#66e5d5, #66e5d5) right top / 16px 1px no-repeat,
+    linear-gradient(#66e5d5, #66e5d5) right top / 1px 16px no-repeat,
+    linear-gradient(#c4f76a, #c4f76a) left bottom / 16px 1px no-repeat,
+    linear-gradient(#c4f76a, #c4f76a) left bottom / 1px 16px no-repeat,
+    linear-gradient(#66e5d5, #66e5d5) right bottom / 16px 1px no-repeat,
+    linear-gradient(#66e5d5, #66e5d5) right bottom / 1px 16px no-repeat;
+  animation: cyber-hud-blink 4.8s ease-in-out infinite;
 }
 .cyber-orbit {
   position: absolute;
@@ -350,6 +444,21 @@ For commercial licensing, please contact support@quantumnous.com
     0 0 0 8px #c4f76a05,
     0 0 75px #c4f76a19,
     inset 0 0 30px #c4f76a08;
+  z-index: 2;
+}
+.cyber-core::before,
+.cyber-core::after {
+  content: '';
+  position: absolute;
+  inset: -6%;
+  z-index: -1;
+  border: 1px solid #c4f76a66;
+  border-radius: 28%;
+  pointer-events: none;
+  animation: cyber-core-pulse 3.8s ease-out infinite;
+}
+.cyber-core::after {
+  animation-delay: -1.9s;
 }
 .cyber-core > svg {
   width: 28%;
@@ -404,6 +513,23 @@ For commercial licensing, please contact support@quantumnous.com
   font-size: 12px;
   box-shadow: 0 8px 30px #0005;
   white-space: nowrap;
+  z-index: 2;
+  animation: cyber-node-float 6.5s ease-in-out infinite;
+}
+.cyber-node-claude {
+  animation-delay: -1.4s;
+}
+.cyber-node-gemini {
+  animation-delay: -2.8s;
+}
+.cyber-node-image {
+  animation-delay: -4.1s;
+}
+.cyber-node-audio {
+  animation-delay: -2.2s;
+}
+.cyber-node-models {
+  animation-delay: -5.2s;
 }
 .cyber-node small {
   display: block;
@@ -491,8 +617,22 @@ For commercial licensing, please contact support@quantumnous.com
   gap: 7px;
 }
 .cyber-integrations {
+  position: relative;
+  overflow: hidden;
   border-bottom: 1px solid var(--cyber-line);
   background: #0c1211;
+}
+.cyber-integrations::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 22%;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, #c4f76a16, transparent);
+  transform: translateX(-130%);
+  animation: cyber-edge-sweep 7.5s linear infinite;
 }
 .cyber-integrations-inner {
   display: flex;
@@ -826,6 +966,16 @@ For commercial licensing, please contact support@quantumnous.com
   padding: 6px 10px;
   border-radius: 4px;
   color: #b3c4b4;
+  animation: cyber-tag-glow 5.2s ease-in-out infinite;
+}
+.cyber-protocol-tags span:nth-child(2) {
+  animation-delay: -1.3s;
+}
+.cyber-protocol-tags span:nth-child(3) {
+  animation-delay: -2.6s;
+}
+.cyber-protocol-tags span:nth-child(4) {
+  animation-delay: -3.9s;
 }
 .cyber-protocol-demo {
   min-width: 0;
@@ -872,17 +1022,38 @@ For commercial licensing, please contact support@quantumnous.com
   font-size: 10px;
 }
 .cyber-launch-decoration > span {
+  position: relative;
   width: 6px;
   height: 6px;
   background: var(--cyber-acid);
   border-radius: 50%;
 }
+.cyber-launch-decoration > span::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border: 1px solid #c4f76a;
+  border-radius: 50%;
+  animation: cyber-ping 2.8s ease-out infinite;
+}
 .cyber-steps {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 40px;
   border-top: 1px solid var(--cyber-line);
   padding-top: 28px;
+}
+.cyber-steps::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 0;
+  width: 16%;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, #c4f76a, transparent);
+  animation: cyber-step-trace 5.5s linear infinite;
 }
 .cyber-step {
   display: flex;
@@ -940,6 +1111,7 @@ For commercial licensing, please contact support@quantumnous.com
     repeating-linear-gradient(0deg, transparent 0 35px, #c4f76a18 36px),
     repeating-linear-gradient(90deg, transparent 0 35px, #c4f76a18 36px);
   mask-image: linear-gradient(90deg, transparent, #000);
+  animation: cyber-grid-drift 14s linear infinite;
 }
 .cyber-cta h2 {
   margin-top: 16px;
@@ -979,14 +1151,33 @@ For commercial licensing, please contact support@quantumnous.com
 .cyber-landing[data-motion='paused']
   :is(
     .cyber-hero-entry,
+    .cyber-hero-dust,
     .cyber-data-line,
     .cyber-orbit,
+    .cyber-node,
     .cyber-core-bars i,
+    .cyber-network-ring-outer,
     .cyber-title-accent,
     .cyber-capability-border,
     .cyber-capability-scan,
-    .cyber-capability-art span
+    .cyber-capability-art span,
+    .cyber-protocol-tags span,
+    .cyber-cta-grid
   ),
+.cyber-landing[data-motion='paused']
+  :is(
+    .cyber-hero,
+    .cyber-network,
+    .cyber-core,
+    .cyber-signal,
+    .cyber-integrations,
+    .cyber-steps,
+    .cyber-launch-decoration > span,
+    .cyber-title-accent
+  )::before,
+.cyber-landing[data-motion='paused']
+  :is(.cyber-hero, .cyber-network, .cyber-core, .cyber-signal)::after,
+.cyber-landing[data-motion='paused'] .cyber-launch-decoration > span::after,
 .cyber-landing[data-motion='paused'] .cyber-title-accent::after {
   animation-play-state: paused;
 }
@@ -1083,6 +1274,123 @@ For commercial licensing, please contact support@quantumnous.com
 @keyframes cyber-control-satellite {
   to {
     transform: rotate(405deg) translateX(48px);
+  }
+}
+@keyframes cyber-grid-pan {
+  from {
+    background-position:
+      76% 50%,
+      0 0,
+      0 0,
+      0 0;
+  }
+  to {
+    background-position:
+      68% 42%,
+      0 0,
+      0 80px,
+      80px 0;
+  }
+}
+@keyframes cyber-hero-scan {
+  from {
+    background-position: 0 -70%;
+  }
+  to {
+    background-position: 0 170%;
+  }
+}
+@keyframes cyber-dust {
+  to {
+    background-position:
+      12px -148px,
+      70px 182px,
+      30px -212px;
+  }
+}
+@keyframes cyber-ping {
+  from {
+    transform: scale(0.55);
+    opacity: 0.75;
+  }
+  to {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+@keyframes cyber-radar {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes cyber-ring-spin {
+  to {
+    stroke-dashoffset: -160;
+  }
+}
+@keyframes cyber-hud-blink {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+@keyframes cyber-core-pulse {
+  from {
+    transform: scale(0.9);
+    opacity: 0.7;
+  }
+  to {
+    transform: scale(1.7);
+    opacity: 0;
+  }
+}
+@keyframes cyber-node-float {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 -7px;
+  }
+}
+@keyframes cyber-edge-sweep {
+  from {
+    transform: translateX(-140%);
+  }
+  to {
+    transform: translateX(520%);
+  }
+}
+@keyframes cyber-tag-glow {
+  0%,
+  68%,
+  100% {
+    border-color: #324236;
+    color: #b3c4b4;
+    box-shadow: none;
+  }
+  34% {
+    border-color: #c4f76a99;
+    color: #e7ffc4;
+    box-shadow: 0 0 16px #c4f76a33;
+  }
+}
+@keyframes cyber-step-trace {
+  from {
+    transform: translateX(-30%);
+  }
+  to {
+    transform: translateX(620%);
+  }
+}
+@keyframes cyber-grid-drift {
+  to {
+    background-position:
+      0 36px,
+      36px 0;
   }
 }
 @media (min-width: 1600px) {

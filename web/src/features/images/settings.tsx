@@ -17,13 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { StaticDataTable } from '@/components/data-table'
+import { MultiSelect } from '@/components/multi-select'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Combobox } from '@/components/ui/combobox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -77,6 +79,10 @@ type ImageChannelPool = {
   resolution: string
   channel_id: number
   priority: number
+}
+type ImagePoolSelectionOptions = {
+  models: { id: string; label: string; channel_ids: number[] }[]
+  channels: { id: number; name: string }[]
 }
 const RUNTIME_FIELDS = [
   { key: 'worker_concurrency', label: 'Workers' },
@@ -711,7 +717,7 @@ function ImagePolicyForm({
   )
 }
 
-function ImagePoolForm({
+export function ImagePoolForm({
   config,
   onSuccess,
 }: {
@@ -724,15 +730,67 @@ function ImagePoolForm({
   const [mode, setMode] = useState('resolution')
   const [model, setModel] = useState('')
   const [resolution, setResolution] = useState('1K')
-  const [channels, setChannels] = useState('')
+  const [channelIds, setChannelIds] = useState<number[]>([])
   const [priorities, setPriorities] = useState<Record<number, number>>({})
   const [busy, setBusy] = useState(false)
-  const channelIds = channels.trim()
-    ? channels
-        .split(',')
-        .map((id) => Number(id.trim()))
-        .filter((id) => Number.isInteger(id) && id > 0)
-    : []
+  const poolOptions = useQuery({
+    queryKey: ['image-pool-options', group, platform],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams({ group, platform })
+      return imageRequest<ImagePoolSelectionOptions>(
+        `/api/option/images/pool/options?${params}`,
+        'GET',
+        undefined,
+        signal
+      )
+    },
+    enabled: group.trim().length > 0 && platform.length > 0,
+  })
+  const modelOptions = useMemo(() => {
+    const options = (poolOptions.data?.models || []).map((item) => ({
+      value: item.id,
+      label: item.label,
+    }))
+    if (model && !options.some((option) => option.value === model)) {
+      options.push({ value: model, label: `${model} · ${t('Unavailable')}` })
+    }
+    return options
+  }, [model, poolOptions.data?.models, t])
+  const availableModelIdSet = useMemo(
+    () => new Set((poolOptions.data?.models || []).map((item) => item.id)),
+    [poolOptions.data?.models]
+  )
+  const availableChannelIds = useMemo(() => {
+    if (mode === 'resolution') {
+      return (poolOptions.data?.channels || []).map((channel) => channel.id)
+    }
+    return (
+      poolOptions.data?.models.find((item) => item.id === model)?.channel_ids ||
+      []
+    )
+  }, [mode, model, poolOptions.data])
+  const availableChannelIdSet = useMemo(
+    () => new Set(availableChannelIds),
+    [availableChannelIds]
+  )
+  const channelOptions = useMemo(() => {
+    const channelsById = new Map(
+      (poolOptions.data?.channels || []).map((channel) => [channel.id, channel])
+    )
+    const ids = new Set(availableChannelIds)
+    for (const channelId of channelIds) {
+      ids.add(channelId)
+    }
+    return [...ids].map((channelId) => {
+      const channel = channelsById.get(channelId)
+      return {
+        value: String(channelId),
+        label: channel
+          ? `#${channelId} · ${channel.name}`
+          : `#${channelId} · ${t('Unavailable')}`,
+      }
+    })
+  }, [availableChannelIds, channelIds, poolOptions.data?.channels, t])
   const bindings = [
     ...new Set(config?.pools.map((pool) => pool.binding_key) || []),
   ].flatMap((key) => {
@@ -744,10 +802,15 @@ function ImagePoolForm({
   const save = async () => {
     setBusy(true)
     try {
-      const ids = channels.trim()
-        ? channels.split(',').map((id) => Number(id.trim()))
-        : []
-      if (ids.some((id) => !Number.isInteger(id) || id < 1)) {
+      if (mode !== 'resolution' && !model) {
+        throw new Error(t('Model name is required'))
+      }
+      if (mode !== 'resolution' && !availableModelIdSet.has(model)) {
+        throw new Error(
+          t('A selected model no longer exists. Reload the model list.')
+        )
+      }
+      if (channelIds.some((id) => !availableChannelIdSet.has(id))) {
         throw new Error(t('Invalid channel IDs'))
       }
       await imageRequest('/api/option/images/pool', 'PUT', {
@@ -756,7 +819,10 @@ function ImagePoolForm({
         mode,
         model: mode === 'resolution' ? '' : model,
         resolution: mode === 'model' ? '' : resolution,
-        channels: ids.map((id) => ({ id, priority: priorities[id] || 0 })),
+        channels: channelIds.map((id) => ({
+          id,
+          priority: priorities[id] || 0,
+        })),
       })
       await onSuccess()
       toast.success(t('Saved'))
@@ -787,7 +853,12 @@ function ImagePoolForm({
           <Input
             id='pool-group'
             value={group}
-            onChange={(event) => setGroup(event.target.value)}
+            onChange={(event) => {
+              setGroup(event.target.value)
+              setModel('')
+              setChannelIds([])
+              setPriorities({})
+            }}
           />
         </div>
         <ImageSelect
@@ -800,7 +871,12 @@ function ImagePoolForm({
             value,
             label: value,
           }))}
-          onChange={setPlatform}
+          onChange={(value) => {
+            setPlatform(value)
+            setModel('')
+            setChannelIds([])
+            setPriorities({})
+          }}
         />
         <ImageSelect
           label={t('Pool binding')}
@@ -809,15 +885,31 @@ function ImagePoolForm({
             value,
             label: t(imageLabel(value)),
           }))}
-          onChange={setMode}
+          onChange={(value) => {
+            setMode(value)
+            if (value === 'resolution') setModel('')
+            setChannelIds([])
+            setPriorities({})
+          }}
         />
         {mode !== 'resolution' && (
           <div className='space-y-2'>
             <Label htmlFor='pool-model'>{t('Model')}</Label>
-            <Input
+            <Combobox
               id='pool-model'
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
+              options={modelOptions}
+              value={model || null}
+              onValueChange={(value) => {
+                setModel(value || '')
+                setChannelIds([])
+                setPriorities({})
+              }}
+              placeholder={
+                poolOptions.isLoading ? t('Loading...') : t('Select model')
+              }
+              emptyText={t('No available models')}
+              disabled={poolOptions.isLoading || poolOptions.isError}
+              className='w-full'
             />
           </div>
         )}
@@ -833,15 +925,34 @@ function ImagePoolForm({
           />
         )}
         <div className='space-y-2'>
-          <Label htmlFor='pool-channels'>
-            {t('Channel IDs, separated by commas')}
-          </Label>
-          <Input
+          <Label htmlFor='pool-channels'>{t('Channels')}</Label>
+          <MultiSelect
             id='pool-channels'
-            value={channels}
-            onChange={(event) => setChannels(event.target.value)}
+            options={channelOptions}
+            selected={channelIds.map(String)}
+            onChange={(values) => {
+              const ids = values.map(Number)
+              setChannelIds(ids)
+              setPriorities((previous) =>
+                Object.fromEntries(ids.map((id) => [id, previous[id] || 0]))
+              )
+            }}
+            placeholder={
+              poolOptions.isLoading ? t('Loading...') : t('Channels')
+            }
+            emptyText={t('No available channels')}
+            disabled={
+              poolOptions.isLoading ||
+              poolOptions.isError ||
+              (mode !== 'resolution' && !model)
+            }
           />
         </div>
+        {poolOptions.isError && (
+          <p className='text-destructive text-sm sm:col-span-2' role='alert'>
+            {poolOptions.error.message}
+          </p>
+        )}
         <div className='sm:col-span-2'>
           {channelIds.length > 0 && (
             <StaticDataTable
@@ -871,7 +982,15 @@ function ImagePoolForm({
               ]}
             />
           )}
-          <Button disabled={busy} type='submit'>
+          <Button
+            disabled={
+              busy ||
+              poolOptions.isLoading ||
+              poolOptions.isError ||
+              !group.trim()
+            }
+            type='submit'
+          >
             {t('Save')}
           </Button>
         </div>
@@ -923,9 +1042,7 @@ function ImagePoolForm({
                   setMode(binding.mode)
                   setModel(binding.model)
                   setResolution(binding.resolution || '1K')
-                  setChannels(
-                    binding.channels.map((row) => row.channel_id).join(',')
-                  )
+                  setChannelIds(binding.channels.map((row) => row.channel_id))
                   setPriorities(
                     Object.fromEntries(
                       binding.channels.map((row) => [

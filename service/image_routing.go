@@ -24,6 +24,119 @@ func ImageChannelSupportsPlatform(channel model.Channel, modelName, platform str
 	return capability.Generate && (platform == "openai" && capability.Protocol == "openai_images" || capability.Provider == platform)
 }
 
+type ImagePoolChannelOption struct {
+	Id   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type ImagePoolModelOption struct {
+	Id         string `json:"id"`
+	Label      string `json:"label"`
+	ChannelIds []int  `json:"channel_ids"`
+}
+
+type ImagePoolSelectionOptions struct {
+	Models   []ImagePoolModelOption   `json:"models"`
+	Channels []ImagePoolChannelOption `json:"channels"`
+}
+
+// GetImagePoolSelectionOptions returns only executable model/channel choices
+// for a configured group and media platform. A saved policy catalog limits the
+// selectable models; without one, enabled channel abilities form the catalog.
+func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (ImagePoolSelectionOptions, error) {
+	options := ImagePoolSelectionOptions{
+		Models:   make([]ImagePoolModelOption, 0),
+		Channels: make([]ImagePoolChannelOption, 0),
+	}
+	var abilities []model.Ability
+	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": group, "enabled": true}).Find(&abilities).Error; err != nil {
+		return options, err
+	}
+
+	labels := make(map[string]string)
+	configuredModels := make([]string, 0)
+	var policies []model.ImageGroupPolicy
+	if err := model.DB.WithContext(ctx).Where("policy_key = ?", ImageIdentityHash(group, platform)).Limit(1).Find(&policies).Error; err != nil {
+		return options, err
+	}
+	if len(policies) > 0 {
+		var catalog []ImageModelCapability
+		if err := common.UnmarshalJsonStr(policies[0].Models, &catalog); err != nil {
+			return options, err
+		}
+		for _, capability := range catalog {
+			configuredModels = append(configuredModels, capability.Id)
+			labels[capability.Id] = capability.Label
+		}
+	}
+
+	abilityChannels := make(map[string][]int)
+	channelIdSet := make(map[int]bool)
+	for _, ability := range abilities {
+		abilityChannels[ability.Model] = append(abilityChannels[ability.Model], ability.ChannelId)
+		channelIdSet[ability.ChannelId] = true
+	}
+	if len(policies) == 0 {
+		for modelName := range abilityChannels {
+			configuredModels = append(configuredModels, modelName)
+			labels[modelName] = modelName
+		}
+	}
+
+	channelIds := make([]int, 0, len(channelIdSet))
+	for channelId := range channelIdSet {
+		channelIds = append(channelIds, channelId)
+	}
+	var channels []model.Channel
+	if len(channelIds) > 0 {
+		if err := model.DB.WithContext(ctx).Where("id IN ? AND status = ?", channelIds, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+			return options, err
+		}
+	}
+	channelsById := make(map[int]*model.Channel, len(channels))
+	for i := range channels {
+		channelsById[channels[i].Id] = &channels[i]
+	}
+
+	slices.Sort(configuredModels)
+	selectedChannels := make(map[int]bool)
+	for _, modelName := range configuredModels {
+		ids := slices.Clone(abilityChannels[modelName])
+		routingModel := ratio_setting.RoutingMatchModelName(modelName)
+		if MediaPlatformSupportsVideoModel(modelName, platform) {
+			ids = append(ids, abilityChannels[routingModel]...)
+		} else if len(ids) == 0 {
+			ids = abilityChannels[routingModel]
+		}
+		modelChannels := make([]int, 0, len(ids))
+		seen := make(map[int]bool)
+		for _, channelId := range ids {
+			channel := channelsById[channelId]
+			if seen[channelId] || !MediaChannelSupportsPlatform(channel, modelName, platform) {
+				continue
+			}
+			seen[channelId] = true
+			selectedChannels[channelId] = true
+			modelChannels = append(modelChannels, channelId)
+		}
+		if len(modelChannels) == 0 {
+			continue
+		}
+		slices.Sort(modelChannels)
+		label := labels[modelName]
+		if label == "" {
+			label = modelName
+		}
+		options.Models = append(options.Models, ImagePoolModelOption{Id: modelName, Label: label, ChannelIds: modelChannels})
+	}
+	for channelId := range selectedChannels {
+		channel := channelsById[channelId]
+		options.Channels = append(options.Channels, ImagePoolChannelOption{Id: channel.Id, Name: channel.Name})
+	}
+	slices.SortFunc(options.Channels, func(a, b ImagePoolChannelOption) int { return cmp.Compare(a.Id, b.Id) })
+	return options, nil
+}
+
 func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution string) string {
 	if policy.PoolMode == "resolution" {
 		modelName = ""

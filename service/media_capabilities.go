@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
+	gatewaydto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -78,6 +79,50 @@ func RegisteredMediaProviders() []string {
 
 func RegisteredMediaProvider(provider string) bool {
 	return slices.Contains(RegisteredMediaProviders(), provider)
+}
+
+// MediaChannelSupportsPlatform reports whether a channel can execute the
+// selected image provider/protocol family or video task-plugin provider.
+func MediaChannelSupportsPlatform(channel *model.Channel, modelName, platform string) bool {
+	if channel == nil {
+		return false
+	}
+	if ImageChannelSupportsPlatform(*channel, modelName, platform) {
+		return true
+	}
+	for _, candidate := range mediaVideoCandidates(modelName) {
+		if candidate.Plugin == nil || candidate.Protocol != "openai_video" || candidate.Plugin.Meta.Key != platform {
+			continue
+		}
+		filter := gatewaydto.ChannelFilter{
+			Kind:                   gatewaydto.FilterTaskPluginIdentity,
+			TaskPluginKey:          platform,
+			TaskPluginChannelTypes: candidate.Plugin.Meta.ChannelTypes,
+		}
+		if matches, _ := model.ChannelSatisfiesFilters(channel, modelName, []gatewaydto.ChannelFilter{filter}); matches {
+			return true
+		}
+	}
+	return false
+}
+
+// MediaPlatformSupportsVideoModel reports whether a registered task plugin
+// exposes the model through the host-owned OpenAI video protocol.
+func MediaPlatformSupportsVideoModel(modelName, platform string) bool {
+	return slices.ContainsFunc(mediaVideoCandidates(modelName), func(candidate jsplugin.ProtocolBinding) bool {
+		return candidate.Plugin != nil && candidate.Protocol == "openai_video" && candidate.Plugin.Meta.Key == platform
+	})
+}
+
+func mediaVideoCandidates(modelName string) []jsplugin.ProtocolBinding {
+	generation := jsplugin.DefaultRegistry.Generation()
+	candidates := generation.LookupEndpointCandidates("POST", "/v1/videos", modelName)
+	if len(candidates) == 0 {
+		if alias, ok := model.ResolveTaskModelAlias(generation, modelName); ok {
+			candidates = generation.LookupEndpointCandidates("POST", "/v1/videos", alias.Declared)
+		}
+	}
+	return candidates
 }
 
 func VideoPoolResolution(size string) string {

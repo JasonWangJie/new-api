@@ -117,6 +117,7 @@ export function CyberLanding(props: CyberLandingProps) {
       data-motion={motionPaused ? 'paused' : 'running'}
     >
       <section className='cyber-hero' aria-labelledby='cyber-hero-title'>
+        <div className='cyber-hero-dust' aria-hidden />
         <div className='cyber-hero-grid cyber-shell'>
           <div className='cyber-hero-copy'>
             <div className='cyber-kicker cyber-hero-entry'>

@@ -120,6 +120,18 @@ describe('cyber landing interactions', () => {
     ).toHaveAttribute('aria-pressed', 'false')
   })
 
+  it('keeps the added hero motion out of the accessibility tree', async () => {
+    await renderLanding()
+    const dust = document.querySelector('.cyber-hero-dust')
+    expect(dust).toHaveAttribute('aria-hidden', 'true')
+    expect(dust).toBeEmptyDOMElement()
+    expect(
+      screen.getByRole('img', {
+        name: 'Unified AI gateway network illustration',
+      })
+    ).toBeVisible()
+  })
+
   it('routes a visitor to registration from the main entry point', async () => {
     const user = userEvent.setup()
     await renderLanding()
