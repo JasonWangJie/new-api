@@ -23,21 +23,34 @@ import {
   StaggerContainer,
   StaggerItem,
 } from '@/components/page-transition'
-import { CARD_ITEM_VARIANTS, CARD_STAGGER_VARIANTS } from '@/lib/motion'
+import { MOTION_TRANSITION } from '@/lib/motion'
 
 import { AuthLayout } from '../auth-layout'
 import { AuthPageHeader } from '../components/auth-page-header'
 import { ForgotPasswordForm } from './components/forgot-password-form'
 
+const AUTH_STAGGER = {
+  initial: {},
+  animate: { transition: { staggerChildren: 0.12, delayChildren: 0.28 } },
+}
+
+const AUTH_ITEM = {
+  initial: { opacity: 0, y: 22, scale: 0.97, filter: 'blur(6px)' },
+  animate: {
+    opacity: 1,
+    y: 0,
+    scale: 1,
+    filter: 'blur(0px)',
+    transition: MOTION_TRANSITION.slow,
+  },
+}
+
 export function ForgotPassword() {
   const { t } = useTranslation()
   return (
     <AuthLayout>
-      <StaggerContainer
-        className='w-full space-y-8'
-        variants={CARD_STAGGER_VARIANTS}
-      >
-        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+      <StaggerContainer className='w-full space-y-8' variants={AUTH_STAGGER}>
+        <StaggerItem variants={AUTH_ITEM}>
           <AuthPageHeader
             accentTitle
             title={t('Forgot password')}
@@ -58,7 +71,7 @@ export function ForgotPassword() {
           />
         </StaggerItem>
 
-        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+        <StaggerItem variants={AUTH_ITEM}>
           <ForgotPasswordForm className='space-y-0' />
         </StaggerItem>
       </StaggerContainer>

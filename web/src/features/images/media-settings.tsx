@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -65,8 +66,10 @@ function MediaSettingsForm(props: { initial: MediaSettings }) {
   const [values, setValues] = useState(props.initial)
   const save = useMutation({
     mutationFn: () => imageRequest('/api/option/images/media', 'PUT', values),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ['media-settings'] }),
+    onSuccess: () => {
+      toast.success(t('Saved'))
+      void queryClient.invalidateQueries({ queryKey: ['media-settings'] })
+    },
   })
   const fields: {
     key: keyof Omit<MediaSettings, 'video_async_enabled' | 'local_path'>

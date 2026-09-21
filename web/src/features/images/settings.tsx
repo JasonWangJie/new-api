@@ -33,6 +33,7 @@ import { hasPermission } from '@/lib/admin-permissions'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
+import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
 import { MediaSettingsCard } from './media-settings'
@@ -653,7 +654,10 @@ function ImagePolicyForm({
             </Label>
           </div>
         </div>
-        <Label htmlFor='image-model-catalog'>{t('Model capabilities')}</Label>
+        <div className='flex flex-wrap items-center justify-between gap-2'>
+          <Label htmlFor='image-model-catalog'>{t('Model capabilities')}</Label>
+          <ImagePolicyExampleDialog platform={platform} />
+        </div>
         <Textarea
           id='image-model-catalog'
           className='min-h-64 font-mono text-xs'

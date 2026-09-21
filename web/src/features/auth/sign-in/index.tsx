@@ -24,12 +24,28 @@ import {
   StaggerItem,
 } from '@/components/page-transition'
 import { useStatus } from '@/hooks/use-status'
-import { CARD_ITEM_VARIANTS, CARD_STAGGER_VARIANTS } from '@/lib/motion'
+import { MOTION_TRANSITION } from '@/lib/motion'
 
 import { AuthLayout } from '../auth-layout'
 import { AuthPageHeader } from '../components/auth-page-header'
 import { TermsFooter } from '../components/terms-footer'
 import { UserAuthForm } from './components/user-auth-form'
+
+const AUTH_STAGGER = {
+  initial: {},
+  animate: { transition: { staggerChildren: 0.12, delayChildren: 0.28 } },
+}
+
+const AUTH_ITEM = {
+  initial: { opacity: 0, y: 22, scale: 0.97, filter: 'blur(6px)' },
+  animate: {
+    opacity: 1,
+    y: 0,
+    scale: 1,
+    filter: 'blur(0px)',
+    transition: MOTION_TRANSITION.slow,
+  },
+}
 
 export function SignIn() {
   const { t } = useTranslation()
@@ -38,11 +54,8 @@ export function SignIn() {
 
   return (
     <AuthLayout>
-      <StaggerContainer
-        className='w-full space-y-8'
-        variants={CARD_STAGGER_VARIANTS}
-      >
-        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+      <StaggerContainer className='w-full space-y-8' variants={AUTH_STAGGER}>
+        <StaggerItem variants={AUTH_ITEM}>
           <AuthPageHeader
             accentTitle
             title={t('Sign in')}
@@ -59,11 +72,11 @@ export function SignIn() {
           />
         </StaggerItem>
 
-        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+        <StaggerItem variants={AUTH_ITEM}>
           <UserAuthForm redirectTo={redirect} />
         </StaggerItem>
 
-        <StaggerItem variants={CARD_ITEM_VARIANTS}>
+        <StaggerItem variants={AUTH_ITEM}>
           <TermsFooter
             variant='sign-in'
             status={status}

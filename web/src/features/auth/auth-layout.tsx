@@ -25,7 +25,7 @@ import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSystemConfig } from '@/hooks/use-system-config'
-import { MOTION_TRANSITION, MOTION_VARIANTS } from '@/lib/motion'
+import { MOTION_TRANSITION } from '@/lib/motion'
 
 import { AuthBackdrop } from './components/auth-backdrop'
 
@@ -33,6 +33,21 @@ import '@/styles/auth-cyber.css'
 
 type AuthLayoutProps = {
   children: React.ReactNode
+}
+
+const PANEL_ENTER = {
+  initial: { opacity: 0, y: 28, scale: 0.94, filter: 'blur(10px)' },
+  animate: { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' },
+}
+
+const HEADER_ENTER = {
+  initial: { opacity: 0, y: -16, filter: 'blur(6px)' },
+  animate: { opacity: 1, y: 0, filter: 'blur(0px)' },
+}
+
+const FOOTER_ENTER = {
+  initial: { opacity: 0, y: 12 },
+  animate: { opacity: 1, y: 0 },
 }
 
 export function AuthLayout({ children }: AuthLayoutProps) {
@@ -52,44 +67,87 @@ export function AuthLayout({ children }: AuthLayoutProps) {
     >
       <AuthBackdrop />
 
-      <header className='auth-cyber-header'>
-        <Link to='/' className='auth-cyber-brand'>
-          <div className='auth-cyber-brand-mark'>
-            {loading ? (
-              <Skeleton className='absolute inset-0 rounded-full' />
-            ) : (
-              <img src={logo} alt={t('Logo')} />
-            )}
-          </div>
-          <div className='auth-cyber-brand-copy'>
-            <span className='auth-cyber-brand-kicker'>
-              {t('Identity gateway')}
-            </span>
-            {loading ? (
-              <Skeleton className='h-6 w-28' />
-            ) : (
-              <span className='auth-cyber-brand-name'>{systemName}</span>
-            )}
-          </div>
-        </Link>
+      {shouldReduce ? (
+        <header className='auth-cyber-header'>
+          <Link to='/' className='auth-cyber-brand'>
+            <div className='auth-cyber-brand-mark'>
+              {loading ? (
+                <Skeleton className='absolute inset-0 rounded-full' />
+              ) : (
+                <img src={logo} alt={t('Logo')} />
+              )}
+            </div>
+            <div className='auth-cyber-brand-copy'>
+              <span className='auth-cyber-brand-kicker'>
+                {t('Identity gateway')}
+              </span>
+              {loading ? (
+                <Skeleton className='h-6 w-28' />
+              ) : (
+                <span className='auth-cyber-brand-name'>{systemName}</span>
+              )}
+            </div>
+          </Link>
 
-        <Button
-          type='button'
-          variant='ghost'
-          size='sm'
-          className='auth-cyber-motion-toggle'
-          aria-pressed={motionPaused}
-          aria-label={motionLabel}
-          onClick={() => setMotionPaused((paused) => !paused)}
+          <Button
+            type='button'
+            variant='ghost'
+            size='sm'
+            className='auth-cyber-motion-toggle'
+            aria-pressed={motionPaused}
+            aria-label={motionLabel}
+            onClick={() => setMotionPaused((paused) => !paused)}
+          >
+            <MotionIcon size={14} aria-hidden='true' />
+            <span className='hidden sm:inline'>{motionLabel}</span>
+          </Button>
+        </header>
+      ) : (
+        <motion.header
+          className='auth-cyber-header'
+          initial={HEADER_ENTER.initial}
+          animate={HEADER_ENTER.animate}
+          transition={{ ...MOTION_TRANSITION.slow, delay: 0.02 }}
         >
-          <MotionIcon size={14} aria-hidden='true' />
-          <span className='hidden sm:inline'>{motionLabel}</span>
-        </Button>
-      </header>
+          <Link to='/' className='auth-cyber-brand'>
+            <div className='auth-cyber-brand-mark'>
+              {loading ? (
+                <Skeleton className='absolute inset-0 rounded-full' />
+              ) : (
+                <img src={logo} alt={t('Logo')} />
+              )}
+            </div>
+            <div className='auth-cyber-brand-copy'>
+              <span className='auth-cyber-brand-kicker'>
+                {t('Identity gateway')}
+              </span>
+              {loading ? (
+                <Skeleton className='h-6 w-28' />
+              ) : (
+                <span className='auth-cyber-brand-name'>{systemName}</span>
+              )}
+            </div>
+          </Link>
+
+          <Button
+            type='button'
+            variant='ghost'
+            size='sm'
+            className='auth-cyber-motion-toggle'
+            aria-pressed={motionPaused}
+            aria-label={motionLabel}
+            onClick={() => setMotionPaused((paused) => !paused)}
+          >
+            <MotionIcon size={14} aria-hidden='true' />
+            <span className='hidden sm:inline'>{motionLabel}</span>
+          </Button>
+        </motion.header>
+      )}
 
       <main className='auth-cyber-main'>
         {shouldReduce ? (
           <div className='auth-cyber-panel'>
+            <div className='auth-cyber-panel-glow' aria-hidden='true' />
             <div className='auth-cyber-panel-corners' aria-hidden='true'>
               <span />
               <span />
@@ -101,10 +159,16 @@ export function AuthLayout({ children }: AuthLayoutProps) {
         ) : (
           <motion.div
             className='auth-cyber-panel'
-            initial={MOTION_VARIANTS.pageEnter.initial}
-            animate={MOTION_VARIANTS.pageEnter.animate}
-            transition={{ ...MOTION_TRANSITION.slow, delay: 0.08 }}
+            initial={PANEL_ENTER.initial}
+            animate={PANEL_ENTER.animate}
+            transition={{
+              type: 'spring',
+              stiffness: 120,
+              damping: 18,
+              delay: 0.12,
+            }}
           >
+            <div className='auth-cyber-panel-glow' aria-hidden='true' />
             <div className='auth-cyber-panel-corners' aria-hidden='true'>
               <span />
               <span />
@@ -116,12 +180,27 @@ export function AuthLayout({ children }: AuthLayoutProps) {
         )}
       </main>
 
-      <footer className='auth-cyber-footer' aria-hidden='true'>
-        <span className='auth-cyber-footer-live'>
-          {t('Secure channel online')}
-        </span>
-        <span>AUTH / TLS · GATEWAY</span>
-      </footer>
+      {shouldReduce ? (
+        <footer className='auth-cyber-footer' aria-hidden='true'>
+          <span className='auth-cyber-footer-live'>
+            {t('Secure channel online')}
+          </span>
+          <span className='auth-cyber-footer-code'>AUTH / TLS · GATEWAY</span>
+        </footer>
+      ) : (
+        <motion.footer
+          className='auth-cyber-footer'
+          aria-hidden='true'
+          initial={FOOTER_ENTER.initial}
+          animate={FOOTER_ENTER.animate}
+          transition={{ ...MOTION_TRANSITION.slow, delay: 0.35 }}
+        >
+          <span className='auth-cyber-footer-live'>
+            {t('Secure channel online')}
+          </span>
+          <span className='auth-cyber-footer-code'>AUTH / TLS · GATEWAY</span>
+        </motion.footer>
+      )}
     </div>
   )
 }

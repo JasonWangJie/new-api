@@ -92,6 +92,14 @@ describe('auth cyber layout', () => {
     expect(screen.getByText('Panel content')).toBeVisible()
     expect(document.querySelector('.auth-cyber-panel')).not.toBeNull()
     expect(document.querySelector('.auth-cyber-backdrop')).not.toBeNull()
+    expect(document.querySelector('.auth-cyber-radar')).not.toBeNull()
+    expect(document.querySelector('.auth-cyber-hex')).not.toBeNull()
+    expect(document.querySelectorAll('.auth-cyber-meteor').length).toBeGreaterThan(
+      0
+    )
+    expect(
+      document.querySelectorAll('.auth-cyber-rain-drop').length
+    ).toBeGreaterThan(0)
 
     const pause = screen.getByRole('button', { name: 'Pause animations' })
     expect(pause).toHaveAttribute('aria-pressed', 'false')

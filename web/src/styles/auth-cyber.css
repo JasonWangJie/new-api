@@ -75,13 +75,25 @@ For commercial licensing, please contact support@quantumnous.com
   position: absolute;
   inset: -20%;
   background:
-    linear-gradient(#91a59b12 1px, transparent 1px),
-    linear-gradient(90deg, #91a59b12 1px, transparent 1px);
+    linear-gradient(#91a59b18 1px, transparent 1px),
+    linear-gradient(90deg, #91a59b18 1px, transparent 1px);
   background-size: 64px 64px;
   transform: perspective(720px) rotateX(58deg) translateY(-12%);
   transform-origin: center top;
-  animation: auth-grid-drift 28s linear infinite;
+  animation:
+    auth-grid-drift 18s linear infinite,
+    auth-grid-pulse 5s ease-in-out infinite;
   mask-image: radial-gradient(ellipse at 50% 20%, #000 20%, transparent 72%);
+}
+
+.auth-cyber-hex {
+  position: absolute;
+  inset: 0;
+  opacity: 0.22;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='100' viewBox='0 0 56 100'%3E%3Cpath fill='none' stroke='%23c4f76a' stroke-opacity='0.22' stroke-width='0.8' d='M28 66L0 50L0 16L28 0L56 16L56 50L28 66L28 100'/%3E%3C/svg%3E");
+  background-size: 56px 100px;
+  animation: auth-hex-drift 40s linear infinite;
+  mask-image: radial-gradient(ellipse at 50% 45%, #000 10%, transparent 70%);
 }
 
 .auth-cyber-orb {
@@ -98,7 +110,7 @@ For commercial licensing, please contact support@quantumnous.com
   width: min(42vw, 380px);
   height: min(42vw, 380px);
   background: radial-gradient(circle, #c4f76a55 0%, transparent 68%);
-  animation: auth-orb-float 11s ease-in-out infinite;
+  animation: auth-orb-float 9s ease-in-out infinite;
 }
 
 .auth-cyber-orb-cyan {
@@ -107,7 +119,7 @@ For commercial licensing, please contact support@quantumnous.com
   width: min(48vw, 440px);
   height: min(48vw, 440px);
   background: radial-gradient(circle, #66e5d548 0%, transparent 70%);
-  animation: auth-orb-float 14s ease-in-out infinite reverse;
+  animation: auth-orb-float 12s ease-in-out infinite reverse;
 }
 
 .auth-cyber-orb-core {
@@ -116,7 +128,71 @@ For commercial licensing, please contact support@quantumnous.com
   width: min(28vw, 240px);
   height: min(28vw, 240px);
   background: radial-gradient(circle, #c4f76a22 0%, transparent 70%);
-  animation: auth-orb-pulse 5.5s ease-in-out infinite;
+  animation: auth-orb-pulse 4s ease-in-out infinite;
+}
+
+.auth-cyber-orb-side {
+  top: 62%;
+  left: 8%;
+  width: min(24vw, 200px);
+  height: min(24vw, 200px);
+  background: radial-gradient(circle, #66e5d530 0%, transparent 70%);
+  animation: auth-orb-float 15s ease-in-out infinite;
+  animation-delay: -3s;
+}
+
+.auth-cyber-radar {
+  position: absolute;
+  top: 58%;
+  left: 72%;
+  width: min(46vw, 360px);
+  height: min(46vw, 360px);
+  translate: -50% -50%;
+  opacity: 0.55;
+}
+
+.auth-cyber-radar-sweep {
+  position: absolute;
+  inset: 8%;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    #c4f76a00 220deg,
+    #c4f76a33 300deg,
+    #66e5d540 340deg,
+    transparent 360deg
+  );
+  animation: auth-radar-spin 5.5s linear infinite;
+}
+
+.auth-cyber-radar-ring {
+  position: absolute;
+  inset: 18%;
+  border: 1px solid #c4f76a22;
+  border-radius: 50%;
+  animation: auth-radar-pulse 3.2s ease-out infinite;
+}
+
+.auth-cyber-radar-ring-mid {
+  inset: 8%;
+  border-color: #66e5d520;
+  animation-delay: 0.7s;
+}
+
+.auth-cyber-radar-ring-outer {
+  inset: 0;
+  border-color: #91a59b18;
+  animation-delay: 1.4s;
+}
+
+.auth-cyber-radar-cross {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(#c4f76a18 1px, transparent 1px) center / 100% 1px no-repeat,
+    linear-gradient(90deg, #c4f76a18 1px, transparent 1px) center / 1px 100%
+      no-repeat;
 }
 
 .auth-cyber-rings {
@@ -131,9 +207,9 @@ For commercial licensing, please contact support@quantumnous.com
 .auth-cyber-ring {
   position: absolute;
   inset: 0;
-  border: 1px solid #c4f76a18;
+  border: 1px solid #c4f76a22;
   border-radius: 50%;
-  animation: auth-ring-spin 42s linear infinite;
+  animation: auth-ring-spin 28s linear infinite;
 }
 
 .auth-cyber-ring::before {
@@ -152,7 +228,7 @@ For commercial licensing, please contact support@quantumnous.com
 .auth-cyber-ring-two {
   inset: 11%;
   border-color: #66e5d522;
-  animation-duration: 28s;
+  animation-duration: 18s;
   animation-direction: reverse;
 }
 
@@ -163,14 +239,60 @@ For commercial licensing, please contact support@quantumnous.com
 
 .auth-cyber-ring-three {
   inset: 22%;
-  border-color: #91a59b14;
-  animation-duration: 36s;
+  border-color: #91a59b18;
+  animation-duration: 24s;
 }
 
 .auth-cyber-ring-three::before {
   width: 4px;
   height: 4px;
   background: #e3f5d2;
+}
+
+.auth-cyber-ring-four {
+  inset: 32%;
+  border: 1px dashed #c4f76a28;
+  animation-duration: 14s;
+  animation-direction: reverse;
+}
+
+.auth-cyber-ring-four::before {
+  width: 5px;
+  height: 5px;
+  background: #66e5d5;
+  box-shadow: 0 0 12px #66e5d580;
+}
+
+.auth-cyber-constellation {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.55;
+}
+
+.auth-cyber-constellation-path {
+  fill: none;
+  stroke: #c4f76a66;
+  stroke-width: 0.35;
+  stroke-dasharray: 8 10;
+  animation: auth-constellation-dash 8s linear infinite;
+}
+
+.auth-cyber-constellation-path-b {
+  stroke: #66e5d555;
+  animation-duration: 11s;
+  animation-direction: reverse;
+}
+
+.auth-cyber-constellation circle {
+  fill: #c4f76a;
+  animation: auth-constellation-blink 2.8s ease-in-out infinite;
+}
+
+.auth-cyber-constellation circle:nth-child(odd) {
+  fill: #66e5d5;
+  animation-delay: 0.8s;
 }
 
 .auth-cyber-beams {
@@ -186,11 +308,11 @@ For commercial licensing, please contact support@quantumnous.com
   background: linear-gradient(
     90deg,
     transparent,
-    #c4f76a33,
-    #66e5d540,
+    #c4f76a44,
+    #66e5d555,
     transparent
   );
-  animation: auth-beam-sweep 7.5s ease-in-out infinite;
+  animation: auth-beam-sweep 5.5s ease-in-out infinite;
 }
 
 .auth-cyber-beam:nth-child(1) {
@@ -199,13 +321,35 @@ For commercial licensing, please contact support@quantumnous.com
 }
 .auth-cyber-beam:nth-child(2) {
   top: 46%;
-  animation-delay: 2.4s;
-  opacity: 0.7;
+  animation-delay: 1.6s;
+  opacity: 0.8;
 }
 .auth-cyber-beam:nth-child(3) {
   top: 74%;
-  animation-delay: 4.2s;
-  opacity: 0.55;
+  animation-delay: 3.1s;
+  opacity: 0.65;
+}
+
+.auth-cyber-beam-vertical {
+  top: -10%;
+  left: 22%;
+  width: 1px;
+  height: 120%;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    #66e5d540,
+    #c4f76a44,
+    transparent
+  );
+  animation: auth-beam-vertical 6.5s ease-in-out infinite;
+}
+
+.auth-cyber-beam-vertical-b {
+  left: auto;
+  right: 18%;
+  animation-delay: 2.2s;
+  opacity: 0.7;
 }
 
 .auth-cyber-scan {
@@ -214,14 +358,105 @@ For commercial licensing, please contact support@quantumnous.com
   background: linear-gradient(
     180deg,
     transparent 0%,
-    #c4f76a10 48%,
-    #66e5d512 52%,
+    #c4f76a14 48%,
+    #66e5d518 52%,
     transparent 100%
   );
   background-size: 100% 220%;
-  animation: auth-scan 6.5s linear infinite;
+  animation: auth-scan 5s linear infinite;
   mix-blend-mode: screen;
-  opacity: 0.45;
+  opacity: 0.5;
+}
+
+.auth-cyber-scan-fast {
+  opacity: 0.28;
+  animation-duration: 2.8s;
+  animation-delay: 0.6s;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    #66e5d518 49%,
+    #c4f76a14 51%,
+    transparent 100%
+  );
+}
+
+.auth-cyber-rain {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.auth-cyber-rain-drop {
+  position: absolute;
+  top: -20%;
+  width: 1px;
+  height: 18%;
+  background: linear-gradient(180deg, transparent, #c4f76a66, transparent);
+  animation: auth-rain-fall linear infinite;
+  opacity: 0.55;
+}
+
+.auth-cyber-rain-drop:nth-child(even) {
+  background: linear-gradient(180deg, transparent, #66e5d566, transparent);
+}
+
+.auth-cyber-meteors {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.auth-cyber-meteor {
+  position: absolute;
+  left: -15%;
+  width: 90px;
+  height: 2px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, #c4f76acc, #66e5d5);
+  box-shadow: 0 0 12px #c4f76a66;
+  transform: rotate(18deg);
+  animation: auth-meteor-fly linear infinite;
+  opacity: 0;
+}
+
+.auth-cyber-hud {
+  position: absolute;
+  inset: 18px;
+}
+
+.auth-cyber-hud span {
+  position: absolute;
+  width: 42px;
+  height: 42px;
+  border-color: #c4f76a44;
+  border-style: solid;
+  opacity: 0.7;
+  animation: auth-hud-breathe 3.6s ease-in-out infinite;
+}
+
+.auth-cyber-hud span:nth-child(1) {
+  top: 0;
+  left: 0;
+  border-width: 2px 0 0 2px;
+}
+.auth-cyber-hud span:nth-child(2) {
+  top: 0;
+  right: 0;
+  border-width: 2px 2px 0 0;
+  animation-delay: 0.5s;
+}
+.auth-cyber-hud span:nth-child(3) {
+  bottom: 0;
+  left: 0;
+  border-width: 0 0 2px 2px;
+  animation-delay: 1s;
+}
+.auth-cyber-hud span:nth-child(4) {
+  right: 0;
+  bottom: 0;
+  border-width: 0 2px 2px 0;
+  animation-delay: 1.5s;
 }
 
 .auth-cyber-particles {
@@ -325,6 +560,12 @@ For commercial licensing, please contact support@quantumnous.com
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: #8fa49b;
+  background: linear-gradient(90deg, #8fa49b, #c4f76a, #66e5d5, #8fa49b);
+  background-size: 220% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: auth-title-flow 6s ease-in-out infinite;
 }
 
 .auth-cyber-brand-name {
@@ -341,12 +582,18 @@ For commercial licensing, please contact support@quantumnous.com
   background: #0c1412cc;
   color: #c8d7cf;
   backdrop-filter: blur(10px);
+  transition:
+    border-color 0.25s ease,
+    color 0.25s ease,
+    background-color 0.25s ease,
+    box-shadow 0.25s ease;
 }
 
 .auth-cyber-motion-toggle:hover {
   border-color: #c4f76a66;
   color: var(--cyber-acid);
   background: #13201bcc;
+  box-shadow: 0 0 20px #c4f76a22;
 }
 
 .auth-cyber-main {
@@ -372,12 +619,32 @@ For commercial licensing, please contact support@quantumnous.com
     0 0 60px #c4f76a0d;
   backdrop-filter: blur(18px) saturate(1.15);
   overflow: hidden;
+  animation: auth-panel-breathe 7s ease-in-out infinite;
+  animation-delay: 1.2s;
 }
 
 @media (min-width: 640px) {
   .auth-cyber-panel {
     padding: 36px 34px;
   }
+}
+
+.auth-cyber-panel-glow {
+  position: absolute;
+  inset: -30%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    #c4f76a14 60deg,
+    transparent 120deg,
+    #66e5d512 200deg,
+    transparent 280deg,
+    #c4f76a10 330deg,
+    transparent 360deg
+  );
+  animation: auth-panel-glow-spin 12s linear infinite;
+  pointer-events: none;
+  opacity: 0.7;
 }
 
 .auth-cyber-panel::before {
@@ -431,6 +698,7 @@ For commercial licensing, please contact support@quantumnous.com
   border-color: var(--cyber-acid);
   border-style: solid;
   opacity: 0.7;
+  animation: auth-corner-pulse 2.4s ease-in-out infinite;
 }
 
 .auth-cyber-panel-corners span:nth-child(1) {
@@ -442,16 +710,19 @@ For commercial licensing, please contact support@quantumnous.com
   top: 0;
   right: 0;
   border-width: 2px 2px 0 0;
+  animation-delay: 0.4s;
 }
 .auth-cyber-panel-corners span:nth-child(3) {
   bottom: 0;
   left: 0;
   border-width: 0 0 2px 2px;
+  animation-delay: 0.8s;
 }
 .auth-cyber-panel-corners span:nth-child(4) {
   right: 0;
   bottom: 0;
   border-width: 0 2px 2px 0;
+  animation-delay: 1.2s;
 }
 
 .auth-cyber-panel > .auth-cyber-panel-body {
@@ -502,7 +773,7 @@ For commercial licensing, please contact support@quantumnous.com
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: auth-title-flow 9s ease-in-out infinite;
+  animation: auth-title-flow 5.5s ease-in-out infinite;
 }
 
 .auth-page-description {
@@ -545,6 +816,21 @@ For commercial licensing, please contact support@quantumnous.com
   overflow: hidden;
 }
 
+.auth-cyber .auth-cyber-panel button[type='submit']::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    105deg,
+    transparent 30%,
+    #ffffff44 48%,
+    transparent 66%
+  );
+  transform: translateX(-120%);
+  animation: auth-btn-sheen 3.6s ease-in-out infinite;
+  pointer-events: none;
+}
+
 .auth-cyber-footer {
   position: relative;
   z-index: 2;
@@ -583,21 +869,42 @@ For commercial licensing, please contact support@quantumnous.com
   animation: auth-signal-blink 1.8s ease-in-out infinite;
 }
 
+.auth-cyber-footer-code::after {
+  content: '▌';
+  margin-left: 6px;
+  color: var(--cyber-acid);
+  animation: auth-cursor-blink 1s steps(1) infinite;
+}
+
 .auth-cyber[data-motion='paused']
   :is(
     .auth-cyber-grid,
+    .auth-cyber-hex,
     .auth-cyber-orb,
     .auth-cyber-ring,
     .auth-cyber-beam,
     .auth-cyber-scan,
     .auth-cyber-particle,
+    .auth-cyber-rain-drop,
+    .auth-cyber-meteor,
     .auth-cyber-noise,
     .auth-cyber-brand-mark,
+    .auth-cyber-brand-kicker,
+    .auth-cyber-panel,
+    .auth-cyber-panel-glow,
     .auth-cyber-panel::before,
     .auth-cyber-panel::after,
+    .auth-cyber-panel-corners span,
+    .auth-cyber-radar-sweep,
+    .auth-cyber-radar-ring,
+    .auth-cyber-constellation-path,
+    .auth-cyber-constellation circle,
+    .auth-cyber-hud span,
     .auth-page-signal,
     .auth-page-title-accent,
-    .auth-cyber-footer-live::before
+    .auth-cyber-footer-live::before,
+    .auth-cyber-footer-code::after,
+    .auth-cyber .auth-cyber-panel button[type='submit']::after
   ) {
   animation-play-state: paused;
 }
@@ -611,13 +918,32 @@ For commercial licensing, please contact support@quantumnous.com
   }
 }
 
+@keyframes auth-grid-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes auth-hex-drift {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 56px 100px;
+  }
+}
+
 @keyframes auth-orb-float {
   0%,
   100% {
     transform: translate3d(0, 0, 0) scale(1);
   }
   50% {
-    transform: translate3d(24px, -30px, 0) scale(1.08);
+    transform: translate3d(28px, -36px, 0) scale(1.1);
   }
 }
 
@@ -628,8 +954,25 @@ For commercial licensing, please contact support@quantumnous.com
     transform: scale(0.92);
   }
   50% {
-    opacity: 0.7;
+    opacity: 0.8;
+    transform: scale(1.12);
+  }
+}
+
+@keyframes auth-radar-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes auth-radar-pulse {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.8;
+  }
+  100% {
     transform: scale(1.08);
+    opacity: 0.15;
   }
 }
 
@@ -639,14 +982,42 @@ For commercial licensing, please contact support@quantumnous.com
   }
 }
 
+@keyframes auth-constellation-dash {
+  to {
+    stroke-dashoffset: -120;
+  }
+}
+
+@keyframes auth-constellation-blink {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 @keyframes auth-beam-sweep {
   0%,
   100% {
-    transform: translateX(-8%);
+    transform: translateX(-10%);
     opacity: 0.15;
   }
   50% {
-    transform: translateX(8%);
+    transform: translateX(10%);
+    opacity: 0.95;
+  }
+}
+
+@keyframes auth-beam-vertical {
+  0%,
+  100% {
+    transform: translateY(-10%);
+    opacity: 0.12;
+  }
+  50% {
+    transform: translateY(10%);
     opacity: 0.85;
   }
 }
@@ -660,6 +1031,37 @@ For commercial licensing, please contact support@quantumnous.com
   }
 }
 
+@keyframes auth-rain-fall {
+  from {
+    transform: translateY(-10%);
+    opacity: 0;
+  }
+  15% {
+    opacity: 0.7;
+  }
+  to {
+    transform: translateY(130vh);
+    opacity: 0;
+  }
+}
+
+@keyframes auth-meteor-fly {
+  0% {
+    transform: translateX(0) rotate(18deg);
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  35% {
+    opacity: 0;
+  }
+  100% {
+    transform: translateX(130vw) rotate(18deg);
+    opacity: 0;
+  }
+}
+
 @keyframes auth-particle-rise {
   from {
     transform: translate3d(0, 40px, 0);
@@ -669,7 +1071,7 @@ For commercial licensing, please contact support@quantumnous.com
     opacity: 1;
   }
   to {
-    transform: translate3d(12px, -110vh, 0);
+    transform: translate3d(18px, -110vh, 0);
     opacity: 0;
   }
 }
@@ -689,30 +1091,76 @@ For commercial licensing, please contact support@quantumnous.com
   }
   50% {
     box-shadow:
-      0 0 0 6px #c4f76a18,
-      0 0 34px #c4f76a44;
+      0 0 0 7px #c4f76a22,
+      0 0 42px #c4f76a55;
   }
 }
 
 @keyframes auth-border-flow {
   to {
-    filter: hue-rotate(40deg);
+    filter: hue-rotate(55deg);
   }
 }
 
 @keyframes auth-panel-sheen {
   0%,
-  30% {
+  25% {
     transform: translateX(0);
     opacity: 0;
   }
-  45% {
+  40% {
     opacity: 1;
   }
-  70%,
+  65%,
   100% {
     transform: translateX(360%);
     opacity: 0;
+  }
+}
+
+@keyframes auth-panel-breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px #c4f76a0d inset,
+      0 24px 80px #00000088,
+      0 0 48px #c4f76a0d;
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px #c4f76a22 inset,
+      0 28px 90px #00000099,
+      0 0 90px #c4f76a28;
+  }
+}
+
+@keyframes auth-panel-glow-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes auth-corner-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    filter: drop-shadow(0 0 0 transparent);
+  }
+  50% {
+    opacity: 1;
+    filter: drop-shadow(0 0 6px #c4f76a88);
+  }
+}
+
+@keyframes auth-hud-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.04);
   }
 }
 
@@ -738,6 +1186,30 @@ For commercial licensing, please contact support@quantumnous.com
   }
 }
 
+@keyframes auth-btn-sheen {
+  0%,
+  55% {
+    transform: translateX(-120%);
+  }
+  75% {
+    transform: translateX(120%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+@keyframes auth-cursor-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .auth-cyber *,
   .auth-cyber *::before,
@@ -746,7 +1218,8 @@ For commercial licensing, please contact support@quantumnous.com
     transition: none !important;
   }
 
-  .auth-page-title-accent {
+  .auth-page-title-accent,
+  .auth-cyber-brand-kicker {
     color: var(--cyber-acid);
     background: none;
     -webkit-background-clip: unset;
