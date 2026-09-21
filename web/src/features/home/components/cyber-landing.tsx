@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { CherryStudio } from '@lobehub/icons'
+import { CherryStudio, OpenAI } from '@lobehub/icons'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowDown,
@@ -218,7 +218,7 @@ export function CyberLanding(props: CyberLandingProps) {
               </div>
             </div>
             <div className='cyber-node cyber-node-openai' aria-hidden>
-              <span className='cyber-node-mark'>O</span>
+              <OpenAI className='cyber-node-logo' size={26} />
               <span>
                 OpenAI<small>CHAT / RESPONSES</small>
               </span>

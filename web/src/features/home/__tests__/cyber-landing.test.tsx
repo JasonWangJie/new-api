@@ -80,6 +80,16 @@ describe('cyber landing interactions', () => {
     )
   })
 
+  it('shows the OpenAI logo instead of a letter placeholder', async () => {
+    await renderLanding()
+    const node = document.querySelector('.cyber-node-openai')
+    expect(node).not.toBeNull()
+    expect(node).toHaveTextContent('OpenAI')
+    expect(node).toHaveTextContent('CHAT / RESPONSES')
+    expect(node?.querySelector('.cyber-node-mark')).toBeNull()
+    expect(node?.querySelector('svg.cyber-node-logo')).not.toBeNull()
+  })
+
   it('falls back to the default site name when status omits system_name', async () => {
     await renderLanding(false, '')
     const core = document.querySelector('.cyber-core')

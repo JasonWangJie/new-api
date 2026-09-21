@@ -538,6 +538,10 @@ For commercial licensing, please contact support@quantumnous.com
   letter-spacing: 0.07em;
   color: #879e8c;
 }
+.cyber-node-logo {
+  flex-shrink: 0;
+  color: #e8f7e4;
+}
 .cyber-node-mark {
   font-size: 26px;
   color: #e4f7dd;
