@@ -450,6 +450,13 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 }
 
 func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
+	failure.Message = sanitizeAsyncImageProviderDiagnostic(failure.Message, asyncImageProviderMessageLimit)
+	failure.ProviderCode = limitAsyncImageProviderDiagnostic(failure.ProviderCode, asyncImageProviderCodeLimit)
+	failure.ProviderStatus = limitAsyncImageProviderDiagnostic(failure.ProviderStatus, asyncImageProviderCodeLimit)
+	failure.UpstreamRequestID = limitAsyncImageProviderDiagnostic(failure.UpstreamRequestID, asyncImageProviderRequestIDLimit)
+	if failure.Message == "" {
+		failure.Message = "Upstream image request failed"
+	}
 	status, kind := model.ImageTaskFailed, ""
 	updates := map[string]any{"public_error_code": failure.Code, "error_code": failure.InternalCode, "error_message": failure.Message, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "finished_at": time.Now().Unix(), "next_attempt_at": 0}
 	if task.Attempts != "" {
@@ -462,6 +469,11 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			last.FinishedAt = time.Now().Unix()
 			last.Dispatched = task.DispatchedAt > 0
 			last.Code = failure.Code
+			last.HTTPStatus = failure.HTTPStatus
+			last.ErrorMessage = failure.Message
+			last.ProviderCode = failure.ProviderCode
+			last.ProviderStatus = failure.ProviderStatus
+			last.UpstreamRequestID = failure.UpstreamRequestID
 			last.ReferenceFailure = last.Dispatched && failure.Code == 602 && failure.InternalCode == "upstream_failed"
 			encoded, err := common.Marshal(attempts)
 			if err != nil {

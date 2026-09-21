@@ -497,14 +497,22 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		service.InitHttpClient()
 		var responseBody atomic.Value
 		var expectedPath atomic.Value
+		var responseRequestID atomic.Value
+		var responseStatus atomic.Int64
 		var calls atomic.Int64
 		expectedPath.Store("/v1/images/generations")
+		responseRequestID.Store("")
+		responseStatus.Store(http.StatusOK)
 		responseBody.Store(`{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(valid.Data) + `"},{"b64_json":"` + base64.StdEncoding.EncodeToString(valid.Data) + `"}]}`)
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			calls.Add(1)
 			assert.Equal(t, http.MethodPost, r.Method)
 			assert.Equal(t, expectedPath.Load().(string), r.URL.Path)
 			w.Header().Set("Content-Type", "application/json")
+			if requestID := responseRequestID.Load().(string); requestID != "" {
+				w.Header().Set("X-Goog-Request-Id", requestID)
+			}
+			w.WriteHeader(int(responseStatus.Load()))
 			_, _ = w.Write([]byte(responseBody.Load().(string)))
 		}))
 		defer upstream.Close()
@@ -594,6 +602,44 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&token).Error)
 		assert.Equal(t, 970000, user.Quota)
 		assert.Equal(t, 970000, token.RemainQuota)
+		// Gemini failures must be classified from the original provider message,
+		// while persisted diagnostics remain safe for public and admin views.
+		responseStatus.Store(http.StatusBadRequest)
+		responseRequestID.Store("gemini-provider-request-611")
+		responseBody.Store(`{"error":{"code":"too_many_reference_images","message":"image: at most 8 images are allowed; Bearer private-key; https://signed.example/path?secret=token","status":"INVALID_ARGUMENT"}}`)
+		gmRejected := request("POST", "/v1/chat/completions_gm", gmBody, "native-gemini-rejected", token.Key)
+		require.Equal(t, 202, gmRejected.Code, gmRejected.Body.String())
+		require.NoError(t, common.Unmarshal(gmRejected.Body.Bytes(), &nativeTask))
+		require.NoError(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId))
+		task = model.AsyncImageTask{}
+		require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
+		assert.Equal(t, model.ImageTaskFailed, task.Status)
+		assert.Equal(t, 611, task.PublicErrorCode)
+		assert.Contains(t, task.ErrorMessage, "at most 8 images are allowed")
+		assert.NotContains(t, task.ErrorMessage, "private-key")
+		assert.NotContains(t, task.ErrorMessage, "signed.example")
+		var geminiAttempts []service.ImageChannelAttempt
+		require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &geminiAttempts))
+		require.NotEmpty(t, geminiAttempts)
+		geminiAttempt := geminiAttempts[len(geminiAttempts)-1]
+		assert.Equal(t, http.StatusBadRequest, geminiAttempt.HTTPStatus)
+		assert.Equal(t, "too_many_reference_images", geminiAttempt.ProviderCode)
+		assert.Equal(t, "INVALID_ARGUMENT", geminiAttempt.ProviderStatus)
+		assert.Equal(t, "gemini-provider-request-611", geminiAttempt.UpstreamRequestID)
+		assert.Equal(t, task.ErrorMessage, geminiAttempt.ErrorMessage)
+		gmRejectedQuery := request("GET", "/v1/tasks_sc/"+nativeTask.TaskId, "", "", token.Key)
+		require.Equal(t, 200, gmRejectedQuery.Code, gmRejectedQuery.Body.String())
+		var rejectedResult struct {
+			Status     string `json:"status"`
+			ErrorCode  int    `json:"error_code"`
+			FailReason string `json:"fail_reason"`
+		}
+		require.NoError(t, common.Unmarshal(gmRejectedQuery.Body.Bytes(), &rejectedResult))
+		assert.Equal(t, "failed", rejectedResult.Status)
+		assert.Equal(t, 611, rejectedResult.ErrorCode)
+		assert.Equal(t, task.ErrorMessage, rejectedResult.FailReason)
+		responseStatus.Store(http.StatusOK)
+		responseRequestID.Store("")
 		responseBody.Store(`{"candidates":[`)
 		gmBroken := request("POST", "/v1/chat/completions_gm", gmBody, "native-gemini-broken", token.Key)
 		require.Equal(t, 202, gmBroken.Code, gmBroken.Body.String())
@@ -603,7 +649,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
 		assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
 		assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
-		assert.EqualValues(t, 4, calls.Load())
+		assert.EqualValues(t, 5, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
 		assert.Equal(t, 970000, user.Quota)
 		pricing := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
@@ -647,7 +693,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 			assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
 			assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 		}
-		assert.EqualValues(t, 8, calls.Load())
+		assert.EqualValues(t, 9, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
 		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&token).Error)
 		assert.Equal(t, 969820, user.Quota)

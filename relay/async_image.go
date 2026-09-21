@@ -519,11 +519,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			io.Closer
 		}{io.LimitReader(httpResponse.Body, limit+1), httpResponse.Body}
 		if httpResponse.StatusCode != http.StatusOK {
-			retryAfter := service.ImageRetryAfter(httpResponse.Header.Get("Retry-After"), time.Now())
-			apiErr := service.RelayErrorHandler(ctx, httpResponse, false)
-			failure := service.ClassifyAsyncImageFailure(apiErr, httpResponse.StatusCode)
-			failure.RetryAfter = retryAfter
-			return nil, model.AsyncImageBill{}, failure
+			return nil, model.AsyncImageBill{}, service.ClassifyGeminiAsyncImageHTTPFailure(ctx, httpResponse)
 		}
 		value, apiErr := adaptor.DoResponse(c, httpResponse, info)
 		if apiErr != nil {
