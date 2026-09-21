@@ -189,6 +189,9 @@ export function ImageTaskDetails(props: {
       references = []
     }
   }
+  const copyableReferenceUrls = references.filter((url) =>
+    /^https?:\/\//i.test(url)
+  )
   const attempts = props.admin ? data?.attempt_history || [] : []
   const canResume = Boolean(
     data?.can_resume && (props.canManage || !props.admin)
@@ -285,9 +288,23 @@ export function ImageTaskDetails(props: {
             )}
             {references.length > 0 && (
               <div className='space-y-2'>
-                <h3 className='text-muted-foreground text-xs font-medium'>
-                  {t('Reference images')}
-                </h3>
+                <div className='flex items-center justify-between gap-2'>
+                  <h3 className='text-muted-foreground text-xs font-medium'>
+                    {t('Reference images')}
+                  </h3>
+                  {copyableReferenceUrls.length > 0 && (
+                    <CopyButton
+                      value={copyableReferenceUrls.join('\n')}
+                      size='sm'
+                      variant='outline'
+                      className='h-7 gap-1.5 px-2 text-xs'
+                      tooltip={t('Copy all reference image URLs')}
+                      aria-label={t('Copy all reference image URLs')}
+                    >
+                      {t('Copy All')}
+                    </CopyButton>
+                  )}
+                </div>
                 <p className='text-muted-foreground text-xs'>
                   {t(
                     'Click the URL to copy it. Use the button on the right to open the reference image in a new tab.'

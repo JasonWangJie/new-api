@@ -78,7 +78,8 @@ const task: ImageTask = {
   user_id: 101,
   channel_id: 301,
   attempts: 'secret-fingerprint-canary',
-  reference_urls: '["https://example.com/reference.png"]',
+  reference_urls:
+    '["https://example.com/reference.png","https://example.com/reference-2.png","data:image/png;base64,abc"]',
   attempt_history: [
     {
       channel_name: 'Previous upstream',
@@ -257,6 +258,13 @@ test('admin details show named attempts and generated images without rendering r
     screen.getByRole('button', { name: /Copy URL.*Reference image 1/ })
   ).toHaveTextContent('https://example.com/reference.png')
   expect(
+    screen.getByRole('button', { name: /Copy URL.*Reference image 2/ })
+  ).toHaveTextContent('https://example.com/reference-2.png')
+  expect(screen.getByText(/Embedded image/)).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Copy all reference image URLs' })
+  ).toBeVisible()
+  expect(
     screen.getByRole('button', { name: /Open in new tab.*Reference image 1/ })
   ).toBeVisible()
   expect(
@@ -268,6 +276,12 @@ test('admin details show named attempts and generated images without rendering r
     )
   ).toBeVisible()
   const openWindow = vi.spyOn(window, 'open').mockImplementation(() => null)
+  await user.click(
+    screen.getByRole('button', { name: 'Copy all reference image URLs' })
+  )
+  expect(await navigator.clipboard.readText()).toBe(
+    'https://example.com/reference.png\nhttps://example.com/reference-2.png'
+  )
   await user.click(
     screen.getByRole('button', { name: /Copy URL.*Reference image 1/ })
   )
@@ -334,6 +348,9 @@ test('user details hide admin routing, references and account history even if a 
   ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: /Open in new tab.*Reference image/ })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('button', { name: 'Copy all reference image URLs' })
   ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Terminate' })

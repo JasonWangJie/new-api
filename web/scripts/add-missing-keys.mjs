@@ -9,67 +9,25 @@ function stableStringify(obj) {
 
 const newKeys = {
   en: {
-    'Back to documentation': 'Back to documentation',
-    Breadcrumb: 'Breadcrumb',
-    Contents: 'Contents',
-    'Documentation navigation': 'Documentation navigation',
-    'Page not found': 'Page not found',
-    'The requested documentation page does not exist.':
-      'The requested documentation page does not exist.',
+    'Copy all reference image URLs': 'Copy all reference image URLs',
   },
   zh: {
-    'Back to documentation': '返回文档',
-    Breadcrumb: '面包屑导航',
-    Contents: '目录',
-    'Documentation navigation': '文档导航',
-    'Page not found': '页面未找到',
-    'The requested documentation page does not exist.':
-      '请求的文档页面不存在。',
+    'Copy all reference image URLs': '一键复制所有参考图链接',
   },
   'zh-TW': {
-    'Back to documentation': '返回文件',
-    Breadcrumb: '麵包屑導覽',
-    Contents: '目錄',
-    'Documentation navigation': '文件導覽',
-    'Page not found': '找不到頁面',
-    'The requested documentation page does not exist.':
-      '請求的文件頁面不存在。',
+    'Copy all reference image URLs': '一鍵複製所有參考圖連結',
   },
   fr: {
-    'Back to documentation': 'Retour à la documentation',
-    Breadcrumb: 'Fil d’Ariane',
-    Contents: 'Sommaire',
-    'Documentation navigation': 'Navigation de la documentation',
-    'Page not found': 'Page introuvable',
-    'The requested documentation page does not exist.':
-      "La page de documentation demandée n'existe pas.",
+    'Copy all reference image URLs': 'Copier toutes les URL des images de référence',
   },
   ja: {
-    'Back to documentation': 'ドキュメントに戻る',
-    Breadcrumb: 'パンくずリスト',
-    Contents: '目次',
-    'Documentation navigation': 'ドキュメントナビ',
-    'Page not found': 'ページが見つかりません',
-    'The requested documentation page does not exist.':
-      '指定されたドキュメントページは存在しません。',
+    'Copy all reference image URLs': '参照画像の URL をすべてコピー',
   },
   ru: {
-    'Back to documentation': 'Вернуться к документации',
-    Breadcrumb: 'Навигационная цепочка',
-    Contents: 'Содержание',
-    'Documentation navigation': 'Навигация по документации',
-    'Page not found': 'Страница не найдена',
-    'The requested documentation page does not exist.':
-      'Запрошенная страница документации не существует.',
+    'Copy all reference image URLs': 'Скопировать все URL референсных изображений',
   },
   vi: {
-    'Back to documentation': 'Quay lại tài liệu',
-    Breadcrumb: 'Đường dẫn',
-    Contents: 'Mục lục',
-    'Documentation navigation': 'Điều hướng tài liệu',
-    'Page not found': 'Không tìm thấy trang',
-    'The requested documentation page does not exist.':
-      'Trang tài liệu được yêu cầu không tồn tại.',
+    'Copy all reference image URLs': 'Sao chép tất cả URL ảnh tham chiếu',
   },
 }
 
@@ -82,31 +40,30 @@ async function main() {
 
     let count = 0
     for (const [key, value] of Object.entries(trans)) {
-      if (!(key in json.translation)) {
+      if (!Object.prototype.hasOwnProperty.call(json.translation, key)) {
         json.translation[key] = value
         count++
-      } else {
+      } else if (json.translation[key] !== value) {
         json.translation[key] = value
+        count++
       }
     }
 
-    const sorted = Object.keys(json.translation)
-      .sort((a, b) => a.localeCompare(b))
-      .reduce((acc, key) => {
-        acc[key] = json.translation[key]
-        return acc
-      }, {})
+    if (count > 0) {
+      json.translation = Object.fromEntries(
+        Object.entries(json.translation).sort(([a], [b]) => a.localeCompare(b))
+      )
+      await fs.writeFile(filePath, stableStringify(json), 'utf8')
+    }
 
-    json.translation = sorted
-    await fs.writeFile(filePath, stableStringify(json), 'utf8')
+    console.log(`${locale}: ${count} translations applied`)
     totalAdded += count
-    console.log(`${locale}: wrote ${count} new keys`)
   }
 
-  console.log(`Done. Added ${totalAdded} new key slots.`)
+  console.log(`\nTotal: ${totalAdded} translations applied`)
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exit(1)
+main().catch((err) => {
+  console.error(err)
+  process.exitCode = 1
 })
