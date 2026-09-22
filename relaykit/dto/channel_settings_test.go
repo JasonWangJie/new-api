@@ -3,11 +3,13 @@ package dto
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
@@ -731,4 +733,110 @@ func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
 	err := (&ChannelOtherSettings{ToolLossPolicy: "drop"}).ValidateToolLossPolicy()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tool_loss_policy")
+}
+
+func TestUpstreamAsyncConfigValidationMatchingAndCloneIsolation(t *testing.T) {
+	var settings ChannelOtherSettings
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"upstream_async":{"profiles":[{
+			"id":"vendor-video","media_type":"video","models":["mapped-video"],"operations":["generate","edit"],
+			"submit":{"task_id_path":"data.task_id"},
+			"poll":{"request":{"method":"POST","path":"/v1/tasks/{task_id}","query":{"model":"{upstream_model}"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"id":"{task_id}"}},
+			"response":{"status_path":"data.status","status_values":{"queued":["pending",1],"in_progress":["running"],"succeeded":["succeeded",true],"failed":["failed",false]},"progress_path":"data.progress","failure_reason_path":"data.error.message","result_path":"data.output.url","usage_paths":{"total_tokens":"usage.total_tokens"},"download_headers":{"Authorization":"Bearer {api_key}"}}}
+		}]}}
+	`), &settings))
+	require.NotNil(t, settings.UpstreamAsync)
+	require.NoError(t, settings.UpstreamAsync.Validate())
+
+	profile, matched := settings.UpstreamAsync.Match("video", "mapped-video", "generate")
+	require.True(t, matched)
+	assert.Equal(t, "vendor-video", profile.ID)
+	profile.Models[0] = "changed"
+	profile.Poll.Request.Headers["Authorization"] = "changed"
+	assert.Equal(t, "mapped-video", settings.UpstreamAsync.Profiles[0].Models[0])
+	assert.Equal(t, "Bearer {api_key}", settings.UpstreamAsync.Profiles[0].Poll.Request.Headers["Authorization"])
+	assert.True(t, settings.UpstreamAsync.HasMatch("video", "mapped-video", "edit"))
+	assert.False(t, settings.UpstreamAsync.HasMatch("video", "other", "generate"))
+
+	values := settings.UpstreamAsync.Profiles[0].Poll.Response.StatusValues
+	assert.True(t, values.Queued[0].Matches(gjson.Parse(`"pending"`)))
+	assert.False(t, values.Queued[0].Matches(gjson.Parse(`1`)), "JSON types must not be coerced")
+	assert.True(t, values.Queued[1].Matches(gjson.Parse(`1.0`)), "numeric JSON values compare by value")
+}
+
+func TestUpstreamAsyncConfigRejectsInvalidRules(t *testing.T) {
+	validProfile := func() UpstreamAsyncProfile {
+		return UpstreamAsyncProfile{
+			ID:         "profile",
+			MediaType:  "image",
+			Models:     []string{"image-model"},
+			Operations: []string{"generate"},
+			Submit:     UpstreamAsyncSubmit{TaskIDPath: "data.id"},
+			Poll: UpstreamAsyncPoll{
+				Request: UpstreamAsyncPollRequest{Method: "GET", Path: "/tasks/{task_id}"},
+				Response: UpstreamAsyncPollResponse{
+					StatusPath: "data.status",
+					StatusValues: UpstreamAsyncStatusValues{
+						Succeeded: []UpstreamAsyncStatusValue{UpstreamAsyncStatusValue(`"done"`)},
+						Failed:    []UpstreamAsyncStatusValue{UpstreamAsyncStatusValue(`"failed"`)},
+					},
+					ResultPath: "data.urls",
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*UpstreamAsyncProfile)
+		want   string
+	}{
+		{name: "image extend", mutate: func(profile *UpstreamAsyncProfile) { profile.Operations = []string{"extend"} }, want: "does not allow extend"},
+		{name: "unsafe path", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Response.StatusPath = "data.status|@pretty" }, want: "restricted GJSON"},
+		{name: "unknown placeholder", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Path = "/tasks/{secret}" }, want: "unsupported placeholder"},
+		{name: "GET body", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Body = map[string]any{"id": "{task_id}"} }, want: "not allowed for GET"},
+		{name: "surrounding path whitespace", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Path = " /tasks/{task_id}" }, want: "surrounding whitespace"},
+		{name: "surrounding model whitespace", mutate: func(profile *UpstreamAsyncProfile) { profile.Models = []string{" image-model"} }, want: "invalid model"},
+		{name: "unsafe header", mutate: func(profile *UpstreamAsyncProfile) {
+			profile.Poll.Request.Headers = map[string]string{"Host": "other.example"}
+		}, want: "unsafe header"},
+		{name: "header whitespace", mutate: func(profile *UpstreamAsyncProfile) {
+			profile.Poll.Request.Headers = map[string]string{" Authorization ": "Bearer {api_key}"}
+		}, want: "unsafe header"},
+		{name: "unsupported usage", mutate: func(profile *UpstreamAsyncProfile) {
+			profile.Poll.Response.UsagePaths = map[string]string{"quota": "usage.quota"}
+		}, want: "unsupported target"},
+		{name: "overlapping statuses", mutate: func(profile *UpstreamAsyncProfile) {
+			profile.Poll.Response.StatusValues.Succeeded = []UpstreamAsyncStatusValue{UpstreamAsyncStatusValue(`1`)}
+			profile.Poll.Response.StatusValues.Failed = []UpstreamAsyncStatusValue{UpstreamAsyncStatusValue(`1.0`)}
+		}, want: "overlaps"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := validProfile()
+			tt.mutate(&profile)
+			err := (&UpstreamAsyncConfig{Profiles: []UpstreamAsyncProfile{profile}}).Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+
+	first := validProfile()
+	second := validProfile()
+	second.ID = "overlap"
+	err := (&UpstreamAsyncConfig{Profiles: []UpstreamAsyncProfile{first, second}}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "overlaps")
+}
+
+func TestUpstreamAsyncConfigStrictDecode(t *testing.T) {
+	base := `{"profiles":[{"id":"p","media_type":"video","models":[],"operations":["generate"],"submit":{"task_id_path":"id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}]}`
+	var config UpstreamAsyncConfig
+	require.NoError(t, json.Unmarshal([]byte(base), &config))
+	require.NoError(t, config.Validate())
+
+	invalid := strings.Replace(base, `"result_path":"url"`, `"result_path":"url","unexpected":true`, 1)
+	err := json.Unmarshal([]byte(invalid), &config)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown field")
 }

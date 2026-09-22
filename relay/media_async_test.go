@@ -125,6 +125,26 @@ func TestAsyncImageAdaptorCapabilitiesAndConversion(t *testing.T) {
 	assert.Equal(t, "advanced_custom", advanced.Provider)
 }
 
+func TestUpstreamAsyncImageOperationUsesPublicAsyncPath(t *testing.T) {
+	for _, item := range []struct {
+		path string
+		want string
+	}{
+		{path: "/v1/images/generations_async", want: dto.UpstreamAsyncOperationGenerate},
+		{path: "/v1/images/edits_async", want: dto.UpstreamAsyncOperationEdit},
+	} {
+		response := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(response)
+		c.Request = httptest.NewRequest(http.MethodPost, item.path, nil)
+		if strings.Contains(item.path, "/images/edits") {
+			c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationEdit)
+		} else {
+			c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
+		}
+		assert.Equal(t, item.want, upstreamAsyncImageOperation(c))
+	}
+}
+
 func TestAsyncImageExtensionParametersAndQuantityBounds(t *testing.T) {
 	cfg := service.DefaultImageRuntimeConfig()
 	jsonBody := `{"provider":"minimax","model":"image-01","prompt":"a river","size":"1024x1024","seed":0,"prompt_optimizer":false,"aspect_ratio":"16:9","parameters":{"prompt_extend":false}}`
@@ -196,4 +216,74 @@ func TestAsyncImageUpstreamJobPolling(t *testing.T) {
 			require.Len(t, result.Data, 1)
 		})
 	}
+}
+
+func TestDynamicAsyncImageSubmitAndPollProjection(t *testing.T) {
+	var config dto.UpstreamAsyncConfig
+	require.NoError(t, common.Unmarshal([]byte(`{"profiles":[{"id":"dynamic-image","media_type":"image","models":["image-model"],"operations":["generate"],"submit":{"task_id_path":"data.request_id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"data.state","status_values":{"queued":["queued"],"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"failure_reason_path":"data.error.message","result_path":"data.urls","usage_paths":{"total_tokens":"usage.total_tokens"}}}}]}`), &config))
+	require.NoError(t, config.Validate())
+	profile, matched := config.Match("image", "image-model", "generate")
+	require.True(t, matched)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "secret", UpstreamModelName: "image-model"}, OriginModelName: "image-model"}
+
+	t.Run("submission persists task id without exposing provider body", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("async_image_response_limit", int64(1<<20))
+		stored := ""
+		c.Set("async_image_upstream_job", func(id string) error { stored = id; return nil })
+		response := &http.Response{StatusCode: http.StatusAccepted, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"request_id":"vendor-job-7"}}`))}
+		_, apiErr := handleUpstreamAsyncImageResponse(c, info, response, profile)
+		require.NotNil(t, apiErr)
+		var pending *service.AsyncImagePending
+		require.ErrorAs(t, apiErr, &pending)
+		assert.Equal(t, "vendor-job-7", stored)
+		assert.Empty(t, recorder.Body.String())
+	})
+
+	t.Run("poll success projects multiple URLs and mapped usage", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("async_image_response_limit", int64(1<<20))
+		c.Set("async_image_resume_task", "vendor-job-7")
+		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"state":"done","urls":["https://cdn.example/1.png","https://cdn.example/2.png"]},"usage":{"total_tokens":42}}`))}
+		usage, apiErr := handleUpstreamAsyncImageResponse(c, info, response, profile)
+		require.Nil(t, apiErr)
+		require.NotNil(t, usage)
+		assert.Equal(t, 42, usage.TotalTokens)
+		urls, exists := c.Get(contextKeyUpstreamAsyncImageURLs)
+		require.True(t, exists)
+		assert.Equal(t, []string{"https://cdn.example/1.png", "https://cdn.example/2.png"}, urls)
+		var projected dto.ImageResponse
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &projected))
+		require.Len(t, projected.Data, 2)
+	})
+
+	t.Run("unknown status is retryable parse failure", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("async_image_response_limit", int64(1<<20))
+		c.Set("async_image_resume_task", "vendor-job-7")
+		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"state":"new-vendor-state"}}`))}
+		_, apiErr := handleUpstreamAsyncImageResponse(c, info, response, profile)
+		require.NotNil(t, apiErr)
+		var failure *service.AsyncImageFailure
+		require.ErrorAs(t, apiErr, &failure)
+		assert.Equal(t, 606, failure.Code)
+		assert.Equal(t, "upstream_status_unknown", failure.InternalCode)
+	})
+
+	t.Run("invalid token usage is classified for billing retry", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("async_image_response_limit", int64(1<<20))
+		c.Set("async_image_resume_task", "vendor-job-7")
+		response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"state":"done","urls":["https://cdn.example/1.png"]},"usage":{"total_tokens":2147483648}}`))}
+		_, apiErr := handleUpstreamAsyncImageResponse(c, info, response, profile)
+		require.NotNil(t, apiErr)
+		var failure *service.AsyncImageFailure
+		require.ErrorAs(t, apiErr, &failure)
+		assert.Equal(t, 606, failure.Code)
+		assert.Equal(t, "billing_usage_missing", failure.InternalCode)
+	})
 }

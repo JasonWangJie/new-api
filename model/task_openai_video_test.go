@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,4 +101,30 @@ func TestTaskPrivateDataPersistsAsyncMediaMarker(t *testing.T) {
 	var decoded TaskPrivateData
 	require.NoError(t, common.UnmarshalJsonStr(value.(string), &decoded))
 	assert.True(t, decoded.AsyncMedia)
+}
+
+func TestTaskPrivateDataPersistsUpstreamAsyncSnapshot(t *testing.T) {
+	private := TaskPrivateData{
+		UpstreamTaskID: "vendor-task-7",
+		ResultURL:      "https://provider.example/result.mp4?signature=private",
+		UpstreamAsync: &dto.UpstreamAsyncProfile{
+			ID: "vendor-video", MediaType: "video", Models: []string{"mapped-video"}, Operations: []string{"generate"},
+		},
+		UpstreamAsyncResponse: []byte(`{"data":{"status":"succeeded","url":"https://provider.example/result.mp4?signature=private"}}`),
+	}
+	value, err := private.Value()
+	require.NoError(t, err)
+	require.NotNil(t, value)
+
+	var decoded TaskPrivateData
+	require.NoError(t, common.UnmarshalJsonStr(value.(string), &decoded))
+	require.NotNil(t, decoded.UpstreamAsync)
+	assert.Equal(t, "vendor-video", decoded.UpstreamAsync.ID)
+	assert.JSONEq(t, string(private.UpstreamAsyncResponse), string(decoded.UpstreamAsyncResponse))
+
+	publicTask := Task{TaskID: "task-public", Status: TaskStatusSuccess, PrivateData: decoded}
+	encoded, err := common.Marshal(publicTask)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "provider.example")
+	assert.NotContains(t, string(encoded), "vendor-task-7")
 }

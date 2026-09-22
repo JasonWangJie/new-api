@@ -1324,6 +1324,104 @@ test('edits and saves the image channel reference capacity from routing settings
   expect(JSON.parse(payload.setting).image_max_reference_images).toBe(12)
 })
 
+test('edits a channel upstream async profile and preserves unrelated settings', async () => {
+  editingChannel = {
+    ...editingChannel,
+    settings: JSON.stringify({
+      custom_vendor_setting: true,
+      upstream_async: {
+        profiles: [
+          {
+            id: 'saved-video',
+            media_type: 'video',
+            models: ['mapped-video'],
+            operations: ['generate', 'extend'],
+            submit: { task_id_path: 'job.id' },
+            poll: {
+              request: {
+                method: 'GET',
+                path: '/tasks/{task_id}',
+              },
+              response: {
+                status_path: 'job.status',
+                status_values: {
+                  queued: ['queued'],
+                  succeeded: ['done'],
+                  failed: ['failed'],
+                },
+                result_path: 'job.output.url',
+              },
+            },
+          },
+        ],
+      },
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+
+  expect(screen.getByText('Channel override')).toBeVisible()
+  expect(screen.getByText('1 profiles')).toBeVisible()
+  const configure = screen.getByRole('button', {
+    name: 'Configure upstream async',
+  })
+  configure.focus()
+  await user.keyboard('{Enter}')
+  expect(
+    await screen.findByRole('dialog', {
+      name: 'Upstream asynchronous tasks',
+    })
+  ).toBeVisible()
+  expect(screen.getByLabelText('Task ID path')).toHaveValue('job.id')
+  expect(screen.getByRole('checkbox', { name: 'Extend' })).toBeChecked()
+  await user.click(screen.getByRole('combobox', { name: 'Media type' }))
+  await user.click(screen.getByRole('option', { name: 'Image' }))
+  expect(screen.getByRole('checkbox', { name: 'Extend' })).toHaveAttribute(
+    'aria-disabled',
+    'true'
+  )
+  expect(screen.getByRole('checkbox', { name: 'Extend' })).not.toBeChecked()
+
+  await user.click(screen.getByRole('tab', { name: 'Examples' }))
+  expect(
+    screen.getByRole('button', {
+      name: 'Copy Video single-result example upstream async example',
+    })
+  ).toBeEnabled()
+  expect(
+    screen.getByRole('button', {
+      name: 'Copy Image multi-result example upstream async example',
+    })
+  ).toBeEnabled()
+
+  await user.click(screen.getByRole('tab', { name: /^Structured editor/ }))
+  const taskIDPath = screen.getByLabelText('Task ID path')
+  await user.clear(taskIDPath)
+  await user.type(taskIDPath, 'data.request_id')
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('dialog', { name: 'Upstream asynchronous tasks' })
+    ).not.toBeInTheDocument()
+  )
+
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { settings: string }
+  const settings = JSON.parse(payload.settings)
+  expect(settings.custom_vendor_setting).toBe(true)
+  expect(settings.upstream_async.profiles[0].media_type).toBe('image')
+  expect(settings.upstream_async.profiles[0].operations).toEqual(['generate'])
+  expect(settings.upstream_async.profiles[0].submit.task_id_path).toBe(
+    'data.request_id'
+  )
+})
+
 test('request processing configuration does not mark the network category as configured', async () => {
   editingChannel = {
     ...editingChannel,

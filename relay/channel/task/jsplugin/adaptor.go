@@ -825,15 +825,7 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 			result.PluginState = pluginState
 		}
 	}
-	// The raw polling response only exists at this boundary. Capture upstream
-	// units here so the host settlement path can consume them from TaskInfo.
-	if a.hasHook(context.Background(), "extractUsageOnComplete") {
-		facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", ctx, jsonValue(result), input)
-		if hookErr == nil {
-			usageModel, _ := ctx["upstreamModel"].(string)
-			a.applyCompletionUsageFacts(result, facts, usageModel)
-		}
-	}
+	_ = a.ApplyCompletionUsage(task, resp, body, result)
 	taskStatus := model.TaskStatus(result.Status)
 	logger.LogDebug(
 		context.Background(),
@@ -844,6 +836,31 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		time.Since(started).Milliseconds(),
 	)
 	return result, nil
+}
+
+func (a *TaskAdaptor) ApplyCompletionUsage(task *model.Task, _ *http.Response, body []byte, result *relaycommon.TaskInfo) error {
+	if result == nil || !a.hasHook(context.Background(), "extractUsageOnComplete") {
+		return nil
+	}
+	key, baseURL, proxy := a.queryCredentials()
+	if task != nil && task.PrivateData.Key != "" {
+		key = task.PrivateData.Key
+	}
+	ctx, err := a.queryContext(task, key, baseURL, proxy)
+	if err != nil {
+		return err
+	}
+	input := any(string(body))
+	var decoded any
+	if common.Unmarshal(body, &decoded) == nil {
+		input = decoded
+	}
+	facts, err := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", ctx, jsonValue(result), input)
+	if err != nil {
+		return err
+	}
+	usageModel, _ := ctx["upstreamModel"].(string)
+	return a.applyCompletionUsageFacts(result, facts, usageModel)
 }
 
 func (a *TaskAdaptor) applyCompletionUsageFacts(result *relaycommon.TaskInfo, facts any, modelName string) error {
@@ -915,6 +932,17 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 }
 
 func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, error) {
+	artifacts, err := a.listPluginArtifacts(task)
+	if err != nil || len(artifacts) > 0 {
+		return artifacts, err
+	}
+	if task != nil && task.PrivateData.UpstreamAsync != nil && task.Status == model.TaskStatusSuccess && strings.TrimSpace(task.PrivateData.ResultURL) != "" {
+		return []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, nil
+	}
+	return artifacts, nil
+}
+
+func (a *TaskAdaptor) listPluginArtifacts(task *model.Task) ([]channel.TaskArtifact, error) {
 	if !a.hasHook(context.Background(), "listArtifacts") {
 		return nil, nil
 	}
@@ -930,6 +958,19 @@ func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, e
 }
 
 func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
+	if task != nil && task.PrivateData.UpstreamAsync != nil {
+		pluginArtifacts, err := a.listPluginArtifacts(task)
+		if err != nil {
+			return nil, err
+		}
+		if len(pluginArtifacts) > 0 {
+			if !slices.ContainsFunc(pluginArtifacts, func(artifact channel.TaskArtifact) bool { return artifact.Key == artifactKey }) {
+				return nil, fmt.Errorf("plugin artifact is unavailable")
+			}
+		} else {
+			return a.buildUpstreamAsyncContentRequest(task, artifactKey)
+		}
+	}
 	if !a.hasHook(context.Background(), "buildContentRequest") {
 		return nil, nil
 	}
@@ -1008,6 +1049,33 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 		Body:           body,
 		Credentialless: descriptor.Credentialless,
 	}, nil
+}
+
+func (a *TaskAdaptor) buildUpstreamAsyncContentRequest(task *model.Task, artifactKey string) (*channel.TaskContentRequest, error) {
+	if task != nil && task.PrivateData.UpstreamAsync != nil {
+		if a.info == nil {
+			return nil, fmt.Errorf("plugin adaptor is not initialized")
+		}
+		if artifactKey != "video" || task.Status != model.TaskStatusSuccess {
+			return nil, fmt.Errorf("upstream async video artifact is unavailable")
+		}
+		rawURL := strings.TrimSpace(task.PrivateData.ResultURL)
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.User != nil || parsedURL.Fragment != "" {
+			return nil, fmt.Errorf("upstream async video artifact URL is invalid")
+		}
+		headers, credentialless, err := service.BuildUpstreamAsyncDownloadHeaders(task.PrivateData.UpstreamAsync, rawURL, a.info.ChannelBaseUrl, service.UpstreamAsyncTemplateContext{
+			TaskID:        task.GetUpstreamTaskID(),
+			Model:         task.Properties.OriginModelName,
+			UpstreamModel: task.Properties.UpstreamModelName,
+			APIKey:        a.info.ApiKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &channel.TaskContentRequest{URL: rawURL, Method: http.MethodGet, Headers: headers, Credentialless: credentialless}, nil
+	}
+	return nil, fmt.Errorf("upstream async video artifact is unavailable")
 }
 
 func taskArtifactContext(task *model.Task) (map[string]any, error) {

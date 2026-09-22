@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -996,4 +998,173 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func upstreamAsyncTestProfile(t *testing.T, mediaType string) *dto.UpstreamAsyncProfile {
+	t.Helper()
+	configJSON := fmt.Sprintf(`{"profiles":[{"id":"dynamic","media_type":%q,"models":["mapped"],"operations":["generate"],"submit":{"task_id_path":"job.identifier"},"poll":{"request":{"method":"POST","path":"/tasks/{task_id}","query":{"model":"{upstream_model}"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"task":"{task_id}","model":"{model}"}},"response":{"status_path":"job.status","status_values":{"queued":["queued",1],"in_progress":["running"],"succeeded":["done",true],"failed":["failed",false]},"progress_path":"job.progress","failure_reason_path":"job.error.message","result_path":"job.output","usage_paths":{"prompt_tokens":"usage.input","completion_tokens":"usage.output","total_tokens":"usage.total"},"download_headers":{"Authorization":"Bearer {api_key}"}}}}]}`, mediaType)
+	var config dto.UpstreamAsyncConfig
+	require.NoError(t, common.Unmarshal([]byte(configJSON), &config))
+	require.NoError(t, config.Validate())
+	profile, matched := config.Match(mediaType, "mapped", "generate")
+	require.True(t, matched)
+	return profile
+}
+
+func TestUpstreamAsyncRequestAndSubmitParsing(t *testing.T) {
+	profile := upstreamAsyncTestProfile(t, "video")
+	request, err := BuildUpstreamAsyncPollRequest(t.Context(), "https://vendor.example/api", profile, UpstreamAsyncTemplateContext{
+		TaskID:        "job/id",
+		Model:         "client-model",
+		UpstreamModel: "mapped",
+		APIKey:        "secret",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPost, request.Method)
+	assert.Equal(t, "https://vendor.example/api/tasks/job%2Fid?model=mapped", request.URL.String())
+	assert.Equal(t, "Bearer secret", request.Header.Get("Authorization"))
+	body, err := io.ReadAll(request.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"task":"job/id","model":"client-model"}`, string(body))
+
+	_, err = BuildUpstreamAsyncPollRequest(t.Context(), "https://vendor.example/api", profile, UpstreamAsyncTemplateContext{TaskID: "job", APIKey: "secret\r\nX-Injected: yes"})
+	require.ErrorContains(t, err, "header is invalid")
+
+	taskID, err := ParseUpstreamAsyncTaskID(profile, []byte(`{"job":{"identifier":987654321}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "987654321", taskID)
+	_, err = ParseUpstreamAsyncTaskID(profile, []byte(`{"job":{}}`))
+	require.Error(t, err)
+}
+
+func TestUpstreamAsyncPollParsingStatusResultsAndUsage(t *testing.T) {
+	imageProfile := upstreamAsyncTestProfile(t, "image")
+	imageProfile.Poll.Response.UsagePaths["prompt_tokens_details.cached_tokens_details.image_tokens"] = "usage.cached_image"
+	result, err := ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":"queued","progress":25}}`))
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), result.Status)
+	assert.Equal(t, "25%", result.Progress)
+
+	result, err = ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":"missing"}}`))
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), result.Status)
+
+	result, err = ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":"done","output":["https://cdn.example/a.png","https://cdn.example/b.png"]},"usage":{"input":10,"output":4,"total":14,"cached_image":2}}`))
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), result.Status)
+	assert.Equal(t, []string{"https://cdn.example/a.png", "https://cdn.example/b.png"}, result.URLs)
+	require.NotNil(t, result.Usage)
+	assert.Equal(t, 10, result.Usage.PromptTokens)
+	assert.Equal(t, 4, result.Usage.CompletionTokens)
+	assert.Equal(t, 14, result.Usage.TotalTokens)
+	require.NotNil(t, result.Usage.PromptTokensDetails.CachedTokensDetails)
+	require.NotNil(t, result.Usage.PromptTokensDetails.CachedTokensDetails.ImageTokens)
+	assert.Equal(t, 2, *result.Usage.PromptTokensDetails.CachedTokensDetails.ImageTokens)
+
+	result, err = ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":"failed","error":{"message":"Bearer private-token request failed"}}}`))
+	require.NoError(t, err)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), result.Status)
+	assert.NotContains(t, result.Reason, "private-token")
+
+	videoProfile := upstreamAsyncTestProfile(t, "video")
+	_, err = ParseUpstreamAsyncPollResponse(videoProfile, []byte(`{"job":{"status":true,"output":["https://cdn.example/a.mp4","https://cdn.example/b.mp4"]}}`))
+	require.Error(t, err)
+	_, err = ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":true,"output":"https://cdn.example/a.png"},"usage":{"total":-1}}`))
+	require.ErrorIs(t, err, ErrUpstreamAsyncBillingUsage)
+	_, err = ParseUpstreamAsyncPollResponse(imageProfile, []byte(`{"job":{"status":true,"output":"https://cdn.example/a.png"},"usage":{"input":2147483647,"output":1,"total":1}}`))
+	require.ErrorIs(t, err, ErrUpstreamAsyncBillingUsage)
+}
+
+func TestUpstreamAsyncDownloadHeadersRequireSameOrigin(t *testing.T) {
+	profile := upstreamAsyncTestProfile(t, "video")
+	headers, credentialless, err := BuildUpstreamAsyncDownloadHeaders(profile, "https://vendor.example/output.mp4", "https://vendor.example/api", UpstreamAsyncTemplateContext{APIKey: "secret"})
+	require.NoError(t, err)
+	assert.False(t, credentialless)
+	assert.Equal(t, "Bearer secret", headers["Authorization"])
+
+	_, _, err = BuildUpstreamAsyncDownloadHeaders(profile, "https://vendor.example/output.mp4", "https://vendor.example/api", UpstreamAsyncTemplateContext{APIKey: "secret\r\nX-Injected: yes"})
+	require.ErrorContains(t, err, "header is invalid")
+
+	_, _, err = BuildUpstreamAsyncDownloadHeaders(profile, "https://cdn.example/output.mp4", "https://vendor.example/api", UpstreamAsyncTemplateContext{APIKey: "secret"})
+	require.Error(t, err)
+
+	profile.Poll.Response.DownloadHeaders = nil
+	headers, credentialless, err = BuildUpstreamAsyncDownloadHeaders(profile, "https://cdn.example/output.mp4", "https://vendor.example/api", UpstreamAsyncTemplateContext{APIKey: "secret"})
+	require.NoError(t, err)
+	assert.True(t, credentialless)
+	assert.Empty(t, headers)
+}
+
+func TestDynamicUpstreamAsyncVideoPollingUsesFrozenProfile(t *testing.T) {
+	truncate(t)
+	profile := upstreamAsyncTestProfile(t, "video")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assert.Equal(t, http.MethodPost, request.Method)
+		assert.Equal(t, "/tasks/upstream-frozen", request.URL.Path)
+		assert.Equal(t, "mapped", request.URL.Query().Get("model"))
+		assert.Equal(t, "Bearer frozen-key", request.Header.Get("Authorization"))
+		_, err := io.WriteString(writer, `{"job":{"status":"done","output":"https://cdn.example/result.mp4"},"usage":{"input":2,"output":3,"total":5}}`)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{Id: 701, Type: constant.ChannelTypeKling, Name: "dynamic", Key: "live-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	task := &model.Task{
+		TaskID:    "task_dynamic_video",
+		ChannelId: channel.Id,
+		Platform:  constant.TaskPlatform("kling"),
+		Status:    model.TaskStatusInProgress,
+		Properties: model.Properties{
+			OriginModelName:   "client-model",
+			UpstreamModelName: "mapped",
+		},
+		PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-frozen", Key: "frozen-key", UpstreamAsync: profile},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	adaptor := &scriptedPollingAdaptor{}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+	assert.Equal(t, "https://cdn.example/result.mp4", persisted.PrivateData.ResultURL)
+	assert.Empty(t, persisted.Data)
+	assert.JSONEq(t, `{"job":{"status":"done","output":"https://cdn.example/result.mp4"},"usage":{"input":2,"output":3,"total":5}}`, string(persisted.PrivateData.UpstreamAsyncResponse))
+	require.NotNil(t, persisted.PrivateData.UpstreamAsync)
+	assert.Equal(t, "dynamic", persisted.PrivateData.UpstreamAsync.ID)
+}
+
+func TestDynamicUpstreamAsyncUnknownStatusDoesNotExposeResponseBody(t *testing.T) {
+	truncate(t)
+	previous := constant.TaskPollMaxFailures
+	constant.TaskPollMaxFailures = 1
+	t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+
+	profile := upstreamAsyncTestProfile(t, "video")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, err := io.WriteString(writer, `{"job":{"status":"vendor-new-status","output":"https://private.example/result.mp4?signature=secret"}}`)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	channel := &model.Channel{Id: 702, Type: constant.ChannelTypeKling, Name: "dynamic", Key: "key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	task := &model.Task{
+		TaskID:      "task_dynamic_unknown",
+		ChannelId:   channel.Id,
+		Platform:    constant.TaskPlatform("kling"),
+		Status:      model.TaskStatusInProgress,
+		PrivateData: model.TaskPrivateData{UpstreamTaskID: "upstream-unknown", Key: "key", UpstreamAsync: profile},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+
+	adaptor := &scriptedPollingAdaptor{}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
+	assert.Contains(t, persisted.FailReason, "configured upstream status did not match")
+	assert.NotContains(t, persisted.FailReason, "private.example")
+	assert.NotContains(t, persisted.FailReason, "signature")
 }

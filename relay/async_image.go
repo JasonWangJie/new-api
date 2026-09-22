@@ -174,6 +174,10 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	c.Set("async_image_response_limit", limit)
 	c.Set("async_image_execution", true)
 	c.Set("async_image_resume_task", task.UpstreamTaskId)
+	c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
+	if strings.Contains(request.SourcePath, "/images/edits") {
+		c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationEdit)
+	}
 	c.Set("async_image_upstream_job", func(id string) error {
 		if id == "" || len(id) > 191 {
 			return errors.New("invalid upstream image task id")
@@ -451,6 +455,8 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, errors.New("Gemini image adaptor is unavailable")
 		}
 		adaptor.Init(info)
+		imageOperation := upstreamAsyncImageOperation(c)
+		asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, imageOperation)
 		converted, err := adaptor.ConvertGeminiRequest(c, info, parsed.(*dto.GeminiChatRequest))
 		if err != nil {
 			return nil, model.AsyncImageBill{}, err
@@ -485,11 +491,21 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if err := ctx.Err(); err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
-		if err := upstreamBeforeInvoke(); err != nil {
-			return nil, model.AsyncImageBill{}, err
+		if task.UpstreamTaskId == "" {
+			if err := upstreamBeforeInvoke(); err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
 		}
-		response, err := adaptor.DoRequest(c, info, bytes.NewReader(body))
+		var response any
+		if hasAsyncProfile && task.UpstreamTaskId != "" {
+			response, err = service.PollUpstreamAsync(c.Request.Context(), info.ChannelBaseUrl, info.ChannelSetting.Proxy, asyncProfile, upstreamAsyncImageTemplateContext(info, task.UpstreamTaskId))
+		} else {
+			response, err = adaptor.DoRequest(c, info, bytes.NewReader(body))
+		}
 		if err != nil {
+			if task.UpstreamTaskId != "" {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "upstream_poll_failed", Message: "Upstream image task polling failed"}
+			}
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream transport failed after dispatch", ExecutionUnknown: true}
 		}
 		httpResponse, ok := response.(*http.Response)
@@ -500,25 +516,57 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			io.Reader
 			io.Closer
 		}{io.LimitReader(httpResponse.Body, limit+1), httpResponse.Body}
-		if httpResponse.StatusCode != http.StatusOK {
+		if (!hasAsyncProfile && httpResponse.StatusCode != http.StatusOK) || (hasAsyncProfile && (httpResponse.StatusCode < http.StatusOK || httpResponse.StatusCode >= http.StatusMultipleChoices)) {
 			failure := service.ClassifyGeminiAsyncImageHTTPFailure(ctx, httpResponse)
 			if geminiReferenceFallbackEligible && task.RetryCount < cfg.TotalRetries && service.ShouldFallbackGeminiReferenceTransport(failure) {
 				failure.ReferenceTransportFallback = true
 			}
 			return nil, model.AsyncImageBill{}, failure
 		}
-		value, apiErr := adaptor.DoResponse(c, httpResponse, info)
-		if apiErr != nil {
-			// HTTP 200 already followed a dispatched generation. A response read
-			// or conversion failure cannot prove the request was not executed.
-			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream image response could not be decoded after dispatch", ExecutionUnknown: true}
-		}
-		usage, ok = value.(*dto.Usage)
-		if !ok {
-			return nil, model.AsyncImageBill{}, errors.New("Gemini usage is missing")
+		if hasAsyncProfile {
+			dynamicUsage, dynamicErr := handleUpstreamAsyncImageResponse(c, info, httpResponse, asyncProfile)
+			if dynamicErr != nil {
+				var pending *service.AsyncImagePending
+				if errors.As(dynamicErr, &pending) {
+					return nil, model.AsyncImageBill{}, pending
+				}
+				var failure *service.AsyncImageFailure
+				if errors.As(dynamicErr, &failure) {
+					return nil, model.AsyncImageBill{}, failure
+				}
+				return nil, model.AsyncImageBill{}, dynamicErr
+			}
+			usage = dynamicUsage
+		} else {
+			value, apiErr := adaptor.DoResponse(c, httpResponse, info)
+			if apiErr != nil {
+				// HTTP 200 already followed a dispatched generation. A response read
+				// or conversion failure cannot prove the request was not executed.
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream image response could not be decoded after dispatch", ExecutionUnknown: true}
+			}
+			usage, ok = value.(*dto.Usage)
+			if !ok {
+				return nil, model.AsyncImageBill{}, errors.New("Gemini usage is missing")
+			}
 		}
 	}
-	images, err := ExtractAsyncImageOutputs(ctx, writer.Body.Bytes(), request.Platform, cfg)
+	var images []service.ImageBytes
+	if rawURLs, exists := c.Get(contextKeyUpstreamAsyncImageURLs); exists {
+		urls, valid := rawURLs.([]string)
+		profileValue, profileExists := c.Get(contextKeyUpstreamAsyncImageProfile)
+		profile, profileValid := profileValue.(*dto.UpstreamAsyncProfile)
+		if !valid || !profileExists || !profileValid {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: "Upstream image result metadata is invalid"}
+		}
+		images, err = service.DownloadUpstreamAsyncImages(ctx, urls, profile, info.ChannelBaseUrl, info.ChannelSetting.Proxy, service.UpstreamAsyncTemplateContext{
+			TaskID:        task.UpstreamTaskId,
+			Model:         info.OriginModelName,
+			UpstreamModel: info.UpstreamModelName,
+			APIKey:        info.ApiKey,
+		}, cfg)
+	} else {
+		images, err = ExtractAsyncImageOutputs(ctx, writer.Body.Bytes(), request.Platform, cfg)
+	}
 	if err != nil {
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: err.Error()}
 	}
@@ -528,6 +576,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	info.BillingRequestInput = &billingexpr.RequestInput{Body: nativeBody, ImageCount: common.GetPointer(len(images))}
 	bill, err := service.FixAsyncImageBill(c, task, info, usage, images, request, funding)
 	if err != nil {
+		if _, dynamic := c.Get(contextKeyUpstreamAsyncImageProfile); dynamic && usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing", Message: "Upstream image task did not report required billing usage"}
+		}
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "bill_preparation_failed", Message: err.Error(), ExecutionUnknown: true}
 	}
 	return images, bill, nil

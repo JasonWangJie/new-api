@@ -355,7 +355,8 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	defer common.RDB.ZRem(context.WithoutCancel(ctx), channelSlotKey, task.LeaseToken)
 	task.ChannelId = channel.Id
 	capability := ImageChannelCapability(*channel, request.Model)
-	if task.Provider == "" && (task.Dialect == "async" || capability.Provider == "ali" || capability.Provider == "replicate") {
+	upstreamAsyncConfigured := channel.GetOtherSettings().UpstreamAsync != nil
+	if task.Provider == "" && (task.Dialect == "async" || capability.Provider == "ali" || capability.Provider == "replicate" || upstreamAsyncConfigured) {
 		encodedChannel, err := common.Marshal(channel)
 		if err != nil {
 			return err
@@ -364,7 +365,11 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if err != nil {
 			return err
 		}
-		if err := model.TransitionImageTask(ctx, *task, map[string]any{"provider": capability.Provider, "execution_protocol": capability.Protocol, "selected_channel_cipher": cipher}, "provider_selected", "", ""); err != nil {
+		provider := capability.Provider
+		if provider == "" && upstreamAsyncConfigured {
+			provider = "upstream_async"
+		}
+		if err := model.TransitionImageTask(ctx, *task, map[string]any{"provider": provider, "execution_protocol": capability.Protocol, "selected_channel_cipher": cipher}, "provider_selected", "", ""); err != nil {
 			return err
 		}
 		if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
@@ -418,7 +423,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.DispatchedAt > 0 && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 			failure.ExecutionUnknown = true
 		}
-		if task.UpstreamTaskId != "" && (failure.ExecutionUnknown || failure.Code == 605 || failure.Code == 606) {
+		if task.UpstreamTaskId != "" && failure.ExecutionUnknown {
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
 		if task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.ExecutionUnknown) {
@@ -441,6 +446,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	if err := model.StageAsyncImageOutput(ctx, *task, staging, bill); err != nil {
 		if errors.Is(err, model.ErrImageConflict) {
 			return err
+		}
+		if task.UpstreamTaskId != "" {
+			return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, &AsyncImageFailure{Code: 606, InternalCode: "output_persist_failed", Message: "Upstream output could not be durably persisted"}, cfg)
 		}
 		return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream output could not be durably persisted", ExecutionUnknown: true}, cfg)
 	}

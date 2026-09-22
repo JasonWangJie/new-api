@@ -113,6 +113,46 @@ export interface ChannelOtherSettings {
   upstream_model_update_last_check_time?: number
   upstream_model_update_last_detected_models?: string[]
   advanced_custom?: AdvancedCustomConfig
+  upstream_async?: UpstreamAsyncConfig
+}
+
+export type UpstreamAsyncMediaType = 'image' | 'video'
+export type UpstreamAsyncOperation = 'generate' | 'edit' | 'extend'
+export type UpstreamAsyncStatusValue = string | number | boolean
+
+export interface UpstreamAsyncConfig {
+  profiles: UpstreamAsyncProfile[]
+}
+
+export interface UpstreamAsyncProfile {
+  id: string
+  media_type: UpstreamAsyncMediaType
+  models: string[]
+  operations: UpstreamAsyncOperation[]
+  submit: { task_id_path: string }
+  poll: {
+    request: {
+      method: 'GET' | 'POST'
+      path: string
+      query?: Record<string, string>
+      headers?: Record<string, string>
+      body?: unknown
+    }
+    response: {
+      status_path: string
+      status_values: {
+        queued?: UpstreamAsyncStatusValue[]
+        in_progress?: UpstreamAsyncStatusValue[]
+        succeeded: UpstreamAsyncStatusValue[]
+        failed: UpstreamAsyncStatusValue[]
+      }
+      progress_path?: string
+      failure_reason_path?: string
+      result_path: string
+      usage_paths?: Record<string, string>
+      download_headers?: Record<string, string>
+    }
+  }
 }
 
 export interface AdvancedCustomConfig {

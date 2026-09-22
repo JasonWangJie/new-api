@@ -2,7 +2,9 @@ package model
 
 import (
 	"slices"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 )
@@ -92,6 +94,24 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true
+		}
+		if filter.RequestPath == "/v1/images/generations" || filter.RequestPath == "/v1/images/edits" {
+			upstreamModel := modelName
+			if mappingJSON := ch.GetModelMapping(); mappingJSON != "" && mappingJSON != "{}" {
+				mapping := make(map[string]string)
+				if common.UnmarshalJsonStr(mappingJSON, &mapping) == nil {
+					if mapped, cyclic := followChannelModelMapping(mapping, modelName); !cyclic {
+						upstreamModel = mapped
+					}
+				}
+			}
+			operation := "generate"
+			if strings.HasSuffix(filter.RequestPath, "/edits") {
+				operation = "edit"
+			}
+			if ch.GetOtherSettings().UpstreamAsync.HasMatch("image", upstreamModel, operation) {
+				return false
+			}
 		}
 		if !constant.IsAdvancedCustomChannel(ch.Type) {
 			return true

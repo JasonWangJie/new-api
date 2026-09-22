@@ -594,6 +594,8 @@ func executeTaskSubmissionWith(
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+	task.PrivateData.UpstreamAsync = result.UpstreamAsync
+	task.PrivateData.UpstreamAsyncResponse = result.UpstreamAsyncResponse
 	if c.GetBool("async_media_execution") {
 		task.PrivateData.Key = relayInfo.ApiKey
 	}

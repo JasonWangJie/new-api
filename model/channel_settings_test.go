@@ -195,3 +195,54 @@ func TestInferencePresetSettingsAndDatabaseRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestUpstreamAsyncSettingsDatabaseRoundTrip(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(filepath.Join(t.TempDir(), "upstream-async.db"))
+			case "mysql":
+				dsn := os.Getenv("TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("TEST_MYSQL_DSN is not configured")
+				}
+				driver = mysql.Open(dsn)
+			case "postgres":
+				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("TEST_POSTGRES_DSN is not configured")
+				}
+				driver = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(driver, &gorm.Config{})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			table := db.Table("upstream_async_channels").Session(&gorm.Session{})
+			require.NoError(t, table.AutoMigrate(&Channel{}))
+			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable("upstream_async_channels")) })
+
+			var settings dto.ChannelOtherSettings
+			require.NoError(t, common.UnmarshalJsonStr(`{"upstream_async":{"profiles":[{"id":"vendor-video","media_type":"video","models":["mapped-video"],"operations":["generate"],"submit":{"task_id_path":"data.task_id"},"poll":{"request":{"method":"POST","path":"/tasks/{task_id}","headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}"}},"response":{"status_path":"data.status","status_values":{"queued":["queued"],"succeeded":[true],"failed":[false]},"result_path":"data.output.url","usage_paths":{"total_tokens":"usage.total_tokens"}}}}]}}`, &settings))
+			channel := &Channel{Type: constant.ChannelTypeOpenAI, Key: "secret", Name: "dynamic", Status: common.ChannelStatusEnabled}
+			channel.SetOtherSettings(settings)
+			require.NoError(t, channel.ValidateSettings())
+			require.NoError(t, table.Create(channel).Error)
+
+			var loaded Channel
+			require.NoError(t, table.First(&loaded, channel.Id).Error)
+			profile, matched := loaded.GetOtherSettings().UpstreamAsync.Match("video", "mapped-video", "generate")
+			require.True(t, matched)
+			require.NotNil(t, profile)
+			assert.Equal(t, "vendor-video", profile.ID)
+			assert.Equal(t, "Bearer {api_key}", profile.Poll.Request.Headers["Authorization"])
+			profile.Poll.Request.Headers["Authorization"] = "changed"
+			fresh, matched := loaded.GetOtherSettings().UpstreamAsync.Match("video", "mapped-video", "generate")
+			require.True(t, matched)
+			assert.Equal(t, "Bearer {api_key}", fresh.Poll.Request.Headers["Authorization"])
+		})
+	}
+}

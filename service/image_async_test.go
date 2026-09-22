@@ -150,6 +150,22 @@ func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T
 	assert.Equal(t, model.ImageTaskInvoking, recovered.Status)
 	assert.Empty(t, recovered.LeaseToken)
 	assert.Zero(t, recovered.LeaseExpiresAt)
+
+	retryTask, err := model.ClaimAsyncImageTask(ctx, task.TaskId, "storage-retry-worker", 120)
+	require.NoError(t, err)
+	cfg := DefaultImageRuntimeConfig()
+	cfg.TotalRetries = 1
+	cfg.TransientRetries = 1
+	cfg.TransientRetryBase = 1
+	cfg.TransientRetryMax = 1
+	cfg.RetryJitter = 0
+	require.NoError(t, failAsyncImageInvocation(ctx, retryTask, &AsyncImageFailure{Code: 606, InternalCode: "output_persist_failed", Message: "Upstream output could not be durably persisted"}, cfg))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&recovered).Error)
+	assert.Equal(t, model.ImageTaskInvoking, recovered.Status)
+	assert.Equal(t, "upstream-job-1", recovered.UpstreamTaskId)
+	assert.Equal(t, 7, recovered.ChannelId)
+	assert.Equal(t, 1, recovered.TransientRetryCount)
+	assert.Equal(t, 1, recovered.RetryCount)
 }
 
 func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -28,13 +29,15 @@ import (
 )
 
 type TaskSubmitResult struct {
-	UpstreamTaskID string
-	TaskData       []byte
-	ClientResponse any
-	Platform       constant.TaskPlatform
-	Quota          int
-	Immediate      *relaycommon.TaskInfo
-	PluginState    []byte
+	UpstreamTaskID        string
+	TaskData              []byte
+	ClientResponse        any
+	Platform              constant.TaskPlatform
+	Quota                 int
+	Immediate             *relaycommon.TaskInfo
+	PluginState           []byte
+	UpstreamAsync         *kitdto.UpstreamAsyncProfile
+	UpstreamAsyncResponse []byte
 	//PerCallPrice   types.PriceData
 }
 
@@ -378,6 +381,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(err, "media_dispatch_failed", http.StatusInternalServerError)
 		}
 	}
+	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(
+		kitdto.UpstreamAsyncMediaVideo,
+		info.UpstreamModelName,
+		service.UpstreamAsyncOperation(info.Action),
+	)
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
@@ -386,16 +394,34 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if (!hasAsyncProfile && resp.StatusCode != http.StatusOK) || (hasAsyncProfile && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices)) {
 		responseBody, _ := io.ReadAll(resp.Body)
 		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
 	}
 
 	// 10. Parse only. The controller presents the response after the durable
 	// task barrier and billing settlement.
-	parsed, taskErr := adaptor.ParseResponse(c, resp, info)
-	if taskErr != nil {
-		return nil, taskErr
+	var parsed *channel.TaskSubmitResponse
+	var taskErr *dto.TaskError
+	if hasAsyncProfile {
+		responseBody, readErr := service.ReadUpstreamAsyncResponse(resp, 1<<20)
+		if readErr != nil {
+			failure := service.TaskErrorWrapper(readErr, "upstream_async_submit_invalid", http.StatusBadGateway)
+			failure.NoRetry = true
+			return nil, failure
+		}
+		upstreamTaskID, parseErr := service.ParseUpstreamAsyncTaskID(asyncProfile, responseBody)
+		if parseErr != nil {
+			failure := service.TaskErrorWrapper(parseErr, "upstream_async_submit_invalid", http.StatusBadGateway)
+			failure.NoRetry = true
+			return nil, failure
+		}
+		parsed = &channel.TaskSubmitResponse{UpstreamTaskID: upstreamTaskID, TaskData: responseBody}
+	} else {
+		parsed, taskErr = adaptor.ParseResponse(c, resp, info)
+		if taskErr != nil {
+			return nil, taskErr
+		}
 	}
 	if parsed == nil {
 		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
@@ -430,14 +456,22 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	info.PriceData.Quota = finalQuota
 
+	taskData := parsed.TaskData
+	var upstreamAsyncResponse []byte
+	if hasAsyncProfile {
+		upstreamAsyncResponse = append([]byte(nil), parsed.TaskData...)
+		taskData = nil
+	}
 	return &TaskSubmitResult{
-		UpstreamTaskID: parsed.UpstreamTaskID,
-		TaskData:       parsed.TaskData,
-		ClientResponse: parsed.ClientResponse,
-		Platform:       platform,
-		Quota:          finalQuota,
-		Immediate:      parsed.Immediate,
-		PluginState:    parsed.PluginState,
+		UpstreamTaskID:        parsed.UpstreamTaskID,
+		TaskData:              taskData,
+		ClientResponse:        parsed.ClientResponse,
+		Platform:              platform,
+		Quota:                 finalQuota,
+		Immediate:             parsed.Immediate,
+		PluginState:           parsed.PluginState,
+		UpstreamAsync:         asyncProfile,
+		UpstreamAsyncResponse: upstreamAsyncResponse,
 	}, nil
 }
 

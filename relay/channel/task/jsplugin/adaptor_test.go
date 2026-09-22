@@ -442,6 +442,70 @@ export function parseTaskResult(){return {status:"SUCCESS"};}
 	assert.Nil(t, descriptor)
 }
 
+func TestTaskAdaptorBuildsFrozenUpstreamAsyncArtifact(t *testing.T) {
+	plugin, err := pluginruntime.NewRegistry().Register(`
+export const meta = {apiVersion:1,key:"dynamic-artifact",name:"Dynamic Artifact",version:"1.0.0",author:{name:"Test"},models:["video-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(){return {url:"https://provider.example/submit"};}
+export function parseSubmitResponse(){return {taskId:"1"};}
+export function buildQueryRequest(){return {url:"https://provider.example/tasks/1"};}
+export function parseTaskResult(){return {status:"SUCCESS"};}
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example/api", ApiKey: "secret-key"}})
+	task := &model.Task{
+		TaskID: "task-public", Status: model.TaskStatusSuccess,
+		Properties: model.Properties{OriginModelName: "video-model", UpstreamModelName: "mapped-video"},
+		PrivateData: model.TaskPrivateData{
+			UpstreamTaskID: "vendor-task-7",
+			ResultURL:      "https://provider.example/result/video.mp4?signature=private",
+			UpstreamAsync: &dto.UpstreamAsyncProfile{Poll: dto.UpstreamAsyncPoll{Response: dto.UpstreamAsyncPollResponse{DownloadHeaders: map[string]string{
+				"Authorization": "Bearer {api_key}",
+				"X-Task":        "{task_id}:{model}:{upstream_model}",
+			}}}},
+		},
+	}
+
+	artifacts, err := adaptor.ListArtifacts(task)
+	require.NoError(t, err)
+	assert.Equal(t, []channel.TaskArtifact{{Key: "video", Type: "video", MimeType: "video/mp4"}}, artifacts)
+	descriptor, err := adaptor.BuildContentRequest(task, "video", channel.TaskArtifactClientRequest{Method: http.MethodHead})
+	require.NoError(t, err)
+	require.NotNil(t, descriptor)
+	assert.Equal(t, http.MethodGet, descriptor.Method)
+	assert.False(t, descriptor.Credentialless)
+	assert.Equal(t, "Bearer secret-key", descriptor.Headers["Authorization"])
+	assert.Equal(t, "vendor-task-7:video-model:mapped-video", descriptor.Headers["X-Task"])
+
+	task.PrivateData.ResultURL = "https://cdn.example/video.mp4"
+	_, err = adaptor.BuildContentRequest(task, "video", channel.TaskArtifactClientRequest{})
+	require.ErrorContains(t, err, "channel origin")
+	task.PrivateData.UpstreamAsync.Poll.Response.DownloadHeaders = nil
+	descriptor, err = adaptor.BuildContentRequest(task, "video", channel.TaskArtifactClientRequest{})
+	require.NoError(t, err)
+	assert.True(t, descriptor.Credentialless)
+
+	declaredPlugin, err := pluginruntime.NewRegistry().Register(`
+export const meta = {apiVersion:1,key:"declared-artifact",name:"Declared Artifact",version:"1.0.0",author:{name:"Test"},models:["video-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(){return {url:"https://provider.example/submit"};}
+export function parseSubmitResponse(){return {taskId:"1"};}
+export function buildQueryRequest(){return {url:"https://provider.example/tasks/1"};}
+export function parseTaskResult(){return {status:"SUCCESS"};}
+export function listArtifacts(){return [{key:"provider-video",type:"video",mimeType:"video/mp4"}];}
+export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/provider/"+ctx.artifactKey,method:"GET",headers:{"X-Plugin":"used"}};}
+`, pluginruntime.Options{})
+	require.NoError(t, err)
+	declaredAdaptor := New(declaredPlugin)
+	declaredAdaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example", ApiKey: "secret-key"}})
+	artifacts, err = declaredAdaptor.ListArtifacts(task)
+	require.NoError(t, err)
+	assert.Equal(t, []channel.TaskArtifact{{Key: "provider-video", Type: "video", MimeType: "video/mp4"}}, artifacts)
+	descriptor, err = declaredAdaptor.BuildContentRequest(task, "provider-video", channel.TaskArtifactClientRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "https://provider.example/provider/provider-video", descriptor.URL)
+	assert.Equal(t, "used", descriptor.Headers["X-Plugin"])
+}
+
 func TestTaskAdaptorRejectsInvalidArtifactProjection(t *testing.T) {
 	testCases := []struct {
 		name       string

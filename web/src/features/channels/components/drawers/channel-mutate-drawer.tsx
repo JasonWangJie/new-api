@@ -195,7 +195,8 @@ import {
   assessBaseUrlTrust,
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
-import type { Channel } from '../../types'
+import { upstreamAsyncFromSettingsJSON } from '../../lib/upstream-async'
+import type { Channel, UpstreamAsyncConfig } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelTypeLogo } from '../channel-type-badge'
 import { useChannels } from '../channels-provider'
@@ -207,6 +208,7 @@ import {
 } from '../dialogs/missing-models-confirmation-dialog'
 import { ParamOverrideEditorDialog } from '../dialogs/param-override-editor-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
+import { UpstreamAsyncEditorDialog } from '../dialogs/upstream-async-editor-dialog'
 import { ModelMappingEditor } from '../model-mapping-editor'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
@@ -422,6 +424,7 @@ export function ChannelMutateDrawer({
   const [paramOverrideEditorOpen, setParamOverrideEditorOpen] = useState(false)
   const [advancedCustomEditorOpen, setAdvancedCustomEditorOpen] =
     useState(false)
+  const [upstreamAsyncEditorOpen, setUpstreamAsyncEditorOpen] = useState(false)
   const [clipboardConnectionInfo, setClipboardConnectionInfo] =
     useState<ChannelConnectionInfo | null>(null)
 
@@ -541,6 +544,10 @@ export function ChannelMutateDrawer({
   const upstreamModelUpdateCheckEnabled =
     formValues.upstream_model_update_check_enabled
   const currentSettings = formValues.settings
+  const currentUpstreamAsync = useMemo(
+    () => upstreamAsyncFromSettingsJSON(currentSettings),
+    [currentSettings]
+  )
   const currentAdvancedCustom = formValues.advanced_custom
   const currentHeaderOverride = formValues.header_override
   const currentProxy = formValues.proxy
@@ -1983,6 +1990,45 @@ export function ChannelMutateDrawer({
           </FormItem>
         )}
       />
+
+      <div className='rounded-lg border p-4'>
+        <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+          <div className='space-y-1'>
+            <div className='flex flex-wrap items-center gap-2'>
+              <p className='text-sm font-medium'>
+                {t('Upstream asynchronous tasks')}
+              </p>
+              <Badge variant={currentUpstreamAsync ? 'default' : 'secondary'}>
+                {currentUpstreamAsync
+                  ? t('Channel override')
+                  : t('Built-in parsing')}
+              </Badge>
+              {currentUpstreamAsync ? (
+                <Badge variant='outline'>
+                  {t('{{count}} profiles', {
+                    count: currentUpstreamAsync.profiles.length,
+                  })}
+                </Badge>
+              ) : null}
+            </div>
+            <p className='text-muted-foreground text-xs'>
+              {t(
+                'Dynamically extract an upstream task ID, poll its status, and collect local image or video results.'
+              )}
+            </p>
+          </div>
+          <Button
+            type='button'
+            variant='outline'
+            size='sm'
+            disabled={sensitiveLocked}
+            onClick={() => setUpstreamAsyncEditorOpen(true)}
+          >
+            <Settings aria-hidden='true' />
+            {t('Configure upstream async')}
+          </Button>
+        </div>
+      </div>
     </div>
   )
 
@@ -4524,6 +4570,26 @@ export function ChannelMutateDrawer({
           onOpenChange={setAdvancedCustomEditorOpen}
           onSave={(nextValue) => {
             form.setValue('advanced_custom', nextValue, {
+              shouldDirty: true,
+              shouldValidate: true,
+            })
+          }}
+        />
+      )}
+
+      {upstreamAsyncEditorOpen && !sensitiveLocked && (
+        <UpstreamAsyncEditorDialog
+          open={upstreamAsyncEditorOpen}
+          value={currentUpstreamAsync}
+          onOpenChange={setUpstreamAsyncEditorOpen}
+          onSave={(nextValue: UpstreamAsyncConfig | null) => {
+            const settings = parseSettingsRecord(form.getValues('settings'))
+            if (nextValue) {
+              settings.upstream_async = nextValue
+            } else {
+              delete settings.upstream_async
+            }
+            form.setValue('settings', JSON.stringify(settings), {
               shouldDirty: true,
               shouldValidate: true,
             })

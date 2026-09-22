@@ -216,3 +216,20 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
 }
+
+func TestChannelSatisfiesFiltersExcludesDynamicAsyncProfilesFromSyncImages(t *testing.T) {
+	mapping := `{"alias":"vendor-image"}`
+	channel := &Channel{Id: 9, Type: constant.ChannelTypeOpenAI, ModelMapping: &mapping, OtherSettings: `{"upstream_async":{"profiles":[{"id":"image-job","media_type":"image","models":["vendor-image"],"operations":["generate"],"submit":{"task_id_path":"id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}]}}`}
+
+	ok, kind := ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{{Kind: dto.FilterRequestPath, RequestPath: "/v1/images/generations"}})
+	assert.False(t, ok)
+	assert.Equal(t, dto.FilterRequestPath, kind)
+
+	ok, kind = ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{{Kind: dto.FilterRequestPath, RequestPath: "/v1/images/generations_async"}})
+	assert.True(t, ok)
+	assert.Empty(t, kind)
+
+	ok, kind = ChannelSatisfiesFilters(channel, "alias", []dto.ChannelFilter{{Kind: dto.FilterRequestPath, RequestPath: "/v1/images/edits"}})
+	assert.True(t, ok, "a generate-only profile must not hide synchronous edits")
+	assert.Empty(t, kind)
+}

@@ -61,6 +61,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		return nil, types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
 	}
 	adaptor.Init(info)
+	imageOperation := upstreamAsyncImageOperation(c)
+	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, imageOperation)
+	if hasAsyncProfile && !c.GetBool("async_image_execution") {
+		return nil, types.NewErrorWithStatusCode(fmt.Errorf("channel model requires the asynchronous image endpoint"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
 	imageCount, err := request.ImageCount(info.ChannelType == constant.ChannelTypeAli)
 	if err != nil {
 		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -228,7 +233,9 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 
 	var resp any
 	if taskId := c.GetString("async_image_resume_task"); taskId != "" {
-		if provider, ok := adaptor.(channel.AsyncImagePollingProvider); ok {
+		if hasAsyncProfile {
+			resp, err = service.PollUpstreamAsync(c.Request.Context(), info.ChannelBaseUrl, info.ChannelSetting.Proxy, asyncProfile, upstreamAsyncImageTemplateContext(info, taskId))
+		} else if provider, ok := adaptor.(channel.AsyncImagePollingProvider); ok {
 			resp, err = provider.PollImage(c, info, taskId)
 		} else {
 			err = fmt.Errorf("image adaptor cannot resume upstream jobs")
@@ -239,6 +246,9 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	if err != nil {
 		if reserve {
 			_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, false, circuit)
+		}
+		if hasAsyncProfile && c.GetString("async_image_resume_task") != "" {
+			return nil, types.NewError(&service.AsyncImageFailure{Code: 606, InternalCode: "upstream_poll_failed", Message: "Upstream image task polling failed"}, types.ErrorCodeDoRequestFailed)
 		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
@@ -254,7 +264,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			}
 		}
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
-		if httpResp.StatusCode != http.StatusOK {
+		if (!hasAsyncProfile && httpResp.StatusCode != http.StatusOK) || (hasAsyncProfile && (httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices)) {
 			if (httpResp.StatusCode == http.StatusCreated && info.ApiType == constant.APITypeReplicate) || (c.GetBool("async_image_execution") && httpResp.StatusCode == http.StatusAccepted && info.ApiType == constant.APITypeAli) {
 				// replicate channel returns 201 Created when using Prefer: wait, treat it as success.
 				httpResp.StatusCode = http.StatusOK
@@ -271,6 +281,13 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, newAPIError
 			}
 		}
+	}
+	if hasAsyncProfile {
+		usage, apiErr := handleUpstreamAsyncImageResponse(c, info, httpResp, asyncProfile)
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		return &ImageExecutionResult{Request: request, Usage: usage}, nil
 	}
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)

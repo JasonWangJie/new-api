@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	_ "golang.org/x/image/webp"
 )
 
@@ -304,6 +305,113 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 		return ImageBytes{}, errors.New("image reference read failed")
 	}
 	return ValidateImageBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+}
+
+func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dto.UpstreamAsyncProfile, baseURL, proxy string, values UpstreamAsyncTemplateContext, cfg ImageRuntimeConfig) ([]ImageBytes, error) {
+	if len(urls) == 0 || len(urls) > dto.MaxImageN {
+		return nil, fmt.Errorf("upstream async image result count must be between 1 and %d", dto.MaxImageN)
+	}
+	images := make([]ImageBytes, 0, len(urls))
+	for _, raw := range urls {
+		headers, credentialless, err := BuildUpstreamAsyncDownloadHeaders(profile, raw, baseURL, values)
+		if err != nil {
+			return nil, err
+		}
+		var image ImageBytes
+		if credentialless {
+			image, err = downloadPublicUpstreamAsyncImage(ctx, raw, cfg)
+		} else {
+			image, err = downloadCredentialedUpstreamAsyncImage(ctx, raw, baseURL, proxy, headers, cfg)
+		}
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, image)
+	}
+	return images, nil
+}
+
+func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	parsed, err := validatePublicUpstreamAsyncImageURL(raw)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	dialer := &net.Dialer{Timeout: time.Duration(cfg.DownloadTimeout) * time.Second}
+	baseClient := imageReferenceClient(cfg, net.DefaultResolver, dialer.DialContext)
+	client := *baseClient
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) > cfg.DownloadRedirects {
+			return errors.New("image result redirect limit exceeded")
+		}
+		_, err := validatePublicUpstreamAsyncImageURL(request.URL.String())
+		return err
+	}
+	defer client.CloseIdleConnections()
+	return downloadUpstreamAsyncImage(ctx, &client, parsed.String(), nil, cfg)
+}
+
+func downloadCredentialedUpstreamAsyncImage(ctx context.Context, raw, baseURL, proxy string, headers map[string]string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	resultURL, err := url.Parse(raw)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil || !sameUpstreamAsyncOrigin(base, resultURL) {
+		return ImageBytes{}, errors.New("credentialed image result must use the channel origin")
+	}
+	shared, err := GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	client := *shared
+	client.Timeout = time.Duration(cfg.DownloadTimeout) * time.Second
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) > cfg.DownloadRedirects || !sameUpstreamAsyncOrigin(base, request.URL) {
+			return errors.New("credentialed image result redirect was rejected")
+		}
+		return nil
+	}
+	return downloadUpstreamAsyncImage(ctx, &client, resultURL.String(), headers, cfg)
+}
+
+func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw string, headers map[string]string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	for name, value := range headers {
+		if strings.ContainsAny(name+value, "\r\n") {
+			return ImageBytes{}, errors.New("image result header is invalid")
+		}
+		request.Header.Set(name, value)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return ImageBytes{}, errors.New("image result download failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return ImageBytes{}, fmt.Errorf("image result returned HTTP %d", response.StatusCode)
+	}
+	if response.ContentLength > cfg.DownloadMaxBytes {
+		return ImageBytes{}, newImageValidationError("image result byte limit exceeded")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, cfg.DownloadMaxBytes+1))
+	if err != nil {
+		return ImageBytes{}, errors.New("image result read failed")
+	}
+	return ValidateImageBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+}
+
+func validatePublicUpstreamAsyncImageURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+		return nil, errors.New("anonymous image result requires a public HTTP(S) URL without credentials")
+	}
+	if ip, err := netip.ParseAddr(parsed.Hostname()); err == nil && !ImagePublicIP(ip) {
+		return nil, errors.New("image result address is not public")
+	}
+	return parsed, nil
 }
 
 func (image ImageBytes) DataURL() string {

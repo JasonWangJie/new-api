@@ -37,6 +37,10 @@ type TaskContextPollingAdaptor interface {
 	FetchTaskContext(context.Context, string, string, *model.Task, string) (*http.Response, error)
 }
 
+type TaskCompletionUsageAdaptor interface {
+	ApplyCompletionUsage(*model.Task, *http.Response, []byte, *relaycommon.TaskInfo) error
+}
+
 type BatchTaskPollingAdaptor interface {
 	TaskPollingAdaptor
 	FetchMode() string
@@ -216,8 +220,31 @@ func DispatchPlatformUpdate(ctx context.Context, platform constant.TaskPlatform,
 	}
 	adaptor := GetTaskAdaptorFunc(platform)
 	if batchAdaptor, ok := adaptor.(BatchTaskPollingAdaptor); ok && batchAdaptor.FetchMode() == "batch" {
-		if err := UpdateBatchTasks(ctx, batchAdaptor, taskChannelM, taskM); err != nil {
-			common.SysLog(fmt.Sprintf("UpdateBatchTasks fail: %s", err))
+		dynamicChannels := make(map[int][]string)
+		dynamicTasks := make(map[string]*model.Task)
+		batchChannels := make(map[int][]string)
+		batchTasks := make(map[string]*model.Task)
+		for channelID, upstreamIDs := range taskChannelM {
+			for _, upstreamID := range upstreamIDs {
+				task := taskM[upstreamID]
+				if task != nil && task.PrivateData.UpstreamAsync != nil {
+					dynamicChannels[channelID] = append(dynamicChannels[channelID], upstreamID)
+					dynamicTasks[upstreamID] = task
+					continue
+				}
+				batchChannels[channelID] = append(batchChannels[channelID], upstreamID)
+				batchTasks[upstreamID] = task
+			}
+		}
+		if len(batchChannels) > 0 {
+			if err := UpdateBatchTasks(ctx, batchAdaptor, batchChannels, batchTasks); err != nil {
+				common.SysLog(fmt.Sprintf("UpdateBatchTasks fail: %s", err))
+			}
+		}
+		if len(dynamicChannels) > 0 {
+			if err := UpdateVideoTasks(ctx, platform, dynamicChannels, dynamicTasks); err != nil {
+				common.SysLog(fmt.Sprintf("UpdateVideoTasks fail: %s", err))
+			}
 		}
 		return
 	}
@@ -476,7 +503,10 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	info := &relaycommon.RelayInfo{}
 	info.ChannelMeta = &relaycommon.ChannelMeta{
-		ChannelBaseUrl: cacheGetChannel.GetBaseURL(),
+		ChannelType:          cacheGetChannel.Type,
+		ChannelBaseUrl:       cacheGetChannel.GetBaseURL(),
+		ChannelSetting:       cacheGetChannel.GetSetting(),
+		ChannelOtherSettings: cacheGetChannel.GetOtherSettings(),
 	}
 	info.ApiKey = cacheGetChannel.Key
 	adaptor.Init(info)
@@ -537,11 +567,36 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if privateData.Key != "" {
 		key = privateData.Key
 	}
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:          ch.Type,
+		ChannelBaseUrl:       baseURL,
+		ApiKey:               key,
+		ChannelSetting:       ch.GetSetting(),
+		ChannelOtherSettings: ch.GetOtherSettings(),
+	}})
 	snap := task.Snapshot()
 	var resp *http.Response
 	var err error
 	responseLimit := int64(64 << 20)
-	if task.PrivateData.AsyncMedia {
+	if task.PrivateData.UpstreamAsync != nil {
+		pollContext := ctx
+		var cancel context.CancelFunc
+		if task.PrivateData.AsyncMedia {
+			cfg, configErr := GetMediaRuntimeConfig(ctx)
+			if configErr != nil {
+				return configErr
+			}
+			pollContext, cancel = context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
+			defer cancel()
+			responseLimit = min(maxUpstreamAsyncResponseBytes, cfg.MaxFileBytes*4+(1<<20))
+		}
+		resp, err = PollUpstreamAsync(pollContext, baseURL, proxy, task.PrivateData.UpstreamAsync, UpstreamAsyncTemplateContext{
+			TaskID:        task.GetUpstreamTaskID(),
+			Model:         task.Properties.OriginModelName,
+			UpstreamModel: task.Properties.UpstreamModelName,
+			APIKey:        key,
+		})
+	} else if task.PrivateData.AsyncMedia {
 		cfg, configErr := GetMediaRuntimeConfig(ctx)
 		if configErr != nil {
 			return configErr
@@ -584,19 +639,39 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	taskResult := &relaycommon.TaskInfo{}
-	// try parse as New API response format
-	var responseItems taskdto.TaskResponse[model.Task]
-	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
-		logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
-		t := responseItems.Data
-		taskResult.TaskID = t.TaskID
-		taskResult.Status = string(t.Status)
-		taskResult.Url = t.GetResultURL()
-		taskResult.Progress = t.Progress
-		taskResult.Reason = t.FailReason
-		task.Data = t.Data
-	} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+	if task.PrivateData.UpstreamAsync != nil {
+		parsed, parseErr := ParseUpstreamAsyncPollResponse(task.PrivateData.UpstreamAsync, responseBody)
+		if parseErr != nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, parseErr.Error())
+		}
+		taskResult = &relaycommon.TaskInfo{Status: string(parsed.Status), Progress: parsed.Progress, Reason: parsed.Reason}
+		if len(parsed.URLs) > 0 {
+			taskResult.Url = parsed.URLs[0]
+		}
+		if parsed.Usage != nil {
+			taskResult.TotalTokens = parsed.Usage.TotalTokens
+			taskResult.CompletionTokens = parsed.Usage.CompletionTokens
+		}
+		if usageAdaptor, ok := adaptor.(TaskCompletionUsageAdaptor); ok {
+			if usageErr := usageAdaptor.ApplyCompletionUsage(task, resp, responseBody, taskResult); usageErr != nil {
+				logger.LogWarn(ctx, fmt.Sprintf("task %s completion usage hook failed: %v", task.TaskID, usageErr))
+			}
+		}
+	} else {
+		// try parse as New API response format
+		var responseItems taskdto.TaskResponse[model.Task]
+		if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+			logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
+			t := responseItems.Data
+			taskResult.TaskID = t.TaskID
+			taskResult.Status = string(t.Status)
+			taskResult.Url = t.GetResultURL()
+			taskResult.Progress = t.Progress
+			taskResult.Reason = t.FailReason
+			task.Data = t.Data
+		} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+		}
 	}
 
 	if !task.PrivateData.AsyncMedia {
@@ -604,14 +679,28 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
+	var unrecognizedDetail string
+	if task.PrivateData.UpstreamAsync != nil {
+		unrecognizedDetail = strings.TrimSpace(taskResult.Reason)
+		if unrecognizedDetail == "" {
+			unrecognizedDetail = "configured upstream status did not match"
+		}
+	} else {
+		unrecognizedDetail = unrecognizedPollDetail(taskResult.Reason, responseBody)
+	}
 	if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
+		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
 	}
 	if classifyPollHTTP(resp.StatusCode) == pollClassOtherClient && isNonTerminalPollStatus(parsedStatus) {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
+		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
 	}
 
-	task.Data = responseBody
+	if task.PrivateData.UpstreamAsync != nil {
+		task.PrivateData.UpstreamAsyncResponse = append(task.PrivateData.UpstreamAsyncResponse[:0], responseBody...)
+		task.Data = nil
+	} else {
+		task.Data = responseBody
+	}
 	if len(taskResult.PluginState) > 0 {
 		task.PrivateData.PluginState = taskResult.PluginState
 	}
