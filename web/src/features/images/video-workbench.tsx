@@ -21,27 +21,30 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
+import { Badge } from '@/components/ui/badge'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
 
 import { getImageCapabilities, getImageTask, imageRelayRequest } from './api'
 import { ImageSelect } from './components/image-select'
+import {
+  VideoCapabilityForm,
+  type VideoFormSubmission,
+} from './components/video-capability-form'
 import { VideoResults } from './components/video-results'
 import { imageLabel } from './lib/image-labels'
+
+function pricingStatusLabel(status: string): string {
+  if (status === 'configured') return 'Pricing configured'
+  if (status === 'invalid_configuration') {
+    return 'Pricing configuration is invalid'
+  }
+  return 'Pricing expression required'
+}
 
 export function VideoWorkbench(props: { userId: number }) {
   const { t } = useTranslation()
   const [tokenId, setTokenId] = useState('')
   const [modelId, setModelId] = useState('')
-  const [prompt, setPrompt] = useState('')
-  const [seconds, setSeconds] = useState('8')
-  const [size, setSize] = useState('1280x720')
-  const [reference, setReference] = useState('')
-  const [referenceFile, setReferenceFile] = useState<File | null>(null)
-  const [additional, setAdditional] = useState('{}')
   const [taskId, setTaskId] = useState(
     () => sessionStorage.getItem(`new-api:video-task:${props.userId}`) || ''
   )
@@ -56,7 +59,7 @@ export function VideoWorkbench(props: { userId: number }) {
     enabled: !!tokenId,
   })
   const models = capabilities.data?.video_models || []
-  const model = models.find(
+  const selectedModel = models.find(
     (candidate) => `${candidate.provider}:${candidate.id}` === modelId
   )
   const task = useQuery({
@@ -78,18 +81,8 @@ export function VideoWorkbench(props: { userId: number }) {
     },
   })
   const submit = useMutation({
-    mutationFn: async () => {
-      const extra: unknown = JSON.parse(additional)
-      if (
-        !model?.available ||
-        !prompt.trim() ||
-        !extra ||
-        typeof extra !== 'object' ||
-        Array.isArray(extra) ||
-        !Number.isInteger(Number(seconds)) ||
-        Number(seconds) < 1 ||
-        Number(seconds) > model.max_duration_seconds
-      ) {
+    mutationFn: async (submission: VideoFormSubmission) => {
+      if (!selectedModel?.available) {
         throw new Error(t('Invalid video request'))
       }
       const credential = await fetchTokenKey(Number(tokenId))
@@ -97,35 +90,27 @@ export function VideoWorkbench(props: { userId: number }) {
       if (!credential.success || !key) {
         throw new Error(t('Invalid video request'))
       }
-      if (
-        referenceFile &&
-        (!['image/jpeg', 'image/png'].includes(referenceFile.type) ||
-          referenceFile.size > 20 << 20)
-      ) {
-        throw new Error(t('Invalid video request'))
-      }
-      const fields = {
-        ...extra,
-        model: model.id,
-        provider: model.provider,
-        prompt: prompt.trim(),
-        seconds: Number(seconds),
-        size,
-        ...(reference && !referenceFile ? { input_reference: reference } : {}),
-      }
-      let body: string | FormData = JSON.stringify(fields)
-      if (referenceFile) {
+      let body: string | FormData = JSON.stringify(submission.body)
+      if (submission.files.length > 0) {
         body = new FormData()
-        for (const [name, value] of Object.entries(fields)) {
+        for (const [name, value] of Object.entries(submission.body)) {
           body.append(
             name,
             typeof value === 'string' ? value : JSON.stringify(value)
           )
         }
-        body.append('input_reference', referenceFile)
+        for (const upload of submission.files) {
+          body.append(upload.field, upload.file)
+        }
+      }
+      let endpoint = '/v1/videos/generations_async'
+      if (submission.mode === 'edit_video') {
+        endpoint = '/v1/videos/edits_async'
+      } else if (submission.mode === 'extend_video') {
+        endpoint = '/v1/videos/extensions_async'
       }
       const response = await imageRelayRequest(
-        '/v1/videos/generations_async',
+        endpoint,
         key,
         body,
         submissionKey
@@ -141,9 +126,8 @@ export function VideoWorkbench(props: { userId: number }) {
       setSubmissionKey(crypto.randomUUID())
     },
   })
-  // Changing any input starts a new idempotency scope. Retrying unchanged input
-  // after an uncertain network response retains its key.
   const changed = () => setSubmissionKey(crypto.randomUUID())
+
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Video workbench')}</SectionPageLayout.Title>
@@ -154,14 +138,7 @@ export function VideoWorkbench(props: { userId: number }) {
           )}
         </p>
         <div className='grid gap-6 lg:grid-cols-2'>
-          <form
-            className='space-y-4'
-            onSubmit={(event) => {
-              event.preventDefault()
-              submit.mutate()
-            }}
-            onChange={changed}
-          >
+          <div className='space-y-4'>
             <ImageSelect
               label={t('API Key')}
               value={tokenId}
@@ -189,92 +166,52 @@ export function VideoWorkbench(props: { userId: number }) {
                 changed()
               }}
             />
-            {model && !model.available && (
-              <p role='status' className='text-muted-foreground text-sm'>
-                {t('Async video generation is disabled')}
-              </p>
-            )}
-            <div className='space-y-2'>
-              <Label htmlFor='video-prompt'>{t('Prompt')}</Label>
-              <Textarea
-                id='video-prompt'
-                value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
-                required
-                disabled={submit.isPending}
-              />
-            </div>
-            <div className='grid grid-cols-2 gap-3'>
-              <div className='space-y-2'>
-                <Label htmlFor='video-seconds'>{t('Duration (seconds)')}</Label>
-                <Input
-                  id='video-seconds'
-                  type='number'
-                  min={1}
-                  max={model?.max_duration_seconds}
-                  value={seconds}
-                  onChange={(event) => setSeconds(event.target.value)}
-                  disabled={submit.isPending}
-                />
-              </div>
-              <div className='space-y-2'>
-                <Label htmlFor='video-size'>{t('Size')}</Label>
-                <Input
-                  id='video-size'
-                  value={size}
-                  onChange={(event) => setSize(event.target.value)}
-                  disabled={submit.isPending}
-                />
-              </div>
-            </div>
-            {model?.supported_parameters.includes('input_reference') && (
-              <div className='space-y-2'>
-                <Label htmlFor='video-reference'>
-                  {t('Reference image URL')}
-                </Label>
-                <Input
-                  id='video-reference'
-                  value={reference}
-                  onChange={(event) => setReference(event.target.value)}
-                  disabled={submit.isPending || !!referenceFile}
-                />
-                <Label htmlFor='video-reference-file'>
-                  {t('Upload reference image')}
-                </Label>
-                <Input
-                  id='video-reference-file'
-                  type='file'
-                  accept='image/png,image/jpeg'
-                  disabled={submit.isPending}
-                  onChange={(event) =>
-                    setReferenceFile(event.target.files?.[0] || null)
+            {selectedModel && (
+              <div
+                className='flex flex-wrap items-center gap-2'
+                aria-live='polite'
+              >
+                <Badge
+                  variant={
+                    selectedModel.available ? 'secondary' : 'destructive'
                   }
-                />
+                >
+                  {t(selectedModel.available ? 'Available' : 'Unavailable')}
+                </Badge>
+                <Badge
+                  variant={
+                    selectedModel.pricing_status === 'configured'
+                      ? 'outline'
+                      : 'warning'
+                  }
+                >
+                  {t(
+                    pricingStatusLabel(
+                      selectedModel.pricing_status || 'needs_configuration'
+                    )
+                  )}
+                </Badge>
               </div>
             )}
-            <div className='space-y-2'>
-              <Label htmlFor='video-additional'>
-                {t('Additional parameters')}
-              </Label>
-              <Textarea
-                id='video-additional'
-                value={additional}
-                onChange={(event) => setAdditional(event.target.value)}
-                disabled={submit.isPending}
-              />
-            </div>
-            <Button
-              type='submit'
-              disabled={!model?.available || submit.isPending}
-            >
-              {t(submit.isPending ? 'Submitting...' : 'Generate video')}
-            </Button>
-            {submit.error && (
-              <p role='alert' className='text-destructive text-sm'>
-                {submit.error.message}
+            {selectedModel && !selectedModel.available && (
+              <p role='status' className='text-muted-foreground text-sm'>
+                {t(
+                  selectedModel.availability_reason ||
+                    'Async video generation is disabled'
+                )}
               </p>
             )}
-          </form>
+            {selectedModel && (
+              <VideoCapabilityForm
+                key={`${selectedModel.provider}:${selectedModel.id}`}
+                model={selectedModel}
+                busy={submit.isPending}
+                error={submit.error?.message}
+                onChanged={changed}
+                onSubmit={(submission) => submit.mutate(submission)}
+              />
+            )}
+          </div>
           <div className='space-y-4'>
             {task.data && (
               <p role='status'>

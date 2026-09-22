@@ -24,6 +24,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 
 import { imageRequest } from '../api'
 import { MediaSettingsCard } from '../media-settings'
+import { VideoConfiguration } from '../video-settings'
 
 vi.mock('../api', () => ({ imageRequest: vi.fn() }))
 
@@ -51,9 +52,10 @@ test('shows success feedback after media settings are saved', async () => {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   clients.push(client)
+  const onSuccess = vi.fn().mockResolvedValue(undefined)
   render(
     <QueryClientProvider client={client}>
-      <MediaSettingsCard />
+      <MediaSettingsCard onSuccess={onSuccess} />
     </QueryClientProvider>
   )
   const user = userEvent.setup()
@@ -72,4 +74,101 @@ test('shows success feedback after media settings are saved', async () => {
     )
   )
   expect(success).toHaveBeenCalledWith('Saved')
+  expect(onSuccess).toHaveBeenCalledOnce()
+})
+
+test('shows readiness and imports copy-ready xAI and Seedance video policies', async () => {
+  vi.mocked(imageRequest).mockImplementation(async (url, method, body) => {
+    if (url === '/api/option/images/media') return mediaSettings
+    if (url === '/api/option/images/policy' && method === 'PUT') return body
+    throw new Error(`Unexpected request: ${method} ${url}`)
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  const onSuccess = vi.fn().mockResolvedValue(undefined)
+  render(
+    <QueryClientProvider client={client}>
+      <VideoConfiguration
+        config={{
+          runtime: {},
+          storage_profiles: [],
+          policies: [],
+          pools: [],
+          storage_providers: [],
+          media_providers: ['xai', 'doubao'],
+          video_readiness: {
+            ready: false,
+            checks: [
+              { key: 'video_async_enabled', ready: true },
+              {
+                key: 'payload_encryption',
+                ready: false,
+                reason:
+                  'Asynchronous media payload encryption keys are unavailable',
+              },
+            ],
+          },
+          video_plugin_templates: [
+            {
+              provider: 'xai',
+              name: 'xAI Video',
+              models: ['grok-imagine-video-1.5'],
+              video_profiles: [],
+            },
+            {
+              provider: 'doubao',
+              name: 'Doubao Video',
+              models: ['doubao-seedance-2-0-260128'],
+              video_profiles: [],
+            },
+          ],
+        }}
+        onSuccess={onSuccess}
+      />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+
+  expect(screen.getByText('Global video switch')).toBeVisible()
+  expect(screen.getByText('Payload encryption key')).toBeVisible()
+  expect(
+    screen.getByText(
+      'Asynchronous media payload encryption keys are unavailable'
+    )
+  ).toBeVisible()
+  const catalog = screen.getByRole('textbox', {
+    name: 'Combined image and video model catalog',
+  })
+  expect((catalog as HTMLTextAreaElement).value).toContain(
+    'grok-imagine-video-1.5'
+  )
+
+  await user.click(screen.getByRole('combobox', { name: 'Provider' }))
+  await user.click(screen.getByRole('option', { name: /Doubao Video/ }))
+  await user.click(
+    screen.getByRole('button', { name: 'Import Seedance video models' })
+  )
+  expect((catalog as HTMLTextAreaElement).value).toContain(
+    'doubao-seedance-2-0-260128'
+  )
+  expect((catalog as HTMLTextAreaElement).value).toContain(
+    '"media_type": "video"'
+  )
+  expect(screen.getByText(/Seedance has no built-in USD price/)).toBeVisible()
+
+  await user.click(
+    screen.getByRole('button', { name: 'Video configuration examples' })
+  )
+  expect(screen.getByRole('dialog')).toHaveTextContent('Multimodal references')
+  expect(screen.getByRole('dialog')).toHaveTextContent('asset://character')
+  expect(screen.getByRole('dialog')).toHaveTextContent('/v1/videos/edits_async')
+  expect(screen.getByRole('dialog')).toHaveTextContent(
+    '/v1/videos/extensions_async'
+  )
+  expect(screen.getByRole('dialog')).toHaveTextContent('"output_format":"mov"')
+  expect(screen.getByRole('dialog')).toHaveTextContent(
+    '/v1/media/tasks_async/$TASK_ID'
+  )
 })

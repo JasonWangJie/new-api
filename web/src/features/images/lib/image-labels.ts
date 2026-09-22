@@ -62,6 +62,10 @@ export const IMAGE_LABELS: Record<string, string> = {
   image_to_image: 'Image to image',
   text_to_video: 'Text to video',
   image_to_video: 'Image to video',
+  reference_to_video: 'References to video',
+  first_last_frame: 'First and last frame',
+  edit_video: 'Edit video',
+  extend_video: 'Extend video',
   video: 'Video',
   image: 'Images',
   generating: 'Generating',
@@ -99,7 +103,6 @@ export const IMAGE_LABELS: Record<string, string> = {
 export function imageLabel(value: string): string {
   return IMAGE_LABELS[value] || value
 }
-
 export function imageTimelineLabel(event: {
   event_type?: string
   status: string

@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -213,6 +214,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	}
 	var parsed dto.Request
 	var nativeBody []byte
+	geminiReferenceFallbackEligible := false
 	if request.Platform == "openai" {
 		var images []map[string]string
 		mode := service.ResolveImageReferenceTransportMode(cfg.OpenAIReferenceMode, task.ReferenceRetryCount)
@@ -290,6 +292,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
+		geminiReferenceFallbackEligible = cfg.GeminiReferenceMode == "passthrough_fallback_local" && task.ReferenceRetryCount == 0 && slices.ContainsFunc(parts, func(part dto.GeminiPart) bool {
+			return part.FileData != nil
+		})
 		imageConfig := map[string]string{}
 		if request.Resolution != "" {
 			imageConfig["imageSize"] = request.Resolution
@@ -496,7 +501,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			io.Closer
 		}{io.LimitReader(httpResponse.Body, limit+1), httpResponse.Body}
 		if httpResponse.StatusCode != http.StatusOK {
-			return nil, model.AsyncImageBill{}, service.ClassifyGeminiAsyncImageHTTPFailure(ctx, httpResponse)
+			failure := service.ClassifyGeminiAsyncImageHTTPFailure(ctx, httpResponse)
+			if geminiReferenceFallbackEligible && task.RetryCount < cfg.TotalRetries && service.ShouldFallbackGeminiReferenceTransport(failure) {
+				failure.ReferenceTransportFallback = true
+			}
+			return nil, model.AsyncImageBill{}, failure
 		}
 		value, apiErr := adaptor.DoResponse(c, httpResponse, info)
 		if apiErr != nil {

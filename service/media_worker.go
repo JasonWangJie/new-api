@@ -24,6 +24,7 @@ type AsyncVideoRequest struct {
 	Body        []byte
 	ContentType string
 	ClientIP    string
+	Operation   string
 	Channel     model.Channel
 	Execution   *model.TaskExecutionSnapshot
 	Billing     MediaBillingSnapshot
@@ -157,7 +158,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return nil
 	}
 	if job.DispatchedAt > 0 || job.BillingStatus == "reserving" {
-		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; generation will not be repeated", 0
+		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; the video operation will not be repeated", 0
 		return nil
 	}
 	if SubmitAsyncVideoFunc == nil {
@@ -194,7 +195,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 	}
 	updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "failed", "refunded", "Video submission failed", 0
 	if current.DispatchedAt > 0 {
-		updates["status"], updates["billing_status"], updates["error_message"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; generation will not be repeated"
+		updates["status"], updates["billing_status"], updates["error_message"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; the video operation will not be repeated"
 	}
 	return submitErr
 }

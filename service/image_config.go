@@ -146,15 +146,40 @@ func SaveImageRuntimeConfig(ctx context.Context, cfg ImageRuntimeConfig) error {
 }
 
 type ImageModelCapability struct {
-	Id                 string   `json:"id"`
-	Label              string   `json:"label"`
-	Qualities          []string `json:"qualities,omitempty"`
-	Resolutions        []string `json:"resolutions,omitempty"`
-	Formats            []string `json:"formats,omitempty"`
-	Backgrounds        []string `json:"backgrounds,omitempty"`
-	MaxOutputImages    int      `json:"max_output_images"`
-	MaxReferenceImages int      `json:"max_reference_images"`
-	AllowHalfK         bool     `json:"allow_half_k"`
+	Id                 string              `json:"id"`
+	Label              string              `json:"label"`
+	MediaType          string              `json:"media_type,omitempty"`
+	Qualities          []string            `json:"qualities,omitempty"`
+	Resolutions        []string            `json:"resolutions,omitempty"`
+	Formats            []string            `json:"formats,omitempty"`
+	Backgrounds        []string            `json:"backgrounds,omitempty"`
+	MaxOutputImages    int                 `json:"max_output_images"`
+	MaxReferenceImages int                 `json:"max_reference_images"`
+	AllowHalfK         bool                `json:"allow_half_k"`
+	VideoOverrides     VideoModelOverrides `json:"video_overrides,omitempty"`
+}
+
+type VideoModelOverrides struct {
+	Modes                     []string                `json:"modes,omitempty"`
+	Duration                  *VideoDurationOverrides `json:"duration,omitempty"`
+	Resolutions               []string                `json:"resolutions,omitempty"`
+	DefaultResolution         string                  `json:"default_resolution,omitempty"`
+	AspectRatios              []string                `json:"aspect_ratios,omitempty"`
+	DefaultAspectRatio        string                  `json:"default_aspect_ratio,omitempty"`
+	ExtensionDirections       []string                `json:"extension_directions,omitempty"`
+	DefaultExtensionDirection string                  `json:"default_extension_direction,omitempty"`
+	MaxInputItems             map[string]int          `json:"max_input_items,omitempty"`
+}
+
+type VideoDurationOverrides struct {
+	Min     *int  `json:"min,omitempty"`
+	Max     *int  `json:"max,omitempty"`
+	Values  []int `json:"values,omitempty"`
+	Default *int  `json:"default,omitempty"`
+}
+
+func (capability ImageModelCapability) MatchesMedia(modelName, mediaType string) bool {
+	return capability.Id == modelName && (capability.MediaType == "" || capability.MediaType == mediaType)
 }
 
 func ValidateImageModelName(name string) error {
@@ -211,10 +236,10 @@ func ResolveImagePolicy(ctx context.Context, token model.Token, platform string)
 		if models[i].Label == "" {
 			models[i].Label = models[i].Id
 		}
-		if models[i].MaxOutputImages == 0 {
+		if models[i].MediaType != "video" && models[i].MaxOutputImages == 0 {
 			models[i].MaxOutputImages = dto.MaxImageN
 		}
-		if len(models[i].Resolutions) == 0 {
+		if models[i].MediaType != "video" && len(models[i].Resolutions) == 0 {
 			models[i].Resolutions = []string{"1K", "2K", "4K"}
 		}
 	}
@@ -257,7 +282,7 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 			if !IsUserSelectableGroup(owner.Group, policy.Group) {
 				continue
 			}
-			if !slices.ContainsFunc(catalog, func(capability ImageModelCapability) bool { return capability.Id == request.Model }) {
+			if !slices.ContainsFunc(catalog, func(capability ImageModelCapability) bool { return capability.MatchesMedia(request.Model, "image") }) {
 				continue
 			}
 			channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
@@ -315,10 +340,10 @@ func resolveInheritedImagePolicy(ctx context.Context, token model.Token, request
 				if catalog[i].Label == "" {
 					catalog[i].Label = catalog[i].Id
 				}
-				if catalog[i].MaxOutputImages == 0 {
+				if catalog[i].MediaType != "video" && catalog[i].MaxOutputImages == 0 {
 					catalog[i].MaxOutputImages = dto.MaxImageN
 				}
-				if len(catalog[i].Resolutions) == 0 {
+				if catalog[i].MediaType != "video" && len(catalog[i].Resolutions) == 0 {
 					catalog[i].Resolutions = []string{"1K", "2K", "4K"}
 				}
 			}

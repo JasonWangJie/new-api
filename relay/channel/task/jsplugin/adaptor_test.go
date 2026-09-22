@@ -119,6 +119,47 @@ export function parseSubmitResponse(ctx,r){return {taskId:"1"}} export function 
 	assert.Equal(t, "image-bytes", string(content))
 }
 
+func TestTaskAdaptorKeepsRepeatedMultipartFileReferencesDistinct(t *testing.T) {
+	source := `
+export const meta = {apiVersion:1,key:"multipart-repeated",name:"Multipart Repeated",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit",body:{images:ctx.files.map((file)=>({__fileRef:file.ref,encoding:"dataUrl"}))}}; }
+export function parseSubmitResponse(){return {taskId:"1"}} export function buildQueryRequest(){return {url:"https://example.com"}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+	adaptor.Init(info)
+
+	var input bytes.Buffer
+	writer := multipart.NewWriter(&input)
+	for _, file := range []struct {
+		name, content string
+	}{{"first.png", "first-image"}, {"second.png", "second-image"}} {
+		part, createErr := writer.CreateFormFile("reference_images", file.name)
+		require.NoError(t, createErr)
+		_, writeErr := part.Write([]byte(file.content))
+		require.NoError(t, writeErr)
+	}
+	require.NoError(t, writer.Close())
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(input.Bytes()))
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	c.Set("task_request", map[string]any{"model": "m"})
+
+	body, err := adaptor.BuildRequestBody(c, info)
+	require.NoError(t, err)
+	encoded, err := io.ReadAll(body)
+	require.NoError(t, err)
+	var decoded struct {
+		Images []string `json:"images"`
+	}
+	require.NoError(t, common.Unmarshal(encoded, &decoded))
+	require.Len(t, decoded.Images, 2)
+	assert.Equal(t, "data:application/octet-stream;base64,"+base64.StdEncoding.EncodeToString([]byte("first-image")), decoded.Images[0])
+	assert.Equal(t, "data:application/octet-stream;base64,"+base64.StdEncoding.EncodeToString([]byte("second-image")), decoded.Images[1])
+}
+
 func TestTaskAdaptorInlinesJSONFilePlaceholders(t *testing.T) {
 	const fileBytes = "image-bytes"
 	encoded := base64.StdEncoding.EncodeToString([]byte(fileBytes))

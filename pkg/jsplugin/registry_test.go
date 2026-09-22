@@ -922,6 +922,77 @@ func TestLocalizedTextContract(t *testing.T) {
 		assert.Equal(t, "Video generation via the vendor API", plugin.Meta.Description["en"])
 		assert.Equal(t, "Generated media duration.", plugin.Meta.UsageSchema["seconds"].Description["en"])
 	})
+
+	t.Run("video profiles validate and snapshot deeply", func(t *testing.T) {
+		registry := NewRegistry()
+		plugin, err := registry.Register(
+			routingTestPluginSource(
+				"video-profile",
+				0,
+				`["video-a"]`,
+				`protocols:["openai_video"],videoProfiles: [{models:["video-a"],modes:[{name:"reference_to_video",duration:{values:[5,10],default:5},resolutions:["480p","720p"],defaultResolution:"720p",aspectRatios:["16:9"],defaultAspectRatio:"16:9",inputs:[{name:"reference_images",kind:"image",sources:["url","upload"],maxItems:7,required:true}],options:{generateAudio:true}},{name:"extend_video",duration:{min:2,max:10,step:1,default:6},extensionDirections:["forward","backward"],defaultExtensionDirection:"backward",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]}]}],`,
+				`export const protocols={openai_video:{decodeRequest(){return {kind:"submit",model:"video-a",requestBody:{}}},render(){return {}}}};export function listArtifacts(){return [];}export function buildContentRequest(){return {url:"https://example.com/video"};}`,
+			),
+			Options{},
+		)
+		require.NoError(t, err)
+		profile, ok := plugin.Meta.VideoProfileForModel("VIDEO-A")
+		require.True(t, ok)
+		require.Len(t, profile.Modes, 2)
+		assert.Equal(t, []int{5, 10}, profile.Modes[0].Duration.Values)
+
+		snapshot := registry.Snapshot()
+		require.Len(t, snapshot.Override, 1)
+		snapshot.Override[0].VideoProfiles[0].Models[0] = "changed"
+		snapshot.Override[0].VideoProfiles[0].Modes[0].Duration.Values[0] = 99
+		snapshot.Override[0].VideoProfiles[0].Modes[0].Inputs[0].Sources[0] = "changed"
+		snapshot.Override[0].VideoProfiles[0].Modes[1].ExtensionDirections[0] = "changed"
+		stored, found := registry.Get("video-profile")
+		require.True(t, found)
+		assert.Equal(t, "video-a", stored.Meta.VideoProfiles[0].Models[0])
+		assert.Equal(t, 5, stored.Meta.VideoProfiles[0].Modes[0].Duration.Values[0])
+		assert.Equal(t, "url", stored.Meta.VideoProfiles[0].Modes[0].Inputs[0].Sources[0])
+		assert.Equal(t, "forward", stored.Meta.VideoProfiles[0].Modes[1].ExtensionDirections[0])
+	})
+}
+
+func TestVideoProfilesContract(t *testing.T) {
+	valid := `[{models:["video"],modes:[{name:"text_to_video",duration:{min:1,max:15,step:1,default:5},resolutions:["720p"],defaultResolution:"720p"}]}]`
+	validOperations := `[{models:["video"],modes:[{name:"edit_video",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]},{name:"extend_video",duration:{min:2,max:10,step:1,default:6},extensionDirections:["forward","backward"],defaultExtensionDirection:"backward",inputs:[{name:"video",kind:"video",sources:["url","asset"],maxItems:1,required:true}]}]}]`
+	videoExports := `export const protocols={openai_video:{decodeRequest(){return {kind:"submit",model:"video",requestBody:{}}},render(){return {}}}};export function listArtifacts(){return [];}export function buildContentRequest(){return {url:"https://example.com/video"};}`
+	for _, testCase := range []struct {
+		name, profiles, protocols, models, wantError string
+	}{
+		{name: "valid", profiles: valid, protocols: `"openai_video"`, models: `["video"]`},
+		{name: "valid edit and extension", profiles: validOperations, protocols: `"openai_video"`, models: `["video"]`},
+		{name: "optional locked dimensions", profiles: `[{models:["video"],modes:[{name:"text_to_video"}]}]`, protocols: `"openai_video"`, models: `["video"]`},
+		{name: "edit requires primary video", profiles: `[{models:["video"],modes:[{name:"edit_video"}]}]`, protocols: `"openai_video"`, models: `["video"]`, wantError: "must declare one required video input"},
+		{name: "extend requires directions", profiles: `[{models:["video"],modes:[{name:"extend_video",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]}]}]`, protocols: `"openai_video"`, models: `["video"]`, wantError: "extensionDirections"},
+		{name: "direction only on extension", profiles: `[{models:["video"],modes:[{name:"text_to_video",extensionDirections:["backward"],defaultExtensionDirection:"backward"}]}]`, protocols: `"openai_video"`, models: `["video"]`, wantError: "require extend_video"},
+		{name: "requires video protocol", profiles: valid, protocols: ``, models: `["video"]`, wantError: "requires the openai_video protocol"},
+		{name: "model must belong to plugin", profiles: valid, protocols: `"openai_video"`, models: `["other"]`, wantError: "not declared"},
+		{name: "model must belong to claim", profiles: valid, protocols: `{name:"openai_video",models:["other"]}`, models: `["video","other"]`, wantError: "not bound"},
+		{name: "duplicate ownership", profiles: valid[:len(valid)-1] + `,{models:["video"],modes:[{name:"text_to_video",duration:{values:[5],default:5},resolutions:["720p"],defaultResolution:"720p"}]}]`, protocols: `"openai_video"`, models: `["video"]`, wantError: "multiple profiles"},
+		{name: "unsupported mode", profiles: strings.Replace(valid, "text_to_video", "video_to_video", 1), protocols: `"openai_video"`, models: `["video"]`, wantError: "unsupported name"},
+		{name: "duration exceeds host", profiles: strings.Replace(valid, "max:15", "max:3601", 1), protocols: `"openai_video"`, models: `["video"]`, wantError: "range is invalid"},
+		{name: "default must align", profiles: strings.Replace(valid, "step:1,default:5", "step:4,default:6", 1), protocols: `"openai_video"`, models: `["video"]`, wantError: "align"},
+		{name: "default resolution declared", profiles: strings.Replace(valid, `defaultResolution:"720p"`, `defaultResolution:"1080p"`, 1), protocols: `"openai_video"`, models: `["video"]`, wantError: "default must be one"},
+		{name: "input source validated", profiles: strings.Replace(valid, `defaultResolution:"720p"`, `defaultResolution:"720p",inputs:[{name:"image",kind:"image",sources:["disk"],maxItems:1}]`, 1), protocols: `"openai_video"`, models: `["video"]`, wantError: "unsupported source"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			protocols := ""
+			if testCase.protocols != "" {
+				protocols = `protocols:[` + testCase.protocols + `],`
+			}
+			source := routingTestPluginSource("video-profile-contract", 0, testCase.models, protocols+`videoProfiles:`+testCase.profiles+`,`, videoExports)
+			_, err := CompilePlugin(source, Options{})
+			if testCase.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, testCase.wantError)
+		})
+	}
 }
 
 func TestRegistryNormalizesBaseURL(t *testing.T) {

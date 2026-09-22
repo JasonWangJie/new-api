@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"}
+var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu", "xai"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -53,6 +53,7 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		{1, "sora"},
 		{36, "sunoapi"},
 		{45, "doubao"},
+		{48, "xai"},
 		{50, "kling"},
 		{51, "jimeng"},
 		{54, "doubao"},
@@ -89,6 +90,15 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			registry := jsplugin.NewRegistry()
 			plugin, registerErr := registry.RegisterFactory(source, jsplugin.Options{Key: key})
 			require.NoError(t, registerErr)
+
+			if key == "xai" {
+				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/videos", "grok-imagine-video-1.5")
+				require.True(t, claimed)
+				assert.Same(t, plugin, binding.Plugin)
+				require.NotEmpty(t, plugin.Meta.VideoProfiles)
+				require.NotEmpty(t, plugin.Meta.UsageSchema)
+				return
+			}
 
 			var responsesClaim jsplugin.ProtocolClaim
 			foundResponses := false
@@ -128,6 +138,9 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 	bodyOverrides := map[string]map[string]any{}
 	for _, key := range expectedKeys {
 		t.Run(key, func(t *testing.T) {
+			if key == "xai" {
+				t.Skip("xAI exposes only the host-owned OpenAI Video protocol")
+			}
 			source, sourceErr := Source(key)
 			require.NoError(t, sourceErr)
 			registry := jsplugin.NewRegistry()

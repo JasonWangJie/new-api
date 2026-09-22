@@ -109,26 +109,30 @@ func TestPresentTaskSubmissionFallbackUsesPersistedPublicID(t *testing.T) {
 	}`, recorder.Body.String())
 }
 
-func TestPresentTaskSubmissionUsesHostOpenAIVideoCreateReceipt(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
-	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{
-		Protocol:  "openai_video",
-		Operation: pluginruntime.HostProtocolOperation{Name: "create"},
-	})
-	task := &model.Task{
-		TaskID:     "task_public",
-		Status:     model.TaskStatusSubmitted,
-		Progress:   "0%",
-		CreatedAt:  456,
-		Properties: model.Properties{OriginModelName: "video-model"},
+func TestPresentTaskSubmissionUsesHostOpenAIVideoReceipt(t *testing.T) {
+	for _, operation := range []string{"create", "edit", "extend"} {
+		t.Run(operation, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{
+				Protocol:  "openai_video",
+				Operation: pluginruntime.HostProtocolOperation{Name: operation},
+			})
+			task := &model.Task{
+				TaskID:     "task_public",
+				Status:     model.TaskStatusSubmitted,
+				Progress:   "0%",
+				CreatedAt:  456,
+				Properties: model.Properties{OriginModelName: "video-model"},
+			}
+			outcome := &taskSubmissionOutcome{Result: &relay.TaskSubmitResult{}, Task: task, RelayInfo: &relaycommon.RelayInfo{}}
+
+			presentTaskSubmission(c, outcome)
+
+			assert.JSONEq(t, `{"id":"task_public","object":"video","model":"video-model","status":"queued","progress":0,"created_at":456}`, recorder.Body.String())
+			assert.NotContains(t, recorder.Body.String(), "task_id")
+		})
 	}
-	outcome := &taskSubmissionOutcome{Result: &relay.TaskSubmitResult{}, Task: task, RelayInfo: &relaycommon.RelayInfo{}}
-
-	presentTaskSubmission(c, outcome)
-
-	assert.JSONEq(t, `{"id":"task_public","object":"video","model":"video-model","status":"queued","progress":0,"created_at":456}`, recorder.Body.String())
-	assert.NotContains(t, recorder.Body.String(), "task_id")
 }
 
 func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {

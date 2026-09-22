@@ -20,6 +20,14 @@ export const ASYNC_IMAGE_ENDPOINTS = [
   ['POST', '/v1/images/generations_async', 'Image · capability routed'],
   ['POST', '/v1/images/edits_async', 'Image edit · capability routed'],
   ['POST', '/v1/videos/generations_async', 'Video · OpenAI Video shape'],
+  ['POST', '/v1/videos/edits', 'Video edit · task plugin'],
+  ['POST', '/v1/videos/extensions', 'Video extension · task plugin'],
+  ['POST', '/v1/videos/edits_async', 'Video edit · durable media task'],
+  [
+    'POST',
+    '/v1/videos/extensions_async',
+    'Video extension · durable media task',
+  ],
   ['GET', '/v1/media/tasks_async/{task_id}', 'Unified media task query'],
   ['GET', '/v1/media/objects/{object_id}', 'Signed local video content'],
   ['HEAD', '/v1/media/objects/{object_id}', 'Signed video metadata'],
@@ -65,7 +73,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           paragraphs: [
             '提交和任务查询都使用 Authorization: Bearer <NEW_API_TOKEN>。查询必须使用提交时的同一 Token；同一用户的其他 Token 也会得到 404。签名视频链接不要求 Bearer，但服务端仍会检查原 Token 的状态、有效期和 IP 限制。',
             'provider 是可选的网关调度字段。指定后只在该供应商范围内选渠道，未指定时由分组、模型能力、平台策略和渠道池自动选择；该字段不会发送给上游。',
-            'Idempotency-Key 最多 255 个 UTF-8 字节。图片重放要求同一路径、Token、Key 和完全相同的原始请求字节。视频 JSON 也按请求字节判断；视频 multipart 会忽略随机 boundary，但字段顺序、part 头或内容变化仍会冲突。不同任务应使用新 Key。',
+            'Idempotency-Key 最多 255 个 UTF-8 字节。图片重放要求同一路径、Token、Key 和完全相同的原始请求字节。视频 JSON 也按请求字节判断；生成接口的 multipart 会忽略随机 boundary，但字段顺序、part 头或内容变化仍会冲突。生成、编辑和延长属于不同路径，同一个 Key 跨路径复用会返回 409。',
           ],
         },
         {
@@ -103,11 +111,11 @@ export function asyncImageGuide(chinese: boolean, base: string) {
         },
         {
           id: 'video',
-          title: '异步视频生成与本地保存',
+          title: '异步视频生成、编辑、延长与本地保存',
           paragraphs: [
-            'POST /v1/videos/generations_async 接受 OpenAI Video 形状的 JSON 或 multipart。常用字段为 model、prompt、seconds（兼容 duration）、size 和 input_reference；具体时长、尺寸、参考图和供应商扩展参数由选中的任务插件校验。multipart 参考文件字段名为 input_reference。',
-            '可选 provider 可指定 sora、alibaba、doubao、jimeng、kling、hailuo、vidu、google 或 vertex-ai 等已注册视频供应商。管理员必须启用对应插件、模型能力、分组和渠道；模型名本身不能代替能力声明。',
-            '视频渠道池按 size 的短边归档：不超过 1024 为 1K，1025–2048 为 2K，超过 2048 为 4K。生成完成后，网关通过插件内容描述下载一个或多个产物，流式写入临时文件，验证媒体格式、大小和校验和后原子发布。保存失败只重试保存，不会重新生成或再次计费。',
+            'POST /v1/videos/generations_async 接受 OpenAI Video 形状的 JSON 或 multipart。POST /v1/videos/edits_async 和 POST /v1/videos/extensions_async 只接受 JSON，要求 model、prompt 和直接源 video；延长还接受互斥的 seconds/duration 与 extension_direction。标准任务插件兼容端点为 POST /v1/videos/edits 和 POST /v1/videos/extensions。',
+            'xAI 经典 grok-imagine-video 支持 HTTPS MP4、video/mp4 data URI 或 file_id 的编辑和向后延长；1.5 不支持。Seedance 2.0、Fast、Mini 和 2.5 支持公网 URL 或 asset:// 源视频及额外多模态参考，延长方向默认为 backward。浏览器视频上传和 source_task_id 不受支持。',
+            '可选 provider 只参与网关调度且不会发送到上游。视频渠道池按分辨率档位归档：480p/720p 为 1K，1080p 为 2K，4K 为 4K；xAI 编辑和延长固定按 1K 档路由。产物保存失败只重试保存，不会重新调用生成、编辑或延长，也不会再次计费。',
           ],
         },
         {
@@ -160,7 +168,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           paragraphs: [
             'Send Authorization: Bearer <NEW_API_TOKEN> for submission and task queries. Poll with the exact submitting token; another token owned by the same user still receives 404. Signed video URLs need no Bearer header, but the server rechecks the original token status, expiry and IP restrictions.',
             'provider is an optional gateway routing field. When present, only that provider is considered. Otherwise group access, model capability, platform policy and channel pools select it. The field is never forwarded upstream.',
-            'Idempotency-Key is limited to 255 UTF-8 bytes. Image replay requires the same path, token, key and exact raw request bytes. Video JSON follows the same byte rule. Video multipart ignores a random boundary, while part order, headers and content remain significant. Use a new key for a new task.',
+            'Idempotency-Key is limited to 255 UTF-8 bytes. Image replay requires the same path, token, key and exact raw request bytes. Video JSON follows the same byte rule. Generation multipart ignores a random boundary, while part order, headers and content remain significant. Reusing one key across generation, edit, or extension paths returns 409.',
           ],
         },
         {
@@ -198,11 +206,12 @@ export function asyncImageGuide(chinese: boolean, base: string) {
         },
         {
           id: 'video',
-          title: 'Asynchronous video and local persistence',
+          title:
+            'Asynchronous video generation, editing, extension and persistence',
           paragraphs: [
-            'POST /v1/videos/generations_async accepts an OpenAI Video-shaped JSON or multipart request. Common fields are model, prompt, seconds (duration is accepted as an alias), size and input_reference. The selected task plugin validates exact duration, size, reference-image and provider-extension rules. The multipart reference file field is input_reference.',
-            'The optional provider can select registered video providers such as sora, alibaba, doubao, jimeng, kling, hailuo, vidu, google or vertex-ai. The administrator must enable the matching plugin, model capability, group and channel. A model name alone is never a capability declaration.',
-            'Video pools classify size by its shorter edge: up to 1024 is 1K, 1025–2048 is 2K, and larger is 4K. After generation, the gateway streams one or more plugin-described artifacts into temporary files, validates format, size and checksum, and atomically publishes them. A storage retry never regenerates or charges again.',
+            'POST /v1/videos/generations_async accepts OpenAI Video-shaped JSON or multipart. POST /v1/videos/edits_async and POST /v1/videos/extensions_async accept JSON only and require model, prompt, and a direct video source; extension also accepts mutually exclusive seconds/duration and extension_direction. The standard task-plugin compatibility routes are POST /v1/videos/edits and POST /v1/videos/extensions.',
+            'Classic grok-imagine-video accepts HTTPS MP4, video/mp4 data URI, or file_id for editing and backward extension; 1.5 does not. Seedance 2.0, Fast, Mini, and 2.5 accept public URL or asset:// source videos plus optional multimodal references, with backward as the default extension direction. Browser video uploads and source_task_id are unsupported.',
+            'provider controls gateway routing and is never forwarded upstream. Video pools map 480p/720p to 1K, 1080p to 2K, and 4K to 4K; xAI edit and extension use the 1K tier. Storage recovery never repeats generation, editing, or extension and never charges again.',
           ],
         },
         {
@@ -308,6 +317,31 @@ export function asyncImageGuide(chinese: boolean, base: string) {
     null,
     2
   )
+  const videoEdit = JSON.stringify(
+    {
+      provider: 'xai',
+      model: 'grok-imagine-video',
+      prompt: chinese ? '将天空替换为日落' : 'Replace the sky with a sunset',
+      video: { url: 'https://cdn.example/source.mp4' },
+    },
+    null,
+    2
+  )
+  const videoExtension = JSON.stringify(
+    {
+      provider: 'doubao',
+      model: 'doubao-seedance-2-5-260628',
+      prompt: chinese
+        ? '向前延长并展示城门后的城市'
+        : 'Extend forward and reveal the city beyond the gate',
+      video: 'asset://source-video',
+      seconds: 8,
+      extension_direction: 'forward',
+      resolution: '720p',
+    },
+    null,
+    2
+  )
   const examples: Record<string, string[]> = {
     authentication: [
       `export NEW_API_TOKEN='YOUR_NEW_API_TOKEN'\nexport NEW_API_BASE='${base}'`,
@@ -406,6 +440,12 @@ export function asyncImageGuide(chinese: boolean, base: string) {
       ),
     ],
   }
+  examples.video.push(
+    `curl -X POST '${base}/v1/videos/edits' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoEdit}'`,
+    `curl -X POST '${base}/v1/videos/edits_async' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' -H 'Idempotency-Key: video-edit-example-001' --data '${videoEdit}'`,
+    `curl -X POST '${base}/v1/videos/extensions' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoExtension}'`,
+    `curl -X POST '${base}/v1/videos/extensions_async' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' -H 'Idempotency-Key: video-extension-example-001' --data '${videoExtension}'`
+  )
   return sections.map((section) => ({
     ...section,
     examples: examples[section.id] || [],

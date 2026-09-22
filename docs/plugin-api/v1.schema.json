@@ -20,7 +20,7 @@
     ]}},
     "submitResponseTypes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["json", "sse"]}},
     "requiredCapabilities": {"type": "array", "uniqueItems": true, "items": {"enum": ["json-clone@1", "submit-sse-delta@1"]}},
-    "routes": {"type": "array", "items": {"$ref": "#/$defs/route"}}, "usageSchema": {"type": "object", "additionalProperties": {"$ref": "#/$defs/usageField"}}, "usageExamples": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["label", "facts"], "properties": {"label": {"type": "string"}, "facts": {"type": "object"}}}}, "usageProfiles": {"type": "array", "items": {"$ref": "#/$defs/usageProfile"}}, "auth": {}
+    "routes": {"type": "array", "items": {"$ref": "#/$defs/route"}}, "usageSchema": {"type": "object", "additionalProperties": {"$ref": "#/$defs/usageField"}}, "usageExamples": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["label", "facts"], "properties": {"label": {"type": "string"}, "facts": {"type": "object"}}}}, "usageProfiles": {"type": "array", "items": {"$ref": "#/$defs/usageProfile"}}, "videoProfiles": {"type": "array", "items": {"$ref": "#/$defs/videoProfile"}}, "auth": {}
   },
   "allOf": [{"if": {"required": ["requiredCapabilities"], "properties": {"requiredCapabilities": {"contains": {"const": "submit-sse-delta@1"}}}}, "then": {"required": ["submitResponseTypes"], "properties": {"submitResponseTypes": {"contains": {"const": "sse"}}}}}],
   "$defs": {
@@ -51,6 +51,63 @@
         "examples": {"type": "array", "maxItems": 16, "items": {"$ref": "#/properties/usageExamples/items"}}
       },
       "description": "Complete usage metadata for declared models. The host validates model membership, unique profile ownership and examples, including required token-unit examples."
+    },
+    "videoProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["models", "modes"],
+      "properties": {
+        "models": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "modes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/videoMode"}}
+      }
+    },
+    "videoMode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"enum": ["text_to_video", "image_to_video", "reference_to_video", "first_last_frame", "edit_video", "extend_video"]},
+        "duration": {"$ref": "#/$defs/videoDuration"},
+        "resolutions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "defaultResolution": {"type": "string", "minLength": 1},
+        "aspectRatios": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "defaultAspectRatio": {"type": "string", "minLength": 1},
+        "extensionDirections": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["forward", "backward"]}},
+        "defaultExtensionDirection": {"enum": ["forward", "backward"]},
+        "inputs": {"type": "array", "items": {"$ref": "#/$defs/videoInput"}},
+        "options": {"$ref": "#/$defs/videoOptions"}
+      },
+      "allOf": [
+        {"if": {"properties": {"name": {"enum": ["edit_video", "extend_video"]}}}, "then": {"required": ["inputs"], "properties": {"inputs": {"contains": {"type": "object", "required": ["name", "kind", "maxItems", "required"], "properties": {"name": {"const": "video"}, "kind": {"const": "video"}, "maxItems": {"const": 1}, "required": {"const": true}}}, "minContains": 1, "maxContains": 1}}}},
+        {"if": {"properties": {"name": {"const": "extend_video"}}}, "then": {"required": ["extensionDirections", "defaultExtensionDirection"]}, "else": {"not": {"anyOf": [{"required": ["extensionDirections"]}, {"required": ["defaultExtensionDirection"]}]}}}
+      ]
+    },
+    "videoDuration": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["min", "max", "step", "default"], "properties": {"min": {"type": "integer", "minimum": 1, "maximum": 3600}, "max": {"type": "integer", "minimum": 1, "maximum": 3600}, "step": {"type": "integer", "minimum": 1, "maximum": 3600}, "default": {"type": "integer", "minimum": 1, "maximum": 3600}}},
+        {"type": "object", "additionalProperties": false, "required": ["values", "default"], "properties": {"values": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 3600}}, "default": {"type": "integer", "minimum": 1, "maximum": 3600}}}
+      ]
+    },
+    "videoInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "sources", "maxItems"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["image", "video", "audio"]},
+        "sources": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["url", "asset", "data_uri", "file_id", "voice_id", "upload"]}},
+        "maxItems": {"type": "integer", "minimum": 1, "maximum": 64},
+        "required": {"type": "boolean"}
+      }
+    },
+    "videoOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generateAudio": {"type": "boolean"},
+        "watermark": {"type": "boolean"},
+        "returnLastFrame": {"type": "boolean"}
+      }
     },
     "usageField": {
       "type": "object",

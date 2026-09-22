@@ -85,6 +85,8 @@ var hostProtocols = []HostProtocolDefinition{
 	}},
 	{Name: "openai_video", Operations: []HostProtocolOperation{
 		{Name: "create", Methods: []string{http.MethodPost}, Path: "/v1/videos", BodyKinds: []BodyKind{BodyJSON, BodyMultipart}, ModelField: "model", RequiredProtocolMembers: []string{"decodeRequest"}},
+		{Name: "edit", Methods: []string{http.MethodPost}, Path: "/v1/videos/edits", BodyKinds: []BodyKind{BodyJSON}, ModelField: "model", RequiredProtocolMembers: []string{"decodeRequest"}},
+		{Name: "extend", Methods: []string{http.MethodPost}, Path: "/v1/videos/extensions", BodyKinds: []BodyKind{BodyJSON}, ModelField: "model", RequiredProtocolMembers: []string{"decodeRequest"}},
 		{Name: "retrieve", Methods: []string{http.MethodGet}, Path: "/v1/videos/:task_id", BodyKinds: []BodyKind{BodyNone}, RequiredProtocolMembers: []string{"render"}},
 		{Name: "content", Methods: []string{http.MethodGet, http.MethodHead}, Path: "/v1/videos/:task_id/content", BodyKinds: []BodyKind{BodyNone}, RequiredDriverHooks: []string{"listArtifacts", "buildContentRequest"}},
 	}},
@@ -939,6 +941,13 @@ func buildRoutingGenerationFromPlugins(effective map[string]*LoadedPlugin, numbe
 				}
 				for _, method := range operation.Methods {
 					for _, model := range boundModels {
+						if claim.Name == "openai_video" && (operation.Name == "edit" || operation.Name == "extend") {
+							profile, declared := plugin.Meta.VideoProfileForModel(model)
+							modeName := operation.Name + "_video"
+							if !declared || !slices.ContainsFunc(profile.Modes, func(mode VideoModeProfile) bool { return mode.Name == modeName }) {
+								continue
+							}
+						}
 						indexKey := endpointIndexKey(method, operation.Path, model)
 						bindings := generation.protocolIndex[indexKey]
 						if len(bindings) > 0 {

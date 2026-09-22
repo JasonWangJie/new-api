@@ -14,6 +14,8 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -91,6 +93,9 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				}
 			}
 			for _, capability := range catalog {
+				if capability.MediaType == "video" {
+					continue
+				}
 				scoped = append(scoped, scopedCapability{policy: policy, capability: capability})
 			}
 			versionFacts = append(versionFacts, policy)
@@ -193,7 +198,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 		}
 		platforms = append(platforms, gin.H{"provider": platform, "media_type": "image", "platform": platform, "mode": providerMode, "protocol": providerProtocol, "available": providerAvailable, "reason": providerReason, "group": providerGroup})
 	}
-	videoCfg, err := service.GetMediaRuntimeConfig(ctx)
+	videoReadiness, err := service.GetVideoReadiness(ctx)
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
@@ -233,7 +238,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 					return
 				}
 				allowedGroup := policy.Group == ability.Group || policy.Group == "auto" && slices.Contains(service.GetUserAutoGroup(owner.Group), ability.Group)
-				if !allowedGroup || !service.GroupInUserUsableGroups(owner.Group, ability.Group) || policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !slices.ContainsFunc(catalog, func(capability service.ImageModelCapability) bool { return capability.Id == ability.Model })) {
+				if !allowedGroup || !service.GroupInUserUsableGroups(owner.Group, ability.Group) {
 					continue
 				}
 				matches, _ := model.ChannelSatisfiesFilters(channel, ability.Model, []gatewaydto.ChannelFilter{{Kind: gatewaydto.FilterTaskPluginIdentity, TaskPluginKey: provider, TaskPluginChannelTypes: candidate.Plugin.Meta.ChannelTypes}})
@@ -241,12 +246,49 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 					continue
 				}
 				seen[key] = true
-				available := valid && videoCfg.VideoAsyncEnabled && service.ImageEncryptionAvailable() && common.RedisEnabled && common.RDB != nil
-				videoModels = append(videoModels, gin.H{"id": ability.Model, "label": ability.Model, "provider": provider, "media_type": "video", "protocol": "openai_video", "mode": "async", "available": available, "supported_parameters": []string{"model", "prompt", "seconds", "size", "input_reference", "provider_extensions"}, "max_duration_seconds": relaycommon.MaxTaskDurationSeconds})
+				capability, selected := service.VideoPolicyCapability(catalog, ability.Model)
+				profile, profileErr := service.EffectiveVideoProfile(candidate, ability.Model, capability.VideoOverrides)
+				available := valid && videoReadiness.Ready
+				availabilityReason := ""
+				switch {
+				case !valid:
+					availabilityReason = "Token is unavailable"
+				case policy.Id != 0 && !policy.Enabled:
+					available, availabilityReason = false, "Video provider policy is disabled"
+				case policy.Id != 0 && !policy.AsyncEnabled:
+					available, availabilityReason = false, "Asynchronous video is disabled by the provider policy"
+				case policy.Id != 0 && !selected:
+					available, availabilityReason = false, "Video model is not selected by the provider policy"
+				case profileErr != nil:
+					available, availabilityReason = false, "Video policy capability is invalid"
+				case !videoReadiness.Ready:
+					availabilityReason = "Asynchronous video service is unavailable"
+				}
+				if profileErr != nil {
+					profile = service.GenericVideoProfile(ability.Model)
+				}
+				label := capability.Label
+				if label == "" {
+					label = ability.Model
+				}
+				videoModels = append(videoModels, gin.H{
+					"id":                   ability.Model,
+					"label":                label,
+					"provider":             provider,
+					"media_type":           "video",
+					"protocol":             "openai_video",
+					"mode":                 "async",
+					"available":            available,
+					"availability_reason":  availabilityReason,
+					"pricing_status":       videoPricingStatus(provider, ability.Model, candidate.Model, candidate.Plugin),
+					"capability":           profile,
+					"supported_parameters": []string{"model", "prompt", "seconds", "duration", "size", "resolution", "aspect_ratio", "generate_audio", "image", "input_reference", "last_frame", "reference_images", "reference_videos", "reference_audios", "provider_extensions"},
+					"max_duration_seconds": videoProfileMaxDuration(profile),
+				})
 			}
 		}
 	}
-	versionFacts = append(versionFacts, videoCfg, videoModels)
+	versionFacts = append(versionFacts, videoReadiness, videoModels)
 	var pools []model.ImageChannelPool
 	if err := model.DB.WithContext(ctx).Find(&pools).Error; err != nil {
 		imageManagementError(c, 503, err)
@@ -259,5 +301,55 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 		return
 	}
 	slices.SortFunc(models, func(a, b gin.H) int { return strings.Compare(a["id"].(string), b["id"].(string)) })
+	slices.SortFunc(videoModels, func(a, b gin.H) int {
+		providerOrder := strings.Compare(a["provider"].(string), b["provider"].(string))
+		if providerOrder != 0 {
+			return providerOrder
+		}
+		return strings.Compare(a["id"].(string), b["id"].(string))
+	})
 	imageManagementData(c, gin.H{"api_key_id": token.Id, "platforms": platforms, "models": models, "video_models": videoModels, "image_providers": service.RegisteredImageProviders(), "capability_version": service.ImageIdentityHash(string(encoded)), "gateway_base_url": AsyncImageGatewayBase(), "local_library_defaults": gin.H{"retention_days": 30, "max_items": 100, "max_bytes": 200 << 20}, "poll_interval_seconds": 3})
+}
+
+func videoProfileMaxDuration(profile pluginruntime.VideoProfile) int {
+	maximum := 0
+	for _, mode := range profile.Modes {
+		if mode.Duration == nil {
+			continue
+		}
+		if len(mode.Duration.Values) > 0 {
+			for _, value := range mode.Duration.Values {
+				maximum = max(maximum, value)
+			}
+			continue
+		}
+		maximum = max(maximum, mode.Duration.Max)
+	}
+	if maximum == 0 {
+		return relaycommon.MaxTaskDurationSeconds
+	}
+	return maximum
+}
+
+func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginruntime.LoadedPlugin) string {
+	expression, exists := billing_setting.ResolveTaskBillingExpr(provider, modelName, mappedModel)
+	if exists {
+		schema, _ := plugin.Meta.UsageForModel(mappedModel)
+		if billing_setting.TaskExprCompatible(expression, schema) {
+			return "configured"
+		}
+		return "invalid_configuration"
+	}
+	for _, name := range []string{modelName, mappedModel} {
+		if name == "" {
+			continue
+		}
+		if ratio_setting.HasConfiguredModelRatio(name) {
+			return "configured"
+		}
+		if _, configured := ratio_setting.GetModelPrice(name, false); configured {
+			return "configured"
+		}
+	}
+	return "needs_configuration"
 }

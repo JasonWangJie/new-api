@@ -17,14 +17,67 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 export type ImagePlatform = string
+export type VideoModeName =
+  | 'text_to_video'
+  | 'image_to_video'
+  | 'reference_to_video'
+  | 'first_last_frame'
+  | 'edit_video'
+  | 'extend_video'
+export type VideoDurationCapability = {
+  min?: number
+  max?: number
+  step?: number
+  values?: number[]
+  default: number
+}
+export type VideoInputCapability = {
+  name:
+    | 'image'
+    | 'last_frame'
+    | 'reference_images'
+    | 'reference_videos'
+    | 'reference_audios'
+    | 'video'
+  kind: 'image' | 'video' | 'audio'
+  sources: ('url' | 'asset' | 'data_uri' | 'file_id' | 'voice_id' | 'upload')[]
+  maxItems: number
+  required?: boolean
+}
+export type VideoModeCapability = {
+  name: VideoModeName
+  duration?: VideoDurationCapability
+  resolutions?: string[]
+  defaultResolution?: string
+  aspectRatios?: string[]
+  defaultAspectRatio?: string
+  extensionDirections?: ('forward' | 'backward')[]
+  defaultExtensionDirection?: 'forward' | 'backward'
+  inputs?: VideoInputCapability[]
+  options?: {
+    generateAudio?: boolean
+    watermark?: boolean
+    returnLastFrame?: boolean
+  }
+}
+export type VideoCapability = {
+  models: string[]
+  modes: VideoModeCapability[]
+}
 export type VideoModel = {
   id: string
   label: string
   provider: string
   available: boolean
+  availability_reason?: string
+  pricing_status?:
+    | 'configured'
+    | 'needs_configuration'
+    | 'invalid_configuration'
   protocol: string
   supported_parameters: string[]
   max_duration_seconds: number
+  capability: VideoCapability
 }
 export type ImageModel = {
   provider?: string
@@ -208,3 +261,64 @@ export type ImagePublication = {
   expires_at: number
 }
 export type CursorPage<T> = { items: T[]; next_cursor: string }
+export type ImageStorageProfile = {
+  profile_id: string
+  class: string
+  backend: string
+  provider: string
+  root: string
+  endpoint: string
+  bucket: string
+  region: string
+  prefix: string
+  active: boolean
+  path_style: boolean
+}
+export type ImageChannelPool = {
+  binding_key: string
+  group: string
+  platform: string
+  mode: string
+  model: string
+  resolution: string
+  channel_id: number
+  priority: number
+}
+export type VideoReadiness = {
+  ready: boolean
+  checks: { key: string; ready: boolean; reason?: string }[]
+}
+export type VideoPluginTemplate = {
+  provider: string
+  name: string
+  models: string[]
+  video_profiles: VideoCapability[]
+}
+export type ImageAdminConfiguration = {
+  image_providers?: string[]
+  media_providers?: string[]
+  runtime: Record<string, string | number | boolean>
+  storage_profiles: ImageStorageProfile[]
+  policies: {
+    group: string
+    platform: string
+    pool_mode: string
+    enabled: boolean
+    async_enabled: boolean
+    models: string
+    version: number
+  }[]
+  pools: ImageChannelPool[]
+  storage_providers: string[]
+  video_readiness?: VideoReadiness
+  video_plugin_templates?: VideoPluginTemplate[]
+}
+export type ImagePoolSelectionOptions = {
+  models: {
+    id: string
+    label: string
+    media_types?: ('image' | 'video')[]
+    channel_ids: number[]
+  }[]
+  channels: { id: number; name: string }[]
+}

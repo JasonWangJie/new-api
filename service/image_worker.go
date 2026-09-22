@@ -472,7 +472,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			last.ProviderCode = failure.ProviderCode
 			last.ProviderStatus = failure.ProviderStatus
 			last.UpstreamRequestID = failure.UpstreamRequestID
-			last.ReferenceFailure = last.Dispatched && failure.Code == 602 && failure.InternalCode == "upstream_failed"
+			last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && failure.InternalCode == "upstream_failed")
 			encoded, err := common.Marshal(attempts)
 			if err != nil {
 				return err
@@ -487,19 +487,23 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		status = model.ImageTaskExpired
 	} else if task.RetryCount < cfg.TotalRetries {
 		count, maximum, base, maxDelay, key := 0, 0, 0, 0, ""
-		switch failure.Code {
-		case 602:
-			count, maximum, base, maxDelay, key = task.ReferenceRetryCount, cfg.ReferenceRetries, cfg.ReferenceRetryBase, cfg.ReferenceRetryMax, "reference_retry_count"
-			if task.DispatchedAt > 0 && failure.InternalCode == "upstream_failed" {
-				maximum++
+		if failure.ReferenceTransportFallback {
+			count, maximum, base, maxDelay, key = task.ReferenceRetryCount, 1, cfg.ReferenceRetryBase, cfg.ReferenceRetryMax, "reference_retry_count"
+		} else {
+			switch failure.Code {
+			case 602:
+				count, maximum, base, maxDelay, key = task.ReferenceRetryCount, cfg.ReferenceRetries, cfg.ReferenceRetryBase, cfg.ReferenceRetryMax, "reference_retry_count"
+				if task.DispatchedAt > 0 && failure.InternalCode == "upstream_failed" {
+					maximum++
+				}
+				if failure.InternalCode == "reference_accounts_exhausted" {
+					maximum = 0
+				}
+			case 603:
+				count, maximum, base, maxDelay, key = task.CapacityRetryCount, cfg.CapacityRetries, cfg.CapacityRetryBase, cfg.CapacityRetryMax, "capacity_retry_count"
+			case 605, 606:
+				count, maximum, base, maxDelay, key = task.TransientRetryCount, cfg.TransientRetries, cfg.TransientRetryBase, cfg.TransientRetryMax, "transient_retry_count"
 			}
-			if failure.InternalCode == "reference_accounts_exhausted" {
-				maximum = 0
-			}
-		case 603:
-			count, maximum, base, maxDelay, key = task.CapacityRetryCount, cfg.CapacityRetries, cfg.CapacityRetryBase, cfg.CapacityRetryMax, "capacity_retry_count"
-		case 605, 606:
-			count, maximum, base, maxDelay, key = task.TransientRetryCount, cfg.TransientRetries, cfg.TransientRetryBase, cfg.TransientRetryMax, "transient_retry_count"
 		}
 		if key != "" && count < maximum {
 			delay := ImageRetryDelay(base, maxDelay, count, cfg.RetryJitter, failure.RetryAfter, cfg.RetryAfterMax)

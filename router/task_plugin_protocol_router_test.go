@@ -17,6 +17,8 @@ func TestHostProtocolRegistryDrivesProtocolRoutesOnce(t *testing.T) {
 		"POST /v1/responses",
 		"GET /v1/responses/:response_id",
 		"POST /v1/videos",
+		"POST /v1/videos/edits",
+		"POST /v1/videos/extensions",
 		"GET /v1/videos/:task_id",
 		"GET /v1/videos/:task_id/content",
 		"HEAD /v1/videos/:task_id/content",

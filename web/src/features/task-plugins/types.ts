@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { VideoCapability } from '@/features/images/types'
 import type {
   BillingUsageSchema,
   BillingUsageExample,
@@ -66,6 +67,7 @@ export type TaskPluginMeta = {
     schema: BillingUsageSchema
     examples?: BillingUsageExample[]
   }[]
+  videoProfiles?: VideoCapability[]
 }
 
 export type TaskPluginRecord = {

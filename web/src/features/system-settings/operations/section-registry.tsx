@@ -143,7 +143,7 @@ const OPERATIONS_SECTIONS = [
       />
     ),
   },
-  { id: 'images', titleKey: 'Image Settings', build: () => <ImageSettings /> },
+  { id: 'images', titleKey: 'Media Settings', build: () => <ImageSettings /> },
 ] as const
 
 export type OperationsSectionId = (typeof OPERATIONS_SECTIONS)[number]['id']

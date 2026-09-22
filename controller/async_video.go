@@ -38,6 +38,31 @@ import (
 // PrepareAsyncVideo uses the existing /videos protocol pipeline after removing
 // the gateway-only provider field. Multipart parts and headers stay intact.
 func PrepareAsyncVideo(c *gin.Context) {
+	prepareAsyncVideo(c, "create")
+}
+
+func PrepareAsyncVideoEdit(c *gin.Context) {
+	prepareAsyncVideo(c, "edit")
+}
+
+func PrepareAsyncVideoExtension(c *gin.Context) {
+	prepareAsyncVideo(c, "extend")
+}
+
+func asyncVideoInternalPath(operation string) (string, bool) {
+	switch operation {
+	case "", "create":
+		return "/v1/videos", true
+	case "edit":
+		return "/v1/videos/edits", true
+	case "extend":
+		return "/v1/videos/extensions", true
+	default:
+		return "", false
+	}
+}
+
+func prepareAsyncVideo(c *gin.Context, operation string) {
 	defer common.CleanupBodyStorage(c)
 	raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 64<<20))
 	if err != nil {
@@ -73,6 +98,10 @@ func PrepareAsyncVideo(c *gin.Context) {
 			body, err = common.Marshal(fields)
 		}
 	case "multipart/form-data":
+		if operation != "create" {
+			err = errors.New("video editing and extension require JSON")
+			break
+		}
 		reader := multipart.NewReader(bytes.NewReader(raw), params["boundary"])
 		var encoded bytes.Buffer
 		writer := multipart.NewWriter(&encoded)
@@ -136,6 +165,7 @@ func PrepareAsyncVideo(c *gin.Context) {
 		return
 	}
 	c.Set("async_media_provider", provider)
+	c.Set("async_media_operation", operation)
 	c.Set("async_media_request_hash", service.AsyncImageRequestHash("video", "openai_video", c.Request.URL.Path, hashBody))
 	key, err := AsyncImageIdempotencyKey(c)
 	if err != nil {
@@ -166,7 +196,13 @@ func PrepareAsyncVideo(c *gin.Context) {
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	c.Request.ContentLength = int64(len(body))
 	c.Request.Header.Set("Content-Type", contentType)
-	c.Request.URL.Path = "/v1/videos"
+	internalPath, ok := asyncVideoInternalPath(operation)
+	if !ok {
+		AsyncImagePublicError(c, 400, "invalid_request", "Invalid video operation")
+		c.Abort()
+		return
+	}
+	c.Request.URL.Path = internalPath
 	c.Next()
 }
 
@@ -174,7 +210,7 @@ func FilterAsyncVideoProvider(c *gin.Context) {
 	value, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 	pinned, ok := value.(pluginruntime.PinnedEndpoint)
 	if !ok || pinned.Plugin == nil || pinned.Protocol != "openai_video" {
-		AsyncImagePublicError(c, 400, "unsupported_model", "Model has no video generation capability")
+		AsyncImagePublicError(c, 400, "unsupported_model", "Model has no capability for this video operation")
 		c.Abort()
 		return
 	}
@@ -192,6 +228,56 @@ func FilterAsyncVideoProvider(c *gin.Context) {
 		c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: pinned.Generation, Plugin: pinned.Plugin})
 	}
 	c.Next()
+}
+
+func asyncVideoCapabilityRequest(c *gin.Context) (map[string]any, []map[string]any, string, string, error) {
+	requestValue, exists := c.Get("task_request")
+	if !exists {
+		return nil, nil, "", "", errors.New("video request is unavailable")
+	}
+	requestData, err := common.Marshal(requestValue)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+	request := make(map[string]any)
+	if err := common.Unmarshal(requestData, &request); err != nil {
+		return nil, nil, "", "", err
+	}
+	var parameters struct {
+		Size       string `json:"size"`
+		Resolution string `json:"resolution"`
+		Metadata   struct {
+			Size       string `json:"size"`
+			Resolution string `json:"resolution"`
+		} `json:"metadata"`
+	}
+	if err := common.Unmarshal(requestData, &parameters); err != nil {
+		return nil, nil, "", "", err
+	}
+	resolution := parameters.Resolution
+	if resolution == "" {
+		resolution = parameters.Metadata.Resolution
+	}
+	if resolution == "" {
+		resolution = parameters.Size
+	}
+	if resolution == "" {
+		resolution = parameters.Metadata.Size
+	}
+	var files []map[string]any
+	if value, ok := c.Get(pluginruntime.ContextKeyRouteRequest); ok {
+		if routeRequest, ok := value.(pluginruntime.RouteRequestContext); ok {
+			files = routeRequest.Files
+		}
+	}
+	action := c.GetString("task_action")
+	if action == "" {
+		action = "text_to_video"
+		if request["image"] != nil || request["input_reference"] != nil || len(files) > 0 {
+			action = "image_to_video"
+		}
+	}
+	return request, files, action, resolution, nil
 }
 
 // RouteAsyncVideo applies provider policy before freezing a channel. A provider
@@ -219,18 +305,16 @@ func RouteAsyncVideo(c *gin.Context) {
 		binding pluginruntime.ProtocolBinding
 	}
 	choices := make([]choice, 0)
-	var videoParameters struct {
-		Size string `json:"size"`
-	}
-	requestValue, _ := c.Get("task_request")
-	requestData, err := common.Marshal(requestValue)
-	if err != nil || common.Unmarshal(requestData, &videoParameters) != nil {
-		c.AbortWithStatus(400)
+	videoRequest, videoFiles, videoAction, videoResolution, err := asyncVideoCapabilityRequest(c)
+	if err != nil {
+		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
+		c.Abort()
 		return
 	}
-	resolution := service.VideoPoolResolution(videoParameters.Size)
+	resolution := service.VideoPoolResolution(videoResolution)
 	constraints := service.GetChannelConstraints(c)
 	forced, hasForced, _ := constraints.ResolvedPin()
+	var capabilityErr error
 	for _, binding := range pinned.Candidates {
 		if binding.Plugin == nil || binding.Protocol != "openai_video" {
 			continue
@@ -241,7 +325,17 @@ func RouteAsyncVideo(c *gin.Context) {
 			c.AbortWithStatus(503)
 			return
 		}
-		if policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !slices.ContainsFunc(catalog, func(capability service.ImageModelCapability) bool { return capability.Id == pinned.Model })) {
+		capability, selected := service.VideoPolicyCapability(catalog, pinned.Model)
+		if policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !selected) {
+			continue
+		}
+		profile, profileErr := service.EffectiveVideoProfile(binding, pinned.Model, capability.VideoOverrides)
+		if profileErr != nil {
+			capabilityErr = profileErr
+			continue
+		}
+		if profileErr = service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
+			capabilityErr = profileErr
 			continue
 		}
 		groups := []string{policy.Group}
@@ -297,6 +391,11 @@ func RouteAsyncVideo(c *gin.Context) {
 		}
 	}
 	if len(choices) == 0 {
+		if capabilityErr != nil {
+			AsyncImagePublicError(c, 400, "invalid_request", capabilityErr.Error())
+			c.Abort()
+			return
+		}
 		AsyncImagePublicError(c, 403, "provider_unavailable", "No authorized video channel is available")
 		c.Abort()
 		return
@@ -411,7 +510,7 @@ func AcceptAsyncVideo(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", "Video body is unavailable")
 		return
 	}
-	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
+	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
 	if value, ok := c.Get(pluginruntime.ContextKeyPinnedPlugin); ok {
 		if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
 			request.PluginHash = pinned.Plugin.Engine.SourceFingerprint()
@@ -463,10 +562,17 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 	engine := gin.New()
 	_ = engine.SetTrustedProxies(nil)
 	var executionErr error
-	engine.POST("/v1/videos", middleware.BodyStorageCleanup(), middleware.TokenAuth(), middleware.PinTaskPluginEndpoint(), func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	operation := request.Operation
+	path, validOperation := asyncVideoInternalPath(operation)
+	if !validOperation {
+		return errors.New("encrypted video operation is invalid")
+	}
+	handler := []gin.HandlerFunc{middleware.BodyStorageCleanup(), middleware.TokenAuth(), middleware.PinTaskPluginEndpoint(), func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		value, _ := c.Get(pluginruntime.ContextKeyPinnedPlugin)
 		pinned, ok := value.(pluginruntime.PinnedPlugin)
-		if !ok || pinned.Plugin == nil || pinned.Plugin.Engine.SourceFingerprint() != request.PluginHash {
+		endpointValue, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
+		endpoint, endpointOK := endpointValue.(pluginruntime.PinnedEndpoint)
+		if !ok || !endpointOK || pinned.Plugin == nil || pinned.Plugin.Engine.SourceFingerprint() != request.PluginHash {
 			executionErr = errors.New("video provider changed before submission")
 			return
 		}
@@ -503,25 +609,38 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 			return
 		}
 		policy, catalog, err := service.ResolveImagePolicy(ctx, token, job.Provider)
-		if err != nil || policy.Group != job.Group && policy.Group != "auto" || !service.GroupInUserUsableGroups(common.GetContextKeyString(c, constant.ContextKeyUserGroup), job.Group) || policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !slices.ContainsFunc(catalog, func(capability service.ImageModelCapability) bool { return capability.Id == job.Model })) {
+		capability, selected := service.VideoPolicyCapability(catalog, job.Model)
+		if err != nil || policy.Group != job.Group && policy.Group != "auto" || !service.GroupInUserUsableGroups(common.GetContextKeyString(c, constant.ContextKeyUserGroup), job.Group) || policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !selected) {
 			executionErr = errors.New("video provider permission changed")
+			return
+		}
+		bindingIndex := slices.IndexFunc(endpoint.Candidates, func(binding pluginruntime.ProtocolBinding) bool {
+			return binding.Plugin != nil && binding.Plugin.Meta.Key == job.Provider && binding.Protocol == "openai_video"
+		})
+		if bindingIndex < 0 {
+			executionErr = errors.New("video provider capability changed")
+			return
+		}
+		videoRequest, videoFiles, videoAction, videoResolution, requestErr := asyncVideoCapabilityRequest(c)
+		if requestErr != nil {
+			executionErr = errors.New("video parameters are unavailable")
+			return
+		}
+		profile, profileErr := service.EffectiveVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
+		if profileErr != nil {
+			executionErr = errors.New("video provider capability changed")
+			return
+		}
+		if profileErr = service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
+			executionErr = profileErr
 			return
 		}
 		info.UsingGroup = job.Group
 		common.SetContextKey(c, constant.ContextKeyUsingGroup, job.Group)
 		common.SetContextKey(c, constant.ContextKeyAutoGroup, job.Group)
-		var videoParameters struct {
-			Size string `json:"size"`
-		}
-		requestValue, _ := c.Get("task_request")
-		requestData, err := common.Marshal(requestValue)
-		if err != nil || common.Unmarshal(requestData, &videoParameters) != nil {
-			executionErr = errors.New("video parameters are unavailable")
-			return
-		}
 		policy.Group = job.Group
 		var pools []model.ImageChannelPool
-		if err := model.DB.WithContext(ctx).Where("binding_key = ?", service.ImagePoolBindingKey(policy, job.Model, service.VideoPoolResolution(videoParameters.Size))).Find(&pools).Error; err != nil {
+		if err := model.DB.WithContext(ctx).Where("binding_key = ?", service.ImagePoolBindingKey(policy, job.Model, service.VideoPoolResolution(videoResolution))).Find(&pools).Error; err != nil {
 			executionErr = err
 			return
 		}
@@ -543,8 +662,9 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 		if taskErr != nil {
 			executionErr = taskErr.Error
 		}
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/videos", bytes.NewReader(request.Body))
+	}}
+	engine.POST(path, handler...)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(request.Body))
 	if err != nil {
 		return err
 	}

@@ -105,7 +105,89 @@ type Meta struct {
 	UsageSchema          map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
 	UsageExamples        []UsageExample              `json:"usageExamples,omitempty"`
 	UsageProfiles        []UsageProfile              `json:"usageProfiles,omitempty"`
+	VideoProfiles        []VideoProfile              `json:"videoProfiles,omitempty"`
 	Auth                 AuthMeta                    `json:"auth"`
+}
+
+// VideoProfile describes the request forms supported by one or more video
+// models. It is display metadata and an input-validation contract; plugins
+// must still enforce provider-specific constraints in decodeRequest.
+type VideoProfile struct {
+	Models []string           `json:"models"`
+	Modes  []VideoModeProfile `json:"modes"`
+}
+
+type VideoModeProfile struct {
+	Name                      string                `json:"name"`
+	Duration                  *VideoDurationProfile `json:"duration,omitempty"`
+	Resolutions               []string              `json:"resolutions,omitempty"`
+	DefaultResolution         string                `json:"defaultResolution,omitempty"`
+	AspectRatios              []string              `json:"aspectRatios,omitempty"`
+	DefaultAspectRatio        string                `json:"defaultAspectRatio,omitempty"`
+	ExtensionDirections       []string              `json:"extensionDirections,omitempty"`
+	DefaultExtensionDirection string                `json:"defaultExtensionDirection,omitempty"`
+	Inputs                    []VideoInputProfile   `json:"inputs,omitempty"`
+	Options                   VideoOptionsProfile   `json:"options,omitempty"`
+}
+
+type VideoDurationProfile struct {
+	Min     int   `json:"min,omitempty"`
+	Max     int   `json:"max,omitempty"`
+	Step    int   `json:"step,omitempty"`
+	Values  []int `json:"values,omitempty"`
+	Default int   `json:"default"`
+}
+
+type VideoInputProfile struct {
+	Name     string   `json:"name"`
+	Kind     string   `json:"kind"`
+	Sources  []string `json:"sources"`
+	MaxItems int      `json:"maxItems"`
+	Required bool     `json:"required,omitempty"`
+}
+
+type VideoOptionsProfile struct {
+	GenerateAudio   bool `json:"generateAudio,omitempty"`
+	Watermark       bool `json:"watermark,omitempty"`
+	ReturnLastFrame bool `json:"returnLastFrame,omitempty"`
+}
+
+// VideoProfileForModel returns the declared video profile for model. Aliases
+// must be resolved by the host before lookup. Older plugins return false and
+// continue to use the host's generic video form.
+func (m Meta) VideoProfileForModel(model string) (VideoProfile, bool) {
+	folded := asciiFold(model)
+	for _, profile := range m.VideoProfiles {
+		for _, declared := range profile.Models {
+			if asciiFold(declared) == folded {
+				return CloneVideoProfile(profile), true
+			}
+		}
+	}
+	return VideoProfile{}, false
+}
+
+// CloneVideoProfile returns an independent capability profile for policy and
+// UI consumers that need to narrow it without mutating registry metadata.
+func CloneVideoProfile(profile VideoProfile) VideoProfile {
+	profile.Models = slices.Clone(profile.Models)
+	profile.Modes = append([]VideoModeProfile(nil), profile.Modes...)
+	for modeIndex := range profile.Modes {
+		mode := &profile.Modes[modeIndex]
+		if mode.Duration != nil {
+			duration := *mode.Duration
+			duration.Values = slices.Clone(duration.Values)
+			mode.Duration = &duration
+		}
+		mode.Resolutions = slices.Clone(mode.Resolutions)
+		mode.AspectRatios = slices.Clone(mode.AspectRatios)
+		mode.ExtensionDirections = slices.Clone(mode.ExtensionDirections)
+		mode.Inputs = append([]VideoInputProfile(nil), mode.Inputs...)
+		for inputIndex := range mode.Inputs {
+			mode.Inputs[inputIndex].Sources = slices.Clone(mode.Inputs[inputIndex].Sources)
+		}
+	}
+	return profile
 }
 
 // UsageProfile replaces the plugin's default usage metadata for its models.
@@ -855,6 +937,10 @@ func cloneMeta(meta Meta) Meta {
 		profile.Schema = CloneUsageSchema(profile.Schema)
 		profile.Examples = CloneUsageExamples(profile.Examples)
 	}
+	meta.VideoProfiles = append([]VideoProfile(nil), meta.VideoProfiles...)
+	for profileIndex := range meta.VideoProfiles {
+		meta.VideoProfiles[profileIndex] = CloneVideoProfile(meta.VideoProfiles[profileIndex])
+	}
 	return meta
 }
 
@@ -975,7 +1061,7 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	for field := range object {
 		switch field {
-		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions":
+		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "videoProfiles", "auth", "endpoints", "submitPaths", "actions":
 		default:
 			return Meta{}, &UnknownMetaFieldError{Field: field}
 		}
@@ -1096,6 +1182,12 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	if usageProfiles, exists := object["usageProfiles"]; exists {
 		meta.UsageProfiles, err = decodeUsageProfiles(usageProfiles)
+		if err != nil {
+			return Meta{}, err
+		}
+	}
+	if videoProfiles, exists := object["videoProfiles"]; exists {
+		meta.VideoProfiles, err = decodeVideoProfiles(videoProfiles)
 		if err != nil {
 			return Meta{}, err
 		}
@@ -1392,7 +1484,380 @@ func normalizeV1Meta(meta *Meta) error {
 			return fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
 		}
 	}
+	if err := validateVideoProfiles(meta, models, protocols); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateVideoProfiles(meta *Meta, models map[string]struct{}, protocols map[string]struct{}) error {
+	if len(meta.VideoProfiles) == 0 {
+		return nil
+	}
+	if _, claimed := protocols["openai_video"]; !claimed {
+		return fmt.Errorf("plugin meta videoProfiles requires the openai_video protocol")
+	}
+	videoModels := make(map[string]struct{}, len(meta.Models))
+	for _, claim := range meta.Protocols {
+		if claim.Name != "openai_video" {
+			continue
+		}
+		if len(claim.Models) == 0 {
+			maps.Copy(videoModels, models)
+		} else {
+			for _, model := range claim.Models {
+				videoModels[model] = struct{}{}
+			}
+		}
+	}
+	profileModels := make(map[string]struct{})
+	validModes := []string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame", "edit_video", "extend_video"}
+	validKinds := []string{"image", "video", "audio"}
+	validSources := []string{"url", "asset", "data_uri", "file_id", "voice_id", "upload"}
+	for profileIndex := range meta.VideoProfiles {
+		profile := &meta.VideoProfiles[profileIndex]
+		if len(profile.Models) == 0 {
+			return fmt.Errorf("plugin meta videoProfiles[%d] models must contain at least one model", profileIndex)
+		}
+		if err := validateModelScope(profile.Models, fmt.Sprintf("videoProfiles[%d]", profileIndex)); err != nil {
+			return err
+		}
+		for _, model := range profile.Models {
+			if _, exists := models[model]; !exists {
+				return fmt.Errorf("plugin meta videoProfiles[%d] model %q is not declared in plugin meta models", profileIndex, model)
+			}
+			if _, exists := videoModels[model]; !exists {
+				return fmt.Errorf("plugin meta videoProfiles[%d] model %q is not bound to openai_video", profileIndex, model)
+			}
+			if _, duplicate := profileModels[model]; duplicate {
+				return fmt.Errorf("plugin meta videoProfiles model %q belongs to multiple profiles", model)
+			}
+			profileModels[model] = struct{}{}
+		}
+		if len(profile.Modes) == 0 {
+			return fmt.Errorf("plugin meta videoProfiles[%d] modes must contain at least one mode", profileIndex)
+		}
+		seenModes := make(map[string]struct{}, len(profile.Modes))
+		for modeIndex := range profile.Modes {
+			mode := &profile.Modes[modeIndex]
+			path := fmt.Sprintf("videoProfiles[%d].modes[%d]", profileIndex, modeIndex)
+			if !slices.Contains(validModes, mode.Name) {
+				return fmt.Errorf("plugin meta %s has unsupported name %q", path, mode.Name)
+			}
+			if _, duplicate := seenModes[mode.Name]; duplicate {
+				return fmt.Errorf("plugin meta videoProfiles[%d] mode names must be unique", profileIndex)
+			}
+			seenModes[mode.Name] = struct{}{}
+			if mode.Duration != nil {
+				if err := validateVideoDuration(*mode.Duration, path+".duration"); err != nil {
+					return err
+				}
+			}
+			if err := validateVideoChoices(mode.Resolutions, mode.DefaultResolution, path+".resolutions", false); err != nil {
+				return err
+			}
+			if err := validateVideoChoices(mode.AspectRatios, mode.DefaultAspectRatio, path+".aspectRatios", false); err != nil {
+				return err
+			}
+			seenInputs := make(map[string]struct{}, len(mode.Inputs))
+			primaryVideoInputs := 0
+			for inputIndex := range mode.Inputs {
+				input := &mode.Inputs[inputIndex]
+				inputPath := fmt.Sprintf("%s.inputs[%d]", path, inputIndex)
+				if strings.TrimSpace(input.Name) == "" || input.Name != strings.TrimSpace(input.Name) {
+					return fmt.Errorf("plugin meta %s name must be canonical", inputPath)
+				}
+				if _, duplicate := seenInputs[input.Name]; duplicate {
+					return fmt.Errorf("plugin meta %s input names must be unique", path)
+				}
+				seenInputs[input.Name] = struct{}{}
+				if input.Name == "video" && input.Kind == "video" && input.Required && input.MaxItems == 1 {
+					primaryVideoInputs++
+				}
+				if !slices.Contains(validKinds, input.Kind) {
+					return fmt.Errorf("plugin meta %s kind must be image, video, or audio", inputPath)
+				}
+				if input.MaxItems < 1 || input.MaxItems > 64 {
+					return fmt.Errorf("plugin meta %s maxItems must be between 1 and 64", inputPath)
+				}
+				if len(input.Sources) == 0 {
+					return fmt.Errorf("plugin meta %s sources must contain at least one source", inputPath)
+				}
+				seenSources := make(map[string]struct{}, len(input.Sources))
+				for _, source := range input.Sources {
+					if !slices.Contains(validSources, source) {
+						return fmt.Errorf("plugin meta %s has unsupported source %q", inputPath, source)
+					}
+					if _, duplicate := seenSources[source]; duplicate {
+						return fmt.Errorf("plugin meta %s sources must be unique", inputPath)
+					}
+					seenSources[source] = struct{}{}
+				}
+			}
+			if mode.Name == "edit_video" || mode.Name == "extend_video" {
+				if primaryVideoInputs != 1 {
+					return fmt.Errorf("plugin meta %s must declare one required video input named %q with maxItems 1", path, "video")
+				}
+			}
+			if mode.Name == "extend_video" {
+				if err := validateVideoChoices(mode.ExtensionDirections, mode.DefaultExtensionDirection, path+".extensionDirections", true); err != nil {
+					return err
+				}
+				for _, direction := range mode.ExtensionDirections {
+					if direction != "forward" && direction != "backward" {
+						return fmt.Errorf("plugin meta %s extension direction %q is unsupported", path, direction)
+					}
+				}
+			} else if len(mode.ExtensionDirections) > 0 || mode.DefaultExtensionDirection != "" {
+				return fmt.Errorf("plugin meta %s extension directions require extend_video", path)
+			}
+		}
+	}
+	return nil
+}
+
+func validateVideoDuration(duration VideoDurationProfile, path string) error {
+	if duration.Default < 1 || duration.Default > relaycommon.MaxTaskDurationSeconds {
+		return fmt.Errorf("plugin meta %s default must be between 1 and %d", path, relaycommon.MaxTaskDurationSeconds)
+	}
+	if len(duration.Values) > 0 {
+		if duration.Min != 0 || duration.Max != 0 || duration.Step != 0 {
+			return fmt.Errorf("plugin meta %s cannot combine values with min, max, or step", path)
+		}
+		seen := make(map[int]struct{}, len(duration.Values))
+		for _, value := range duration.Values {
+			if value < 1 || value > relaycommon.MaxTaskDurationSeconds {
+				return fmt.Errorf("plugin meta %s values must be between 1 and %d", path, relaycommon.MaxTaskDurationSeconds)
+			}
+			if _, duplicate := seen[value]; duplicate {
+				return fmt.Errorf("plugin meta %s values must be unique", path)
+			}
+			seen[value] = struct{}{}
+		}
+		if _, exists := seen[duration.Default]; !exists {
+			return fmt.Errorf("plugin meta %s default must be present in values", path)
+		}
+		return nil
+	}
+	if duration.Min < 1 || duration.Max < duration.Min || duration.Max > relaycommon.MaxTaskDurationSeconds || duration.Step < 1 {
+		return fmt.Errorf("plugin meta %s range is invalid", path)
+	}
+	if duration.Default < duration.Min || duration.Default > duration.Max || (duration.Default-duration.Min)%duration.Step != 0 {
+		return fmt.Errorf("plugin meta %s default must align with the declared range", path)
+	}
+	return nil
+}
+
+func validateVideoChoices(values []string, defaultValue, path string, required bool) error {
+	if len(values) == 0 {
+		if required || defaultValue != "" {
+			return fmt.Errorf("plugin meta %s must contain at least one value", path)
+		}
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			return fmt.Errorf("plugin meta %s values must be canonical", path)
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return fmt.Errorf("plugin meta %s values must be unique", path)
+		}
+		seen[value] = struct{}{}
+	}
+	if _, exists := seen[defaultValue]; !exists {
+		return fmt.Errorf("plugin meta %s default must be one of the declared values", path)
+	}
+	return nil
+}
+
+func decodeVideoProfiles(value any) ([]VideoProfile, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("plugin meta videoProfiles must be an array")
+	}
+	profiles := make([]VideoProfile, 0, len(items))
+	for profileIndex, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("plugin meta videoProfiles[%d] must be an object", profileIndex)
+		}
+		for key := range object {
+			if key != "models" && key != "modes" {
+				return nil, fmt.Errorf("plugin meta videoProfiles[%d] has unknown field %q", profileIndex, key)
+			}
+		}
+		models, err := strictStringSlice(object, "models")
+		if err != nil {
+			return nil, fmt.Errorf("plugin meta videoProfiles[%d]: %w", profileIndex, err)
+		}
+		rawModes, ok := object["modes"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("plugin meta videoProfiles[%d] modes must be an array", profileIndex)
+		}
+		profile := VideoProfile{Models: models, Modes: make([]VideoModeProfile, 0, len(rawModes))}
+		for modeIndex, rawMode := range rawModes {
+			modeObject, ok := rawMode.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("plugin meta videoProfiles[%d].modes[%d] must be an object", profileIndex, modeIndex)
+			}
+			for key := range modeObject {
+				switch key {
+				case "name", "duration", "resolutions", "defaultResolution", "aspectRatios", "defaultAspectRatio", "extensionDirections", "defaultExtensionDirection", "inputs", "options":
+				default:
+					return nil, fmt.Errorf("plugin meta videoProfiles[%d].modes[%d] has unknown field %q", profileIndex, modeIndex, key)
+				}
+			}
+			mode := VideoModeProfile{}
+			if mode.Name, err = stringMetaField(modeObject, "name"); err != nil {
+				return nil, err
+			}
+			if rawDuration, exists := modeObject["duration"]; exists {
+				duration, durationErr := decodeVideoDuration(rawDuration)
+				if durationErr != nil {
+					return nil, fmt.Errorf("plugin meta videoProfiles[%d].modes[%d]: %w", profileIndex, modeIndex, durationErr)
+				}
+				mode.Duration = &duration
+			}
+			if _, exists := modeObject["resolutions"]; exists {
+				if mode.Resolutions, err = strictStringSlice(modeObject, "resolutions"); err != nil {
+					return nil, err
+				}
+			}
+			if mode.DefaultResolution, err = stringMetaField(modeObject, "defaultResolution"); err != nil {
+				return nil, err
+			}
+			if _, exists := modeObject["aspectRatios"]; exists {
+				if mode.AspectRatios, err = strictStringSlice(modeObject, "aspectRatios"); err != nil {
+					return nil, err
+				}
+			}
+			if mode.DefaultAspectRatio, err = stringMetaField(modeObject, "defaultAspectRatio"); err != nil {
+				return nil, err
+			}
+			if _, exists := modeObject["extensionDirections"]; exists {
+				if mode.ExtensionDirections, err = strictStringSlice(modeObject, "extensionDirections"); err != nil {
+					return nil, err
+				}
+			}
+			if mode.DefaultExtensionDirection, err = stringMetaField(modeObject, "defaultExtensionDirection"); err != nil {
+				return nil, err
+			}
+			if rawInputs, exists := modeObject["inputs"]; exists {
+				mode.Inputs, err = decodeVideoInputs(rawInputs)
+				if err != nil {
+					return nil, fmt.Errorf("plugin meta videoProfiles[%d].modes[%d]: %w", profileIndex, modeIndex, err)
+				}
+			}
+			if rawOptions, exists := modeObject["options"]; exists {
+				mode.Options, err = decodeVideoOptions(rawOptions)
+				if err != nil {
+					return nil, fmt.Errorf("plugin meta videoProfiles[%d].modes[%d]: %w", profileIndex, modeIndex, err)
+				}
+			}
+			profile.Modes = append(profile.Modes, mode)
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, nil
+}
+
+func decodeVideoDuration(value any) (VideoDurationProfile, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return VideoDurationProfile{}, fmt.Errorf("duration must be an object")
+	}
+	for key := range object {
+		if key != "min" && key != "max" && key != "step" && key != "values" && key != "default" {
+			return VideoDurationProfile{}, fmt.Errorf("duration has unknown field %q", key)
+		}
+	}
+	duration := VideoDurationProfile{}
+	var err error
+	if duration.Min, err = integerMetaField(object, "min"); err != nil {
+		return duration, err
+	}
+	if duration.Max, err = integerMetaField(object, "max"); err != nil {
+		return duration, err
+	}
+	if duration.Step, err = integerMetaField(object, "step"); err != nil {
+		return duration, err
+	}
+	if duration.Default, err = integerMetaField(object, "default"); err != nil {
+		return duration, err
+	}
+	if _, exists := object["values"]; exists {
+		if duration.Values, err = integerSliceMetaField(object, "values"); err != nil {
+			return duration, err
+		}
+	}
+	return duration, nil
+}
+
+func decodeVideoInputs(value any) ([]VideoInputProfile, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("inputs must be an array")
+	}
+	inputs := make([]VideoInputProfile, 0, len(items))
+	for index, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("inputs[%d] must be an object", index)
+		}
+		for key := range object {
+			if key != "name" && key != "kind" && key != "sources" && key != "maxItems" && key != "required" {
+				return nil, fmt.Errorf("inputs[%d] has unknown field %q", index, key)
+			}
+		}
+		input := VideoInputProfile{}
+		var err error
+		if input.Name, err = stringMetaField(object, "name"); err != nil {
+			return nil, err
+		}
+		if input.Kind, err = stringMetaField(object, "kind"); err != nil {
+			return nil, err
+		}
+		if input.Sources, err = strictStringSlice(object, "sources"); err != nil {
+			return nil, err
+		}
+		if input.MaxItems, err = integerMetaField(object, "maxItems"); err != nil {
+			return nil, err
+		}
+		if required, exists := object["required"]; exists {
+			input.Required, ok = required.(bool)
+			if !ok {
+				return nil, fmt.Errorf("inputs[%d] required must be a boolean", index)
+			}
+		}
+		inputs = append(inputs, input)
+	}
+	return inputs, nil
+}
+
+func decodeVideoOptions(value any) (VideoOptionsProfile, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return VideoOptionsProfile{}, fmt.Errorf("options must be an object")
+	}
+	options := VideoOptionsProfile{}
+	for key, value := range object {
+		enabled, ok := value.(bool)
+		if !ok {
+			return options, fmt.Errorf("options field %q must be a boolean", key)
+		}
+		switch key {
+		case "generateAudio":
+			options.GenerateAudio = enabled
+		case "watermark":
+			options.Watermark = enabled
+		case "returnLastFrame":
+			options.ReturnLastFrame = enabled
+		default:
+			return options, fmt.Errorf("options has unknown field %q", key)
+		}
+	}
+	return options, nil
 }
 
 func validateUsageSchema(schema map[string]UsageFieldSchema) error {

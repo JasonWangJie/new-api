@@ -671,6 +671,7 @@ func GetTaskPluginOptions(c *gin.Context) {
 				"channelTypes":  meta.ChannelTypes,
 				"usageSchema":   meta.UsageSchema,
 				"usageProfiles": meta.UsageProfiles,
+				"videoProfiles": meta.VideoProfiles,
 			})
 		}
 	}

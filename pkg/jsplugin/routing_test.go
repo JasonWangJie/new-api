@@ -91,6 +91,22 @@ func TestLookupHostProtocolOperationExcludesRetrieveWithoutModelField(t *testing
 	assert.True(t, ok)
 }
 
+func TestVideoOperationBindingsRequireDeclaredProfiles(t *testing.T) {
+	registry := NewRegistry()
+	exports := `export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:{}}},render(){return {}}}};export function listArtifacts(){return [];}export function buildContentRequest(){return {url:"https://example.com/video.mp4"};}`
+	legacy := mustCompileRoutingPlugin(t, "legacy-video", 0, `["legacy"]`, `protocols:["openai_video"],`, exports)
+	operations := mustCompileRoutingPlugin(t, "operation-video", 0, `["operation"]`, `protocols:["openai_video"],videoProfiles:[{models:["operation"],modes:[{name:"text_to_video"},{name:"edit_video",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]},{name:"extend_video",duration:{min:2,max:10,step:1,default:6},extensionDirections:["backward"],defaultExtensionDirection:"backward",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]}]}],`, exports)
+	require.NoError(t, registry.ReplaceOverrides([]*LoadedPlugin{legacy, operations}))
+
+	for _, path := range []string{"/v1/videos/edits", "/v1/videos/extensions"} {
+		_, found := registry.Generation().LookupEndpoint(http.MethodPost, path, "legacy")
+		assert.False(t, found, path)
+		binding, found := registry.Generation().LookupEndpoint(http.MethodPost, path, "operation")
+		require.True(t, found, path)
+		assert.Same(t, operations, binding.Plugin)
+	}
+}
+
 func TestPerProtocolModelsNarrowEndpointBindings(t *testing.T) {
 	registry := NewRegistry()
 	plugin := mustCompileRoutingPlugin(t, "narrow-protocol", 50, `["gpt-5.5", "gpt-5.6"]`,

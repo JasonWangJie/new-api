@@ -933,7 +933,7 @@ func buildTaskPluginRouteRequest(c *gin.Context) (pluginruntime.RouteRequestCont
 			if !utf8.ValidString(field) || len(field) > maxTaskPluginFieldNameBytes {
 				return requestContext, fmt.Errorf("invalid multipart file field name")
 			}
-			for _, header := range headers {
+			for index, header := range headers {
 				if !utf8.ValidString(header.Filename) || len(header.Filename) > maxTaskPluginFilenameBytes {
 					return requestContext, fmt.Errorf("invalid multipart filename")
 				}
@@ -948,6 +948,9 @@ func buildTaskPluginRouteRequest(c *gin.Context) (pluginruntime.RouteRequestCont
 					return requestContext, fmt.Errorf("multipart file exceeds %d MB", fileLimitMB)
 				}
 				ref := "request_file:" + field
+				if index > 0 {
+					ref += ":" + strconv.Itoa(index)
+				}
 				files = append(files, map[string]any{"ref": ref, "field": field, "filename": header.Filename, "mimeType": header.Header.Get("Content-Type"), "size": header.Size})
 			}
 		}

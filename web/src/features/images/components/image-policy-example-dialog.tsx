@@ -28,6 +28,7 @@ import { imageLabel } from '../lib/image-labels'
 type ImageModelCapabilityExample = {
   id: string
   label: string
+  media_type: 'image'
   qualities?: string[]
   resolutions: string[]
   formats?: string[]
@@ -41,6 +42,7 @@ const OPENAI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
   {
     id: 'gpt-image-2',
     label: 'gpt-image-2',
+    media_type: 'image',
     qualities: ['low', 'medium', 'high'],
     resolutions: ['1K', '2K', '4K'],
     formats: ['png', 'jpeg', 'webp'],
@@ -55,6 +57,7 @@ const GEMINI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
   {
     id: 'gemini-3-pro-image-preview',
     label: 'Gemini 3 Pro Image',
+    media_type: 'image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
     max_reference_images: 14,
@@ -63,6 +66,7 @@ const GEMINI_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
   {
     id: 'gemini-2.5-flash-image',
     label: 'Gemini 2.5 Flash Image',
+    media_type: 'image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
     max_reference_images: 14,
@@ -74,6 +78,7 @@ const VERTEX_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
   {
     id: 'gemini-2.5-flash-image',
     label: 'Gemini 2.5 Flash Image',
+    media_type: 'image',
     resolutions: ['1K', '2K', '4K'],
     max_output_images: 1,
     max_reference_images: 14,
@@ -82,6 +87,7 @@ const VERTEX_MODEL_EXAMPLE: ImageModelCapabilityExample[] = [
   {
     id: 'imagen-4.0-generate-001',
     label: 'Imagen 4',
+    media_type: 'image',
     resolutions: ['1K', '2K'],
     max_output_images: 1,
     max_reference_images: 0,
@@ -139,6 +145,7 @@ function imagePolicyExample(platform: string): string {
     {
       id: model,
       label: model,
+      media_type: 'image',
       resolutions: ['1K', '2K', '4K'],
       max_output_images: 1,
       max_reference_images: REFERENCE_IMAGE_PROVIDERS.has(normalizedPlatform)

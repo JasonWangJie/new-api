@@ -29,30 +29,66 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+const runtime = {
+  async_enabled: true,
+  auto_archive_to_library: false,
+  worker_concurrency: 4,
+  worker_lease_seconds: 120,
+  recovery_interval_seconds: 30,
+  execution_timeout_seconds: 1200,
+  account_attempt_timeout_seconds: 300,
+  image_concurrency: 4,
+  storage_retry_attempts: 5,
+  billing_retry_attempts: 10,
+  retry_backoff_seconds: 30,
+  openai_reference_transport_mode: 'passthrough_fallback_local',
+  gemini_reference_transport_mode: 'passthrough_fallback_local',
+  gemini_async_max_account_switches: 3,
+  image_circuit_breaker_enabled: true,
+  failure_threshold: 5,
+  cooldown_seconds: 300,
+  reference_fetch_max_retries: 2,
+  reference_retry_base_seconds: 15,
+  reference_retry_max_seconds: 60,
+  upstream_transient_max_retries: 3,
+  upstream_transient_retry_base_seconds: 15,
+  upstream_transient_retry_max_seconds: 60,
+  capacity_max_retries: 5,
+  capacity_retry_base_seconds: 30,
+  capacity_retry_max_seconds: 300,
+  total_max_retries: 16,
+  retry_jitter_percent: 20,
+  retry_after_max_seconds: 900,
+  download_max_bytes: 33554432,
+  download_max_pixels: 80000000,
+  max_reference_images: 14,
+  download_timeout_seconds: 30,
+  download_max_redirects: 3,
+  reference_fetch_concurrency: 8,
+  reference_cache_ttl_seconds: 60,
+  reference_cache_max_bytes: 134217728,
+  upload_timeout_seconds: 300,
+  upload_per_minute: 20,
+  max_input_bytes_per_key: 1073741824,
+  max_upload_bytes: 33554432,
+  signed_url_expiry_seconds: 3600,
+  input_retention_hours: 24,
+  task_retention_days: 90,
+  result_retention_days: 90,
+  prompt_preview_enabled: true,
+  prompt_preview_max_chars: 160,
+  library_retention_days: 90,
+  library_max_items_per_user: 1000,
+  library_max_bytes_per_user: 5368709120,
+  library_max_image_bytes: 20971520,
+  library_max_image_pixels: 40000000,
+  library_import_per_minute: 20,
+  library_submission_per_minute: 10,
+}
+
 test('edits the global reference-image limit in the normal runtime form', async () => {
   vi.mocked(imageRequest).mockResolvedValue(undefined)
   const onSuccess = vi.fn().mockResolvedValue(undefined)
-  const runtime = {
-    async_enabled: true,
-    auto_archive_to_library: false,
-    image_circuit_breaker_enabled: true,
-    prompt_preview_enabled: true,
-    worker_concurrency: 4,
-    image_concurrency: 4,
-    max_reference_images: 14,
-    worker_lease_seconds: 120,
-    execution_timeout_seconds: 1200,
-    account_attempt_timeout_seconds: 300,
-    signed_url_expiry_seconds: 3600,
-    input_retention_hours: 24,
-    task_retention_days: 90,
-    result_retention_days: 90,
-    reference_fetch_max_retries: 2,
-    storage_retry_attempts: 5,
-    billing_retry_attempts: 10,
-    openai_reference_transport_mode: 'passthrough_fallback_local',
-    gemini_reference_transport_mode: 'passthrough_fallback_local',
-  }
 
   render(<ImageRuntimeForm initial={runtime} onSuccess={onSuccess} />)
   const input = screen.getByRole('spinbutton', {
@@ -74,4 +110,39 @@ test('edits the global reference-image limit in the normal runtime form', async 
     )
   )
   expect(onSuccess).toHaveBeenCalledOnce()
+})
+
+test('explains every advanced runtime field outside the strict JSON document', async () => {
+  const user = userEvent.setup()
+  render(
+    <ImageRuntimeForm
+      initial={runtime}
+      onSuccess={vi.fn().mockResolvedValue(undefined)}
+    />
+  )
+
+  await user.click(
+    screen.getByRole('button', { name: 'Advanced runtime settings' })
+  )
+
+  expect(
+    screen.getByText(
+      'Use strict JSON. Comments such as // or /* */ are not supported.'
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByRole('textbox', { name: 'Complete runtime configuration' })
+  ).toHaveAttribute('aria-describedby', 'image-runtime-advanced-help')
+
+  await user.click(
+    screen.getByRole('button', { name: 'Runtime field reference' })
+  )
+  for (const key of Object.keys(runtime)) {
+    expect(screen.getByText(key)).toBeVisible()
+  }
+  expect(
+    screen.getByText(
+      'Maximum downloaded bytes allowed for each reference image.'
+    )
+  ).toBeVisible()
 })

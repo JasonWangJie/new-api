@@ -82,7 +82,7 @@ func StageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []As
 		if len(actualSize) > 250 {
 			actualSize = actualSize[:250] + "..."
 		}
-		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now).Updates(map[string]any{"status": ImageTaskUpstreamSucceeded, "version": task.Version + 1, "updated_at": now, "upstream_succeeded_at": now, "request_cipher": nil, "image_count": len(images), "quota": bill.Quota, "billing_status": "pending", "progress": 65, "attempts": task.Attempts, "actual_size": actualSize})
+		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now).Updates(map[string]any{"status": ImageTaskUpstreamSucceeded, "version": task.Version + 1, "updated_at": now, "upstream_succeeded_at": now, "request_cipher": nil, "image_count": len(images), "quota": bill.Quota, "billing_status": "pending", "progress": 65, "attempts": task.Attempts, "actual_size": actualSize, "error_code": "", "error_message": "", "public_error_code": 0})
 		if result.Error != nil {
 			return result.Error
 		}

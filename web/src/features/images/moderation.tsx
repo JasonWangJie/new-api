@@ -434,7 +434,7 @@ export function ImageModeration() {
           href='/system-settings/operations/images'
           className='text-sm underline'
         >
-          {t('Image Settings')}
+          {t('Media Settings')}
         </a>
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>

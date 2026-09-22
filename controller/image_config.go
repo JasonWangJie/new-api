@@ -6,12 +6,15 @@ import (
 	"image"
 	"image/png"
 	"net/http"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -48,7 +51,27 @@ func GetImageConfiguration(c *gin.Context) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}})
+	readiness, err := service.GetVideoReadiness(ctx)
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	templates := make([]gin.H, 0)
+	seenPlugins := make(map[string]bool)
+	snapshot := pluginruntime.DefaultRegistry.Snapshot()
+	for _, meta := range slices.Concat(snapshot.Override, snapshot.Factory) {
+		if seenPlugins[meta.Key] || !slices.ContainsFunc(meta.Protocols, func(claim pluginruntime.ProtocolClaim) bool { return claim.Name == "openai_video" }) {
+			continue
+		}
+		plugin, found := pluginruntime.DefaultRegistry.Get(meta.Key)
+		if !found {
+			continue
+		}
+		seenPlugins[meta.Key] = true
+		templates = append(templates, gin.H{"provider": meta.Key, "name": meta.Name, "models": slices.Clone(meta.Models), "video_profiles": plugin.Meta.VideoProfiles})
+	}
+	sort.Slice(templates, func(i, j int) bool { return templates[i]["provider"].(string) < templates[j]["provider"].(string) })
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates})
 }
 
 func GetImageChannelPoolOptions(c *gin.Context) {
@@ -95,17 +118,48 @@ func SaveImagePolicy(c *gin.Context) {
 		return
 	}
 	seen := make(map[string]bool)
+	seenMedia := make(map[string]map[string]bool)
 	for i := range catalog {
 		catalog[i].Id = strings.TrimSpace(catalog[i].Id)
+		catalog[i].Label = strings.TrimSpace(catalog[i].Label)
+		catalog[i].MediaType = strings.ToLower(strings.TrimSpace(catalog[i].MediaType))
 		if err := service.ValidateImageModelName(catalog[i].Id); err != nil {
 			imageManagementError(c, 400, err)
 			return
 		}
-		if seen[catalog[i].Id] || catalog[i].MaxOutputImages < 1 || catalog[i].MaxOutputImages > dto.MaxImageN || catalog[i].MaxReferenceImages < 0 || catalog[i].MaxReferenceImages > dto.MaxImageN {
+		if catalog[i].MediaType != "" && catalog[i].MediaType != "image" && catalog[i].MediaType != "video" {
+			imageManagementError(c, 400, errors.New("Invalid media type in model capability"))
+			return
+		}
+		if catalog[i].Label == "" {
+			catalog[i].Label = catalog[i].Id
+		}
+		media := catalog[i].MediaType
+		if seenMedia[catalog[i].Id] == nil {
+			seenMedia[catalog[i].Id] = make(map[string]bool)
+		}
+		if seen[catalog[i].Id] && (media == "" || seenMedia[catalog[i].Id][""] || seenMedia[catalog[i].Id][media]) {
 			imageManagementError(c, 400, errors.New("Invalid or duplicate image model capability"))
 			return
 		}
 		seen[catalog[i].Id] = true
+		seenMedia[catalog[i].Id][media] = true
+
+		legacyVideo := media == "" && service.MediaPlatformSupportsVideoModel(catalog[i].Id, policy.Platform) && catalog[i].MaxOutputImages == 0 && catalog[i].MaxReferenceImages == 0 && len(catalog[i].Qualities) == 0 && len(catalog[i].Resolutions) == 0 && len(catalog[i].Formats) == 0 && len(catalog[i].Backgrounds) == 0
+		if media == "video" || legacyVideo {
+			if err := service.ValidateVideoModelOverrides(policy.Platform, catalog[i].Id, catalog[i].VideoOverrides); err != nil {
+				imageManagementError(c, 400, err)
+				return
+			}
+			continue
+		}
+		if catalog[i].MaxOutputImages == 0 {
+			catalog[i].MaxOutputImages = dto.MaxImageN
+		}
+		if catalog[i].MaxOutputImages < 1 || catalog[i].MaxOutputImages > dto.MaxImageN || catalog[i].MaxReferenceImages < 0 || catalog[i].MaxReferenceImages > dto.MaxImageN {
+			imageManagementError(c, 400, errors.New("Invalid image model capability"))
+			return
+		}
 	}
 	encoded, err := common.Marshal(catalog)
 	if err != nil {

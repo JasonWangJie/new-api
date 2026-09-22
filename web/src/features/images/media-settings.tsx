@@ -40,7 +40,11 @@ type MediaSettings = {
   storage_retry_attempts: number
 }
 
-export function MediaSettingsCard() {
+export function MediaSettingsCard(
+  props: {
+    onSuccess?: () => Promise<unknown> | unknown
+  } = {}
+) {
   const settings = useQuery({
     queryKey: ['media-settings'],
     queryFn: () => imageRequest<MediaSettings>('/api/option/images/media'),
@@ -56,19 +60,24 @@ export function MediaSettingsCard() {
     <MediaSettingsForm
       key={JSON.stringify(settings.data)}
       initial={settings.data}
+      onSuccess={props.onSuccess}
     />
   ) : null
 }
 
-function MediaSettingsForm(props: { initial: MediaSettings }) {
+function MediaSettingsForm(props: {
+  initial: MediaSettings
+  onSuccess?: () => Promise<unknown> | unknown
+}) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [values, setValues] = useState(props.initial)
   const save = useMutation({
     mutationFn: () => imageRequest('/api/option/images/media', 'PUT', values),
-    onSuccess: () => {
+    onSuccess: async () => {
       toast.success(t('Saved'))
       void queryClient.invalidateQueries({ queryKey: ['media-settings'] })
+      await props.onSuccess?.()
     },
   })
   const fields: {

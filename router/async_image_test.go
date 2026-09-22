@@ -730,11 +730,11 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
 		video = append(video, box("moov", box("trak", box("mdia", box("hdlr", handler))))...)
 		video = append(video, box("mdat", []byte("local-video-sample"))...)
-		var submits, downloads atomic.Int32
+		var submits, xaiSubmits, downloads atomic.Int32
 		upper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			assert.Equal(t, "Bearer frozen-video-key", r.Header.Get("Authorization"))
 			switch {
 			case r.Method == "POST" && r.URL.Path == "/v1/videos":
+				assert.Equal(t, "Bearer frozen-video-key", r.Header.Get("Authorization"))
 				submits.Add(1)
 				var sent map[string]any
 				if !assert.NoError(t, common.DecodeJson(r.Body, &sent)) {
@@ -745,10 +745,24 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 				assert.NotContains(t, sent, "provider")
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"id":"upstream-video","status":"queued","model":"sora-2"}`))
+			case r.Method == "POST" && r.URL.Path == "/v1/videos/edits":
+				assert.Equal(t, "Bearer xai-frozen-video-key", r.Header.Get("Authorization"))
+				xaiSubmits.Add(1)
+				var sent map[string]any
+				if !assert.NoError(t, common.DecodeJson(r.Body, &sent)) {
+					w.WriteHeader(400)
+					return
+				}
+				assert.Equal(t, "grok-imagine-video", sent["model"])
+				assert.Equal(t, "https://cdn.example/source.mp4", sent["video"].(map[string]any)["url"])
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"request_id":"upstream-xai-edit","status":"pending"}`))
 			case r.URL.Path == "/v1/videos/upstream-video":
+				assert.Equal(t, "Bearer frozen-video-key", r.Header.Get("Authorization"))
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(`{"id":"upstream-video","status":"completed","model":"sora-2"}`))
 			case r.URL.Path == "/v1/videos/upstream-video/content":
+				assert.Equal(t, "Bearer frozen-video-key", r.Header.Get("Authorization"))
 				if downloads.Add(1) == 1 {
 					_, _ = w.Write([]byte("<html>temporary download failure</html>"))
 					return
@@ -764,6 +778,55 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		videoChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "frozen-video-key", BaseURL: &base, Setting: &setting, Status: common.ChannelStatusEnabled, Models: "sora-2", Group: "default"}
 		require.NoError(t, model.DB.Create(&videoChannel).Error)
 		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "sora-2", ChannelId: videoChannel.Id, Enabled: true}).Error)
+		xaiCatalog, err := common.Marshal([]service.ImageModelCapability{{Id: "grok-imagine-video", Label: "Grok Imagine Video", MediaType: "video"}})
+		require.NoError(t, err)
+		xaiPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "xai"), Group: "default", Platform: "xai", Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: string(xaiCatalog), Version: 1}
+		require.NoError(t, model.DB.Create(&xaiPolicy).Error)
+		xaiChannel := model.Channel{Type: constant.ChannelTypeXai, Key: "xai-frozen-video-key", BaseURL: &base, Status: common.ChannelStatusEnabled, Models: "grok-imagine-video", Group: "default"}
+		require.NoError(t, model.DB.Create(&xaiChannel).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "grok-imagine-video", ChannelId: xaiChannel.Id, Enabled: true}).Error)
+		xaiEditBody := `{"provider":"xai","model":"grok-imagine-video","prompt":"replace the sky","video":"https://cdn.example/source.mp4"}`
+		xaiEdit := request("POST", "/v1/videos/edits_async", xaiEditBody, "video-operation-scope", token.Key)
+		require.Equal(t, 202, xaiEdit.Code, xaiEdit.Body.String())
+		var xaiAccepted struct {
+			TaskID string `json:"task_id"`
+		}
+		require.NoError(t, common.Unmarshal(xaiEdit.Body.Bytes(), &xaiAccepted))
+		assert.Equal(t, 202, request("POST", "/v1/videos/edits_async", xaiEditBody, "video-operation-scope", token.Key).Code)
+		xaiExtensionBody := `{"provider":"xai","model":"grok-imagine-video","prompt":"continue backward","video":{"file_id":"file-video"},"seconds":6,"extension_direction":"backward"}`
+		assert.Equal(t, 409, request("POST", "/v1/videos/extensions_async", xaiExtensionBody, "video-operation-scope", token.Key).Code)
+		var xaiJob model.AsyncMediaJob
+		require.NoError(t, model.DB.Where("task_id = ?", xaiAccepted.TaskID).Take(&xaiJob).Error)
+		xaiFrozenPayload, err := service.DecryptImagePayload(xaiJob.RequestCipher, "media-request:"+xaiJob.TaskId)
+		require.NoError(t, err)
+		var xaiFrozen service.AsyncVideoRequest
+		require.NoError(t, common.Unmarshal(xaiFrozenPayload, &xaiFrozen))
+		assert.Equal(t, "edit", xaiFrozen.Operation)
+		claimed, err := model.ClaimAsyncMediaJob(t.Context(), &xaiJob, common.GetUUID(), 30)
+		require.NoError(t, err)
+		require.True(t, claimed)
+		require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), xaiJob, mediaCfg))
+		assert.EqualValues(t, 1, xaiSubmits.Load())
+		var xaiTask model.Task
+		require.NoError(t, model.DB.Where("task_id = ?", xaiAccepted.TaskID).Take(&xaiTask).Error)
+		assert.Equal(t, "edit_video", xaiTask.Action)
+		assert.Equal(t, "upstream-xai-edit", xaiTask.GetUpstreamTaskID())
+		var multipartEdit bytes.Buffer
+		multipartEditWriter := multipart.NewWriter(&multipartEdit)
+		require.NoError(t, multipartEditWriter.WriteField("model", "grok-imagine-video"))
+		require.NoError(t, multipartEditWriter.WriteField("prompt", "replace the sky"))
+		require.NoError(t, multipartEditWriter.WriteField("video", "https://cdn.example/source.mp4"))
+		require.NoError(t, multipartEditWriter.Close())
+		multipartEditRequest := httptest.NewRequest("POST", "/v1/videos/edits_async", &multipartEdit)
+		multipartEditRequest.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		multipartEditRequest.Header.Set("Content-Type", multipartEditWriter.FormDataContentType())
+		multipartEditResponse := httptest.NewRecorder()
+		engine.ServeHTTP(multipartEditResponse, multipartEditRequest)
+		assert.Equal(t, 400, multipartEditResponse.Code)
+		historyEditBody := `{"provider":"xai","model":"grok-imagine-video","prompt":"replace the sky","video":"https://cdn.example/source.mp4","source_task_id":"old-task"}`
+		historyEdit := request("POST", "/v1/videos/edits_async", historyEditBody, "video-history-source", token.Key)
+		assert.Equal(t, 400, historyEdit.Code)
+		assert.Contains(t, historyEdit.Body.String(), "source_task_id")
 		originalPrices := ratio_setting.GetModelPriceCopy()
 		originalPriceJSON, err := common.Marshal(originalPrices)
 		require.NoError(t, err)
@@ -816,6 +879,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, err)
 		var frozen service.AsyncVideoRequest
 		require.NoError(t, common.Unmarshal(frozenRequest, &frozen))
+		assert.Equal(t, "create", frozen.Operation)
 		originalPrices["sora-2"] = 10
 		encoded, err = common.Marshal(originalPrices)
 		require.NoError(t, err)

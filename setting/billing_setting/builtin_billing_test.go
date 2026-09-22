@@ -148,3 +148,64 @@ func TestImageModelBuiltinPricesAndOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestXAIVideoBuiltinPricesAndOverrides(t *testing.T) {
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	saved := *settings
+	savedRatios, savedPrices := ratio_setting.ModelRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() {
+		*settings = saved
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(savedPrices))
+	})
+	*settings = billing_setting.BillingSetting{BillingMode: map[string]string{}, BillingExpr: map[string]string{}, PluginBillingExpr: map[string]string{}}
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+
+	for _, tc := range []struct {
+		model      string
+		resolution string
+		seconds    float64
+		images     float64
+		inputVideo float64
+		wantCost   float64
+	}{
+		{model: "grok-imagine-video-1.5", resolution: "480p", seconds: 10, images: 2, wantCost: 0.82},
+		{model: "grok-imagine-video-1.5-preview", resolution: "720p", seconds: 10, images: 2, wantCost: 1.42},
+		{model: "grok-imagine-video-1.5-2026-05-30", resolution: "1080p", seconds: 10, images: 2, wantCost: 2.52},
+		{model: "grok-imagine-video", resolution: "720p", seconds: 10, images: 2, wantCost: 0.704},
+	} {
+		t.Run(tc.model+"/"+tc.resolution, func(t *testing.T) {
+			expression, ok := billing_setting.ResolveTaskBillingExpr("xai", tc.model, tc.model)
+			require.True(t, ok)
+			cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: map[string]any{
+				"seconds": tc.seconds, "resolution": tc.resolution, "input_images": tc.images, "input_video_seconds": tc.inputVideo,
+				"billing_source": "estimate", "upstream_cost_credit": float64(0),
+			}})
+			require.NoError(t, err)
+			assert.InDelta(t, tc.wantCost, cost, 1e-12)
+		})
+	}
+
+	expression, exists := billing_setting.ResolveTaskBillingExpr("xai", "grok-imagine-video", "grok-imagine-video")
+	require.True(t, exists)
+	cost, tier, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: map[string]any{
+		"seconds": float64(8.7), "resolution": "720p", "input_images": float64(0), "input_video_seconds": float64(8.7),
+		"billing_source": "upstream", "upstream_cost_credit": float64(1.23),
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "upstream", tier.MatchedTier)
+	assert.InDelta(t, 1.23, cost, 1e-12)
+
+	modelName := "grok-imagine-video-1.5"
+	encoded, err := common.Marshal(map[string]float64{modelName: 3})
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(string(encoded)))
+	_, exists = billing_setting.ResolveTaskBillingExpr("xai", modelName, modelName)
+	assert.False(t, exists, "an administrator legacy ratio keeps priority over the built-in expression")
+
+	settings.PluginBillingExpr[billing_setting.PluginBillingExprKey("xai", modelName)] = `tier("custom", u("seconds") * 0.5)`
+	expression, exists = billing_setting.ResolveTaskBillingExpr("xai", modelName, modelName)
+	require.True(t, exists)
+	assert.Equal(t, settings.PluginBillingExpr[billing_setting.PluginBillingExprKey("xai", modelName)], expression)
+}

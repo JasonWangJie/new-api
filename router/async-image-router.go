@@ -119,6 +119,8 @@ func SetAsyncImagePublicRouter(router *gin.Engine) {
 		api.POST(path, asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
 	}
 	api.POST("/videos/generations_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideo, middleware.PinTaskPluginEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	api.POST("/videos/edits_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideoEdit, middleware.PinTaskPluginEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	api.POST("/videos/extensions_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideoExtension, middleware.PinTaskPluginEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
 	api.GET("/media/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncMedia)
 	api.GET("/media/objects/:object_id", controller.MediaObjectContent)
 	api.HEAD("/media/objects/:object_id", controller.MediaObjectContent)

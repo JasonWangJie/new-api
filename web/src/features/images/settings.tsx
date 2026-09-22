@@ -22,12 +22,27 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { StaticDataTable } from '@/components/data-table'
+import { JsonCodeEditor } from '@/components/json-code-editor'
 import { MultiSelect } from '@/components/multi-select'
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from '@/components/ui/accordion'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Combobox } from '@/components/ui/combobox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
@@ -38,52 +53,15 @@ import { imageRequest } from './api'
 import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
-import { MediaSettingsCard } from './media-settings'
+import type {
+  ImageAdminConfiguration,
+  ImagePoolSelectionOptions,
+  ImageStorageProfile,
+} from './types'
+import { VideoConfiguration } from './video-settings'
 
-type StorageProfile = {
-  profile_id: string
-  class: string
-  backend: string
-  provider: string
-  root: string
-  endpoint: string
-  bucket: string
-  region: string
-  prefix: string
-  active: boolean
-  path_style: boolean
-}
-type ImageConfiguration = {
-  image_providers?: string[]
-  media_providers?: string[]
-  runtime: Record<string, string | number | boolean>
-  storage_profiles: StorageProfile[]
-  policies: {
-    group: string
-    platform: string
-    pool_mode: string
-    enabled: boolean
-    async_enabled: boolean
-    models: string
-    version: number
-  }[]
-  pools: ImageChannelPool[]
-  storage_providers: string[]
-}
-type ImageChannelPool = {
-  binding_key: string
-  group: string
-  platform: string
-  mode: string
-  model: string
-  resolution: string
-  channel_id: number
-  priority: number
-}
-type ImagePoolSelectionOptions = {
-  models: { id: string; label: string; channel_ids: number[] }[]
-  channels: { id: number; name: string }[]
-}
+type ImageConfiguration = ImageAdminConfiguration
+type StorageProfile = ImageStorageProfile
 type RuntimeField = {
   key: string
   label: string
@@ -127,6 +105,254 @@ const RUNTIME_FIELDS: readonly RuntimeField[] = [
   { key: 'billing_retry_attempts', label: 'Billing retries', min: 0 },
 ]
 
+type RuntimeFieldReference = {
+  key: string
+  description: string
+}
+
+const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
+  {
+    key: 'async_enabled',
+    description: 'Enables asynchronous image task APIs and workers.',
+  },
+  {
+    key: 'auto_archive_to_library',
+    description:
+      "Automatically adds completed asynchronous results to the user's image library.",
+  },
+  {
+    key: 'worker_concurrency',
+    description: 'Number of asynchronous task workers running on this node.',
+  },
+  {
+    key: 'worker_lease_seconds',
+    description: 'Seconds before an inactive worker lease can be recovered.',
+  },
+  {
+    key: 'recovery_interval_seconds',
+    description:
+      'Seconds between scans for expired worker leases and recoverable tasks.',
+  },
+  {
+    key: 'execution_timeout_seconds',
+    description: 'Maximum total execution time for one image task, in seconds.',
+  },
+  {
+    key: 'account_attempt_timeout_seconds',
+    description: 'Maximum time for one upstream account attempt, in seconds.',
+  },
+  {
+    key: 'image_concurrency',
+    description:
+      'Maximum image generations executed concurrently on this node.',
+  },
+  {
+    key: 'storage_retry_attempts',
+    description: 'Maximum retries for storing generated output.',
+  },
+  {
+    key: 'billing_retry_attempts',
+    description: 'Maximum retries for final billing settlement.',
+  },
+  {
+    key: 'retry_backoff_seconds',
+    description: 'Base delay used by general retry scheduling, in seconds.',
+  },
+  {
+    key: 'openai_reference_transport_mode',
+    description:
+      'How OpenAI references are sent: upstream URL, server download, or URL with local fallback.',
+  },
+  {
+    key: 'gemini_reference_transport_mode',
+    description:
+      'How Gemini references are sent: upstream URL, server download, or URL with local fallback.',
+  },
+  {
+    key: 'gemini_async_max_account_switches',
+    description: 'Maximum Gemini account switches during one task.',
+  },
+  {
+    key: 'image_circuit_breaker_enabled',
+    description:
+      'Temporarily stops routing to repeatedly failing image channels.',
+  },
+  {
+    key: 'failure_threshold',
+    description:
+      'Consecutive failures required to open an image channel circuit.',
+  },
+  {
+    key: 'cooldown_seconds',
+    description: 'Seconds an opened image channel circuit remains unavailable.',
+  },
+  {
+    key: 'reference_fetch_max_retries',
+    description: 'Maximum retries for temporary reference download failures.',
+  },
+  {
+    key: 'reference_retry_base_seconds',
+    description:
+      'Initial delay before retrying a reference download, in seconds.',
+  },
+  {
+    key: 'reference_retry_max_seconds',
+    description:
+      'Maximum delay between reference download retries, in seconds.',
+  },
+  {
+    key: 'upstream_transient_max_retries',
+    description: 'Maximum retries for temporary upstream service failures.',
+  },
+  {
+    key: 'upstream_transient_retry_base_seconds',
+    description:
+      'Initial delay before retrying a temporary upstream failure, in seconds.',
+  },
+  {
+    key: 'upstream_transient_retry_max_seconds',
+    description:
+      'Maximum delay between temporary upstream retries, in seconds.',
+  },
+  {
+    key: 'capacity_max_retries',
+    description:
+      'Maximum retries while image execution capacity is unavailable.',
+  },
+  {
+    key: 'capacity_retry_base_seconds',
+    description:
+      'Initial delay before retrying unavailable execution capacity, in seconds.',
+  },
+  {
+    key: 'capacity_retry_max_seconds',
+    description:
+      'Maximum delay between execution-capacity retries, in seconds.',
+  },
+  {
+    key: 'total_max_retries',
+    description:
+      'Maximum retries allowed across all retry categories for one task.',
+  },
+  {
+    key: 'retry_jitter_percent',
+    description:
+      'Random percentage added to retry delays to avoid synchronized retries.',
+  },
+  {
+    key: 'retry_after_max_seconds',
+    description:
+      'Maximum Retry-After delay accepted from an upstream response, in seconds.',
+  },
+  {
+    key: 'download_max_bytes',
+    description: 'Maximum downloaded bytes allowed for each reference image.',
+  },
+  {
+    key: 'download_max_pixels',
+    description: 'Maximum decoded pixels allowed for each reference image.',
+  },
+  {
+    key: 'max_reference_images',
+    description:
+      'Global reference-image count limit; the effective limit is the lowest applicable model, channel, and global limit.',
+  },
+  {
+    key: 'download_timeout_seconds',
+    description: 'Timeout for downloading one reference image, in seconds.',
+  },
+  {
+    key: 'download_max_redirects',
+    description:
+      'Maximum redirects followed while downloading a reference image.',
+  },
+  {
+    key: 'reference_fetch_concurrency',
+    description:
+      'Maximum reference images downloaded concurrently on this node.',
+  },
+  {
+    key: 'reference_cache_ttl_seconds',
+    description:
+      'Seconds downloaded reference bytes remain in the shared cache; 0 disables retention.',
+  },
+  {
+    key: 'reference_cache_max_bytes',
+    description:
+      'Maximum bytes stored in the shared reference cache; 0 disables the cache.',
+  },
+  {
+    key: 'upload_timeout_seconds',
+    description: 'Timeout for completing one staged input upload, in seconds.',
+  },
+  {
+    key: 'upload_per_minute',
+    description: 'Maximum input uploads accepted per API key each minute.',
+  },
+  {
+    key: 'max_input_bytes_per_key',
+    description: 'Maximum retained input bytes per API key.',
+  },
+  {
+    key: 'max_upload_bytes',
+    description: 'Maximum bytes allowed for one uploaded image.',
+  },
+  {
+    key: 'signed_url_expiry_seconds',
+    description: 'Lifetime of generated signed image URLs, in seconds.',
+  },
+  {
+    key: 'input_retention_hours',
+    description: 'Hours uploaded input images are retained.',
+  },
+  {
+    key: 'task_retention_days',
+    description: 'Days image task records are retained.',
+  },
+  {
+    key: 'result_retention_days',
+    description: 'Days generated result objects are retained.',
+  },
+  {
+    key: 'prompt_preview_enabled',
+    description: 'Shows a shortened prompt summary in task lists and details.',
+  },
+  {
+    key: 'prompt_preview_max_chars',
+    description: 'Maximum characters stored in a prompt summary.',
+  },
+  {
+    key: 'library_retention_days',
+    description: 'Days archived library images are retained.',
+  },
+  {
+    key: 'library_max_items_per_user',
+    description: 'Maximum archived image items per user.',
+  },
+  {
+    key: 'library_max_bytes_per_user',
+    description: 'Maximum total archived image bytes per user.',
+  },
+  {
+    key: 'library_max_image_bytes',
+    description:
+      'Maximum bytes allowed for one image imported into the library.',
+  },
+  {
+    key: 'library_max_image_pixels',
+    description:
+      'Maximum decoded pixels allowed for one image imported into the library.',
+  },
+  {
+    key: 'library_import_per_minute',
+    description: 'Maximum external image imports per user each minute.',
+  },
+  {
+    key: 'library_submission_per_minute',
+    description: 'Maximum library submission operations per user each minute.',
+  },
+]
+
 export function ImageSettings() {
   const { t } = useTranslation()
   const user = useAuthStore((state) => state.auth.user)
@@ -146,7 +372,7 @@ export function ImageSettings() {
   if (!allowed) {
     return (
       <p className='text-muted-foreground text-sm'>
-        {t('Image settings require administrator storage permissions.')}
+        {t('Media settings require administrator storage permissions.')}
       </p>
     )
   }
@@ -160,9 +386,10 @@ export function ImageSettings() {
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList className='h-auto flex-wrap'>
           {[
-            { id: 'runtime', label: 'Runtime' },
+            { id: 'runtime', label: 'Image runtime' },
             { id: 'storage', label: 'Image storage' },
-            { id: 'policy', label: 'Platform policies' },
+            { id: 'policy', label: 'Image policies' },
+            { id: 'video', label: 'Video configuration' },
             { id: 'pool', label: 'Channel pools' },
           ].map((item) => (
             <TabsTrigger key={item.id} value={item.id}>
@@ -171,7 +398,6 @@ export function ImageSettings() {
           ))}
         </TabsList>
       </Tabs>
-      {tab === 'runtime' && <MediaSettingsCard />}
       {tab === 'runtime' && (
         <ImageRuntimeForm
           key={JSON.stringify(config.runtime)}
@@ -187,6 +413,12 @@ export function ImageSettings() {
       )}{' '}
       {tab === 'policy' && (
         <ImagePolicyForm
+          config={config}
+          onSuccess={() => configuration.refetch()}
+        />
+      )}{' '}
+      {tab === 'video' && (
+        <VideoConfiguration
           config={config}
           onSuccess={() => configuration.refetch()}
         />
@@ -212,6 +444,18 @@ export function ImageRuntimeForm({
   const [values, setValues] = useState(initial)
   const [advanced, setAdvanced] = useState('')
   const [busy, setBusy] = useState(false)
+  const advancedValues = useMemo(() => {
+    if (!advanced) return values
+    try {
+      const parsed: unknown = JSON.parse(advanced)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as ImageConfiguration['runtime']
+      }
+    } catch {
+      // Keep the last valid form values visible while the JSON draft is invalid.
+    }
+    return values
+  }, [advanced, values])
   const save = async () => {
     setBusy(true)
     try {
@@ -324,17 +568,62 @@ export function ImageRuntimeForm({
           {t('Advanced runtime settings')}
         </Button>
         {advanced && (
-          <div className='space-y-2'>
+          <div className='space-y-3'>
             <Label htmlFor='image-runtime-advanced'>
               {t('Complete runtime configuration')}
             </Label>
-            <Textarea
+            <p
+              id='image-runtime-advanced-help'
+              className='text-muted-foreground text-sm'
+            >
+              {t(
+                'Use strict JSON. Comments such as // or /* */ are not supported.'
+              )}
+            </p>
+            <JsonCodeEditor
               id='image-runtime-advanced'
-              className='min-h-72 font-mono text-xs'
               value={advanced}
-              onChange={(event) => setAdvanced(event.target.value)}
+              onChange={setAdvanced}
               disabled={busy}
+              heightClassName='h-72 min-h-72 max-h-72'
+              ariaLabel={t('Complete runtime configuration')}
+              aria-describedby='image-runtime-advanced-help'
             />
+            <Accordion>
+              <AccordionItem value='runtime-field-reference'>
+                <AccordionTrigger>
+                  {t('Runtime field reference')}
+                </AccordionTrigger>
+                <AccordionContent>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>{t('Field')}</TableHead>
+                        <TableHead>{t('Description')}</TableHead>
+                        <TableHead>{t('Current value')}</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {RUNTIME_FIELD_REFERENCES.map((field) => (
+                        <TableRow key={field.key}>
+                          <TableCell>
+                            <code className='text-xs'>{field.key}</code>
+                          </TableCell>
+                          <TableCell className='min-w-80 whitespace-normal'>
+                            {t(field.description)}
+                          </TableCell>
+                          <TableCell>
+                            <code className='text-xs'>
+                              {String(advancedValues[field.key])}
+                            </code>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </AccordionContent>
+              </AccordionItem>
+            </Accordion>
           </div>
         )}
         <div>
@@ -581,6 +870,7 @@ function ImagePolicyForm({
         {
           id: 'gpt-image-2',
           label: 'gpt-image-2',
+          media_type: 'image',
           qualities: ['low', 'medium', 'high'],
           resolutions: ['1K', '2K', '4K'],
           formats: ['png', 'jpeg', 'webp'],
@@ -773,7 +1063,10 @@ export function ImagePoolForm({
   const modelOptions = useMemo(() => {
     const options = (poolOptions.data?.models || []).map((item) => ({
       value: item.id,
-      label: item.label,
+      label:
+        item.media_types && item.media_types.length > 0
+          ? `${item.label} · ${item.media_types.map((media) => t(media === 'video' ? 'Video' : 'Images')).join(' + ')}`
+          : item.label,
     }))
     if (model && !options.some((option) => option.value === model)) {
       options.push({ value: model, label: `${model} · ${t('Unavailable')}` })

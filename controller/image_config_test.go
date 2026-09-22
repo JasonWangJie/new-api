@@ -111,7 +111,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 				Data service.ImagePoolSelectionOptions `json:"data"`
 			}
 			require.NoError(t, common.Unmarshal(optionsRecorder.Body.Bytes(), &optionsResponse))
-			require.Equal(t, []service.ImagePoolModelOption{{Id: "image-alpha", Label: "Image Alpha", ChannelIds: []int{11}}}, optionsResponse.Data.Models)
+			require.Equal(t, []service.ImagePoolModelOption{{Id: "image-alpha", Label: "Image Alpha", MediaTypes: []string{"image"}, ChannelIds: []int{11}}}, optionsResponse.Data.Models)
 			assert.Equal(t, []service.ImagePoolChannelOption{{Id: 11, Name: "OpenAI primary"}}, optionsResponse.Data.Channels)
 			for _, secret := range []string{"openai-secret", "gemini-secret", "disabled-secret"} {
 				assert.NotContains(t, optionsRecorder.Body.String(), secret)
@@ -158,4 +158,57 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			assert.Contains(t, invalidModelRecorder.Body.String(), "Pool model is not enabled")
 		})
 	}
+}
+
+func TestSaveMediaPolicyAcceptsImageVideoCatalogAndRejectsCapabilityExpansion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "media-policy.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		connection, closeErr := db.DB()
+		if assert.NoError(t, closeErr) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.ImageGroupPolicy{}))
+
+	save := func(models any) *httptest.ResponseRecorder {
+		catalogJSON, catalogErr := common.Marshal(models)
+		require.NoError(t, catalogErr)
+		body, marshalErr := common.Marshal(gin.H{
+			"group": "default", "platform": "xai", "pool_mode": "model_resolution", "enabled": true, "async_enabled": true, "models": string(catalogJSON),
+		})
+		require.NoError(t, marshalErr)
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+		SaveImagePolicy(context)
+		return recorder
+	}
+
+	models := []service.ImageModelCapability{
+		{Id: "grok-imagine-video-1.5", Label: "Grok image-compatible entry", MediaType: "image", MaxOutputImages: 1},
+		{Id: "grok-imagine-video-1.5", Label: "Grok Imagine Video 1.5", MediaType: "video", VideoOverrides: service.VideoModelOverrides{Modes: []string{"text_to_video", "image_to_video"}, Resolutions: []string{"720p"}, DefaultResolution: "720p"}},
+	}
+	recorder := save(models)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var saved model.ImageGroupPolicy
+	require.NoError(t, db.Where("platform = ?", "xai").Take(&saved).Error)
+	var catalog []service.ImageModelCapability
+	require.NoError(t, common.UnmarshalJsonStr(saved.Models, &catalog))
+	require.Len(t, catalog, 2)
+	assert.Equal(t, "image", catalog[0].MediaType)
+	assert.Equal(t, "video", catalog[1].MediaType)
+
+	models[1].VideoOverrides.Resolutions = []string{"4k"}
+	recorder = save(models)
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "expands")
+
+	require.NoError(t, db.Where("platform = ?", "xai").Delete(&model.ImageGroupPolicy{}).Error)
+	recorder = save([]service.ImageModelCapability{{Id: "grok-imagine-video-1.5", Label: "Legacy hand-authored video"}})
+	assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 }

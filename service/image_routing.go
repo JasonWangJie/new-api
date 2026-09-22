@@ -30,9 +30,10 @@ type ImagePoolChannelOption struct {
 }
 
 type ImagePoolModelOption struct {
-	Id         string `json:"id"`
-	Label      string `json:"label"`
-	ChannelIds []int  `json:"channel_ids"`
+	Id         string   `json:"id"`
+	Label      string   `json:"label"`
+	MediaTypes []string `json:"media_types"`
+	ChannelIds []int    `json:"channel_ids"`
 }
 
 type ImagePoolSelectionOptions struct {
@@ -54,7 +55,9 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 	}
 
 	labels := make(map[string]string)
+	mediaTypes := make(map[string][]string)
 	configuredModels := make([]string, 0)
+	configuredModelSet := make(map[string]bool)
 	var policies []model.ImageGroupPolicy
 	if err := model.DB.WithContext(ctx).Where("policy_key = ?", ImageIdentityHash(group, platform)).Limit(1).Find(&policies).Error; err != nil {
 		return options, err
@@ -65,8 +68,23 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 			return options, err
 		}
 		for _, capability := range catalog {
-			configuredModels = append(configuredModels, capability.Id)
+			if !configuredModelSet[capability.Id] {
+				configuredModels = append(configuredModels, capability.Id)
+				configuredModelSet[capability.Id] = true
+			}
 			labels[capability.Id] = capability.Label
+			kinds := []string{capability.MediaType}
+			if capability.MediaType == "" {
+				kinds = []string{"image"}
+				if MediaPlatformSupportsVideoModel(capability.Id, platform) {
+					kinds = append(kinds, "video")
+				}
+			}
+			for _, kind := range kinds {
+				if kind != "" && !slices.Contains(mediaTypes[capability.Id], kind) {
+					mediaTypes[capability.Id] = append(mediaTypes[capability.Id], kind)
+				}
+			}
 		}
 	}
 
@@ -80,6 +98,9 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 		for modelName := range abilityChannels {
 			configuredModels = append(configuredModels, modelName)
 			labels[modelName] = modelName
+			if MediaPlatformSupportsVideoModel(modelName, platform) {
+				mediaTypes[modelName] = append(mediaTypes[modelName], "video")
+			}
 		}
 	}
 
@@ -122,12 +143,22 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 		if len(modelChannels) == 0 {
 			continue
 		}
+		if len(policies) == 0 && !slices.Contains(mediaTypes[modelName], "image") {
+			for _, channelId := range ids {
+				if channel := channelsById[channelId]; channel != nil && ImageChannelSupportsPlatform(*channel, modelName, platform) {
+					mediaTypes[modelName] = append(mediaTypes[modelName], "image")
+					break
+				}
+			}
+		}
 		slices.Sort(modelChannels)
 		label := labels[modelName]
 		if label == "" {
 			label = modelName
 		}
-		options.Models = append(options.Models, ImagePoolModelOption{Id: modelName, Label: label, ChannelIds: modelChannels})
+		kinds := slices.Clone(mediaTypes[modelName])
+		slices.Sort(kinds)
+		options.Models = append(options.Models, ImagePoolModelOption{Id: modelName, Label: label, MediaTypes: kinds, ChannelIds: modelChannels})
 	}
 	for channelId := range selectedChannels {
 		channel := channelsById[channelId]
@@ -363,6 +394,13 @@ type ImageChannelAttempt struct {
 
 func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, platform string, maxSwitches int) ImageAccountRouting {
 	routing := ImageAccountRouting{}
+	effectiveRetries := retries
+	for _, attempt := range attempts {
+		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 610 || attempt.Code == 613) {
+			effectiveRetries = max(effectiveRetries, 1)
+			break
+		}
+	}
 	var reference []ImageChannelAttempt
 	var last string
 	switches := 0
@@ -371,7 +409,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 			continue
 		}
 		if attempt.KeyFingerprint == "" {
-			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, retries)
+			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
 			return routing
 		}
 		if last != "" && last != attempt.KeyFingerprint {
@@ -390,7 +428,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 				return routing
 			}
 		}
-		if len(reference) <= retries {
+		if len(reference) <= effectiveRetries {
 			routing.Pin = first
 		} else {
 			routing.Excluded = []string{first}
@@ -466,7 +504,7 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	if !ratio_setting.ContainsGroupRatio(policy.Group) {
 		return policy, model.ImageFundingSelection{}, errors.New("image platform group is unavailable")
 	}
-	index := slices.IndexFunc(catalog, func(capability ImageModelCapability) bool { return capability.Id == request.Model })
+	index := slices.IndexFunc(catalog, func(capability ImageModelCapability) bool { return capability.MatchesMedia(request.Model, "image") })
 	if index < 0 {
 		return policy, model.ImageFundingSelection{}, errors.New("image model is not available in this platform catalog")
 	}

@@ -23,8 +23,10 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/types"
@@ -193,6 +195,14 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		assert.Equal(t, tc.excluded, routing.Excluded)
 		assert.Equal(t, tc.stop, routing.Stop)
 	}
+	ambiguousFallback := accountA
+	ambiguousFallback.Code = 601
+	ambiguousFallback.ReferenceMode = "passthrough_fallback_local"
+	routing := ImageAccountAttemptRouting([]ImageChannelAttempt{ambiguousFallback}, 0, "gemini", 3)
+	assert.Equal(t, "account-a", routing.Pin, "the forced local fallback must reuse the selected account even when configured reference retries are zero")
+	ambiguousFallback.KeyFingerprint = ""
+	routing = ImageAccountAttemptRouting([]ImageChannelAttempt{ambiguousFallback}, 0, "gemini", 3)
+	assert.Equal(t, 10, routing.PinChannel, "single-key channels must also remain pinned for the forced local fallback")
 	assert.True(t, ImageAccountAttemptRouting([]ImageChannelAttempt{accountA, accountA, accountA}, 2, "gemini", 0).Stop)
 	accountA.ReferenceFailure, accountB.ReferenceFailure = false, false
 	assert.Equal(t, "account-b", ImageAccountAttemptRouting([]ImageChannelAttempt{accountA, accountB}, 2, "gemini", 1).Pin)
@@ -343,6 +353,7 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		providerCode string
 		requestID    string
 		message      string
+		fallback     bool
 	}{
 		{
 			name:         "reference image limit from provider code",
@@ -370,6 +381,15 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			providerCode: "400",
 			requestID:    "gemini-unprocessable",
 			message:      "prompt or input images could not be processed",
+			fallback:     true,
+		},
+		{
+			name:         "ambiguous safety rejection can retry remote references locally",
+			body:         `{"error":{"code":400,"message":"The request was rejected by the upstream safety policy.","status":"INVALID_ARGUMENT"}}`,
+			expectedCode: 601,
+			providerCode: "400",
+			message:      "upstream safety policy",
+			fallback:     true,
 		},
 	}
 
@@ -392,8 +412,115 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			assert.NotContains(t, failure.Message, "private-key")
 			assert.NotContains(t, failure.Message, "signed.example")
 			assert.LessOrEqual(t, len([]rune(failure.Message)), asyncImageProviderMessageLimit)
+			assert.Equal(t, testCase.fallback, ShouldFallbackGeminiReferenceTransport(failure))
 		})
 	}
+}
+
+func TestGeminiAmbiguousReferenceFailureSchedulesSingleLocalFallback(t *testing.T) {
+	previousDB := model.DB
+	dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "gemini-reference-fallback.db")))
+	if dsn := os.Getenv("IMAGE_WORKER_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_worker_test", "use the dedicated disposable image worker database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_WORKER_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_worker_test") || strings.Contains(dsn, "/new_api_image_worker_test"), "use the dedicated disposable image worker database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	t.Cleanup(func() {
+		model.DB = previousDB
+		connection, openErr := db.DB()
+		if openErr == nil {
+			_ = connection.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageStagingObject{}, &model.AsyncImageBill{}))
+
+	now := time.Now().Unix()
+	attempts, err := common.Marshal([]ImageChannelAttempt{{
+		ChannelId:     15,
+		StartedAt:     now - 1,
+		Dispatched:    true,
+		ReferenceMode: "passthrough_fallback_local",
+	}})
+	require.NoError(t, err)
+	task := model.AsyncImageTask{
+		TaskId:         "asyncimg_gemini_reference_fallback",
+		Status:         model.ImageTaskInvoking,
+		Version:        1,
+		ChannelId:      15,
+		LeaseToken:     "gemini-reference-fallback-lease",
+		LeaseExpiresAt: now + 60,
+		DispatchedAt:   now - 1,
+		RequestCipher:  []byte("encrypted-request"),
+		Attempts:       string(attempts),
+		CreatedAt:      now - 1,
+	}
+	require.NoError(t, db.Create(&task).Error)
+	cfg := DefaultImageRuntimeConfig()
+	cfg.GeminiReferenceMode = "passthrough_fallback_local"
+	cfg.ReferenceRetries = 0
+	cfg.ReferenceRetryBase = 1
+	cfg.ReferenceRetryMax = 1
+	cfg.RetryJitter = 0
+	failure := &AsyncImageFailure{
+		Code:                       601,
+		InternalCode:               "upstream_failed",
+		Message:                    "The request was rejected by the upstream safety policy.",
+		HTTPStatus:                 http.StatusBadRequest,
+		ProviderCode:               "400",
+		ProviderStatus:             "INVALID_ARGUMENT",
+		ReferenceTransportFallback: true,
+	}
+
+	require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, cfg))
+
+	var stored model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, model.ImageTaskQueued, stored.Status)
+	assert.Equal(t, 1, stored.RetryCount)
+	assert.Equal(t, 1, stored.ReferenceRetryCount)
+	assert.Zero(t, stored.DispatchedAt)
+	assert.Zero(t, stored.ChannelId)
+	assert.Zero(t, stored.FinishedAt)
+	assert.Greater(t, stored.NextAttemptAt, now)
+	assert.Equal(t, "local", ResolveImageReferenceTransportMode(cfg.GeminiReferenceMode, stored.ReferenceRetryCount))
+	var storedAttempts []ImageChannelAttempt
+	require.NoError(t, common.UnmarshalJsonStr(stored.Attempts, &storedAttempts))
+	require.Len(t, storedAttempts, 1)
+	assert.True(t, storedAttempts[0].ReferenceFailure)
+	assert.Equal(t, 601, storedAttempts[0].Code)
+	assert.Equal(t, "passthrough_fallback_local", storedAttempts[0].ReferenceMode)
+
+	require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{
+		"status":           model.ImageTaskInvoking,
+		"version":          stored.Version + 1,
+		"lease_token":      "gemini-reference-success-lease",
+		"lease_expires_at": time.Now().Unix() + 60,
+	}).Error)
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	bill := model.AsyncImageBill{
+		TaskId:           stored.TaskId,
+		BillingRequestId: "async-image:" + stored.TaskId,
+		Fingerprint:      "gemini-reference-fallback-bill",
+		UserId:           stored.UserId,
+		TokenId:          stored.TokenId,
+	}
+	require.NoError(t, model.StageAsyncImageOutput(t.Context(), stored, []model.AsyncImageStagingObject{{
+		Data:        []byte("generated-image"),
+		Checksum:    "generated-image-checksum",
+		Width:       1024,
+		Height:      1024,
+		ContentType: "image/png",
+	}}, bill))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, model.ImageTaskUpstreamSucceeded, stored.Status)
+	assert.Empty(t, stored.ErrorCode)
+	assert.Empty(t, stored.ErrorMessage)
+	assert.Zero(t, stored.PublicErrorCode)
 }
 
 func TestFailAsyncImageInvocationPersistsSanitizedProviderDiagnostics(t *testing.T) {
@@ -840,4 +967,149 @@ func TestAsyncImageLocalStorageAndDurableIntentRetry(t *testing.T) {
 	assert.ErrorIs(t, err, ErrImageObjectMissing)
 	_, err = os.Stat(filepath.Join(profile.Root, "outside.png"))
 	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestVideoCapabilityNarrowingAndRequestValidation(t *testing.T) {
+	profile := jsplugin.VideoProfile{Models: []string{"video-model"}, Modes: []jsplugin.VideoModeProfile{
+		{Name: "text_to_video", Duration: &jsplugin.VideoDurationProfile{Min: 1, Max: 15, Step: 1, Default: 5}, Resolutions: []string{"480p", "720p", "1080p"}, DefaultResolution: "720p", AspectRatios: []string{"16:9", "9:16"}, DefaultAspectRatio: "16:9"},
+		{Name: "image_to_video", Duration: &jsplugin.VideoDurationProfile{Min: 1, Max: 15, Step: 1, Default: 5}, Resolutions: []string{"720p"}, DefaultResolution: "720p", Inputs: []jsplugin.VideoInputProfile{{Name: "image", Kind: "image", Sources: []string{"url"}, MaxItems: 1, Required: true}}},
+		{Name: "reference_to_video", Duration: &jsplugin.VideoDurationProfile{Min: 1, Max: 15, Step: 1, Default: 5}, Resolutions: []string{"480p", "720p"}, DefaultResolution: "720p", Inputs: []jsplugin.VideoInputProfile{{Name: "reference_images", Kind: "image", Sources: []string{"url", "data_uri"}, MaxItems: 7, Required: true}}},
+	}}
+	maximum := 10
+	defaultDuration := 6
+	narrowed, err := ApplyVideoModelOverrides(profile, VideoModelOverrides{
+		Modes:             []string{"reference_to_video"},
+		Duration:          &VideoDurationOverrides{Max: &maximum, Default: &defaultDuration},
+		Resolutions:       []string{"720p"},
+		DefaultResolution: "720p",
+		MaxInputItems:     map[string]int{"reference_images": 3},
+	})
+	require.NoError(t, err)
+	require.Len(t, narrowed.Modes, 1)
+	assert.Equal(t, "reference_to_video", narrowed.Modes[0].Name)
+	assert.Equal(t, 10, narrowed.Modes[0].Duration.Max)
+	assert.Equal(t, 6, narrowed.Modes[0].Duration.Default)
+	assert.Equal(t, []string{"720p"}, narrowed.Modes[0].Resolutions)
+	assert.Equal(t, 3, narrowed.Modes[0].Inputs[0].MaxItems)
+	assert.Equal(t, 15, profile.Modes[2].Duration.Max, "narrowing must not mutate the plugin declaration")
+
+	request := map[string]any{"duration": float64(10), "resolution": "720p", "reference_images": []any{"https://cdn.example/one.png", "data:image/png;base64,eA=="}}
+	require.NoError(t, ValidateVideoProfileRequest(narrowed, "reference_to_video", request, nil))
+	request["duration"] = float64(11)
+	assert.ErrorContains(t, ValidateVideoProfileRequest(narrowed, "reference_to_video", request, nil), "duration")
+	request["duration"] = float64(10)
+	request["reference_images"] = []any{"asset://one"}
+	assert.ErrorContains(t, ValidateVideoProfileRequest(narrowed, "reference_to_video", request, nil), "source")
+	request["reference_images"] = []any{"https://cdn.example/one.png"}
+	request["reference_videos"] = []any{"https://cdn.example/video.mp4"}
+	assert.ErrorContains(t, ValidateVideoProfileRequest(narrowed, "reference_to_video", request, nil), "not enabled")
+
+	legacyNative := map[string]any{"metadata": map[string]any{"content": []any{map[string]any{
+		"type": "image_url", "image_url": map[string]any{"url": "https://cdn.example/legacy.png"},
+	}}}}
+	require.NoError(t, ValidateVideoProfileRequest(profile, "image_to_video", legacyNative, nil))
+
+	customInputProfile := jsplugin.VideoProfile{Models: []string{"video-model"}, Modes: []jsplugin.VideoModeProfile{{
+		Name: "reference_to_video", Duration: &jsplugin.VideoDurationProfile{Values: []int{5}, Default: 5}, Resolutions: []string{"720p"}, DefaultResolution: "720p",
+		Inputs: []jsplugin.VideoInputProfile{{Name: "storyboard", Kind: "image", Sources: []string{"url"}, MaxItems: 2, Required: true}},
+	}}}
+	require.NoError(t, ValidateVideoProfileRequest(customInputProfile, "reference_to_video", map[string]any{
+		"storyboard": []any{"https://cdn.example/frame-1.png", "https://cdn.example/frame-2.png"},
+	}, nil))
+	assert.ErrorContains(t, ValidateVideoProfileRequest(customInputProfile, "reference_to_video", map[string]any{}, nil), "required")
+
+	_, err = ApplyVideoModelOverrides(profile, VideoModelOverrides{Resolutions: []string{"4k"}})
+	assert.ErrorContains(t, err, "expands")
+	tooMany := 8
+	_, err = ApplyVideoModelOverrides(profile, VideoModelOverrides{MaxInputItems: map[string]int{"reference_images": tooMany}})
+	assert.ErrorContains(t, err, "expands")
+
+	operationDuration := jsplugin.VideoDurationProfile{Min: 2, Max: 10, Step: 1, Default: 6}
+	operationProfile := jsplugin.VideoProfile{Models: []string{"video-model"}, Modes: []jsplugin.VideoModeProfile{
+		{Name: "edit_video", Inputs: []jsplugin.VideoInputProfile{{Name: "video", Kind: "video", Sources: []string{"url"}, MaxItems: 1, Required: true}}},
+		{Name: "extend_video", Duration: &operationDuration, ExtensionDirections: []string{"forward", "backward"}, DefaultExtensionDirection: "backward", Inputs: []jsplugin.VideoInputProfile{{Name: "video", Kind: "video", Sources: []string{"url", "asset"}, MaxItems: 1, Required: true}}},
+	}}
+	editRequest := map[string]any{"prompt": "restyle", "video": "https://cdn.example/source.mp4"}
+	require.NoError(t, ValidateVideoProfileRequest(operationProfile, "edit_video", editRequest, nil))
+	editRequest["duration"] = float64(5)
+	assert.ErrorContains(t, ValidateVideoProfileRequest(operationProfile, "edit_video", editRequest, nil), "fixed")
+	delete(editRequest, "duration")
+	delete(editRequest, "prompt")
+	assert.ErrorContains(t, ValidateVideoProfileRequest(operationProfile, "edit_video", editRequest, nil), "prompt")
+	editRequest["prompt"] = "restyle"
+	editRequest["source_task_id"] = "old-task"
+	assert.ErrorContains(t, ValidateVideoProfileRequest(operationProfile, "edit_video", editRequest, nil), "source_task_id")
+	delete(editRequest, "source_task_id")
+
+	extendRequest := map[string]any{"prompt": "continue", "video": "asset://source", "duration": float64(10), "extension_direction": "forward"}
+	require.NoError(t, ValidateVideoProfileRequest(operationProfile, "extend_video", extendRequest, nil))
+	extendRequest["extension_direction"] = "sideways"
+	assert.ErrorContains(t, ValidateVideoProfileRequest(operationProfile, "extend_video", extendRequest, nil), "direction")
+	extendRequest["extension_direction"] = "backward"
+	extendRequest["seconds"] = float64(10)
+	assert.ErrorContains(t, ValidateVideoProfileRequest(operationProfile, "extend_video", extendRequest, nil), "cannot both")
+
+	directions := []string{"backward"}
+	narrowedOperations, err := ApplyVideoModelOverrides(operationProfile, VideoModelOverrides{ExtensionDirections: directions, DefaultExtensionDirection: "backward"})
+	require.NoError(t, err)
+	assert.Empty(t, narrowedOperations.Modes[0].ExtensionDirections)
+	assert.Equal(t, directions, narrowedOperations.Modes[1].ExtensionDirections)
+	mixedAspectProfile := jsplugin.VideoProfile{Models: []string{"video-model"}, Modes: []jsplugin.VideoModeProfile{
+		{Name: "text_to_video", AspectRatios: []string{"16:9", "9:16"}, DefaultAspectRatio: "16:9"},
+		operationProfile.Modes[0],
+	}}
+	narrowedAspects, err := ApplyVideoModelOverrides(mixedAspectProfile, VideoModelOverrides{AspectRatios: []string{"9:16"}, DefaultAspectRatio: "9:16"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"9:16"}, narrowedAspects.Modes[0].AspectRatios)
+	assert.Equal(t, "9:16", narrowedAspects.Modes[0].DefaultAspectRatio)
+	assert.Empty(t, narrowedAspects.Modes[1].AspectRatios)
+	_, err = ApplyVideoModelOverrides(jsplugin.VideoProfile{Models: []string{"video-model"}, Modes: []jsplugin.VideoModeProfile{operationProfile.Modes[0]}}, VideoModelOverrides{ExtensionDirections: directions})
+	assert.ErrorContains(t, err, "unavailable")
+}
+
+func TestVideoPoolResolutionPresets(t *testing.T) {
+	for _, testCase := range []struct {
+		input, expected string
+	}{
+		{"480p", "1K"}, {"720p", "1K"}, {"1080p", "2K"}, {"2K", "2K"}, {"4K", "4K"}, {"1920x1080", "2K"}, {"3840x2160", "4K"},
+	} {
+		assert.Equal(t, testCase.expected, VideoPoolResolution(testCase.input), testCase.input)
+	}
+}
+
+func TestVideoReadinessReportsSafeFailureReasons(t *testing.T) {
+	previousDB := model.DB
+	previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
+	previousSecret, previousPlugins := common.CryptoSecret, constant.TaskPluginEnabled
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "video-readiness.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	common.RDB = nil
+	common.RedisEnabled = false
+	common.CryptoSecret = ""
+	constant.TaskPluginEnabled = false
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "")
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "")
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.RDB, common.RedisEnabled = previousRedis, previousRedisEnabled
+		common.CryptoSecret, constant.TaskPluginEnabled = previousSecret, previousPlugins
+		connection, closeErr := db.DB()
+		if assert.NoError(t, closeErr) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	require.NoError(t, SaveMediaRuntimeConfig(t.Context(), DefaultMediaRuntimeConfig()))
+
+	readiness, err := GetVideoReadiness(t.Context())
+	require.NoError(t, err)
+	assert.False(t, readiness.Ready)
+	require.Len(t, readiness.Checks, 5)
+	for _, check := range readiness.Checks {
+		assert.False(t, check.Ready, check.Key)
+		assert.NotEmpty(t, check.Reason, check.Key)
+		assert.NotContains(t, check.Reason, "ASYNC_IMAGE_PAYLOAD_KEYS")
+		assert.NotContains(t, check.Reason, "CRYPTO_SECRET")
+	}
 }

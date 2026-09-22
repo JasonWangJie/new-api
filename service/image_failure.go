@@ -29,15 +29,16 @@ var (
 )
 
 type AsyncImageFailure struct {
-	Code              int
-	InternalCode      string
-	Message           string
-	HTTPStatus        int
-	ProviderCode      string
-	ProviderStatus    string
-	UpstreamRequestID string
-	RetryAfter        time.Duration
-	ExecutionUnknown  bool
+	Code                       int
+	InternalCode               string
+	Message                    string
+	HTTPStatus                 int
+	ProviderCode               string
+	ProviderStatus             string
+	UpstreamRequestID          string
+	RetryAfter                 time.Duration
+	ExecutionUnknown           bool
+	ReferenceTransportFallback bool
 }
 
 type AsyncImagePending struct{ TaskId string }
@@ -200,6 +201,18 @@ func ClassifyGeminiAsyncImageHTTPFailure(ctx context.Context, response *http.Res
 	failure.UpstreamRequestID = requestID
 	failure.RetryAfter = ImageRetryAfter(response.Header.Get("Retry-After"), time.Now())
 	return failure
+}
+
+// ShouldFallbackGeminiReferenceTransport identifies the narrow ambiguous
+// response emitted by some Gemini-compatible gateways when they cannot use a
+// remote fileData URI. Known count, missing-reference and parameter failures
+// remain terminal; the caller must also verify that URL fallback is configured
+// and that the request actually contained a remote fileData reference.
+func ShouldFallbackGeminiReferenceTransport(failure *AsyncImageFailure) bool {
+	if failure == nil || failure.HTTPStatus != http.StatusBadRequest || !strings.EqualFold(failure.ProviderStatus, "INVALID_ARGUMENT") || failure.ProviderCode != "400" {
+		return false
+	}
+	return failure.Code == 601 || failure.Code == 610 || failure.Code == 613
 }
 
 // ClassifyAsyncImageFailure gives policy and reference-network semantics
