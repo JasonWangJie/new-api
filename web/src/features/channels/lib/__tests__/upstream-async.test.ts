@@ -25,6 +25,7 @@ import {
   upstreamAsyncFormToConfig,
   upstreamAsyncFromSettingsJSON,
   UPSTREAM_ASYNC_IMAGE_EXAMPLE,
+  UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE,
   UPSTREAM_ASYNC_VIDEO_EXAMPLE,
 } from '../upstream-async'
 
@@ -41,6 +42,33 @@ describe('upstream async channel configuration', () => {
     expect(restored.profiles[0].poll.request.body).toEqual({
       id: '{task_id}',
     })
+  })
+
+  test('round-trips a custom image submit request and preserves default submit mode', () => {
+    const withQuery = structuredClone(UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE)
+    const submitRequest = withQuery.profiles[0].submit.request
+    if (!submitRequest) {
+      throw new Error('Mai Token example requires a submit request')
+    }
+    submitRequest.query = { source: 'studio' }
+    const customForm = upstreamAsyncConfigToForm(withQuery)
+    expect(customForm.profiles[0].submit_mode).toBe('custom')
+    expect(upstreamAsyncFormToConfig(customForm)).toEqual(withQuery)
+
+    const defaultForm = upstreamAsyncConfigToForm(UPSTREAM_ASYNC_IMAGE_EXAMPLE)
+    expect(defaultForm.profiles[0].submit_mode).toBe('default')
+    defaultForm.profiles[0].submit_body_json = '{invalid'
+    expect(upstreamAsyncEditorFormSchema.safeParse(defaultForm).success).toBe(
+      true
+    )
+    expect(
+      upstreamAsyncFormToConfig(defaultForm).profiles[0].submit.request
+    ).toBeUndefined()
+
+    customForm.profiles[0].submit_body_json = '{invalid'
+    expect(upstreamAsyncEditorFormSchema.safeParse(customForm).success).toBe(
+      false
+    )
   })
 
   test('rejects overlapping selectors and status sets without coercing JSON types', () => {

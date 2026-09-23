@@ -30,6 +30,7 @@ func TestAsyncImageAdaptorCapabilitiesAndConversion(t *testing.T) {
 		edit                      bool
 	}{
 		{constant.ChannelTypeOpenAI, "gpt-image-2", "openai", "openai_images", true},
+		{constant.ChannelTypeOpenAI, "seedream-5-pro", "openai", "openai_images", true},
 		{constant.ChannelTypeOpenAIMax, "private-image-model", "openai", "openai_images", true},
 		{constant.ChannelTypeCustom, "private-image-model", "openai", "openai_images", true},
 		{constant.ChannelTypeAzure, "gpt-image-2", "azure", "openai_images", true},

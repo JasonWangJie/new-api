@@ -61,6 +61,7 @@ import {
   upstreamAsyncEditorFormSchema,
   upstreamAsyncFormToConfig,
   UPSTREAM_ASYNC_IMAGE_EXAMPLE,
+  UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE,
   UPSTREAM_ASYNC_VIDEO_EXAMPLE,
   type UpstreamAsyncEditorForm,
 } from '../../lib/upstream-async'
@@ -329,6 +330,7 @@ export function UpstreamAsyncEditorDialog(
           {profiles.fields.map((profileField, index) => {
             const errors = form.formState.errors.profiles?.[index]
             const mediaType = form.watch(`profiles.${index}.media_type`)
+            const submitMode = form.watch(`profiles.${index}.submit_mode`)
             return (
               <Card key={profileField.id} size='sm'>
                 <CardHeader>
@@ -492,6 +494,96 @@ export function UpstreamAsyncEditorDialog(
                         {...form.register(`profiles.${index}.task_id_path`)}
                       />
                     </FieldShell>
+                  </div>
+
+                  <div className='space-y-4 border-t pt-4'>
+                    <p className='font-medium'>{t('Submit request')}</p>
+                    <FieldShell
+                      id={`upstream-async-${index}-submit-mode`}
+                      label={t('Submit request mode')}
+                      description={t(
+                        'Default uses the channel adapter or task plugin request. Custom sends a POST to the configured path.'
+                      )}
+                    >
+                      <Controller
+                        control={form.control}
+                        name={`profiles.${index}.submit_mode`}
+                        render={({ field }) => (
+                          <Select
+                            items={[
+                              { value: 'default', label: t('Default') },
+                              { value: 'custom', label: t('Custom') },
+                            ]}
+                            value={field.value}
+                            onValueChange={field.onChange}
+                          >
+                            <SelectTrigger
+                              id={`upstream-async-${index}-submit-mode`}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent alignItemWithTrigger={false}>
+                              <SelectGroup>
+                                <SelectItem value='default'>
+                                  {t('Default')}
+                                </SelectItem>
+                                <SelectItem value='custom'>
+                                  {t('Custom')}
+                                </SelectItem>
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                        )}
+                      />
+                    </FieldShell>
+                    {submitMode === 'custom' ? (
+                      <>
+                        <FieldShell
+                          id={`upstream-async-${index}-submit-path`}
+                          label={t('Submit path')}
+                          description={t(
+                            'Relative to the channel Base URL; custom submit requests stay on the same origin.'
+                          )}
+                          error={errors?.submit_path?.message}
+                        >
+                          <Input
+                            id={`upstream-async-${index}-submit-path`}
+                            placeholder='/v1/videos'
+                            aria-invalid={Boolean(errors?.submit_path)}
+                            {...form.register(`profiles.${index}.submit_path`)}
+                          />
+                        </FieldShell>
+                        <JSONTextField
+                          id={`upstream-async-${index}-submit-query`}
+                          label={t('Submit query templates')}
+                          register={form.register(
+                            `profiles.${index}.submit_query_json`
+                          )}
+                          error={errors?.submit_query_json?.message}
+                        />
+                        <div className='grid gap-4 lg:grid-cols-2'>
+                          <JSONTextField
+                            id={`upstream-async-${index}-submit-headers`}
+                            label={t('Submit header templates')}
+                            register={form.register(
+                              `profiles.${index}.submit_headers_json`
+                            )}
+                            error={errors?.submit_headers_json?.message}
+                          />
+                          <JSONTextField
+                            id={`upstream-async-${index}-submit-body`}
+                            label={t('Submit JSON body template')}
+                            description={t(
+                              'Use {request.field} to copy a client field with its JSON type; leave empty to use the default request body.'
+                            )}
+                            register={form.register(
+                              `profiles.${index}.submit_body_json`
+                            )}
+                            error={errors?.submit_body_json?.message}
+                          />
+                        </div>
+                      </>
+                    ) : null}
                   </div>
 
                   <div className='space-y-4 border-t pt-4'>
@@ -688,7 +780,7 @@ export function UpstreamAsyncEditorDialog(
           />
           <p className='text-muted-foreground mt-2 text-xs'>
             {t(
-              'Only task_id, model, upstream_model, and api_key template placeholders are allowed.'
+              'Submit bodies also accept {request.field} placeholders for typed client fields.'
             )}
           </p>
           {jsonError ? (
@@ -710,6 +802,13 @@ export function UpstreamAsyncEditorDialog(
               'An image profile extracts a string array and maps final token usage.'
             )}
             value={UPSTREAM_ASYNC_IMAGE_EXAMPLE}
+          />
+          <ExampleCard
+            title={t('Mai Token image example')}
+            description={t(
+              'An image task submits to the provider video path and downloads the completed image URL.'
+            )}
+            value={UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE}
           />
         </TabsContent>
       </Tabs>

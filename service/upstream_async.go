@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,6 +37,177 @@ type UpstreamAsyncPollResult struct {
 	Reason   string
 	URLs     []string
 	Usage    *relaydto.Usage
+}
+
+// BuildUpstreamAsyncSubmitRequest replaces only the outbound HTTP request.
+// Admission, billing, and the dispatch barrier remain owned by the caller.
+func BuildUpstreamAsyncSubmitRequest(ctx context.Context, baseURL string, profile *relaydto.UpstreamAsyncProfile, values UpstreamAsyncTemplateContext, source any, defaultBody io.Reader, defaultContentType string) (*http.Request, error) {
+	if profile == nil || profile.Submit.Request == nil {
+		return nil, errors.New("upstream async submit request is not configured")
+	}
+	configured := profile.Submit.Request
+	base, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || base.Scheme == "" || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		return nil, errors.New("channel base URL is invalid")
+	}
+	requestURL, err := url.Parse(strings.TrimRight(base.String(), "/") + expandUpstreamAsyncTemplate(configured.Path, values, true))
+	if err != nil || !sameUpstreamAsyncOrigin(base, requestURL) {
+		return nil, errors.New("upstream async submit URL is invalid")
+	}
+	query := requestURL.Query()
+	for name, template := range configured.Query {
+		query.Set(name, expandUpstreamAsyncTemplate(template, values, false))
+	}
+	requestURL.RawQuery = query.Encode()
+	body := defaultBody
+	contentType := defaultContentType
+	if configured.Body != nil {
+		if strings.HasPrefix(strings.ToLower(defaultContentType), "multipart/") {
+			return nil, errors.New("upstream async submit JSON template cannot replace multipart input")
+		}
+		encodedSource, err := common.Marshal(source)
+		if err != nil {
+			return nil, errors.New("upstream async submit source is invalid")
+		}
+		expanded, present, err := expandUpstreamAsyncSubmitJSON(configured.Body, values, encodedSource, 0)
+		if err != nil || !present {
+			return nil, errors.New("upstream async submit body could not be rendered")
+		}
+		encoded, err := common.Marshal(expanded)
+		if err != nil || len(encoded) > 64<<20 {
+			return nil, errors.New("upstream async submit body exceeds the byte limit")
+		}
+		body = bytes.NewReader(encoded)
+		contentType = "application/json"
+	}
+	request, err := http.NewRequestWithContext(ctx, configured.Method, requestURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	for name, template := range configured.Headers {
+		value := expandUpstreamAsyncTemplate(template, values, false)
+		if strings.ContainsAny(name+value, "\r\n") {
+			return nil, errors.New("upstream async submit header is invalid")
+		}
+		request.Header.Set(name, value)
+	}
+	return request, nil
+}
+
+// A missing request field omits its containing object property. Array elements
+// cannot be omitted, so a missing field there rejects the submit before dispatch.
+func expandUpstreamAsyncSubmitJSON(value any, values UpstreamAsyncTemplateContext, source []byte, depth int) (any, bool, error) {
+	if depth > 16 {
+		return nil, false, errors.New("upstream async submit body exceeds the nesting limit")
+	}
+	switch typed := value.(type) {
+	case nil, bool, float64, json.Number:
+		return typed, true, nil
+	case string:
+		if path, ok := strings.CutPrefix(typed, "{request."); ok {
+			if path, ok = strings.CutSuffix(path, "}"); ok {
+				result := gjson.GetBytes(source, path)
+				if !result.Exists() {
+					return nil, false, nil
+				}
+				var decoded any
+				if err := common.Unmarshal([]byte(result.Raw), &decoded); err != nil {
+					return nil, false, errors.New("upstream async submit source field is invalid")
+				}
+				return decoded, true, nil
+			}
+		}
+		return expandUpstreamAsyncTemplate(typed, values, false), true, nil
+	case []any:
+		result := make([]any, len(typed))
+		for index, child := range typed {
+			expanded, present, err := expandUpstreamAsyncSubmitJSON(child, values, source, depth+1)
+			if err != nil || !present {
+				return nil, false, errors.New("upstream async submit array field is missing or invalid")
+			}
+			result[index] = expanded
+		}
+		return result, true, nil
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, child := range typed {
+			expanded, present, err := expandUpstreamAsyncSubmitJSON(child, values, source, depth+1)
+			if err != nil {
+				return nil, false, err
+			}
+			if present {
+				result[key] = expanded
+			}
+		}
+		return result, true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported upstream async submit value %T", value)
+	}
+}
+
+func ValidateUpstreamAsyncImageSubmitCount(request *http.Request, expected int) error {
+	if request == nil || request.GetBody == nil {
+		return errors.New("upstream async submit body is unavailable")
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	encoded, err := io.ReadAll(io.LimitReader(body, (64<<20)+1))
+	if err != nil || len(encoded) > 64<<20 {
+		return errors.New("upstream async submit body exceeds the byte limit")
+	}
+	for _, path := range []string{"n", "create_count", "batch_size", "num_outputs", "input.num_outputs", "parameters.n", "sequential_image_generation_options.max_images"} {
+		value := gjson.GetBytes(encoded, path)
+		if !value.Exists() {
+			continue
+		}
+		count, err := strconv.ParseUint(value.Raw, 10, 64)
+		if err != nil || count != uint64(expected) {
+			return fmt.Errorf("upstream async submit %s conflicts with the validated image count", path)
+		}
+	}
+	return nil
+}
+
+func ValidateUpstreamAsyncVideoSubmitDuration(request *http.Request, source any, maxSeconds int) error {
+	if request == nil || request.GetBody == nil {
+		return errors.New("upstream async submit body is unavailable")
+	}
+	sourceJSON, err := common.Marshal(source)
+	if err != nil {
+		return errors.New("upstream async submit source is invalid")
+	}
+	var original gjson.Result
+	for _, path := range []string{"seconds", "duration", "metadata.seconds", "metadata.duration"} {
+		if candidate := gjson.GetBytes(sourceJSON, path); candidate.Exists() {
+			original = candidate
+			break
+		}
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	encoded, err := io.ReadAll(io.LimitReader(body, (64<<20)+1))
+	if err != nil || len(encoded) > 64<<20 {
+		return errors.New("upstream async submit body exceeds the byte limit")
+	}
+	for _, path := range []string{"seconds", "duration", "metadata.seconds", "metadata.duration", "input.seconds", "input.duration", "parameters.seconds", "parameters.duration"} {
+		value := gjson.GetBytes(encoded, path)
+		if !value.Exists() {
+			continue
+		}
+		if value.Type != gjson.Number || value.Num <= 0 || value.Num > float64(maxSeconds) || original.Type != gjson.Number || value.Num != original.Num {
+			return fmt.Errorf("upstream async submit %s conflicts with the validated video duration", path)
+		}
+	}
+	return nil
 }
 
 func ParseUpstreamAsyncTaskID(profile *relaydto.UpstreamAsyncProfile, body []byte) (string, error) {

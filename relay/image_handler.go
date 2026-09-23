@@ -225,6 +225,19 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	if err := c.Request.Context().Err(); err != nil {
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 	}
+	var submitRequest *http.Request
+	if hasAsyncProfile && asyncProfile.Submit.Request != nil && c.GetString("async_image_resume_task") == "" {
+		source, _ := c.Get(contextKeyUpstreamAsyncSubmitSource)
+		submitRequest, err = service.BuildUpstreamAsyncSubmitRequest(c.Request.Context(), info.ChannelBaseUrl, asyncProfile, upstreamAsyncImageTemplateContext(info, ""), source, requestBody, c.Request.Header.Get("Content-Type"))
+		if err != nil {
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeConvertRequestFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		if asyncProfile.Submit.Request.Body != nil {
+			if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, imageCount); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
+	}
 	if beforeInvoke != nil && c.GetString("async_image_resume_task") == "" {
 		if err := beforeInvoke(); err != nil {
 			return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
@@ -240,6 +253,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		} else {
 			err = fmt.Errorf("image adaptor cannot resume upstream jobs")
 		}
+	} else if submitRequest != nil {
+		wasStream := info.IsStream
+		info.IsStream = false
+		resp, err = channel.DoRequest(c, submitRequest, info)
+		info.IsStream = wasStream
 	} else {
 		resp, err = adaptor.DoRequest(c, info, requestBody)
 	}

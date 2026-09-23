@@ -33,6 +33,8 @@ const allowedPlaceholders = [
   '{upstream_model}',
   '{api_key}',
 ]
+const requestFieldPattern =
+  /^\{request\.([A-Za-z0-9_-]+(?:\.(?:[A-Za-z0-9_-]+|[0-9]+))*)\}$/
 const usageTargets = new Set([
   'prompt_tokens',
   'completion_tokens',
@@ -131,6 +133,34 @@ function validateTemplateValue(
   }
 }
 
+function validateSubmitBodyTemplate(
+  value: unknown,
+  context: z.RefinementCtx,
+  path: PropertyKey[] = []
+): void {
+  if (typeof value === 'string' && value.includes('{task_id}')) {
+    context.addIssue({
+      code: 'custom',
+      path,
+      message: 'Template contains an unsupported placeholder',
+    })
+  }
+  if (typeof value === 'string' && requestFieldPattern.test(value)) return
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      validateSubmitBodyTemplate(item, context, [...path, index])
+    )
+    return
+  }
+  if (value && typeof value === 'object') {
+    Object.entries(value).forEach(([key, item]) =>
+      validateSubmitBodyTemplate(item, context, [...path, key])
+    )
+    return
+  }
+  validateTemplateValue(value, context, path)
+}
+
 const profileSchema = z
   .object({
     id: z
@@ -152,7 +182,32 @@ const profileSchema = z
       .array(z.enum(['generate', 'edit', 'extend']))
       .min(1, 'Select at least one operation')
       .max(3, 'A profile can contain at most three operations'),
-    submit: z.object({ task_id_path: pathSchema }).strict(),
+    submit: z
+      .object({
+        task_id_path: pathSchema,
+        request: z
+          .object({
+            method: z.literal('POST'),
+            path: z
+              .string()
+              .trim()
+              .min(1)
+              .refine(
+                (value) =>
+                  value.startsWith('/') &&
+                  !value.startsWith('//') &&
+                  !value.includes('?') &&
+                  !value.includes('#'),
+                'Use a relative absolute path without query or fragment'
+              ),
+            headers: stringRecordSchema.optional(),
+            query: stringRecordSchema.optional(),
+            body: z.record(z.string(), z.unknown()).optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict(),
     poll: z
       .object({
         request: z
@@ -204,6 +259,60 @@ const profileSchema = z
   })
   .strict()
   .superRefine((profile, context) => {
+    if (profile.submit.request) {
+      const submitRequest = profile.submit.request
+      if (submitRequest.path.includes('{task_id}')) {
+        context.addIssue({
+          code: 'custom',
+          path: ['submit', 'request', 'path'],
+          message: 'Template contains an unsupported placeholder',
+        })
+      }
+      validateTemplateValue(profile.submit.request.path, context, [
+        'submit',
+        'request',
+        'path',
+      ])
+      validateTemplateValue(profile.submit.request.headers, context, [
+        'submit',
+        'request',
+        'headers',
+      ])
+      validateTemplateValue(profile.submit.request.query, context, [
+        'submit',
+        'request',
+        'query',
+      ])
+      for (const [field, entries] of [
+        ['query', submitRequest.query],
+        ['headers', submitRequest.headers],
+      ] as const) {
+        for (const [name, value] of Object.entries(entries || {})) {
+          if (value.includes('{task_id}')) {
+            context.addIssue({
+              code: 'custom',
+              path: ['submit', 'request', field, name],
+              message: 'Template contains an unsupported placeholder',
+            })
+          }
+        }
+      }
+      validateSubmitBodyTemplate(profile.submit.request.body, context, [
+        'submit',
+        'request',
+        'body',
+      ])
+      if (
+        JSON.stringify(profile.submit.request.body || {}).length >
+        64 * 1024
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['submit', 'request', 'body'],
+          message: 'Submit body template is too large',
+        })
+      }
+    }
     if (
       profile.media_type === 'image' &&
       profile.operations.includes('extend')
@@ -358,6 +467,11 @@ export const upstreamAsyncProfileFormSchema = z.object({
     .array(z.enum(['generate', 'edit', 'extend']))
     .min(1, 'Select at least one operation'),
   task_id_path: z.string().trim().min(1, 'Task ID path is required'),
+  submit_mode: z.enum(['default', 'custom']),
+  submit_path: z.string(),
+  submit_query_json: z.string(),
+  submit_headers_json: z.string(),
+  submit_body_json: z.string(),
   method: z.enum(['GET', 'POST']),
   poll_path: z.string().trim().min(1, 'Polling path is required'),
   query_json: jsonTextSchema({}, 'object'),
@@ -375,12 +489,39 @@ export const upstreamAsyncProfileFormSchema = z.object({
   download_headers_json: jsonTextSchema({}, 'object'),
 })
 
-export const upstreamAsyncEditorFormSchema = z.object({
-  profiles: z
-    .array(upstreamAsyncProfileFormSchema)
-    .min(1, 'At least one profile is required')
-    .max(32, 'At most 32 profiles are allowed'),
-})
+export const upstreamAsyncEditorFormSchema = z
+  .object({
+    profiles: z
+      .array(upstreamAsyncProfileFormSchema)
+      .min(1, 'At least one profile is required')
+      .max(32, 'At most 32 profiles are allowed'),
+  })
+  .superRefine((form, context) => {
+    form.profiles.forEach((profile, index) => {
+      if (profile.submit_mode !== 'custom') return
+      if (!profile.submit_path.trim()) {
+        context.addIssue({
+          code: 'custom',
+          path: ['profiles', index, 'submit_path'],
+          message: 'Submit path is required',
+        })
+      }
+      for (const field of [
+        'submit_query_json',
+        'submit_headers_json',
+        'submit_body_json',
+      ] as const) {
+        const result = jsonTextSchema({}, 'object').safeParse(profile[field])
+        if (!result.success) {
+          context.addIssue({
+            code: 'custom',
+            path: ['profiles', index, field],
+            message: result.error.issues[0]?.message || 'Enter valid JSON',
+          })
+        }
+      }
+    })
+  })
 
 export type UpstreamAsyncProfileForm = z.infer<
   typeof upstreamAsyncProfileFormSchema
@@ -396,6 +537,11 @@ export function createUpstreamAsyncProfileForm(): UpstreamAsyncProfileForm {
     models: '',
     operations: ['generate'],
     task_id_path: 'data.task_id',
+    submit_mode: 'default',
+    submit_path: '/v1/videos',
+    submit_query_json: '{}',
+    submit_headers_json: '{\n  "Authorization": "Bearer {api_key}"\n}',
+    submit_body_json: '',
     method: 'GET',
     poll_path: '/v1/tasks/{task_id}',
     query_json: '{}',
@@ -431,6 +577,24 @@ export function upstreamAsyncConfigToForm(
       models: profile.models.join(', '),
       operations: [...profile.operations],
       task_id_path: profile.submit.task_id_path,
+      submit_mode: profile.submit.request ? 'custom' : 'default',
+      submit_path: profile.submit.request?.path || '/v1/videos',
+      submit_query_json: JSON.stringify(
+        profile.submit.request?.query || {},
+        null,
+        2
+      ),
+      submit_headers_json: JSON.stringify(
+        profile.submit.request?.headers || {
+          Authorization: 'Bearer {api_key}',
+        },
+        null,
+        2
+      ),
+      submit_body_json:
+        profile.submit.request?.body === undefined
+          ? ''
+          : JSON.stringify(profile.submit.request.body, null, 2),
       method: profile.poll.request.method,
       poll_path: profile.poll.request.path,
       query_json: JSON.stringify(profile.poll.request.query || {}, null, 2),
@@ -472,6 +636,11 @@ export function upstreamAsyncFormToConfig(
 ): UpstreamAsyncConfig {
   const profiles: UpstreamAsyncProfile[] = form.profiles.map((profile) => {
     const requestBody = parseJSONText(profile.body_json, undefined)
+    const submitQuery = (
+      profile.submit_mode === 'custom'
+        ? parseJSONText(profile.submit_query_json, {})
+        : {}
+    ) as Record<string, string>
     const query = parseJSONText(profile.query_json, {}) as Record<
       string,
       string
@@ -539,7 +708,32 @@ export function upstreamAsyncFormToConfig(
         .map((model) => model.trim())
         .filter(Boolean),
       operations: [...profile.operations] as UpstreamAsyncOperation[],
-      submit: { task_id_path: profile.task_id_path.trim() },
+      submit: {
+        task_id_path: profile.task_id_path.trim(),
+        ...(profile.submit_mode === 'custom'
+          ? {
+              request: {
+                method: 'POST' as const,
+                path: profile.submit_path.trim(),
+                ...(Object.keys(submitQuery).length > 0
+                  ? { query: submitQuery }
+                  : {}),
+                headers: parseJSONText(
+                  profile.submit_headers_json,
+                  {}
+                ) as Record<string, string>,
+                ...(profile.submit_body_json.trim()
+                  ? {
+                      body: parseJSONText(
+                        profile.submit_body_json,
+                        {}
+                      ) as Record<string, unknown>,
+                    }
+                  : {}),
+              },
+            }
+          : {}),
+      },
       poll: {
         request,
         response,
@@ -635,6 +829,52 @@ export const UPSTREAM_ASYNC_IMAGE_EXAMPLE: UpstreamAsyncConfig = {
             completion_tokens: 'usage.completion_tokens',
             total_tokens: 'usage.total_tokens',
           },
+        },
+      },
+    },
+  ],
+}
+
+export const UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE: UpstreamAsyncConfig = {
+  profiles: [
+    {
+      id: 'mai-token-image',
+      media_type: 'image',
+      models: ['seedream-5-pro'],
+      operations: ['generate'],
+      submit: {
+        task_id_path: 'id',
+        request: {
+          method: 'POST',
+          path: '/v1/videos',
+          headers: { Authorization: 'Bearer {api_key}' },
+          body: {
+            model: '{upstream_model}',
+            prompt: '{request.prompt}',
+            aspect_ratio: '{request.aspect_ratio}',
+            quality: '1440p',
+            image_urls: '{request.image_urls}',
+            create_count: '{request.create_count}',
+          },
+        },
+      },
+      poll: {
+        request: {
+          method: 'GET',
+          path: '/v1/videos/{task_id}',
+          headers: { Authorization: 'Bearer {api_key}' },
+        },
+        response: {
+          status_path: 'status',
+          status_values: {
+            queued: ['queued'],
+            in_progress: ['in_progress'],
+            succeeded: ['completed'],
+            failed: ['failed', 'cancelled'],
+          },
+          progress_path: 'progress',
+          failure_reason_path: 'error.message',
+          result_path: 'video_url',
         },
       },
     },

@@ -1387,6 +1387,23 @@ test('edits a channel upstream async profile and preserves unrelated settings', 
   )
   expect(screen.getByRole('checkbox', { name: 'Extend' })).not.toBeChecked()
 
+  await user.click(
+    screen.getByRole('combobox', { name: 'Submit request mode' })
+  )
+  await user.click(screen.getByRole('option', { name: 'Custom' }))
+  const submitPath = screen.getByLabelText('Submit path')
+  await user.clear(submitPath)
+  await user.type(submitPath, '/v1/videos')
+  fireEvent.change(screen.getByLabelText('Submit query templates'), {
+    target: { value: '{"source":"studio"}' },
+  })
+  fireEvent.change(screen.getByLabelText('Submit header templates'), {
+    target: { value: '{"Authorization":"Bearer {api_key}"}' },
+  })
+  fireEvent.change(screen.getByLabelText('Submit JSON body template'), {
+    target: { value: '{"image_urls":"{request.image_urls}"}' },
+  })
+
   await user.click(screen.getByRole('tab', { name: 'Examples' }))
   expect(
     screen.getByRole('button', {
@@ -1396,6 +1413,11 @@ test('edits a channel upstream async profile and preserves unrelated settings', 
   expect(
     screen.getByRole('button', {
       name: 'Copy Image multi-result example upstream async example',
+    })
+  ).toBeEnabled()
+  expect(
+    screen.getByRole('button', {
+      name: 'Copy Mai Token image example upstream async example',
     })
   ).toBeEnabled()
 
@@ -1420,6 +1442,13 @@ test('edits a channel upstream async profile and preserves unrelated settings', 
   expect(settings.upstream_async.profiles[0].submit.task_id_path).toBe(
     'data.request_id'
   )
+  expect(settings.upstream_async.profiles[0].submit.request).toEqual({
+    method: 'POST',
+    path: '/v1/videos',
+    query: { source: 'studio' },
+    headers: { Authorization: 'Bearer {api_key}' },
+    body: { image_urls: '{request.image_urls}' },
+  })
 })
 
 test('request processing configuration does not mark the network category as configured', async () => {

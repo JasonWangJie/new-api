@@ -218,6 +218,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	}
 	var parsed dto.Request
 	var nativeBody []byte
+	var submitImageURLs []string
 	geminiReferenceFallbackEligible := false
 	if request.Platform == "openai" {
 		var images []map[string]string
@@ -251,6 +252,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				request.Native["mask"] = mask
 				continue
 			}
+			submitImageURLs = append(submitImageURLs, reference)
 			images = append(images, map[string]string{"image_url": reference})
 		}
 		if len(images) > 0 {
@@ -317,6 +319,36 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, err
 		}
 	}
+	var submitSource map[string]any
+	if err := common.Unmarshal(nativeBody, &submitSource); err != nil {
+		return nil, model.AsyncImageBill{}, err
+	}
+	if submitSource == nil {
+		submitSource = make(map[string]any)
+	}
+	if request.Platform != "openai" {
+		for _, part := range request.Parts {
+			if part.Type == "image_url" {
+				submitImageURLs = append(submitImageURLs, part.URL)
+			}
+		}
+	}
+	submitSource["model"] = request.Model
+	submitSource["prompt"] = request.Prompt
+	if len(submitImageURLs) > 0 {
+		submitSource["image_urls"] = submitImageURLs
+	}
+	submitSource["n"] = request.Count
+	if _, exists := submitSource["create_count"]; !exists {
+		submitSource["create_count"] = request.Count
+	}
+	if request.AspectRatio != "" {
+		submitSource["aspect_ratio"] = request.AspectRatio
+	}
+	if request.Resolution != "" {
+		submitSource["resolution"] = request.Resolution
+	}
+	c.Set(contextKeyUpstreamAsyncSubmitSource, submitSource)
 	contentType := "application/json"
 	if request.Platform == "openai" && request.Kind == "image_to_image" && service.ImageChannelCapability(*channel, request.Model).EditFormat == "multipart" && task.UpstreamTaskId == "" {
 		var encoded bytes.Buffer

@@ -81,7 +81,16 @@ type UpstreamAsyncProfile struct {
 }
 
 type UpstreamAsyncSubmit struct {
-	TaskIDPath string `json:"task_id_path"`
+	TaskIDPath string                      `json:"task_id_path"`
+	Request    *UpstreamAsyncSubmitRequest `json:"request,omitempty"`
+}
+
+type UpstreamAsyncSubmitRequest struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	Query   map[string]string `json:"query,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    any               `json:"body,omitempty"`
 }
 
 type UpstreamAsyncPoll struct {
@@ -274,17 +283,59 @@ func (profile UpstreamAsyncProfile) validate(index int) error {
 	if err := validateUpstreamAsyncPath(profile.Submit.TaskIDPath, prefix+".submit.task_id_path", true); err != nil {
 		return err
 	}
+	if request := profile.Submit.Request; request != nil {
+		if request.Method != http.MethodPost {
+			return fmt.Errorf("%s.submit.request.method must be POST", prefix)
+		}
+		if err := validateUpstreamAsyncRequestURLPath(request.Path, prefix+".submit.request.path"); err != nil {
+			return err
+		}
+		if strings.Contains(request.Path, "{task_id}") {
+			return fmt.Errorf("%s.submit.request.path cannot use task_id before submission", prefix)
+		}
+		if len(request.Query) > 64 {
+			return fmt.Errorf("%s.submit.request.query contains too many entries", prefix)
+		}
+		for name, value := range request.Query {
+			if strings.TrimSpace(name) == "" || name != strings.TrimSpace(name) || strings.ContainsAny(name, "&=\r\n") {
+				return fmt.Errorf("%s.submit.request.query contains an invalid name", prefix)
+			}
+			if strings.Contains(value, "{task_id}") {
+				return fmt.Errorf("%s.submit.request.query cannot use task_id before submission", prefix)
+			}
+			if err := validateUpstreamAsyncTemplates(value, prefix+".submit.request.query."+name); err != nil {
+				return err
+			}
+		}
+		if len(request.Headers) > 64 {
+			return fmt.Errorf("%s.submit.request.headers contains too many entries", prefix)
+		}
+		if err := validateUpstreamAsyncHeaders(request.Headers, prefix+".submit.request.headers"); err != nil {
+			return err
+		}
+		for _, value := range request.Headers {
+			if strings.Contains(value, "{task_id}") {
+				return fmt.Errorf("%s.submit.request.headers cannot use task_id before submission", prefix)
+			}
+		}
+		if request.Body != nil {
+			if _, ok := request.Body.(map[string]any); !ok {
+				return fmt.Errorf("%s.submit.request.body must be a JSON object", prefix)
+			}
+			if err := validateUpstreamAsyncSubmitBody(request.Body, prefix+".submit.request.body", 0); err != nil {
+				return err
+			}
+			if encoded, err := kitutil.Marshal(request.Body); err != nil || len(encoded) > 64<<10 {
+				return fmt.Errorf("%s.submit.request.body must be no larger than 64 KiB", prefix)
+			}
+		}
+	}
 	method := strings.ToUpper(strings.TrimSpace(profile.Poll.Request.Method))
 	if profile.Poll.Request.Method != method || method != http.MethodGet && method != http.MethodPost {
 		return fmt.Errorf("%s.poll.request.method must be GET or POST", prefix)
 	}
-	trimmedPollPath := strings.TrimSpace(profile.Poll.Request.Path)
-	parsedPath, err := url.Parse(trimmedPollPath)
-	if err != nil || parsedPath.Path == "" || !strings.HasPrefix(parsedPath.Path, "/") || strings.HasPrefix(parsedPath.Path, "//") || parsedPath.IsAbs() || parsedPath.Host != "" || parsedPath.User != nil || parsedPath.RawQuery != "" || parsedPath.Fragment != "" {
-		return fmt.Errorf("%s.poll.request.path must be a relative absolute-path without query or fragment", prefix)
-	}
-	if profile.Poll.Request.Path != trimmedPollPath {
-		return fmt.Errorf("%s.poll.request.path must not contain surrounding whitespace", prefix)
+	if err := validateUpstreamAsyncRequestURLPath(profile.Poll.Request.Path, prefix+".poll.request.path"); err != nil {
+		return err
 	}
 	if method == http.MethodGet && profile.Poll.Request.Body != nil {
 		return fmt.Errorf("%s.poll.request.body is not allowed for GET", prefix)
@@ -378,6 +429,51 @@ func validateUpstreamAsyncPath(path string, field string, required bool) error {
 		return fmt.Errorf("%s must be a restricted GJSON path", field)
 	}
 	return nil
+}
+
+func validateUpstreamAsyncRequestURLPath(path, field string) error {
+	trimmed := strings.TrimSpace(path)
+	parsed, err := url.Parse(trimmed)
+	if path != trimmed || err != nil || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || strings.ContainsAny(path, "?#") || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return fmt.Errorf("%s must be a relative absolute-path without query or fragment", field)
+	}
+	return validateUpstreamAsyncTemplates(path, field)
+}
+
+func validateUpstreamAsyncSubmitBody(value any, field string, depth int) error {
+	if depth > 16 {
+		return fmt.Errorf("%s exceeds the nesting limit", field)
+	}
+	switch typed := value.(type) {
+	case nil, bool, float64, json.Number:
+		return nil
+	case string:
+		if strings.Contains(typed, "{task_id}") {
+			return fmt.Errorf("%s cannot use task_id before submission", field)
+		}
+		if path, ok := strings.CutPrefix(typed, "{request."); ok {
+			if path, ok = strings.CutSuffix(path, "}"); ok {
+				return validateUpstreamAsyncPath(path, field, true)
+			}
+		}
+		return validateUpstreamAsyncTemplates(typed, field)
+	case []any:
+		for index, child := range typed {
+			if err := validateUpstreamAsyncSubmitBody(child, fmt.Sprintf("%s[%d]", field, index), depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	case map[string]any:
+		for key, child := range typed {
+			if err := validateUpstreamAsyncSubmitBody(child, field+"."+key, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s contains an unsupported JSON value", field)
+	}
 }
 
 func validateUpstreamAsyncHeaders(headers map[string]string, field string) error {
@@ -567,11 +663,24 @@ func decodeUpstreamAsyncProfile(data []byte, index int) (UpstreamAsyncProfile, e
 	if err := kitutil.Unmarshal(raw["submit"], &submit); err != nil {
 		return UpstreamAsyncProfile{}, fmt.Errorf("%s.submit must be an object", prefix)
 	}
-	if err := rejectUpstreamAsyncUnknown(submit, prefix+".submit", "task_id_path"); err != nil {
+	if err := rejectUpstreamAsyncUnknown(submit, prefix+".submit", "task_id_path", "request"); err != nil {
 		return UpstreamAsyncProfile{}, err
 	}
 	if err := decodeUpstreamAsyncFields(submit, map[string]any{"task_id_path": &profile.Submit.TaskIDPath}); err != nil {
 		return UpstreamAsyncProfile{}, fmt.Errorf("%s.submit: %w", prefix, err)
+	}
+	if rawRequest, exists := submit["request"]; exists {
+		var request map[string]json.RawMessage
+		if err := kitutil.Unmarshal(rawRequest, &request); err != nil || request == nil {
+			return UpstreamAsyncProfile{}, fmt.Errorf("%s.submit.request must be an object", prefix)
+		}
+		if err := rejectUpstreamAsyncUnknown(request, prefix+".submit.request", "method", "path", "query", "headers", "body"); err != nil {
+			return UpstreamAsyncProfile{}, err
+		}
+		profile.Submit.Request = &UpstreamAsyncSubmitRequest{}
+		if err := decodeUpstreamAsyncFields(request, map[string]any{"method": &profile.Submit.Request.Method, "path": &profile.Submit.Request.Path, "query": &profile.Submit.Request.Query, "headers": &profile.Submit.Request.Headers, "body": &profile.Submit.Request.Body}); err != nil {
+			return UpstreamAsyncProfile{}, fmt.Errorf("%s.submit.request: %w", prefix, err)
+		}
 	}
 	var poll map[string]json.RawMessage
 	if err := kitutil.Unmarshal(raw["poll"], &poll); err != nil {

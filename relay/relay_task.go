@@ -371,7 +371,28 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
-	// 9. Persist the dispatch barrier before the first upstream byte.
+	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(
+		kitdto.UpstreamAsyncMediaVideo,
+		info.UpstreamModelName,
+		service.UpstreamAsyncOperation(info.Action),
+	)
+	var submitRequest *http.Request
+	if hasAsyncProfile && asyncProfile.Submit.Request != nil {
+		source, _ := c.Get("task_request")
+		submitRequest, err = service.BuildUpstreamAsyncSubmitRequest(c.Request.Context(), info.ChannelBaseUrl, asyncProfile, service.UpstreamAsyncTemplateContext{
+			Model: info.OriginModelName, UpstreamModel: info.UpstreamModelName, APIKey: info.ApiKey,
+		}, source, requestBody, c.Request.Header.Get("Content-Type"))
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "upstream_async_submit_invalid", http.StatusBadRequest)
+		}
+		if asyncProfile.Submit.Request.Body != nil {
+			if err := service.ValidateUpstreamAsyncVideoSubmitDuration(submitRequest, source, relaycommon.MaxTaskDurationSeconds); err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "upstream_async_submit_invalid", http.StatusBadRequest)
+			}
+		}
+	}
+
+	// 9. Persist the dispatch barrier after all local request validation.
 	if hook, exists := c.Get("async_media_before_dispatch"); exists {
 		record, ok := hook.(func(*relaycommon.RelayInfo) error)
 		if !ok {
@@ -381,12 +402,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(err, "media_dispatch_failed", http.StatusInternalServerError)
 		}
 	}
-	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(
-		kitdto.UpstreamAsyncMediaVideo,
-		info.UpstreamModelName,
-		service.UpstreamAsyncOperation(info.Action),
-	)
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	var resp *http.Response
+	if submitRequest != nil {
+		wasStream := info.IsStream
+		info.IsStream = false
+		resp, err = channel.DoRequest(c, submitRequest, info)
+		info.IsStream = wasStream
+	} else {
+		resp, err = adaptor.DoRequest(c, info, requestBody)
+	}
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}

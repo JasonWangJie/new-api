@@ -129,7 +129,16 @@ export interface UpstreamAsyncProfile {
   media_type: UpstreamAsyncMediaType
   models: string[]
   operations: UpstreamAsyncOperation[]
-  submit: { task_id_path: string }
+  submit: {
+    task_id_path: string
+    request?: {
+      method: 'POST'
+      path: string
+      query?: Record<string, string>
+      headers?: Record<string, string>
+      body?: Record<string, unknown>
+    }
+  }
   poll: {
     request: {
       method: 'GET' | 'POST'

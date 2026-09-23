@@ -1037,6 +1037,72 @@ func TestUpstreamAsyncRequestAndSubmitParsing(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestUpstreamAsyncCustomSubmitRequest(t *testing.T) {
+	var config dto.UpstreamAsyncConfig
+	require.NoError(t, common.Unmarshal([]byte(`{"profiles":[{"id":"mai-image","media_type":"image","models":["seedream-5-pro"],"operations":["generate"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/v1/videos","headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}","prompt":"{request.prompt}","aspect_ratio":"{request.aspect_ratio}","quality":"1440p","image_urls":"{request.image_urls}","create_count":"{request.create_count}"}}},"poll":{"request":{"method":"GET","path":"/v1/videos/{task_id}","headers":{"Authorization":"Bearer {api_key}"}},"response":{"status_path":"status","status_values":{"queued":["queued"],"in_progress":["in_progress"],"succeeded":["completed"],"failed":["failed","cancelled"]},"result_path":"video_url"}}}]}`), &config))
+	require.NoError(t, config.Validate())
+	profile, found := config.Match("image", "seedream-5-pro", "generate")
+	require.True(t, found)
+	profile.Submit.Request.Query = map[string]string{"client": "{model}"}
+	require.NoError(t, (&dto.UpstreamAsyncConfig{Profiles: []dto.UpstreamAsyncProfile{*profile}}).Validate())
+	source := map[string]any{"prompt": "panda", "aspect_ratio": "16:9", "image_urls": []string{"https://cdn.example/ref.jpg"}, "create_count": 1}
+	request, err := BuildUpstreamAsyncSubmitRequest(t.Context(), "https://api.mai-token.com", profile, UpstreamAsyncTemplateContext{Model: "public-model", UpstreamModel: "seedream-5-pro", APIKey: "secret"}, source, strings.NewReader(`{"wrong":true}`), "application/json")
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPost, request.Method)
+	assert.Equal(t, "https://api.mai-token.com/v1/videos?client=public-model", request.URL.String())
+	assert.Equal(t, "Bearer secret", request.Header.Get("Authorization"))
+	assert.Equal(t, "application/json", request.Header.Get("Content-Type"))
+	body, err := io.ReadAll(request.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"seedream-5-pro","prompt":"panda","aspect_ratio":"16:9","quality":"1440p","image_urls":["https://cdn.example/ref.jpg"],"create_count":1}`, string(body))
+	require.NoError(t, ValidateUpstreamAsyncImageSubmitCount(request, 1))
+	taskID, err := ParseUpstreamAsyncTaskID(profile, []byte(`{"id":"task_123","status":"queued"}`))
+	require.NoError(t, err)
+	assert.Equal(t, "task_123", taskID)
+
+	profile.Submit.Request.Body = map[string]any{"create_count": float64(2)}
+	request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://api.mai-token.com", profile, UpstreamAsyncTemplateContext{}, source, nil, "")
+	require.NoError(t, err)
+	require.ErrorContains(t, ValidateUpstreamAsyncImageSubmitCount(request, 1), "validated image count")
+
+	profile.Submit.Request.Body = map[string]any{"image_urls": "{request.image_urls}", "optional": "{request.missing}"}
+	request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://api.mai-token.com", profile, UpstreamAsyncTemplateContext{}, source, nil, "")
+	require.NoError(t, err)
+	body, err = io.ReadAll(request.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"image_urls":["https://cdn.example/ref.jpg"]}`, string(body))
+}
+
+func TestUpstreamAsyncCustomSubmitRejectsUnsafeTemplates(t *testing.T) {
+	profile := upstreamAsyncTestProfile(t, "video")
+	profile.Submit.Request = &dto.UpstreamAsyncSubmitRequest{Method: http.MethodPost, Path: "/v1/videos", Body: map[string]any{"seconds": "{request.seconds}"}}
+	require.NoError(t, (&dto.UpstreamAsyncConfig{Profiles: []dto.UpstreamAsyncProfile{*profile}}).Validate())
+	source := map[string]any{"seconds": 4}
+	request, err := BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "application/json")
+	require.NoError(t, err)
+	require.NoError(t, ValidateUpstreamAsyncVideoSubmitDuration(request, source, 3600))
+	profile.Submit.Request.Body = map[string]any{"seconds": float64(3601)}
+	request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "application/json")
+	require.NoError(t, err)
+	require.ErrorContains(t, ValidateUpstreamAsyncVideoSubmitDuration(request, source, 3600), "validated video duration")
+	_, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "multipart/form-data; boundary=test")
+	require.ErrorContains(t, err, "cannot replace multipart input")
+
+	for _, invalid := range []*dto.UpstreamAsyncSubmitRequest{
+		{Method: http.MethodPost, Path: "https://evil.example/submit"},
+		{Method: http.MethodPost, Path: "/v1/videos?"},
+		{Method: http.MethodPost, Path: "/v1/videos/{task_id}"},
+		{Method: http.MethodPost, Path: "/v1/videos", Query: map[string]string{"id": "{task_id}"}},
+		{Method: http.MethodPost, Path: "/v1/videos", Headers: map[string]string{"X-Task-ID": "{task_id}"}},
+		{Method: http.MethodGet, Path: "/v1/videos"},
+		{Method: http.MethodPost, Path: "/v1/videos", Body: map[string]any{"prompt": "prefix {request.prompt}"}},
+		{Method: http.MethodPost, Path: "/v1/videos", Headers: map[string]string{"Host": "evil.example"}},
+	} {
+		profile.Submit.Request = invalid
+		require.Error(t, (&dto.UpstreamAsyncConfig{Profiles: []dto.UpstreamAsyncProfile{*profile}}).Validate())
+	}
+}
+
 func TestUpstreamAsyncPollParsingStatusResultsAndUsage(t *testing.T) {
 	imageProfile := upstreamAsyncTestProfile(t, "image")
 	imageProfile.Poll.Response.UsagePaths["prompt_tokens_details.cached_tokens_details.image_tokens"] = "usage.cached_image"

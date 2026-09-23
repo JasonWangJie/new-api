@@ -18,6 +18,7 @@ const (
 	contextKeyUpstreamAsyncImageProfile = "upstream_async_image_profile"
 	contextKeyUpstreamAsyncImageURLs    = "upstream_async_image_urls"
 	contextKeyUpstreamAsyncOperation    = "upstream_async_operation"
+	contextKeyUpstreamAsyncSubmitSource = "upstream_async_submit_source"
 )
 
 func upstreamAsyncImageOperation(c *gin.Context) string {
