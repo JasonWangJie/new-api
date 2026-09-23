@@ -743,10 +743,14 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 	}
 	copyTask := *task
 	task = &copyTask
-	if err := service.RestoreAsyncMediaOutput(ctx, job, task); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	restoreErr := service.RestoreAsyncMediaOutput(ctx, job, task)
+	if restoreErr != nil && !errors.Is(restoreErr, os.ErrNotExist) {
+		return restoreErr
+	}
+	// A signed upstream URL in the saved poll snapshot can expire between
+	// storage attempts. Re-poll a completed dynamic task to obtain a fresh URL;
+	// this never resubmits generation or repeats billing.
+	if errors.Is(restoreErr, os.ErrNotExist) || (job.StorageStatus == "failed" || job.StorageStatus == "saving") && task.PrivateData.UpstreamAsync != nil {
 		adaptor, err := initTaskArtifactAdaptor(task)
 		if err != nil {
 			return err
@@ -763,13 +767,24 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 		if base == "" {
 			base = constant.GetChannelBaseURL(channel.Type)
 		}
-		poller, ok := adaptor.(service.TaskContextPollingAdaptor)
-		if !ok {
-			return errors.New("video provider does not support bounded content polling")
+		var response *http.Response
+		if task.PrivateData.UpstreamAsync != nil {
+			response, err = service.PollUpstreamAsync(ctx, base, channel.GetSetting().Proxy, task.PrivateData.UpstreamAsync, service.UpstreamAsyncTemplateContext{
+				TaskID: task.GetUpstreamTaskID(), Model: task.Properties.OriginModelName,
+				UpstreamModel: task.Properties.UpstreamModelName, APIKey: key,
+			})
+		} else {
+			poller, ok := adaptor.(service.TaskContextPollingAdaptor)
+			if !ok {
+				return errors.New("video provider does not support bounded content polling")
+			}
+			response, err = poller.FetchTaskContext(ctx, base, key, task, channel.GetSetting().Proxy)
 		}
-		response, err := poller.FetchTaskContext(ctx, base, key, task, channel.GetSetting().Proxy)
 		if err != nil {
 			return err
+		}
+		if response == nil || response.Body == nil {
+			return errors.New("completed video result is unavailable")
 		}
 		defer response.Body.Close()
 		cfg, err := service.GetMediaRuntimeConfig(ctx)
@@ -781,22 +796,39 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 		if err != nil {
 			return err
 		}
-		if response.StatusCode != http.StatusOK || int64(len(body)) > limit {
+		statusOK := response.StatusCode == http.StatusOK
+		if task.PrivateData.UpstreamAsync != nil {
+			statusOK = response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+		}
+		if !statusOK || int64(len(body)) > limit {
 			return errors.New("completed video result is unavailable")
 		}
-		result, err := adaptor.ParseTaskResult(task, response, body)
-		if err != nil {
-			return err
-		}
-		if model.TaskStatus(result.Status) != model.TaskStatusSuccess {
-			return errors.New("completed video result is unavailable")
-		}
-		task.Data = body
-		if len(result.PluginState) > 0 {
-			task.PrivateData.PluginState = result.PluginState
-		}
-		if result.Url != "" {
-			task.PrivateData.ResultURL = result.Url
+		if task.PrivateData.UpstreamAsync != nil {
+			result, parseErr := service.ParseUpstreamAsyncPollResponse(task.PrivateData.UpstreamAsync, body)
+			if parseErr != nil {
+				return parseErr
+			}
+			if result.Status != model.TaskStatusSuccess || len(result.URLs) == 0 {
+				return errors.New("completed video result is unavailable")
+			}
+			task.PrivateData.UpstreamAsyncResponse = append(task.PrivateData.UpstreamAsyncResponse[:0], body...)
+			task.PrivateData.ResultURL = result.URLs[0]
+			task.Data = nil
+		} else {
+			result, parseErr := adaptor.ParseTaskResult(task, response, body)
+			if parseErr != nil {
+				return parseErr
+			}
+			if model.TaskStatus(result.Status) != model.TaskStatusSuccess {
+				return errors.New("completed video result is unavailable")
+			}
+			task.Data = body
+			if len(result.PluginState) > 0 {
+				task.PrivateData.PluginState = result.PluginState
+			}
+			if result.Url != "" {
+				task.PrivateData.ResultURL = result.Url
+			}
 		}
 		if _, err := service.CaptureAsyncMediaOutput(ctx, task); err != nil {
 			return err

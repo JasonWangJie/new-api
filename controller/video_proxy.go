@@ -290,7 +290,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		req.Header.Set(name, value)
 	}
 
-	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless)
+	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless, task.PrivateData.UpstreamAsync != nil && !descriptor.Credentialless, parsedURL)
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)
@@ -443,8 +443,33 @@ func applyTaskMediaRequestHeaders(destination http.Header, headers map[string]st
 	return nil
 }
 
-func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, clientHeaders map[string]string, credentialless bool) *http.Client {
+type taskMediaRedirectTransport struct {
+	origin       *url.URL
+	credentialed http.RoundTripper
+	public       http.RoundTripper
+}
+
+func (transport taskMediaRedirectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if sameTaskMediaOrigin(transport.origin, request.URL) {
+		return transport.credentialed.RoundTrip(request)
+	}
+	return transport.public.RoundTrip(request)
+}
+
+func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, clientHeaders map[string]string, credentialless, allowPublicRedirect bool, origin *url.URL) *http.Client {
 	cloned := *base
+	if allowPublicRedirect {
+		protected := service.GetSSRFProtectedHTTPClient()
+		if protected == nil || protected.Transport == nil {
+			allowPublicRedirect = false
+		} else {
+			credentialed := cloned.Transport
+			if credentialed == nil {
+				credentialed = http.DefaultTransport
+			}
+			cloned.Transport = taskMediaRedirectTransport{origin: origin, credentialed: credentialed, public: protected.Transport}
+		}
+	}
 	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return fmt.Errorf("%w: too many redirects", errTaskMediaRequestRejected)
@@ -460,8 +485,13 @@ func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, cl
 			return fmt.Errorf("%w: proxy loop", errTaskMediaRequestRejected)
 		}
 		if len(via) > 0 && !sameTaskMediaOrigin(via[len(via)-1].URL, req.URL) {
-			if !credentialless {
+			if !credentialless && !allowPublicRedirect {
 				return fmt.Errorf("%w: credentialed cross-origin redirect", errTaskMediaRequestRejected)
+			}
+			if allowPublicRedirect && !sameTaskMediaOrigin(origin, req.URL) {
+				if err := service.ValidateSSRFProtectedFetchURL(req.URL.String()); err != nil {
+					return fmt.Errorf("%w: public redirect target is invalid", errTaskMediaRequestRejected)
+				}
 			}
 			for name := range req.Header {
 				req.Header.Del(name)

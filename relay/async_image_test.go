@@ -1,6 +1,9 @@
 package relay
 
 import (
+	"bytes"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,22 +26,58 @@ import (
 
 func TestUpstreamImageResultReadRetriesExistingTask(t *testing.T) {
 	service.InitHttpClient()
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Length", "12")
-		_, _ = w.Write([]byte("partial"))
+	var pngBytes bytes.Buffer
+	require.NoError(t, png.Encode(&pngBytes, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	redirectAuthorization := make(chan string, 1)
+	privateRedirects := make(chan struct{}, 1)
+	privateDestination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		privateRedirects <- struct{}{}
+	}))
+	defer privateDestination.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/partial":
+			w.Header().Set("Content-Length", "12")
+			_, _ = w.Write([]byte("partial"))
+		case "/busy":
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "/unavailable":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "/missing":
+			w.WriteHeader(http.StatusNotFound)
+		case "/redirect":
+			http.Redirect(w, request, "/image", http.StatusFound)
+		case "/redirect-private":
+			http.Redirect(w, request, privateDestination.URL, http.StatusFound)
+		case "/image":
+			redirectAuthorization <- request.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes.Bytes())
+		}
 	}))
 	defer upstream.Close()
 	profile := &dto.UpstreamAsyncProfile{}
 	profile.Poll.Response.DownloadHeaders = map[string]string{"Authorization": "Bearer {api_key}"}
 	cfg := service.DefaultImageRuntimeConfig()
-	_, err := service.DownloadUpstreamAsyncImages(t.Context(), []string{upstream.URL + "/image"}, profile, upstream.URL, "", service.UpstreamAsyncTemplateContext{APIKey: "test-key"}, cfg)
-	require.ErrorIs(t, err, service.ErrUpstreamAsyncImageTransport)
-
-	failure := classifyAsyncImageOutputFailure(model.AsyncImageTask{UpstreamTaskId: "vendor-job-1"}, err)
-	assert.Equal(t, 606, failure.Code)
-	assert.Equal(t, "result_download_failed", failure.InternalCode)
-	assert.False(t, failure.ExecutionUnknown)
-	assert.Equal(t, 607, classifyAsyncImageOutputFailure(model.AsyncImageTask{}, err).Code)
+	for _, path := range []string{"/partial", "/busy", "/unavailable"} {
+		_, err := service.DownloadUpstreamAsyncImages(t.Context(), []string{upstream.URL + path}, profile, upstream.URL, "", service.UpstreamAsyncTemplateContext{APIKey: "test-key"}, cfg)
+		require.ErrorIs(t, err, service.ErrUpstreamAsyncImageTransport, path)
+		failure := classifyAsyncImageOutputFailure(model.AsyncImageTask{UpstreamTaskId: "vendor-job-1"}, err)
+		assert.Equal(t, 606, failure.Code, path)
+		assert.Equal(t, "result_download_failed", failure.InternalCode, path)
+		assert.False(t, failure.ExecutionUnknown, path)
+		assert.Equal(t, 607, classifyAsyncImageOutputFailure(model.AsyncImageTask{}, err).Code, path)
+	}
+	_, err := service.DownloadUpstreamAsyncImages(t.Context(), []string{upstream.URL + "/missing"}, profile, upstream.URL, "", service.UpstreamAsyncTemplateContext{APIKey: "test-key"}, cfg)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, service.ErrUpstreamAsyncImageTransport)
+	images, err := service.DownloadUpstreamAsyncImages(t.Context(), []string{upstream.URL + "/redirect"}, profile, upstream.URL, "", service.UpstreamAsyncTemplateContext{APIKey: "test-key"}, cfg)
+	require.NoError(t, err)
+	require.Len(t, images, 1)
+	assert.Equal(t, "Bearer test-key", <-redirectAuthorization)
+	_, err = service.DownloadUpstreamAsyncImages(t.Context(), []string{upstream.URL + "/redirect-private"}, profile, upstream.URL, "", service.UpstreamAsyncTemplateContext{APIKey: "test-key"}, cfg)
+	require.ErrorContains(t, err, "not public")
+	assert.Empty(t, privateRedirects)
 }
 
 func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {

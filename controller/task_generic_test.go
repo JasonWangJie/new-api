@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -497,9 +500,10 @@ func TestWriteVideoDataURLRejectsOversizedPayloadBeforeDecode(t *testing.T) {
 
 func TestProxyTaskMediaAllowsOnlyCredentiallessCrossOriginRedirect(t *testing.T) {
 	task := setupGenericTaskTest(t)
-	var destinationAuthorization, destinationRange string
+	var destinationAuthorization, destinationProviderKey, destinationRange string
 	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		destinationAuthorization = r.Header.Get("Authorization")
+		destinationProviderKey = r.Header.Get("X-Provider-Key")
 		destinationRange = r.Header.Get("Range")
 		_, _ = w.Write([]byte("redirected"))
 	}))
@@ -536,6 +540,103 @@ func TestProxyTaskMediaAllowsOnlyCredentiallessCrossOriginRedirect(t *testing.T)
 	require.ErrorAs(t, err, &proxyErr)
 	assert.Equal(t, "artifact_request_rejected", proxyErr.code)
 	assert.Empty(t, destinationRange)
+
+	// Dynamic upstream downloads may start with same-origin credentials and
+	// continue at a public CDN. The redirected request must lose every secret.
+	task.PrivateData.UpstreamAsync = &relaydto.UpstreamAsyncProfile{}
+	redirectedRecorder := httptest.NewRecorder()
+	redirectedContext, _ := gin.CreateTestContext(redirectedRecorder)
+	redirectedContext.Request = httptest.NewRequest(http.MethodGet, "/content", nil)
+	redirectedContext.Request.Header.Set("Range", "bytes=0-3")
+	require.NoError(t, proxyTaskMedia(redirectedContext, task, &relaychannel.TaskContentRequest{
+		URL: source.URL, Method: http.MethodGet,
+		Headers: map[string]string{"Authorization": "Bearer provider-secret", "X-Provider-Key": "private"},
+	}))
+	assert.Equal(t, http.StatusOK, redirectedRecorder.Code)
+	assert.Equal(t, "redirected", redirectedRecorder.Body.String())
+	assert.Empty(t, destinationAuthorization)
+	assert.Empty(t, destinationProviderKey)
+	assert.Equal(t, "bytes=0-3", destinationRange)
+}
+
+func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	connection, err := model.DB.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	allowPrivateTaskMediaTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:"+base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))))
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+
+	box := func(kind string, payload []byte) []byte {
+		result := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(result, uint32(len(result)))
+		copy(result[4:8], kind)
+		copy(result[8:], payload)
+		return result
+	}
+	handler := make([]byte, 25)
+	copy(handler[8:12], "vide")
+	video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
+	video = append(video, box("moov", box("trak", box("mdia", box("hdlr", handler))))...)
+	video = append(video, box("mdat", []byte("video-sample"))...)
+
+	var upstream *httptest.Server
+	polls, freshDownloads, staleDownloads := 0, 0, 0
+	upstream = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/tasks/vendor-1":
+			polls++
+			assert.Equal(t, "Bearer frozen-key", request.Header.Get("Authorization"))
+			_, _ = io.WriteString(writer, `{"status":"done","url":"`+upstream.URL+`/fresh"}`)
+		case "/fresh":
+			freshDownloads++
+			writer.Header().Set("Content-Type", "video/mp4")
+			_, _ = writer.Write(video)
+		case "/stale":
+			staleDownloads++
+			writer.WriteHeader(http.StatusGone)
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	var profile relaydto.UpstreamAsyncProfile
+	require.NoError(t, common.Unmarshal([]byte(`{"id":"video-job","media_type":"video","models":["mapped"],"operations":["generate"],"submit":{"task_id_path":"id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}","headers":{"Authorization":"Bearer {api_key}"}},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}`), &profile))
+	require.NoError(t, (&relaydto.UpstreamAsyncConfig{Profiles: []relaydto.UpstreamAsyncProfile{profile}}).Validate())
+	frozen := model.Channel{Id: task.ChannelId, Type: constant.ChannelTypeKling, Key: "frozen-key", BaseURL: &upstream.URL}
+	channelBytes, err := common.Marshal(frozen)
+	require.NoError(t, err)
+	channelCipher, err := service.EncryptImagePayload(channelBytes, "media-channel:"+task.TaskID)
+	require.NoError(t, err)
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "dynamic-refresh", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Status: "submitted", StorageStatus: "failed", ChannelCipher: channelCipher, ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, model.DB.Create(&job).Error)
+	task.Platform = constant.TaskPlatform("kling")
+	task.PrivateData = model.TaskPrivateData{
+		AsyncMedia: true, UpstreamTaskID: "vendor-1", ResultURL: upstream.URL + "/stale",
+		UpstreamAsync: &profile, Key: "frozen-key",
+		Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "kling"}},
+	}
+	task.Properties.OriginModelName, task.Properties.UpstreamModelName = "client-model", "mapped"
+	require.NoError(t, model.DB.Save(task).Error)
+	captured, err := service.CaptureAsyncMediaOutput(t.Context(), task)
+	require.NoError(t, err)
+	require.True(t, captured)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+
+	require.NoError(t, PersistAsyncVideo(t.Context(), job, task))
+	assert.Equal(t, 1, polls)
+	assert.Equal(t, 1, freshDownloads)
+	assert.Zero(t, staleDownloads)
+	ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+	assert.EqualValues(t, len(video), ref.Size)
 }
 
 func TestTaskMediaRequestHeaderPolicy(t *testing.T) {

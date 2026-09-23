@@ -367,13 +367,44 @@ func downloadCredentialedUpstreamAsyncImage(ctx context.Context, raw, baseURL, p
 	}
 	client := *shared
 	client.Timeout = time.Duration(cfg.DownloadTimeout) * time.Second
-	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
-		if len(via) > cfg.DownloadRedirects || !sameUpstreamAsyncOrigin(base, request.URL) {
-			return errors.New("credentialed image result redirect was rejected")
+	// Inspect redirects ourselves so download credentials are sent only to the
+	// channel origin. A provider may redirect its authenticated content endpoint
+	// to a public CDN; that second request uses the protected anonymous client.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	for redirects := 0; ; redirects++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, resultURL.String(), nil)
+		if err != nil {
+			return ImageBytes{}, err
 		}
-		return nil
+		for name, value := range headers {
+			if strings.ContainsAny(name+value, "\r\n") {
+				return ImageBytes{}, errors.New("image result header is invalid")
+			}
+			request.Header.Set(name, value)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return ImageBytes{}, ErrUpstreamAsyncImageTransport
+		}
+		switch response.StatusCode {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			location, locationErr := response.Location()
+			_ = response.Body.Close()
+			if locationErr != nil || location.User != nil || location.Fragment != "" || redirects >= cfg.DownloadRedirects {
+				return ImageBytes{}, errors.New("image result redirect was rejected")
+			}
+			if sameUpstreamAsyncOrigin(base, location) {
+				resultURL = location
+				continue
+			}
+			anonymous := cfg
+			anonymous.DownloadRedirects = cfg.DownloadRedirects - redirects - 1
+			return downloadPublicUpstreamAsyncImage(ctx, location.String(), anonymous)
+		default:
+			defer response.Body.Close()
+			return readUpstreamAsyncImageResponse(response, cfg)
+		}
 	}
-	return downloadUpstreamAsyncImage(ctx, &client, resultURL.String(), headers, cfg)
 }
 
 func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw string, headers map[string]string, cfg ImageRuntimeConfig) (ImageBytes, error) {
@@ -392,7 +423,14 @@ func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw st
 		return ImageBytes{}, ErrUpstreamAsyncImageTransport
 	}
 	defer response.Body.Close()
+	return readUpstreamAsyncImageResponse(response, cfg)
+}
+
+func readUpstreamAsyncImageResponse(response *http.Response, cfg ImageRuntimeConfig) (ImageBytes, error) {
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			return ImageBytes{}, ErrUpstreamAsyncImageTransport
+		}
 		return ImageBytes{}, fmt.Errorf("image result returned HTTP %d", response.StatusCode)
 	}
 	if response.ContentLength > cfg.DownloadMaxBytes {
