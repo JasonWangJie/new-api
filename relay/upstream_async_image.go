@@ -22,10 +22,13 @@ const (
 )
 
 func upstreamAsyncImageOperation(c *gin.Context) string {
-	if operation := c.GetString(contextKeyUpstreamAsyncOperation); operation == dto.UpstreamAsyncOperationEdit {
+	if c == nil {
+		return dto.UpstreamAsyncOperationGenerate
+	}
+	if operation := c.GetString(contextKeyUpstreamAsyncOperation); operation == dto.UpstreamAsyncOperationGenerate || operation == dto.UpstreamAsyncOperationEdit {
 		return operation
 	}
-	if c != nil && c.Request != nil && strings.Contains(c.Request.URL.Path, "/images/edits") {
+	if c.Request != nil && strings.Contains(c.Request.URL.Path, "/images/edits") {
 		return dto.UpstreamAsyncOperationEdit
 	}
 	return dto.UpstreamAsyncOperationGenerate

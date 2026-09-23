@@ -179,16 +179,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationEdit)
 	}
 	c.Set("async_image_upstream_job", func(id string) error {
-		if id == "" || len(id) > 191 {
-			return errors.New("invalid upstream image task id")
-		}
-		if task.UpstreamTaskId == id {
-			return nil
-		}
-		if err := model.TransitionImageTask(ctx, task, map[string]any{"upstream_task_id": id}, "upstream_accepted", "", ""); err != nil {
-			return err
-		}
-		return model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(&task).Error
+		return recordAsyncImageUpstreamJob(ctx, &task, id)
 	})
 	if task.ExecutionProtocol == "openai_images" {
 		request.Platform = "openai"
@@ -600,7 +591,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		images, err = ExtractAsyncImageOutputs(ctx, writer.Body.Bytes(), request.Platform, cfg)
 	}
 	if err != nil {
-		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: err.Error()}
+		return nil, model.AsyncImageBill{}, classifyAsyncImageOutputFailure(task, err)
 	}
 	if usage == nil {
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, Message: "Upstream usage is missing"}
@@ -614,6 +605,36 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "bill_preparation_failed", Message: err.Error(), ExecutionUnknown: true}
 	}
 	return images, bill, nil
+}
+
+func classifyAsyncImageOutputFailure(task model.AsyncImageTask, err error) *service.AsyncImageFailure {
+	if task.UpstreamTaskId != "" && errors.Is(err, service.ErrUpstreamAsyncImageTransport) {
+		return &service.AsyncImageFailure{Code: 606, InternalCode: "result_download_failed", Message: "Upstream image result download was interrupted"}
+	}
+	return &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: err.Error()}
+}
+
+func recordAsyncImageUpstreamJob(ctx context.Context, task *model.AsyncImageTask, id string) error {
+	if id == "" || len(id) > 191 {
+		return errors.New("invalid upstream image task id")
+	}
+	// Dispatch increments the task version through the worker's beforeInvoke
+	// callback. Reload the leased row before recording the returned upstream ID.
+	var current model.AsyncImageTask
+	if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(&current).Error; err != nil {
+		return err
+	}
+	if current.UpstreamTaskId == id {
+		*task = current
+		return nil
+	}
+	if current.UpstreamTaskId != "" {
+		return model.ErrImageConflict
+	}
+	if err := model.TransitionImageTask(ctx, current, map[string]any{"upstream_task_id": id}, "upstream_accepted", "", ""); err != nil {
+		return err
+	}
+	return model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error
 }
 
 func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, cfg service.ImageRuntimeConfig) ([]dto.GeminiPart, error) {

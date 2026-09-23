@@ -128,20 +128,18 @@ func TestAsyncImageAdaptorCapabilitiesAndConversion(t *testing.T) {
 
 func TestUpstreamAsyncImageOperationUsesPublicAsyncPath(t *testing.T) {
 	for _, item := range []struct {
-		path string
-		want string
+		path      string
+		operation string
+		want      string
 	}{
-		{path: "/v1/images/generations_async", want: dto.UpstreamAsyncOperationGenerate},
-		{path: "/v1/images/edits_async", want: dto.UpstreamAsyncOperationEdit},
+		{path: "/v1/images/generations_async", operation: dto.UpstreamAsyncOperationGenerate, want: dto.UpstreamAsyncOperationGenerate},
+		{path: "/v1/images/edits_async", operation: dto.UpstreamAsyncOperationEdit, want: dto.UpstreamAsyncOperationEdit},
+		{path: "/v1/images/edits", operation: dto.UpstreamAsyncOperationGenerate, want: dto.UpstreamAsyncOperationGenerate},
 	} {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, item.path, nil)
-		if strings.Contains(item.path, "/images/edits") {
-			c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationEdit)
-		} else {
-			c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
-		}
+		c.Set(contextKeyUpstreamAsyncOperation, item.operation)
 		assert.Equal(t, item.want, upstreamAsyncImageOperation(c))
 	}
 }

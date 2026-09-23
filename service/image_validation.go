@@ -331,6 +331,8 @@ func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dt
 	return images, nil
 }
 
+var ErrUpstreamAsyncImageTransport = errors.New("image result transport failed")
+
 func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
 	parsed, err := validatePublicUpstreamAsyncImageURL(raw)
 	if err != nil {
@@ -387,7 +389,7 @@ func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw st
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return ImageBytes{}, errors.New("image result download failed")
+		return ImageBytes{}, ErrUpstreamAsyncImageTransport
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -398,7 +400,7 @@ func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw st
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, cfg.DownloadMaxBytes+1))
 	if err != nil {
-		return ImageBytes{}, errors.New("image result read failed")
+		return ImageBytes{}, ErrUpstreamAsyncImageTransport
 	}
 	return ValidateImageBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 }
