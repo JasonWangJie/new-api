@@ -5962,6 +5962,7 @@
     "Submit parsing": "Submit parsing",
     "Submit path": "Submit path",
     "Submit path is required": "Submit path is required",
+    "Submit query templates": "Submit query templates",
     "Submit report": "Submit report",
     "Submit request": "Submit request",
     "Submit request mode": "Submit request mode",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "Upstream did not return reset credit details.",
     "Upstream fetch with local fallback": "Upstream fetch with local fallback",
     "Upstream JSON response": "Upstream JSON response",
+    "Upstream link": "Upstream link",
     "Upstream Model Detection Settings": "Upstream Model Detection Settings",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.",
     "Upstream model list": "Upstream model list",
@@ -7244,7 +7246,6 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom",
-    "Submit query templates": "Submit query templates"
+    "Zoom": "Zoom"
   }
 }

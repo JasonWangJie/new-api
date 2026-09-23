@@ -153,7 +153,11 @@ export function ImageTaskDetails(props: {
           return {
             id: String(result.image_index),
             url,
-            description: `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
+            direct: result.source === 'upstream',
+            description:
+              result.source === 'upstream'
+                ? t('Upstream link')
+                : `${result.width} × ${result.height} · ${(result.byte_size / 1048576).toFixed(2)} MiB`,
           }
         })
       ),
@@ -636,7 +640,8 @@ export function ImageTaskDetails(props: {
                   images={images.data}
                   previewMode='original'
                   actions={
-                    !props.admin
+                    !props.admin &&
+                    !results.some((result) => result.source === 'upstream')
                       ? (index) => (
                           <Button
                             size='sm'

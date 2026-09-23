@@ -5962,6 +5962,7 @@
     "Submit parsing": "Phân tích phản hồi gửi",
     "Submit path": "Đường dẫn gửi",
     "Submit path is required": "Cần nhập đường dẫn gửi",
+    "Submit query templates": "Mẫu tham số truy vấn khi gửi",
     "Submit report": "Gửi báo cáo",
     "Submit request": "Gửi yêu cầu",
     "Submit request mode": "Chế độ gửi yêu cầu",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "Upstream không trả về chi tiết lượt đặt lại.",
     "Upstream fetch with local fallback": "Thượng nguồn tải, dự phòng bằng máy chủ",
     "Upstream JSON response": "Phản hồi JSON thượng nguồn",
+    "Upstream link": "Liên kết từ nhà cung cấp",
     "Upstream Model Detection Settings": "Cài đặt phát hiện mô hình nguồn",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "Đã bắt đầu tác vụ phát hiện mô hình thượng nguồn. Theo dõi tiến trình trong Thông tin hệ thống, sau đó làm mới để xem các cập nhật đang chờ.",
     "Upstream model list": "Danh sách mô hình thượng nguồn",
@@ -7244,7 +7246,6 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom",
-    "Submit query templates": "Mẫu tham số truy vấn khi gửi"
+    "Zoom": "Zoom"
   }
 }

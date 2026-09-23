@@ -275,6 +275,73 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			assert.Empty(t, expired.RequestCipher)
 			assert.Equal(t, model.ImageTaskSucceeded, expired.Status)
 			assert.Equal(t, "active-reference", active.ReferenceUrls)
+
+			fallback := model.AsyncImageTask{TaskId: "asyncimg_public_fallback", UserId: 101, TokenId: 201, ChannelId: 301, Status: model.ImageTaskInvoking, Version: 1, UpstreamTaskId: "upstream-fallback", LeaseToken: "image-fallback-lease", LeaseExpiresAt: now + 120, ErrorCode: "result_download_failed", CreatedAt: now, ExpiresAt: now + 3600}
+			require.NoError(t, db.Create(&fallback).Error)
+			firstURL := "https://cdn.example.com/first.png?signature=result-only"
+			latestURL := "https://cdn.example.com/latest.png?signature=result-only"
+			require.NoError(t, model.RecordAsyncImageUpstreamResult(t.Context(), fallback, []string{firstURL}))
+			require.NoError(t, model.RecordAsyncImageUpstreamResult(t.Context(), fallback, []string{latestURL}))
+			require.NoError(t, model.ScheduleAsyncImagePoll(t.Context(), fallback, now+10, "upstream_pending", ""))
+			var milestoneCount, queueCount int64
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ?", fallback.TaskId).Count(&milestoneCount).Error)
+			require.NoError(t, db.Model(&model.ImageOutbox{}).Where("aggregate_id = ? AND kind = ?", fallback.TaskId, "execute").Count(&queueCount).Error)
+			assert.EqualValues(t, 1, milestoneCount, "repeated polls must not grow the timeline")
+			assert.EqualValues(t, 1, queueCount, "suppressing the timeline must keep the durable poll command")
+			require.NoError(t, db.Model(&model.ImageOutbox{}).Where("aggregate_id = ? AND kind = ?", fallback.TaskId, "execute").Update("status", "delivered").Error)
+			require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", fallback.TaskId).Update("next_attempt_at", now).Error)
+			claimedImage, err := model.ClaimAsyncImageTask(t.Context(), fallback.TaskId, "image-second-lease", 120)
+			require.NoError(t, err)
+			require.NoError(t, model.ScheduleAsyncImagePoll(t.Context(), claimedImage, now+10, "upstream_pending", ""))
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ?", fallback.TaskId).Count(&milestoneCount).Error)
+			require.NoError(t, db.Model(&model.ImageOutbox{}).Where("aggregate_id = ? AND kind = ?", fallback.TaskId, "execute").Count(&queueCount).Error)
+			assert.EqualValues(t, 1, milestoneCount)
+			assert.EqualValues(t, 1, queueCount, "delivered poll commands should be compacted")
+			for _, key := range []string{"legacy-poll-one", "legacy-poll-two"} {
+				require.NoError(t, db.Create(&model.AsyncImageEvent{TaskId: fallback.TaskId, EventKey: key, EventType: "upstream_pending", Status: model.ImageTaskInvoking, CreatedAt: now}).Error)
+			}
+
+			queryRecorder := httptest.NewRecorder()
+			queryContext, _ := gin.CreateTestContext(queryRecorder)
+			queryContext.Set("id", 101)
+			queryContext.Set("token_id", 201)
+			queryContext.Params = gin.Params{{Key: "task_id", Value: fallback.TaskId}}
+			queryContext.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+fallback.TaskId, nil)
+			QueryAsyncImage(queryContext)
+			require.Equal(t, http.StatusOK, queryRecorder.Code)
+			var queried gin.H
+			require.NoError(t, common.Unmarshal(queryRecorder.Body.Bytes(), &queried))
+			assert.Equal(t, "upstream", queried["result_source"])
+			assert.Equal(t, []any{map[string]any{"url": latestURL}}, queried["data"])
+			otherRecorder := httptest.NewRecorder()
+			otherContext, _ := gin.CreateTestContext(otherRecorder)
+			otherContext.Set("id", 102)
+			otherContext.Set("token_id", 202)
+			otherContext.Params = gin.Params{{Key: "task_id", Value: fallback.TaskId}}
+			otherContext.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+fallback.TaskId, nil)
+			QueryAsyncImage(otherContext)
+			assert.Equal(t, http.StatusNotFound, otherRecorder.Code)
+			assert.NotContains(t, otherRecorder.Body.String(), latestURL)
+
+			detailRecorder := httptest.NewRecorder()
+			detailContext, _ := gin.CreateTestContext(detailRecorder)
+			detailContext.Set("id", 101)
+			detailContext.Params = gin.Params{{Key: "task_id", Value: fallback.TaskId}}
+			detailContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/async-image-tasks/"+fallback.TaskId, nil)
+			GetImageTask(detailContext, false)
+			require.Equal(t, http.StatusOK, detailRecorder.Code, detailRecorder.Body.String())
+			var fallbackDetail struct {
+				Data struct {
+					Results []gin.H
+					Events  []model.AsyncImageEvent
+				}
+			}
+			require.NoError(t, common.Unmarshal(detailRecorder.Body.Bytes(), &fallbackDetail))
+			require.Len(t, fallbackDetail.Data.Results, 1)
+			assert.Equal(t, latestURL, fallbackDetail.Data.Results[0]["url"])
+			assert.Equal(t, "upstream", fallbackDetail.Data.Results[0]["source"])
+			require.Len(t, fallbackDetail.Data.Events, 2, "legacy repeated poll events should display once")
+			assert.Equal(t, "", fallbackDetail.Data.Events[0].Message)
 		})
 	}
 }

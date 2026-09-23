@@ -134,6 +134,13 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		return nil, nil, err
 	}
 	results := make([]gin.H, 0)
+	if job.StorageStatus == "upstream" && job.ExpiresAt > time.Now().Unix() {
+		if link := service.PublicUpstreamAsyncVideoResultURL(&task); link != "" {
+			results = append(results, gin.H{"id": job.ID, "image_index": 0, "key": "video", "url": link, "view_url": link, "source": "upstream", "content_type": "video/mp4", "width": 0, "height": 0, "byte_size": 0, "checksum": "", "expires_at": job.ExpiresAt})
+			view["result_count"] = 1
+		}
+		return view, results, nil
+	}
 	// A partial manifest remains hidden until every generated video is saved.
 	if job.StorageStatus != "succeeded" || job.ExpiresAt <= time.Now().Unix() {
 		return view, results, nil

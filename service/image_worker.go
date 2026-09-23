@@ -381,16 +381,18 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		mode = cfg.GeminiReferenceMode
 	}
 	mode = ResolveImageReferenceTransportMode(mode, task.ReferenceRetryCount)
-	attempts = append(attempts, ImageChannelAttempt{ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode})
-	encoded, err := common.Marshal(attempts)
-	if err != nil {
-		return err
-	}
-	if err := model.TransitionImageTask(ctx, *task, map[string]any{"channel_id": channel.Id, "attempts": string(encoded)}, "channel_selected", "", ""); err != nil {
-		return err
-	}
-	if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
-		return err
+	if task.UpstreamTaskId == "" || len(attempts) == 0 {
+		attempts = append(attempts, ImageChannelAttempt{ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode})
+		encoded, err := common.Marshal(attempts)
+		if err != nil {
+			return err
+		}
+		if err := model.TransitionImageTask(ctx, *task, map[string]any{"channel_id": channel.Id, "attempts": string(encoded)}, "channel_selected", "", ""); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
+			return err
+		}
 	}
 	remaining := int64(cfg.ExecutionTimeout) - (time.Now().Unix() - task.StartedAt)
 	if remaining <= 0 {
@@ -434,7 +436,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, true, cfg)
 	attempts[len(attempts)-1].Dispatched = task.DispatchedAt > 0
 	attempts[len(attempts)-1].FinishedAt = time.Now().Unix()
-	encoded, err = common.Marshal(attempts)
+	encoded, err := common.Marshal(attempts)
 	if err != nil {
 		return err
 	}

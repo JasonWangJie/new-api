@@ -145,7 +145,19 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		if err := model.UpdateAsyncMediaJob(ctx, job, map[string]any{"storage_status": "saving"}); err != nil {
 			return err
 		}
+		previousResultURL := task.PrivateData.ResultURL
 		if err := PersistAsyncVideoFunc(ctx, job, &task); err != nil {
+			if job.StorageRetries >= cfg.StorageRetries && PublicUpstreamAsyncVideoResultURL(&task) != "" {
+				if task.PrivateData.ResultURL != previousResultURL {
+					updated := model.DB.WithContext(ctx).Model(&model.Task{}).Where("id = ? AND status = ?", task.ID, model.TaskStatusSuccess).Update("private_data", task.PrivateData)
+					if updated.Error != nil || updated.RowsAffected != 1 {
+						return errors.New("updated upstream video result could not be saved")
+					}
+				}
+				updates["storage_status"], updates["status"], updates["storage_retries"] = "upstream", "succeeded", job.StorageRetries+1
+				updates["error_message"], updates["next_attempt_at"] = "", 0
+				return nil
+			}
 			updates["storage_status"], updates["storage_retries"], updates["error_message"] = "failed", job.StorageRetries+1, "Generated video could not be saved locally"
 			if job.StorageRetries >= cfg.StorageRetries {
 				updates["next_attempt_at"] = int64(1 << 62)

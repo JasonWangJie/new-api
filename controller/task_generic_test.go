@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -631,12 +632,97 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 
 	require.NoError(t, PersistAsyncVideo(t.Context(), job, task))
 	assert.Equal(t, 1, polls)
+	assert.Equal(t, upstream.URL+"/fresh", task.PrivateData.ResultURL)
 	assert.Equal(t, 1, freshDownloads)
 	assert.Zero(t, staleDownloads)
 	ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
 	require.NoError(t, err)
 	require.NotNil(t, ref)
 	assert.EqualValues(t, len(video), ref.Size)
+}
+
+func TestDynamicUpstreamVideoUsesPublicURLAfterStorageRetries(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	connection, err := model.DB.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.AsyncMediaJob{}))
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+	resultURL := "https://cdn.example.com/output.mp4?signature=old"
+	latestURL := "https://cdn.example.com/output.mp4?signature=for-owner"
+	task.PrivateData = model.TaskPrivateData{AsyncMedia: true, ResultURL: resultURL, UpstreamAsync: &relaydto.UpstreamAsyncProfile{}}
+	require.NoError(t, model.DB.Save(task).Error)
+	oldPersist := service.PersistAsyncVideoFunc
+	service.PersistAsyncVideoFunc = func(_ context.Context, _ model.AsyncMediaJob, task *model.Task) error {
+		task.PrivateData.ResultURL = latestURL
+		return errors.New("gateway download failed")
+	}
+	t.Cleanup(func() { service.PersistAsyncVideoFunc = oldPersist })
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "video-public-fallback", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Status: "submitted", StorageStatus: "failed", StorageRetries: cfg.StorageRetries, LeaseToken: "fallback-lease", LeaseExpiresAt: now + 120, ExpiresAt: now + 3600, CreatedAt: now}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, model.DB.Where("id = ?", job.ID).Take(&job).Error)
+	assert.Equal(t, "succeeded", job.Status)
+	assert.Equal(t, "upstream", job.StorageStatus)
+	assert.Equal(t, cfg.StorageRetries+1, job.StorageRetries)
+	var refreshed model.Task
+	require.NoError(t, model.DB.Where("id = ?", task.ID).Take(&refreshed).Error)
+	assert.Equal(t, latestURL, refreshed.PrivateData.ResultURL)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Set("id", task.UserId)
+	c.Set("token_id", job.TokenId)
+	c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+job.TaskId, nil)
+	QueryAsyncMedia(c)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	var response gin.H
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.Equal(t, "succeeded", response["status"])
+	assert.Equal(t, "upstream", response["storage_status"])
+	assert.Equal(t, []any{map[string]any{"id": float64(job.ID), "image_index": float64(0), "key": "video", "url": latestURL, "view_url": latestURL, "source": "upstream", "content_type": "video/mp4", "width": float64(0), "height": float64(0), "byte_size": float64(0), "checksum": "", "expires_at": float64(job.ExpiresAt)}}, response["data"])
+
+	artifactRecorder := httptest.NewRecorder()
+	artifactContext, _ := gin.CreateTestContext(artifactRecorder)
+	artifactContext.Set("id", task.UserId)
+	artifactContext.Params = gin.Params{{Key: "key", Value: task.TaskID}}
+	artifactContext.Request = httptest.NewRequest(http.MethodGet, "/v1/tasks/"+task.TaskID+"/artifacts", nil)
+	GetTaskArtifacts(artifactContext)
+	require.Equal(t, http.StatusOK, artifactRecorder.Code, artifactRecorder.Body.String())
+	var artifactResponse struct {
+		Artifacts []taskArtifactResponse `json:"artifacts"`
+	}
+	require.NoError(t, common.Unmarshal(artifactRecorder.Body.Bytes(), &artifactResponse))
+	assert.Equal(t, []taskArtifactResponse{{Key: "video", Type: "video", MimeType: "video/mp4", ContentURL: latestURL, Source: "upstream"}}, artifactResponse.Artifacts)
+
+	for _, endpoint := range []struct {
+		path    string
+		params  gin.Params
+		handler gin.HandlerFunc
+	}{
+		{"/v1/videos/" + task.TaskID + "/content", gin.Params{{Key: "task_id", Value: task.TaskID}}, VideoProxy},
+		{"/v1/tasks/" + task.TaskID + "/artifacts/video/content", gin.Params{{Key: "key", Value: task.TaskID}, {Key: "artifact_key", Value: "video"}}, TaskArtifactContent},
+	} {
+		endpointRecorder := httptest.NewRecorder()
+		endpointContext, _ := gin.CreateTestContext(endpointRecorder)
+		endpointContext.Set("id", task.UserId)
+		endpointContext.Params = endpoint.params
+		endpointContext.Request = httptest.NewRequest(http.MethodGet, endpoint.path, nil)
+		endpoint.handler(endpointContext)
+		assert.Equal(t, http.StatusTemporaryRedirect, endpointRecorder.Code, endpoint.path)
+		assert.Equal(t, latestURL, endpointRecorder.Header().Get("Location"), endpoint.path)
+		assert.Equal(t, "private, no-store", endpointRecorder.Header().Get("Cache-Control"), endpoint.path)
+	}
+
+	task.PrivateData.UpstreamAsync.Poll.Response.DownloadHeaders = map[string]string{"Authorization": "Bearer {api_key}"}
+	assert.Empty(t, service.PublicUpstreamAsyncVideoResultURL(task), "credentialed content cannot be used as a direct client link")
+	task.PrivateData.UpstreamAsync.Poll.Response.DownloadHeaders = nil
+	task.PrivateData.ResultURL = "http://127.0.0.1/private.mp4"
+	assert.Empty(t, service.PublicUpstreamAsyncVideoResultURL(task), "private hosts cannot be returned to clients")
 }
 
 func TestTaskMediaRequestHeaderPolicy(t *testing.T) {

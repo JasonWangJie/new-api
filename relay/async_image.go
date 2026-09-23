@@ -581,6 +581,19 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if !valid || !profileExists || !profileValid {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: "Upstream image result metadata is invalid"}
 		}
+		publicURLs := make([]string, 0, len(urls))
+		if len(profile.Poll.Response.DownloadHeaders) == 0 {
+			for _, resultURL := range urls {
+				if !service.PublicUpstreamAsyncResultURL(resultURL) {
+					publicURLs = nil
+					break
+				}
+				publicURLs = append(publicURLs, resultURL)
+			}
+		}
+		if err := model.RecordAsyncImageUpstreamResult(ctx, task, publicURLs); err != nil {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_record_failed", Message: "Upstream image result could not be recorded"}
+		}
 		images, err = service.DownloadUpstreamAsyncImages(ctx, urls, profile, info.ChannelBaseUrl, info.ChannelSetting.Proxy, service.UpstreamAsyncTemplateContext{
 			TaskID:        task.UpstreamTaskId,
 			Model:         info.OriginModelName,

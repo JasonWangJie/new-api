@@ -21,6 +21,7 @@ import { useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
 
@@ -33,7 +34,13 @@ export function ImageResults({
   empty,
   previewMode = 'standard',
 }: {
-  images: { url: string; id: string; title?: string; description?: string }[]
+  images: {
+    url: string
+    id: string
+    title?: string
+    description?: string
+    direct?: boolean
+  }[]
   actions?: (id: string) => ReactNode
   empty?: string
   previewMode?: 'standard' | 'original'
@@ -43,6 +50,10 @@ export function ImageResults({
   const download = async (index: number) => {
     try {
       const image = images[index]
+      if (image.direct) {
+        window.open(image.url, '_blank', 'noopener,noreferrer')
+        return
+      }
       const blob = await imageBlob(image.url)
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
@@ -106,6 +117,9 @@ export function ImageResults({
                 >
                   <Download className='size-4' />
                 </Button>
+                {image.direct && (
+                  <CopyButton value={image.url} aria-label={t('Copy link')} />
+                )}
               </div>
               {image.description && (
                 <p className='text-muted-foreground text-xs'>

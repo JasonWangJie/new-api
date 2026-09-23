@@ -454,6 +454,30 @@ func validatePublicUpstreamAsyncImageURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// PublicUpstreamAsyncResultURL accepts anonymous links suitable for a
+// client-facing fallback. It intentionally avoids DNS lookup: clients may
+// reach a public CDN even when the gateway's download connection has failed.
+func PublicUpstreamAsyncResultURL(raw string) bool {
+	if len(raw) == 0 || len(raw) > 8192 {
+		return false
+	}
+	parsed, err := validatePublicUpstreamAsyncImageURL(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	if strings.Trim(host, "0123456789.") == "" {
+		return false
+	}
+	return strings.Contains(host, ".") && host != "localhost" &&
+		!strings.HasSuffix(host, ".localhost") && !strings.HasSuffix(host, ".local") &&
+		!strings.HasSuffix(host, ".internal") && !strings.HasSuffix(host, ".test") &&
+		!strings.HasSuffix(host, ".invalid")
+}
+
 func (image ImageBytes) DataURL() string {
 	return "data:" + image.ContentType + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
 }

@@ -10,6 +10,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const upstreamImageResultEvent = "upstream_result_received"
+
 // EraseExpiredAsyncImageTaskContent preserves accounting and idempotency
 // tombstones while removing expired prompt, payload and reference content.
 func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
@@ -123,6 +125,52 @@ func ScheduleAsyncImagePoll(ctx context.Context, task AsyncImageTask, nextAttemp
 		"lease_expires_at": 0,
 		"next_attempt_at":  nextAttemptAt,
 	}, eventType, message, "execute")
+}
+
+// RecordAsyncImageUpstreamResult keeps one result milestone and refreshes its
+// public fallback URLs without adding a timeline row on every poll.
+func RecordAsyncImageUpstreamResult(ctx context.Context, task AsyncImageTask, urls []string) error {
+	if task.UpstreamTaskId == "" || task.LeaseToken == "" {
+		return ErrImageConflict
+	}
+	encoded, err := common.Marshal(urls)
+	if err != nil {
+		return err
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current AsyncImageTask
+		if err := lockForUpdate(tx).Where("task_id = ? AND lease_token = ? AND lease_expires_at > ? AND status = ?", task.TaskId, task.LeaseToken, time.Now().Unix(), ImageTaskInvoking).Take(&current).Error; err != nil {
+			return err
+		}
+		var event AsyncImageEvent
+		err := lockForUpdate(tx).Where("task_id = ? AND event_type = ?", task.TaskId, upstreamImageResultEvent).Take(&event).Error
+		if err == nil {
+			if event.Message == string(encoded) {
+				return nil
+			}
+			return tx.Model(&event).Update("message", string(encoded)).Error
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		return tx.Create(&AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: upstreamImageResultEvent, Status: ImageTaskUpstreamSucceeded, Message: string(encoded), CreatedAt: time.Now().Unix()}).Error
+	})
+}
+
+func GetAsyncImageUpstreamResultURLs(ctx context.Context, taskID string) ([]string, error) {
+	var event AsyncImageEvent
+	err := DB.WithContext(ctx).Where("task_id = ? AND event_type = ?", taskID, upstreamImageResultEvent).Take(&event).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var urls []string
+	if err := common.UnmarshalJsonStr(event.Message, &urls); err != nil {
+		return nil, err
+	}
+	return urls, nil
 }
 
 func HeartbeatAsyncImageTask(ctx context.Context, id, lease string, seconds int) error {
@@ -296,14 +344,22 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
 			if changed.RowsAffected != 1 {
 				return ErrImageConflict
 			}
-			record := AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: event, Status: updates["status"].(string), CreatedAt: now}
-			if err := tx.Create(&record).Error; err != nil {
-				return err
+			eventKey := common.GetUUID()
+			if task.UpstreamTaskId == "" || updates["status"] != task.Status {
+				record := AsyncImageEvent{TaskId: task.TaskId, EventKey: eventKey, EventType: event, Status: updates["status"].(string), CreatedAt: now}
+				if err := tx.Create(&record).Error; err != nil {
+					return err
+				}
 			}
 			if kind == "" {
 				return nil
 			}
-			return tx.Create(&ImageOutbox{EventKey: record.EventKey, Kind: kind, AggregateId: task.TaskId, Status: "pending", CreatedAt: now, NextAttemptAt: now}).Error
+			if task.UpstreamTaskId != "" {
+				if err := tx.Where("aggregate_id = ? AND kind = ? AND status = ?", task.TaskId, "execute", "delivered").Delete(&ImageOutbox{}).Error; err != nil {
+					return err
+				}
+			}
+			return tx.Create(&ImageOutbox{EventKey: eventKey, Kind: kind, AggregateId: task.TaskId, Status: "pending", CreatedAt: now, NextAttemptAt: now}).Error
 		}); err != nil && !errors.Is(err, ErrImageConflict) {
 			return err
 		}

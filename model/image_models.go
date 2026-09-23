@@ -458,16 +458,29 @@ func transitionImageTaskTx(tx *gorm.DB, task AsyncImageTask, updates map[string]
 	if value, ok := updates["status"].(string); ok {
 		status = value
 	}
-	event := AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: eventType, Status: status, Message: message, CreatedAt: now}
-	if err := tx.Create(&event).Error; err != nil {
-		return err
+	eventKey := common.GetUUID()
+	// Polling an accepted upstream job can run many times without changing its
+	// phase. Keep the queue command, but do not add another timeline row.
+	repeatedPoll := task.UpstreamTaskId != "" && status == task.Status &&
+		(eventType == "claimed" || eventType == "channel_selected" || eventType == "upstream_pending" ||
+			eventType == "recovered" || eventType == "invocation_failed")
+	if !repeatedPoll {
+		event := AsyncImageEvent{TaskId: task.TaskId, EventKey: eventKey, EventType: eventType, Status: status, Message: message, CreatedAt: now}
+		if err := tx.Create(&event).Error; err != nil {
+			return err
+		}
 	}
 	if outboxKind == "" {
 		return nil
+	}
+	if task.UpstreamTaskId != "" && outboxKind == "execute" {
+		if err := tx.Where("aggregate_id = ? AND kind = ? AND status = ?", task.TaskId, "execute", "delivered").Delete(&ImageOutbox{}).Error; err != nil {
+			return err
+		}
 	}
 	nextAttemptAt := now
 	if value, ok := updates["next_attempt_at"].(int64); ok && value > nextAttemptAt {
 		nextAttemptAt = value
 	}
-	return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: outboxKind, AggregateId: task.TaskId, Status: "pending", NextAttemptAt: nextAttemptAt, CreatedAt: now}).Error
+	return tx.Create(&ImageOutbox{EventKey: eventKey, Kind: outboxKind, AggregateId: task.TaskId, Status: "pending", NextAttemptAt: nextAttemptAt, CreatedAt: now}).Error
 }

@@ -5962,6 +5962,7 @@
     "Submit parsing": "提交回應解析",
     "Submit path": "提交路徑",
     "Submit path is required": "必須填寫提交路徑",
+    "Submit query templates": "提交查詢參數範本",
     "Submit report": "送出檢舉",
     "Submit request": "提交請求",
     "Submit request mode": "提交請求模式",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "上游未返回重置次數詳情。",
     "Upstream fetch with local fallback": "上游擷取失敗後改由伺服器下載",
     "Upstream JSON response": "上游 JSON 回應",
+    "Upstream link": "上游連結",
     "Upstream Model Detection Settings": "偵測上游模型設定",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "上游模型檢測任務已開始。可在「系統資訊」中查看進度，完成後重新整理以查看待處理的更新。",
     "Upstream model list": "上游模型清單",
@@ -7244,7 +7246,6 @@
     "Zhipu": "智譜",
     "Zhipu GLM": "智譜GLM",
     "Zhipu V4": "智譜 V4",
-    "Zoom": "縮放",
-    "Submit query templates": "提交查詢參數範本"
+    "Zoom": "縮放"
   }
 }

@@ -741,6 +741,7 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 			return nil
 		}
 	}
+	originalTask := task
 	copyTask := *task
 	task = &copyTask
 	restoreErr := service.RestoreAsyncMediaOutput(ctx, job, task)
@@ -813,6 +814,7 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 			}
 			task.PrivateData.UpstreamAsyncResponse = append(task.PrivateData.UpstreamAsyncResponse[:0], body...)
 			task.PrivateData.ResultURL = result.URLs[0]
+			originalTask.PrivateData.ResultURL = result.URLs[0]
 			task.Data = nil
 		} else {
 			result, parseErr := adaptor.ParseTaskResult(task, response, body)

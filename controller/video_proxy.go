@@ -89,7 +89,16 @@ func VideoProxy(c *gin.Context) {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		if middleware.IsTaskArtifactAccess(c) || mediaJob.StorageStatus != "succeeded" {
+		if middleware.IsTaskArtifactAccess(c) {
+			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+			return
+		}
+		if link := upstreamVideoArtifactURL(task, mediaJob); link != "" {
+			c.Header("Cache-Control", "private, no-store")
+			c.Redirect(http.StatusTemporaryRedirect, link)
+			return
+		}
+		if mediaJob.StorageStatus != "succeeded" {
 			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
 			return
 		}

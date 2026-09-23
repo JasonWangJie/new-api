@@ -387,6 +387,18 @@ func BuildUpstreamAsyncDownloadHeaders(profile *relaydto.UpstreamAsyncProfile, r
 	return headers, false, nil
 }
 
+func PublicUpstreamAsyncVideoResultURL(task *model.Task) string {
+	if task == nil || task.Status != model.TaskStatusSuccess || task.PrivateData.UpstreamAsync == nil ||
+		len(task.PrivateData.UpstreamAsync.Poll.Response.DownloadHeaders) != 0 {
+		return ""
+	}
+	resultURL := strings.TrimSpace(task.PrivateData.ResultURL)
+	if !PublicUpstreamAsyncResultURL(resultURL) {
+		return ""
+	}
+	return resultURL
+}
+
 func UpstreamAsyncOperation(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "edit", "edit_video":

@@ -299,8 +299,25 @@ func GetImageTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	if !admin {
-		for i := range events {
+	if task.UpstreamTaskId != "" {
+		seen := make(map[string]bool)
+		visible := events[:0]
+		for _, event := range events {
+			if event.Status == model.ImageTaskInvoking {
+				switch event.EventType {
+				case "claimed", "channel_selected", "upstream_pending", "recovered", "invocation_failed":
+					if seen[event.EventType] {
+						continue
+					}
+					seen[event.EventType] = true
+				}
+			}
+			visible = append(visible, event)
+		}
+		events = visible
+	}
+	for i := range events {
+		if !admin || events[i].EventType == "upstream_result_received" {
 			events[i].Message = ""
 		}
 	}
@@ -347,10 +364,27 @@ func GetImageTask(c *gin.Context, admin bool) {
 			results = append(results, item)
 		}
 	}
+	if !task.ResultsAvailable() && task.ErrorCode == "result_download_failed" {
+		urls, err := model.GetAsyncImageUpstreamResultURLs(c.Request.Context(), task.TaskId)
+		if err != nil {
+			imageManagementError(c, 503, err)
+			return
+		}
+		for i, resultURL := range urls {
+			if !service.PublicUpstreamAsyncResultURL(resultURL) {
+				results = results[:0]
+				break
+			}
+			results = append(results, gin.H{"id": i, "image_index": i, "url": resultURL, "view_url": resultURL, "source": "upstream", "content_type": "", "byte_size": 0, "checksum": "", "width": 0, "height": 0, "created_at": task.UpstreamSucceededAt, "expires_at": task.ExpiresAt})
+		}
+	}
 	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
+	}
+	if len(results) > 0 && !task.ResultsAvailable() {
+		items[0]["result_count"], items[0]["result_source"] = len(results), "upstream"
 	}
 	imageManagementData(c, gin.H{"task": items[0], "results": results, "events": events})
 }

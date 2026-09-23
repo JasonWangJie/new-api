@@ -275,6 +275,26 @@ func QueryAsyncImage(c *gin.Context) {
 		c.JSON(200, response)
 		return
 	}
+	if task.ErrorCode == "result_download_failed" {
+		urls, err := model.GetAsyncImageUpstreamResultURLs(ctx, task.TaskId)
+		if err != nil {
+			AsyncImagePublicError(c, 503, "database_unavailable", "Upstream image results are unavailable")
+			return
+		}
+		if len(urls) > 0 {
+			data := make([]gin.H, 0, len(urls))
+			for _, resultURL := range urls {
+				if !service.PublicUpstreamAsyncResultURL(resultURL) {
+					data = nil
+					break
+				}
+				data = append(data, gin.H{"url": resultURL})
+			}
+			if len(data) == len(urls) {
+				response["data"], response["result_source"] = data, "upstream"
+			}
+		}
+	}
 	if task.Terminal() || (task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed) && task.NextAttemptAt == 0 {
 		code := task.PublicErrorCode
 		if code < 601 || code > 613 {

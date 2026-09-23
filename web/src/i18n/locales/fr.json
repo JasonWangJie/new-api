@@ -5962,6 +5962,7 @@
     "Submit parsing": "Analyse de l’envoi",
     "Submit path": "Chemin de soumission",
     "Submit path is required": "Le chemin de soumission est requis",
+    "Submit query templates": "Modèles des paramètres de requête pour l’envoi",
     "Submit report": "Envoyer le signalement",
     "Submit request": "Envoyer une requête",
     "Submit request mode": "Mode de soumission",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "L'amont n'a renvoyé aucun détail de crédit de réinitialisation.",
     "Upstream fetch with local fallback": "Lecture fournisseur avec repli serveur",
     "Upstream JSON response": "Réponse JSON amont",
+    "Upstream link": "Lien du fournisseur",
     "Upstream Model Detection Settings": "Paramètres de détection des modèles en amont",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "Tâche de détection des modèles en amont démarrée. Suivez la progression dans Infos système, puis actualisez pour examiner les mises à jour en attente.",
     "Upstream model list": "Liste des modèles en amont",
@@ -7244,7 +7246,6 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom",
-    "Submit query templates": "Modèles des paramètres de requête pour l’envoi"
+    "Zoom": "Zoom"
   }
 }

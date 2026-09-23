@@ -461,3 +461,100 @@ test('video task details play local results and refresh an expired link', async 
   )
   expect(document.body).not.toHaveTextContent('secret-fingerprint-canary')
 })
+
+test('failed image downloads show the upstream link without a local archive action', async () => {
+  const user = userEvent.setup()
+  const link = 'https://cdn.example.com/image.png?signature=for-owner'
+  vi.mocked(getImageTask).mockResolvedValue({
+    task: {
+      ...task,
+      status: 'failed',
+      error_code: 'result_download_failed',
+      result_count: 1,
+    },
+    events: [
+      {
+        id: 1,
+        event_type: 'upstream_result_received',
+        status: 'upstream_succeeded',
+        message: '',
+        created_at: 1789600000,
+      },
+    ],
+    results: [
+      {
+        ...detail.results[0],
+        url: link,
+        view_url: link,
+        source: 'upstream',
+        width: 0,
+        height: 0,
+        byte_size: 0,
+      },
+    ],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin={false}
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  await screen.findByText('Upstream link')
+  expect(screen.getByAltText('Generated image')).toHaveAttribute('src', link)
+  expect(
+    screen.queryByRole('button', { name: 'Archive to server' })
+  ).not.toBeInTheDocument()
+  const openWindow = vi.spyOn(window, 'open').mockImplementation(() => null)
+  await user.click(screen.getByRole('button', { name: 'Download image' }))
+  expect(openWindow).toHaveBeenCalledWith(link, '_blank', 'noopener,noreferrer')
+  openWindow.mockRestore()
+  await user.click(screen.getByRole('button', { name: 'Copy link' }))
+  expect(await navigator.clipboard.readText()).toBe(link)
+})
+
+test('video upstream fallback plays its direct link without offering to refresh it', async () => {
+  const link = 'https://cdn.example.com/video.mp4?signature=for-owner'
+  vi.mocked(getImageTask).mockResolvedValue({
+    task: {
+      ...task,
+      media_type: 'video',
+      request_type: 'text_to_video',
+      status: 'succeeded',
+      storage_status: 'upstream',
+      billing_status: 'settled',
+    },
+    events: [],
+    results: [
+      {
+        ...detail.results[0],
+        url: link,
+        view_url: link,
+        source: 'upstream',
+        byte_size: 0,
+      },
+    ],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin={false}
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  await screen.findByText('Upstream link')
+  expect(document.querySelector('video')).toHaveAttribute('src', link)
+  expect(
+    screen.queryByRole('button', { name: 'Refresh link' })
+  ).not.toBeInTheDocument()
+  expect(screen.getByText('Download').closest('a')).toHaveAttribute(
+    'href',
+    link
+  )
+})

@@ -5962,6 +5962,7 @@
     "Submit parsing": "Разбор отправки",
     "Submit path": "Путь отправки",
     "Submit path is required": "Укажите путь отправки",
+    "Submit query templates": "Шаблоны параметров запроса отправки",
     "Submit report": "Отправить жалобу",
     "Submit request": "Отправить запрос",
     "Submit request mode": "Режим отправки запроса",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "Вышестоящий сервис не вернул сведения о сбросах лимита.",
     "Upstream fetch with local fallback": "Загрузка провайдером с резервной загрузкой сервера",
     "Upstream JSON response": "JSON-ответ поставщика",
+    "Upstream link": "Ссылка поставщика",
     "Upstream Model Detection Settings": "Настройки обнаружения моделей провайдера",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "Задача обнаружения моделей вышестоящего источника запущена. Следите за ходом в разделе «Информация о системе», затем обновите, чтобы просмотреть подготовленные изменения.",
     "Upstream model list": "Список моделей провайдера",
@@ -7244,7 +7246,6 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom",
-    "Submit query templates": "Шаблоны параметров запроса отправки"
+    "Zoom": "Zoom"
   }
 }

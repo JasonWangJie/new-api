@@ -27,6 +27,14 @@ type taskArtifactResponse struct {
 	Type       string `json:"type"`
 	MimeType   string `json:"mime_type,omitempty"`
 	ContentURL string `json:"content_url"`
+	Source     string `json:"source,omitempty"`
+}
+
+func upstreamVideoArtifactURL(task *model.Task, job model.AsyncMediaJob) string {
+	if job.Status != "succeeded" || job.StorageStatus != "upstream" || job.ExpiresAt <= common.GetTimestamp() {
+		return ""
+	}
+	return service.PublicUpstreamAsyncVideoResultURL(task)
 }
 
 var (
@@ -118,6 +126,8 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 				}
 				items = append(items, taskArtifactResponse{Key: object.ArtifactKey, Type: "video", MimeType: object.MimeType, ContentURL: link})
 			}
+		} else if link := upstreamVideoArtifactURL(task, mediaJob); link != "" {
+			items = append(items, taskArtifactResponse{Key: "video", Type: "video", MimeType: "video/mp4", ContentURL: link, Source: "upstream"})
 		}
 		response := gin.H{"task_id": task.TaskID, "artifacts": items}
 		if dashboard {
@@ -343,7 +353,18 @@ func TaskArtifactContent(c *gin.Context) {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		if middleware.IsTaskArtifactAccess(c) || mediaJob.StorageStatus != "succeeded" {
+		if middleware.IsTaskArtifactAccess(c) {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if artifactKey == "video" {
+			if link := upstreamVideoArtifactURL(task, mediaJob); link != "" {
+				c.Header("Cache-Control", "private, no-store")
+				c.Redirect(http.StatusTemporaryRedirect, link)
+				return
+			}
+		}
+		if mediaJob.StorageStatus != "succeeded" {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 			return
 		}

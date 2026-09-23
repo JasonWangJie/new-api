@@ -103,11 +103,20 @@ func StageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []As
 		if err := tx.Create(&bill).Error; err != nil {
 			return err
 		}
-		event := AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: "upstream_succeeded", Status: ImageTaskUpstreamSucceeded, Message: "Image output and immutable bill persisted", CreatedAt: now}
-		if err := tx.Create(&event).Error; err != nil {
-			return err
+		eventKey := common.GetUUID()
+		var received int64
+		if task.UpstreamTaskId != "" {
+			if err := tx.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, upstreamImageResultEvent).Count(&received).Error; err != nil {
+				return err
+			}
 		}
-		return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: "postprocess", AggregateId: task.TaskId, Status: "pending", NextAttemptAt: now, CreatedAt: now}).Error
+		if received == 0 {
+			event := AsyncImageEvent{TaskId: task.TaskId, EventKey: eventKey, EventType: "upstream_succeeded", Status: ImageTaskUpstreamSucceeded, Message: "Image output and immutable bill persisted", CreatedAt: now}
+			if err := tx.Create(&event).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Create(&ImageOutbox{EventKey: eventKey, Kind: "postprocess", AggregateId: task.TaskId, Status: "pending", NextAttemptAt: now, CreatedAt: now}).Error
 	})
 }
 

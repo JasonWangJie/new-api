@@ -123,7 +123,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           title: '统一查询、状态与本地链接',
           paragraphs: [
             '新入口受理成功返回 HTTP 202、task_id、query_url，并带 Location、Retry-After: 3。使用 GET /v1/media/tasks_async/{task_id} 查询图片或视频；响应包含 media_type、provider、protocol、stage、progress、billing_status 和 storage_status。',
-            '稳定阶段为 queued、generating、saving、completed 和 failed。status 提供更细状态，例如 queued、processing、invoking、uploading、storage_failed、execution_unknown、succeeded、failed 或 expired。只有全部产物保存并确认后，data 才会返回可用 URL。',
+            '稳定阶段为 queued、generating、saving、completed 和 failed。status 提供更细状态，例如 queued、processing、invoking、uploading、storage_failed、execution_unknown、succeeded、failed 或 expired。保存成功后 data 返回本站链接；动态上游任务下载失败时，符合公开访问条件的上游结果也会在 data 中返回，并标记 source 或 result_source 为 upstream。图片仍保留当前下载及计费状态。',
             '视频结果包含 content_type、byte_size、checksum 和 expires_at。签名链接默认有效 1 小时，重新查询会签发新链接；GET、HEAD 和 Range 均受支持。链接过期、任务清理、签名错误，或原 Token 被禁用、过期、撤销、IP 不匹配时返回 404。',
           ],
         },
@@ -133,7 +133,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           paragraphs: [
             '图片沿用固定账单和幂等结算；视频沿用现有任务预扣及上游结果结算。受理时冻结价格快照，之后修改价格不会影响该任务。存储重试不会新增费用。',
             '带上游任务 ID 的图片供应商会持久化任务 ID 并恢复轮询。视频先持久化网关任务，再由后台提交；已经跨过上游提交边界但无法确认结果的任务进入 execution_unknown，禁止自动重新生成。',
-            '视频上游成功但本地保存失败时会显示 saving 或 storage_failed，并保留已经发生的费用。管理员或用户恢复只处理现有产物。不要通过重新提交生成来修复存储失败，否则会创建新的计费任务。',
+            '视频上游成功但本地保存失败时会显示 saving 或 storage_failed，并保留已经发生的费用。动态上游任务耗尽本地保存重试后，如有可匿名访问的公网结果链接，会改用上游链接完成任务并标记 storage_status=upstream。管理员或用户恢复只处理现有产物；重新提交生成会创建新的计费任务。',
           ],
         },
         {
@@ -219,7 +219,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           title: 'Unified queries, states and local links',
           paragraphs: [
             'New routes return HTTP 202 with task_id and query_url plus Location and Retry-After: 3. Query either image or video with GET /v1/media/tasks_async/{task_id}. The response includes media_type, provider, protocol, stage, progress, billing_status and storage_status.',
-            'Stable stages are queued, generating, saving, completed and failed. status supplies more detail, including queued, processing, invoking, uploading, storage_failed, execution_unknown, succeeded, failed and expired. data remains unavailable until every artifact is saved and confirmed.',
+            'Stable stages are queued, generating, saving, completed and failed. status supplies more detail, including queued, processing, invoking, uploading, storage_failed, execution_unknown, succeeded, failed and expired. Saved artifacts return local links in data. Dynamic upstream tasks can also return a public upstream result link after a download failure, marked by source or result_source as upstream. Images retain their current download and billing status.',
             'Video results include content_type, byte_size, checksum and expires_at. Signed links default to one hour and a fresh task query issues new links. GET, HEAD and Range are supported. Expired or invalid signatures, cleaned tasks, and an original token that is disabled, expired, revoked or outside its IP policy return 404.',
           ],
         },
@@ -229,7 +229,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           paragraphs: [
             'Images retain fixed, idempotent settlement. Videos retain existing task pre-consumption and upstream-result settlement. Admission freezes the price snapshot, so later price changes do not alter the task. Storage retries add no charge.',
             'Image providers returning an upstream task ID persist it and resume polling. Video jobs are persisted before a worker submits upstream. If submission may have crossed the upstream boundary but cannot be confirmed, the task becomes execution_unknown and is never automatically regenerated.',
-            'An upstream-successful video whose local save fails remains in saving or storage_failed and keeps the charge already incurred. User or administrator recovery handles the existing artifact only. Submitting generation again creates a separate billable task.',
+            'An upstream-successful video whose local save fails remains in saving or storage_failed and keeps the charge already incurred. After local storage retries are exhausted, a dynamic upstream task can complete with a public anonymous upstream link and storage_status=upstream. User or administrator recovery handles the existing artifact only; submitting generation again creates a separate billable task.',
           ],
         },
         {

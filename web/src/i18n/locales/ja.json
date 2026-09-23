@@ -5962,6 +5962,7 @@
     "Submit parsing": "送信応答の解析",
     "Submit path": "送信パス",
     "Submit path is required": "送信パスは必須です",
+    "Submit query templates": "送信クエリパラメーターテンプレート",
     "Submit report": "報告を送信",
     "Submit request": "リクエストを送信",
     "Submit request mode": "送信リクエストモード",
@@ -6742,6 +6743,7 @@
     "Upstream did not return reset credit details.": "上流からリセット回数の詳細が返されませんでした。",
     "Upstream fetch with local fallback": "上流取得の失敗時はサーバーで取得",
     "Upstream JSON response": "上流 JSON レスポンス",
+    "Upstream link": "提供元のリンク",
     "Upstream Model Detection Settings": "アップストリームモデル検出設定",
     "Upstream model detection task started. Track progress in System Info, then refresh to review staged updates.": "上流モデル検出タスクを開始しました。システム情報で進捗を確認し、完了後に更新してステージングされた変更をご確認ください。",
     "Upstream model list": "上流のモデル一覧",
@@ -7244,7 +7246,6 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V 4",
-    "Zoom": "ズーム",
-    "Submit query templates": "送信クエリパラメーターテンプレート"
+    "Zoom": "ズーム"
   }
 }

@@ -54,11 +54,15 @@ export function VideoResults(props: {
             <CopyButton value={result.url || result.view_url}>
               {t('Copy link')}
             </CopyButton>
-            <Button variant='ghost' size='sm' onClick={props.onRefresh}>
-              {t('Refresh link')}
-            </Button>
+            {result.source !== 'upstream' && (
+              <Button variant='ghost' size='sm' onClick={props.onRefresh}>
+                {t('Refresh link')}
+              </Button>
+            )}
             <span className='text-muted-foreground text-xs'>
-              {(result.byte_size / 1048576).toFixed(2)} MiB
+              {result.source === 'upstream'
+                ? t('Upstream link')
+                : `${(result.byte_size / 1048576).toFixed(2)} MiB`}
             </span>
           </div>
         </div>
