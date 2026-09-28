@@ -662,7 +662,12 @@ func executeTaskSubmissionWith(
 		diagnostics.failed("settle", "billing_error", taskErr, true)
 		return nil, taskErr
 	}
-	service.LogTaskConsumption(c, relayInfo, task)
+	if logErr := service.LogTaskConsumption(c, relayInfo, task); logErr != nil {
+		common.SysError("record task consumption error: " + logErr.Error())
+		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task usage"), "task_billing_settlement_failed", http.StatusInternalServerError)
+		diagnostics.failed("settle", "usage_error", taskErr, true)
+		return nil, taskErr
+	}
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

@@ -221,12 +221,20 @@ func TestUpstreamAsyncSettingsDatabaseRoundTrip(t *testing.T) {
 			sqlDB, err := db.DB()
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			versionQuery := map[string]string{
+				"sqlite":   "SELECT sqlite_version()",
+				"mysql":    "SELECT VERSION()",
+				"postgres": "SHOW server_version",
+			}[dialect]
+			var version string
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("%s version: %s", dialect, version)
 			table := db.Table("upstream_async_channels").Session(&gorm.Session{})
 			require.NoError(t, table.AutoMigrate(&Channel{}))
 			t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable("upstream_async_channels")) })
 
 			var settings dto.ChannelOtherSettings
-			require.NoError(t, common.UnmarshalJsonStr(`{"upstream_async":{"profiles":[{"id":"vendor-video","media_type":"video","models":["mapped-video"],"operations":["generate"],"submit":{"task_id_path":"data.task_id","request":{"method":"POST","path":"/videos","query":{"source":"studio"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}","prompt":"{request.prompt}"}}},"poll":{"request":{"method":"POST","path":"/tasks/{task_id}","headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}"}},"response":{"status_path":"data.status","status_values":{"queued":["queued"],"succeeded":[true],"failed":[false]},"result_path":"data.output.url","usage_paths":{"total_tokens":"usage.total_tokens"}}}}]}}`, &settings))
+			require.NoError(t, common.UnmarshalJsonStr(`{"upstream_async":{"profiles":[{"id":"vendor-video","media_type":"video","models":["mapped-video"],"operations":["generate"],"submit":{"task_id_path":"data.task_id","request":{"method":"POST","path":"/videos","query":{"source":"studio"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}","prompt":"{request.prompt}"}}},"poll":{"request":{"method":"POST","path":"/tasks/{task_id}","headers":{"Authorization":"Bearer {api_key}"},"body":{"model":"{upstream_model}"}},"response":{"status_path":"data.status","status_values":{"queued":["queued"],"succeeded":[true],"failed":[false]},"result_path":"data.output.url","actual_seconds_path":"data.output.duration","usage_paths":{"total_tokens":"usage.total_tokens"}}}}]}}`, &settings))
 			channel := &Channel{Type: constant.ChannelTypeOpenAI, Key: "secret", Name: "dynamic", Status: common.ChannelStatusEnabled}
 			channel.SetOtherSettings(settings)
 			require.NoError(t, channel.ValidateSettings())
@@ -243,12 +251,14 @@ func TestUpstreamAsyncSettingsDatabaseRoundTrip(t *testing.T) {
 			assert.Equal(t, "studio", profile.Submit.Request.Query["source"])
 			assert.Equal(t, "{request.prompt}", profile.Submit.Request.Body.(map[string]any)["prompt"])
 			assert.Equal(t, "Bearer {api_key}", profile.Poll.Request.Headers["Authorization"])
+			assert.Equal(t, "data.output.duration", profile.Poll.Response.ActualSecondsPath)
 			profile.Submit.Request.Headers["Authorization"] = "changed"
 			profile.Poll.Request.Headers["Authorization"] = "changed"
 			fresh, matched := loaded.GetOtherSettings().UpstreamAsync.Match("video", "mapped-video", "generate")
 			require.True(t, matched)
 			assert.Equal(t, "Bearer {api_key}", fresh.Poll.Request.Headers["Authorization"])
 			assert.Equal(t, "Bearer {api_key}", fresh.Submit.Request.Headers["Authorization"])
+			assert.Equal(t, "data.output.duration", fresh.Poll.Response.ActualSecondsPath)
 		})
 	}
 }

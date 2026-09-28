@@ -18,6 +18,36 @@ const (
 // PreConsumeBilling 根据用户计费偏好创建 BillingSession 并执行预扣费。
 // 会话存储在 relayInfo.Billing 上，供后续 Settle / Refund 使用。
 func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	return preConsumeBillingWithMode(c, preConsumedQuota, relayInfo, false)
+}
+
+// PreConsumeDurableTaskBilling records an asynchronous task reservation in the
+// primary database immediately, including when ordinary quota updates are
+// batched. The prepare pass only quotes the task and must not reserve funds.
+func PreConsumeDurableTaskBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	if c.GetBool("async_media_prepare") {
+		return nil
+	}
+	return preConsumeBillingWithMode(c, preConsumedQuota, relayInfo, true)
+}
+
+// HasDurableTaskReservation reports whether a previously established billing
+// session has fully reserved the measured task's upper bound in the database.
+// This prevents a channel retry from reusing a trusted or batched reservation.
+func HasDurableTaskReservation(relayInfo *relaycommon.RelayInfo, requiredQuota int) bool {
+	if relayInfo == nil || relayInfo.Billing == nil || requiredQuota < 0 {
+		return false
+	}
+	session, ok := relayInfo.Billing.(*BillingSession)
+	if !ok {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.durable && !session.trusted && !session.settled && !session.refunded && session.preConsumedQuota >= requiredQuota
+}
+
+func preConsumeBillingWithMode(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo, durable bool) *types.NewAPIError {
 	if relayInfo != nil && relayInfo.QuotaClamp != nil {
 		return types.NewErrorWithStatusCode(
 			relayInfo.QuotaClamp,
@@ -34,7 +64,7 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
+	session, apiErr := newBillingSession(c, relayInfo, preConsumedQuota, durable)
 	if apiErr != nil {
 		return apiErr
 	}

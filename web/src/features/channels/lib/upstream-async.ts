@@ -250,6 +250,7 @@ const profileSchema = z
             progress_path: optionalPathSchema.optional(),
             failure_reason_path: optionalPathSchema.optional(),
             result_path: pathSchema,
+            actual_seconds_path: optionalPathSchema.optional(),
             usage_paths: stringRecordSchema.optional(),
             download_headers: stringRecordSchema.optional(),
           })
@@ -321,6 +322,16 @@ const profileSchema = z
         code: 'custom',
         path: ['operations'],
         message: 'Image profiles cannot use extend',
+      })
+    }
+    if (
+      profile.media_type === 'image' &&
+      profile.poll.response.actual_seconds_path
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['poll', 'response', 'actual_seconds_path'],
+        message: 'Image profiles cannot use actual video seconds',
       })
     }
     if (
@@ -485,6 +496,7 @@ export const upstreamAsyncProfileFormSchema = z.object({
   progress_path: z.string(),
   failure_reason_path: z.string(),
   result_path: z.string().trim().min(1, 'Result URL path is required'),
+  actual_seconds_path: optionalPathSchema,
   usage_paths_json: jsonTextSchema({}, 'object'),
   download_headers_json: jsonTextSchema({}, 'object'),
 })
@@ -555,6 +567,7 @@ export function createUpstreamAsyncProfileForm(): UpstreamAsyncProfileForm {
     progress_path: 'data.progress',
     failure_reason_path: 'data.error.message',
     result_path: 'data.output.url',
+    actual_seconds_path: '',
     usage_paths_json: '{}',
     download_headers_json: '{}',
   }
@@ -617,6 +630,7 @@ export function upstreamAsyncConfigToForm(
       progress_path: profile.poll.response.progress_path || '',
       failure_reason_path: profile.poll.response.failure_reason_path || '',
       result_path: profile.poll.response.result_path,
+      actual_seconds_path: profile.poll.response.actual_seconds_path || '',
       usage_paths_json: JSON.stringify(
         profile.poll.response.usage_paths || {},
         null,
@@ -689,6 +703,9 @@ export function upstreamAsyncFormToConfig(
       status_path: profile.status_path.trim(),
       status_values: statusValues,
       result_path: profile.result_path.trim(),
+    }
+    if (profile.media_type === 'video' && profile.actual_seconds_path.trim()) {
+      response.actual_seconds_path = profile.actual_seconds_path.trim()
     }
     if (profile.progress_path.trim()) {
       response.progress_path = profile.progress_path.trim()
@@ -792,7 +809,7 @@ export const UPSTREAM_ASYNC_VIDEO_EXAMPLE: UpstreamAsyncConfig = {
           progress_path: 'data.progress',
           failure_reason_path: 'data.error.message',
           result_path: 'data.output.url',
-          usage_paths: { total_tokens: 'usage.total_tokens' },
+          actual_seconds_path: 'data.output.duration',
         },
       },
     },

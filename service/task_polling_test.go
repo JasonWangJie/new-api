@@ -22,6 +22,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type taskPollingFetchAdaptor struct {
@@ -766,6 +767,16 @@ func (a *scriptedPollingAdaptor) AdjustBillingOnComplete(*model.Task, *relaycomm
 	return 0
 }
 
+type scriptedCompletionUsageAdaptor struct {
+	scriptedPollingAdaptor
+	usageFacts map[string]any
+}
+
+func (a *scriptedCompletionUsageAdaptor) ApplyCompletionUsage(_ *model.Task, _ *http.Response, _ []byte, result *relaycommon.TaskInfo) error {
+	result.UsageFacts = a.usageFacts
+	return nil
+}
+
 type scriptedBatchPollingAdaptor struct {
 	scriptedPollingAdaptor
 	results map[string]*BatchTaskResult
@@ -1163,6 +1174,50 @@ func TestUpstreamAsyncPollParsingStatusResultsAndUsage(t *testing.T) {
 	require.ErrorIs(t, err, ErrUpstreamAsyncBillingUsage)
 }
 
+func TestUpstreamAsyncPollActualVideoSeconds(t *testing.T) {
+	profile := upstreamAsyncTestProfile(t, "video")
+	completed := `{"job":{"status":"done","output":"https://cdn.example/video.mp4","duration":3.25}}`
+
+	result, err := ParseUpstreamAsyncPollResponse(profile, []byte(completed))
+	require.NoError(t, err)
+	assert.Nil(t, result.ActualSeconds, "existing profiles must keep their original billing behavior")
+
+	profile.Poll.Response.ActualSecondsPath = "job.duration"
+	result, err = ParseUpstreamAsyncPollResponse(profile, []byte(completed))
+	require.NoError(t, err)
+	require.NotNil(t, result.ActualSeconds)
+	assert.Equal(t, 3.25, *result.ActualSeconds)
+
+	result, err = ParseUpstreamAsyncPollResponse(profile, []byte(`{"job":{"status":"running","duration":"bad"}}`))
+	require.NoError(t, err)
+	assert.Nil(t, result.ActualSeconds)
+
+	for _, testCase := range []struct {
+		name     string
+		duration string
+	}{
+		{name: "missing"},
+		{name: "null", duration: `,"duration":null`},
+		{name: "string", duration: `,"duration":"3.25"`},
+		{name: "boolean", duration: `,"duration":true`},
+		{name: "zero", duration: `,"duration":0`},
+		{name: "negative", duration: `,"duration":-1`},
+		{name: "fraction above maximum", duration: `,"duration":3600.0000000000000001`},
+		{name: "above maximum", duration: `,"duration":3601`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := `{"job":{"status":"done","output":"https://cdn.example/video.mp4"` + testCase.duration + `}}`
+			_, err := ParseUpstreamAsyncPollResponse(profile, []byte(body))
+			require.ErrorIs(t, err, ErrUpstreamAsyncBillingUsage)
+		})
+	}
+
+	result, err = ParseUpstreamAsyncPollResponse(profile, []byte(`{"job":{"status":"done","output":"https://cdn.example/video.mp4","duration":3600}}`))
+	require.NoError(t, err)
+	require.NotNil(t, result.ActualSeconds)
+	assert.Equal(t, float64(3600), *result.ActualSeconds)
+}
+
 func TestUpstreamAsyncDownloadHeadersRequireSameOrigin(t *testing.T) {
 	profile := upstreamAsyncTestProfile(t, "video")
 	headers, credentialless, err := BuildUpstreamAsyncDownloadHeaders(profile, "https://vendor.example/output.mp4", "https://vendor.example/api", UpstreamAsyncTemplateContext{APIKey: "secret"})
@@ -1268,6 +1323,195 @@ func TestDynamicUpstreamAsyncVideoPollingUsesFrozenProfile(t *testing.T) {
 	assert.JSONEq(t, `{"job":{"status":"done","output":"https://cdn.example/result.mp4"},"usage":{"input":2,"output":3,"total":5}}`, string(persisted.PrivateData.UpstreamAsyncResponse))
 	require.NotNil(t, persisted.PrivateData.UpstreamAsync)
 	assert.Equal(t, "dynamic", persisted.PrivateData.UpstreamAsync.ID)
+}
+
+func TestDynamicUpstreamAsyncVideoUsageSettlement(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		durationField  string
+		retry          bool
+		failSettlement bool
+		costExceeds    bool
+		upstreamFailed bool
+		missingChannel bool
+		pluginSeconds  bool
+		timedOut       bool
+		wantStatus     model.TaskStatus
+		wantQuota      int
+		wantReason     string
+		wantURL        string
+	}{
+		{name: "plugin seconds settle without configured duration override", durationField: `,"duration":4`, pluginSeconds: true, wantStatus: model.TaskStatusSuccess, wantQuota: 3_250, wantURL: "https://cdn.example/result.mp4"},
+		{name: "upstream seconds override plugin and refund difference", durationField: `,"duration":3.25`, wantStatus: model.TaskStatusSuccess, wantQuota: 3_250, wantURL: "https://cdn.example/result.mp4"},
+		{name: "failed settlement transaction can retry", durationField: `,"duration":3.25`, failSettlement: true, wantStatus: model.TaskStatusSuccess, wantQuota: 3_250, wantURL: "https://cdn.example/result.mp4"},
+		{name: "duration above reserved limit fails and refunds", durationField: `,"duration":6`, wantStatus: model.TaskStatusFailure, wantQuota: 0, wantReason: "exceeded reserved billing limit"},
+		{name: "completion cost above reservation fails and refunds", durationField: `,"duration":3.25`, costExceeds: true, wantStatus: model.TaskStatusFailure, wantQuota: 0, wantReason: "cost exceeded reserved billing limit"},
+		{name: "upstream failure refunds", upstreamFailed: true, wantStatus: model.TaskStatusFailure, wantQuota: 0, wantReason: "vendor failed"},
+		{name: "deleted channel refunds", missingChannel: true, wantStatus: model.TaskStatusFailure, wantQuota: 0, wantReason: "Failed to get channel info"},
+		{name: "timed out measured task refunds once", timedOut: true, wantStatus: model.TaskStatusFailure, wantQuota: 0, wantReason: "任务超时"},
+		{name: "missing duration consumes retry budget", retry: true, wantStatus: model.TaskStatusFailure, wantReason: "actual_seconds_path"},
+		{name: "string duration consumes retry budget", durationField: `,"duration":"3.25"`, retry: true, wantStatus: model.TaskStatusFailure, wantReason: "actual_seconds_path"},
+		{name: "duration above host maximum consumes retry budget", durationField: `,"duration":3601`, retry: true, wantStatus: model.TaskStatusFailure, wantReason: "actual_seconds_path"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			truncate(t)
+			previousFailures := constant.TaskPollMaxFailures
+			constant.TaskPollMaxFailures = 2
+			t.Cleanup(func() { constant.TaskPollMaxFailures = previousFailures })
+			previousTimeout := constant.TaskTimeoutMinutes
+			constant.TaskTimeoutMinutes = 60
+			t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+			const userID, tokenID, channelID = 711, 711, 711
+			const userQuota, tokenQuota, reservedQuota = 10_000, 8_000, 5_000
+			seedUser(t, userID, userQuota)
+			seedToken(t, tokenID, userID, "sk-measured-video", tokenQuota)
+			profile := upstreamAsyncTestProfile(t, "video")
+			if !testCase.pluginSeconds {
+				profile.Poll.Response.ActualSecondsPath = "job.duration"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				status := "done"
+				if testCase.upstreamFailed {
+					status = "failed"
+				}
+				_, err := io.WriteString(writer, `{"job":{"status":"`+status+`","output":"https://cdn.example/result.mp4","error":{"message":"vendor failed"}`+testCase.durationField+`}}`)
+				assert.NoError(t, err)
+			}))
+			defer server.Close()
+
+			channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Name: "measured-video", Key: "key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+			require.NoError(t, model.DB.Create(channel).Error)
+			seedChargedAccounting(t, userID, channelID, tokenID, reservedQuota, 1)
+
+			expression := `tier("seconds", u("seconds"))`
+			estimatedFacts := map[string]any{"seconds": float64(5)}
+			completionFacts := map[string]any{"seconds": float64(99)}
+			if testCase.pluginSeconds {
+				completionFacts["seconds"] = 3.25
+			}
+			if testCase.costExceeds {
+				expression = `tier("seconds", u("seconds") + u("extra"))`
+				estimatedFacts["extra"] = float64(0)
+				completionFacts["extra"] = float64(5)
+			}
+			task := makeTask(userID, channelID, reservedQuota, tokenID, BillingSourceWallet, 0)
+			task.TaskID = "task_measured_video"
+			task.Platform = constant.TaskPlatform("kling")
+			task.SubmitTime = time.Now().Unix()
+			if testCase.timedOut {
+				task.SubmitTime -= int64(constant.TaskTimeoutMinutes)*60 + 1
+			}
+			task.PrivateData.UpstreamTaskID = "upstream-measured"
+			task.PrivateData.UpstreamAsync = profile
+			task.PrivateData.SubmitAccountingRecorded = true
+			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+				ExprString:       expression,
+				ExprHash:         billingexpr.ExprHashString(expression),
+				GroupRatio:       1,
+				QuotaPerUnit:     1_000,
+				ExprVersion:      1,
+				TaskUsageBilling: true,
+				UsageFacts:       estimatedFacts,
+				EstimatedTier:    "seconds",
+			}
+			require.NoError(t, model.DB.Create(task).Error)
+			if testCase.missingChannel {
+				require.NoError(t, model.DB.Delete(channel).Error)
+			}
+			var staleTask model.Task
+			require.NoError(t, model.DB.First(&staleTask, task.ID).Error)
+
+			adaptor := &scriptedCompletionUsageAdaptor{usageFacts: completionFacts}
+			const callbackName = "test:fail_measured_video_token_refund"
+			callbackRegistered := false
+			failureInjected := false
+			if testCase.failSettlement {
+				require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" && !failureInjected {
+						failureInjected = true
+						tx.AddError(fmt.Errorf("forced measured video token refund failure"))
+					}
+				}))
+				callbackRegistered = true
+				t.Cleanup(func() {
+					if callbackRegistered {
+						_ = model.DB.Callback().Update().Remove(callbackName)
+					}
+				})
+			}
+			poll := func(current *model.Task) error {
+				if testCase.timedOut {
+					sweepTimedOutTasks(t.Context())
+					return nil
+				}
+				if testCase.missingChannel {
+					_ = updateVideoTasks(t.Context(), current.Platform, channelID, []string{current.GetUpstreamTaskID()}, map[string]*model.Task{current.GetUpstreamTaskID(): current})
+					return nil
+				}
+				return updateVideoSingleTask(t.Context(), adaptor, channel, current.GetUpstreamTaskID(), map[string]*model.Task{current.GetUpstreamTaskID(): current})
+			}
+			firstErr := poll(task)
+			if testCase.failSettlement {
+				require.ErrorContains(t, firstErr, "forced measured video token refund failure")
+				require.True(t, failureInjected)
+				require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+				callbackRegistered = false
+				var pending model.Task
+				require.NoError(t, model.DB.First(&pending, task.ID).Error)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), pending.Status)
+				assert.Equal(t, reservedQuota, pending.Quota)
+				assert.Equal(t, userQuota, getUserQuota(t, userID))
+				assert.Equal(t, tokenQuota, getTokenRemainQuota(t, tokenID))
+				assert.Zero(t, countLogs(t))
+				require.NoError(t, poll(&pending))
+			} else {
+				require.NoError(t, firstErr)
+			}
+			if testCase.retry {
+				var pending model.Task
+				require.NoError(t, model.DB.First(&pending, task.ID).Error)
+				assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), pending.Status)
+				assert.Equal(t, 1, pending.PrivateData.PollFailures)
+				assert.Equal(t, reservedQuota, pending.Quota)
+				assert.Equal(t, userQuota, getUserQuota(t, userID))
+				assert.Zero(t, countLogs(t))
+				require.NoError(t, poll(&pending))
+			}
+
+			var persisted model.Task
+			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+			assert.Equal(t, testCase.wantStatus, persisted.Status)
+			assert.Equal(t, testCase.wantQuota, persisted.Quota)
+			assert.Equal(t, testCase.wantURL, persisted.PrivateData.ResultURL)
+			if testCase.wantReason != "" {
+				assert.Contains(t, persisted.FailReason, testCase.wantReason)
+			}
+			if testCase.retry {
+				assert.Equal(t, 2, persisted.PrivateData.PollFailures)
+			}
+			assert.Equal(t, userQuota+reservedQuota-testCase.wantQuota, getUserQuota(t, userID))
+			assert.Equal(t, tokenQuota+reservedQuota-testCase.wantQuota, getTokenRemainQuota(t, tokenID))
+			usedQuota, _ := getUserUsageAccounting(t, userID)
+			assert.Equal(t, testCase.wantQuota, usedQuota)
+			assert.Equal(t, int64(1), countLogs(t))
+			log := getLastLog(t)
+			require.NotNil(t, log)
+			assert.Equal(t, model.LogTypeRefund, log.Type)
+			assert.Equal(t, reservedQuota-testCase.wantQuota, log.Quota)
+			if testCase.wantStatus == model.TaskStatusSuccess {
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+				facts, ok := other["usage_facts"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, 3.25, facts["seconds"])
+			}
+
+			// A stale terminal poll cannot settle the same reservation twice.
+			require.NoError(t, poll(&staleTask))
+			assert.Equal(t, userQuota+reservedQuota-testCase.wantQuota, getUserQuota(t, userID))
+			assert.Equal(t, int64(1), countLogs(t))
+		})
+	}
 }
 
 func TestDynamicUpstreamAsyncUnknownStatusDoesNotExposeResponseBody(t *testing.T) {

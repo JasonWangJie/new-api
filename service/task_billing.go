@@ -19,9 +19,22 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
-// 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
-func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) {
+// LogTaskConsumption 记录任务消费日志和统计信息；按实际秒数结算的异步视频
+// 先在主库幂等持久化提交用量，再写日志。实际扣费由 BillingSession 完成。
+func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) error {
+	measuredVideo := task != nil && task.PrivateData.UpstreamAsync != nil &&
+		task.PrivateData.UpstreamAsync.Poll.Response.ActualSecondsPath != ""
+	if measuredVideo {
+		if task.UserId != info.UserId || task.ChannelId != info.ChannelId || task.Quota != info.PriceData.Quota {
+			return fmt.Errorf("measured task accounting differs from submitted billing")
+		}
+		_, err := model.RecordMeasuredTaskSubmitAccounting(c.Request.Context(), task)
+		if err != nil {
+			return err
+		}
+		// A poller may have recorded usage first; controller still owns the submit log.
+		task.PrivateData.SubmitAccountingRecorded = true
+	}
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费
@@ -80,8 +93,11 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Group:     info.UsingGroup,
 		Other:     other,
 	})
-	model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
-	model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
+	if !measuredVideo {
+		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
+		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +224,85 @@ func taskModelName(task *model.Task) string {
 		return bc.OriginModelName
 	}
 	return task.Properties.OriginModelName
+}
+
+// SettleMeasuredVideoTask commits the terminal task and its measured refund in
+// one primary-database transaction. A losing poller does not adjust balances or
+// emit another billing log. The caller must have validated the upstream duration
+// against the reserved limit before passing the actual charge.
+func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, actualQuota int, usageFacts map[string]any, clamp *common.QuotaClamp) (bool, error) {
+	if task == nil {
+		return false, fmt.Errorf("measured task is missing")
+	}
+	if task.Status == model.TaskStatusSuccess {
+		billingContext := task.PrivateData.BillingContext
+		if billingContext == nil || billingContext.TieredSnapshot == nil {
+			return false, fmt.Errorf("measured task billing snapshot is missing")
+		}
+		result, _, err := EvaluateTaskCompletionUsage(billingContext.TieredSnapshot, usageFacts)
+		if err != nil {
+			return false, err
+		}
+		if result.Clamp != nil || result.ActualQuotaAfterGroup != actualQuota {
+			return false, fmt.Errorf("measured task charge does not match completion usage")
+		}
+		if actualQuota > task.Quota {
+			return false, fmt.Errorf("measured task charge exceeds reserved quota")
+		}
+		reservedQuota := task.Quota
+		won, _, err := model.SettleMeasuredVideoTask(ctx, task, fromStatus, actualQuota, usageFacts, result.MatchedTier)
+		if err != nil || !won {
+			return won, err
+		}
+		if refund := reservedQuota - actualQuota; refund > 0 {
+			other := taskBillingOther(task)
+			other.SetPublic("pre_consumed_quota", reservedQuota)
+			other.SetPublic("actual_quota", actualQuota)
+			attachQuotaSaturationToOther(other, clamp)
+			model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+				UserId:    task.UserId,
+				LogType:   model.LogTypeRefund,
+				Content:   "任务用量表达式结算",
+				ChannelId: task.ChannelId,
+				ModelName: taskModelName(task),
+				Quota:     refund,
+				TokenId:   task.PrivateData.TokenId,
+				Group:     task.Group,
+				Other:     other,
+				NodeName:  task.PrivateData.NodeName,
+			})
+		}
+		return true, nil
+	}
+
+	if task.Status != model.TaskStatusFailure || actualQuota != 0 {
+		return false, fmt.Errorf("failed measured task must settle with zero charge")
+	}
+	reservedQuota := task.Quota
+	won, _, err := model.SettleMeasuredVideoTask(ctx, task, fromStatus, 0, usageFacts, "")
+	if err != nil || !won {
+		return won, err
+	}
+	if reservedQuota > 0 {
+		other := taskBillingOther(task)
+		other.SetPublic("reason", task.FailReason)
+		other.SetPublic("pre_consumed_quota", reservedQuota)
+		other.SetPublic("actual_quota", 0)
+		attachQuotaSaturationToOther(other, clamp)
+		model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+			UserId:    task.UserId,
+			LogType:   model.LogTypeRefund,
+			Content:   task.FailReason,
+			ChannelId: task.ChannelId,
+			ModelName: taskModelName(task),
+			Quota:     reservedQuota,
+			TokenId:   task.PrivateData.TokenId,
+			Group:     task.Group,
+			Other:     other,
+			NodeName:  task.PrivateData.NodeName,
+		})
+	}
+	return true, nil
 }
 
 // RefundTaskQuota 统一的任务失败退款逻辑。

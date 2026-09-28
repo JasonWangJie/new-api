@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -737,12 +738,12 @@ func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
 
 func TestUpstreamAsyncConfigValidationMatchingAndCloneIsolation(t *testing.T) {
 	var settings ChannelOtherSettings
-	require.NoError(t, json.Unmarshal([]byte(`{
+	require.NoError(t, kitutil.Unmarshal([]byte(`{
 		"upstream_async":{"profiles":[{
 			"id":"vendor-video","media_type":"video","models":["mapped-video"],"operations":["generate","edit"],
 			"submit":{"task_id_path":"data.task_id"},
 			"poll":{"request":{"method":"POST","path":"/v1/tasks/{task_id}","query":{"model":"{upstream_model}"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"id":"{task_id}"}},
-			"response":{"status_path":"data.status","status_values":{"queued":["pending",1],"in_progress":["running"],"succeeded":["succeeded",true],"failed":["failed",false]},"progress_path":"data.progress","failure_reason_path":"data.error.message","result_path":"data.output.url","usage_paths":{"total_tokens":"usage.total_tokens"},"download_headers":{"Authorization":"Bearer {api_key}"}}}
+			"response":{"status_path":"data.status","status_values":{"queued":["pending",1],"in_progress":["running"],"succeeded":["succeeded",true],"failed":["failed",false]},"progress_path":"data.progress","failure_reason_path":"data.error.message","result_path":"data.output.url","actual_seconds_path":"data.output.seconds","usage_paths":{"total_tokens":"usage.total_tokens"},"download_headers":{"Authorization":"Bearer {api_key}"}}}
 		}]}}
 	`), &settings))
 	require.NotNil(t, settings.UpstreamAsync)
@@ -753,8 +754,10 @@ func TestUpstreamAsyncConfigValidationMatchingAndCloneIsolation(t *testing.T) {
 	assert.Equal(t, "vendor-video", profile.ID)
 	profile.Models[0] = "changed"
 	profile.Poll.Request.Headers["Authorization"] = "changed"
+	profile.Poll.Response.ActualSecondsPath = "changed"
 	assert.Equal(t, "mapped-video", settings.UpstreamAsync.Profiles[0].Models[0])
 	assert.Equal(t, "Bearer {api_key}", settings.UpstreamAsync.Profiles[0].Poll.Request.Headers["Authorization"])
+	assert.Equal(t, "data.output.seconds", settings.UpstreamAsync.Profiles[0].Poll.Response.ActualSecondsPath)
 	assert.True(t, settings.UpstreamAsync.HasMatch("video", "mapped-video", "edit"))
 	assert.False(t, settings.UpstreamAsync.HasMatch("video", "other", "generate"))
 
@@ -793,6 +796,11 @@ func TestUpstreamAsyncConfigRejectsInvalidRules(t *testing.T) {
 	}{
 		{name: "image extend", mutate: func(profile *UpstreamAsyncProfile) { profile.Operations = []string{"extend"} }, want: "does not allow extend"},
 		{name: "unsafe path", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Response.StatusPath = "data.status|@pretty" }, want: "restricted GJSON"},
+		{name: "video duration on image", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Response.ActualSecondsPath = "data.seconds" }, want: "only supported for video"},
+		{name: "empty video duration path", mutate: func(profile *UpstreamAsyncProfile) {
+			profile.MediaType = "video"
+			profile.Poll.Response.ActualSecondsPath = "  "
+		}, want: "restricted GJSON"},
 		{name: "unknown placeholder", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Path = "/tasks/{secret}" }, want: "unsupported placeholder"},
 		{name: "GET body", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Body = map[string]any{"id": "{task_id}"} }, want: "not allowed for GET"},
 		{name: "surrounding path whitespace", mutate: func(profile *UpstreamAsyncProfile) { profile.Poll.Request.Path = " /tasks/{task_id}" }, want: "surrounding whitespace"},
@@ -832,11 +840,21 @@ func TestUpstreamAsyncConfigRejectsInvalidRules(t *testing.T) {
 func TestUpstreamAsyncConfigStrictDecode(t *testing.T) {
 	base := `{"profiles":[{"id":"p","media_type":"video","models":[],"operations":["generate"],"submit":{"task_id_path":"id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}]}`
 	var config UpstreamAsyncConfig
-	require.NoError(t, json.Unmarshal([]byte(base), &config))
+	require.NoError(t, kitutil.Unmarshal([]byte(base), &config))
 	require.NoError(t, config.Validate())
+	assert.Empty(t, config.Profiles[0].Poll.Response.ActualSecondsPath)
+
+	withSeconds := strings.Replace(base, `"result_path":"url"`, `"result_path":"url","actual_seconds_path":"data.duration"`, 1)
+	require.NoError(t, kitutil.Unmarshal([]byte(withSeconds), &config))
+	require.NoError(t, config.Validate())
+	assert.Equal(t, "data.duration", config.Profiles[0].Poll.Response.ActualSecondsPath)
+
+	unsafeSeconds := strings.Replace(base, `"result_path":"url"`, `"result_path":"url","actual_seconds_path":"data.duration|@pretty"`, 1)
+	require.NoError(t, kitutil.Unmarshal([]byte(unsafeSeconds), &config))
+	require.ErrorContains(t, config.Validate(), "restricted GJSON")
 
 	invalid := strings.Replace(base, `"result_path":"url"`, `"result_path":"url","unexpected":true`, 1)
-	err := json.Unmarshal([]byte(invalid), &config)
+	err := kitutil.Unmarshal([]byte(invalid), &config)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown field")
 }

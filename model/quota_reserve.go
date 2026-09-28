@@ -105,8 +105,8 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 
 // persistUserQuotaDelta 把已在缓存侧预扣成功的增量落库；批量模式下入队，
 // 直写模式下要求行存在（用户已删除时报错，交由调用方补偿缓存）。
-func persistUserQuotaDelta(id int, delta int) error {
-	if common.BatchUpdateEnabled {
+func persistUserQuotaDeltaWithMode(id int, delta int, durable bool) error {
+	if common.BatchUpdateEnabled && !durable {
 		addNewRecord(BatchUpdateTypeUserQuota, id, delta)
 		return nil
 	}
@@ -120,8 +120,8 @@ func persistUserQuotaDelta(id int, delta int) error {
 	return nil
 }
 
-func persistTokenQuotaDelta(id int, delta int) error {
-	if common.BatchUpdateEnabled {
+func persistTokenQuotaDeltaWithMode(id int, delta int, durable bool) error {
+	if common.BatchUpdateEnabled && !durable {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, delta)
 		return nil
 	}
@@ -163,6 +163,17 @@ func reserveTokenQuotaDB(id int, quota int) (bool, error) {
 // 缓存命中时以缓存余额为准（避免批量模式下过期的数据库余额放大并发超扣）；
 // Redis 异常或水合失败时降级为数据库条件更新，保证服务可用。
 func TryReserveUserQuota(id int, quota int) (bool, error) {
+	return tryReserveUserQuota(id, quota, false)
+}
+
+// TryReserveUserQuotaDurable persists a task reservation immediately even when
+// ordinary quota updates are batched. Async tasks can outlive the current
+// process, so their reservation must survive a restart before dispatch.
+func TryReserveUserQuotaDurable(id int, quota int) (bool, error) {
+	return tryReserveUserQuota(id, quota, true)
+}
+
+func tryReserveUserQuota(id int, quota int, durable bool) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota 不能为负数！")
 	}
@@ -175,20 +186,32 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 
 	result, err := cacheTryReserveUserQuota(id, int64(quota))
 	if err == nil && result == cacheQuotaMiss {
+		// A cold cache cannot prove the database includes batches currently
+		// flushing or owned by another node. Do not hydrate a spendable balance.
+		if durable && common.BatchUpdateEnabled {
+			return false, errors.New("durable task user quota cache is cold during batch updates")
+		}
 		if _, hydrateErr := GetUserCache(id); hydrateErr == nil {
 			result, err = cacheTryReserveUserQuota(id, int64(quota))
 		}
 	}
 	if err != nil || result == cacheQuotaMiss {
+		if durable && common.BatchUpdateEnabled {
+			return false, errors.New("durable task user quota cache is unavailable during batch updates")
+		}
 		if err != nil {
 			common.SysLog("user quota cache reserve unavailable, falling back to database: " + err.Error())
 		}
-		return reserveUserQuotaDB(id, quota)
+		reserved, reserveErr := reserveUserQuotaDB(id, quota)
+		if reserved && durable {
+			syncDurableUserQuotaCache(id, -quota)
+		}
+		return reserved, reserveErr
 	}
 	if result == cacheQuotaInsufficient {
 		return false, nil
 	}
-	if err = persistUserQuotaDelta(id, -quota); err != nil {
+	if err = persistUserQuotaDeltaWithMode(id, -quota, durable); err != nil {
 		compensated, compensateErr := cacheApplyUserQuotaDelta(id, int64(quota))
 		if compensateErr != nil || compensated != cacheQuotaOK {
 			common.SysError(fmt.Sprintf("failed to compensate reserved user quota: result=%d error=%v", compensated, compensateErr))
@@ -201,6 +224,16 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 // TryReserveTokenQuota atomically checks and deducts a token quota. Unlimited
 // tokens skip the balance check but still update remain/used accounting.
 func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, error) {
+	return tryReserveTokenQuota(id, key, quota, unlimited, false)
+}
+
+// TryReserveTokenQuotaDurable is the token counterpart of the durable wallet
+// reservation used by asynchronous task submission.
+func TryReserveTokenQuotaDurable(id int, key string, quota int, unlimited bool) (bool, error) {
+	return tryReserveTokenQuota(id, key, quota, unlimited, true)
+}
+
+func tryReserveTokenQuota(id int, key string, quota int, unlimited, durable bool) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota 不能为负数！")
 	}
@@ -208,6 +241,9 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return true, nil
 	}
 	if unlimited {
+		if durable {
+			return true, AdjustTokenQuotaDurable(id, key, -quota)
+		}
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
 	if !common.RedisEnabled {
@@ -216,20 +252,30 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 
 	result, err := cacheTryReserveTokenQuota(id, key, int64(quota))
 	if err == nil && result == cacheQuotaMiss {
+		if durable && common.BatchUpdateEnabled {
+			return false, errors.New("durable task token quota cache is cold during batch updates")
+		}
 		if _, hydrateErr := GetTokenByKey(key, true); hydrateErr == nil {
 			result, err = cacheTryReserveTokenQuota(id, key, int64(quota))
 		}
 	}
 	if err != nil || result == cacheQuotaMiss {
+		if durable && common.BatchUpdateEnabled {
+			return false, errors.New("durable task token quota cache is unavailable during batch updates")
+		}
 		if err != nil {
 			common.SysLog("token quota cache reserve unavailable, falling back to database: " + err.Error())
 		}
-		return reserveTokenQuotaDB(id, quota)
+		reserved, reserveErr := reserveTokenQuotaDB(id, quota)
+		if reserved && durable {
+			syncDurableTokenQuotaCache(id, key, -quota)
+		}
+		return reserved, reserveErr
 	}
 	if result == cacheQuotaInsufficient {
 		return false, nil
 	}
-	if err = persistTokenQuotaDelta(id, -quota); err != nil {
+	if err = persistTokenQuotaDeltaWithMode(id, -quota, durable); err != nil {
 		compensated, compensateErr := cacheApplyTokenQuotaDelta(id, key, int64(quota))
 		if compensateErr != nil || compensated != cacheQuotaOK {
 			common.SysError(fmt.Sprintf("failed to compensate reserved token quota: result=%d error=%v", compensated, compensateErr))
@@ -237,4 +283,81 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return false, err
 	}
 	return true, nil
+}
+
+// AdjustTokenQuotaDurable applies a signed token balance change directly to the
+// database. Positive delta refunds quota; negative delta consumes it. It is
+// used when rolling back or settling a durable asynchronous reservation.
+func AdjustTokenQuotaDurable(id int, key string, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	var err error
+	if delta > 0 {
+		err = increaseTokenQuota(id, delta)
+	} else {
+		err = decreaseTokenQuota(id, -delta)
+	}
+	if err != nil {
+		return err
+	}
+	syncDurableTokenQuotaCache(id, key, delta)
+	return nil
+}
+
+// AdjustUserQuotaDurable applies a signed wallet change directly to the
+// database and syncs the live cache after commit. Async task rollbacks must
+// not remain only in a process-local batch queue.
+func AdjustUserQuotaDurable(id int, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	var err error
+	if delta > 0 {
+		err = increaseUserQuota(id, delta)
+	} else {
+		err = decreaseUserQuota(id, -delta)
+	}
+	if err != nil {
+		return err
+	}
+	syncDurableUserQuotaCache(id, delta)
+	return nil
+}
+
+// Applying the committed delta to a live cache preserves other quota changes
+// that still reside in the ordinary batch queue. Deleting that cache would
+// rehydrate from a database that may not yet include those changes.
+func syncDurableUserQuotaCache(id, delta int) {
+	if !common.RedisEnabled || delta == 0 {
+		return
+	}
+	result, err := cacheApplyUserQuotaDelta(id, int64(delta))
+	if err != nil {
+		common.SysError("durable task user quota cache sync failed: " + err.Error())
+		if invalidateErr := invalidateUserCache(id); invalidateErr != nil {
+			common.SysError("durable task user quota cache invalidation failed: " + invalidateErr.Error())
+		}
+		return
+	}
+	if result == cacheQuotaMiss && common.BatchUpdateEnabled {
+		common.SysError("durable task user quota cache missing while batch updates may be pending")
+	}
+}
+
+func syncDurableTokenQuotaCache(id int, key string, delta int) {
+	if !common.RedisEnabled || key == "" || delta == 0 {
+		return
+	}
+	result, err := cacheApplyTokenQuotaDelta(id, key, int64(delta))
+	if err != nil {
+		common.SysError("durable task token quota cache sync failed: " + err.Error())
+		if invalidateErr := invalidateTokenCacheForMutation(key); invalidateErr != nil {
+			common.SysError("durable task token quota cache invalidation failed: " + invalidateErr.Error())
+		}
+		return
+	}
+	if result == cacheQuotaMiss && common.BatchUpdateEnabled {
+		common.SysError("durable task token quota cache missing while batch updates may be pending")
+	}
 }

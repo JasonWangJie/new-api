@@ -1324,6 +1324,37 @@ test('edits and saves the image channel reference capacity from routing settings
   expect(JSON.parse(payload.setting).image_max_reference_images).toBe(12)
 })
 
+test('saves an actual video seconds path in channel settings', async () => {
+  editingChannel = {
+    ...editingChannel,
+    settings: JSON.stringify({ custom_vendor_setting: true }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  await user.click(
+    screen.getByRole('button', { name: 'Configure upstream async' })
+  )
+  await user.type(
+    screen.getByLabelText('Actual video seconds path'),
+    'data.output.duration'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as { settings: string }
+  const settings = JSON.parse(payload.settings)
+  expect(settings.custom_vendor_setting).toBe(true)
+  expect(
+    settings.upstream_async.profiles[0].poll.response.actual_seconds_path
+  ).toBe('data.output.duration')
+})
+
 test('edits a channel upstream async profile and preserves unrelated settings', async () => {
   editingChannel = {
     ...editingChannel,
@@ -1379,8 +1410,14 @@ test('edits a channel upstream async profile and preserves unrelated settings', 
   ).toBeVisible()
   expect(screen.getByLabelText('Task ID path')).toHaveValue('job.id')
   expect(screen.getByRole('checkbox', { name: 'Extend' })).toBeChecked()
+  const actualSecondsPath = screen.getByLabelText('Actual video seconds path')
+  expect(actualSecondsPath).toHaveValue('')
+  await user.type(actualSecondsPath, 'job.output.duration')
   await user.click(screen.getByRole('combobox', { name: 'Media type' }))
   await user.click(screen.getByRole('option', { name: 'Image' }))
+  expect(
+    screen.queryByLabelText('Actual video seconds path')
+  ).not.toBeInTheDocument()
   expect(screen.getByRole('checkbox', { name: 'Extend' })).toHaveAttribute(
     'aria-disabled',
     'true'
@@ -1438,6 +1475,9 @@ test('edits a channel upstream async profile and preserves unrelated settings', 
   const settings = JSON.parse(payload.settings)
   expect(settings.custom_vendor_setting).toBe(true)
   expect(settings.upstream_async.profiles[0].media_type).toBe('image')
+  expect(
+    settings.upstream_async.profiles[0].poll.response.actual_seconds_path
+  ).toBeUndefined()
   expect(settings.upstream_async.profiles[0].operations).toEqual(['generate'])
   expect(settings.upstream_async.profiles[0].submit.task_id_path).toBe(
     'data.request_id'

@@ -383,6 +383,11 @@ export function UpstreamAsyncEditorDialog(
                             onValueChange={(value) => {
                               field.onChange(value)
                               if (value !== 'image') return
+                              form.setValue(
+                                `profiles.${index}.actual_seconds_path`,
+                                '',
+                                { shouldDirty: true, shouldValidate: true }
+                              )
                               const operationPath =
                                 `profiles.${index}.operations` as const
                               const operations = form.getValues(operationPath)
@@ -685,6 +690,19 @@ export function UpstreamAsyncEditorDialog(
                         placeholder='data.output.url'
                         error={errors?.result_path?.message}
                       />
+                      {mediaType === 'video' && (
+                        <PathField
+                          form={form}
+                          index={index}
+                          name='actual_seconds_path'
+                          label={t('Actual video seconds path')}
+                          description={t(
+                            'Read the generated video duration in seconds from a successful poll. Set the per-second price in Model Pricing.'
+                          )}
+                          placeholder='data.output.duration'
+                          error={errors?.actual_seconds_path?.message}
+                        />
+                      )}
                       <PathField
                         form={form}
                         index={index}
@@ -846,6 +864,7 @@ function JSONTextField(props: {
 type PathFieldName =
   | 'status_path'
   | 'result_path'
+  | 'actual_seconds_path'
   | 'progress_path'
   | 'failure_reason_path'
 
@@ -854,12 +873,18 @@ function PathField(props: {
   index: number
   name: PathFieldName
   label: string
+  description?: string
   placeholder: string
   error?: string
 }) {
   const id = `upstream-async-${props.index}-${props.name}`
   return (
-    <FieldShell id={id} label={props.label} error={props.error}>
+    <FieldShell
+      id={id}
+      label={props.label}
+      description={props.description}
+      error={props.error}
+    >
       <Input
         id={id}
         placeholder={props.placeholder}

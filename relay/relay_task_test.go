@@ -13,9 +13,11 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -396,6 +398,129 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
 			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+		})
+	}
+}
+
+func TestTaskRetryDoesNotCarryPreviousPluginExpression(t *testing.T) {
+	saveBillingConfig(t)
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices))
+	})
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"declared-model":0.1}`))
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":          `{}`,
+		"billing_setting.billing_expr":          `{}`,
+		billing_setting.PluginBillingExprOption: `{"bill-fallback::declared-model":"tier(\"seconds\", u(\"seconds\") * 0.5)"}`,
+	}))
+	c, info := newTaskSubmitContext(t, "declared-model", "")
+	c.Set("group", "default")
+	c.Set("async_media_prepare", true)
+	info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
+	source := billingFallbackPlugin + `export function extractUsage(){return {seconds:2};}`
+	pinMappingOrderPlugin(t, c, source)
+	first, taskErr := RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, common.QuotaRound(common.QuotaPerUnit), first.Quota)
+	frozen := service.MediaBillingSnapshot{Price: info.PriceData, Tiered: info.TieredBillingSnapshot}
+
+	// The next selected plugin has no expression override, so its legacy
+	// per-unit price and duration multiplier must both apply.
+	pinMappingOrderPlugin(t, c, strings.ReplaceAll(source, "bill-fallback", "legacy-video"))
+	retried, taskErr := RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	assert.Nil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, common.QuotaRound(0.2*common.QuotaPerUnit), retried.Quota)
+	assert.Equal(t, float64(2), info.PriceData.OtherRatios()["seconds"])
+
+	// Persisted media jobs keep their accepted price even if live routing or
+	// pricing has changed before execution.
+	c.Set("async_media_billing", frozen)
+	prepared, taskErr := RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, first.Quota, prepared.Quota)
+	assert.Equal(t, frozen.Tiered.ExprString, info.TieredBillingSnapshot.ExprString)
+}
+
+func TestMeasuredVideoPrechargeRequiresSecondsContract(t *testing.T) {
+	schema := map[string]pluginruntime.UsageFieldSchema{"seconds": {Type: "number", Unit: "second"}}
+	snapshot := &billingexpr.BillingSnapshot{
+		TaskUsageBilling:         true,
+		ExprString:               `tier("base", u("seconds") * 0.05)`,
+		UsageFacts:               map[string]any{"seconds": float64(12)},
+		EstimatedQuotaAfterGroup: 100,
+	}
+	require.NoError(t, validateMeasuredVideoPrecharge(schema, snapshot, 100))
+
+	for _, tc := range []struct {
+		name   string
+		schema map[string]pluginruntime.UsageFieldSchema
+		snap   *billingexpr.BillingSnapshot
+		quota  int
+	}{
+		{name: "undeclared seconds", schema: nil, snap: snapshot, quota: 100},
+		{name: "wrong unit", schema: map[string]pluginruntime.UsageFieldSchema{"seconds": {Type: "number", Unit: "count"}}, snap: snapshot, quota: 100},
+		{name: "missing expression", schema: schema, snap: nil, quota: 100},
+		{name: "expression does not meter seconds", schema: schema, snap: &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprString: `tier("base", 1)`, UsageFacts: snapshot.UsageFacts}, quota: 100},
+		{name: "missing bound", schema: schema, snap: &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprString: snapshot.ExprString, UsageFacts: nil}, quota: 100},
+		{name: "duration exceeds limit", schema: schema, snap: &billingexpr.BillingSnapshot{TaskUsageBilling: true, ExprString: snapshot.ExprString, UsageFacts: map[string]any{"seconds": float64(relaycommon.MaxTaskDurationSeconds + 1)}}, quota: 100},
+		{name: "reservation below estimate", schema: schema, snap: snapshot, quota: 99},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validateMeasuredVideoPrecharge(tc.schema, tc.snap, tc.quota))
+		})
+	}
+}
+
+func TestRelayTaskSubmitRejectsMeasuredVideoWithoutSecondsPrice(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unit       string
+		expression string
+		usage      string
+		wantError  bool
+	}{
+		{name: "valid seconds contract", unit: "second", expression: `tier("base", u("seconds") * 0.05)`, usage: `{seconds:5}`},
+		{name: "price ignores seconds", unit: "second", expression: `tier("base", 0.25)`, usage: `{seconds:5}`, wantError: true},
+		{name: "wrong declared unit", unit: "count", expression: `tier("base", u("seconds") * 0.05)`, usage: `{seconds:5}`, wantError: true},
+		{name: "missing precharge bound", unit: "second", expression: `tier("base", u("seconds") * 0.05)`, usage: `{}`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveBillingConfig(t)
+			expressions, err := common.Marshal(map[string]string{"declared-model": tc.expression})
+			require.NoError(t, err)
+			modes, err := common.Marshal(map[string]string{"declared-model": billing_setting.BillingModeTieredExpr})
+			require.NoError(t, err)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode": string(modes), "billing_setting.billing_expr": string(expressions),
+			}))
+			var rules kitdto.UpstreamAsyncConfig
+			require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"measured","media_type":"video","models":["declared-model"],"operations":["generate"],"submit":{"task_id_path":"job.id"},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"job.status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"job.output","actual_seconds_path":"job.seconds"}}}]}`, &rules))
+			require.NoError(t, rules.Validate())
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			c.Set("group", "default")
+			c.Set("task_plugin_key", "bill-fallback")
+			c.Set("async_media_prepare", true)
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, kitdto.ChannelOtherSettings{UpstreamAsync: &rules})
+			info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
+			source := strings.Replace(billingFallbackPlugin, `fetchMode:"per_task"`, `fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"`+tc.unit+`"}}`, 1)
+			source += `export function extractUsage(){return ` + tc.usage + `;}`
+			pinMappingOrderPlugin(t, c, source)
+			result, taskErr := RelayTaskSubmit(c, info)
+			if tc.wantError {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, "model_price_error", taskErr.Code)
+				assert.Nil(t, result)
+				assert.Nil(t, info.Billing)
+				return
+			}
+			require.Nil(t, taskErr)
+			require.NotNil(t, result)
+			assert.Positive(t, result.Quota)
+			assert.Nil(t, info.Billing, "prepare must not precharge")
 		})
 	}
 }

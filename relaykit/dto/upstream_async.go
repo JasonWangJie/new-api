@@ -112,6 +112,7 @@ type UpstreamAsyncPollResponse struct {
 	ProgressPath      string                    `json:"progress_path,omitempty"`
 	FailureReasonPath string                    `json:"failure_reason_path,omitempty"`
 	ResultPath        string                    `json:"result_path"`
+	ActualSecondsPath string                    `json:"actual_seconds_path,omitempty"`
 	UsagePaths        map[string]string         `json:"usage_paths,omitempty"`
 	DownloadHeaders   map[string]string         `json:"download_headers,omitempty"`
 }
@@ -372,11 +373,16 @@ func (profile UpstreamAsyncProfile) validate(index int) error {
 		"progress_path":       response.ProgressPath,
 		"failure_reason_path": response.FailureReasonPath,
 		"result_path":         response.ResultPath,
+		"actual_seconds_path": response.ActualSecondsPath,
 	} {
-		required := pathName == "status_path" || pathName == "result_path"
+		required := pathName == "status_path" || pathName == "result_path" ||
+			(pathName == "actual_seconds_path" && path != "")
 		if err := validateUpstreamAsyncPath(path, prefix+".poll.response."+pathName, required); err != nil {
 			return err
 		}
+	}
+	if mediaType != UpstreamAsyncMediaVideo && response.ActualSecondsPath != "" {
+		return fmt.Errorf("%s.poll.response.actual_seconds_path is only supported for video", prefix)
 	}
 	if len(response.StatusValues.Succeeded) == 0 || len(response.StatusValues.Failed) == 0 {
 		return fmt.Errorf("%s.poll.response.status_values.succeeded and failed are required", prefix)
@@ -706,10 +712,10 @@ func decodeUpstreamAsyncProfile(data []byte, index int) (UpstreamAsyncProfile, e
 	if err := kitutil.Unmarshal(poll["response"], &response); err != nil {
 		return UpstreamAsyncProfile{}, fmt.Errorf("%s.poll.response must be an object", prefix)
 	}
-	if err := rejectUpstreamAsyncUnknown(response, prefix+".poll.response", "status_path", "status_values", "progress_path", "failure_reason_path", "result_path", "usage_paths", "download_headers"); err != nil {
+	if err := rejectUpstreamAsyncUnknown(response, prefix+".poll.response", "status_path", "status_values", "progress_path", "failure_reason_path", "result_path", "actual_seconds_path", "usage_paths", "download_headers"); err != nil {
 		return UpstreamAsyncProfile{}, err
 	}
-	if err := decodeUpstreamAsyncFields(response, map[string]any{"status_path": &profile.Poll.Response.StatusPath, "progress_path": &profile.Poll.Response.ProgressPath, "failure_reason_path": &profile.Poll.Response.FailureReasonPath, "result_path": &profile.Poll.Response.ResultPath, "usage_paths": &profile.Poll.Response.UsagePaths, "download_headers": &profile.Poll.Response.DownloadHeaders}); err != nil {
+	if err := decodeUpstreamAsyncFields(response, map[string]any{"status_path": &profile.Poll.Response.StatusPath, "progress_path": &profile.Poll.Response.ProgressPath, "failure_reason_path": &profile.Poll.Response.FailureReasonPath, "result_path": &profile.Poll.Response.ResultPath, "actual_seconds_path": &profile.Poll.Response.ActualSecondsPath, "usage_paths": &profile.Poll.Response.UsagePaths, "download_headers": &profile.Poll.Response.DownloadHeaders}); err != nil {
 		return UpstreamAsyncProfile{}, fmt.Errorf("%s.poll.response: %w", prefix, err)
 	}
 	var statuses map[string]json.RawMessage

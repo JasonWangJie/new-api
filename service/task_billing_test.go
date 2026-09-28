@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,13 +17,18 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -80,6 +87,67 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
 	})
+}
+
+// DSNs must point at isolated test databases. Measured task tests keep logs in
+// a separate database so transaction success cannot depend on log DB placement.
+func setupMeasuredTaskBillingDB(t *testing.T) {
+	t.Helper()
+	dbType := common.DatabaseTypeSQLite
+	var driver gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "billing.db"))
+	var logDriver gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "logs.db"))
+	logType := common.DatabaseTypeSQLite
+	if dsn := os.Getenv("TEST_MYSQL_DSN"); dsn != "" {
+		dbType = common.DatabaseTypeMySQL
+		driver = mysql.Open(dsn)
+		if logDSN := os.Getenv("TEST_MYSQL_LOG_DSN"); logDSN != "" {
+			logDriver = mysql.Open(logDSN)
+			logType = dbType
+		}
+	} else if dsn := os.Getenv("TEST_POSTGRES_DSN"); dsn != "" {
+		dbType = common.DatabaseTypePostgreSQL
+		driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+		if logDSN := os.Getenv("TEST_POSTGRES_LOG_DSN"); logDSN != "" {
+			logDriver = postgres.New(postgres.Config{DSN: logDSN, PreferSimpleProtocol: true})
+			logType = dbType
+		}
+	}
+	db, err := gorm.Open(driver, &gorm.Config{})
+	require.NoError(t, err)
+	logDB, err := gorm.Open(logDriver, &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	if dbType == common.DatabaseTypeSQLite {
+		sqlDB.SetMaxOpenConns(1)
+	} else {
+		sqlDB.SetMaxOpenConns(4)
+	}
+	sqlLogDB, err := logDB.DB()
+	require.NoError(t, err)
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, model.LOG_DB = db, logDB
+	common.SetDatabaseTypes(dbType, logType)
+	rows := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.UserSubscription{}}
+	t.Cleanup(func() {
+		for _, row := range rows {
+			require.NoError(t, db.Unscoped().Where("1 = 1").Delete(row).Error)
+		}
+		require.NoError(t, logDB.Where("1 = 1").Delete(&model.Log{}).Error)
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.SetDatabaseTypes(oldMainType, oldLogType)
+		require.NoError(t, sqlLogDB.Close())
+		require.NoError(t, sqlDB.Close())
+	})
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(rows...))
+		require.NoError(t, logDB.AutoMigrate(&model.Log{}))
+	}
+	for _, row := range rows {
+		require.NoError(t, db.Unscoped().Where("1 = 1").Delete(row).Error)
+	}
+	require.NoError(t, logDB.Where("1 = 1").Delete(&model.Log{}).Error)
 }
 
 func seedUser(t *testing.T, id int, quota int) {
@@ -1265,6 +1333,312 @@ func TestCASGuardedRefund_Lose(t *testing.T) {
 
 	// No billing log should be created
 	assert.Equal(t, int64(0), countLogs(t))
+}
+
+func TestMeasuredVideoSubscriptionFailureRefundsOnceAndKeepsActualSeconds(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID, subscriptionID = 71, 71, 71, 71
+	const reservedQuota = 4_000
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-measured-subscription", 6_000)
+	seedChannel(t, channelID)
+	seedSubscription(t, subscriptionID, userID, 10_000, reservedQuota)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", reservedQuota).Error)
+
+	task := makeTask(userID, channelID, reservedQuota, tokenID, BillingSourceSubscription, subscriptionID)
+	expression := `tier("seconds", u("seconds"))`
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString:       expression,
+		ExprHash:         billingexpr.ExprHashString(expression),
+		GroupRatio:       1,
+		QuotaPerUnit:     1_000,
+		ExprVersion:      1,
+		TaskUsageBilling: true,
+		UsageFacts:       map[string]any{"seconds": float64(4)},
+		EstimatedTier:    "seconds",
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	recorded, err := model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	assert.True(t, recorded)
+	recorded, err = model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	assert.False(t, recorded)
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, reservedQuota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+
+	stale := *task
+	task.Status = model.TaskStatusFailure
+	task.FailReason = "upstream duration exceeds reserved limit"
+	won, err := SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 0, map[string]any{"seconds": float64(6)}, nil)
+	require.NoError(t, err)
+	assert.True(t, won)
+	stale.Status = model.TaskStatusFailure
+	won, err = SettleMeasuredVideoTask(t.Context(), &stale, model.TaskStatusInProgress, 0, nil, nil)
+	require.NoError(t, err)
+	assert.False(t, won)
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
+	assert.Zero(t, persisted.Quota)
+	assert.Equal(t, float64(6), persisted.PrivateData.BillingContext.TieredSnapshot.UsageFacts["seconds"])
+	assert.Equal(t, 10_000, getUserQuota(t, userID))
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, tokenID))
+	usedQuota, requestCount = getUserUsageAccounting(t, userID)
+	assert.Zero(t, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Zero(t, getChannelUsedQuota(t, channelID))
+	var subscription model.UserSubscription
+	require.NoError(t, model.DB.First(&subscription, subscriptionID).Error)
+	assert.Zero(t, subscription.AmountUsed)
+	assert.Equal(t, int64(1), countLogs(t))
+}
+
+func TestMeasuredVideoConcurrentSettlementChargesOnce(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID = 74, 74, 74
+	const reservedQuota = 5_000
+	seedUser(t, userID, 10_000)
+	seedToken(t, tokenID, userID, "sk-measured-concurrent", 8_000)
+	seedChannel(t, channelID)
+	seedChargedAccounting(t, userID, channelID, tokenID, reservedQuota, 1)
+
+	expression := `tier("seconds", u("seconds"))`
+	task := makeTask(userID, channelID, reservedQuota, tokenID, BillingSourceWallet, 0)
+	task.PrivateData.SubmitAccountingRecorded = true
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+		GroupRatio: 1, QuotaPerUnit: 1_000, ExprVersion: 1, TaskUsageBilling: true,
+		UsageFacts: map[string]any{"seconds": float64(5)},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	var saved model.Task
+	require.NoError(t, model.DB.First(&saved, task.ID).Error)
+
+	type result struct {
+		won bool
+		err error
+	}
+	ready := make(chan struct{})
+	outcomes := make(chan result, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Go(func() {
+			<-ready
+			candidate := saved
+			candidate.Status = model.TaskStatusSuccess
+			won, err := SettleMeasuredVideoTask(t.Context(), &candidate, model.TaskStatusInProgress, 3_250, map[string]any{"seconds": 3.25}, nil)
+			outcomes <- result{won: won, err: err}
+		})
+	}
+	close(ready)
+	workers.Wait()
+	close(outcomes)
+	winners := 0
+	for outcome := range outcomes {
+		require.NoError(t, outcome.err)
+		if outcome.won {
+			winners++
+		}
+	}
+	assert.Equal(t, 1, winners)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+	assert.Equal(t, 3_250, persisted.Quota)
+	assert.Equal(t, 3.25, persisted.PrivateData.BillingContext.TieredSnapshot.UsageFacts["seconds"])
+	assert.Equal(t, 11_750, getUserQuota(t, userID))
+	assert.Equal(t, 9_750, getTokenRemainQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, 3_250, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(3_250), getChannelUsedQuota(t, channelID))
+	assert.Equal(t, int64(1), countLogs(t))
+}
+
+func TestDurableTaskReservationRequiresFullPersistedUpperBound(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	oldRedis, oldEnabled, oldBatch := common.RDB, common.RedisEnabled, common.BatchUpdateEnabled
+	common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = client, true, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldEnabled, oldBatch
+		require.NoError(t, client.Close())
+	})
+
+	const userID, tokenID = 72, 72
+	initialQuota := common.GetTrustQuota() + 100
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, "sk-durable-task-reservation", initialQuota)
+	// Service's SQLite TestMain uses AutoMigrate directly and does not run
+	// model.InitDB's reserved-column setup. Prime the token cache just as the
+	// request authentication layer would before the relay billing session.
+	require.NoError(t, client.HSet(context.Background(), "token:"+common.GenerateHMAC("sk-durable-task-reservation"), map[string]any{
+		"Id": tokenID, "UserId": userID, "RemainQuota": initialQuota, "UsedQuota": 0,
+		"Status": common.TokenStatusEnabled,
+	}).Err())
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("token_quota", initialQuota)
+	info := &relaycommon.RelayInfo{
+		UserId:      userID,
+		TokenId:     tokenID,
+		TokenKey:    "sk-durable-task-reservation",
+		UserSetting: dto.UserSetting{BillingPreference: "wallet_only"},
+	}
+	c.Set("async_media_prepare", true)
+	require.Nil(t, PreConsumeDurableTaskBilling(c, 40, info))
+	assert.Nil(t, info.Billing)
+	assert.Equal(t, initialQuota, getUserQuota(t, userID))
+	c.Set("async_media_prepare", false)
+	require.Nil(t, PreConsumeDurableTaskBilling(c, 40, info))
+	require.NotNil(t, info.Billing)
+	assert.True(t, HasDurableTaskReservation(info, 40))
+	assert.False(t, HasDurableTaskReservation(info, 41))
+	assert.Equal(t, initialQuota-40, getUserQuota(t, userID))
+	assert.Equal(t, initialQuota-40, getTokenRemainQuota(t, tokenID))
+	cachedUserQuota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Equal(t, initialQuota-40, cachedUserQuota)
+
+	require.NoError(t, info.Billing.Reserve(60))
+	assert.True(t, HasDurableTaskReservation(info, 60))
+	assert.Equal(t, initialQuota-60, getUserQuota(t, userID))
+	assert.Equal(t, initialQuota-60, getTokenRemainQuota(t, tokenID))
+	require.Error(t, info.Billing.Reserve(initialQuota+1))
+	assert.False(t, HasDurableTaskReservation(info, initialQuota+1))
+	assert.Equal(t, initialQuota-60, getUserQuota(t, userID))
+	require.Error(t, info.Billing.Settle(61), "durable charges cannot exceed the reservation")
+	assert.Equal(t, initialQuota-60, getUserQuota(t, userID))
+
+	assert.False(t, HasDurableTaskReservation(&relaycommon.RelayInfo{Billing: &BillingSession{preConsumedQuota: 60}}, 0))
+	assert.False(t, HasDurableTaskReservation(&relaycommon.RelayInfo{Billing: &BillingSession{durable: true, trusted: true, preConsumedQuota: 60}}, 0))
+}
+
+func TestMeasuredVideoRefundSurvivesDeletedChannelAndCredentials(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID = 73, 73, 73
+	const reservedQuota = 3_000
+	seedUser(t, userID, 7_000)
+	seedToken(t, tokenID, userID, "sk-measured-deleted", 7_000)
+	seedChannel(t, channelID)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", reservedQuota).Error)
+
+	task := makeTask(userID, channelID, reservedQuota, tokenID, BillingSourceWallet, 0)
+	expression := `tier("seconds", u("seconds"))`
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+		GroupRatio: 1, QuotaPerUnit: 1_000, ExprVersion: 1, TaskUsageBilling: true,
+		UsageFacts: map[string]any{"seconds": float64(3)},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	_, err := model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Delete(&model.Token{Id: tokenID}).Error)
+	require.NoError(t, model.DB.Delete(&model.User{Id: userID}).Error)
+	require.NoError(t, model.DB.Delete(&model.Channel{Id: channelID}).Error)
+
+	task.Status = model.TaskStatusFailure
+	won, err := SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 0, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, won)
+	var user model.User
+	require.NoError(t, model.DB.Unscoped().First(&user, userID).Error)
+	assert.Equal(t, 10_000, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	var token model.Token
+	require.NoError(t, model.DB.Unscoped().First(&token, tokenID).Error)
+	assert.Equal(t, 10_000, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), persisted.Status)
+	assert.Zero(t, persisted.Quota)
+}
+
+func TestMeasuredVideoZeroPriceStillRecordsAndSettlesOnce(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, channelID = 75, 75
+	seedUser(t, userID, 10_000)
+	seedChannel(t, channelID)
+	expression := `tier("free", u("seconds") * 0)`
+	task := makeTask(userID, channelID, 0, 0, BillingSourceWallet, 0)
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+		GroupRatio: 1, QuotaPerUnit: 1_000, ExprVersion: 1, TaskUsageBilling: true,
+		UsageFacts: map[string]any{"seconds": float64(5)},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	recorded, err := model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	assert.True(t, recorded)
+	recorded, err = model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	assert.False(t, recorded)
+	task.Status = model.TaskStatusSuccess
+	won, err := SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 0, map[string]any{"seconds": 3.25}, nil)
+	require.NoError(t, err)
+	assert.True(t, won)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+	assert.Equal(t, 3.25, persisted.PrivateData.BillingContext.TieredSnapshot.UsageFacts["seconds"])
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Zero(t, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, 10_000, getUserQuota(t, userID))
+	assert.Zero(t, getChannelUsedQuota(t, channelID))
+	assert.Zero(t, countLogs(t))
+}
+
+func TestMeasuredVideoRefundFailureRollsBackTerminalStateAndBalances(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID = 76, 76, 76
+	const reservedQuota = 3_000
+	seedUser(t, userID, 7_000)
+	seedToken(t, tokenID, userID, "sk-measured-rollback", 7_000)
+	seedChannel(t, channelID)
+	expression := `tier("seconds", u("seconds"))`
+	task := makeTask(userID, channelID, reservedQuota, tokenID, BillingSourceWallet, 0)
+	task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+		ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+		GroupRatio: 1, QuotaPerUnit: 1_000, ExprVersion: 1, TaskUsageBilling: true,
+		UsageFacts: map[string]any{"seconds": float64(3)},
+	}
+	require.NoError(t, model.DB.Create(task).Error)
+	_, err := model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	// The token has no recorded debit: its refund must abort the entire
+	// transaction, including the earlier wallet refund and terminal CAS.
+	task.Status = model.TaskStatusFailure
+	won, err := SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 0, nil, nil)
+	require.ErrorContains(t, err, "token refund could not be applied")
+	assert.False(t, won)
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), persisted.Status)
+	assert.Equal(t, reservedQuota, persisted.Quota)
+	assert.Equal(t, 7_000, getUserQuota(t, userID))
+	assert.Equal(t, 7_000, getTokenRemainQuota(t, tokenID))
+	usedQuota, requestCount := getUserUsageAccounting(t, userID)
+	assert.Equal(t, reservedQuota, usedQuota)
+	assert.Equal(t, 1, requestCount)
+	assert.Equal(t, int64(reservedQuota), getChannelUsedQuota(t, channelID))
+	assert.Zero(t, countLogs(t))
+
+	// After repairing the missing debit, the persisted task is still eligible
+	// for one complete refund on the next poll.
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", reservedQuota).Error)
+	won, err = SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 0, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, won)
+	assert.Equal(t, 10_000, getUserQuota(t, userID))
+	assert.Equal(t, 10_000, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
 }
 
 func TestCASGuardedSettle_Win(t *testing.T) {

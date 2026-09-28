@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -259,6 +260,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			info.PriceData.AddOtherRatio(key, ratio)
 		}
 	} else {
+		// A retry may select another plugin with legacy pricing. Only a frozen
+		// media job may carry the previous attempt's expression into this one.
+		info.TieredBillingSnapshot = nil
 		// 4. 价格计算：基础模型价格
 		info.OriginModelName = modelName
 		var priceData types.PriceData
@@ -344,6 +348,26 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 
 	}
+	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(
+		kitdto.UpstreamAsyncMediaVideo,
+		info.UpstreamModelName,
+		service.UpstreamAsyncOperation(info.Action),
+	)
+	measuredVideo := hasAsyncProfile && asyncProfile.Poll.Response.ActualSecondsPath != ""
+	if measuredVideo {
+		pinnedValue, _ := c.Get(jsplugin.ContextKeyPinnedPlugin)
+		pinnedPlugin, _ := pinnedValue.(jsplugin.PinnedPlugin)
+		var schema map[string]jsplugin.UsageFieldSchema
+		if pinnedPlugin.Plugin != nil {
+			schema, _ = pinnedPlugin.Plugin.Meta.UsageForModel(info.UpstreamModelName)
+		}
+		if err := validateMeasuredVideoPrecharge(schema, info.TieredBillingSnapshot, info.PriceData.Quota); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "model_price_error", http.StatusBadRequest)
+		}
+		if info.PriceData.FreeModel {
+			return nil, service.TaskErrorWrapperLocal(errors.New("measured video billing requires a reserved charge"), "model_price_error", http.StatusBadRequest)
+		}
+	}
 	if c.GetBool("async_media_prepare") {
 		return &TaskSubmitResult{Quota: info.PriceData.Quota}, nil
 	}
@@ -358,10 +382,27 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(err, "media_billing_failed", http.StatusInternalServerError)
 		}
 	}
+	if measuredVideo && info.Billing != nil {
+		if !service.HasDurableTaskReservation(info, 0) {
+			return nil, service.TaskErrorWrapperLocal(errors.New("measured video retry requires a durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
+		}
+		if err := info.Billing.Reserve(info.PriceData.Quota); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "insufficient_quota", http.StatusForbidden)
+		}
+		if !service.HasDurableTaskReservation(info, info.PriceData.Quota) {
+			return nil, service.TaskErrorWrapperLocal(errors.New("measured video reservation does not cover estimated cost"), "task_billing_reservation_invalid", http.StatusConflict)
+		}
+	}
 	if info.Billing == nil && !info.PriceData.FreeModel {
 		info.ForcePreConsume = true
-		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
-			return nil, service.TaskErrorFromAPIError(apiErr)
+		if measuredVideo {
+			if apiErr := service.PreConsumeDurableTaskBilling(c, info.PriceData.Quota, info); apiErr != nil {
+				return nil, service.TaskErrorFromAPIError(apiErr)
+			}
+		} else {
+			if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
+				return nil, service.TaskErrorFromAPIError(apiErr)
+			}
 		}
 	}
 
@@ -371,11 +412,6 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
-	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(
-		kitdto.UpstreamAsyncMediaVideo,
-		info.UpstreamModelName,
-		service.UpstreamAsyncOperation(info.Action),
-	)
 	var submitRequest *http.Request
 	if hasAsyncProfile && asyncProfile.Submit.Request != nil {
 		source, _ := c.Get("task_request")
@@ -497,6 +533,38 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		UpstreamAsync:         asyncProfile,
 		UpstreamAsyncResponse: upstreamAsyncResponse,
 	}, nil
+}
+
+// validateMeasuredVideoPrecharge checks that the frozen task price reserves
+// the plugin's declared upper bound for a measured video request.
+func validateMeasuredVideoPrecharge(schema map[string]jsplugin.UsageFieldSchema, snap *billingexpr.BillingSnapshot, quota int) error {
+	secondsField, declared := schema["seconds"]
+	if !declared || secondsField.Type != "number" || secondsField.Unit != "second" {
+		return errors.New("measured video billing requires a numeric seconds usage field with unit second")
+	}
+	if snap == nil || !snap.TaskUsageBilling || !billingexpr.UsedUsageKeys(snap.ExprString)["seconds"] {
+		return errors.New("measured video billing requires a task pricing expression using seconds")
+	}
+	var seconds float64
+	switch value := snap.UsageFacts["seconds"].(type) {
+	case float64:
+		seconds = value
+	case float32:
+		seconds = float64(value)
+	case int:
+		seconds = float64(value)
+	case int64:
+		seconds = float64(value)
+	default:
+		return errors.New("measured video billing requires a numeric precharge seconds limit")
+	}
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 || seconds > relaycommon.MaxTaskDurationSeconds {
+		return fmt.Errorf("measured video precharge seconds must be between 0 and %d", relaycommon.MaxTaskDurationSeconds)
+	}
+	if quota <= 0 || quota < snap.EstimatedQuotaAfterGroup {
+		return errors.New("measured video billing requires a positive reserved quota covering the estimate")
+	}
+	return nil
 }
 
 // recalcQuotaFromRatios 根据 adjustedRatios 重新计算 quota。

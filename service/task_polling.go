@@ -92,6 +92,12 @@ func sweepTimedOutTasks(ctx context.Context) {
 
 	for _, task := range tasks {
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
+		if taskUsesMeasuredVideoBilling(task) && !isLegacy {
+			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks submit accounting error for task %s: %v", task.TaskID, err))
+				continue
+			}
+		}
 
 		oldStatus := task.Status
 		task.Status = model.TaskStatusFailure
@@ -104,6 +110,17 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.Quota = 0
 		} else {
 			task.FailReason = reason
+		}
+		if taskUsesMeasuredVideoBilling(task) && !isLegacy {
+			won, err := SettleMeasuredVideoTask(ctx, task, oldStatus, 0, nil, nil)
+			if err != nil {
+				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks settlement error for task %s: %v", task.TaskID, err))
+				continue
+			}
+			if won {
+				timedOutCount++
+			}
+			continue
 		}
 
 		won, err := task.UpdateWithStatus(oldStatus)
@@ -177,6 +194,24 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
+				if taskUsesMeasuredVideoBilling(task) {
+					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, task); accountingErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", task.TaskID, accountingErr))
+						continue
+					}
+					oldStatus := task.Status
+					task.Status = model.TaskStatusFailure
+					task.Progress = taskcommon.ProgressComplete
+					task.FinishTime = time.Now().Unix()
+					task.FailReason = "upstream task ID is missing"
+					won, settleErr := SettleMeasuredVideoTask(ctx, task, oldStatus, 0, nil, nil)
+					if settleErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("settle task %s with missing upstream ID: %v", task.TaskID, settleErr))
+					} else if won {
+						summary.NullTasksFailed++
+					}
+					continue
+				}
 				// 统计失败的未完成任务
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
@@ -281,16 +316,29 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if taskUsesMeasuredVideoBilling(t) {
+					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
+						continue
+					}
+					reason := fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId)
+					if settleErr := failTaskFromPoll(ctx, adaptor, t, t.Status, reason); settleErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("settle task %s after missing channel: %v", t.TaskID, settleErr))
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
-		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if err != nil {
-			common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
+		if len(failedIDs) > 0 {
+			err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
+				"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
+				"status":      "FAILURE",
+				"progress":    "100%",
+			})
+			if err != nil {
+				common.SysLog(fmt.Sprintf("UpdateSunoTask error: %v", err))
+			}
 		}
 		return err
 	}
@@ -484,16 +532,29 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if taskUsesMeasuredVideoBilling(t) {
+					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
+						continue
+					}
+					reason := fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId)
+					if settleErr := failTaskFromPoll(ctx, nil, t, t.Status, reason); settleErr != nil {
+						logger.LogError(ctx, fmt.Sprintf("settle task %s after missing channel: %v", t.TaskID, settleErr))
+					}
+					continue
+				}
 				failedIDs = append(failedIDs, t.ID)
 			}
 		}
-		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
-			"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
-			"status":      "FAILURE",
-			"progress":    "100%",
-		})
-		if errUpdate != nil {
-			common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
+		if len(failedIDs) > 0 {
+			errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
+				"fail_reason": fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId),
+				"status":      "FAILURE",
+				"progress":    "100%",
+			})
+			if errUpdate != nil {
+				common.SysLog(fmt.Sprintf("UpdateVideoTask error: %v", errUpdate))
+			}
 		}
 		return fmt.Errorf("CacheGetChannel failed: %w", err)
 	}
@@ -560,6 +621,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task == nil {
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
+	}
+	if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
+		return err
 	}
 	key := ch.Key
 
@@ -638,6 +702,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransient, resp.StatusCode, "")
 	}
 
+	measuredVideo := taskUsesMeasuredVideoBilling(task)
+	var actualSeconds *float64
 	taskResult := &relaycommon.TaskInfo{}
 	if task.PrivateData.UpstreamAsync != nil {
 		parsed, parseErr := ParseUpstreamAsyncPollResponse(task.PrivateData.UpstreamAsync, responseBody)
@@ -652,10 +718,19 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			taskResult.TotalTokens = parsed.Usage.TotalTokens
 			taskResult.CompletionTokens = parsed.Usage.CompletionTokens
 		}
+		actualSeconds = parsed.ActualSeconds
 		if usageAdaptor, ok := adaptor.(TaskCompletionUsageAdaptor); ok {
 			if usageErr := usageAdaptor.ApplyCompletionUsage(task, resp, responseBody, taskResult); usageErr != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("task %s completion usage hook failed: %v", task.TaskID, usageErr))
 			}
+		}
+		if actualSeconds != nil {
+			if taskResult.UsageFacts == nil {
+				taskResult.UsageFacts = make(map[string]any)
+			}
+			// The channel's frozen response rule is authoritative for measured
+			// seconds; the plugin may still contribute other completion facts.
+			taskResult.UsageFacts["seconds"] = *actualSeconds
 		}
 	} else {
 		// try parse as New API response format
@@ -679,6 +754,39 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
+	measuredActualQuota := 0
+	var measuredClamp *common.QuotaClamp
+	if measuredVideo && parsedStatus == model.TaskStatusSuccess {
+		billingContext := task.PrivateData.BillingContext
+		if actualSeconds == nil || billingContext == nil || billingContext.TieredSnapshot == nil {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video billing facts are unavailable")
+		}
+		limit, ok := billingContext.TieredSnapshot.UsageFacts["seconds"].(float64)
+		if !ok || limit <= 0 {
+			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video precharge limit is unavailable")
+		}
+		if *actualSeconds > limit {
+			logger.LogWarn(ctx, fmt.Sprintf("task %s measured video seconds %.6f exceed reserved limit %.6f", task.TaskID, *actualSeconds, limit))
+			parsedStatus = model.TaskStatusFailure
+			taskResult.Status = string(parsedStatus)
+			taskResult.Url = ""
+			taskResult.Reason = "upstream video duration exceeded reserved billing limit"
+		} else {
+			result, _, billingErr := EvaluateTaskCompletionUsage(billingContext.TieredSnapshot, taskResult.UsageFacts)
+			if billingErr != nil {
+				return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video expression could not be evaluated")
+			}
+			measuredActualQuota, measuredClamp = result.ActualQuotaAfterGroup, result.Clamp
+			if measuredClamp != nil || measuredActualQuota > task.Quota {
+				logger.LogWarn(ctx, fmt.Sprintf("task %s measured video final quota %d exceeds reserved quota %d (clamp=%v)", task.TaskID, measuredActualQuota, task.Quota, measuredClamp))
+				parsedStatus = model.TaskStatusFailure
+				taskResult.Status = string(parsedStatus)
+				taskResult.Url = ""
+				taskResult.Reason = "upstream video cost exceeded reserved billing limit"
+				measuredActualQuota = 0
+			}
+		}
+	}
 	var unrecognizedDetail string
 	if task.PrivateData.UpstreamAsync != nil {
 		unrecognizedDetail = strings.TrimSpace(taskResult.Reason)
@@ -766,6 +874,16 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	task.Data = redactVideoResponseBody(task.Data)
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	if measuredVideo && isDone {
+		won, settleErr := SettleMeasuredVideoTask(ctx, task, snap.Status, measuredActualQuota, taskResult.UsageFacts, measuredClamp)
+		if settleErr != nil {
+			return settleErr
+		}
+		if !won {
+			logger.LogInfo(ctx, fmt.Sprintf("task %s was already settled by another poller", task.TaskID))
+		}
+		return nil
+	}
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {
@@ -973,6 +1091,10 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		task.FinishTime = now
 	}
 	task.FailReason = reason
+	if taskUsesMeasuredVideoBilling(task) {
+		_, err := SettleMeasuredVideoTask(ctx, task, fromStatus, 0, nil, nil)
+		return err
+	}
 	won, err := task.UpdateWithStatus(fromStatus)
 	if err != nil {
 		return err
@@ -986,6 +1108,20 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		RefundTaskQuota(ctx, task, reason)
 	}
 	return nil
+}
+
+func taskUsesMeasuredVideoBilling(task *model.Task) bool {
+	return task != nil && task.PrivateData.UpstreamAsync != nil &&
+		task.PrivateData.UpstreamAsync.MediaType == "video" &&
+		task.PrivateData.UpstreamAsync.Poll.Response.ActualSecondsPath != ""
+}
+
+func ensureMeasuredTaskSubmitAccounting(ctx context.Context, task *model.Task) error {
+	if !taskUsesMeasuredVideoBilling(task) || task.PrivateData.SubmitAccountingRecorded {
+		return nil
+	}
+	_, err := model.RecordMeasuredTaskSubmitAccounting(ctx, task)
+	return err
 }
 
 func failTasksFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, tasks []*model.Task, reason string) error {

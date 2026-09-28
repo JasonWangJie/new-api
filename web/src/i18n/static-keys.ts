@@ -27,6 +27,7 @@ export const STATIC_I18N_KEYS = [
   'Template contains an unsupported placeholder',
   'Use a relative absolute path without query or fragment',
   'Image profiles cannot use extend',
+  'Image profiles cannot use actual video seconds',
   'GET polling cannot include a JSON body',
   'Status values must not overlap',
   'Unsupported usage target',

@@ -44,6 +44,38 @@ describe('upstream async channel configuration', () => {
     })
   })
 
+  test('round-trips a video actual seconds path and omits it for existing profiles', () => {
+    const form = upstreamAsyncConfigToForm(UPSTREAM_ASYNC_VIDEO_EXAMPLE)
+    expect(form.profiles[0].actual_seconds_path).toBe('data.output.duration')
+    expect(upstreamAsyncFormToConfig(form)).toEqual(
+      UPSTREAM_ASYNC_VIDEO_EXAMPLE
+    )
+
+    const existing = structuredClone(UPSTREAM_ASYNC_VIDEO_EXAMPLE)
+    delete existing.profiles[0].poll.response.actual_seconds_path
+    const existingForm = upstreamAsyncConfigToForm(existing)
+    expect(existingForm.profiles[0].actual_seconds_path).toBe('')
+    expect(upstreamAsyncFormToConfig(existingForm)).toEqual(existing)
+  })
+
+  test('rejects actual seconds paths on image profiles and invalid paths', () => {
+    const image = structuredClone(UPSTREAM_ASYNC_IMAGE_EXAMPLE)
+    image.profiles[0].poll.response.actual_seconds_path = 'usage.seconds'
+    const imageResult = upstreamAsyncConfigSchema.safeParse(image)
+    expect(imageResult.success).toBe(false)
+    if (!imageResult.success) {
+      expect(imageResult.error.issues.map((issue) => issue.message)).toContain(
+        'Image profiles cannot use actual video seconds'
+      )
+    }
+
+    const videoForm = upstreamAsyncConfigToForm(UPSTREAM_ASYNC_VIDEO_EXAMPLE)
+    videoForm.profiles[0].actual_seconds_path = 'usage.seconds|0'
+    expect(upstreamAsyncEditorFormSchema.safeParse(videoForm).success).toBe(
+      false
+    )
+  })
+
   test('round-trips a custom image submit request and preserves default submit mode', () => {
     const withQuery = structuredClone(UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE)
     const submitRequest = withQuery.profiles[0].submit.request

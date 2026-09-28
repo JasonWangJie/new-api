@@ -27,6 +27,7 @@ import (
 type BillingSession struct {
 	relayInfo        *relaycommon.RelayInfo
 	funding          FundingSource
+	durable          bool // async task reservations bypass process-local batch updates
 	preConsumedQuota int  // 实际预扣额度（信任用户可能为 0）
 	tokenConsumed    int  // 令牌额度实际扣减量
 	extraReserved    int  // 发送前补充预扣的额度（订阅退款时需要单独回滚）
@@ -47,6 +48,9 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		return nil
 	}
 	delta := actualQuota - s.preConsumedQuota
+	if s.durable && delta > 0 {
+		return fmt.Errorf("durable task charge exceeds reserved quota")
+	}
 	if delta == 0 {
 		s.settled = true
 		return nil
@@ -61,7 +65,9 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	// 2) 调整令牌额度
 	var tokenErr error
 	if !s.relayInfo.IsPlayground {
-		if delta > 0 {
+		if s.durable {
+			tokenErr = model.AdjustTokenQuotaDurable(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
+		} else if delta > 0 {
 			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
 		} else {
 			tokenErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
@@ -117,7 +123,13 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
-			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
+			var err error
+			if s.durable {
+				err = model.AdjustTokenQuotaDurable(tokenId, tokenKey, tokenConsumed)
+			} else {
+				err = model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed)
+			}
+			if err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
 			}
 		}
@@ -207,7 +219,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 
 	// ---- 1) 预扣令牌额度 ----
 	if effectiveQuota > 0 {
-		if err := PreConsumeTokenQuota(s.relayInfo, effectiveQuota); err != nil {
+		if err := preConsumeTokenQuotaWithMode(s.relayInfo, effectiveQuota, s.durable); err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
 		s.tokenConsumed = effectiveQuota
@@ -217,7 +229,13 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	if err := s.funding.PreConsume(effectiveQuota); err != nil {
 		// 预扣费失败，回滚令牌额度
 		if s.tokenConsumed > 0 && !s.relayInfo.IsPlayground {
-			if rollbackErr := model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed); rollbackErr != nil {
+			var rollbackErr error
+			if s.durable {
+				rollbackErr = model.AdjustTokenQuotaDurable(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed)
+			} else {
+				rollbackErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, s.tokenConsumed)
+			}
+			if rollbackErr != nil {
 				common.SysLog(fmt.Sprintf("error rolling back token quota (userId=%d, tokenId=%d, amount=%d, fundingErr=%s): %s",
 					s.relayInfo.UserId, s.relayInfo.TokenId, s.tokenConsumed, err.Error(), rollbackErr.Error()))
 			}
@@ -252,7 +270,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if requireAvailableQuota {
+		if requireAvailableQuota || s.durable {
 			// Image quantity is known before submission, including retries and
 			// overrides. Reserve atomically instead of admitting wallet debt.
 			if err := funding.PreConsume(delta); err != nil {
@@ -291,7 +309,13 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 func (s *BillingSession) rollbackFundingReserve(delta int) {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.IncreaseUserQuota(funding.userId, delta, false); err != nil {
+		var err error
+		if s.durable {
+			err = model.AdjustUserQuotaDurable(funding.userId, delta)
+		} else {
+			err = model.IncreaseUserQuota(funding.userId, delta, false)
+		}
+		if err != nil {
 			common.SysLog("error rolling back wallet funding reserve: " + err.Error())
 		} else {
 			funding.consumed -= delta
@@ -307,7 +331,7 @@ func (s *BillingSession) reserveToken(delta int) error {
 	if delta <= 0 || s.relayInfo.IsPlayground {
 		return nil
 	}
-	if err := PreConsumeTokenQuota(s.relayInfo, delta); err != nil {
+	if err := preConsumeTokenQuotaWithMode(s.relayInfo, delta, s.durable); err != nil {
 		return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 	}
 	return nil
@@ -316,7 +340,7 @@ func (s *BillingSession) reserveToken(delta int) error {
 // shouldTrust 统一信任额度检查，适用于钱包和订阅。
 func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	// 异步任务（ForcePreConsume=true）必须预扣全额，不允许信任旁路
-	if s.relayInfo.ForcePreConsume {
+	if s.durable || s.relayInfo.ForcePreConsume {
 		return false
 	}
 
@@ -375,6 +399,10 @@ func (s *BillingSession) syncRelayInfo() {
 
 // NewBillingSession 根据用户计费偏好创建 BillingSession，处理 subscription_first / wallet_first 的回退。
 func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int) (*BillingSession, *types.NewAPIError) {
+	return newBillingSession(c, relayInfo, preConsumedQuota, false)
+}
+
+func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int, durable bool) (*BillingSession, *types.NewAPIError) {
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -403,7 +431,8 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 
 		session := &BillingSession{
 			relayInfo: relayInfo,
-			funding:   &WalletFunding{userId: relayInfo.UserId},
+			funding:   &WalletFunding{userId: relayInfo.UserId, durable: durable},
+			durable:   durable,
 		}
 		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
 			return nil, apiErr
@@ -418,6 +447,7 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		}
 		session := &BillingSession{
 			relayInfo: relayInfo,
+			durable:   durable,
 			funding: &SubscriptionFunding{
 				requestId: relayInfo.RequestId,
 				userId:    relayInfo.UserId,

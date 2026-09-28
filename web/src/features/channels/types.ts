@@ -158,6 +158,7 @@ export interface UpstreamAsyncProfile {
       progress_path?: string
       failure_reason_path?: string
       result_path: string
+      actual_seconds_path?: string
       usage_paths?: Record<string, string>
       download_headers?: Record<string, string>
     }

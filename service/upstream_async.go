@@ -16,6 +16,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/tidwall/gjson"
 )
@@ -32,11 +33,12 @@ type UpstreamAsyncTemplateContext struct {
 }
 
 type UpstreamAsyncPollResult struct {
-	Status   model.TaskStatus
-	Progress string
-	Reason   string
-	URLs     []string
-	Usage    *relaydto.Usage
+	Status        model.TaskStatus
+	Progress      string
+	Reason        string
+	URLs          []string
+	ActualSeconds *float64
+	Usage         *relaydto.Usage
 }
 
 // BuildUpstreamAsyncSubmitRequest replaces only the outbound HTTP request.
@@ -384,6 +386,21 @@ func ParseUpstreamAsyncPollResponse(profile *relaydto.UpstreamAsyncProfile, body
 			return nil, err
 		}
 		result.URLs = urls
+		if profile.MediaType == relaydto.UpstreamAsyncMediaVideo && profile.Poll.Response.ActualSecondsPath != "" {
+			value := gjson.GetBytes(body, profile.Poll.Response.ActualSecondsPath)
+			if value.Type != gjson.Number || len(value.Raw) > 128 {
+				return nil, fmt.Errorf("%w: actual_seconds_path must resolve to a JSON number", ErrUpstreamAsyncBillingUsage)
+			}
+			actualSeconds, err := strconv.ParseFloat(value.Raw, 64)
+			if err != nil || actualSeconds <= 0 || actualSeconds > relaycommon.MaxTaskDurationSeconds || math.IsNaN(actualSeconds) || math.IsInf(actualSeconds, 0) {
+				return nil, fmt.Errorf("%w: actual_seconds_path must be greater than 0 and at most %d seconds", ErrUpstreamAsyncBillingUsage, relaycommon.MaxTaskDurationSeconds)
+			}
+			seconds, ok := new(big.Rat).SetString(value.Raw)
+			if !ok || seconds.Sign() <= 0 || seconds.Cmp(big.NewRat(relaycommon.MaxTaskDurationSeconds, 1)) > 0 {
+				return nil, fmt.Errorf("%w: actual_seconds_path must be greater than 0 and at most %d seconds", ErrUpstreamAsyncBillingUsage, relaycommon.MaxTaskDurationSeconds)
+			}
+			result.ActualSeconds = &actualSeconds
+		}
 	}
 	usage, err := parseUpstreamAsyncUsage(body, profile.Poll.Response.UsagePaths)
 	if err != nil {
