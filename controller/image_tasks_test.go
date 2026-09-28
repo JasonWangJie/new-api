@@ -46,11 +46,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			}
 			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 			require.NoError(t, err)
-			previousDB := model.DB
+			previousDB, previousType := model.DB, common.MainDatabaseType()
 			model.DB = db
+			common.SetMainDatabaseType(common.DatabaseType(engine))
 			entities := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
+				common.SetMainDatabaseType(previousType)
 				assert.NoError(t, db.Migrator().DropTable(entities...))
 				connection, closeErr := db.DB()
 				if assert.NoError(t, closeErr) {
@@ -342,6 +344,25 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, "upstream", fallbackDetail.Data.Results[0]["source"])
 			require.Len(t, fallbackDetail.Data.Events, 2, "legacy repeated poll events should display once")
 			assert.Equal(t, "", fallbackDetail.Data.Events[0].Message)
+
+			require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", fallback.TaskId).Updates(map[string]any{"status": model.ImageTaskFailed, "expires_at": now - 1}).Error)
+			for _, admin := range []bool{false, true} {
+				expiredRecorder := httptest.NewRecorder()
+				expiredContext, _ := gin.CreateTestContext(expiredRecorder)
+				expiredContext.Set("id", 101)
+				expiredContext.Params = gin.Params{{Key: "task_id", Value: fallback.TaskId}}
+				expiredContext.Request = httptest.NewRequest(http.MethodGet, "/api/user/async-image-tasks/"+fallback.TaskId, nil)
+				GetImageTask(expiredContext, admin)
+				require.Equal(t, http.StatusOK, expiredRecorder.Code, expiredRecorder.Body.String())
+				var expiredDetail struct {
+					Data struct {
+						Results []gin.H
+					}
+				}
+				require.NoError(t, common.Unmarshal(expiredRecorder.Body.Bytes(), &expiredDetail))
+				assert.Empty(t, expiredDetail.Data.Results, "expired task results must be hidden for owners and administrators")
+				assert.NotContains(t, expiredRecorder.Body.String(), latestURL)
+			}
 		})
 	}
 }

@@ -379,7 +379,30 @@ func runResetOnFirstStreamServer(ln net.Listener, expectRetry bool) <-chan h2Ser
 					return
 				}
 				if !expectRetry {
-					break attempts
+					// Drain the client's acknowledgement before closing the socket.
+					// Closing with unread frames can hide REFUSED_STREAM behind a
+					// platform-specific connection reset, especially on Windows.
+					ping := [8]byte{'r', 's', 't', '-', 'r', 'e', 'a', 'd'}
+					if err := framer.WritePing(false, ping); err != nil {
+						res.err = err
+						return
+					}
+					for {
+						frame, err := framer.ReadFrame()
+						if err != nil {
+							res.err = err
+							return
+						}
+						switch frame := frame.(type) {
+						case *http2.PingFrame:
+							if frame.IsAck() && frame.Data == ping {
+								break attempts
+							}
+						case *http2.MetaHeadersFrame:
+							res.err = fmt.Errorf("unexpected retry of a non-replayable request on stream %d", frame.Header().StreamID)
+							return
+						}
+					}
 				}
 				continue
 			}
@@ -416,11 +439,25 @@ func runGoAwayAfterFirstRequestServer(ln net.Listener) <-chan h2ServerResult {
 
 			if attempt == 0 {
 				err = framer.WriteGoAway(0, http2.ErrCodeNo, nil)
-				conn.Close()
 				if err != nil {
+					conn.Close()
 					res.err = err
 					return
 				}
+				// GOAWAY closes the client's idle connection. Drain its remaining
+				// control frames so the socket close cannot discard the GOAWAY.
+				for {
+					_, err = framer.ReadFrame()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						conn.Close()
+						res.err = err
+						return
+					}
+				}
+				conn.Close()
 				continue
 			}
 

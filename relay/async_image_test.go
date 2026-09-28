@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
@@ -81,7 +82,7 @@ func TestUpstreamImageResultReadRetriesExistingTask(t *testing.T) {
 }
 
 func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
-	previousDB := model.DB
+	previousDB, previousType := model.DB, common.MainDatabaseType()
 	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "upstream-job.db"))
 	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
 		require.Contains(t, dsn, "/new_api_image_job_test", "use a dedicated disposable database")
@@ -93,8 +94,10 @@ func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
 	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
 	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
 	t.Cleanup(func() {
 		model.DB = previousDB
+		common.SetMainDatabaseType(previousType)
 		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageEvent{}, &model.AsyncImageTask{}))
 		connection, openErr := db.DB()
 		if openErr == nil {

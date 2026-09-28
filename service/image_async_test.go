@@ -55,7 +55,7 @@ func asyncImageBytesFixture(t *testing.T) ImageBytes {
 
 func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T) {
 	ctx := context.Background()
-	previousDB, previousRedis := model.DB, common.RDB
+	previousDB, previousRedis, previousType := model.DB, common.RDB, common.MainDatabaseType()
 	dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "polling.db")))
 	databaseVersionQuery := "SELECT sqlite_version()"
 	if dsn := os.Getenv("IMAGE_WORKER_TEST_MYSQL_DSN"); dsn != "" {
@@ -70,12 +70,14 @@ func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T
 	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
 	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	common.RDB = client
 	t.Setenv("ASYNC_IMAGE_REDIS_PREFIX", "image-poll-test")
 	t.Cleanup(func() {
 		model.DB, common.RDB = previousDB, previousRedis
+		common.SetMainDatabaseType(previousType)
 		_ = client.Close()
 		assert.NoError(t, db.Migrator().DropTable(&model.ImageOutbox{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}))
 		sqlDB, openErr := db.DB()
@@ -434,7 +436,7 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 }
 
 func TestGeminiAmbiguousReferenceFailureSchedulesSingleLocalFallback(t *testing.T) {
-	previousDB := model.DB
+	previousDB, previousType := model.DB, common.MainDatabaseType()
 	dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "gemini-reference-fallback.db")))
 	if dsn := os.Getenv("IMAGE_WORKER_TEST_MYSQL_DSN"); dsn != "" {
 		require.Contains(t, dsn, "/new_api_image_worker_test", "use the dedicated disposable image worker database")
@@ -446,8 +448,10 @@ func TestGeminiAmbiguousReferenceFailureSchedulesSingleLocalFallback(t *testing.
 	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
 	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
 	t.Cleanup(func() {
 		model.DB = previousDB
+		common.SetMainDatabaseType(previousType)
 		connection, openErr := db.DB()
 		if openErr == nil {
 			_ = connection.Close()

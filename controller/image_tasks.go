@@ -364,7 +364,7 @@ func GetImageTask(c *gin.Context, admin bool) {
 			results = append(results, item)
 		}
 	}
-	if !task.ResultsAvailable() && task.ErrorCode == "result_download_failed" {
+	if !task.ResultsAvailable() && task.ErrorCode == "result_download_failed" && (!task.Terminal() || task.ExpiresAt == 0 || task.ExpiresAt > common.GetTimestamp()) {
 		urls, err := model.GetAsyncImageUpstreamResultURLs(c.Request.Context(), task.TaskId)
 		if err != nil {
 			imageManagementError(c, 503, err)

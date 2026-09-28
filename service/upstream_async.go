@@ -203,11 +203,25 @@ func ValidateUpstreamAsyncVideoSubmitDuration(request *http.Request, source any,
 		if !value.Exists() {
 			continue
 		}
-		if value.Type != gjson.Number || value.Num <= 0 || value.Num > float64(maxSeconds) || original.Type != gjson.Number || value.Num != original.Num {
+		seconds, valid := upstreamAsyncVideoDuration(value)
+		originalSeconds, originalValid := upstreamAsyncVideoDuration(original)
+		if !valid || !originalValid || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 || seconds > float64(maxSeconds) || seconds != originalSeconds {
 			return fmt.Errorf("upstream async submit %s conflicts with the validated video duration", path)
 		}
 	}
 	return nil
+}
+
+func upstreamAsyncVideoDuration(value gjson.Result) (float64, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return value.Num, true
+	case gjson.String:
+		seconds, err := strconv.ParseFloat(strings.TrimSpace(value.Str), 64)
+		return seconds, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func ParseUpstreamAsyncTaskID(profile *relaydto.UpstreamAsyncProfile, body []byte) (string, error) {
@@ -289,7 +303,22 @@ func PollUpstreamAsync(ctx context.Context, baseURL, proxy string, profile *rela
 	if err != nil {
 		return nil, err
 	}
-	return client.Do(request)
+	// Keep channel credentials at the configured origin without changing the
+	// shared client's redirect policy for other requests.
+	pollClient := *client
+	pollClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if next.URL.User != nil || next.URL.Fragment != "" || !sameUpstreamAsyncOrigin(request.URL, next.URL) {
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= 10 {
+			return errors.New("upstream async poll redirect limit exceeded")
+		}
+		if client.CheckRedirect != nil {
+			return client.CheckRedirect(next, via)
+		}
+		return nil
+	}
+	return pollClient.Do(request)
 }
 
 func ReadUpstreamAsyncResponse(response *http.Response, limit int64) ([]byte, error) {
@@ -411,19 +440,18 @@ func UpstreamAsyncOperation(action string) string {
 }
 
 func expandUpstreamAsyncTemplate(template string, values UpstreamAsyncTemplateContext, escapePath bool) string {
-	replacements := map[string]string{
-		"{task_id}":        values.TaskID,
-		"{model}":          values.Model,
-		"{upstream_model}": values.UpstreamModel,
-		"{api_key}":        values.APIKey,
+	if escapePath {
+		values.TaskID = url.PathEscape(values.TaskID)
+		values.Model = url.PathEscape(values.Model)
+		values.UpstreamModel = url.PathEscape(values.UpstreamModel)
+		values.APIKey = url.PathEscape(values.APIKey)
 	}
-	for placeholder, value := range replacements {
-		if escapePath {
-			value = url.PathEscape(value)
-		}
-		template = strings.ReplaceAll(template, placeholder, value)
-	}
-	return template
+	return strings.NewReplacer(
+		"{task_id}", values.TaskID,
+		"{model}", values.Model,
+		"{upstream_model}", values.UpstreamModel,
+		"{api_key}", values.APIKey,
+	).Replace(template)
 }
 
 func expandUpstreamAsyncJSON(value any, values UpstreamAsyncTemplateContext, depth int) (any, error) {

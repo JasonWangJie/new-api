@@ -1035,6 +1035,13 @@ func TestUpstreamAsyncRequestAndSubmitParsing(t *testing.T) {
 	assert.Equal(t, "987654321", taskID)
 	_, err = ParseUpstreamAsyncTaskID(profile, []byte(`{"job":{}}`))
 	require.Error(t, err)
+
+	request, err = BuildUpstreamAsyncPollRequest(t.Context(), "https://vendor.example/api", profile, UpstreamAsyncTemplateContext{TaskID: "{model}", Model: "{task_id}"})
+	require.NoError(t, err)
+	assert.Equal(t, "/api/tasks/{model}", request.URL.Path)
+	body, err = io.ReadAll(request.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"task":"{model}","model":"{task_id}"}`, string(body), "template substitutions must preserve opaque task IDs and model values")
 }
 
 func TestUpstreamAsyncCustomSubmitRequest(t *testing.T) {
@@ -1081,10 +1088,25 @@ func TestUpstreamAsyncCustomSubmitRejectsUnsafeTemplates(t *testing.T) {
 	request, err := BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "application/json")
 	require.NoError(t, err)
 	require.NoError(t, ValidateUpstreamAsyncVideoSubmitDuration(request, source, 3600))
+	for _, duration := range []any{float64(4), "4"} {
+		for _, sourceDuration := range []any{4, "4"} {
+			profile.Submit.Request.Body = map[string]any{"seconds": duration}
+			stringSource := map[string]any{"seconds": sourceDuration}
+			request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, stringSource, nil, "application/json")
+			require.NoError(t, err)
+			require.NoError(t, ValidateUpstreamAsyncVideoSubmitDuration(request, stringSource, 3600), "valid numeric string durations must match the validated duration")
+		}
+	}
 	profile.Submit.Request.Body = map[string]any{"seconds": float64(3601)}
 	request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "application/json")
 	require.NoError(t, err)
 	require.ErrorContains(t, ValidateUpstreamAsyncVideoSubmitDuration(request, source, 3600), "validated video duration")
+	for _, invalidDuration := range []any{"0", "-1", "3601", "NaN", "+Inf", "not a duration", true} {
+		profile.Submit.Request.Body = map[string]any{"seconds": invalidDuration}
+		request, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "application/json")
+		require.NoError(t, err)
+		require.ErrorContains(t, ValidateUpstreamAsyncVideoSubmitDuration(request, source, 3600), "validated video duration")
+	}
 	_, err = BuildUpstreamAsyncSubmitRequest(t.Context(), "https://vendor.example", profile, UpstreamAsyncTemplateContext{}, source, nil, "multipart/form-data; boundary=test")
 	require.ErrorContains(t, err, "cannot replace multipart input")
 
@@ -1159,6 +1181,53 @@ func TestUpstreamAsyncDownloadHeadersRequireSameOrigin(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, credentialless)
 	assert.Empty(t, headers)
+}
+
+func TestUpstreamAsyncPollRedirectsKeepCredentialsAtOrigin(t *testing.T) {
+	targetRequests := make(chan http.Header, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetRequests <- request.Header.Clone()
+		_, _ = io.WriteString(writer, `{"job":{"status":"queued"}}`)
+	}))
+	defer target.Close()
+	previousClient := httpClient
+	httpClient = target.Client()
+	t.Cleanup(func() {
+		httpClient.CloseIdleConnections()
+		httpClient = previousClient
+	})
+
+	for _, external := range []bool{true, false} {
+		t.Run(map[bool]string{true: "different port", false: "same origin"}[external], func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, "Bearer channel-secret", request.Header.Get("Authorization"))
+				assert.Equal(t, "channel-secret", request.Header.Get("X-API-Key"))
+				if request.URL.Path == "/tasks/job" {
+					location := "/result"
+					if external {
+						location = target.URL + "/result"
+					}
+					http.Redirect(writer, request, location, http.StatusTemporaryRedirect)
+					return
+				}
+				assert.Equal(t, "/result", request.URL.Path)
+				_, _ = io.WriteString(writer, `{"job":{"status":"queued"}}`)
+			}))
+			defer upstream.Close()
+			profile := upstreamAsyncTestProfile(t, "video")
+			profile.Poll.Request.Headers["X-API-Key"] = "{api_key}"
+			response, err := PollUpstreamAsync(t.Context(), upstream.URL, "", profile, UpstreamAsyncTemplateContext{TaskID: "job", APIKey: "channel-secret"})
+			require.NoError(t, err)
+			require.NotNil(t, response)
+			defer response.Body.Close()
+			if external {
+				assert.Equal(t, http.StatusTemporaryRedirect, response.StatusCode)
+				assert.Empty(t, targetRequests, "poll redirects must not send channel credentials to another origin")
+			} else {
+				assert.Equal(t, http.StatusOK, response.StatusCode)
+			}
+		})
+	}
 }
 
 func TestDynamicUpstreamAsyncVideoPollingUsesFrozenProfile(t *testing.T) {

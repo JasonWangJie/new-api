@@ -2,6 +2,8 @@ package model
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -9,8 +11,63 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
+
+func invoiceDatabaseFixture(t *testing.T, engine string) *gorm.DB {
+	t.Helper()
+	var dialector gorm.Dialector
+	switch engine {
+	case "mysql":
+		dsn := os.Getenv("INVOICE_TEST_MYSQL_DSN")
+		if dsn == "" {
+			t.Skip("INVOICE_TEST_MYSQL_DSN is not configured")
+		}
+		require.Contains(t, dsn, "/new_api_invoice_test", "use the dedicated disposable invoice database")
+		dialector = mysql.Open(dsn)
+	case "postgres":
+		dsn := os.Getenv("INVOICE_TEST_PG_DSN")
+		if dsn == "" {
+			t.Skip("INVOICE_TEST_PG_DSN is not configured")
+		}
+		require.Contains(t, dsn, "dbname=new_api_invoice_test", "use the dedicated disposable invoice database")
+		dialector = postgres.Open(dsn)
+	default:
+		dialector = sqlite.Open(filepath.Join(t.TempDir(), "invoice.db"))
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	if engine == "sqlite" {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	t.Cleanup(func() {
+		assert.NoError(t, db.Migrator().DropTable(&InvoiceOrderClaim{}, &InvoiceRequestItem{}, &InvoiceRequest{}, &SubscriptionOrder{}, &TopUp{}, &User{}))
+		assert.NoError(t, sqlDB.Close())
+	})
+	versionQuery := "SELECT VERSION()"
+	if engine == "sqlite" {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	var version string
+	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("Database version: %s", version)
+	require.NoError(t, db.AutoMigrate(&TopUp{}, &SubscriptionOrder{}, &User{}))
+	return db
+}
+
+func clearInvoiceTestTables(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, entity := range []any{&InvoiceOrderClaim{}, &InvoiceRequestItem{}, &InvoiceRequest{}, &SubscriptionOrder{}, &TopUp{}} {
+			require.NoError(t, DB.Where("1 = 1").Delete(entity).Error)
+		}
+	})
+}
 
 func createInvoiceTestTopUp(t *testing.T, userID int, tradeNo string, money float64) TopUp {
 	t.Helper()
@@ -28,37 +85,59 @@ func createInvoiceTestTopUp(t *testing.T, userID int, tradeNo string, money floa
 	return topUp
 }
 
-func TestInvoiceMigrationSQLite(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	var sqliteVersion string
-	require.NoError(t, db.Raw("SELECT sqlite_version()").Scan(&sqliteVersion).Error)
-	t.Logf("SQLite version: %s", sqliteVersion)
-	require.NoError(t, db.AutoMigrate(&TopUp{}, &SubscriptionOrder{}))
-
-	legacy := TopUp{
-		UserId: 71, TradeNo: "migration-preserved", Money: 12.34,
-		PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusSuccess,
+func TestInvoiceMigrationDatabaseMatrix(t *testing.T) {
+	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			db := invoiceDatabaseFixture(t, engine)
+			legacy := TopUp{
+				UserId: 71, TradeNo: "migration-preserved", Money: 12.34,
+				PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusSuccess,
+			}
+			require.NoError(t, db.Create(&legacy).Error)
+			require.NoError(t, db.AutoMigrate(&InvoiceRequest{}, &InvoiceRequestItem{}, &InvoiceOrderClaim{}))
+			recorder := &migrationSQLRecorder{}
+			db = db.Session(&gorm.Session{Logger: recorder})
+			require.NoError(t, db.AutoMigrate(&InvoiceRequest{}, &InvoiceRequestItem{}, &InvoiceOrderClaim{}))
+			assert.Empty(t, recorder.schemaMutations(), "repeated invoice migration must preserve the schema")
+			var preserved TopUp
+			require.NoError(t, db.Where("id = ?", legacy.Id).First(&preserved).Error)
+			assert.Equal(t, legacy.TradeNo, preserved.TradeNo)
+			require.NoError(t, db.Create(&InvoiceOrderClaim{TopUpId: legacy.Id, RequestId: 1}).Error)
+			require.Error(t, db.Create(&InvoiceOrderClaim{TopUpId: legacy.Id, RequestId: 2}).Error)
+		})
 	}
-	require.NoError(t, db.Create(&legacy).Error)
-	for range 2 {
-		require.NoError(t, db.AutoMigrate(
-			&InvoiceRequest{},
-			&InvoiceRequestItem{},
-			&InvoiceOrderClaim{},
-		))
-	}
-
-	var preserved TopUp
-	require.NoError(t, db.Where("id = ?", legacy.Id).First(&preserved).Error)
-	assert.Equal(t, legacy.TradeNo, preserved.TradeNo)
-	require.NoError(t, db.Create(&InvoiceOrderClaim{TopUpId: legacy.Id, RequestId: 1}).Error)
-	require.Error(t, db.Create(&InvoiceOrderClaim{TopUpId: legacy.Id, RequestId: 2}).Error)
 }
 
 func TestInvoiceWorkflow(t *testing.T) {
+	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			db := invoiceDatabaseFixture(t, engine)
+			require.NoError(t, db.AutoMigrate(&InvoiceRequest{}, &InvoiceRequestItem{}, &InvoiceOrderClaim{}))
+			require.NoError(t, db.AutoMigrate(&InvoiceRequest{}, &InvoiceRequestItem{}, &InvoiceOrderClaim{}))
+			previousDB, previousType := DB, common.MainDatabaseType()
+			DB = db
+			switch engine {
+			case "mysql":
+				common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+			case "postgres":
+				common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+			default:
+				common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+			}
+			initCol()
+			t.Cleanup(func() {
+				DB = previousDB
+				common.SetMainDatabaseType(previousType)
+				initCol()
+			})
+			runInvoiceWorkflow(t)
+		})
+	}
+}
+
+func runInvoiceWorkflow(t *testing.T) {
 	t.Run("eligible orders include verified legacy Epay and exclude unknown or subscription orders", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		explicit := createInvoiceTestTopUp(t, 61, "invoice-explicit", 10)
 		legacy := createInvoiceTestTopUp(t, 61, "USR61NOabc1231700000000", 20)
 		require.NoError(t, DB.Model(&legacy).Update("payment_provider", "").Error)
@@ -86,7 +165,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("amount threshold uses stored two decimal payment amount", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 11, "invoice-threshold", 10.126)
 
 		_, err := CreateUserInvoiceRequest(11, []int{order.Id}, "ACME", "TAX-1", "billing@example.com", 1014)
@@ -100,7 +179,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("payment method is exposed in eligible orders and request details", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 13, "invoice-payment-method", 13)
 
 		eligible, total, err := ListInvoiceEligibleOrders(13, "", &common.PageInfo{Page: 1, PageSize: 20})
@@ -126,7 +205,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("large cross-page selections are processed in database-safe batches", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		topUps := make([]TopUp, 101)
 		for i := range topUps {
 			topUps[i] = TopUp{
@@ -148,7 +227,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("orders cannot be claimed across users or requests", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 21, "invoice-owner", 20)
 
 		_, err := CreateUserInvoiceRequest(22, []int{order.Id}, "Other", "TAX-2", "other@example.com", 0)
@@ -161,7 +240,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("rejection releases claims and preserves the old record", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 31, "invoice-retry", 30)
 		first, err := CreateUserInvoiceRequest(31, []int{order.Id}, "First", "TAX-4", "first@example.com", 0)
 		require.NoError(t, err)
@@ -185,7 +264,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("latest user application supplies the remembered profile", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		firstOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-first", 10)
 		secondOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-second", 20)
 		historyOrder := createInvoiceTestTopUp(t, 91, "invoice-profile-history", 30)
@@ -211,7 +290,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("historical supplement bypasses threshold and records operator", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 41, "invoice-history", 0.01)
 
 		created, err := CreateHistoricalInvoiceRequest(41, []int{order.Id}, "paper invoice", InvoiceOperator{Id: 8, Username: "operator"})
@@ -228,7 +307,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("only one concurrent request can occupy an order", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 51, "invoice-concurrent", 50)
 
 		start := make(chan struct{})
@@ -260,7 +339,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 	})
 
 	t.Run("only one reviewer can transition a pending request", func(t *testing.T) {
-		truncateTables(t)
+		clearInvoiceTestTables(t)
 		order := createInvoiceTestTopUp(t, 81, "invoice-review-race", 80)
 		created, err := CreateUserInvoiceRequest(81, []int{order.Id}, "Review", "TAX-8", "review@example.com", 0)
 		require.NoError(t, err)

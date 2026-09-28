@@ -433,8 +433,11 @@ func validateUpstreamAsyncPath(path string, field string, required bool) error {
 
 func validateUpstreamAsyncRequestURLPath(path, field string) error {
 	trimmed := strings.TrimSpace(path)
+	if path != trimmed {
+		return fmt.Errorf("%s must not contain surrounding whitespace", field)
+	}
 	parsed, err := url.Parse(trimmed)
-	if path != trimmed || err != nil || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || strings.ContainsAny(path, "?#") || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+	if err != nil || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/") || strings.HasPrefix(parsed.Path, "//") || parsed.IsAbs() || parsed.Host != "" || parsed.User != nil || strings.ContainsAny(path, "?#") || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return fmt.Errorf("%s must be a relative absolute-path without query or fragment", field)
 	}
 	return validateUpstreamAsyncTemplates(path, field)
