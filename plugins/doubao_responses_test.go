@@ -1,11 +1,15 @@
 package plugins_test
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,9 +37,126 @@ func TestDoubaoResponsesProtocol(t *testing.T) {
 				"resolution": "1080p",
 			},
 		},
-		wantUsageKeys:  []string{"resolution", "tokens", "video_input"},
+		wantUsageKeys:  []string{"resolution", "seconds", "tokens", "video_input"},
 		wantVendorName: "doubao",
 	})
+}
+
+func TestDoubaoVideoUsageBilling(t *testing.T) {
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	plugin, err := registry.RegisterFactory(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+
+	usage := func(t *testing.T, hook string, args ...any) map[string]any {
+		t.Helper()
+		value, callErr := plugin.Engine.Call(t.Context(), hook, args...)
+		require.NoError(t, callErr)
+		encoded, marshalErr := common.Marshal(value)
+		require.NoError(t, marshalErr)
+		var facts map[string]any
+		require.NoError(t, common.Unmarshal(encoded, &facts))
+		return facts
+	}
+
+	for _, tc := range []struct {
+		name, model, action string
+		request             map[string]any
+		seconds, tokens     float64
+	}{
+		{name: "omitted duration keeps five second default", request: map[string]any{}, seconds: 5, tokens: 108000},
+		{name: "request seconds expose output duration", request: map[string]any{"seconds": 10}, seconds: 10, tokens: 216000},
+		{name: "native metadata duration exposes output duration", request: map[string]any{"metadata": map[string]any{"duration": 8}}, seconds: 8, tokens: 172800},
+		{name: "native frames keep fractional output duration and legacy token estimate", model: "doubao-seedance-1-0-pro-250528", request: map[string]any{"metadata": map[string]any{"frames": 57}}, seconds: 2.375, tokens: 43200},
+		{name: "native frames take precedence for second pricing", model: "doubao-seedance-1-0-pro-250528", request: map[string]any{"seconds": 5, "metadata": map[string]any{"frames": 241}}, seconds: 241.0 / 24, tokens: 108000},
+		{name: "editing excludes input reservation from output seconds", action: "edit_video", request: map[string]any{"duration": 8, "video": "https://cdn.example/input.mp4"}, seconds: 8, tokens: 496800},
+		{name: "extension excludes input reservation from output seconds", action: "extend_video", request: map[string]any{"duration": 5, "video": "https://cdn.example/input.mp4"}, seconds: 5, tokens: 432000},
+		{name: "mapped Seedance 2.5 editing reserves thirty output seconds", model: "doubao-seedance-2-5-260628", action: "edit_video", request: map[string]any{"video": "asset://input-video"}, seconds: 30, tokens: 1296000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := tc.model
+			if model == "" {
+				model = "doubao-seedance-2-0-260128"
+			}
+			facts := usage(t, "extractUsage", map[string]any{
+				"model": "client-alias", "upstreamModel": model, "action": tc.action, "requestBody": tc.request,
+			})
+			assert.Equal(t, tc.seconds, facts["seconds"])
+			assert.Equal(t, tc.tokens, facts["tokens"])
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		body    map[string]any
+		seconds float64
+	}{
+		{name: "successful duration is measured in seconds", body: map[string]any{"duration": 6}, seconds: 6},
+		{name: "numeric duration string preserves fractional seconds", body: map[string]any{"duration": "6.5"}, seconds: 6.5},
+		{name: "frames and frame rate preserve fractional seconds", body: map[string]any{"frames": 57, "framespersecond": 24}, seconds: 2.375},
+		{name: "missing duration retains estimate", body: map[string]any{}},
+		{name: "negative duration retains estimate", body: map[string]any{"duration": -1}},
+		{name: "zero duration retains estimate", body: map[string]any{"duration": 0}},
+		{name: "nonfinite duration retains estimate", body: map[string]any{"duration": "Infinity"}},
+		{name: "invalid numeric duration retains estimate", body: map[string]any{"duration": "NaN"}},
+		{name: "over limit duration retains estimate", body: map[string]any{"duration": 3601}},
+		{name: "boolean duration does not become one second", body: map[string]any{"duration": true}},
+		{name: "empty duration does not become zero seconds", body: map[string]any{"duration": ""}},
+		{name: "zero frame rate retains estimate", body: map[string]any{"frames": 120, "framespersecond": 0}},
+		{name: "over limit frame duration retains estimate", body: map[string]any{"frames": 86401, "framespersecond": 24}},
+		{name: "nonterminal response contributes no measured duration", body: map[string]any{"status": "running", "duration": 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{"status": "succeeded", "usage": map[string]any{"completion_tokens": 216000}}
+			maps.Copy(body, tc.body)
+			facts := usage(t, "extractUsageOnComplete", map[string]any{}, map[string]any{}, body)
+			if tc.seconds == 0 {
+				assert.NotContains(t, facts, "seconds")
+			} else {
+				assert.Equal(t, tc.seconds, facts["seconds"])
+			}
+			if body["status"] == "succeeded" {
+				assert.Equal(t, float64(216000), facts["tokens"])
+			}
+		})
+	}
+
+	submitted := usage(t, "extractUsage", map[string]any{
+		"model": "doubao-seedance-2-0-260128", "requestBody": map[string]any{"seconds": 5},
+	})
+	completed := usage(t, "extractUsageOnComplete", map[string]any{}, map[string]any{}, map[string]any{
+		"status": "succeeded", "duration": 6, "usage": map[string]any{"completion_tokens": 216000},
+	})
+	for _, tc := range []struct {
+		name, expression string
+		estimated, final int
+	}{
+		{name: "second pricing settles actual duration", expression: `tier("base", u("seconds") * 0.10)`, estimated: 1000, final: 1200},
+		{name: "per task pricing ignores duration and tokens", expression: `tier("base", 0.50)`, estimated: 1000, final: 1000},
+		{name: "existing token pricing settles actual tokens", expression: `tier("base", u("tokens") * 10 / 1000000)`, estimated: 2160, final: 4320},
+		{name: "explicit zero remains free", expression: `tier("base", u("seconds") * 0)`, estimated: 0, final: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, billing_setting.SmokeTestTaskExpr(tc.expression, plugin.Meta.UsageSchema))
+			snap := &billingexpr.BillingSnapshot{
+				ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression),
+				ExprVersion: billingexpr.ExprVersion(tc.expression), TaskUsageBilling: true,
+				QuotaPerUnit: 1000, GroupRatio: 2, UsageFacts: submitted,
+			}
+			estimate, err := billingexpr.ComputeTieredQuotaWithRequest(snap, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: submitted})
+			require.NoError(t, err)
+			assert.Equal(t, tc.estimated, estimate.ActualQuotaAfterGroup)
+			settled, facts, err := service.EvaluateTaskCompletionUsage(snap, completed)
+			require.NoError(t, err)
+			assert.Equal(t, tc.final, settled.ActualQuotaAfterGroup)
+			assert.Equal(t, float64(6), facts["seconds"])
+			assert.Equal(t, float64(5), snap.UsageFacts["seconds"])
+			retained, _, err := service.EvaluateTaskCompletionUsage(snap, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tc.estimated, retained.ActualQuotaAfterGroup)
+		})
+	}
 }
 
 func TestDoubaoVideoReferencesAndProfiles(t *testing.T) {

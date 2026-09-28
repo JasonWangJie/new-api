@@ -69,7 +69,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.2.0",
+  version: "1.3.0",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -84,6 +84,12 @@ export const meta = {
   ],
   fetchMode: "per_task",
   usageSchema: {
+    // Output duration only; reference video duration remains part of token billing.
+    seconds: {
+      type: "number",
+      unit: "second",
+      description: { en: "Video generation unit price", zh: "视频生成单价" },
+    },
     // Upstream billing tokens (estimated at submit, actual on completion).
     tokens: {
       type: "number",
@@ -111,12 +117,12 @@ export const meta = {
   // Official Ark formula tokens = (input + output seconds) × W × H × 24 / 1024,
   // 16:9 max-pixel sizes, cross-checked against Volcengine price examples.
   usageExamples: [
-    { label: "480p · 5s", facts: { tokens: 48038, resolution: "480p", video_input: "none" } },
-    { label: "720p · 5s", facts: { tokens: 108000, resolution: "720p", video_input: "none" } },
-    { label: "1080p · 5s", facts: { tokens: 243000, resolution: "1080p", video_input: "none" } },
-    { label: "4k · 5s", facts: { tokens: 972000, resolution: "4k", video_input: "none" } },
-    { label: "720p · 10s", facts: { tokens: 216000, resolution: "720p", video_input: "none" } },
-    { label: "720p · 5s (+4s 输入视频)", facts: { tokens: 194400, resolution: "720p", video_input: "video" } },
+    { label: "480p · 5s", facts: { seconds: 5, tokens: 48038, resolution: "480p", video_input: "none" } },
+    { label: "720p · 5s", facts: { seconds: 5, tokens: 108000, resolution: "720p", video_input: "none" } },
+    { label: "1080p · 5s", facts: { seconds: 5, tokens: 243000, resolution: "1080p", video_input: "none" } },
+    { label: "4k · 5s", facts: { seconds: 5, tokens: 972000, resolution: "4k", video_input: "none" } },
+    { label: "720p · 10s", facts: { seconds: 10, tokens: 216000, resolution: "720p", video_input: "none" } },
+    { label: "720p · 5s (+4s 输入视频)", facts: { seconds: 5, tokens: 194400, resolution: "720p", video_input: "video" } },
   ],
   videoProfiles: [
     {
@@ -685,16 +691,24 @@ export function extractUsage(ctx) {
   }
   if (seconds <= 0) seconds = 5;
   seconds = Math.min(seconds, 3600);
+  let outputSeconds = seconds;
+  // Ark frames take precedence over duration and may describe fractional seconds.
+  const frames = Number(metadata.frames);
+  if ((typeof metadata.frames === "number" || typeof metadata.frames === "string") && Number.isInteger(frames) && frames > 0) {
+    outputSeconds = Math.min(frames / 24, 3600);
+  }
   if (ctx.action === "edit_video" || ctx.action === "extend_video") {
     const inputSeconds = (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628" ? 30 : 15;
-    const outputSeconds = ctx.action === "edit_video" && (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628" ? 30 : seconds;
-    seconds = inputSeconds + outputSeconds;
+    const tokenOutputSeconds = ctx.action === "edit_video" && (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628" ? 30 : seconds;
+    seconds = inputSeconds + tokenOutputSeconds;
+    if (ctx.action === "edit_video" && (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628") outputSeconds = 30;
   }
   const rawResolution = req.resolution || metadata.resolution || req.size;
   const raw = trimmed(rawResolution).toLowerCase();
   const recognized = ["480p", "720p", "1080p", "4k"].includes(raw) || raw.replace("*", "x").split("x").length === 2;
   const resolution = recognized ? normalizeResolution(rawResolution) : "720p";
   return {
+    seconds: outputSeconds,
     tokens: estimateTokens(seconds, resolution),
     resolution,
     video_input: hasVideo(content) ? "video" : "none",
@@ -758,6 +772,26 @@ export function extractUsageOnComplete(task, taskResult, body) {
   let tokens = Number(usage.completion_tokens);
   if (!Number.isFinite(tokens) || tokens <= 0) tokens = Number(usage.total_tokens);
   if (Number.isFinite(tokens) && tokens > 0) facts.tokens = tokens;
+  // Official query responses return duration or frames + framespersecond.
+  // Invalid or missing output duration must not replace the frozen estimate.
+  let seconds = NaN;
+  if (typeof body.duration === "number" || typeof body.duration === "string") {
+    seconds = Number(body.duration);
+  } else {
+    const frames = Number(body.frames);
+    const frameRate = Number(body.framespersecond);
+    if (
+      (typeof body.frames === "number" || typeof body.frames === "string") &&
+      (typeof body.framespersecond === "number" || typeof body.framespersecond === "string") &&
+      Number.isInteger(frames) &&
+      frames > 0 &&
+      Number.isFinite(frameRate) &&
+      frameRate > 0
+    ) {
+      seconds = frames / frameRate;
+    }
+  }
+  if (Number.isFinite(seconds) && seconds > 0 && seconds <= 3600) facts.seconds = seconds;
   const content = body.content || {};
   const resolution = trimmed(content.resolution || body.resolution).toLowerCase();
   if (["480p", "720p", "1080p", "4k"].includes(resolution)) facts.resolution = resolution;
