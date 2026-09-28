@@ -317,7 +317,7 @@ func readH2TestRequest(framer *http2.Framer) (uint32, []byte, error) {
 	}
 }
 
-func writeH2TestResponse(framer *http2.Framer, streamID uint32) error {
+func serveH2TestResponse(conn net.Conn, framer *http2.Framer, streamID uint32) error {
 	var hpackBuf bytes.Buffer
 	henc := hpack.NewEncoder(&hpackBuf)
 	if err := henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"}); err != nil {
@@ -330,7 +330,22 @@ func writeH2TestResponse(framer *http2.Framer, streamID uint32) error {
 	}); err != nil {
 		return err
 	}
-	return framer.WriteData(streamID, true, []byte(`{}`))
+	if err := framer.WriteData(streamID, true, []byte(`{}`)); err != nil {
+		return err
+	}
+
+	// Send an orderly EOF after the response and drain any remaining control
+	// frames. Closing both directions with unread bytes can reset the socket
+	// before the client receives the complete response on Windows.
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return fmt.Errorf("HTTP/2 test connection must use TCP")
+	}
+	if err := tcpConn.CloseWrite(); err != nil {
+		return err
+	}
+	_, err := io.Copy(io.Discard, conn)
+	return err
 }
 
 func awaitH2ServerResult(t *testing.T, resultCh <-chan h2ServerResult) h2ServerResult {
@@ -407,7 +422,7 @@ func runResetOnFirstStreamServer(ln net.Listener, expectRetry bool) <-chan h2Ser
 				continue
 			}
 
-			if err := writeH2TestResponse(framer, streamID); err != nil {
+			if err := serveH2TestResponse(conn, framer, streamID); err != nil {
 				res.err = err
 			}
 			return
@@ -461,7 +476,7 @@ func runGoAwayAfterFirstRequestServer(ln net.Listener) <-chan h2ServerResult {
 				continue
 			}
 
-			err = writeH2TestResponse(framer, streamID)
+			err = serveH2TestResponse(conn, framer, streamID)
 			conn.Close()
 			if err != nil {
 				res.err = err
