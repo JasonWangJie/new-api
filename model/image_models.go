@@ -19,6 +19,7 @@ const (
 	ImageTaskBillingFailed     = "billing_failed"
 	ImageTaskSucceeded         = "succeeded"
 	ImageTaskFailed            = "failed"
+	ImageResultSourceUpstream  = "upstream"
 	ImageTaskExpired           = "expired"
 	ImageTaskExecutionUnknown  = "execution_unknown"
 )
@@ -90,6 +91,7 @@ type AsyncImageTask struct {
 	ActualSize            string `json:"actual_size" gorm:"size:255"`
 	ImageCount            int    `json:"image_count"`
 	ResultCount           int    `json:"result_count"`
+	ResultSource          string `json:"result_source,omitempty" gorm:"size:16"`
 	Quota                 int    `json:"quota"`
 	RetryCount            int    `json:"retry_count"`
 	StorageRetryCount     int    `json:"storage_retry_count"`

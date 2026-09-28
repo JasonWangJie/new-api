@@ -16,7 +16,12 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type AsyncImageExecutor func(context.Context, model.AsyncImageTask, AsyncImageRequest, *model.Channel, ImageRuntimeConfig, func() error) ([]ImageBytes, model.AsyncImageBill, error)
+type AsyncImageOutput struct {
+	Images       []ImageBytes
+	UpstreamURLs []string
+}
+
+type AsyncImageExecutor func(context.Context, model.AsyncImageTask, AsyncImageRequest, *model.Channel, ImageRuntimeConfig, func() error) (*AsyncImageOutput, model.AsyncImageBill, error)
 
 var ExecuteAsyncImageFunc AsyncImageExecutor
 
@@ -409,7 +414,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		}
 		return model.DB.WithContext(attemptCtx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error
 	}
-	images, bill, err := ExecuteAsyncImageFunc(attemptCtx, *task, request, channel, cfg, beforeInvoke)
+	output, bill, err := ExecuteAsyncImageFunc(attemptCtx, *task, request, channel, cfg, beforeInvoke)
 	if reloadErr := model.DB.WithContext(context.WithoutCancel(ctx)).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; reloadErr != nil {
 		return reloadErr
 	}
@@ -441,13 +446,30 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return err
 	}
 	task.Attempts = string(encoded)
-	staging := make([]model.AsyncImageStagingObject, len(images))
-	for i, image := range images {
-		staging[i] = model.AsyncImageStagingObject{Data: image.Data, ContentType: image.ContentType, Checksum: image.Checksum, Width: image.Width, Height: image.Height}
+	if output == nil {
+		return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, &AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: "Upstream image output is missing"}, cfg)
 	}
-	if err := model.StageAsyncImageOutput(ctx, *task, staging, bill); err != nil {
-		if errors.Is(err, model.ErrImageConflict) {
-			return err
+	var persistErr error
+	if len(output.UpstreamURLs) > 0 {
+		if len(output.Images) > 0 {
+			return model.ErrImageConflict
+		}
+		for _, resultURL := range output.UpstreamURLs {
+			if !PublicUpstreamAsyncResultURL(resultURL) {
+				return model.ErrImageConflict
+			}
+		}
+		persistErr = model.StageAsyncImageUpstreamOutput(context.WithoutCancel(ctx), *task, output.UpstreamURLs, bill)
+	} else {
+		staging := make([]model.AsyncImageStagingObject, len(output.Images))
+		for i, image := range output.Images {
+			staging[i] = model.AsyncImageStagingObject{Data: image.Data, ContentType: image.ContentType, Checksum: image.Checksum, Width: image.Width, Height: image.Height}
+		}
+		persistErr = model.StageAsyncImageOutput(ctx, *task, staging, bill)
+	}
+	if persistErr != nil {
+		if errors.Is(persistErr, model.ErrImageConflict) {
+			return persistErr
 		}
 		if task.UpstreamTaskId != "" {
 			return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, &AsyncImageFailure{Code: 606, InternalCode: "output_persist_failed", Message: "Upstream output could not be durably persisted"}, cfg)

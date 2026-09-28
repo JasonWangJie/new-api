@@ -270,6 +270,9 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	displayStatus := task.DisplayStatus()
 	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(displayStatus), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": displayStatus, "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
+	if task.ResultSource != "" {
+		data["result_source"] = task.ResultSource
+	}
 	if task.FinishedAt > 0 {
 		data["duration_ms"] = max(0, task.FinishedAt-task.CreatedAt) * 1000
 	}
@@ -322,7 +325,7 @@ func GetImageTask(c *gin.Context, admin bool) {
 		}
 	}
 	results := make([]gin.H, 0)
-	if task.ResultsAvailable() {
+	if task.ResultsAvailable() && task.ResultSource != model.ImageResultSourceUpstream {
 		var saved []model.AsyncImageResult
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", task.TaskId).Order("image_index").Find(&saved).Error; err != nil {
 			imageManagementError(c, 503, err)
@@ -364,17 +367,13 @@ func GetImageTask(c *gin.Context, admin bool) {
 			results = append(results, item)
 		}
 	}
-	if !task.ResultsAvailable() && task.ErrorCode == "result_download_failed" && (!task.Terminal() || task.ExpiresAt == 0 || task.ExpiresAt > common.GetTimestamp()) {
-		urls, err := model.GetAsyncImageUpstreamResultURLs(c.Request.Context(), task.TaskId)
+	if task.ResultsAvailable() && task.ResultSource == model.ImageResultSourceUpstream {
+		urls, err := service.AsyncImageUpstreamResultURLs(c.Request.Context(), task)
 		if err != nil {
 			imageManagementError(c, 503, err)
 			return
 		}
 		for i, resultURL := range urls {
-			if !service.PublicUpstreamAsyncResultURL(resultURL) {
-				results = results[:0]
-				break
-			}
 			results = append(results, gin.H{"id": i, "image_index": i, "url": resultURL, "view_url": resultURL, "source": "upstream", "content_type": "", "byte_size": 0, "checksum": "", "width": 0, "height": 0, "created_at": task.UpstreamSucceededAt, "expires_at": task.ExpiresAt})
 		}
 	}
@@ -382,9 +381,6 @@ func GetImageTask(c *gin.Context, admin bool) {
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
-	}
-	if len(results) > 0 && !task.ResultsAvailable() {
-		items[0]["result_count"], items[0]["result_source"] = len(results), "upstream"
 	}
 	imageManagementData(c, gin.H{"task": items[0], "results": results, "events": events})
 }
@@ -403,6 +399,24 @@ func ViewImageTaskResult(c *gin.Context, admin bool) {
 	index, err := strconv.Atoi(c.Param("image_index"))
 	if err != nil || index < 0 {
 		imageManagementError(c, 400, errors.New("Invalid image index"))
+		return
+	}
+	if task.ResultSource == model.ImageResultSourceUpstream {
+		urls, err := service.AsyncImageUpstreamResultURLs(ctx, task)
+		if err != nil {
+			imageManagementError(c, 503, err)
+			return
+		}
+		if index >= len(urls) {
+			imageManagementError(c, 404, errors.New("Image task result was not found"))
+			return
+		}
+		c.Header("Cache-Control", "private, no-store")
+		if strings.Contains(c.GetHeader("Accept"), "application/json") {
+			imageManagementData(c, gin.H{"url": urls[index], "expires_at": task.ExpiresAt, "source": "upstream"})
+			return
+		}
+		c.Redirect(http.StatusTemporaryRedirect, urls[index])
 		return
 	}
 	var result model.AsyncImageResult

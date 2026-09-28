@@ -158,8 +158,12 @@ func RecordAsyncImageUpstreamResult(ctx context.Context, task AsyncImageTask, ur
 }
 
 func GetAsyncImageUpstreamResultURLs(ctx context.Context, taskID string) ([]string, error) {
+	return getAsyncImageUpstreamResultURLs(DB.WithContext(ctx), taskID)
+}
+
+func getAsyncImageUpstreamResultURLs(db *gorm.DB, taskID string) ([]string, error) {
 	var event AsyncImageEvent
-	err := DB.WithContext(ctx).Where("task_id = ? AND event_type = ?", taskID, upstreamImageResultEvent).Take(&event).Error
+	err := db.Where("task_id = ? AND event_type = ?", taskID, upstreamImageResultEvent).Take(&event).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -249,7 +253,7 @@ func CompleteAsyncImageTask(ctx context.Context, task AsyncImageTask, autoArchiv
 			billingStatus = "not_billable"
 		}
 		now := time.Now().Unix()
-		updated := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ? AND result_count = image_count AND result_count > 0", task.TaskId, task.Version, ImageTaskBillingPending, task.LeaseToken, now).Updates(map[string]any{"status": ImageTaskSucceeded, "billing_status": billingStatus, "request_cipher": nil, "lease_token": "", "lease_expires_at": 0, "version": task.Version + 1, "progress": 100, "finished_at": now, "updated_at": now})
+		updated := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ? AND result_count = image_count AND result_count > 0", task.TaskId, task.Version, ImageTaskBillingPending, task.LeaseToken, now).Updates(map[string]any{"status": ImageTaskSucceeded, "billing_status": billingStatus, "request_cipher": nil, "lease_token": "", "lease_expires_at": 0, "version": task.Version + 1, "progress": 100, "finished_at": now, "updated_at": now, "next_attempt_at": 0, "error_code": "", "error_message": "", "public_error_code": 0})
 		if updated.Error != nil {
 			return updated.Error
 		}
@@ -263,7 +267,7 @@ func CompleteAsyncImageTask(ctx context.Context, task AsyncImageTask, autoArchiv
 		if err := tx.Create(&event).Error; err != nil {
 			return err
 		}
-		if autoArchive {
+		if autoArchive && task.ResultSource != ImageResultSourceUpstream {
 			return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: "library_archive", AggregateId: task.TaskId, Status: "pending", CreatedAt: now, NextAttemptAt: now}).Error
 		}
 		return nil

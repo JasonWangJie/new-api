@@ -313,8 +313,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.Equal(t, http.StatusOK, queryRecorder.Code)
 			var queried gin.H
 			require.NoError(t, common.Unmarshal(queryRecorder.Body.Bytes(), &queried))
-			assert.Equal(t, "upstream", queried["result_source"])
-			assert.Equal(t, []any{map[string]any{"url": latestURL}}, queried["data"])
+			assert.Empty(t, queried["data"], "unsettled fallback results must not be released")
+			assert.NotContains(t, queryRecorder.Body.String(), latestURL)
 			otherRecorder := httptest.NewRecorder()
 			otherContext, _ := gin.CreateTestContext(otherRecorder)
 			otherContext.Set("id", 102)
@@ -339,9 +339,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			}
 			require.NoError(t, common.Unmarshal(detailRecorder.Body.Bytes(), &fallbackDetail))
-			require.Len(t, fallbackDetail.Data.Results, 1)
-			assert.Equal(t, latestURL, fallbackDetail.Data.Results[0]["url"])
-			assert.Equal(t, "upstream", fallbackDetail.Data.Results[0]["source"])
+			assert.Empty(t, fallbackDetail.Data.Results, "unsettled fallback results must not be released")
+			assert.NotContains(t, detailRecorder.Body.String(), latestURL)
 			require.Len(t, fallbackDetail.Data.Events, 2, "legacy repeated poll events should display once")
 			assert.Equal(t, "", fallbackDetail.Data.Events[0].Message)
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -69,7 +70,19 @@ func SelectImageFunding(ctx context.Context, userId, amount int, preference stri
 
 // StageAsyncImageOutput fixes the entire output and bill in one main-DB commit.
 func StageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []AsyncImageStagingObject, bill AsyncImageBill) error {
-	if len(images) == 0 || len(images) > dto.MaxImageN || bill.Quota < 0 || bill.Quota > math.MaxInt32 || bill.TaskId != task.TaskId || bill.TokenId != task.TokenId || bill.UserId != task.UserId || bill.Fingerprint == "" || bill.BillingRequestId != "async-image:"+task.TaskId {
+	return stageAsyncImageOutput(ctx, task, images, nil, bill)
+}
+
+// StageAsyncImageUpstreamOutput fixes the public result manifest and bill
+// without creating local storage objects for media that was not downloaded.
+func StageAsyncImageUpstreamOutput(ctx context.Context, task AsyncImageTask, urls []string, bill AsyncImageBill) error {
+	return stageAsyncImageOutput(ctx, task, nil, urls, bill)
+}
+
+func stageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []AsyncImageStagingObject, urls []string, bill AsyncImageBill) error {
+	count := len(images) + len(urls)
+	if count == 0 || count > dto.MaxImageN || len(images) > 0 && len(urls) > 0 ||
+		bill.Quota < 0 || bill.Quota > math.MaxInt32 || bill.TaskId != task.TaskId || bill.TokenId != task.TokenId || bill.UserId != task.UserId || bill.Fingerprint == "" || bill.BillingRequestId != "async-image:"+task.TaskId {
 		return errors.New("invalid immutable image output")
 	}
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -82,12 +95,28 @@ func StageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []As
 		if len(actualSize) > 250 {
 			actualSize = actualSize[:250] + "..."
 		}
-		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now).Updates(map[string]any{"status": ImageTaskUpstreamSucceeded, "version": task.Version + 1, "updated_at": now, "upstream_succeeded_at": now, "request_cipher": nil, "image_count": len(images), "quota": bill.Quota, "billing_status": "pending", "progress": 65, "attempts": task.Attempts, "actual_size": actualSize, "error_code": "", "error_message": "", "public_error_code": 0})
+		status, source, resultCount, progress := ImageTaskUpstreamSucceeded, "", 0, 65
+		if len(urls) > 0 {
+			if task.UpstreamTaskId == "" {
+				return ErrImageConflict
+			}
+			status, source, resultCount, progress = ImageTaskBillingPending, ImageResultSourceUpstream, count, 85
+		}
+		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now).Updates(map[string]any{"status": status, "version": task.Version + 1, "updated_at": now, "upstream_succeeded_at": now, "request_cipher": nil, "image_count": count, "result_count": resultCount, "result_source": source, "quota": bill.Quota, "billing_status": "pending", "progress": progress, "attempts": task.Attempts, "actual_size": actualSize, "error_code": "", "error_message": "", "public_error_code": 0})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return ErrImageConflict
+		}
+		if len(urls) > 0 {
+			recorded, err := getAsyncImageUpstreamResultURLs(tx, task.TaskId)
+			if err != nil {
+				return err
+			}
+			if !slices.Equal(recorded, urls) {
+				return ErrImageConflict
+			}
 		}
 		for index := range images {
 			image := &images[index]
@@ -145,7 +174,15 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 		if err := tx.Model(&AsyncImageResult{}).Where("task_id = ?", taskId).Count(&resultCount).Error; err != nil {
 			return err
 		}
-		if resultCount != int64(task.ImageCount) {
+		if task.ResultSource == ImageResultSourceUpstream {
+			urls, err := getAsyncImageUpstreamResultURLs(tx, taskId)
+			if err != nil {
+				return err
+			}
+			if resultCount != 0 || len(urls) != task.ImageCount {
+				return ErrImageConflict
+			}
+		} else if task.ResultSource != "" || resultCount != int64(task.ImageCount) {
 			return ErrImageConflict
 		}
 		var user User

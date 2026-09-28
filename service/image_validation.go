@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	_ "golang.org/x/image/webp"
 )
@@ -476,6 +477,27 @@ func PublicUpstreamAsyncResultURL(raw string) bool {
 		!strings.HasSuffix(host, ".localhost") && !strings.HasSuffix(host, ".local") &&
 		!strings.HasSuffix(host, ".internal") && !strings.HasSuffix(host, ".test") &&
 		!strings.HasSuffix(host, ".invalid")
+}
+
+// AsyncImageUpstreamResultURLs exposes fallback media only after the frozen
+// bill, financial transaction and consumption log have completed.
+func AsyncImageUpstreamResultURLs(ctx context.Context, task model.AsyncImageTask) ([]string, error) {
+	if task.ResultSource != model.ImageResultSourceUpstream || !task.ResultsAvailable() {
+		return nil, nil
+	}
+	urls, err := model.GetAsyncImageUpstreamResultURLs(ctx, task.TaskId)
+	if err != nil {
+		return nil, err
+	}
+	if len(urls) != task.ResultCount || len(urls) == 0 {
+		return nil, errors.New("upstream image result manifest is incomplete")
+	}
+	for _, resultURL := range urls {
+		if !PublicUpstreamAsyncResultURL(resultURL) {
+			return nil, errors.New("upstream image result is not public")
+		}
+	}
+	return urls, nil
 }
 
 func (image ImageBytes) DataURL() string {

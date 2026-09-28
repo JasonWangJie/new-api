@@ -114,6 +114,10 @@ func FixAsyncImageBill(c *gin.Context, task model.AsyncImageTask, info *relaycom
 	other.SetPublic("async_image", true)
 	other.SetPublic("image_count", count)
 	other.SetPublic("image_billing_specifications", specifications)
+	if c.GetString("async_image_result_source") == "upstream" {
+		other.SetPublic("result_source", "upstream")
+		other.SetPublic("image_billing_specification_source", "request")
+	}
 	if tieredResult != nil {
 		InjectTieredBillingInfo(other, info, tieredResult)
 	}
@@ -149,16 +153,26 @@ func ImageBillingSpecifications(request AsyncImageRequest, images []ImageBytes) 
 	specifications := make([]map[string]any, len(images))
 	for i, image := range images {
 		tier := request.Resolution
-		if !request.ExplicitTier || tier == "" || tier == "AUTO" {
+		if image.Width > 0 && image.Height > 0 && (!request.ExplicitTier || tier == "" || tier == "AUTO") {
 			tier = ImageNativeTier(image.Width, image.Height, request.Platform)
 			if width, height, native := imageDimensions(request.Size); native && request.Platform == "openai" && !request.ExplicitTier {
+				tier = ImageNativeTier(width, height, request.Platform)
+			}
+		}
+		if image.Width == 0 && image.Height == 0 && !request.ExplicitTier && request.Platform == "openai" {
+			if width, height, native := imageDimensions(request.Size); native {
 				tier = ImageNativeTier(width, height, request.Platform)
 			}
 		}
 		if tier == "0.5K" {
 			tier = "1K"
 		}
-		specifications[i] = map[string]any{"model": request.Model, "n": request.Count, "size": fmt.Sprintf("%dx%d", image.Width, image.Height), "resolution": tier, "billing_resolution": tier, "actual_width": image.Width, "actual_height": image.Height}
+		specifications[i] = map[string]any{"model": request.Model, "n": request.Count, "resolution": tier, "billing_resolution": tier}
+		if image.Width > 0 && image.Height > 0 {
+			specifications[i]["size"] = fmt.Sprintf("%dx%d", image.Width, image.Height)
+			specifications[i]["actual_width"] = image.Width
+			specifications[i]["actual_height"] = image.Height
+		}
 		if request.Size != "" && request.Size != "auto" && request.Platform == "openai" {
 			specifications[i]["size"] = request.Size
 		}

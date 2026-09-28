@@ -153,7 +153,7 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 	return snapshot.Price.QuotaToPreConsume, err
 }
 
-func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) ([]service.ImageBytes, model.AsyncImageBill, error) {
+func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
 		return nil, model.AsyncImageBill{}, err
@@ -574,6 +574,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 	}
 	var images []service.ImageBytes
+	var upstreamURLs []string
 	if rawURLs, exists := c.Get(contextKeyUpstreamAsyncImageURLs); exists {
 		urls, valid := rawURLs.([]string)
 		profileValue, profileExists := c.Get(contextKeyUpstreamAsyncImageProfile)
@@ -600,6 +601,15 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			UpstreamModel: info.UpstreamModelName,
 			APIKey:        info.ApiKey,
 		}, cfg)
+		if errors.Is(err, service.ErrUpstreamAsyncImageTransport) && len(publicURLs) == len(urls) &&
+			(task.TransientRetryCount >= cfg.TransientRetries || task.RetryCount >= cfg.TotalRetries) {
+			upstreamURLs = publicURLs
+			// Only quantity and the original request specification are known when
+			// downloading fails. Do not invent output dimensions or token usage.
+			images = make([]service.ImageBytes, len(upstreamURLs))
+			c.Set("async_image_result_source", "upstream")
+			err = nil
+		}
 	} else {
 		images, err = ExtractAsyncImageOutputs(ctx, writer.Body.Bytes(), request.Platform, cfg)
 	}
@@ -617,7 +627,10 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "bill_preparation_failed", Message: err.Error(), ExecutionUnknown: true}
 	}
-	return images, bill, nil
+	if len(upstreamURLs) > 0 {
+		return &service.AsyncImageOutput{UpstreamURLs: upstreamURLs}, bill, nil
+	}
+	return &service.AsyncImageOutput{Images: images}, bill, nil
 }
 
 func classifyAsyncImageOutputFailure(task model.AsyncImageTask, err error) *service.AsyncImageFailure {

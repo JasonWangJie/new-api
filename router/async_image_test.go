@@ -326,7 +326,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
 	valid, err := service.ValidateImageBytes(bitmap.Bytes(), "image/png", 1<<20, 100)
 	require.NoError(t, err)
-	service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, _ service.AsyncImageRequest, selected *model.Channel, _ service.ImageRuntimeConfig, dispatch func() error) ([]service.ImageBytes, model.AsyncImageBill, error) {
+	service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, _ service.AsyncImageRequest, selected *model.Channel, _ service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 		invocations++
 		require.Equal(t, channel.Id, selected.Id)
 		if err := dispatch(); err != nil {
@@ -338,7 +338,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		if err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
-		return []service.ImageBytes{valid, valid}, model.AsyncImageBill{TaskId: task.TaskId, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, BillingRequestId: log.RequestId, Fingerprint: "fixed-api-bill", Quota: 50, FundingSource: "wallet", LogPayload: string(encoded)}, nil
+		return &service.AsyncImageOutput{Images: []service.ImageBytes{valid, valid}}, model.AsyncImageBill{TaskId: task.TaskId, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, BillingRequestId: log.RequestId, Fingerprint: "fixed-api-bill", Quota: 50, FundingSource: "wallet", LogPayload: string(encoded)}, nil
 	}
 	require.NoError(t, service.RunAsyncImageTask(context.Background(), payload.TaskId))
 	var task model.AsyncImageTask
@@ -444,7 +444,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		TaskId string `json:"task_id"`
 	}
 	require.NoError(t, common.Unmarshal(panicAdmission.Body.Bytes(), &interrupted))
-	service.ExecuteAsyncImageFunc = func(_ context.Context, _ model.AsyncImageTask, _ service.AsyncImageRequest, _ *model.Channel, _ service.ImageRuntimeConfig, dispatch func() error) ([]service.ImageBytes, model.AsyncImageBill, error) {
+	service.ExecuteAsyncImageFunc = func(_ context.Context, _ model.AsyncImageTask, _ service.AsyncImageRequest, _ *model.Channel, _ service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 		require.NoError(t, dispatch())
 		panic("synthetic interruption after dispatch")
 	}
@@ -519,7 +519,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("base_url", upstream.URL).Error)
 		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 1000000).Error)
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
-		service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, native service.AsyncImageRequest, selected *model.Channel, runtime service.ImageRuntimeConfig, dispatch func() error) ([]service.ImageBytes, model.AsyncImageBill, error) {
+		service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, native service.AsyncImageRequest, selected *model.Channel, runtime service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 			images, bill, err := relay.ExecuteAsyncImage(ctx, task, native, selected, runtime, dispatch)
 			if err == nil {
 				err = model.DB.Model(&model.ImageStorageProfile{}).Where("profile_id = ?", profile.ProfileId).Update("active", false).Error

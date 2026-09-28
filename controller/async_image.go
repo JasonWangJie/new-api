@@ -242,6 +242,23 @@ func QueryAsyncImage(c *gin.Context) {
 		}
 	}
 	if task.ResultsAvailable() {
+		if task.ResultSource == model.ImageResultSourceUpstream {
+			urls, err := service.AsyncImageUpstreamResultURLs(ctx, task)
+			if err != nil {
+				AsyncImagePublicError(c, 503, "storage_unavailable", "Upstream image results are unavailable")
+				return
+			}
+			data := make([]gin.H, len(urls))
+			for i, resultURL := range urls {
+				data[i] = gin.H{"url": resultURL}
+			}
+			response["status"], response["data"], response["result_source"] = "succeeded", data, model.ImageResultSourceUpstream
+			if strings.Contains(c.Request.URL.Path, "/media/") {
+				response["storage_status"] = "upstream"
+			}
+			c.JSON(http.StatusOK, response)
+			return
+		}
 		cfg, err := service.GetImageRuntimeConfig(ctx)
 		if err != nil {
 			AsyncImagePublicError(c, 503, "storage_unavailable", "Image links are unavailable")
@@ -274,26 +291,6 @@ func QueryAsyncImage(c *gin.Context) {
 		response["data"] = data
 		c.JSON(200, response)
 		return
-	}
-	if task.ErrorCode == "result_download_failed" {
-		urls, err := model.GetAsyncImageUpstreamResultURLs(ctx, task.TaskId)
-		if err != nil {
-			AsyncImagePublicError(c, 503, "database_unavailable", "Upstream image results are unavailable")
-			return
-		}
-		if len(urls) > 0 {
-			data := make([]gin.H, 0, len(urls))
-			for _, resultURL := range urls {
-				if !service.PublicUpstreamAsyncResultURL(resultURL) {
-					data = nil
-					break
-				}
-				data = append(data, gin.H{"url": resultURL})
-			}
-			if len(data) == len(urls) {
-				response["data"], response["result_source"] = data, "upstream"
-			}
-		}
 	}
 	if task.Terminal() || (task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed) && task.NextAttemptAt == 0 {
 		code := task.PublicErrorCode
