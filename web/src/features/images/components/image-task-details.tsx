@@ -20,7 +20,6 @@ import { useQuery } from '@tanstack/react-query'
 import { ArrowUpRight, Ban, ChevronDown } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
@@ -167,19 +166,6 @@ export function ImageTaskDetails(props: {
     enabled: results.length > 0 && task.data?.task.media_type !== 'video',
     staleTime: 60_000,
   })
-  const archive = async (index: string) => {
-    try {
-      await imageRequest('/api/user/image-library/from-task', 'POST', {
-        task_id: props.id,
-        image_index: Number(index),
-      })
-      toast.success(t('Archived to server storage'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    }
-  }
   const data = task.data?.task
   let references: string[] = []
   if (props.admin && data?.reference_urls) {
@@ -647,24 +633,7 @@ export function ImageTaskDetails(props: {
             )}
             {data.media_type !== 'video' &&
               (images.data?.length ? (
-                <ImageResults
-                  images={images.data}
-                  previewMode='original'
-                  actions={
-                    !props.admin &&
-                    !results.some((result) => result.source === 'upstream')
-                      ? (index) => (
-                          <Button
-                            size='sm'
-                            variant='outline'
-                            onClick={() => void archive(index)}
-                          >
-                            {t('Archive to server')}
-                          </Button>
-                        )
-                      : undefined
-                  }
-                />
+                <ImageResults images={images.data} previewMode='original' />
               ) : (
                 !images.isLoading &&
                 !images.isError && (

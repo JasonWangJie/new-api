@@ -413,8 +413,11 @@ test('user details hide admin routing, references and account history even if a 
     screen.queryByRole('button', { name: 'Terminate' })
   ).not.toBeInTheDocument()
   expect(
-    await screen.findByRole('button', { name: 'Archive to server' })
+    await screen.findByRole('button', { name: 'Download image' })
   ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Archive to server' })
+  ).not.toBeInTheDocument()
   expect(getImageTask).toHaveBeenCalledWith(
     false,
     task.id,
