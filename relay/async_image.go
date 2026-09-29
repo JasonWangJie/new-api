@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"slices"
 	"strings"
 	"time"
@@ -342,7 +344,13 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	}
 	c.Set(contextKeyUpstreamAsyncSubmitSource, submitSource)
 	contentType := "application/json"
-	if request.Platform == "openai" && request.Kind == "image_to_image" && service.ImageChannelCapability(*channel, request.Model).EditFormat == "multipart" && task.UpstreamTaskId == "" {
+	editFormat := service.ImageChannelCapability(*channel, request.Model).EditFormat
+	if editFormat == "" && upstreamPath == "/v1/images/edits" {
+		// Retain uploaded-file requests for compatible providers that support
+		// multipart edits but do not implement JSON image references.
+		editFormat = request.InputFormat
+	}
+	if request.Platform == "openai" && request.Kind == "image_to_image" && editFormat == "multipart" && task.UpstreamTaskId == "" {
 		var encoded bytes.Buffer
 		form := multipart.NewWriter(&encoded)
 		for key, raw := range request.Native {
@@ -371,7 +379,12 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			if part.Type == "mask" {
 				field = "mask"
 			}
-			output, err := form.CreateFormFile(field, fmt.Sprintf("reference-%d.png", index))
+			header := make(textproto.MIMEHeader)
+			header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+				"name": field, "filename": fmt.Sprintf("reference-%d.%s", index, strings.TrimPrefix(image.ContentType, "image/")),
+			}))
+			header.Set("Content-Type", image.ContentType)
+			output, err := form.CreatePart(header)
 			if err != nil {
 				return nil, model.AsyncImageBill{}, err
 			}

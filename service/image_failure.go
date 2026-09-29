@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 const (
@@ -24,8 +25,9 @@ const (
 
 var (
 	asyncImageBearerCredentialPattern = regexp.MustCompile(`(?i)(\bbearer\s+)[^\s,;"']+`)
-	asyncImageNamedCredentialPattern  = regexp.MustCompile(`(?i)(\b(?:api[_ -]?key|authorization|access[_ -]?token|secret|password)\b["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
+	asyncImageNamedCredentialPattern  = regexp.MustCompile(`(?i)(\b(?:api[_ -]?key|authorization|access[_ -]?token|secret|password)\b(?:\s+(?:provided|supplied))?["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
 	asyncImageGoogleAPIKeyPattern     = regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{20,}\b`)
+	asyncImageOpenAIAPIKeyPattern     = regexp.MustCompile(`\bsk-[0-9A-Za-z_-]+`)
 )
 
 type AsyncImageFailure struct {
@@ -77,6 +79,7 @@ func sanitizeAsyncImageProviderDiagnostic(value string, limit int) string {
 	value = asyncImageBearerCredentialPattern.ReplaceAllString(value, "${1}***")
 	value = asyncImageNamedCredentialPattern.ReplaceAllString(value, "${1}***")
 	value = asyncImageGoogleAPIKeyPattern.ReplaceAllString(value, "***")
+	value = asyncImageOpenAIAPIKeyPattern.ReplaceAllString(value, "***")
 	return limitAsyncImageProviderDiagnostic(value, limit)
 }
 
@@ -123,8 +126,19 @@ func findAsyncImageProviderRequestID(value any) string {
 // compatibility error layer can replace its diagnostic message. Only bounded,
 // sanitized fields are retained on the durable image attempt.
 func ClassifyGeminiAsyncImageHTTPFailure(ctx context.Context, response *http.Response) *AsyncImageFailure {
+	return classifyAsyncImageHTTPFailure(ctx, response, "", true)
+}
+
+// ClassifyOpenAIAsyncImageHTTPFailure preserves provider diagnostics while
+// retaining channel status mappings for retry classification. HTTPStatus is
+// always the actual response status, rather than the mapped status.
+func ClassifyOpenAIAsyncImageHTTPFailure(ctx context.Context, response *http.Response, statusCodeMapping string) *AsyncImageFailure {
+	return classifyAsyncImageHTTPFailure(ctx, response, statusCodeMapping, false)
+}
+
+func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response, statusCodeMapping string, classifyErrorType bool) *AsyncImageFailure {
 	if response == nil {
-		return ClassifyAsyncImageFailure(errors.New("upstream Gemini response is missing"), 0)
+		return ClassifyAsyncImageFailure(errors.New("upstream image response is missing"), 0)
 	}
 	status := response.StatusCode
 	var body []byte
@@ -155,13 +169,20 @@ func ClassifyGeminiAsyncImageHTTPFailure(ctx context.Context, response *http.Res
 	case "string", "number":
 		providerCode = common.JsonRawMessageToString(providerError.Code)
 	}
+	classificationCode := sanitizeAsyncImageProviderDiagnostic(providerCode, asyncImageProviderCodeLimit)
 	if providerCode == "" {
 		providerCode = providerError.Type
 	}
-	providerCode = limitAsyncImageProviderDiagnostic(providerCode, asyncImageProviderCodeLimit)
-	providerStatus := limitAsyncImageProviderDiagnostic(providerError.Status, asyncImageProviderCodeLimit)
+	providerCode = sanitizeAsyncImageProviderDiagnostic(providerCode, asyncImageProviderCodeLimit)
+	providerStatus := sanitizeAsyncImageProviderDiagnostic(providerError.Status, asyncImageProviderCodeLimit)
 	if providerCode == "" {
 		providerCode = providerStatus
+	}
+	// OpenAI-compatible gateways may use invalid_request_error as a generic
+	// error type even for 5xx responses. Keep it for diagnostics without
+	// overriding the HTTP retry policy; explicit provider codes still apply.
+	if classifyErrorType {
+		classificationCode = providerCode
 	}
 
 	requestID := ""
@@ -176,11 +197,11 @@ func ClassifyGeminiAsyncImageHTTPFailure(ctx context.Context, response *http.Res
 			}
 		}
 	}
-	requestID = limitAsyncImageProviderDiagnostic(requestID, asyncImageProviderRequestIDLimit)
+	requestID = sanitizeAsyncImageProviderDiagnostic(requestID, asyncImageProviderRequestIDLimit)
 
 	var normalizedErr error
 	if readErr != nil {
-		normalizedErr = fmt.Errorf("read upstream Gemini error response: %w", readErr)
+		normalizedErr = fmt.Errorf("read upstream image error response: %w", readErr)
 	} else {
 		responseCopy := *response
 		responseCopy.Body = io.NopCloser(bytes.NewReader(body))
@@ -190,8 +211,11 @@ func ClassifyGeminiAsyncImageHTTPFailure(ctx context.Context, response *http.Res
 	if classificationMessage == "" {
 		classificationMessage = normalizedErr.Error()
 	}
-	classificationSignals := strings.TrimSpace(strings.Join([]string{classificationMessage, providerCode, providerStatus}, " "))
-	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), status)
+	classificationSignals := strings.TrimSpace(strings.Join([]string{classificationMessage, classificationCode, providerStatus}, " "))
+	mappedStatus := types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, status)
+	ResetStatusCode(mappedStatus, statusCodeMapping)
+	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
+	failure.HTTPStatus = status
 	if providerMessage != "" {
 		failure.Message = providerMessage
 	}

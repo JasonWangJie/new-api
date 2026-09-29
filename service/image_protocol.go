@@ -34,6 +34,7 @@ type AsyncImageRequest struct {
 	Platform       string                       `json:"platform"`
 	Dialect        string                       `json:"dialect"`
 	SourcePath     string                       `json:"source_path"`
+	InputFormat    string                       `json:"input_format,omitempty"`
 	Model          string                       `json:"model"`
 	Prompt         string                       `json:"prompt"`
 	Kind           string                       `json:"kind"`
@@ -245,6 +246,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		return request, errors.New("invalid content type")
 	}
 	if mediaType == "multipart/form-data" && request.Platform == "openai" {
+		request.InputFormat = "multipart"
 		reader := multipart.NewReader(bytes.NewReader(raw), params["boundary"])
 		multipartReferenceIndex := 0
 		for {
@@ -273,7 +275,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				if name != "image" && name != "image[]" && name != "mask" && !indexedImage {
 					return request, errors.New("unsupported multipart file field")
 				}
-				if len(request.Parts) >= cfg.MaxReferences {
+				if name != "mask" && request.ReferenceImageCount() >= cfg.MaxReferences {
 					return request, errors.New("too_many_reference_images_for_model")
 				}
 				image, err := ValidateImageBytes(data, "", cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
@@ -305,7 +307,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 					continue
 				}
 			}
-			if name == "n" || name == "stream" || name == "output_compression" || name == "partial_images" {
+			if name == "n" || name == "stream" || name == "watermark" || name == "output_compression" || name == "partial_images" {
 				fields[name] = common.RawMessage(data)
 			} else {
 				encoded, err := common.Marshal(value)

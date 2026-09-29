@@ -290,6 +290,10 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				if !reserve {
 					c.Set("async_image_retry_after", httpResp.Header.Get("Retry-After"))
 				}
+				if !reserve && c.GetBool("async_image_execution") && info.ApiType == constant.APITypeOpenAI {
+					failure := service.ClassifyOpenAIAsyncImageHTTPFailure(c.Request.Context(), httpResp, statusCodeMappingStr)
+					return nil, types.NewErrorWithStatusCode(failure, types.ErrorCodeBadResponseStatusCode, failure.HTTPStatus)
+				}
 				if reserve && (httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500) {
 					_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, false, circuit)
 				}

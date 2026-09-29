@@ -3,8 +3,10 @@ package relay
 import (
 	"bytes"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,6 +67,283 @@ func TestAsyncImageUnreadableReceiptDoesNotRepeatSubmission(t *testing.T) {
 					assert.False(t, failure.ExecutionUnknown, "known upstream jobs can safely retry polling")
 				}
 			}
+		})
+	}
+}
+
+func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
+	previousDB, previousCount, previousRedis := model.DB, constant.CountToken, common.RedisEnabled
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "openai-outbound.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled = db, false, false
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.RedisEnabled = previousDB, previousCount, previousRedis
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	user := model.User{Username: "openai-outbound-user", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "openai-outbound-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	service.InitHttpClient()
+
+	const referenceURL = "https://example.com/reference%20image.png?sig=synthetic%2Fsignature%2Bvalue&part=1"
+	const maskURL = "https://example.com/mask.png?sig=synthetic%3Dmask"
+	var pngImage, jpegImage bytes.Buffer
+	require.NoError(t, png.Encode(&pngImage, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	require.NoError(t, jpeg.Encode(&jpegImage, image.NewRGBA(image.Rect(0, 0, 2, 3)), nil))
+	for _, tc := range []struct {
+		name, path, referenceField string
+		providerStatus, requestID  string
+		secrets                    []string
+		maxReferences              int
+		status, failureCode        int
+		responseMessage            string
+		providerCode               string
+		statusMapping              string
+		fileFormat                 string
+		passThrough                bool
+	}{
+		{name: "edits_oa", path: "/v1/images/edits_oa", referenceField: "image_urls"},
+		{name: "edits_async", path: "/v1/images/edits_async", referenceField: "image"},
+		{name: "generations_oa_with_reference", path: "/v1/images/generations_oa", referenceField: "images"},
+		{name: "generations_async_with_reference", path: "/v1/images/generations_async", referenceField: "images"},
+		{name: "edits_oa_body_passthrough", path: "/v1/images/edits_oa", referenceField: "images", passThrough: true},
+		{name: "edits_async_body_passthrough", path: "/v1/images/edits_async", referenceField: "image", passThrough: true},
+		{name: "edits_async_multipart_png", path: "/v1/images/edits_async", fileFormat: "png"},
+		{name: "edits_async_multipart_jpeg", path: "/v1/images/edits_async", fileFormat: "jpeg"},
+		{name: "edits_async_multipart_jpeg_body_passthrough", path: "/v1/images/edits_async", fileFormat: "jpeg", passThrough: true},
+		{name: "edits_oa_multipart_png", path: "/v1/images/edits_oa", fileFormat: "png"},
+		{name: "multipart_mask_does_not_count_as_reference", path: "/v1/images/edits_async", fileFormat: "png", maxReferences: 1},
+		{name: "reference_fetch_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 602, providerCode: "image_fetch_failed", responseMessage: "image_url fetch failed for https://example.com/private.png?token=secret-url; authorization=Bearer secret-bearer api_key=secret-key"},
+		{name: "upstream_service_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, providerCode: "overloaded", responseMessage: "upstream image worker unavailable"},
+		{name: "mapped_status_keeps_original_diagnostic", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 605, providerCode: "overloaded", responseMessage: "upstream image worker unavailable", statusMapping: `{"502":"429"}`},
+		{name: "mapped_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 605, responseMessage: "please retry later", statusMapping: `{"400":"429"}`},
+		{name: "server_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, responseMessage: "please retry later"},
+		{
+			name: "credential_diagnostics_redact_all_provider_fields", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusUnauthorized, failureCode: 610,
+			responseMessage: "Incorrect API key provided: sk-proj-SYNTHETIC123456789NOTAREALKEY",
+			providerCode:    "https://example.com/private-code?signature=SYNTHETIC-CODE-SECRET",
+			providerStatus:  "sk-proj-SYNTHETICSTATUS123456789NOTAREALKEY",
+			requestID:       "https://example.com/private-request?signature=SYNTHETIC-REQUEST-SECRET sk-proj-SYNTHETICREQUEST123456789NOTAREALKEY",
+			secrets: []string{
+				"sk-proj-SYNTHETIC123456789NOTAREALKEY", "SYNTHETIC-CODE-SECRET", "sk-proj-SYNTHETICSTATUS123456789NOTAREALKEY",
+				"SYNTHETIC-REQUEST-SECRET", "sk-proj-SYNTHETICREQUEST123456789NOTAREALKEY", "https://example.com/private-code", "https://example.com/private-request",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			type recordedRequest struct {
+				method, path, contentType, authorization, marker string
+				body                                             []byte
+			}
+			received := make(chan recordedRequest, 1)
+			responseStatus := tc.status
+			if responseStatus == 0 {
+				responseStatus = http.StatusBadRequest
+			}
+			responseMessage := tc.responseMessage
+			if responseMessage == "" {
+				responseMessage = "synthetic request capture complete"
+			}
+			providerError := map[string]string{"message": responseMessage, "type": "invalid_request_error"}
+			if tc.providerCode != "" {
+				providerError["code"] = tc.providerCode
+			}
+			if tc.providerStatus != "" {
+				providerError["status"] = tc.providerStatus
+			}
+			requestID := tc.requestID
+			if requestID == "" {
+				requestID = "synthetic-upstream-request"
+			}
+			responseBody, err := common.Marshal(map[string]any{"error": providerError})
+			require.NoError(t, err)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, readErr := io.ReadAll(r.Body)
+				if !assert.NoError(t, readErr) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				received <- recordedRequest{r.Method, r.URL.RequestURI(), r.Header.Get("Content-Type"), r.Header.Get("Authorization"), r.Header.Get("X-Image-Probe"), body}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Request-Id", requestID)
+				w.Header().Set("Retry-After", "7")
+				w.WriteHeader(responseStatus)
+				_, _ = w.Write(responseBody)
+			}))
+			defer upstream.Close()
+			mapping := `{"image-alias":"gpt-image-2"}`
+			parameters := `{"quality":"low","vendor_override":true}`
+			headers := `{"X-Image-Probe":"synthetic"}`
+			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
+			channel.StatusCodeMapping = &tc.statusMapping
+			channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			body := map[string]any{
+				"model": "image-alias", "prompt": "draw a river", "n": 1,
+				"size": "1024x1024", "quality": "high", "response_format": "b64_json",
+				"mask":      map[string]string{"image_url": maskURL},
+				"watermark": false, "seed": 0, "custom_toggle": false,
+				"vendor_options": map[string]any{"strength": 0, "enabled": false},
+			}
+			if tc.referenceField == "images" {
+				body[tc.referenceField] = []map[string]string{{"image_url": referenceURL}}
+			} else if tc.referenceField != "" {
+				body[tc.referenceField] = []string{referenceURL}
+			}
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			contentType := "application/json"
+			imageBytes, imageFilename := pngImage.Bytes(), "input.png"
+			if tc.fileFormat != "" {
+				var formBody bytes.Buffer
+				form := multipart.NewWriter(&formBody)
+				for key, value := range body {
+					if key == "mask" {
+						continue
+					}
+					text, ok := value.(string)
+					if !ok {
+						encoded, err := common.Marshal(value)
+						require.NoError(t, err)
+						text = string(encoded)
+					}
+					require.NoError(t, form.WriteField(key, text))
+				}
+				if tc.fileFormat == "jpeg" {
+					imageBytes, imageFilename = jpegImage.Bytes(), "input.jpg"
+				}
+				part, err := form.CreateFormFile("image", imageFilename)
+				require.NoError(t, err)
+				_, err = part.Write(imageBytes)
+				require.NoError(t, err)
+				part, err = form.CreateFormFile("mask", "mask.png")
+				require.NoError(t, err)
+				_, err = part.Write(pngImage.Bytes())
+				require.NoError(t, err)
+				require.NoError(t, form.Close())
+				raw, contentType = formBody.Bytes(), form.FormDataContentType()
+			}
+			cfg := service.DefaultImageRuntimeConfig()
+			cfg.OpenAIReferenceMode = "passthrough"
+			if tc.maxReferences > 0 {
+				cfg.MaxReferences = tc.maxReferences
+			}
+			request, err := service.ParseAsyncImageRequest(raw, contentType, tc.path, cfg)
+			require.NoError(t, err)
+			request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			persisted, err := common.Marshal(request)
+			require.NoError(t, err)
+			request = service.AsyncImageRequest{}
+			require.NoError(t, common.Unmarshal(persisted, &request))
+			task := model.AsyncImageTask{TaskId: "openai-outbound-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, cfg, func() error {
+				dispatches++
+				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			})
+			require.Error(t, err)
+			if tc.failureCode != 0 {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, tc.failureCode, failure.Code)
+				assert.Equal(t, tc.status, failure.HTTPStatus, "attempt diagnostics must keep the real upstream status")
+				assert.Equal(t, 7*time.Second, failure.RetryAfter)
+				if len(tc.secrets) > 0 {
+					assert.Contains(t, failure.Message, "Incorrect API key provided:")
+					for field, value := range map[string]string{"message": failure.Message, "provider_code": failure.ProviderCode, "provider_status": failure.ProviderStatus, "request_id": failure.UpstreamRequestID} {
+						assert.NotEmpty(t, value, "field %s should retain a redacted diagnostic", field)
+						for _, secret := range tc.secrets {
+							assert.NotContains(t, value, secret, "field %s must not persist provider-echoed credentials or signed URLs", field)
+						}
+					}
+				} else {
+					expectedCode := tc.providerCode
+					if expectedCode == "" {
+						expectedCode = "invalid_request_error"
+					}
+					assert.Equal(t, expectedCode, failure.ProviderCode)
+					assert.Equal(t, requestID, failure.UpstreamRequestID)
+				}
+				if tc.failureCode == 602 {
+					assert.Contains(t, failure.Message, "image_url fetch failed")
+					for _, secret := range []string{"secret-url", "secret-bearer", "secret-key", "https://example.com/private.png"} {
+						assert.NotContains(t, failure.Message, secret)
+					}
+				} else if len(tc.secrets) == 0 {
+					assert.Equal(t, tc.responseMessage, failure.Message)
+				}
+			}
+			require.Equal(t, 1, dispatches)
+			require.Len(t, received, 1)
+			record := <-received
+			assert.Equal(t, http.MethodPost, record.method)
+			assert.Equal(t, "/v1/images/edits", record.path)
+			assert.Equal(t, "Bearer synthetic-upstream-key", record.authorization)
+			assert.Equal(t, "synthetic", record.marker)
+			if tc.fileFormat != "" {
+				require.Contains(t, record.contentType, "multipart/form-data", "file uploads must retain their upstream transport format")
+				replayed := httptest.NewRequest(http.MethodPost, record.path, bytes.NewReader(record.body))
+				replayed.Header.Set("Content-Type", record.contentType)
+				require.NoError(t, replayed.ParseMultipartForm(1<<20))
+				defer replayed.MultipartForm.RemoveAll()
+				imageField, expectedModel := "image", "gpt-image-2"
+				if tc.passThrough {
+					imageField, expectedModel = "image[]", "image-alias"
+				}
+				assert.Equal(t, expectedModel, replayed.PostForm.Get("model"))
+				assert.Equal(t, "draw a river", replayed.PostForm.Get("prompt"))
+				for field, value := range map[string]string{"n": "1", "size": "1024x1024", "response_format": "b64_json", "watermark": "false", "seed": "0", "custom_toggle": "false"} {
+					assert.Equal(t, value, replayed.PostForm.Get(field), "multipart field %s must survive persistence and relay conversion", field)
+				}
+				assert.JSONEq(t, `{"strength":0,"enabled":false}`, replayed.PostForm.Get("vendor_options"))
+				for _, file := range []struct {
+					field, contentType string
+					data               []byte
+				}{
+					{field: imageField, contentType: "image/" + tc.fileFormat, data: imageBytes},
+					{field: "mask", contentType: "image/png", data: pngImage.Bytes()},
+				} {
+					require.Len(t, replayed.MultipartForm.File[file.field], 1)
+					header := replayed.MultipartForm.File[file.field][0]
+					assert.Equal(t, file.contentType, header.Header.Get("Content-Type"), "field %s must declare its real image encoding", file.field)
+					reader, err := header.Open()
+					require.NoError(t, err)
+					actual, err := io.ReadAll(reader)
+					require.NoError(t, err)
+					require.NoError(t, reader.Close())
+					assert.Equal(t, file.data, actual)
+				}
+				return
+			}
+			assert.Equal(t, "application/json", record.contentType)
+			var outbound map[string]common.RawMessage
+			require.NoError(t, common.Unmarshal(record.body, &outbound))
+			expectedModel, expectedQuality := `"gpt-image-2"`, `"low"`
+			if tc.passThrough {
+				expectedModel, expectedQuality = `"image-alias"`, `"high"`
+				assert.NotContains(t, outbound, "vendor_override", "body passthrough bypasses channel parameter overrides")
+			} else {
+				assert.JSONEq(t, "true", string(outbound["vendor_override"]))
+			}
+			assert.JSONEq(t, expectedModel, string(outbound["model"]))
+			assert.JSONEq(t, expectedQuality, string(outbound["quality"]))
+			for _, key := range []string{"prompt", "n", "size", "response_format", "watermark", "seed", "custom_toggle", "vendor_options", "mask"} {
+				encoded, err := common.Marshal(body[key])
+				require.NoError(t, err)
+				assert.JSONEq(t, string(encoded), string(outbound[key]), "field %s must survive persistence and relay conversion", key)
+			}
+			var images []struct {
+				URL string `json:"image_url"`
+			}
+			require.NoError(t, common.Unmarshal(outbound["images"], &images))
+			require.Len(t, images, 1)
+			assert.Equal(t, referenceURL, images[0].URL, "external signed URL bytes must be preserved")
+			assert.NotContains(t, outbound, "image")
+			assert.NotContains(t, outbound, "image_urls")
 		})
 	}
 }
