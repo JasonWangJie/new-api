@@ -362,6 +362,35 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				assert.Empty(t, expiredDetail.Data.Results, "expired task results must be hidden for owners and administrators")
 				assert.NotContains(t, expiredRecorder.Body.String(), latestURL)
 			}
+
+			t.Run("unknown execution requires administrator reconciliation", func(t *testing.T) {
+				unknown := model.AsyncImageTask{TaskId: "asyncimg_unknown_reconcile", UserId: 101, TokenId: 201, Status: model.ImageTaskExecutionUnknown, Version: 1, CreatedAt: now, ExpiresAt: now + 3600}
+				require.NoError(t, db.Create(&unknown).Error)
+				assert.Equal(t, false, imageTaskDTO(unknown, false)["can_terminate"])
+				assert.Equal(t, true, imageTaskDTO(unknown, true)["can_terminate"])
+				for _, item := range []struct {
+					name  string
+					admin bool
+					body  string
+					want  int
+				}{
+					{"owner cannot release unknown work", false, `{"confirm_upstream_checked":true}`, http.StatusForbidden},
+					{"administrator must confirm upstream check", true, `{}`, http.StatusConflict},
+					{"administrator releases after confirmation", true, `{"confirm_upstream_checked":true}`, http.StatusOK},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: unknown.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+unknown.TaskId+"/terminate", strings.NewReader(item.body))
+						ManageMediaTask(c, item.admin, "terminate")
+						assert.Equal(t, item.want, recorder.Code, recorder.Body.String())
+					})
+				}
+				require.NoError(t, db.Where("task_id = ?", unknown.TaskId).Take(&unknown).Error)
+				assert.Equal(t, model.ImageTaskFailed, unknown.Status)
+			})
 		})
 	}
 }

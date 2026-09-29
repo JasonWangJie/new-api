@@ -36,11 +36,16 @@ func upstreamAsyncImageOperation(c *gin.Context) string {
 
 func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInfo, response *http.Response, profile *dto.UpstreamAsyncProfile) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(response)
+	resumeTaskID := c.GetString("async_image_resume_task")
 	body, err := service.ReadUpstreamAsyncResponse(response, c.GetInt64("async_image_response_limit"))
 	if err != nil {
+		if resumeTaskID == "" {
+			// A successful submission response does not prove that generation
+			// was rejected when its receipt is unreadable. Never submit it again.
+			return nil, types.NewError(&service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream image task acceptance could not be determined", ExecutionUnknown: true}, types.ErrorCodeBadResponse)
+		}
 		return nil, types.NewError(&service.AsyncImageFailure{Code: 606, InternalCode: "upstream_response_invalid", Message: "Upstream image task response could not be parsed"}, types.ErrorCodeBadResponse)
 	}
-	resumeTaskID := c.GetString("async_image_resume_task")
 	if resumeTaskID == "" {
 		taskID, parseErr := service.ParseUpstreamAsyncTaskID(profile, body)
 		if parseErr != nil {

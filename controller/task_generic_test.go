@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,8 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -32,14 +35,46 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 	t.Helper()
 	originalDB := model.DB
 	previousRedisEnabled := common.RedisEnabled
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
 	common.RedisEnabled = false
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	dbType := common.DatabaseTypeSQLite
+	var driver gorm.Dialector = sqlite.Open(":memory:")
+	if dsn := os.Getenv("TASK_MEDIA_TEST_MYSQL_DSN"); dsn != "" {
+		dbType, driver = common.DatabaseTypeMySQL, mysql.Open(dsn)
+	} else if dsn := os.Getenv("TASK_MEDIA_TEST_POSTGRES_DSN"); dsn != "" {
+		dbType, driver = common.DatabaseTypePostgreSQL, postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+	}
+	database, err := gorm.Open(driver, &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}))
+	if dbType != common.DatabaseTypeSQLite {
+		var databaseName string
+		query := "SELECT DATABASE()"
+		if dbType == common.DatabaseTypePostgreSQL {
+			query = "SELECT current_database()"
+		}
+		require.NoError(t, database.Raw(query).Scan(&databaseName).Error)
+		require.True(t, strings.HasPrefix(databaseName, "new_api_controller_test"), "media tests require an isolated new_api_controller_test database")
+	}
+	rows := []any{&model.Task{}, &model.Channel{}, &model.User{}, &model.Token{}, &model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+	for range 2 {
+		require.NoError(t, database.AutoMigrate(rows...))
+	}
+	for _, row := range rows {
+		require.NoError(t, database.Unscoped().Where("1 = 1").Delete(row).Error)
+	}
+	sqlDB, err := database.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
 	model.DB = database
+	common.SetDatabaseTypes(dbType, previousLogType)
 	t.Cleanup(func() {
+		for _, row := range rows {
+			require.NoError(t, database.Unscoped().Where("1 = 1").Delete(row).Error)
+		}
 		model.DB = originalDB
 		common.RedisEnabled = previousRedisEnabled
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		require.NoError(t, sqlDB.Close())
 	})
 
 	require.NoError(t, database.Create(&model.User{
@@ -621,7 +656,8 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	task.PrivateData = model.TaskPrivateData{
 		AsyncMedia: true, UpstreamTaskID: "vendor-1", ResultURL: upstream.URL + "/stale",
 		UpstreamAsync: &profile, Key: "frozen-key",
-		Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "kling"}},
+		UpstreamAsyncResponse: []byte(`{"status":"done","url":"https://cdn.example.com/stale.mp4","padding":"` + strings.Repeat("p", 200) + `"}`),
+		Execution:             &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "kling"}},
 	}
 	task.Properties.OriginModelName, task.Properties.UpstreamModelName = "client-model", "mapped"
 	require.NoError(t, model.DB.Save(task).Error)
@@ -633,6 +669,8 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	require.NoError(t, PersistAsyncVideo(t.Context(), job, task))
 	assert.Equal(t, 1, polls)
 	assert.Equal(t, upstream.URL+"/fresh", task.PrivateData.ResultURL)
+	_, err = task.PrivateData.Value()
+	require.NoError(t, err, "refresh must not corrupt the original private response when the new JSON is shorter")
 	assert.Equal(t, 1, freshDownloads)
 	assert.Zero(t, staleDownloads)
 	ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
@@ -657,7 +695,7 @@ func TestDynamicUpstreamVideoUsesPublicURLAfterStorageRetries(t *testing.T) {
 	oldPersist := service.PersistAsyncVideoFunc
 	service.PersistAsyncVideoFunc = func(_ context.Context, _ model.AsyncMediaJob, task *model.Task) error {
 		task.PrivateData.ResultURL = latestURL
-		return errors.New("gateway download failed")
+		return service.ErrAsyncMediaDownloadTransport
 	}
 	t.Cleanup(func() { service.PersistAsyncVideoFunc = oldPersist })
 	now := time.Now().Unix()
@@ -740,6 +778,131 @@ func TestTaskMediaRequestHeaderPolicy(t *testing.T) {
 		})
 	}
 	assert.ErrorIs(t, applyTaskMediaRequestHeaders(http.Header{}, map[string]string{"X-Test": "bad\r\ninjected"}), errTaskMediaRequestRejected)
+}
+
+func TestVideoDownloadFallbackOnlyAllowsTransientUpstreamErrors(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	allowPrivateTaskMediaTest(t)
+	for _, item := range []struct {
+		status   int
+		fallback bool
+	}{
+		{http.StatusUnauthorized, false}, {http.StatusForbidden, false},
+		{http.StatusNotFound, false}, {http.StatusGone, false},
+		{http.StatusTooManyRequests, true}, {http.StatusServiceUnavailable, true},
+	} {
+		t.Run(http.StatusText(item.status), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(item.status)
+			}))
+			defer upstream.Close()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/content", nil)
+			err := proxyTaskMedia(c, task, &relaychannel.TaskContentRequest{URL: upstream.URL, Method: http.MethodGet})
+			require.Error(t, err)
+			assert.Equal(t, item.fallback, errors.Is(err, service.ErrAsyncMediaDownloadTransport))
+		})
+	}
+}
+
+func TestAsyncVideoFallbackRejectsInvalidContentAndRefreshKeepsOwnership(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	connection, err := model.DB.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+	task.Quota = 120
+	task.PrivateData = model.TaskPrivateData{AsyncMedia: true, ResultURL: "https://cdn.example.com/output.mp4", UpstreamAsync: &relaydto.UpstreamAsyncProfile{MediaType: "video"}}
+	require.NoError(t, model.DB.Save(task).Error)
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "video-invalid-fallback", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Status: "submitted", StorageStatus: "failed", StorageRetries: cfg.StorageRetries, LeaseToken: "fallback-lease", LeaseExpiresAt: now + 120, ExpiresAt: now + 3600, CreatedAt: now}
+	require.NoError(t, model.DB.Create(&job).Error)
+	oldPersist, oldSubmit := service.PersistAsyncVideoFunc, service.SubmitAsyncVideoFunc
+	t.Cleanup(func() { service.PersistAsyncVideoFunc, service.SubmitAsyncVideoFunc = oldPersist, oldSubmit })
+	service.SubmitAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, service.AsyncVideoRequest) error {
+		t.Fatal("storage recovery must never submit a new video")
+		return nil
+	}
+	for _, item := range []struct {
+		name    string
+		failure error
+	}{
+		{name: "invalid HTML"},
+		{name: "missing upstream file", failure: &taskMediaProxyError{status: http.StatusGone, code: "artifact_gone", message: "gone"}},
+		{name: "unauthorized upstream file", failure: &taskMediaProxyError{status: http.StatusBadGateway, code: "artifact_upstream_auth_failed", message: "unauthorized"}},
+		{name: "unclassified failure", failure: errors.New("unknown failure")},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			service.PersistAsyncVideoFunc = func(ctx context.Context, _ model.AsyncMediaJob, current *model.Task) error {
+				if item.failure != nil {
+					return item.failure
+				}
+				_, err := service.GetTaskArtifactStore().Persist(ctx, current, relaychannel.TaskArtifact{Key: "video", Type: "video"}, strings.NewReader("<html>upstream failed</html>"))
+				require.Error(t, err)
+				return err
+			}
+			require.Error(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+			require.NoError(t, model.DB.Where("id = ?", job.ID).Take(&job).Error)
+			assert.Equal(t, "submitted", job.Status)
+			assert.Equal(t, "failed", job.StorageStatus)
+		})
+	}
+	service.PersistAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, *model.Task) error {
+		return &os.PathError{Op: "write", Path: "unavailable-local-store", Err: os.ErrPermission}
+	}
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, model.DB.Where("id = ?", job.ID).Take(&job).Error)
+	assert.Equal(t, "succeeded", job.Status)
+	assert.Equal(t, "upstream", job.StorageStatus)
+
+	for _, item := range []struct {
+		name           string
+		userID         int
+		expiresAt      int64
+		leaseExpiresAt int64
+		status         model.TaskStatus
+		want           int
+	}{
+		{"other owner", task.UserId + 1, now + 3600, 0, model.TaskStatusSuccess, http.StatusConflict},
+		{"expired", task.UserId, now - 1, 0, model.TaskStatusSuccess, http.StatusConflict},
+		{"worker owns lease", task.UserId, now + 3600, now + 120, model.TaskStatusSuccess, http.StatusConflict},
+		{"generation still pending", task.UserId, now + 3600, 0, model.TaskStatusInProgress, http.StatusConflict},
+		{"owner refresh", task.UserId, now + 3600, 0, model.TaskStatusSuccess, http.StatusOK},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(&job).Updates(map[string]any{"status": "succeeded", "storage_status": "upstream", "lease_expires_at": item.leaseExpiresAt, "expires_at": item.expiresAt}).Error)
+			require.NoError(t, model.DB.Model(task).Update("status", item.status).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("id", item.userID)
+			c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/user/media-tasks/"+job.TaskId+"/resume", nil)
+			ManageMediaTask(c, false, "resume")
+			assert.Equal(t, item.want, recorder.Code, recorder.Body.String())
+		})
+	}
+	require.NoError(t, model.DB.Where("id = ?", job.ID).Take(&job).Error)
+	assert.Equal(t, "submitted", job.Status)
+	assert.Equal(t, "failed", job.StorageStatus)
+	assert.Zero(t, job.StorageRetries)
+	assert.Zero(t, job.NextAttemptAt)
+	require.NoError(t, model.DB.Where("id = ?", task.ID).Take(task).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+	assert.Equal(t, 120, task.Quota)
+
+	service.PersistAsyncVideoFunc = func(_ context.Context, _ model.AsyncMediaJob, current *model.Task) error {
+		assert.Equal(t, task.TaskID, current.TaskID)
+		assert.Equal(t, 120, current.Quota)
+		return nil
+	}
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, model.DB.Where("id = ?", job.ID).Take(&job).Error)
+	assert.Equal(t, "succeeded", job.Status)
+	assert.Equal(t, "succeeded", job.StorageStatus)
+	assert.Equal(t, 120, job.Quota)
 }
 
 func TestCredentiallessTaskMediaDescriptorRejectsCredentialsAndBody(t *testing.T) {

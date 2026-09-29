@@ -557,6 +557,11 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	if err != nil || amount < 0 || amount > common.MaxQuota {
 		return policy, model.ImageFundingSelection{}, errors.New("async image pricing could not be evaluated")
 	}
+	if request.Reservation != nil {
+		// The worker loaded this server-only field from the durable bill. Its
+		// own hold must not make polling or a safe retry look unaffordable.
+		return policy, model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}, nil
+	}
 	if !token.UnlimitedQuota && token.RemainQuota < amount {
 		return policy, model.ImageFundingSelection{}, model.ErrImageInsufficientQuota
 	}

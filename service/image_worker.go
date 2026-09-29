@@ -294,6 +294,10 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	if err := common.Unmarshal(data, &request); err != nil {
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Persisted request is invalid"}, cfg)
 	}
+	request.Reservation, err = model.GetAsyncImageReservation(ctx, *task)
+	if err != nil {
+		return err
+	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Token is unavailable"}, cfg)

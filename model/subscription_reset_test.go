@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func seedSubscriptionResetPlan(t *testing.T, plan *SubscriptionPlan) {
@@ -111,8 +112,37 @@ func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
 	assert.False(t, result.AdvanceResetTime)
 	sub := getSubscriptionResetSub(t, 9302)
 	assert.Zero(t, sub.AmountUsed)
-	assert.Equal(t, lastReset, sub.LastResetTime)
+	assert.GreaterOrEqual(t, sub.LastResetTime, now)
 	assert.Equal(t, nextReset, sub.NextResetTime)
+	firstPeriod := sub.LastResetTime
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return resetUserSubscriptionTx(tx, &sub, plan, now, false)
+	}))
+	assert.Greater(t, sub.LastResetTime, firstPeriod)
+	assert.Equal(t, nextReset, sub.NextResetTime)
+	// The manual reset preserves the scheduled boundary, including custom
+	// intervals whose next reset must not drift from the original schedule.
+	plan.QuotaResetPeriod = SubscriptionResetCustom
+	plan.QuotaResetCustomSeconds = 3600
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, nextReset)
+	}))
+	assert.Equal(t, nextReset, sub.LastResetTime)
+	assert.Equal(t, nextReset+3600, sub.NextResetTime)
+	// Two manual resets exactly at the scheduled boundary must not let the
+	// following automatic reset reuse a prior reservation's cycle marker.
+	boundary := sub.NextResetTime
+	for range 2 {
+		require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+			return resetUserSubscriptionTx(tx, &sub, plan, boundary, false)
+		}))
+	}
+	manualPeriod := sub.LastResetTime
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		return maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, boundary)
+	}))
+	assert.Greater(t, sub.LastResetTime, manualPeriod)
+	assert.Equal(t, boundary+3600, sub.NextResetTime)
 }
 
 func TestAdminResetUserSubscriptionsByPlanNoActiveMatchReturnsError(t *testing.T) {
@@ -170,7 +200,7 @@ func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
 	for _, id := range []int{9502, 9503, 9504} {
 		sub := getSubscriptionResetSub(t, id)
 		assert.Zero(t, sub.AmountUsed)
-		assert.Zero(t, sub.LastResetTime)
+		assert.GreaterOrEqual(t, sub.LastResetTime, now)
 		assert.Zero(t, sub.NextResetTime)
 	}
 	assert.EqualValues(t, 1300, getSubscriptionResetSub(t, 9505).AmountUsed)

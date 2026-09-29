@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -33,6 +34,11 @@ type AsyncVideoRequest struct {
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
 var PersistAsyncVideoFunc func(context.Context, model.AsyncMediaJob, *model.Task) error
+
+// ErrAsyncMediaDownloadTransport marks download failures for which the owner's
+// browser may still reach the public result. Invalid media and rejected URLs
+// must never use this fallback.
+var ErrAsyncMediaDownloadTransport = errors.New("async media download transport failed")
 
 func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 	ctx, cancel := context.WithCancel(parent)
@@ -147,7 +153,9 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		}
 		previousResultURL := task.PrivateData.ResultURL
 		if err := PersistAsyncVideoFunc(ctx, job, &task); err != nil {
-			if job.StorageRetries >= cfg.StorageRetries && PublicUpstreamAsyncVideoResultURL(&task) != "" {
+			var storageErr *os.PathError
+			fallbackAllowed := errors.Is(err, ErrAsyncMediaDownloadTransport) || errors.As(err, &storageErr)
+			if fallbackAllowed && job.StorageRetries >= cfg.StorageRetries && PublicUpstreamAsyncVideoResultURL(&task) != "" {
 				if task.PrivateData.ResultURL != previousResultURL {
 					updated := model.DB.WithContext(ctx).Model(&model.Task{}).Where("id = ? AND status = ?", task.ID, model.TaskStatusSuccess).Update("private_data", task.PrivateData)
 					if updated.Error != nil || updated.RowsAffected != 1 {

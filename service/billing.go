@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -45,6 +46,18 @@ func HasDurableTaskReservation(relayInfo *relaycommon.RelayInfo, requiredQuota i
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	return session.durable && !session.trusted && !session.settled && !session.refunded && session.preConsumedQuota >= requiredQuota
+}
+
+// SnapshotTaskReservation freezes the funding period captured under the
+// subscription lock, rather than reading a possibly reset subscription later.
+func SnapshotTaskReservation(task *model.Task, info *relaycommon.RelayInfo) {
+	if session, ok := info.Billing.(*BillingSession); ok && session.durable {
+		task.PrivateData.DurableBilling = true
+		if subscription, ok := session.funding.(*SubscriptionFunding); ok {
+			periodStart := subscription.PeriodStart
+			task.PrivateData.SubscriptionPeriodStart = &periodStart
+		}
+	}
 }
 
 func preConsumeBillingWithMode(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo, durable bool) *types.NewAPIError {

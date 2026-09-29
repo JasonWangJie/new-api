@@ -133,6 +133,22 @@ describe('upstream async channel configuration', () => {
     }
   })
 
+  test.each([undefined, {}])(
+    'preserves custom submit headers %j when opening and saving',
+    (headers) => {
+      const config = structuredClone(UPSTREAM_ASYNC_MAI_IMAGE_EXAMPLE)
+      const request = config.profiles[0].submit.request
+      if (!request) throw new Error('Custom submit request is required')
+      request.headers = headers
+
+      const restored = upstreamAsyncFormToConfig(
+        upstreamAsyncConfigToForm(config)
+      )
+
+      expect(restored.profiles[0].submit.request?.headers || {}).toEqual({})
+    }
+  )
+
   test('reads only a valid upstream_async property from channel settings', () => {
     const settings = JSON.stringify({
       allow_speed: true,

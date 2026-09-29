@@ -131,6 +131,11 @@ type TaskPrivateData struct {
 	// SubmitAccountingRecorded fences measured video settlement until the
 	// submission's usage counters have been persisted in the main database.
 	SubmitAccountingRecorded bool `json:"submit_accounting_recorded,omitempty"`
+	// DurableBilling distinguishes persisted reservations from legacy batched
+	// tasks, whose submit accounting must not be applied a second time.
+	DurableBilling bool `json:"durable_billing,omitempty"`
+	// A zero value is a valid never-reset period; nil identifies legacy tasks.
+	SubscriptionPeriodStart *int64 `json:"subscription_period_start,omitempty"`
 	// ResponsesBackground records that the openai_responses create request
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
@@ -211,7 +216,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if !p.AsyncMedia && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.UpstreamAsync == nil && len(p.UpstreamAsyncResponse) == 0 && p.BillingSource == "" && p.SubscriptionId == 0 &&
-		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && !p.SubmitAccountingRecorded &&
+		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 {
 		return nil, nil
 	}

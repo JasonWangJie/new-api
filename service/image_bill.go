@@ -21,7 +21,10 @@ func FixAsyncImageBill(c *gin.Context, task model.AsyncImageTask, info *relaycom
 	if info == nil || usage == nil || count < 1 || count > dto.MaxImageN || info.Billing != nil {
 		return model.AsyncImageBill{}, errors.New("invalid deferred image billing context")
 	}
-	if err := EstimateImageBillingForRequest(info, count, false); err != nil {
+	// Outbound billing preparation has already captured the effective prompt
+	// extension flag, including frozen channel overrides. Refresh only quantity.
+	promptExtend := info.PriceData.OtherRatios()["prompt_extend"] == common.ZImagePromptExtendMultiplier
+	if err := EstimateImageBillingForRequest(info, count, promptExtend); err != nil {
 		return model.AsyncImageBill{}, err
 	}
 	info.BillingImageCount = &count

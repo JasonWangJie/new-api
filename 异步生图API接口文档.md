@@ -498,3 +498,81 @@ ASYNC_IMAGE_REDIS_PREFIX=new-api:images
 | `GET /v1/tasks_sc/{task_id}` | Gemini SC 查询别名 |
 
 旧 OpenAI / Gemini 异步提交与查询路径继续工作；原同步图片接口及原 `/v1/videos` 任务协议保持原语义。新统一查询可以读取新 `_async` 图片任务与异步视频任务；旧图片查询路径不会自动增加完整的统一媒体字段。
+
+## 10. 当日异步生图统计与异步视频扩展
+
+使用 API Key 所属用户身份，查询服务器配置时区当天创建的持久化异步任务汇总。图片接口统计该用户的全部异步生图任务；视频接口统计持久化异步视频任务；统一媒体接口汇总这两类任务。统计包含工作台和该用户其他 API Key 提交的任务，不限于当前 API Key。正在处理的任务也计入请求数。
+
+### 10.1 请求
+
+```http
+GET /v1/images/tasks_async/stats
+Authorization: Bearer <API_KEY>
+```
+
+图片、视频与合并统计使用相同的字段和鉴权规则：
+
+| 方法与路径 | 统计范围 | 响应 `object` |
+|---|---|---|
+| `GET /v1/images/tasks_async/stats` | 持久化异步图片 | `async_image.stats` |
+| `GET /v1/videos/tasks_async/stats` | 持久化异步视频，包括生成、编辑和延长 | `async_video.stats` |
+| `GET /v1/media/tasks_async/stats` | 上述图片和视频之和 | `async_media.stats` |
+
+接口只支持 `Authorization: Bearer` 方式传入 API Key，不接受 URL 查询参数、其他密钥请求头或浏览器登录会话代替 Bearer 鉴权。鉴权通过但 Key 额度或用户余额已耗尽时，仍可读取自己的统计。Key 必须未过期、未被禁用或删除，所属用户必须可用；已有 IP 访问限制继续生效。
+
+无需请求体，也不提供日期、时区、用户或 Key 筛选参数；客户端传入的此类查询参数不改变统计范围。服务器设置了 `TZ` 时使用该配置，例如 `Asia/Shanghai`；未设置时使用服务器本地时区。当天范围按该时区的零点起、次日零点前计算，以任务创建时间归属日期，不能按任务完成日期或固定 24 小时替代自然日。
+
+任务统计只读取已持久化记录，不要求图片或视频提交开关开启，也不依赖 worker 或存储服务就绪。同时启用 Redis 和批量额度更新时，余额查询须能读取有效的实时额度账本。视频范围为持久化异步媒体任务，关联的上游任务记录不会重复计数；旧版普通视频、音乐等仅保存在通用任务表中的任务不计入本接口。
+
+### 10.2 成功响应
+
+```json
+{
+  "object": "async_image.stats",
+  "date": "2026-08-23",
+  "timezone": "Asia/Shanghai",
+  "balance": 12.5,
+  "today_requests": 20,
+  "success_count": 15,
+  "failure_count": 3,
+  "success_rate": 83.3333333333
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `object` | string | 图片为 `async_image.stats`，视频为 `async_video.stats`，合并统计为 `async_media.stats` |
+| `date` | string | 统计日期，格式 `YYYY-MM-DD` |
+| `timezone` | string | 服务器当前配置时区；日期边界按此时区计算 |
+| `balance` | number | 当前用户的钱包余额，按当前额度账本中的用户额度除以服务器 `QuotaPerUnit` 换算；单位与美元基准钱包额度一致，不是当前 API Key 剩余额度，也不应用前端货币显示汇率 |
+| `today_requests` | integer | 当天创建的任务总数，包含处理中、成功和失败任务；一次任务生成多个结果仍只计一次 |
+| `success_count` | integer | 当天任务中已成功的任务数 |
+| `failure_count` | integer | 当天任务中处于失败状态的任务数，包括 `failed`、`execution_unknown`、`storage_failed`、`billing_failed` 和 `expired` |
+| `success_rate` | number | 成功率百分比，计算为 `success_count / (success_count + failure_count) * 100`；没有成功或失败任务时为 `0` |
+
+失败按请求时的持久化状态统计。存储或计费失败即使仍允许恢复，也暂计入失败；恢复后的下次查询按新状态统计。视频上游成功但尚未完成持久化媒体任务时仍按处理中计算；关联上游任务失败、存储失败或计费失败优先计为失败，不能同时增加成功数。已按既有规则完成上游结果链接回退且任务为 `succeeded` 的视频可计为成功。
+
+所有统计响应带有 `Cache-Control: no-store`。任务统计在本次请求读取主数据库；余额优先读取 Redis 中有效的实时额度，未开启 Redis 时读取主库。同时启用 Redis 与批量额度更新时，缓存缺失、失效或不可用会返回 `500 stats_unavailable`，避免用尚未包含待刷扣款的旧主库余额替代；未启用批量更新时，Redis 未命中或不可用可直接读取主库。本接口不会重建或写入余额缓存，也不缓存统计响应。三个接口的 `balance` 都是该用户的完整钱包余额，不按媒体类型分摊。
+
+### 10.3 错误
+
+缺少或无效 API Key 返回 `401`，统一使用以下结构，不公开具体鉴权失败原因：
+
+```json
+{
+  "error": {
+    "type": "authentication_error",
+    "code": "authentication_error",
+    "message": "invalid API key"
+  }
+}
+```
+
+| HTTP | code | 说明 |
+|---|---|---|
+| `401` | `authentication_error` | 缺少、无效、过期、禁用或删除的 API Key，所属用户不可用，或 IP 不符合 Key 限制 |
+| `429` | `rate_limit_exceeded` | 配置的全局 API IP 频率限制已触发，按响应 `Retry-After` 等待后重试 |
+| `500` | `stats_unavailable` | 鉴权数据、余额或统计查询失败，或服务器时区配置不可用 |
+| `503` | `stats_unavailable` | 当前实例未提供异步统计所需的数据库能力 |
+
+`500`、`503` 使用 `error.type: "server_error"`，`429` 使用 `error.type: "rate_limit_error"`；错误响应同样使用上述 `error` 对象结构并带有 `Cache-Control: no-store`。客户端应按 HTTP 状态和 `error.code` 处理，不依赖可调整的服务端错误文案。

@@ -85,8 +85,8 @@ func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T
 			_ = sqlDB.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 	var databaseVersion string
 	require.NoError(t, db.Raw(databaseVersionQuery).Scan(&databaseVersion).Error)
 	t.Logf("Database version: %s", databaseVersion)
@@ -555,7 +555,7 @@ func TestFailAsyncImageInvocationPersistsSanitizedProviderDiagnostics(t *testing
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 
 	now := time.Now().Unix()
 	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1, Dispatched: true}})
@@ -614,7 +614,7 @@ func TestInvalidImageReferenceFailureIsIndexedAndNotRetried(t *testing.T) {
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 
 	now := time.Now().Unix()
 	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1}})

@@ -73,7 +73,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.ExpiresAt <= time.Now().Unix() {
 		status, progress = "expired", 100
 	}
-	view := gin.H{"id": job.TaskId, "task_id": job.TaskId, "media_type": "video", "platform": job.Provider, "provider": job.Provider, "protocol": "openai_video", "model": job.Model, "request_type": "text_to_video", "status": status, "stage": mediaStage(status), "progress": progress, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "cost": float64(job.Quota) / common.QuotaPerUnit, "group": job.Group, "api_key_id": job.TokenId, "image_count": 0, "result_count": 0, "created_at": job.CreatedAt, "started_at": job.DispatchedAt, "finished_at": int64(0), "expires_at": job.ExpiresAt, "next_attempt_at": job.NextAttemptAt, "retry_count": 0, "storage_retry_count": job.StorageRetries, "error_message": job.ErrorMessage, "error_code": "", "prompt_summary": "", "requested_size": "", "actual_size": "", "aspect_ratio": "", "can_resume": job.StorageStatus == "failed" && job.LeaseExpiresAt <= time.Now().Unix(), "can_terminate": job.Status == "queued" && job.DispatchedAt == 0 && job.LeaseExpiresAt <= time.Now().Unix(), "storage_providers": []string{"local"}}
+	view := gin.H{"id": job.TaskId, "task_id": job.TaskId, "media_type": "video", "platform": job.Provider, "provider": job.Provider, "protocol": "openai_video", "model": job.Model, "request_type": "text_to_video", "status": status, "stage": mediaStage(status), "progress": progress, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "cost": float64(job.Quota) / common.QuotaPerUnit, "group": job.Group, "api_key_id": job.TokenId, "image_count": 0, "result_count": 0, "created_at": job.CreatedAt, "started_at": job.DispatchedAt, "finished_at": int64(0), "expires_at": job.ExpiresAt, "next_attempt_at": job.NextAttemptAt, "retry_count": 0, "storage_retry_count": job.StorageRetries, "error_message": job.ErrorMessage, "error_code": "", "prompt_summary": "", "requested_size": "", "actual_size": "", "aspect_ratio": "", "can_resume": false, "can_terminate": job.Status == "queued" && job.DispatchedAt == 0 && job.LeaseExpiresAt <= time.Now().Unix(), "storage_providers": []string{"local"}}
 	if admin {
 		view["user_id"], view["channel_id"] = job.UserId, job.ChannelId
 	}
@@ -104,6 +104,8 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	var task model.Task
 	err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err == nil {
+		view["can_resume"] = task.Status == model.TaskStatusSuccess && job.ExpiresAt > time.Now().Unix() && job.LeaseExpiresAt <= time.Now().Unix() &&
+			(job.Status == "submitted" && job.StorageStatus == "failed" || job.Status == "succeeded" && job.StorageStatus == "upstream")
 		view["updated_at"] = task.UpdatedAt
 		if job.StorageStatus == "pending" && task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
 			if percent, err := strconv.Atoi(strings.TrimSuffix(task.Progress, "%")); err == nil {
@@ -272,7 +274,9 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 	updates := map[string]any{}
 	switch action {
 	case "resume":
-		query = query.Where("status = ? AND storage_status = ?", "submitted", "failed")
+		query = query.Where("((status = ? AND storage_status = ?) OR (status = ? AND storage_status = ?))", "submitted", "failed", "succeeded", "upstream").
+			Where("EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?)", model.TaskStatusSuccess)
+		updates["status"], updates["storage_status"] = "submitted", "failed"
 		updates["next_attempt_at"], updates["storage_retries"], updates["error_message"] = 0, 0, ""
 	case "terminate":
 		query = query.Where("status = ? AND dispatched_at = 0", "queued")

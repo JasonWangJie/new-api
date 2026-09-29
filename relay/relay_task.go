@@ -382,7 +382,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(err, "media_billing_failed", http.StatusInternalServerError)
 		}
 	}
-	if measuredVideo && info.Billing != nil {
+	if info.Billing != nil {
 		if !service.HasDurableTaskReservation(info, 0) {
 			return nil, service.TaskErrorWrapperLocal(errors.New("measured video retry requires a durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
@@ -395,14 +395,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 	if info.Billing == nil && !info.PriceData.FreeModel {
 		info.ForcePreConsume = true
-		if measuredVideo {
-			if apiErr := service.PreConsumeDurableTaskBilling(c, info.PriceData.Quota, info); apiErr != nil {
-				return nil, service.TaskErrorFromAPIError(apiErr)
-			}
-		} else {
-			if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
-				return nil, service.TaskErrorFromAPIError(apiErr)
-			}
+		if apiErr := service.PreConsumeDurableTaskBilling(c, info.PriceData.Quota, info); apiErr != nil {
+			return nil, service.TaskErrorFromAPIError(apiErr)
 		}
 	}
 

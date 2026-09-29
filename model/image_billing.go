@@ -129,7 +129,20 @@ func stageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []As
 			}
 		}
 		bill.Status, bill.LogStatus, bill.CreatedAt = "fixed", "pending", now
-		if err := tx.Create(&bill).Error; err != nil {
+		var reservation AsyncImageBill
+		// The task CAS above already holds the ledger's serialization lock.
+		reservationErr := tx.Where("task_id = ?", task.TaskId).Take(&reservation).Error
+		if reservationErr == nil {
+			if reservation.Status != "reserved" || reservation.FundingSource != bill.FundingSource || reservation.SubscriptionId != bill.SubscriptionId || reservation.UserId != bill.UserId || reservation.TokenId != bill.TokenId {
+				return ErrImageConflict
+			}
+			bill.Id, bill.ReservedAt = reservation.Id, reservation.ReservedAt
+			bill.ReservedQuota, bill.ReservedTokenQuota = reservation.ReservedQuota, reservation.ReservedTokenQuota
+			bill.SubscriptionPeriodStart = reservation.SubscriptionPeriodStart
+		} else if !errors.Is(reservationErr, gorm.ErrRecordNotFound) {
+			return reservationErr
+		}
+		if err := tx.Save(&bill).Error; err != nil {
 			return err
 		}
 		eventKey := common.GetUUID()
@@ -152,7 +165,20 @@ func stageAsyncImageOutput(ctx context.Context, task AsyncImageTask, images []As
 // ApplyAsyncImageBill commits every main-DB financial effect with the ledger.
 // Repeating the same fingerprint succeeds; a different command never replaces it.
 func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error {
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var pending AsyncImageBill
+	if err := DB.WithContext(ctx).Where("task_id = ?", taskId).Take(&pending).Error; err != nil {
+		return err
+	}
+	if pending.Status != "applied" && (pending.Quota > pending.ReservedQuota || pending.Quota > pending.ReservedTokenQuota) {
+		if err := prepareAsyncImageQuotaCaches(ctx, pending.UserId, pending.TokenId); err != nil {
+			return err
+		}
+	}
+	var cached asyncImageQuotaCacheReservation
+	commitAttempted := false
+	var userID, tokenID, walletRefund, tokenRefund, tokenUsage int
+	var tokenKey string
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task AsyncImageTask
 		if err := lockForUpdate(tx).Where("task_id = ?", taskId).First(&task).Error; err != nil {
 			return err
@@ -186,7 +212,7 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 			return ErrImageConflict
 		}
 		var user User
-		if err := lockForUpdate(tx).Where("id = ?", bill.UserId).First(&user).Error; err != nil {
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", bill.UserId).First(&user).Error; err != nil {
 			return err
 		}
 		var token Token
@@ -195,17 +221,21 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 			return err
 		}
 		amount := bill.Quota
-		if !token.UnlimitedQuota && token.RemainQuota < amount {
+		fundingDelta, tokenDelta := amount-bill.ReservedQuota, amount-bill.ReservedTokenQuota
+		if !token.UnlimitedQuota && token.RemainQuota < max(0, tokenDelta) {
 			return ErrImageInsufficientQuota
 		}
-		if user.UsedQuota > math.MaxInt64-amount || token.UsedQuota > math.MaxInt64-amount || user.RequestCount == math.MaxInt64 {
+		if user.UsedQuota > math.MaxInt64-amount || tokenDelta > 0 && token.UsedQuota > math.MaxInt64-tokenDelta || tokenDelta < 0 && token.UsedQuota < -tokenDelta || user.RequestCount == math.MaxInt64 {
 			return errors.New("image accounting counter overflow")
 		}
+		walletCharge, tokenCharge := 0, 0
 		if bill.FundingSource == "wallet" {
-			if user.Quota < amount {
+			if fundingDelta > 0 && user.Quota < fundingDelta || fundingDelta < 0 && user.Quota > math.MaxInt64+fundingDelta {
 				return ErrImageInsufficientQuota
 			}
-			user.Quota -= amount
+			walletCharge = max(0, fundingDelta)
+			walletRefund = max(0, -fundingDelta)
+			user.Quota -= fundingDelta
 		} else if bill.FundingSource == "subscription" {
 			var sub UserSubscription
 			if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", bill.SubscriptionId, bill.UserId).First(&sub).Error; err != nil {
@@ -218,25 +248,35 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 			if err := maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, time.Now().Unix()); err != nil {
 				return err
 			}
-			if sub.Status != "active" || sub.EndTime <= time.Now().Unix() || sub.AmountUsed > math.MaxInt64-int64(amount) || sub.AmountTotal > 0 && sub.AmountTotal-sub.AmountUsed < int64(amount) {
+			samePeriod := bill.ReservedAt == 0 || SubscriptionReservationMatchesPeriod(&sub, bill.SubscriptionPeriodStart, bill.ReservedAt)
+			if fundingDelta > 0 && (!samePeriod || sub.Status != "active" || sub.EndTime <= time.Now().Unix() || sub.AmountUsed > math.MaxInt64-int64(fundingDelta) || sub.AmountTotal > 0 && sub.AmountTotal-sub.AmountUsed < int64(fundingDelta)) {
 				return ErrImageInsufficientQuota
 			}
 			if bill.SubscriptionAmount != int64(amount) {
 				return ErrImageConflict
 			}
-			if err := tx.Model(&UserSubscription{}).Where("id = ?", sub.Id).Update("amount_used", sub.AmountUsed+int64(amount)).Error; err != nil {
-				return err
+			if samePeriod {
+				if err := tx.Model(&UserSubscription{}).Where("id = ?", sub.Id).Update("amount_used", max(0, sub.AmountUsed+int64(fundingDelta))).Error; err != nil {
+					return err
+				}
 			}
 		} else {
 			return errors.New("invalid image funding source")
 		}
-		if err := tx.Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{"quota": user.Quota, "used_quota": user.UsedQuota + amount, "request_count": user.RequestCount + 1}).Error; err != nil {
+		if !token.UnlimitedQuota {
+			tokenCharge = max(0, tokenDelta)
+		}
+		tokenRefund = max(0, -tokenDelta)
+		if token.RemainQuota > math.MaxInt64-tokenRefund {
+			return errors.New("image token refund overflow")
+		}
+		if err := cached.reserve(user.Id, token, walletCharge, tokenCharge); err != nil {
 			return err
 		}
-		tokenUpdates := map[string]any{"used_quota": token.UsedQuota + amount, "accessed_time": time.Now().Unix()}
-		if !token.UnlimitedQuota {
-			tokenUpdates["remain_quota"] = token.RemainQuota - amount
+		if err := tx.Unscoped().Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{"quota": user.Quota, "used_quota": user.UsedQuota + amount, "request_count": user.RequestCount + 1}).Error; err != nil {
+			return err
 		}
+		tokenUpdates := map[string]any{"used_quota": token.UsedQuota + tokenDelta, "accessed_time": time.Now().Unix(), "remain_quota": token.RemainQuota - tokenCharge + tokenRefund}
 		if err := tx.Unscoped().Model(&Token{}).Where("id = ?", token.Id).Updates(tokenUpdates).Error; err != nil {
 			return err
 		}
@@ -267,6 +307,19 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: concurrent image bill", ErrImageConflict)
 		}
+		userID, tokenID, tokenKey = user.Id, token.Id, token.Key
+		if token.UnlimitedQuota {
+			tokenUsage = max(0, tokenDelta)
+		}
+		commitAttempted = true
 		return nil
 	})
+	if err != nil {
+		if !commitAttempted {
+			cached.compensate()
+		}
+		return err
+	}
+	syncAsyncImageQuotaCache(userID, tokenID, tokenKey, walletRefund, tokenRefund, tokenUsage)
+	return nil
 }

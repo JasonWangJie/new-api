@@ -314,12 +314,17 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
 			return &taskMediaProxyError{
 				status: http.StatusGatewayTimeout, code: "artifact_upstream_timeout",
-				message: "Artifact upstream request timed out", err: err,
+				message: "Artifact upstream request timed out", err: errors.Join(service.ErrAsyncMediaDownloadTransport, err),
 			}
+		}
+		var networkErr *net.OpError
+		transportErr := err
+		if errors.As(err, &networkErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			transportErr = errors.Join(service.ErrAsyncMediaDownloadTransport, err)
 		}
 		return &taskMediaProxyError{
 			status: http.StatusBadGateway, code: "artifact_upstream_error",
-			message: "Failed to fetch artifact content", err: err,
+			message: "Failed to fetch artifact content", err: transportErr,
 		}
 	}
 	defer resp.Body.Close()
@@ -335,7 +340,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
 			logger.LogError(c.Request.Context(), fmt.Sprintf("Failed to stream task media: %v", err))
-			return err
+			return errors.Join(service.ErrAsyncMediaDownloadTransport, err)
 		}
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
@@ -355,12 +360,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		}
 		return &taskMediaProxyError{
 			status: http.StatusServiceUnavailable, code: "artifact_upstream_busy",
-			message: "Artifact upstream is busy",
+			message: "Artifact upstream is busy", err: service.ErrAsyncMediaDownloadTransport,
 		}
 	default:
+		var transportErr error
+		if resp.StatusCode >= http.StatusInternalServerError && resp.StatusCode <= 599 {
+			transportErr = service.ErrAsyncMediaDownloadTransport
+		}
 		return &taskMediaProxyError{
 			status: http.StatusBadGateway, code: "artifact_upstream_error",
-			message: fmt.Sprintf("Artifact upstream returned status %d", resp.StatusCode),
+			message: fmt.Sprintf("Artifact upstream returned status %d", resp.StatusCode), err: transportErr,
 		}
 	}
 }

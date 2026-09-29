@@ -2,7 +2,6 @@ package model
 
 import (
 	"context"
-	"errors"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -95,15 +94,7 @@ func RefreshAsyncImageBillingCache(ctx context.Context, taskId string) error {
 	if err := DB.WithContext(ctx).Where("task_id = ? AND status = ?", taskId, "applied").First(&bill).Error; err != nil {
 		return err
 	}
-	if err := invalidateUserCache(bill.UserId); err != nil {
-		return err
-	}
-	var token Token
-	if err := DB.WithContext(ctx).Unscoped().Where("id = ?", bill.TokenId).First(&token).Error; err != nil {
-		return err
-	}
-	if token.Key == "" {
-		return errors.New("image settlement token cache identity missing")
-	}
-	return invalidateTokenCacheForMutation(token.Key)
+	// ApplyAsyncImageBill projects only its own deltas. Invalidating a live
+	// balance here would discard unflushed deductions from ordinary relays.
+	return nil
 }

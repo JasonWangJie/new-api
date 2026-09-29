@@ -243,7 +243,11 @@ func TestServeTaskPluginProtocolDisconnectDuringTerminalSettlementStopsOnlyObser
 	previousMemoryCache := common.MemoryCacheEnabled
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}))
+	sqlDB, err := database.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Channel{}, &model.Task{}))
+	require.NoError(t, database.Create(&model.User{Id: 71, Username: "terminal-settlement", Group: "default", Quota: 990, UsedQuota: 10, RequestCount: 1, Status: common.UserStatusEnabled}).Error)
 	model.DB = database
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {

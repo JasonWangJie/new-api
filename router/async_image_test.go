@@ -9,6 +9,7 @@ import (
 	"errors"
 	"image"
 	"image/png"
+	stdlog "log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
@@ -177,6 +179,287 @@ func imageRouterDatabase(t *testing.T, name string) *gorm.DB {
 		_ = admin.Close()
 	})
 	return db
+}
+
+func TestAsyncTaskStats(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldDB, oldQuotaUnit, oldRedis, oldLimit := model.DB, common.QuotaPerUnit, common.RedisEnabled, common.GlobalApiRateLimitEnable
+	t.Cleanup(func() {
+		model.DB, common.QuotaPerUnit, common.RedisEnabled, common.GlobalApiRateLimitEnable = oldDB, oldQuotaUnit, oldRedis, oldLimit
+	})
+	common.QuotaPerUnit, common.RedisEnabled, common.GlobalApiRateLimitEnable = 500000, false, false
+	t.Setenv("TZ", "Asia/Shanghai")
+	location, err := time.LoadLocation("Asia/Shanghai")
+	require.NoError(t, err)
+	now := time.Now().In(location)
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	model.DB = imageRouterDatabase(t, "stats")
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.Task{}))
+	versionQuery := "SELECT version()"
+	if model.DB.Dialector.Name() == "sqlite" {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	var version string
+	require.NoError(t, model.DB.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("database=%s version=%s", model.DB.Dialector.Name(), version)
+	user := model.User{Username: "statsowner", AffCode: "statsowner", Status: common.UserStatusEnabled, Quota: 6250000}
+	other := model.User{Username: "statsother", AffCode: "statsother", Status: common.UserStatusEnabled}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, model.DB.Create(&other).Error)
+	token := model.Token{UserId: user.Id, Key: strings.Repeat("a", 48), Status: common.TokenStatusExhausted, ExpiredTime: -1}
+	second := model.Token{UserId: user.Id, Key: strings.Repeat("b", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	otherToken := model.Token{UserId: other.Id, Key: strings.Repeat("c", 48), Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	for _, entry := range []*model.Token{&token, &second, &otherToken} {
+		require.NoError(t, model.DB.Create(entry).Error)
+	}
+	engine := gin.New()
+	SetAsyncImagePublicRouter(engine)
+	request := func(path, authorization string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		engine.ServeHTTP(recorder, req)
+		assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		return recorder
+	}
+	readStats := func(kind, key string) map[string]any {
+		path := "/v1/" + kind + "/tasks_async/stats?user_id=" + strconv.Itoa(other.Id) + "&api_key_id=" + strconv.Itoa(otherToken.Id) + "&timezone=UTC&date=2000-01-01"
+		recorder := request(path, "Bearer sk-"+key)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		var payload map[string]any
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
+		assert.Len(t, payload, 8)
+		assert.Equal(t, now.Format(time.DateOnly), payload["date"])
+		assert.Equal(t, "Asia/Shanghai", payload["timezone"])
+		return payload
+	}
+
+	empty := readStats("images", token.Key)
+	assert.Equal(t, float64(0), empty["today_requests"])
+	assert.Equal(t, float64(0), empty["success_rate"])
+	assert.Equal(t, 12.5, empty["balance"])
+	imageStatuses := []string{model.ImageTaskQueued, model.ImageTaskInvoking, model.ImageTaskUpstreamSucceeded, model.ImageTaskUploading, model.ImageTaskBillingPending, model.ImageTaskSucceeded, model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExecutionUnknown, model.ImageTaskStorageFailed, model.ImageTaskBillingFailed, model.ImageTaskExpired}
+	for i, status := range imageStatuses {
+		ownerToken := token.Id
+		if i%2 != 0 {
+			ownerToken = second.Id
+		}
+		require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: "stats-image-" + strconv.Itoa(i), UserId: user.Id, TokenId: ownerToken, Status: status, CreatedAt: start.Unix() + int64(i)}).Error)
+	}
+	for i, created := range []int64{start.Unix() - 1, start.AddDate(0, 0, 1).Unix()} {
+		require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: "outside-image-" + strconv.Itoa(i), UserId: user.Id, Status: model.ImageTaskSucceeded, CreatedAt: created}).Error)
+		require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: "outside-video-" + strconv.Itoa(i), IdentityHash: "outside-" + strconv.Itoa(i), UserId: user.Id, Status: "succeeded", CreatedAt: created}).Error)
+	}
+	require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: "other-image", UserId: other.Id, Status: model.ImageTaskSucceeded, CreatedAt: start.Unix()}).Error)
+	require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: "other-video", IdentityHash: "other-video", UserId: other.Id, Status: "succeeded", CreatedAt: start.Unix()}).Error)
+	videoCases := []struct{ status, storage, billing, upstream string }{
+		{"queued", "pending", "pending", ""},
+		{"submitting", "pending", "pending", ""},
+		{"submitted", "pending", "reserved", string(model.TaskStatusInProgress)},
+		{"submitted", "saving", "settled", string(model.TaskStatusSuccess)},
+		{"succeeded", "succeeded", "settled", string(model.TaskStatusSuccess)},
+		{"succeeded", "upstream", "settled", string(model.TaskStatusSuccess)},
+		{"failed", "pending", "refunded", ""},
+		{"execution_unknown", "pending", "unknown", ""},
+		{"submitted", "failed", "settled", string(model.TaskStatusSuccess)},
+		{"succeeded", "succeeded", "failed", string(model.TaskStatusSuccess)},
+		{"expired", "expired", "settled", ""},
+		{"submitted", "pending", "reserved", string(model.TaskStatusFailure)},
+	}
+	for i, entry := range videoCases {
+		id := "stats-video-" + strconv.Itoa(i)
+		require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: user.Id, TokenId: second.Id, Status: entry.status, StorageStatus: entry.storage, BillingStatus: entry.billing, CreatedAt: start.Unix() + int64(i)}).Error)
+		if entry.upstream != "" {
+			// Multiple upstream rows must never multiply the persisted job count.
+			for range 2 {
+				require.NoError(t, model.DB.Create(&model.Task{TaskID: id, UserId: user.Id, Status: model.TaskStatus(entry.upstream), CreatedAt: start.Unix()}).Error)
+			}
+		}
+	}
+	// Neither a generic legacy task nor another owner's colliding ID is this user's failed video.
+	require.NoError(t, model.DB.Create(&model.Task{TaskID: "unrelated-generic-task", UserId: user.Id, Status: model.TaskStatusSuccess, CreatedAt: start.Unix()}).Error)
+	require.NoError(t, model.DB.Create(&model.Task{TaskID: "stats-video-4", UserId: other.Id, Status: model.TaskStatusFailure, CreatedAt: start.Unix()}).Error)
+	for _, entry := range []struct {
+		kind, object              string
+		requests, success, failed float64
+	}{
+		{"images", "async_image.stats", 12, 2, 5},
+		{"videos", "async_video.stats", 12, 2, 6},
+		{"media", "async_media.stats", 24, 4, 11},
+	} {
+		t.Run(entry.kind, func(t *testing.T) {
+			payload := readStats(entry.kind, token.Key)
+			assert.Equal(t, entry.object, payload["object"])
+			assert.Equal(t, entry.requests, payload["today_requests"])
+			assert.Equal(t, entry.success, payload["success_count"])
+			assert.Equal(t, entry.failed, payload["failure_count"])
+			assert.InDelta(t, entry.success/(entry.success+entry.failed)*100, payload["success_rate"], 1e-10)
+			assert.Equal(t, payload, readStats(entry.kind, second.Key))
+		})
+	}
+	require.NoError(t, model.DB.Model(&user).Update("quota", 0).Error)
+	assert.Equal(t, float64(0), readStats("images", token.Key)["balance"])
+
+	t.Run("authentication", func(t *testing.T) {
+		path := "/v1/images/tasks_async/stats"
+		for _, authorization := range []string{"", token.Key, "Basic " + token.Key, "Bearer", "Bearer sk-", "Bearer invalid", "Bearer sk-" + strings.ToUpper(token.Key), "Bearer sk-" + token.Key + "-1", "Bearer sk-" + token.Key + " extra"} {
+			recorder := request(path+"?key=sk-"+token.Key+"&api_key=sk-"+token.Key, authorization)
+			assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+			assert.JSONEq(t, `{"error":{"type":"authentication_error","code":"authentication_error","message":"invalid API key"}}`, recorder.Body.String())
+		}
+		for _, header := range []string{"x-api-key", "x-goog-api-key", "Cookie", "Sec-WebSocket-Protocol"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set(header, "sk-"+token.Key)
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, req)
+			assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Add("Authorization", "Bearer sk-"+token.Key)
+		req.Header.Add("Authorization", "Bearer sk-"+second.Key)
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, req)
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+		assert.Equal(t, http.StatusOK, request(path, "bearer sk-"+token.Key).Code)
+		for _, changes := range []map[string]any{
+			{"status": common.TokenStatusDisabled},
+			{"status": common.TokenStatusExpired},
+			{"expired_time": time.Now().Unix() - 1},
+			{"allow_ips": "203.0.113.0/24"},
+			{"deleted_at": time.Now()},
+		} {
+			require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Updates(changes).Error)
+			assert.Equal(t, http.StatusUnauthorized, request(path, "Bearer sk-"+token.Key).Code)
+			require.NoError(t, model.DB.Unscoped().Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"status": common.TokenStatusExhausted, "expired_time": -1, "allow_ips": nil, "deleted_at": nil}).Error)
+		}
+		for _, changes := range []map[string]any{{"status": common.UserStatusDisabled}, {"deleted_at": time.Now()}} {
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Updates(changes).Error)
+			assert.Equal(t, http.StatusUnauthorized, request(path, "Bearer sk-"+token.Key).Code)
+			require.NoError(t, model.DB.Unscoped().Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"status": common.UserStatusEnabled, "deleted_at": nil}).Error)
+		}
+	})
+
+	t.Run("daylight saving boundaries", func(t *testing.T) {
+		zone, err := time.LoadLocation("America/New_York")
+		require.NoError(t, err)
+		for _, day := range []string{"2026-03-08", "2026-11-01"} {
+			start, err := time.ParseInLocation(time.DateOnly, day, zone)
+			require.NoError(t, err)
+			end := start.AddDate(0, 0, 1)
+			for i, created := range []int64{start.Unix() - 1, start.Unix(), end.Unix() - 1, end.Unix()} {
+				id := day + "-" + strconv.Itoa(i)
+				require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: id, UserId: user.Id, Status: model.ImageTaskSucceeded, CreatedAt: created}).Error)
+				require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: user.Id, Status: "succeeded", CreatedAt: created}).Error)
+			}
+			stats, err := model.GetAsyncTaskStats(t.Context(), user.Id, "media", start.Add(12*time.Hour))
+			require.NoError(t, err)
+			assert.Equal(t, model.AsyncTaskStats{TodayRequests: 4, SuccessCount: 4}, stats)
+		}
+	})
+
+	t.Run("live balance", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		oldClient, oldBatch := common.RDB, common.BatchUpdateEnabled
+		client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = client, true, true
+		t.Cleanup(func() {
+			common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = oldClient, false, oldBatch
+			assert.NoError(t, client.Close())
+			assert.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 0).Error)
+		})
+		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 6250000).Error)
+		path := "/v1/images/tasks_async/stats"
+		// An uncertain live ledger cannot be replaced with a stale database snapshot.
+		recorder := request(path, "Bearer sk-"+token.Key)
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"code":"stats_unavailable"`)
+		cacheKey := "user:" + strconv.Itoa(user.Id)
+		assert.False(t, server.Exists(cacheKey))
+		_, err := model.GetUserCache(user.Id)
+		require.NoError(t, err)
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "Quota", 1250000).Err())
+		assert.Equal(t, 2.5, readStats("images", token.Key)["balance"])
+		require.NoError(t, client.HSet(t.Context(), cacheKey, "Quota", 0).Err())
+		assert.Equal(t, float64(0), readStats("images", token.Key)["balance"])
+		server.SetError("ledger unavailable")
+		recorder = request(path, "Bearer sk-"+token.Key)
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"code":"stats_unavailable"`)
+		server.SetError("")
+		server.Del(cacheKey)
+		common.BatchUpdateEnabled = false
+		assert.Equal(t, 12.5, readStats("images", token.Key)["balance"])
+		assert.False(t, server.Exists(cacheKey), "read-only stats do not hydrate the live quota ledger")
+	})
+
+	t.Run("credential logging", func(t *testing.T) {
+		var logs bytes.Buffer
+		oldWriter, db := gin.DefaultWriter, model.DB
+		gin.DefaultWriter = &logs
+		model.DB = db.Session(&gorm.Session{Logger: logger.New(stdlog.New(&logs, "", 0), logger.Config{LogLevel: logger.Info})})
+		t.Cleanup(func() { gin.DefaultWriter, model.DB = oldWriter, db })
+		logEngine := gin.New()
+		middleware.SetUpLogger(logEngine)
+		SetAsyncImagePublicRouter(logEngine)
+		for _, kind := range []string{"images", "videos", "media"} {
+			for _, authorization := range []string{"", "Bearer sk-" + token.Key} {
+				req := httptest.NewRequest(http.MethodGet, "/v1/"+kind+"/tasks_async/stats?key=sk-"+token.Key, nil)
+				if authorization != "" {
+					req.Header.Set("Authorization", authorization)
+				}
+				recorder := httptest.NewRecorder()
+				logEngine.ServeHTTP(recorder, req)
+			}
+		}
+		assert.Contains(t, logs.String(), "/tasks_async/stats")
+		assert.NotContains(t, logs.String(), token.Key)
+		assert.NotContains(t, logs.String(), "?key=")
+	})
+
+	t.Run("rate limit", func(t *testing.T) {
+		oldNum, oldDuration := common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 1, 60
+		t.Cleanup(func() {
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = false, oldNum, oldDuration
+		})
+		limited := gin.New()
+		SetAsyncImagePublicRouter(limited)
+		for i := range 2 {
+			req := httptest.NewRequest(http.MethodGet, "/v1/images/tasks_async/stats", nil)
+			req.RemoteAddr = "198.51.100.231:5000"
+			recorder := httptest.NewRecorder()
+			limited.ServeHTTP(recorder, req)
+			assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+			if i == 0 {
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+			} else {
+				assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
+				assert.Equal(t, "60", recorder.Header().Get("Retry-After"))
+				assert.Contains(t, recorder.Body.String(), `"code":"rate_limit_exceeded"`)
+			}
+		}
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		t.Setenv("TZ", "invalid/timezone")
+		recorder := request("/v1/media/tasks_async/stats", "Bearer sk-"+token.Key)
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"code":"stats_unavailable"`)
+		t.Setenv("TZ", "Asia/Shanghai")
+		db := model.DB
+		model.DB = nil
+		recorder = request("/v1/media/tasks_async/stats", "Bearer sk-"+token.Key)
+		model.DB = db
+		assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"code":"stats_unavailable"`)
+		require.NoError(t, model.DB.Migrator().DropTable(&model.AsyncImageTask{}))
+		recorder = request("/v1/media/tasks_async/stats", "Bearer sk-"+token.Key)
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), `"code":"stats_unavailable"`)
+		assert.NotContains(t, recorder.Body.String(), "async_image_tasks")
+	})
 }
 
 func imageUploadRequest(t *testing.T, engine *gin.Engine, data []byte, filename, key, credential string) *httptest.ResponseRecorder {
@@ -472,8 +755,10 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 			assert.Equal(t, tc.submitStatus, request("POST", "/v1/images/generations_oa", body, common.GetUUID(), token.Key).Code)
 		})
 	}
-	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 0}).Error)
-	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 0).Error)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusEnabled).Error)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 0).Error)
+	require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota", 0).Err())
+	require.NoError(t, model.AdjustUserQuotaDurable(user.Id, -user.Quota))
 	oldPrices := ratio_setting.ModelPrice2JSONString()
 	t.Cleanup(func() { assert.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices)) })
 	priceMap := ratio_setting.GetModelPriceCopy()
@@ -517,8 +802,11 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		}))
 		defer upstream.Close()
 		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("base_url", upstream.URL).Error)
-		require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 1000000).Error)
+		require.NoError(t, model.AdjustUserQuotaDurable(user.Id, 1000000))
+		// This fixture allocates token quota; it is not a usage refund. Keep
+		// the existing cache balance aligned without changing UsedQuota.
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
+		require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota", 1000000).Err())
 		service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, native service.AsyncImageRequest, selected *model.Channel, runtime service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 			images, bill, err := relay.ExecuteAsyncImage(ctx, task, native, selected, runtime, dispatch)
 			if err == nil {
@@ -578,7 +866,13 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 		assert.EqualValues(t, 2, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
-		assert.Equal(t, 990000, user.Quota, "ambiguous generation does not invent a local debit")
+		assert.Equal(t, 970000, user.Quota, "ambiguous generation retains its reservation until reconciliation")
+		var unknownBill model.AsyncImageBill
+		require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&unknownBill).Error)
+		assert.Equal(t, "reserved", unknownBill.Status)
+		assert.Equal(t, 20000, unknownBill.ReservedQuota)
+		assert.ErrorIs(t, model.TerminateAsyncImageTask(t.Context(), task), model.ErrImageConflict)
+		require.NoError(t, model.TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
 		// Gemini uses its native protocol and the same durable settlement chain.
 		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", geminiChannel.Id).Update("base_url", upstream.URL).Error)
 		expectedPath.Store("/v1beta/models/gemini-2.5-flash-image:generateContent")
@@ -651,7 +945,8 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 		assert.EqualValues(t, 5, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
-		assert.Equal(t, 970000, user.Quota)
+		assert.Equal(t, 960000, user.Quota, "Gemini ambiguous execution keeps its estimated reservation")
+		require.NoError(t, model.TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
 		pricing := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
 		previousPricing := *pricing
 		defer func() { *pricing = previousPricing }()
@@ -692,6 +987,11 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 			require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
 			assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
 			assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
+			var held model.AsyncImageBill
+			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&held).Error)
+			assert.Equal(t, "reserved", held.Status)
+			assert.Positive(t, held.ReservedQuota, "missing usage cannot turn accepted work into a free request")
+			require.NoError(t, model.TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
 		}
 		assert.EqualValues(t, 9, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)

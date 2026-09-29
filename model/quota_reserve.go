@@ -103,21 +103,35 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 	return quotaResultFromLua(result, err)
 }
 
-// persistUserQuotaDelta 把已在缓存侧预扣成功的增量落库；批量模式下入队，
-// 直写模式下要求行存在（用户已删除时报错，交由调用方补偿缓存）。
+var errDurableQuotaCommitUncertain = errors.New("durable quota transaction commit outcome is unknown")
+
+// persistUserQuotaDeltaWithMode 把已在缓存侧预扣成功的增量落库；批量模式下入队。
+// durable 提交结果不确定时保留缓存预留，仅明确回滚的失败允许调用方补偿。
 func persistUserQuotaDeltaWithMode(id int, delta int, durable bool) error {
 	if common.BatchUpdateEnabled && !durable {
 		addNewRecord(BatchUpdateTypeUserQuota, id, delta)
 		return nil
 	}
-	result := DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", delta))
-	if result.Error != nil {
-		return result.Error
+	transactionBodySucceeded := false
+	update := func(tx *gorm.DB) error {
+		result := tx.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", delta))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		transactionBodySucceeded = true
+		return nil
 	}
-	if result.RowsAffected != 1 {
-		return gorm.ErrRecordNotFound
+	if !durable {
+		return update(DB)
 	}
-	return nil
+	err := DB.Transaction(update)
+	if err != nil && transactionBodySucceeded {
+		return errors.Join(errDurableQuotaCommitUncertain, err)
+	}
+	return err
 }
 
 func persistTokenQuotaDeltaWithMode(id int, delta int, durable bool) error {
@@ -125,20 +139,32 @@ func persistTokenQuotaDeltaWithMode(id int, delta int, durable bool) error {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, delta)
 		return nil
 	}
-	result := DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]any{
-			"remain_quota":  gorm.Expr("remain_quota + ?", delta),
-			"used_quota":    gorm.Expr("used_quota - ?", delta),
-			"accessed_time": common.GetTimestamp(),
-		},
-	)
-	if result.Error != nil {
-		return result.Error
+	transactionBodySucceeded := false
+	update := func(tx *gorm.DB) error {
+		result := tx.Model(&Token{}).Where("id = ?", id).Updates(
+			map[string]any{
+				"remain_quota":  gorm.Expr("remain_quota + ?", delta),
+				"used_quota":    gorm.Expr("used_quota - ?", delta),
+				"accessed_time": common.GetTimestamp(),
+			},
+		)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		transactionBodySucceeded = true
+		return nil
 	}
-	if result.RowsAffected != 1 {
-		return gorm.ErrRecordNotFound
+	if !durable {
+		return update(DB)
 	}
-	return nil
+	err := DB.Transaction(update)
+	if err != nil && transactionBodySucceeded {
+		return errors.Join(errDurableQuotaCommitUncertain, err)
+	}
+	return err
 }
 
 func reserveUserQuotaDB(id int, quota int) (bool, error) {
@@ -212,6 +238,9 @@ func tryReserveUserQuota(id int, quota int, durable bool) (bool, error) {
 		return false, nil
 	}
 	if err = persistUserQuotaDeltaWithMode(id, -quota, durable); err != nil {
+		if errors.Is(err, errDurableQuotaCommitUncertain) {
+			return false, err
+		}
 		compensated, compensateErr := cacheApplyUserQuotaDelta(id, int64(quota))
 		if compensateErr != nil || compensated != cacheQuotaOK {
 			common.SysError(fmt.Sprintf("failed to compensate reserved user quota: result=%d error=%v", compensated, compensateErr))
@@ -276,6 +305,9 @@ func tryReserveTokenQuota(id int, key string, quota int, unlimited, durable bool
 		return false, nil
 	}
 	if err = persistTokenQuotaDeltaWithMode(id, -quota, durable); err != nil {
+		if errors.Is(err, errDurableQuotaCommitUncertain) {
+			return false, err
+		}
 		compensated, compensateErr := cacheApplyTokenQuotaDelta(id, key, int64(quota))
 		if compensateErr != nil || compensated != cacheQuotaOK {
 			common.SysError(fmt.Sprintf("failed to compensate reserved token quota: result=%d error=%v", compensated, compensateErr))

@@ -1287,6 +1287,7 @@ func TestUpstreamAsyncPollRedirectsKeepCredentialsAtOrigin(t *testing.T) {
 
 func TestDynamicUpstreamAsyncVideoPollingUsesFrozenProfile(t *testing.T) {
 	truncate(t)
+	seedUser(t, 701, 1000)
 	profile := upstreamAsyncTestProfile(t, "video")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		assert.Equal(t, http.MethodPost, request.Method)
@@ -1299,8 +1300,10 @@ func TestDynamicUpstreamAsyncVideoPollingUsesFrozenProfile(t *testing.T) {
 	defer server.Close()
 
 	channel := &model.Channel{Id: 701, Type: constant.ChannelTypeKling, Name: "dynamic", Key: "live-key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
 	task := &model.Task{
 		TaskID:    "task_dynamic_video",
+		UserId:    701,
 		ChannelId: channel.Id,
 		Platform:  constant.TaskPlatform("kling"),
 		Status:    model.TaskStatusInProgress,
@@ -1516,6 +1519,7 @@ func TestDynamicUpstreamAsyncVideoUsageSettlement(t *testing.T) {
 
 func TestDynamicUpstreamAsyncUnknownStatusDoesNotExposeResponseBody(t *testing.T) {
 	truncate(t)
+	seedUser(t, 702, 1000)
 	previous := constant.TaskPollMaxFailures
 	constant.TaskPollMaxFailures = 1
 	t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
@@ -1528,8 +1532,10 @@ func TestDynamicUpstreamAsyncUnknownStatusDoesNotExposeResponseBody(t *testing.T
 	defer server.Close()
 
 	channel := &model.Channel{Id: 702, Type: constant.ChannelTypeKling, Name: "dynamic", Key: "key", BaseURL: &server.URL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
 	task := &model.Task{
 		TaskID:      "task_dynamic_unknown",
+		UserId:      702,
 		ChannelId:   channel.Id,
 		Platform:    constant.TaskPlatform("kling"),
 		Status:      model.TaskStatusInProgress,

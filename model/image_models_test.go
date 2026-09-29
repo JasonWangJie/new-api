@@ -2,6 +2,9 @@ package model
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,10 +13,12 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -21,10 +26,33 @@ import (
 
 func imageTestDatabase(t *testing.T, name string) *gorm.DB {
 	t.Helper()
+	if dsn := os.Getenv("ASYNC_IMAGE_TEST_MYSQL_DSN"); dsn != "" {
+		cfg, err := mysqlDriver.ParseDSN(dsn)
+		require.NoError(t, err)
+		require.True(t, strings.HasPrefix(cfg.DBName, "new_api_image_test_"), "use an isolated image test database")
+		cfg.DBName = ""
+		admin, err := sql.Open("mysql", cfg.FormatDSN())
+		require.NoError(t, err)
+		database := "new_api_image_test_" + strings.ToLower(common.GetUUID())
+		_, err = admin.ExecContext(t.Context(), "CREATE DATABASE `"+database+"` CHARACTER SET utf8mb4")
+		require.NoError(t, err)
+		cfg.DBName = database
+		db, err := gorm.Open(mysql.Open(cfg.FormatDSN()), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			connection, _ := db.DB()
+			_ = connection.Close()
+			_, err := admin.ExecContext(context.Background(), "DROP DATABASE `"+database+"`")
+			assert.NoError(t, err)
+			_ = admin.Close()
+		})
+		return db
+	}
 	dsn := os.Getenv("ASYNC_IMAGE_TEST_PG_DSN")
 	if dsn == "" {
 		db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), name+".db")), &gorm.Config{})
 		require.NoError(t, err)
+		t.Cleanup(func() { connection, _ := db.DB(); _ = connection.Close() })
 		return db
 	}
 	cfg, err := pgx.ParseConfig(dsn)
@@ -62,6 +90,8 @@ func imageDatabaseFixture(t *testing.T) (*gorm.DB, AsyncImageTask, AsyncImageBil
 	db := imageTestDatabase(t, "main")
 	logDB := imageTestDatabase(t, "logs")
 	DB, LOG_DB = db, logDB
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(logDB.Dialector.Name()))
+	initCol()
 	t.Cleanup(func() {
 		mainSQL, _ := db.DB()
 		_ = mainSQL.Close()
@@ -70,6 +100,7 @@ func imageDatabaseFixture(t *testing.T) (*gorm.DB, AsyncImageTask, AsyncImageBil
 		DB, LOG_DB = previousDB, previousLogDB
 		common.SetMainDatabaseType(previousMainType)
 		common.SetLogDatabaseType(previousLogType)
+		initCol()
 		common.RedisEnabled, common.DataExportEnabled, common.LogConsumeEnabled = previousRedis, previousExport, previousLogs
 	})
 	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}))
@@ -336,4 +367,281 @@ func TestAsyncImageLibraryPublicationAndReferenceCleanup(t *testing.T) {
 	assert.ErrorIs(t, err, ErrImageConflict)
 	_, err = ClaimUnconfirmedImageIntent(ctx, orphan.Id, "second-delete", 120, now+600)
 	require.NoError(t, err)
+}
+
+func TestAsyncImageReservationSettlementAndCompetition(t *testing.T) {
+	db, task, bill := imageDatabaseFixture(t)
+	if db.Dialector.Name() == "sqlite" {
+		connection, err := db.DB()
+		require.NoError(t, err)
+		connection.SetMaxOpenConns(1)
+	}
+	other := task
+	other.Id, other.TaskId = 0, "competing-image"
+	require.NoError(t, db.Create(&other).Error)
+	start, finished := make(chan struct{}), make(chan error, 2)
+	for _, candidate := range []AsyncImageTask{task, other} {
+		go func() {
+			<-start
+			finished <- ReserveAsyncImageQuota(t.Context(), candidate, 600, ImageFundingSelection{Source: "wallet"})
+		}()
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		err := <-finished
+		if err == nil {
+			winners++
+		} else {
+			assert.ErrorIs(t, err, ErrImageInsufficientQuota)
+		}
+	}
+	assert.Equal(t, 1, winners)
+	var reservation AsyncImageBill
+	require.NoError(t, db.Where("status = ?", "reserved").Take(&reservation).Error)
+	task = AsyncImageTask{}
+	require.NoError(t, db.Where("task_id = ?", reservation.TaskId).Take(&task).Error)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "wallet"}))
+	assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+	reserved, err := TryReserveUserQuota(task.UserId, 500)
+	require.NoError(t, err)
+	assert.False(t, reserved, "ordinary relays cannot spend the image hold")
+	bill.TaskId, bill.BillingRequestId = task.TaskId, "async-image:"+task.TaskId
+	stageImageBillFixture(t, db, task, bill)
+	require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+	require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+	token := getTokenFromDB(t, task.TokenId)
+	assert.Equal(t, 900, token.RemainQuota)
+	assert.Equal(t, 100, token.UsedQuota)
+	var user User
+	require.NoError(t, db.First(&user, task.UserId).Error)
+	assert.Equal(t, 1, user.RequestCount)
+	assert.Equal(t, 100, user.UsedQuota)
+}
+
+func TestAsyncImageReservationRecoveryAndReconciliation(t *testing.T) {
+	for _, status := range []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown} {
+		t.Run(status, func(t *testing.T) {
+			db, task, _ := imageDatabaseFixture(t)
+			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "wallet"}))
+			// Simulate a crash after terminal state persistence but before refund.
+			require.NoError(t, db.Model(&task).Update("status", status).Error)
+			require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60))
+			if status == ImageTaskExecutionUnknown {
+				assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.ErrorIs(t, TerminateAsyncImageTask(t.Context(), task), ErrImageConflict)
+				require.NoError(t, TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
+			}
+			require.NoError(t, RefundAsyncImageReservation(t.Context(), task.TaskId))
+			assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+			token := getTokenFromDB(t, task.TokenId)
+			assert.Equal(t, 1000, token.RemainQuota)
+			assert.Zero(t, token.UsedQuota)
+			var bill AsyncImageBill
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, "refunded", bill.Status)
+		})
+	}
+}
+
+func TestAsyncImageReservationSharesBatchQuotaAndCompensates(t *testing.T) {
+	db, task, bill := imageDatabaseFixture(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	_, err := GetUserCache(task.UserId)
+	require.NoError(t, err)
+	token, err := GetTokenByKey("image-test-key", true)
+	require.NoError(t, err)
+	common.BatchUpdateEnabled = true
+	reserved, err := TryReserveUserQuota(task.UserId, 500)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	reserved, err = TryReserveTokenQuota(task.TokenId, token.Key, 500, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId), "ordinary quota is still waiting in the batch")
+	assert.ErrorIs(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "wallet"}), ErrImageInsufficientQuota)
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("image-reservation-test-failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "async_image_bills" {
+			tx.AddError(errors.New("injected reservation ledger failure"))
+		}
+	}))
+	assert.ErrorContains(t, ReserveAsyncImageQuota(t.Context(), task, 400, ImageFundingSelection{Source: "wallet"}), "injected reservation ledger failure")
+	require.NoError(t, db.Callback().Create().Remove("image-reservation-test-failure"))
+	cached, err := GetUserCache(task.UserId)
+	require.NoError(t, err)
+	assert.Equal(t, 500, cached.Quota)
+	cachedToken, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 500, cachedToken.RemainQuota)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 400, ImageFundingSelection{Source: "wallet"}))
+	stageImageBillFixture(t, db, task, bill)
+	require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+	require.NoError(t, RefreshAsyncImageBillingCache(t.Context(), task.TaskId))
+	cached, err = GetUserCache(task.UserId)
+	require.NoError(t, err)
+	assert.Equal(t, 400, cached.Quota, "settlement must preserve the other request's pending 500 deduction")
+	cachedToken, err = cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 400, cachedToken.RemainQuota)
+	batchUpdate()
+	assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+	other := task
+	other.Id, other.TaskId, other.Status = 0, "cold-cache-image", ImageTaskInvoking
+	require.NoError(t, db.Create(&other).Error)
+	server.Del(getUserCacheKey(task.UserId))
+	assert.ErrorContains(t, ReserveAsyncImageQuota(t.Context(), other, 100, ImageFundingSelection{Source: "wallet"}), "cache is unavailable")
+	assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+}
+
+func TestAsyncImageReservationRefundRecoveryDoesNotStarve(t *testing.T) {
+	db, task, _ := imageDatabaseFixture(t)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+	other := task
+	other.Id, other.TaskId = 0, "later-refundable-image"
+	require.NoError(t, db.Create(&other).Error)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), other, 100, ImageFundingSelection{Source: "wallet"}))
+	require.NoError(t, db.Model(&AsyncImageTask{}).Where("task_id IN ?", []string{task.TaskId, other.TaskId}).Update("status", ImageTaskFailed).Error)
+	// A corrupt older ledger must not occupy the head of every recovery batch.
+	require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("token_id", -1).Error)
+	assert.Error(t, RecoverAsyncImageTasks(t.Context(), 1, 60))
+	// Accepted-work refunds still apply to soft-deleted financial records.
+	require.NoError(t, db.Delete(&User{}, task.UserId).Error)
+	require.NoError(t, db.Delete(&Token{}, task.TokenId).Error)
+	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60))
+	var user User
+	require.NoError(t, db.Unscoped().First(&user, task.UserId).Error)
+	assert.Equal(t, 900, user.Quota)
+	var token Token
+	require.NoError(t, db.Unscoped().First(&token, task.TokenId).Error)
+	assert.Equal(t, 900, token.RemainQuota)
+	assert.Equal(t, 100, token.UsedQuota)
+	var count int64
+	require.NoError(t, RefundAsyncImageReservation(t.Context(), other.TaskId))
+	require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", other.TaskId, "reservation_refunded").Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestAsyncImageReservationAdditionalSettlement(t *testing.T) {
+	for _, quota := range []int{700, 1100} {
+		t.Run(fmt.Sprint(quota), func(t *testing.T) {
+			db, task, bill := imageDatabaseFixture(t)
+			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "wallet"}))
+			bill.Quota = quota
+			stageImageBillFixture(t, db, task, bill)
+			err := ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint)
+			if quota > 1000 {
+				assert.ErrorIs(t, err, ErrImageInsufficientQuota)
+				assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+				assert.Equal(t, 400, getTokenFromDB(t, task.TokenId).RemainQuota)
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+				assert.Equal(t, 300, getUserQuotaFromDB(t, task.UserId))
+				assert.Equal(t, 300, getTokenFromDB(t, task.TokenId).RemainQuota)
+			}
+		})
+	}
+}
+
+func TestAsyncImageReservationSubscriptionPeriod(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same_period", true: "reset_period"}[changed], func(t *testing.T) {
+			db, task, bill := imageDatabaseFixture(t)
+			plan := SubscriptionPlan{Title: "Image reservation plan"}
+			require.NoError(t, db.Create(&plan).Error)
+			sub := UserSubscription{UserId: task.UserId, PlanId: plan.Id, AmountTotal: 1000, Status: "active", LastResetTime: 1, StartTime: time.Now().Unix(), EndTime: time.Now().Unix() + 86400}
+			require.NoError(t, db.Create(&sub).Error)
+			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "subscription", SubscriptionId: sub.Id}))
+			if changed {
+				require.NoError(t, db.Model(&sub).Updates(map[string]any{"last_reset_time": 2, "amount_used": 200}).Error)
+			}
+			bill.FundingSource, bill.SubscriptionId, bill.SubscriptionAmount = "subscription", sub.Id, int64(bill.Quota)
+			stageImageBillFixture(t, db, task, bill)
+			require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+			require.NoError(t, db.First(&sub, sub.Id).Error)
+			if changed {
+				assert.EqualValues(t, 200, sub.AmountUsed)
+			} else {
+				assert.EqualValues(t, 100, sub.AmountUsed)
+			}
+			assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+			assert.Equal(t, 900, getTokenFromDB(t, task.TokenId).RemainQuota)
+		})
+	}
+}
+
+type imageReservationMigrationTrace struct {
+	logger.Interface
+	changes []string
+}
+
+func (trace *imageReservationMigrationTrace) Trace(_ context.Context, _ time.Time, sql func() (string, int64), _ error) {
+	statement, _ := sql()
+	upper := strings.ToUpper(strings.TrimSpace(statement))
+	if strings.HasPrefix(upper, "CREATE ") || strings.HasPrefix(upper, "ALTER ") || strings.HasPrefix(upper, "DROP ") {
+		trace.changes = append(trace.changes, statement)
+	}
+}
+
+func TestAsyncImageReservationMigration(t *testing.T) {
+	// This is the bill schema at the audit base, before durable reservations.
+	type legacyBill struct {
+		Id                                int
+		TaskId                            string `gorm:"size:64;uniqueIndex"`
+		BillingRequestId                  string `gorm:"size:96;uniqueIndex"`
+		Fingerprint                       string `gorm:"size:64"`
+		UserId, TokenId, ChannelId, Quota int
+		FundingSource                     string `gorm:"size:32"`
+		SubscriptionId                    int
+		SubscriptionAmount                int64  `gorm:"type:bigint"`
+		Snapshot, Usage                   string `gorm:"type:text"`
+		Status, LogStatus                 string `gorm:"size:16"`
+		LogPayload                        string `gorm:"type:text"`
+		CreatedAt, AppliedAt              int64  `gorm:"type:bigint"`
+	}
+	for _, upgrade := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh", true: "upgrade"}[upgrade], func(t *testing.T) {
+			db := imageTestDatabase(t, "reservation-migration")
+			query := "SELECT VERSION()"
+			if db.Dialector.Name() == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, db.Raw(query).Scan(&version).Error)
+			t.Logf("Database version: %s", version)
+			if upgrade {
+				require.NoError(t, db.Table("async_image_bills").AutoMigrate(&legacyBill{}))
+				for _, status := range []string{"fixed", "applied"} {
+					require.NoError(t, db.Table("async_image_bills").Create(&legacyBill{TaskId: status, BillingRequestId: "async-image:" + status, Fingerprint: "legacy-" + status, Quota: 123, FundingSource: "wallet", Snapshot: "legacy-snapshot", Status: status, LogStatus: "pending"}).Error)
+				}
+			}
+			require.NoError(t, db.AutoMigrate(&AsyncImageBill{}))
+			trace := &imageReservationMigrationTrace{Interface: logger.Default.LogMode(logger.Silent)}
+			require.NoError(t, db.Session(&gorm.Session{Logger: trace}).AutoMigrate(&AsyncImageBill{}))
+			assert.Empty(t, trace.changes, "the second startup must not alter this schema")
+			if upgrade {
+				var bills []AsyncImageBill
+				require.NoError(t, db.Order("id").Find(&bills).Error)
+				require.Len(t, bills, 2)
+				for _, bill := range bills {
+					assert.Equal(t, 123, bill.Quota)
+					assert.Equal(t, "legacy-snapshot", bill.Snapshot)
+					assert.Zero(t, bill.ReservedAt)
+					assert.Zero(t, bill.ReservedQuota)
+					assert.Zero(t, bill.ReservedTokenQuota)
+					assert.Nil(t, bill.SubscriptionPeriodStart)
+				}
+				duplicate := bills[0]
+				duplicate.Id = 0
+				duplicate.BillingRequestId = "different-request"
+				assert.Error(t, db.Create(&duplicate).Error)
+				duplicate.TaskId = "different-task"
+				duplicate.BillingRequestId = bills[0].BillingRequestId
+				assert.Error(t, db.Create(&duplicate).Error)
+			}
+		})
+	}
 }

@@ -745,13 +745,14 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 	copyTask := *task
 	task = &copyTask
 	restoreErr := service.RestoreAsyncMediaOutput(ctx, job, task)
-	if restoreErr != nil && !errors.Is(restoreErr, os.ErrNotExist) {
+	refreshResult := task.PrivateData.UpstreamAsync != nil && (job.StorageStatus == "failed" || job.StorageStatus == "saving")
+	if restoreErr != nil && !errors.Is(restoreErr, os.ErrNotExist) && !refreshResult {
 		return restoreErr
 	}
 	// A signed upstream URL in the saved poll snapshot can expire between
 	// storage attempts. Re-poll a completed dynamic task to obtain a fresh URL;
 	// this never resubmits generation or repeats billing.
-	if errors.Is(restoreErr, os.ErrNotExist) || (job.StorageStatus == "failed" || job.StorageStatus == "saving") && task.PrivateData.UpstreamAsync != nil {
+	if errors.Is(restoreErr, os.ErrNotExist) || refreshResult {
 		adaptor, err := initTaskArtifactAdaptor(task)
 		if err != nil {
 			return err
@@ -812,8 +813,9 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 			if result.Status != model.TaskStatusSuccess || len(result.URLs) == 0 {
 				return errors.New("completed video result is unavailable")
 			}
-			task.PrivateData.UpstreamAsyncResponse = append(task.PrivateData.UpstreamAsyncResponse[:0], body...)
+			task.PrivateData.UpstreamAsyncResponse = append([]byte(nil), body...)
 			task.PrivateData.ResultURL = result.URLs[0]
+			originalTask.PrivateData.UpstreamAsyncResponse = task.PrivateData.UpstreamAsyncResponse
 			originalTask.PrivateData.ResultURL = result.URLs[0]
 			task.Data = nil
 		} else {

@@ -290,17 +290,30 @@ func ResumeAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
 }
 
 func TerminateAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
-	if task.Terminal() {
+	return terminateAsyncImageTask(ctx, task, false)
+}
+
+// The caller must require administrator authorization and explicit confirmation
+// that the uncertain upstream execution has been checked before releasing funds.
+func TerminateAsyncImageTaskAfterReconciliation(ctx context.Context, task AsyncImageTask) error {
+	if task.Status != ImageTaskExecutionUnknown {
 		return ErrImageConflict
 	}
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return terminateAsyncImageTask(ctx, task, true)
+}
+
+func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reconciled bool) error {
+	if task.Terminal() && !(reconciled && task.Status == ImageTaskExecutionUnknown) {
+		return ErrImageConflict
+	}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Settlement locks the task before the bill. Keep the same lock order so
 		// the terminal state reflects whether the financial transaction committed.
 		var current AsyncImageTask
 		if err := lockForUpdate(tx).Where("task_id = ?", task.TaskId).Take(&current).Error; err != nil {
 			return err
 		}
-		if current.Terminal() || current.Version != task.Version || current.Status != task.Status {
+		if current.Terminal() && !(reconciled && current.Status == ImageTaskExecutionUnknown) || current.Version != task.Version || current.Status != task.Status {
 			return ErrImageConflict
 		}
 		updates := map[string]any{"status": ImageTaskFailed, "request_cipher": nil, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "error_code": "admin_terminated", "public_error_code": 608, "error_message": "Task terminated by administrator", "reconciliation_status": "not_charged", "finished_at": time.Now().Unix()}
@@ -314,8 +327,16 @@ func TerminateAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
 		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		return transitionImageTaskTx(tx, current, updates, "terminated", "Administrator terminated task", "")
+		event, message := "terminated", "Administrator terminated task"
+		if reconciled {
+			event, message = "admin_reconciled", "Administrator checked upstream execution and approved reservation release"
+		}
+		return transitionImageTaskTx(tx, current, updates, event, message, "")
 	})
+	if err != nil {
+		return err
+	}
+	return RefundAsyncImageReservation(context.WithoutCancel(ctx), task.TaskId)
 }
 
 func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
@@ -368,5 +389,22 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
 			return err
 		}
 	}
-	return nil
+	// A crash after the terminal state commit but before the separate refund
+	// transaction is recoverable without ever repeating the financial effect.
+	var refundable []AsyncImageBill
+	if err := DB.WithContext(ctx).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_bills.task_id").Where("async_image_bills.reserved_at > 0 AND async_image_bills.status IN ? AND async_image_tasks.status IN ?", []string{"reserved", "fixed"}, []string{ImageTaskFailed, ImageTaskExpired}).Order("COALESCE(async_image_bills.refund_attempt_at, 0), async_image_bills.id").Limit(limit).Find(&refundable).Error; err != nil {
+		return err
+	}
+	var refundErrors []error
+	for _, bill := range refundable {
+		if err := RefundAsyncImageReservation(ctx, bill.TaskId); err != nil {
+			refundErrors = append(refundErrors, err)
+			// Rotate persistent failures behind unattempted refunds, even when
+			// more than one full recovery batch contains damaged records.
+			if updateErr := DB.WithContext(ctx).Model(&AsyncImageBill{}).Where("id = ? AND status IN ?", bill.Id, []string{"reserved", "fixed"}).Update("refund_attempt_at", time.Now().UnixMilli()).Error; updateErr != nil {
+				refundErrors = append(refundErrors, updateErr)
+			}
+		}
+	}
+	return errors.Join(refundErrors...)
 }

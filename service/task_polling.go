@@ -92,7 +92,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 
 	for _, task := range tasks {
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
-		if taskUsesMeasuredVideoBilling(task) && !isLegacy {
+		if !isLegacy {
 			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks submit accounting error for task %s: %v", task.TaskID, err))
 				continue
@@ -111,8 +111,8 @@ func sweepTimedOutTasks(ctx context.Context) {
 		} else {
 			task.FailReason = reason
 		}
-		if taskUsesMeasuredVideoBilling(task) && !isLegacy {
-			won, err := SettleMeasuredVideoTask(ctx, task, oldStatus, 0, nil, nil)
+		if !isLegacy {
+			won, err := SettleTaskBillingOnComplete(ctx, nil, task, oldStatus, relaycommon.FailTaskInfo(reason))
 			if err != nil {
 				logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks settlement error for task %s: %v", task.TaskID, err))
 				continue
@@ -194,7 +194,7 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
-				if taskUsesMeasuredVideoBilling(task) {
+				if task.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(task) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, task); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", task.TaskID, accountingErr))
 						continue
@@ -204,7 +204,7 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 					task.Progress = taskcommon.ProgressComplete
 					task.FinishTime = time.Now().Unix()
 					task.FailReason = "upstream task ID is missing"
-					won, settleErr := SettleMeasuredVideoTask(ctx, task, oldStatus, 0, nil, nil)
+					won, settleErr := SettleTaskBillingOnComplete(ctx, nil, task, oldStatus, relaycommon.FailTaskInfo(task.FailReason))
 					if settleErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("settle task %s with missing upstream ID: %v", task.TaskID, settleErr))
 					} else if won {
@@ -316,7 +316,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
-				if taskUsesMeasuredVideoBilling(t) {
+				if t.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(t) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
 						continue
@@ -350,6 +350,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	tasks := make([]*model.Task, 0, len(taskIds))
 	for _, upstreamID := range taskIds {
 		if task := taskM[upstreamID]; task != nil {
+			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
+				return err
+			}
 			tasks = append(tasks, task)
 		}
 	}
@@ -454,6 +457,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
+		if terminalTransition {
+			if _, err := SettleTaskBillingOnComplete(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("settle batch task %s: %v", task.TaskID, err))
+			}
+			continue
+		}
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
 			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
@@ -462,12 +471,6 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		if !won {
 			logger.LogWarn(ctx, fmt.Sprintf("Batch task %s already transitioned by another process, skip billing", task.TaskID))
 			continue
-		}
-		if terminalTransition {
-			billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, &responseItem.TaskInfo)
-			if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
-				RefundTaskQuota(ctx, task, task.FailReason)
-			}
 		}
 	}
 	return nil
@@ -532,7 +535,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
-				if taskUsesMeasuredVideoBilling(t) {
+				if t.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(t) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
 						continue
@@ -817,7 +820,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	now := time.Now().Unix()
-	shouldFinalizeBilling := false
 
 	task.Status = parsedStatus
 	switch parsedStatus {
@@ -845,7 +847,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			// No URL from adaptor — construct proxy URL using public task ID
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		}
-		shouldFinalizeBilling = true
 	case model.TaskStatusFailure:
 		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
 		task.Status = model.TaskStatusFailure
@@ -856,7 +857,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		task.FailReason = taskResult.Reason
 		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed: %s", task.TaskID, task.FailReason))
 		taskResult.Progress = taskcommon.ProgressComplete
-		shouldFinalizeBilling = true
 	}
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
@@ -884,29 +884,17 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		}
 		return nil
 	}
-	if isDone && snap.Status != task.Status {
-		won, err := task.UpdateWithStatus(snap.Status)
-		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
-			shouldFinalizeBilling = false
-		} else if !won {
-			logger.LogWarn(ctx, fmt.Sprintf("Task %s CAS lost or no-op update, skip billing", task.TaskID))
-			shouldFinalizeBilling = false
-		}
-	} else if !snap.Equal(task.Snapshot()) {
+	if isDone {
+		_, err := SettleTaskBillingOnComplete(ctx, adaptor, task, snap.Status, taskResult)
+		return err
+	}
+	if !snap.Equal(task.Snapshot()) {
 		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update task %s: %s", task.TaskID, err.Error()))
 		}
 	} else {
 		// No changes, skip update
 		logger.LogDebug(ctx, "No update needed for task %s", task.TaskID)
-	}
-
-	if shouldFinalizeBilling {
-		billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-		if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
-			RefundTaskQuota(ctx, task, task.FailReason)
-		}
 	}
 
 	return nil
@@ -944,51 +932,6 @@ func truncateBase64(s string) string {
 		return s
 	}
 	return s[:maxKeep] + "..."
-}
-
-// settleTaskBillingOnComplete 任务完成时的统一计费调整。
-// 返回 true 表示用量结算路径已接管最终计费；失败任务仅在返回 false 时补做全额退款。
-// 优先级：1. tiered snapshot → 2. adaptor 调整 → 3. token 重算。
-//
-// 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
-func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
-	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
-		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
-		if task.Status == model.TaskStatusFailure {
-			return false
-		}
-		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
-		if err != nil {
-			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算失败，保留预扣额度: %v", task.TaskID, err))
-			return true
-		}
-		if result.Clamp != nil {
-			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算额度发生饱和: %+v", task.TaskID, result.Clamp))
-		}
-		bc.TieredSnapshot.UsageFacts = usageFacts
-		bc.TieredSnapshot.EstimatedTier = result.MatchedTier
-		RecalculateTaskQuota(ctx, task, result.ActualQuotaAfterGroup, "任务用量表达式结算", result.Clamp)
-		return true
-	}
-	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
-	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
-		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 按次计费，跳过差额结算", task.TaskID))
-		return false
-	}
-	// 优先让 adaptor 决定最终额度。
-	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
-		RecalculateTaskQuota(ctx, task, actualQuota, "adaptor计费调整")
-		return true
-	}
-	// 回退到 token 重算。
-	tokens := taskResult.TotalTokens
-	if tokens == 0 && taskResult.CompletionTokens > 0 {
-		tokens = taskResult.CompletionTokens
-	}
-	if tokens > 0 {
-		return RecalculateTaskQuotaByTokens(ctx, task, tokens)
-	}
-	return false
 }
 
 func classifyPollHTTP(statusCode int) string {
@@ -1091,23 +1034,9 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		task.FinishTime = now
 	}
 	task.FailReason = reason
-	if taskUsesMeasuredVideoBilling(task) {
-		_, err := SettleMeasuredVideoTask(ctx, task, fromStatus, 0, nil, nil)
-		return err
-	}
-	won, err := task.UpdateWithStatus(fromStatus)
-	if err != nil {
-		return err
-	}
-	if !won {
-		return nil
-	}
 	taskResult := relaycommon.FailTaskInfo(reason)
-	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-	if !billingSettled && task.Quota != 0 {
-		RefundTaskQuota(ctx, task, reason)
-	}
-	return nil
+	_, err := SettleTaskBillingOnComplete(ctx, adaptor, task, fromStatus, taskResult)
+	return err
 }
 
 func taskUsesMeasuredVideoBilling(task *model.Task) bool {
@@ -1117,7 +1046,7 @@ func taskUsesMeasuredVideoBilling(task *model.Task) bool {
 }
 
 func ensureMeasuredTaskSubmitAccounting(ctx context.Context, task *model.Task) error {
-	if !taskUsesMeasuredVideoBilling(task) || task.PrivateData.SubmitAccountingRecorded {
+	if task == nil || (!task.PrivateData.DurableBilling && !taskUsesMeasuredVideoBilling(task)) || task.PrivateData.SubmitAccountingRecorded {
 		return nil
 	}
 	_, err := model.RecordMeasuredTaskSubmitAccounting(ctx, task)

@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -427,17 +428,25 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 	}
 	info.PriceData = price
-	funding, err := model.SelectImageFunding(ctx, user.Id, price.QuotaToPreConsume, user.GetSetting().BillingPreference)
-	if err != nil {
-		return nil, model.AsyncImageBill{}, err
-	}
-	if !token.UnlimitedQuota && token.RemainQuota < price.QuotaToPreConsume {
-		return nil, model.AsyncImageBill{}, model.ErrImageInsufficientQuota
+	var funding model.ImageFundingSelection
+	if request.Reservation != nil {
+		funding = model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}
+	} else {
+		funding, err = model.SelectImageFunding(ctx, user.Id, price.QuotaToPreConsume, user.GetSetting().BillingPreference)
+		if err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
+		if !token.UnlimitedQuota && token.RemainQuota < price.QuotaToPreConsume {
+			return nil, model.AsyncImageBill{}, model.ErrImageInsufficientQuota
+		}
 	}
 	var usage *dto.Usage
 	dispatched := false
 	upstreamBeforeInvoke := func() error {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := model.ReserveAsyncImageQuota(ctx, task, info.PriceData.QuotaToPreConsume, funding); err != nil {
 			return err
 		}
 		if err := beforeInvoke(); err != nil {
@@ -514,6 +523,18 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if err := ctx.Err(); err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
+		var submitRequest *http.Request
+		if hasAsyncProfile && asyncProfile.Submit.Request != nil && task.UpstreamTaskId == "" {
+			submitRequest, err = service.BuildUpstreamAsyncSubmitRequest(ctx, info.ChannelBaseUrl, asyncProfile, upstreamAsyncImageTemplateContext(info, ""), submitSource, bytes.NewReader(body), c.Request.Header.Get("Content-Type"))
+			if err != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+			}
+			if asyncProfile.Submit.Request.Body != nil {
+				if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, request.Count); err != nil {
+					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+				}
+			}
+		}
 		if task.UpstreamTaskId == "" {
 			if err := upstreamBeforeInvoke(); err != nil {
 				return nil, model.AsyncImageBill{}, err
@@ -522,6 +543,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		var response any
 		if hasAsyncProfile && task.UpstreamTaskId != "" {
 			response, err = service.PollUpstreamAsync(c.Request.Context(), info.ChannelBaseUrl, info.ChannelSetting.Proxy, asyncProfile, upstreamAsyncImageTemplateContext(info, task.UpstreamTaskId))
+		} else if submitRequest != nil {
+			wasStream := info.IsStream
+			info.IsStream = false
+			response, err = relaychannel.DoRequest(c, submitRequest, info)
+			info.IsStream = wasStream
 		} else {
 			response, err = adaptor.DoRequest(c, info, bytes.NewReader(body))
 		}

@@ -107,7 +107,10 @@ export function ImageTaskDetails(props: {
   userId: number
   onClose: () => void
   canManage: boolean
-  onManage: (action: 'resume' | 'terminate') => void
+  onManage: (
+    action: 'resume' | 'terminate',
+    confirmUpstreamChecked?: boolean
+  ) => void
 }) {
   const { t } = useTranslation()
   const { copyToClipboard } = useCopyToClipboard()
@@ -257,7 +260,12 @@ export function ImageTaskDetails(props: {
                     <Button
                       size='sm'
                       variant='destructive'
-                      onClick={() => props.onManage('terminate')}
+                      onClick={() =>
+                        props.onManage(
+                          'terminate',
+                          data.status === 'execution_unknown'
+                        )
+                      }
                     >
                       <Ban className='size-3.5' aria-hidden />
                       {t('Terminate')}
@@ -622,6 +630,9 @@ export function ImageTaskDetails(props: {
                 onRefresh={() => {
                   void task.refetch()
                 }}
+                onRefreshUpstream={
+                  canResume ? () => props.onManage('resume') : undefined
+                }
               />
             )}
             {data.media_type !== 'video' && images.isLoading && (

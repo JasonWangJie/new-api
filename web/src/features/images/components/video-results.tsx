@@ -27,6 +27,7 @@ import type { ImageResult } from '../types'
 export function VideoResults(props: {
   results: ImageResult[]
   onRefresh: () => void
+  onRefreshUpstream?: () => void
 }) {
   const { t } = useTranslation()
   return (
@@ -54,8 +55,16 @@ export function VideoResults(props: {
             <CopyButton value={result.url || result.view_url}>
               {t('Copy link')}
             </CopyButton>
-            {result.source !== 'upstream' && (
-              <Button variant='ghost' size='sm' onClick={props.onRefresh}>
+            {(result.source !== 'upstream' || props.onRefreshUpstream) && (
+              <Button
+                variant='ghost'
+                size='sm'
+                onClick={
+                  result.source === 'upstream'
+                    ? props.onRefreshUpstream
+                    : props.onRefresh
+                }
+              >
                 {t('Refresh link')}
               </Button>
             )}

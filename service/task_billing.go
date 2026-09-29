@@ -22,9 +22,8 @@ import (
 // LogTaskConsumption 记录任务消费日志和统计信息；按实际秒数结算的异步视频
 // 先在主库幂等持久化提交用量，再写日志。实际扣费由 BillingSession 完成。
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model.Task) error {
-	measuredVideo := task != nil && task.PrivateData.UpstreamAsync != nil &&
-		task.PrivateData.UpstreamAsync.Poll.Response.ActualSecondsPath != ""
-	if measuredVideo {
+	durableTask := task != nil && (task.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(task))
+	if durableTask {
 		if task.UserId != info.UserId || task.ChannelId != info.ChannelId || task.Quota != info.PriceData.Quota {
 			return fmt.Errorf("measured task accounting differs from submitted billing")
 		}
@@ -93,7 +92,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Group:     info.UsingGroup,
 		Other:     other,
 	})
-	if !measuredVideo {
+	if !durableTask {
 		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
 		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
 	}
@@ -250,7 +249,7 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 			return false, fmt.Errorf("measured task charge exceeds reserved quota")
 		}
 		reservedQuota := task.Quota
-		won, _, err := model.SettleMeasuredVideoTask(ctx, task, fromStatus, actualQuota, usageFacts, result.MatchedTier)
+		won, _, err := model.SettleTaskBilling(ctx, task, fromStatus, actualQuota, usageFacts, result.MatchedTier)
 		if err != nil || !won {
 			return won, err
 		}
@@ -279,7 +278,7 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 		return false, fmt.Errorf("failed measured task must settle with zero charge")
 	}
 	reservedQuota := task.Quota
-	won, _, err := model.SettleMeasuredVideoTask(ctx, task, fromStatus, 0, usageFacts, "")
+	won, _, err := model.SettleTaskBilling(ctx, task, fromStatus, 0, usageFacts, "")
 	if err != nil || !won {
 		return won, err
 	}
@@ -300,6 +299,66 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 			Group:     task.Group,
 			Other:     other,
 			NodeName:  task.PrivateData.NodeName,
+		})
+	}
+	return true, nil
+}
+
+// SettleTaskBillingOnComplete evaluates the frozen bill before publishing a
+// terminal result. Balance changes and the terminal CAS commit together.
+func SettleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, result *relaycommon.TaskInfo) (bool, error) {
+	actualQuota := task.Quota
+	var facts map[string]any
+	var tier string
+	var clamp *common.QuotaClamp
+	if task.Status == model.TaskStatusFailure {
+		actualQuota = 0
+	} else if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
+		evaluated, usage, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, result.UsageFacts)
+		if err != nil {
+			// Preserve the established contract: invalid measured usage retains
+			// the frozen reservation rather than silently creating a free result.
+			logger.LogWarn(ctx, fmt.Sprintf("task %s completion billing unavailable; retaining reservation: %v", task.TaskID, err))
+		} else {
+			actualQuota, facts, tier, clamp = evaluated.ActualQuotaAfterGroup, usage, evaluated.MatchedTier, evaluated.Clamp
+		}
+	} else if bc == nil || !bc.PerCallBilling {
+		if adaptor != nil {
+			actualQuota = adaptor.AdjustBillingOnComplete(task, result)
+		}
+		if actualQuota <= 0 {
+			actualQuota = task.Quota
+			tokens := result.TotalTokens
+			if tokens == 0 {
+				tokens = result.CompletionTokens
+			}
+			if quota, quotaClamp, configured := taskQuotaByTokens(task, tokens); configured {
+				actualQuota, clamp = quota, quotaClamp
+			}
+		}
+	}
+	reserved := task.Quota
+	won, _, err := model.SettleTaskBilling(ctx, task, fromStatus, actualQuota, facts, tier)
+	if err != nil || !won {
+		return won, err
+	}
+	delta := task.Quota - reserved
+	if delta != 0 {
+		logType, logQuota := model.LogTypeConsume, delta
+		if delta < 0 {
+			logType, logQuota = model.LogTypeRefund, -delta
+		}
+		other := taskBillingOther(task)
+		other.SetPublic("pre_consumed_quota", reserved)
+		other.SetPublic("actual_quota", task.Quota)
+		if task.Status == model.TaskStatusFailure {
+			other.SetPublic("reason", task.FailReason)
+		}
+		attachQuotaSaturationToOther(other, clamp)
+		model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
+			UserId: task.UserId, LogType: logType, Content: "任务用量结算", ChannelId: task.ChannelId,
+			ModelName: taskModelName(task), Quota: logQuota, TokenId: task.PrivateData.TokenId,
+			Group: task.Group, Other: other, NodeName: task.PrivateData.NodeName,
 		})
 	}
 	return true, nil
@@ -429,8 +488,28 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
-	if totalTokens <= 0 {
+	actualQuota, clamp, configured := taskQuotaByTokens(task, totalTokens)
+	if !configured {
 		return false
+	}
+	RecalculateTaskQuota(ctx, task, actualQuota, fmt.Sprintf("token重算：tokens=%d", totalTokens), clamp)
+	return true
+}
+
+func taskQuotaByTokens(task *model.Task, totalTokens int) (int, *common.QuotaClamp, bool) {
+	if totalTokens <= 0 {
+		return 0, nil, false
+	}
+	if bc := task.PrivateData.BillingContext; bc != nil && task.PrivateData.DurableBilling {
+		if bc.ModelRatio <= 0 {
+			return 0, nil, false
+		}
+		multiplier := 1.0
+		if price := taskBillingContextPriceData(bc); price != nil {
+			multiplier = price.OtherRatioMultiplier()
+		}
+		quota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * bc.ModelRatio * bc.GroupRatio * multiplier)
+		return quota, clamp, true
 	}
 
 	modelName := taskModelName(task)
@@ -439,7 +518,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
 	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
-		return false
+		return 0, nil, false
 	}
 
 	// 获取用户和组的倍率信息
@@ -451,7 +530,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		}
 	}
 	if group == "" {
-		return false
+		return 0, nil, false
 	}
 
 	groupRatio := ratio_setting.GetGroupRatio(group)
@@ -473,9 +552,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	// 计算实际应扣费额度: totalTokens * modelRatio * groupRatio * otherMultiplier（饱和转换，防止溢出成负数）
 	actualQuota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
 
-	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
-	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
-	return true
+	return actualQuota, clamp, true
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task

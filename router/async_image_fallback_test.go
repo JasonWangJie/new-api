@@ -259,7 +259,7 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 				require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
 				if tc.lowBalance {
 					assert.Zero(t, user.UsedQuota)
-					require.NoError(t, model.DB.Model(&user).Update("quota", 100000).Error)
+					require.NoError(t, model.AdjustUserQuotaDurable(user.Id, 99999))
 				} else {
 					assert.Equal(t, tc.quota, user.UsedQuota)
 				}

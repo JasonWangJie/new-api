@@ -598,9 +598,9 @@ export function upstreamAsyncConfigToForm(
         2
       ),
       submit_headers_json: JSON.stringify(
-        profile.submit.request?.headers || {
-          Authorization: 'Bearer {api_key}',
-        },
+        profile.submit.request
+          ? profile.submit.request.headers || {}
+          : { Authorization: 'Bearer {api_key}' },
         null,
         2
       ),

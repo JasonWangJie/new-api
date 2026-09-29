@@ -141,6 +141,7 @@ function TaskCenterSession({
   const [operation, setOperation] = useState<{
     ids: string[]
     action: 'resume' | 'terminate' | 'batch-terminate'
+    confirmUpstreamChecked?: boolean
   } | null>(null)
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState<
@@ -442,6 +443,8 @@ function TaskCenterSession({
                     setOperation({
                       ids: [row.original.id],
                       action: 'terminate',
+                      confirmUpstreamChecked:
+                        row.original.status === 'execution_unknown',
                     })
                   }
                 >
@@ -499,7 +502,10 @@ function TaskCenterSession({
           try {
             await imageRequest(
               `${mediaTasksPath(true)}/${id}/terminate`,
-              'POST'
+              'POST',
+              operation.confirmUpstreamChecked
+                ? { confirm_upstream_checked: true }
+                : undefined
             )
             items.push({ id, status: 'terminated' })
           } catch (error) {
@@ -516,7 +522,9 @@ function TaskCenterSession({
         await imageRequest(
           `${mediaTasksPath(admin)}/${operation.ids[0]}/${operation.action}`,
           'POST',
-          {}
+          operation.confirmUpstreamChecked
+            ? { confirm_upstream_checked: true }
+            : {}
         )
       }
       await queryClient.invalidateQueries({
@@ -536,6 +544,17 @@ function TaskCenterSession({
     }
   }
   const successRate = imageTaskSuccessRate(tasks.data?.stats)
+  let confirmationDescription = t(
+    'Selected task IDs are fixed for this operation. Late results cannot change terminated tasks.'
+  )
+  if (operation?.confirmUpstreamChecked) {
+    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing and releases its reserved quota; it does not cancel the upstream task.')} ${confirmationDescription}`
+  }
+  if (operation?.action === 'resume') {
+    confirmationDescription = t(
+      'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
+    )
+  }
   const currentPending = (tasks.data?.items || []).filter(
     (task) => task.can_terminate
   )
@@ -612,6 +631,9 @@ function TaskCenterSession({
                 setOperation({
                   ids: currentPending.map((task) => task.id),
                   action: 'batch-terminate',
+                  confirmUpstreamChecked: currentPending.some(
+                    (task) => task.status === 'execution_unknown'
+                  ),
                 })
               }
             >
@@ -628,6 +650,11 @@ function TaskCenterSession({
                     .getSelectedRowModel()
                     .rows.map((row) => row.original.id),
                   action: 'batch-terminate',
+                  confirmUpstreamChecked: table
+                    .getSelectedRowModel()
+                    .rows.some(
+                      (row) => row.original.status === 'execution_unknown'
+                    ),
                 })
               }
             >
@@ -864,7 +891,9 @@ function TaskCenterSession({
               userId={userId}
               onClose={() => setDetail('')}
               canManage={canManage}
-              onManage={(action) => setOperation({ ids: [detail], action })}
+              onManage={(action, confirmUpstreamChecked) =>
+                setOperation({ ids: [detail], action, confirmUpstreamChecked })
+              }
             />
           )}
           <ConfirmDialog
@@ -874,14 +903,10 @@ function TaskCenterSession({
             }}
             title={t(
               operation?.action === 'resume'
-                ? 'Resume image post-processing'
+                ? 'Resume media post-processing'
                 : 'Terminate image tasks'
             )}
-            desc={t(
-              operation?.action === 'resume'
-                ? 'Only storage and billing are retried. The image is never generated again.'
-                : 'Selected task IDs are fixed for this operation. Late results cannot change terminated tasks.'
-            )}
+            desc={confirmationDescription}
             destructive={operation?.action !== 'resume'}
             isLoading={busy}
             handleConfirm={() => void confirm()}

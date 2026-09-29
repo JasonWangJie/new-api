@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
@@ -25,6 +26,7 @@ type AsyncImageInputPart struct {
 }
 
 type AsyncImageRequest struct {
+	Reservation    *model.AsyncImageBill        `json:"-"`
 	Billing        *MediaBillingSnapshot        `json:"billing,omitempty"`
 	Provider       string                       `json:"provider,omitempty"`
 	PolicyPlatform string                       `json:"policy_platform,omitempty"`

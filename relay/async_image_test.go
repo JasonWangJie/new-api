@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"image"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +30,177 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestAsyncImageUnreadableReceiptDoesNotRepeatSubmission(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		limit     int64
+		readError bool
+	}{
+		{name: "truncated_json", body: `{"id":"accepted-job"`, limit: 1024},
+		{name: "non_json", body: `<html>gateway error</html>`, limit: 1024},
+		{name: "oversized_receipt", body: `{"id":"accepted-job"}`, limit: 4},
+		{name: "read_failure", limit: 1024, readError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, upstreamID := range []string{"", "accepted-job"} {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Set("async_image_resume_task", upstreamID)
+				c.Set("async_image_response_limit", tc.limit)
+				var reader io.Reader = strings.NewReader(tc.body)
+				if tc.readError {
+					reader = iotest.ErrReader(io.ErrUnexpectedEOF)
+				}
+				response := &http.Response{StatusCode: http.StatusAccepted, Header: make(http.Header), Body: io.NopCloser(reader)}
+				_, apiErr := handleUpstreamAsyncImageResponse(c, &relaycommon.RelayInfo{}, response, &dto.UpstreamAsyncProfile{})
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, apiErr, &failure)
+				if upstreamID == "" {
+					assert.Equal(t, 608, failure.Code)
+					assert.Equal(t, "execution_unknown", failure.InternalCode)
+					assert.True(t, failure.ExecutionUnknown, "an unreadable accepted submission must never be retried")
+				} else {
+					assert.Equal(t, 606, failure.Code)
+					assert.False(t, failure.ExecutionUnknown, "known upstream jobs can safely retry polling")
+				}
+			}
+		})
+	}
+}
+
+func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
+	previousDB, previousCount, previousRedis := model.DB, constant.CountToken, common.RedisEnabled
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "gemini-submit.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled = db, false, false
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.RedisEnabled = previousDB, previousCount, previousRedis
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	user := model.User{Username: "gemini-submit-user", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "gemini-submit-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name    string
+		body    map[string]any
+		invalid bool
+	}{
+		{name: "template", body: map[string]any{"prompt": "{request.prompt}", "n": "{request.n}"}},
+		{name: "native_body"},
+		{name: "conflicting_count", body: map[string]any{"n": float64(2)}, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			type recordedRequest struct{ method, path, auth, query, body string }
+			received := make(chan recordedRequest, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if !assert.NoError(t, err) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				received <- recordedRequest{r.Method, r.URL.Path, r.Header.Get("X-Custom-Key"), r.URL.Query().Get("model"), string(body)}
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"status":"running"}`))
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"id":"vendor-job"}`))
+			}))
+			defer upstream.Close()
+			var config dto.UpstreamAsyncConfig
+			require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"custom","media_type":"image","models":["gemini-image-test"],"operations":["generate"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/custom/jobs","headers":{"X-Custom-Key":"{api_key}"},"query":{"model":"{upstream_model}"}}},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"result_path":"urls"}}}]}`, &config))
+			config.Profiles[0].Submit.Request.Body = tc.body
+			require.NoError(t, config.Validate())
+			channel := &model.Channel{Id: 1, Key: "upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeGemini, Status: common.ChannelStatusEnabled, Models: "gemini-image-test", Group: "default"}
+			channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &config})
+			request := service.AsyncImageRequest{Platform: "gemini", Model: "gemini-image-test", Prompt: "draw", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "text", Text: "draw"}}, Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+			task := model.AsyncImageTask{TaskId: "gemini-submit-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			_, _, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
+				dispatches++
+				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			})
+			if tc.invalid {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, http.StatusBadRequest, failure.HTTPStatus)
+				assert.Zero(t, dispatches)
+				assert.Empty(t, received)
+				return
+			}
+			var pending *service.AsyncImagePending
+			require.ErrorAs(t, err, &pending)
+			assert.Equal(t, 1, dispatches)
+			record := <-received
+			assert.Equal(t, http.MethodPost, record.method)
+			assert.Equal(t, "/custom/jobs", record.path)
+			assert.Equal(t, "upstream-key", record.auth)
+			assert.Equal(t, request.Model, record.query)
+			if tc.body != nil {
+				assert.JSONEq(t, `{"prompt":"draw","n":1}`, record.body)
+			} else {
+				assert.Contains(t, record.body, `"contents"`)
+			}
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, "vendor-job", task.UpstreamTaskId)
+			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error { dispatches++; return nil })
+			require.ErrorAs(t, err, &pending)
+			assert.Equal(t, 1, dispatches, "polling must not cross the submission barrier again")
+			record = <-received
+			assert.Equal(t, http.MethodGet, record.method)
+			assert.Equal(t, "/tasks/vendor-job", record.path)
+		})
+	}
+}
+
+func TestAsyncImageSettlementPreservesPromptExtension(t *testing.T) {
+	previousDB, previousQuotaUnit := model.DB, common.QuotaPerUnit
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "ali-image-bill.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, common.QuotaPerUnit = db, 500000
+	t.Cleanup(func() {
+		model.DB, common.QuotaPerUnit = previousDB, previousQuotaUnit
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	user := model.User{Username: "ali-image-bill-user", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	for _, tc := range []struct {
+		name             string
+		extend, fallback bool
+		want             int
+	}{
+		{name: "local_extended", extend: true, want: 10000},
+		{name: "fallback_extended", extend: true, fallback: true, want: 10000},
+		{name: "local_disabled", want: 5000},
+		{name: "fallback_disabled", fallback: true, want: 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations_async", nil)
+			images := []service.ImageBytes{{Width: 1024, Height: 1024}}
+			if tc.fallback {
+				c.Set("async_image_result_source", "upstream")
+				images[0] = service.ImageBytes{}
+			}
+			info := &relaycommon.RelayInfo{UserId: user.Id, OriginModelName: "z-image", ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAli, UpstreamModelName: "z-image"}, StartTime: time.Now(), Request: &dto.ImageRequest{}, PriceData: types.PriceData{UsePrice: true, ModelPrice: 0.01, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			require.Nil(t, service.EstimateImageBillingForRequest(info, 2, tc.extend))
+			assert.Equal(t, 2*tc.want, info.PriceData.QuotaToPreConsume)
+			bill, err := service.FixAsyncImageBill(c, model.AsyncImageTask{TaskId: "ali-bill-" + tc.name, UserId: user.Id, TokenId: 1, ChannelId: 1}, info, &dto.Usage{}, images, service.AsyncImageRequest{Platform: "openai", Model: "z-image", Count: 2}, model.ImageFundingSelection{Source: "wallet"})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, bill.Quota, "settle actual image count using the captured prompt-extension multiplier")
+		})
+	}
+}
 
 func TestUpstreamImageResultReadRetriesExistingTask(t *testing.T) {
 	service.InitHttpClient()

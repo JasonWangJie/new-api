@@ -115,6 +115,9 @@ func asyncImageTokenPermissions(readOnly bool) gin.HandlerFunc {
 func SetAsyncImagePublicRouter(router *gin.Engine) {
 	api := router.Group("/v1")
 	api.Use(middleware.RouteTag("relay"))
+	api.GET("/images/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("image"))
+	api.GET("/videos/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("video"))
+	api.GET("/media/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("media"))
 	for _, path := range []string{"/images/generations_oa", "/images/edits_oa", "/chat/completions_gm", "/images/generations_sc", "/images/generations_async", "/images/edits_async"} {
 		api.POST(path, asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
 	}

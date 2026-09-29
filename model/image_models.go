@@ -241,24 +241,29 @@ type AsyncImageResult struct {
 }
 
 type AsyncImageBill struct {
-	Id                 int
-	TaskId             string `gorm:"size:64;uniqueIndex"`
-	BillingRequestId   string `gorm:"size:96;uniqueIndex"`
-	Fingerprint        string `gorm:"size:64"`
-	UserId             int
-	TokenId            int
-	ChannelId          int
-	Quota              int
-	FundingSource      string `gorm:"size:32"`
-	SubscriptionId     int
-	SubscriptionAmount int64  `gorm:"type:bigint"`
-	Snapshot           string `gorm:"type:text"`
-	Usage              string `gorm:"type:text"`
-	Status             string `gorm:"size:16"`
-	LogStatus          string `gorm:"size:16"`
-	LogPayload         string `gorm:"type:text"`
-	CreatedAt          int64  `gorm:"type:bigint"`
-	AppliedAt          int64  `gorm:"type:bigint"`
+	Id                      int
+	TaskId                  string `gorm:"size:64;uniqueIndex"`
+	BillingRequestId        string `gorm:"size:96;uniqueIndex"`
+	Fingerprint             string `gorm:"size:64"`
+	UserId                  int
+	TokenId                 int
+	ChannelId               int
+	Quota                   int
+	ReservedQuota           int
+	ReservedTokenQuota      int
+	ReservedAt              int64  `gorm:"type:bigint"`
+	RefundAttemptAt         int64  `gorm:"type:bigint"`
+	SubscriptionPeriodStart *int64 `gorm:"type:bigint"`
+	FundingSource           string `gorm:"size:32"`
+	SubscriptionId          int
+	SubscriptionAmount      int64  `gorm:"type:bigint"`
+	Snapshot                string `gorm:"type:text"`
+	Usage                   string `gorm:"type:text"`
+	Status                  string `gorm:"size:16"`
+	LogStatus               string `gorm:"size:16"`
+	LogPayload              string `gorm:"type:text"`
+	CreatedAt               int64  `gorm:"type:bigint"`
+	AppliedAt               int64  `gorm:"type:bigint"`
 }
 
 type AsyncImageLogReceipt struct {
@@ -434,9 +439,13 @@ func MigrateImageModels(db *gorm.DB) error {
 // TransitionImageTask owns the state CAS and its event/outbox transaction.
 // External I/O must happen before or after this transaction, never inside it.
 func TransitionImageTask(ctx context.Context, task AsyncImageTask, updates map[string]any, eventType, message, outboxKind string) error {
-	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return transitionImageTaskTx(tx, task, updates, eventType, message, outboxKind)
 	})
+	if err == nil && (updates["status"] == ImageTaskFailed || updates["status"] == ImageTaskExpired) {
+		return RefundAsyncImageReservation(context.WithoutCancel(ctx), task.TaskId)
+	}
+	return err
 }
 
 func transitionImageTaskTx(tx *gorm.DB, task AsyncImageTask, updates map[string]any, eventType, message, outboxKind string) error {

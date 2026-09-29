@@ -97,11 +97,13 @@ type SubscriptionFunding struct {
 	amount         int64 // 预扣的订阅额度（subConsume）
 	subscriptionId int
 	preConsumed    int64
+	durable        bool
 	// 以下字段在 PreConsume 成功后填充，供 RelayInfo 同步使用
 	AmountTotal     int64
 	AmountUsedAfter int64
 	PlanId          int
 	PlanTitle       string
+	PeriodStart     int64
 }
 
 func (s *SubscriptionFunding) Source() string { return BillingSourceSubscription }
@@ -116,6 +118,7 @@ func (s *SubscriptionFunding) PreConsume(_ int) error {
 	s.preConsumed = res.PreConsumed
 	s.AmountTotal = res.AmountTotal
 	s.AmountUsedAfter = res.AmountUsedAfter
+	s.PeriodStart = res.PeriodStart
 	// 获取订阅计划信息
 	if planInfo, err := model.GetSubscriptionPlanInfoByUserSubscriptionId(res.UserSubscriptionId); err == nil && planInfo != nil {
 		s.PlanId = planInfo.PlanId
@@ -128,6 +131,9 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
+	if s.durable {
+		return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta), s.PeriodStart)
+	}
 	return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta))
 }
 
@@ -136,6 +142,9 @@ func (s *SubscriptionFunding) Refund() error {
 		return nil
 	}
 	return refundWithRetry(func() error {
+		if s.durable {
+			return model.RefundSubscriptionPreConsume(s.requestId, s.PeriodStart)
+		}
 		return model.RefundSubscriptionPreConsume(s.requestId)
 	})
 }

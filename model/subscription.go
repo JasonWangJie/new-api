@@ -1014,14 +1014,12 @@ func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *Subscript
 		return errors.New("invalid reset args")
 	}
 	sub.AmountUsed = 0
+	// A manual reset starts a new accounting period even when the operator
+	// keeps the original renewal schedule.
+	sub.LastResetTime = max(now, sub.LastResetTime+1)
 	if advanceResetTime {
 		nextReset := calcNextResetTime(time.Unix(now, 0), plan, sub.EndTime)
 		sub.NextResetTime = nextReset
-		if nextReset > 0 {
-			sub.LastResetTime = now
-		} else {
-			sub.LastResetTime = 0
-		}
 	}
 	return tx.Save(sub).Error
 }
@@ -1134,6 +1132,7 @@ type SubscriptionPreConsumeResult struct {
 	AmountTotal        int64
 	AmountUsedBefore   int64
 	AmountUsedAfter    int64
+	PeriodStart        int64
 }
 
 // ExpireDueSubscriptions marks expired subscriptions and handles group downgrade.
@@ -1273,7 +1272,10 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		baseUnix = sub.StartTime
 	}
 	base := time.Unix(baseUnix, 0)
-	next := calcNextResetTime(base, plan, sub.EndTime)
+	next := sub.NextResetTime
+	if next <= 0 {
+		next = calcNextResetTime(base, plan, sub.EndTime)
+	}
 	advanced := false
 	for next > 0 && next <= now {
 		advanced = true
@@ -1289,7 +1291,9 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		return nil
 	}
 	sub.AmountUsed = 0
-	sub.LastResetTime = base.Unix()
+	// Manual resets in the same second can move the cycle marker ahead of the
+	// clock. A scheduled reset must not reuse an earlier reservation's marker.
+	sub.LastResetTime = max(base.Unix(), sub.LastResetTime+1)
 	sub.NextResetTime = next
 	return tx.Save(sub).Error
 }
@@ -1328,6 +1332,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 			returnValue.AmountTotal = sub.AmountTotal
 			returnValue.AmountUsedBefore = sub.AmountUsed
 			returnValue.AmountUsedAfter = sub.AmountUsed
+			returnValue.PeriodStart = sub.LastResetTime
 			return nil
 		}
 
@@ -1375,6 +1380,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 					returnValue.AmountTotal = sub.AmountTotal
 					returnValue.AmountUsedBefore = sub.AmountUsed
 					returnValue.AmountUsedAfter = sub.AmountUsed
+					returnValue.PeriodStart = sub.LastResetTime
 					return nil
 				}
 				return err
@@ -1388,6 +1394,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 			returnValue.AmountTotal = sub.AmountTotal
 			returnValue.AmountUsedBefore = usedBefore
 			returnValue.AmountUsedAfter = sub.AmountUsed
+			returnValue.PeriodStart = sub.LastResetTime
 			return nil
 		}
 		return fmt.Errorf("subscription quota insufficient, need=%d", amount)
@@ -1399,7 +1406,7 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 }
 
 // RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota by requestId.
-func RefundSubscriptionPreConsume(requestId string) error {
+func RefundSubscriptionPreConsume(requestId string, periodStart ...int64) error {
 	if strings.TrimSpace(requestId) == "" {
 		return errors.New("requestId is empty")
 	}
@@ -1416,8 +1423,19 @@ func RefundSubscriptionPreConsume(requestId string) error {
 			record.Status = "refunded"
 			return tx.Save(&record).Error
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
+		var sub UserSubscription
+		if err := lockForUpdate(tx).Where("id = ?", record.UserSubscriptionId).Take(&sub).Error; err != nil {
 			return err
+		}
+		var period *int64
+		if len(periodStart) > 0 {
+			period = &periodStart[0]
+		}
+		if SubscriptionReservationMatchesPeriod(&sub, period, record.CreatedAt) {
+			if err := tx.Model(&UserSubscription{}).Where("id = ?", sub.Id).
+				Update("amount_used", max(sub.AmountUsed-record.PreConsumed, 0)).Error; err != nil {
+				return err
+			}
 		}
 		record.Status = "refunded"
 		return tx.Save(&record).Error
@@ -1507,7 +1525,7 @@ func GetSubscriptionPlanInfoByUserSubscriptionId(userSubscriptionId int) (*Subsc
 }
 
 // Update subscription used amount by delta (positive consume more, negative refund).
-func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error {
+func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64, periodStart ...int64) error {
 	if userSubscriptionId <= 0 {
 		return errors.New("invalid userSubscriptionId")
 	}
@@ -1521,6 +1539,12 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 			First(&sub).Error; err != nil {
 			return err
 		}
+		if len(periodStart) > 0 && !SubscriptionReservationMatchesPeriod(&sub, &periodStart[0], 0) {
+			if delta > 0 {
+				return errors.New("subscription quota insufficient: reservation period has reset")
+			}
+			return nil
+		}
 		newUsed := max(sub.AmountUsed+delta, 0)
 		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
 			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
@@ -1528,4 +1552,13 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 		sub.AmountUsed = newUsed
 		return tx.Save(&sub).Error
 	})
+}
+
+// SubscriptionReservationMatchesPeriod keeps refunds in their original quota
+// period. Older tasks lack the snapshot and use their acceptance time instead.
+func SubscriptionReservationMatchesPeriod(sub *UserSubscription, periodStart *int64, reservedAt int64) bool {
+	if periodStart != nil {
+		return sub.LastResetTime == *periodStart
+	}
+	return reservedAt <= 0 || sub.LastResetTime <= reservedAt
 }

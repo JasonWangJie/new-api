@@ -281,7 +281,7 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 		data["channel_id"] = task.ChannelId
 		data["attempts"] = task.Attempts
 		data["reference_urls"] = task.ReferenceUrls
-		data["can_terminate"] = !task.Terminal()
+		data["can_terminate"] = !task.Terminal() || task.Status == model.ImageTaskExecutionUnknown
 		data["reconciliation_status"] = task.ReconciliationStatus
 	}
 	return data
@@ -456,6 +456,15 @@ func ManageImageTask(c *gin.Context, action string) {
 	var err error
 	if action == "resume" {
 		err = model.ResumeAsyncImageTask(c.Request.Context(), task)
+	} else if task.Status == model.ImageTaskExecutionUnknown {
+		var confirmation struct {
+			UpstreamChecked bool `json:"confirm_upstream_checked"`
+		}
+		if decodeErr := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &confirmation); decodeErr != nil || !confirmation.UpstreamChecked {
+			imageManagementError(c, http.StatusConflict, errors.New("Verify the upstream task before releasing reserved quota"))
+			return
+		}
+		err = model.TerminateAsyncImageTaskAfterReconciliation(c.Request.Context(), task)
 	} else {
 		err = model.TerminateAsyncImageTask(c.Request.Context(), task)
 	}
@@ -472,7 +481,8 @@ func ManageImageTask(c *gin.Context, action string) {
 
 func BatchTerminateImageTasks(c *gin.Context) {
 	var input struct {
-		TaskIds []string `json:"task_ids"`
+		TaskIds         []string `json:"task_ids"`
+		UpstreamChecked bool     `json:"confirm_upstream_checked"`
 	}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
@@ -494,6 +504,14 @@ func BatchTerminateImageTasks(c *gin.Context) {
 		var task model.AsyncImageTask
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", id).Take(&task).Error; err != nil {
 			item["message"] = "Image task was not found"
+		} else if task.Status == model.ImageTaskExecutionUnknown {
+			if !input.UpstreamChecked {
+				item["message"] = "Verify the upstream task before releasing reserved quota"
+			} else if err := model.TerminateAsyncImageTaskAfterReconciliation(c.Request.Context(), task); err != nil {
+				item["message"] = err.Error()
+			} else {
+				item["status"] = "terminated"
+			}
 		} else if task.Terminal() {
 			item["status"] = "skipped"
 			item["message"] = "Task is already terminal"
