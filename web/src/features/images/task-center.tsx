@@ -389,7 +389,7 @@ function TaskCenterSession({
             {['succeeded', 'not_billable', 'settled', 'reserved'].includes(
               row.original.billing_status
             )
-              ? `US$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
+              ? `$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
               : '—'}
           </span>
         ),

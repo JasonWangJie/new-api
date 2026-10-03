@@ -386,7 +386,7 @@ export function ImageTaskDetails(props: {
                     'reserved',
                   ].includes(data.billing_status) ? (
                     <span className='text-emerald-700 dark:text-emerald-400'>
-                      {`US$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
+                      {`$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
                     </span>
                   ) : (
                     '—'
