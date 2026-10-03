@@ -23,8 +23,8 @@ import type {
   RowSelectionState,
   SortingState,
 } from '@tanstack/react-table'
-import { Ban, Eye, RefreshCw } from 'lucide-react'
-import { startTransition, useMemo, useState } from 'react'
+import { Ban, Eye, Filter, RefreshCw } from 'lucide-react'
+import { startTransition, useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -36,13 +36,16 @@ import {
   useDataTable,
 } from '@/components/data-table'
 import { DataTableMobileFilterPanel } from '@/components/data-table/toolbar/mobile-filter-panel'
+import { Dialog } from '@/components/dialog'
 import { SectionPageLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useMediaQuery } from '@/hooks/use-media-query'
 import { hasPermission } from '@/lib/admin-permissions'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -106,6 +109,7 @@ function TaskCenterSession({
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const isMobile = useMediaQuery('(max-width: 640px)')
   const user = useAuthStore((state) => state.auth.user)
   const canManage = admin && hasPermission(user, 'async_image_task', 'manage')
   const today = useMemo(() => {
@@ -138,6 +142,7 @@ function TaskCenterSession({
   const [selection, setSelection] = useState<RowSelectionState>({})
   const [detail, setDetail] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(false)
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   const [operation, setOperation] = useState<{
     ids: string[]
     action: 'resume' | 'terminate' | 'batch-terminate'
@@ -555,6 +560,144 @@ function TaskCenterSession({
       'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
     )
   }
+  function applyFilters(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setFilters(draft)
+    setPagination((previous) => ({ ...previous, pageIndex: 0 }))
+    setSelection({})
+    setMobileFiltersOpen(false)
+  }
+  function resetFilters() {
+    const reset = Object.fromEntries(Object.keys(draft).map((key) => [key, '']))
+    reset.start_date = today
+    reset.end_date = today
+    reset.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    setDraft(reset)
+    setFilters(reset)
+    setPagination((previous) => ({ ...previous, pageIndex: 0 }))
+    setSelection({})
+  }
+  const primaryFilters = (
+    <>
+      <ImageSelect
+        label={t('Status')}
+        value={draft.status}
+        options={choices(TASK_STATES)}
+        onChange={(value) =>
+          setDraft((previous) => ({ ...previous, status: value }))
+        }
+      />
+      <ImageSelect
+        label={t('Media type')}
+        value={draft.media_type}
+        options={[
+          { value: '', label: t('All') },
+          { value: 'image', label: t('Image') },
+          { value: 'video', label: t('Video') },
+        ]}
+        onChange={(value) =>
+          setDraft((previous) => ({
+            ...previous,
+            media_type: value,
+          }))
+        }
+      />
+      <ImageSelect
+        label={t('Phase')}
+        value={draft.stage}
+        options={[
+          { value: '', label: t('All') },
+          { value: 'queued', label: t('Queued') },
+          { value: 'generating', label: t('Generating') },
+          { value: 'saving', label: t('Saving') },
+          { value: 'completed', label: t('Completed') },
+          { value: 'failed', label: t('Failed') },
+        ]}
+        onChange={(value) =>
+          setDraft((previous) => ({ ...previous, stage: value }))
+        }
+      />
+      {field('provider', 'Provider')}
+      <ImageSelect
+        label={t('Request type')}
+        value={draft.request_type}
+        options={choices([
+          'text_to_image',
+          'image_to_image',
+          'text_to_video',
+          'image_to_video',
+          'video',
+        ])}
+        onChange={(value) =>
+          setDraft((previous) => ({
+            ...previous,
+            request_type: value,
+          }))
+        }
+      />
+      <ImageSelect
+        label={t('Storage provider')}
+        value={draft.storage_provider}
+        options={choices([
+          'local',
+          'aws',
+          'aliyun',
+          'tencent',
+          'qiniu',
+          'r2',
+          'custom_s3',
+        ])}
+        onChange={(value) =>
+          setDraft((previous) => ({
+            ...previous,
+            storage_provider: value,
+          }))
+        }
+      />
+    </>
+  )
+  const advancedFilters = (
+    <>
+      {field('start_date', 'Start date', 'date')}
+      {field('end_date', 'End date', 'date')}
+      <ImageSelect
+        label={t('Protocol')}
+        value={draft.protocol}
+        options={choices(['bb', 'sc'])}
+        onChange={(value) =>
+          setDraft((previous) => ({ ...previous, protocol: value }))
+        }
+      />
+      <ImageSelect
+        label={t('Billing status')}
+        value={draft.billing_status}
+        options={choices(['pending', 'succeeded', 'not_billable', 'failed'])}
+        onChange={(value) =>
+          setDraft((previous) => ({
+            ...previous,
+            billing_status: value,
+          }))
+        }
+      />
+      {TASK_FILTER_FIELDS.map(({ key, label }) => field(key, label))}
+      {admin && (
+        <>
+          {field('channel_id', 'Channel ID', 'number')}
+          {field('user_id', 'User ID', 'number')}
+        </>
+      )}
+    </>
+  )
+  const filterActions = (
+    <>
+      <Button type='button' variant='outline' onClick={resetFilters}>
+        {t('Reset')}
+      </Button>
+      <Button type='submit' form='image-task-filter-form'>
+        {t('Apply filters')}
+      </Button>
+    </>
+  )
   const currentPending = (tasks.data?.items || []).filter(
     (task) => task.can_terminate
   )
@@ -600,7 +743,7 @@ function TaskCenterSession({
     },
   ]
   return (
-    <SectionPageLayout fixedContent stackActionsOnMobile>
+    <SectionPageLayout fixedContent={!isMobile} stackActionsOnMobile>
       <SectionPageLayout.Title>
         {t('Media task center')}
       </SectionPageLayout.Title>
@@ -664,7 +807,9 @@ function TaskCenterSession({
         )}
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
-        <div className='flex h-full min-h-0 flex-col gap-3'>
+        <div
+          className={cn('flex flex-col gap-3', !isMobile && 'h-full min-h-0')}
+        >
           <dl
             aria-label={t('Task statistics')}
             className='flex shrink-0 flex-wrap gap-2'
@@ -683,169 +828,79 @@ function TaskCenterSession({
               </div>
             ))}
           </dl>
-          <form
-            id='image-task-filter-form'
-            className='shrink-0'
-            onSubmit={(event) => {
-              event.preventDefault()
-              setFilters(draft)
-              setPagination((previous) => ({ ...previous, pageIndex: 0 }))
-              setSelection({})
-            }}
-          >
-            <DataTableMobileFilterPanel
-              compact
-              defaultOpen={false}
-              summary={
-                <div className='grid grid-cols-2 gap-3 xl:grid-cols-6'>
-                  <div className='col-span-2'>{field('q', 'Search tasks')}</div>
-                  <ImageSelect
-                    label={t('Status')}
-                    value={draft.status}
-                    options={choices(TASK_STATES)}
-                    onChange={(value) =>
-                      setDraft((previous) => ({ ...previous, status: value }))
-                    }
-                  />
-                  <ImageSelect
-                    label={t('Media type')}
-                    value={draft.media_type}
-                    options={[
-                      { value: '', label: t('All') },
-                      { value: 'image', label: t('Image') },
-                      { value: 'video', label: t('Video') },
-                    ]}
-                    onChange={(value) =>
-                      setDraft((previous) => ({
-                        ...previous,
-                        media_type: value,
-                      }))
-                    }
-                  />
-                  <ImageSelect
-                    label={t('Phase')}
-                    value={draft.stage}
-                    options={[
-                      { value: '', label: t('All') },
-                      { value: 'queued', label: t('Queued') },
-                      { value: 'generating', label: t('Generating') },
-                      { value: 'saving', label: t('Saving') },
-                      { value: 'completed', label: t('Completed') },
-                      { value: 'failed', label: t('Failed') },
-                    ]}
-                    onChange={(value) =>
-                      setDraft((previous) => ({ ...previous, stage: value }))
-                    }
-                  />
-                  {field('provider', 'Provider')}
-                  <ImageSelect
-                    label={t('Request type')}
-                    value={draft.request_type}
-                    options={choices([
-                      'text_to_image',
-                      'image_to_image',
-                      'text_to_video',
-                      'image_to_video',
-                      'video',
-                    ])}
-                    onChange={(value) =>
-                      setDraft((previous) => ({
-                        ...previous,
-                        request_type: value,
-                      }))
-                    }
-                  />
-                  <ImageSelect
-                    label={t('Storage provider')}
-                    value={draft.storage_provider}
-                    options={choices([
-                      'local',
-                      'aws',
-                      'aliyun',
-                      'tencent',
-                      'qiniu',
-                      'r2',
-                      'custom_s3',
-                    ])}
-                    onChange={(value) =>
-                      setDraft((previous) => ({
-                        ...previous,
-                        storage_provider: value,
-                      }))
-                    }
-                  />
-                </div>
-              }
-              actions={
-                <>
-                  <span className='text-muted-foreground mr-auto hidden text-xs sm:block'>
-                    {filters.start_date} — {filters.end_date}
-                  </span>
-                  <Button
-                    type='button'
-                    variant='outline'
-                    onClick={() => {
-                      const reset = Object.fromEntries(
-                        Object.keys(draft).map((key) => [key, ''])
-                      )
-                      reset.start_date = today
-                      reset.end_date = today
-                      reset.timezone =
-                        Intl.DateTimeFormat().resolvedOptions().timeZone
-                      setDraft(reset)
-                      setFilters(reset)
-                      setPagination((previous) => ({
-                        ...previous,
-                        pageIndex: 0,
-                      }))
-                      setSelection({})
-                    }}
-                  >
-                    {t('Reset')}
-                  </Button>
-                  <Button type='submit' form='image-task-filter-form'>
-                    {t('Apply filters')}
-                  </Button>
-                </>
-              }
+          {isMobile ? (
+            <>
+              <form
+                className='grid grid-cols-2 items-end gap-2 rounded-lg border p-2.5'
+                onSubmit={applyFilters}
+              >
+                <div className='col-span-2'>{field('q', 'Search tasks')}</div>
+                <Button
+                  type='button'
+                  variant='outline'
+                  className='min-h-11'
+                  aria-haspopup='dialog'
+                  aria-expanded={mobileFiltersOpen}
+                  onClick={() => setMobileFiltersOpen(true)}
+                >
+                  <Filter className='size-4' aria-hidden />
+                  {t('Filter')}
+                </Button>
+                <Button type='submit' className='min-h-11'>
+                  {t('Apply filters')}
+                </Button>
+              </form>
+              <Dialog
+                open={mobileFiltersOpen}
+                onOpenChange={setMobileFiltersOpen}
+                title={t('Filter')}
+                contentClassName='max-h-[calc(100dvh-2rem)]'
+                scrollAreaClassName='max-h-[calc(100dvh-12rem)]'
+                footerClassName='grid grid-cols-2 [&>button]:min-h-11'
+                footer={filterActions}
+              >
+                <form
+                  id='image-task-filter-form'
+                  className='grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 [&_[data-slot=select-trigger]]:min-h-11 [&_input]:min-h-11'
+                  onSubmit={applyFilters}
+                >
+                  {primaryFilters}
+                  {advancedFilters}
+                </form>
+              </Dialog>
+            </>
+          ) : (
+            <form
+              id='image-task-filter-form'
+              className='shrink-0'
+              onSubmit={applyFilters}
             >
-              <div className='mt-3 grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto border-t p-1 pt-3 sm:grid-cols-3 xl:grid-cols-5'>
-                {field('start_date', 'Start date', 'date')}
-                {field('end_date', 'End date', 'date')}
-                <ImageSelect
-                  label={t('Protocol')}
-                  value={draft.protocol}
-                  options={choices(['bb', 'sc'])}
-                  onChange={(value) =>
-                    setDraft((previous) => ({ ...previous, protocol: value }))
-                  }
-                />
-                <ImageSelect
-                  label={t('Billing status')}
-                  value={draft.billing_status}
-                  options={choices([
-                    'pending',
-                    'succeeded',
-                    'not_billable',
-                    'failed',
-                  ])}
-                  onChange={(value) =>
-                    setDraft((previous) => ({
-                      ...previous,
-                      billing_status: value,
-                    }))
-                  }
-                />
-                {TASK_FILTER_FIELDS.map(({ key, label }) => field(key, label))}
-                {admin && (
+              <DataTableMobileFilterPanel
+                compact
+                defaultOpen={false}
+                summary={
+                  <div className='grid grid-cols-2 gap-3 xl:grid-cols-6'>
+                    <div className='col-span-2'>
+                      {field('q', 'Search tasks')}
+                    </div>
+                    {primaryFilters}
+                  </div>
+                }
+                actions={
                   <>
-                    {field('channel_id', 'Channel ID', 'number')}
-                    {field('user_id', 'User ID', 'number')}
+                    <span className='text-muted-foreground mr-auto hidden text-xs sm:block'>
+                      {filters.start_date} — {filters.end_date}
+                    </span>
+                    {filterActions}
                   </>
-                )}
-              </div>
-            </DataTableMobileFilterPanel>
-          </form>
+                }
+              >
+                <div className='mt-3 grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto border-t p-1 pt-3 sm:grid-cols-3 xl:grid-cols-5'>
+                  {advancedFilters}
+                </div>
+              </DataTableMobileFilterPanel>
+            </form>
+          )}
           {tasks.isError && (
             <p role='alert' className='text-destructive shrink-0 text-sm'>
               {tasks.error.message}
@@ -863,11 +918,13 @@ function TaskCenterSession({
               ))}
             </div>
           )}
-          <div className='min-h-0 flex-1'>
+          <div className={isMobile ? undefined : 'min-h-0 flex-1'}>
             <DataTablePage
               table={table}
               columns={columns}
               toolbarProps={null}
+              fixedHeight={!isMobile}
+              compactPagination={isMobile}
               isLoading={tasks.isLoading}
               isFetching={tasks.isFetching}
               emptyTitle={t('No image tasks found')}

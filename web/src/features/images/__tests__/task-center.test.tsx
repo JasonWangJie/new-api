@@ -136,6 +136,13 @@ function mount(content: React.ReactNode) {
   clients.push(client)
   render(<QueryClientProvider client={client}>{content}</QueryClientProvider>)
 }
+function setMobileViewport() {
+  const matchMedia = window.matchMedia.bind(window)
+  vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+    ...matchMedia(query),
+    matches: query === '(max-width: 640px)' || matchMedia(query).matches,
+  }))
+}
 beforeEach(() => {
   // jsdom has no Web Animations API; native preview geometry is checked in the browser.
   Object.defineProperty(HTMLElement.prototype, 'getAnimations', {
@@ -199,6 +206,128 @@ test('keeps primary filters visible while advanced fields start collapsed and pr
   expect(screen.getAllByText('Creative account').length).toBeGreaterThan(0)
   expect(screen.getAllByText('Image to image').length).toBeGreaterThan(0)
 })
+
+test.each([
+  { admin: false, scope: 'user' },
+  { admin: true, scope: 'administrator' },
+])(
+  'mobile $scope tasks scroll with their search and statistics',
+  async ({ admin }) => {
+    setMobileViewport()
+    mount(<ImageTaskCenter admin={admin} />)
+    const taskLink = await screen.findByRole('button', { name: task.id })
+    const pageScroll = screen
+      .getByLabelText('Search tasks')
+      .closest<HTMLElement>('.overflow-auto')
+
+    expect(pageScroll).toContainElement(
+      screen.getByLabelText('Task statistics')
+    )
+    expect(pageScroll).toContainElement(taskLink)
+    expect(
+      screen.getByRole('button', { name: 'Go to next page' })
+    ).toBeVisible()
+  }
+)
+
+test.each([
+  { admin: false, scope: 'user' },
+  { admin: true, scope: 'administrator' },
+])(
+  'mobile $scope filters apply from the dialog footer and return to page one',
+  async ({ admin }) => {
+    setMobileViewport()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [task],
+      total: 45,
+      pages: 3,
+      stats: {},
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    expect(
+      screen.queryByRole('combobox', { name: 'Status' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Go to next page' }))
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
+        '2'
+      )
+    )
+    await user.type(screen.getByLabelText('Search tasks'), 'city')
+    await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Filter' })
+    const model = within(dialog).getByLabelText('Model')
+    const apply = within(dialog).getByRole('button', { name: 'Apply filters' })
+    const fieldsScroll = model.closest<HTMLElement>('.overflow-y-auto')
+    expect(fieldsScroll).toContainElement(model)
+    expect(fieldsScroll).not.toContainElement(apply)
+    expect(within(dialog).getByRole('button', { name: 'Close' })).toBeVisible()
+    await user.type(model, 'flare')
+    await user.click(
+      within(dialog).getByRole('combobox', { name: 'Media type' })
+    )
+    await user.click(await screen.findByRole('option', { name: 'Video' }))
+    fireEvent.change(within(dialog).getByLabelText('Start date'), {
+      target: { value: '2026-10-01' },
+    })
+    await user.click(apply)
+
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('model')).toBe(
+        'flare'
+      )
+    )
+    const request = vi.mocked(getImageTasks).mock.calls.at(-1)
+    expect(request?.[0]).toBe(admin)
+    expect(request?.[1].get('q')).toBe('city')
+    expect(request?.[1].get('media_type')).toBe('video')
+    expect(request?.[1].get('start_date')).toBe('2026-10-01')
+    expect(request?.[1].get('page')).toBe('1')
+    expect(screen.getByRole('button', { name: 'Filter' })).toBeVisible()
+  }
+)
+
+test.each([
+  { admin: false, scope: 'user' },
+  { admin: true, scope: 'administrator' },
+])(
+  'mobile $scope filters preserve dismissed drafts and reset them when reopened',
+  async ({ admin }) => {
+    setMobileViewport()
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    await user.type(screen.getByLabelText('Search tasks'), 'city')
+    await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Filter' })
+    await user.type(within(dialog).getByLabelText('Model'), 'flare')
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(
+      vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('model')
+    ).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const reopened = await screen.findByRole('dialog', { name: 'Filter' })
+    expect(within(reopened).getByLabelText('Model')).toHaveValue('flare')
+    await user.click(within(reopened).getByRole('button', { name: 'Reset' }))
+    expect(within(reopened).getByLabelText('Model')).toHaveValue('')
+    await user.keyboard('{Escape}')
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    expect(screen.getByLabelText('Search tasks')).toHaveValue('')
+    expect(
+      screen.getByRole('button', { name: 'Go to next page' })
+    ).toBeVisible()
+  }
+)
 
 test.each(['invoking', 'execution_unknown'])(
   'terminates one fixed %s task after confirmation and retains the dialog when the request fails',
