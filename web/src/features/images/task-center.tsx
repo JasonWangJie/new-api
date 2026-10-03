@@ -24,7 +24,13 @@ import type {
   SortingState,
 } from '@tanstack/react-table'
 import { Ban, Eye, Filter, RefreshCw } from 'lucide-react'
-import { startTransition, useMemo, useState, type FormEvent } from 'react'
+import {
+  startTransition,
+  useCallback,
+  useMemo,
+  useState,
+  type FormEvent,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -32,6 +38,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { CopyButton } from '@/components/copy-button'
 import {
   DataTableColumnHeader,
+  DataTableCardGrid,
   DataTablePage,
   useDataTable,
 } from '@/components/data-table'
@@ -61,6 +68,7 @@ import {
 } from './components/image-badges'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
+import { ImageTaskMobileCard } from './components/image-task-mobile-card'
 import { imageLabel } from './lib/image-labels'
 import {
   imageTaskElapsedSeconds,
@@ -166,6 +174,19 @@ function TaskCenterSession({
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
     refetchInterval: autoRefresh ? 10000 : false,
   })
+  const openTask = useCallback((id: string) => {
+    startTransition(() => setDetail(id))
+  }, [])
+  const prefetchTask = useCallback(
+    (id: string) => {
+      void queryClient.prefetchQuery({
+        queryKey: ['image-task-details', userId, admin, id],
+        queryFn: ({ signal }) => getImageTask(admin, id, signal),
+        staleTime: 10_000,
+      })
+    },
+    [admin, queryClient, userId]
+  )
   const columns = useMemo<ColumnDef<ImageTask, unknown>[]>(
     () => [
       ...(canManage
@@ -204,22 +225,8 @@ function TaskCenterSession({
                 variant='link'
                 className='h-auto min-w-0 flex-1 justify-start overflow-hidden p-0 font-mono text-[11px]'
                 title={row.original.id}
-                onClick={() =>
-                  startTransition(() => setDetail(row.original.id))
-                }
-                onMouseEnter={() => {
-                  void queryClient.prefetchQuery({
-                    queryKey: [
-                      'image-task-details',
-                      userId,
-                      admin,
-                      row.original.id,
-                    ],
-                    queryFn: ({ signal }) =>
-                      getImageTask(admin, row.original.id, signal),
-                    staleTime: 10_000,
-                  })
-                }}
+                onClick={() => openTask(row.original.id)}
+                onMouseEnter={() => prefetchTask(row.original.id)}
               >
                 <span className='truncate'>{row.original.id}</span>
               </Button>
@@ -408,20 +415,8 @@ function TaskCenterSession({
             <Button
               size='xs'
               variant='ghost'
-              onClick={() => startTransition(() => setDetail(row.original.id))}
-              onMouseEnter={() => {
-                void queryClient.prefetchQuery({
-                  queryKey: [
-                    'image-task-details',
-                    userId,
-                    admin,
-                    row.original.id,
-                  ],
-                  queryFn: ({ signal }) =>
-                    getImageTask(admin, row.original.id, signal),
-                  staleTime: 10_000,
-                })
-              }}
+              onClick={() => openTask(row.original.id)}
+              onMouseEnter={() => prefetchTask(row.original.id)}
             >
               <Eye className='size-3.5' aria-hidden />
               {t('View')}
@@ -462,7 +457,7 @@ function TaskCenterSession({
         size: 118,
       },
     ],
-    [admin, canManage, queryClient, t, userId]
+    [admin, canManage, openTask, prefetchTask, t]
   )
   const { table } = useDataTable({
     data: tasks.data?.items || [],
@@ -742,6 +737,43 @@ function TaskCenterSession({
       dot: 'bg-cyan-500',
     },
   ]
+  const batchActions = canManage && (
+    <>
+      <Button
+        size='sm'
+        variant='destructive'
+        disabled={!currentPending.length || busy}
+        onClick={() =>
+          setOperation({
+            ids: currentPending.map((task) => task.id),
+            action: 'batch-terminate',
+            confirmUpstreamChecked: currentPending.some(
+              (task) => task.status === 'execution_unknown'
+            ),
+          })
+        }
+      >
+        <Ban className='size-3.5' aria-hidden />
+        {t('Terminate current page')} ({currentPending.length})
+      </Button>
+      <Button
+        size='sm'
+        variant='destructive'
+        disabled={!table.getSelectedRowModel().rows.length}
+        onClick={() =>
+          setOperation({
+            ids: table.getSelectedRowModel().rows.map((row) => row.original.id),
+            action: 'batch-terminate',
+            confirmUpstreamChecked: table
+              .getSelectedRowModel()
+              .rows.some((row) => row.original.status === 'execution_unknown'),
+          })
+        }
+      >
+        {t('Terminate selected')}
+      </Button>
+    </>
+  )
   return (
     <SectionPageLayout fixedContent={!isMobile} stackActionsOnMobile>
       <SectionPageLayout.Title>
@@ -764,47 +796,7 @@ function TaskCenterSession({
         >
           {t('Refresh')}
         </Button>
-        {canManage && (
-          <>
-            <Button
-              size='sm'
-              variant='destructive'
-              disabled={!currentPending.length || busy}
-              onClick={() =>
-                setOperation({
-                  ids: currentPending.map((task) => task.id),
-                  action: 'batch-terminate',
-                  confirmUpstreamChecked: currentPending.some(
-                    (task) => task.status === 'execution_unknown'
-                  ),
-                })
-              }
-            >
-              <Ban className='size-3.5' aria-hidden />
-              {t('Terminate current page')} ({currentPending.length})
-            </Button>
-            <Button
-              size='sm'
-              variant='destructive'
-              disabled={!table.getSelectedRowModel().rows.length}
-              onClick={() =>
-                setOperation({
-                  ids: table
-                    .getSelectedRowModel()
-                    .rows.map((row) => row.original.id),
-                  action: 'batch-terminate',
-                  confirmUpstreamChecked: table
-                    .getSelectedRowModel()
-                    .rows.some(
-                      (row) => row.original.status === 'execution_unknown'
-                    ),
-                })
-              }
-            >
-              {t('Terminate selected')}
-            </Button>
-          </>
-        )}
+        {!isMobile && batchActions}
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
         <div
@@ -812,19 +804,40 @@ function TaskCenterSession({
         >
           <dl
             aria-label={t('Task statistics')}
-            className='flex shrink-0 flex-wrap gap-2'
+            className={
+              isMobile
+                ? 'grid shrink-0 grid-cols-6 gap-2'
+                : 'flex shrink-0 flex-wrap gap-2'
+            }
           >
-            {statistics.map((item) => (
+            {statistics.map((item, index) => (
               <div
                 key={item.label}
-                className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs shadow-sm ${item.shell} ${item.color}`}
+                className={cn(
+                  'flex rounded-lg border px-3 py-2 text-xs shadow-sm',
+                  item.shell,
+                  item.color,
+                  isMobile
+                    ? 'flex-col items-start gap-1'
+                    : 'items-center gap-2',
+                  isMobile && (index < 3 ? 'col-span-2' : 'col-span-3')
+                )}
               >
-                <span
-                  className={`size-1.5 shrink-0 rounded-full ${item.dot}`}
-                  aria-hidden
-                />
-                <dt>{item.label}</dt>
-                <dd className='font-semibold tabular-nums'>{item.value}</dd>
+                <dt className='flex items-center gap-1.5'>
+                  <span
+                    className={cn('size-1.5 shrink-0 rounded-full', item.dot)}
+                    aria-hidden
+                  />
+                  {item.label}
+                </dt>
+                <dd
+                  className={cn(
+                    'font-semibold tabular-nums',
+                    isMobile && 'text-base leading-6'
+                  )}
+                >
+                  {item.value}
+                </dd>
               </div>
             ))}
           </dl>
@@ -838,7 +851,7 @@ function TaskCenterSession({
                 <Button
                   type='button'
                   variant='outline'
-                  className='min-h-11'
+                  className='min-h-11 min-w-0 whitespace-normal'
                   aria-haspopup='dialog'
                   aria-expanded={mobileFiltersOpen}
                   onClick={() => setMobileFiltersOpen(true)}
@@ -846,7 +859,10 @@ function TaskCenterSession({
                   <Filter className='size-4' aria-hidden />
                   {t('Filter')}
                 </Button>
-                <Button type='submit' className='min-h-11'>
+                <Button
+                  type='submit'
+                  className='min-h-11 min-w-0 whitespace-normal'
+                >
                   {t('Apply filters')}
                 </Button>
               </form>
@@ -934,7 +950,48 @@ function TaskCenterSession({
               applyHeaderSize
               pinnedColumns={[{ columnId: 'actions', side: 'right' }]}
               showMobileBulkActions
-              mobileProps={{ enableRowSelection: canManage }}
+              mobile={
+                isMobile && (
+                  <div className='space-y-2'>
+                    {canManage && !!table.getRowModel().rows.length && (
+                      <div className='grid grid-cols-2 items-center gap-x-2 rounded-lg border px-2.5 pb-2.5 [&>button]:min-h-11 [&>button]:min-w-0 [&>button]:whitespace-normal'>
+                        <label className='col-span-2 flex min-h-11 items-center gap-2 text-xs'>
+                          <Checkbox
+                            checked={table.getIsAllPageRowsSelected()}
+                            indeterminate={table.getIsSomePageRowsSelected()}
+                            onCheckedChange={(checked) =>
+                              table.toggleAllPageRowsSelected(checked)
+                            }
+                          />
+                          {t('Select current page')}
+                        </label>
+                        {batchActions}
+                      </div>
+                    )}
+                    <DataTableCardGrid
+                      table={table}
+                      isLoading={tasks.isLoading}
+                      emptyTitle={t('No image tasks found')}
+                      emptyDescription={t(
+                        'Adjust filters or create an image from the workbench.'
+                      )}
+                      gridClassName='grid min-w-0 grid-cols-1 gap-3'
+                      getRowClassName={() =>
+                        'min-w-0 rounded-xl p-3.5 shadow-sm'
+                      }
+                      renderCard={(row, { isSelected }) => (
+                        <ImageTaskMobileCard
+                          row={row}
+                          isSelected={isSelected}
+                          admin={admin}
+                          onView={openTask}
+                          onPrefetch={prefetchTask}
+                        />
+                      )}
+                    />
+                  </div>
+                )
+              }
               getColumnClassName={(_id, section) =>
                 section === 'cell' ? 'py-4 align-middle' : undefined
               }

@@ -211,6 +211,127 @@ test.each([
   { admin: false, scope: 'user' },
   { admin: true, scope: 'administrator' },
 ])(
+  'mobile $scope cards group long model names, cost and actions without desktop column widths',
+  async ({ admin }) => {
+    setMobileViewport()
+    const longModel = `gpt-image-${'extended-model-name-'.repeat(6)}`
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        { ...task, model: longModel, billing_status: 'settled', cost: 0.12 },
+      ],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    const card = await screen.findByRole('article', { name: task.id })
+    const model = within(card).getByRole('heading', { name: longModel })
+    expect(model).toHaveClass('wrap-anywhere')
+    expect(
+      within(card).getByText('Actual cost').nextElementSibling
+    ).toHaveTextContent('$0.12')
+    expect(card).not.toHaveTextContent('US$')
+    expect(
+      within(card).getByRole('progressbar', { name: 'Progress' })
+    ).toHaveAttribute('aria-valuenow', '20')
+    if (admin) {
+      expect(within(card).getByText('Creative account')).toBeVisible()
+      expect(within(card).getByText('Sunburst upstream')).toBeVisible()
+    } else {
+      expect(
+        within(card).queryByText('Creative account')
+      ).not.toBeInTheDocument()
+      expect(
+        within(card).queryByText('Sunburst upstream')
+      ).not.toBeInTheDocument()
+    }
+    await user.click(within(card).getByRole('button', { name: 'Copy Task ID' }))
+    expect(await navigator.clipboard.readText()).toBe(task.id)
+    await user.click(within(card).getByRole('button', { name: 'View' }))
+    expect(
+      await screen.findByRole('dialog', { name: 'Media task details' })
+    ).toBeVisible()
+  }
+)
+
+test('mobile administrator cards highlight selection and enable the existing batch action', async () => {
+  setMobileViewport()
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  const card = await screen.findByRole('article', { name: task.id })
+  const selectedAction = screen.getByRole('button', {
+    name: 'Terminate selected',
+  })
+  expect(
+    screen.getByLabelText('Search tasks').closest('.overflow-auto')
+  ).toContainElement(selectedAction)
+  expect(selectedAction).toBeDisabled()
+  await user.click(
+    within(card).getByRole('checkbox', { name: `Select task ${task.id}` })
+  )
+  expect(card.closest('[data-slot=data-table-card]')).toHaveAttribute(
+    'data-state',
+    'selected'
+  )
+  expect(selectedAction).toBeEnabled()
+  await user.click(
+    screen.getByRole('checkbox', { name: 'Select current page' })
+  )
+  expect(within(card).getByRole('checkbox')).not.toBeChecked()
+})
+
+test('mobile cards distinguish pending charges from a completed free task', async () => {
+  setMobileViewport()
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [
+      task,
+      {
+        ...task,
+        id: 'asyncimg_free',
+        status: 'succeeded',
+        billing_status: 'not_billable',
+        progress: 100,
+      },
+    ],
+    total: 2,
+    pages: 1,
+    stats: {},
+  })
+  mount(<ImageTaskCenter />)
+  const pending = await screen.findByRole('article', { name: task.id })
+  const free = screen.getByRole('article', { name: 'asyncimg_free' })
+  expect(
+    within(pending).getByText('Actual cost').nextElementSibling
+  ).toHaveTextContent('—')
+  expect(
+    within(free).getByText('Actual cost').nextElementSibling
+  ).toHaveTextContent('$0')
+  expect(within(free).getByText('No charge')).toBeVisible()
+  expect(within(free).queryByRole('progressbar')).not.toBeInTheDocument()
+})
+
+test('mobile tasks with no results retain the shared empty state without selection controls', async () => {
+  setMobileViewport()
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [],
+    total: 0,
+    pages: 0,
+    stats: {},
+  })
+  mount(<ImageTaskCenter admin />)
+  expect(await screen.findByText('No image tasks found')).toBeVisible()
+  expect(
+    screen.getByText('Adjust filters or create an image from the workbench.')
+  ).toBeVisible()
+  expect(screen.queryByRole('article')).not.toBeInTheDocument()
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+})
+
+test.each([
+  { admin: false, scope: 'user' },
+  { admin: true, scope: 'administrator' },
+])(
   'mobile $scope tasks scroll with their search and statistics',
   async ({ admin }) => {
     setMobileViewport()
@@ -554,22 +675,26 @@ test('user details hide admin routing, references and account history even if a 
   )
 })
 
-test('administrators with read permission cannot select or terminate tasks', async () => {
-  useAuthStore.getState().auth.setUser({
-    id: 101,
-    username: 'auditor',
-    role: 10,
-    permissions: {
-      admin_permissions: { async_image_task: { read: true, manage: false } },
-    },
-  })
-  mount(<ImageTaskCenter admin />)
-  await screen.findAllByText('Sunburst upstream')
-  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
-  expect(
-    screen.queryByRole('button', { name: /Terminate/ })
-  ).not.toBeInTheDocument()
-})
+test.each([false, true])(
+  'administrators with read permission cannot select or terminate tasks (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    useAuthStore.getState().auth.setUser({
+      id: 101,
+      username: 'auditor',
+      role: 10,
+      permissions: {
+        admin_permissions: { async_image_task: { read: true, manage: false } },
+      },
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findAllByText('Sunburst upstream')
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: /Terminate/ })
+    ).not.toBeInTheDocument()
+  }
+)
 
 test('success rate excludes unfinished tasks and stays undefined before any terminal result', () => {
   expect(
