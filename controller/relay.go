@@ -596,9 +596,6 @@ func executeTaskSubmissionWith(
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.UpstreamAsync = result.UpstreamAsync
 	task.PrivateData.UpstreamAsyncResponse = result.UpstreamAsyncResponse
-	if c.GetBool("async_media_execution") {
-		task.PrivateData.Key = relayInfo.ApiKey
-	}
 	task.PrivateData.AsyncMedia = c.GetBool("async_media_execution")
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId

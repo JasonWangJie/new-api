@@ -226,6 +226,52 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			_, _, err = model.AcceptAsyncMediaJob(t.Context(), conflict)
 			assert.ErrorIs(t, err, model.ErrImageConflict)
 			require.NoError(t, db.Model(&video).Updates(map[string]any{"status": "submitted", "storage_status": "failed", "billing_status": "settled"}).Error)
+			for _, query := range []string{"request_type=video", "media_type=video&request_type=video", "request_type=text_to_video"} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", 101)
+				c.Request = httptest.NewRequest(http.MethodGet, "/?"+query, nil)
+				ListMediaTasks(c, false)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var response struct {
+					Data struct {
+						Items []gin.H
+						Total int
+					}
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				require.Len(t, response.Data.Items, 1, query)
+				assert.Equal(t, video.TaskId, response.Data.Items[0]["id"])
+				assert.Equal(t, 1, response.Data.Total)
+			}
+			// A delayed pair of old upstream jobs must leave room for new work.
+			waiting := []model.AsyncMediaJob{
+				{TaskId: "wait-old-1", IdentityHash: "wait-old-1", Status: "submitted", CreatedAt: now - 100},
+				{TaskId: "wait-old-2", IdentityHash: "wait-old-2", Status: "submitted", CreatedAt: now - 99},
+				{TaskId: "wait-new", IdentityHash: "wait-new", Status: "queued", CreatedAt: now},
+			}
+			require.NoError(t, db.Create(&waiting).Error)
+			require.NoError(t, db.Model(&video).Update("next_attempt_at", now+60).Error)
+			due, err := model.GetDueAsyncMediaJobs(t.Context(), now, 2)
+			require.NoError(t, err)
+			require.Len(t, due, 2)
+			assert.Equal(t, waiting[0].TaskId, due[0].TaskId)
+			assert.Equal(t, waiting[1].TaskId, due[1].TaskId)
+			require.NoError(t, db.Model(&model.AsyncMediaJob{}).Where("id IN ?", []int{waiting[0].ID, waiting[1].ID}).Update("next_attempt_at", now+3).Error)
+			due, err = model.GetDueAsyncMediaJobs(t.Context(), now+3, 2)
+			require.NoError(t, err)
+			require.Len(t, due, 2)
+			assert.Equal(t, waiting[2].TaskId, due[0].TaskId, "new submissions get a turn even while old upstream jobs remain pending")
+			require.NoError(t, db.Model(&waiting[2]).Update("next_attempt_at", now+10).Error)
+			arrival := model.AsyncMediaJob{TaskId: "wait-new-arrival", IdentityHash: "wait-new-arrival", Status: "queued", CreatedAt: now + 4}
+			require.NoError(t, db.Create(&arrival).Error)
+			due, err = model.GetDueAsyncMediaJobs(t.Context(), now+4, 2)
+			require.NoError(t, err)
+			require.Len(t, due, 2)
+			assert.Equal(t, waiting[0].TaskId, due[0].TaskId, "continuous new submissions must not starve overdue upstream reconciliation")
+			require.NoError(t, db.Delete(&arrival).Error)
+			require.NoError(t, db.Where("id IN ?", []int{waiting[0].ID, waiting[1].ID, waiting[2].ID}).Delete(&model.AsyncMediaJob{}).Error)
+			require.NoError(t, db.Model(&video).Update("next_attempt_at", 0).Error)
 			for _, owner := range []int{101, 102} {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)

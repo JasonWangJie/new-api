@@ -19,6 +19,8 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/alicebob/miniredis/v2"
@@ -1853,6 +1855,95 @@ func TestTaskBillingTerminalSettlement(t *testing.T) {
 			assert.False(t, won)
 			assert.Equal(t, wantWallet, getUserQuota(t, id))
 		})
+	}
+}
+
+func TestTaskRequestBillingDatabaseSettlement(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		savedConfig[key] = value
+		return nil
+	}))
+	t.Cleanup(func() { require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig)) })
+	const id, initialQuota = 984, 10000
+	const tokenKey = "sk-frozen-request-billing"
+	const expression = `tier("seconds", u("seconds") * 10) * (param("priority") == true ? 2 : 1) * (header("X-Video-Tier") == "fast" ? 3 : 1) * (hour("UTC") == 3 ? 4 : 1)`
+	rawExprs, err := common.Marshal(map[string]string{"test-video::test-model": expression})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(rawExprs)}))
+	resolvedExpr, configured := billing_setting.ResolveTaskBillingExpr("test-video", "test-model", "test-model")
+	require.True(t, configured)
+	request := billingexpr.RequestInput{
+		Body:    []byte(`{"priority":true,"prompt":"private-video-prompt"}`),
+		Headers: map[string]string{"X-Video-Tier": "fast", "Authorization": "Bearer private-token"},
+		Usage:   map[string]any{"seconds": float64(5)},
+	}
+	frozenRequest, err := billingexpr.FreezeTaskRequestInput(resolvedExpr, request, time.Date(2000, time.January, 2, 3, 4, 0, 0, time.UTC))
+	require.NoError(t, err)
+	request.Frozen = frozenRequest
+	cost, trace, err := billingexpr.RunExprWithRequest(resolvedExpr, billingexpr.TokenParams{}, request)
+	require.NoError(t, err)
+	reservedQuota := common.QuotaRound(cost)
+	require.Equal(t, 1200, reservedQuota)
+	seedUser(t, id, initialQuota)
+	seedToken(t, id, id, tokenKey, initialQuota)
+	seedChannel(t, id)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("token_quota", initialQuota)
+	info := &relaycommon.RelayInfo{
+		UserId: id, TokenId: id, TokenKey: tokenKey, UserGroup: "default", UsingGroup: "default", OriginModelName: "test-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "text_to_video"},
+		ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: id}, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"},
+		PriceData: types.PriceData{Quota: reservedQuota, QuotaToPreConsume: reservedQuota, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}},
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode: "tiered_expr", ExprString: resolvedExpr, ExprHash: billingexpr.ExprHashString(resolvedExpr),
+			GroupRatio: 1, QuotaPerUnit: 1, ExprVersion: 1, TaskUsageBilling: true, UsageFacts: request.Usage,
+			EstimatedTier: trace.MatchedTier, EstimatedQuotaAfterGroup: reservedQuota, TaskRequest: frozenRequest,
+		},
+	}
+	require.Nil(t, PreConsumeDurableTaskBilling(c, reservedQuota, info))
+	assert.Equal(t, initialQuota-reservedQuota, getUserQuota(t, id))
+	assert.Equal(t, initialQuota-reservedQuota, getTokenRemainQuota(t, id))
+	task := makeTask(id, id, reservedQuota, id, BillingSourceWallet, 0)
+	task.PrivateData.DurableBilling = true
+	task.PrivateData.BillingContext.TieredSnapshot = info.TieredBillingSnapshot
+	require.NoError(t, model.DB.Create(task).Error)
+	require.NoError(t, LogTaskConsumption(c, info, task))
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	require.NotNil(t, persisted.PrivateData.BillingContext.TieredSnapshot.TaskRequest)
+	assert.Equal(t, frozenRequest, persisted.PrivateData.BillingContext.TieredSnapshot.TaskRequest)
+
+	request.Body = []byte(`{"priority":false}`)
+	request.Headers["X-Video-Tier"] = "standard"
+	rawExprs, err = common.Marshal(map[string]string{"test-video::test-model": `tier("changed", 9999)`})
+	require.NoError(t, err)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(rawExprs)}))
+	persisted.Status = model.TaskStatusSuccess
+	won, err := SettleTaskBillingOnComplete(t.Context(), &mockAdaptor{}, &persisted, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(3)}})
+	require.NoError(t, err)
+	require.True(t, won)
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.Equal(t, 720, completed.Quota)
+	assert.Equal(t, initialQuota-720, getUserQuota(t, id))
+	assert.Equal(t, initialQuota-720, getTokenRemainQuota(t, id))
+	used, requests := getUserUsageAccounting(t, id)
+	assert.Equal(t, 720, used)
+	assert.Equal(t, 1, requests)
+	assert.Equal(t, int64(720), getChannelUsedQuota(t, id))
+	assert.Equal(t, frozenRequest, completed.PrivateData.BillingContext.TieredSnapshot.TaskRequest)
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Find(&logs).Error)
+	require.Len(t, logs, 2)
+	for _, log := range logs {
+		encoded, err := common.Marshal(log)
+		require.NoError(t, err)
+		for _, private := range []string{"private-video-prompt", "private-token", "task_request", "x-video-tier"} {
+			assert.NotContains(t, string(encoded), private)
+		}
 	}
 }
 

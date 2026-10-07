@@ -429,10 +429,15 @@ func UploadAsyncImageInput(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", "Filename exceeds 255 UTF-8 bytes")
 		return
 	}
+	image, err := service.ValidateImageBytes(data, declared, cfg.SingleUploadBytes, cfg.DownloadMaxPixels)
+	if err != nil {
+		AsyncImagePublicError(c, 400, "invalid_image", err.Error())
+		return
+	}
 	sum := sha256.Sum256(data)
 	fingerprint := service.ImageIdentityHash(hex.EncodeToString(sum[:]), declared, filename, strconv.Itoa(len(data)))
 	now := time.Now().Unix()
-	input := model.ImageInputObject{InputId: "sci_" + common.GetUUID(), TokenId: token.Id, KeyHash: key, Fingerprint: fingerprint, Filename: filename, ByteSize: int64(len(data)), Status: "reserved", LeaseToken: common.GetUUID(), LeaseExpiresAt: now + int64(cfg.UploadTimeout) + 120, CreatedAt: now, ExpiresAt: now + int64(cfg.InputRetentionHours)*3600}
+	input := model.ImageInputObject{InputId: "sci_" + common.GetUUID(), TokenId: token.Id, KeyHash: key, Fingerprint: fingerprint, Filename: filename, ByteSize: int64(len(image.Data)), Status: "reserved", LeaseToken: common.GetUUID(), LeaseExpiresAt: now + int64(cfg.UploadTimeout) + 120, CreatedAt: now, ExpiresAt: now + int64(cfg.InputRetentionHours)*3600}
 	input.IntentKey = service.ImageIdentityHash("sc-input", input.InputId)
 	input, reused, err := model.ReserveImageInput(ctx, ticket, input, cfg.InputBytesPerKey)
 	if err != nil {
@@ -446,12 +451,6 @@ func UploadAsyncImageInput(c *gin.Context) {
 			return
 		}
 	} else {
-		image, err := service.ValidateImageBytes(data, declared, cfg.SingleUploadBytes, cfg.DownloadMaxPixels)
-		if err != nil {
-			_ = model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Where("input_id = ? AND status = ?", input.InputId, "reserved").Update("status", "rejected").Error
-			AsyncImagePublicError(c, 400, "invalid_image", err.Error())
-			return
-		}
 		extension := ".png"
 		if image.ContentType == "image/jpeg" {
 			extension = ".jpg"
@@ -459,7 +458,7 @@ func UploadAsyncImageInput(c *gin.Context) {
 			extension = ".webp"
 		}
 		key := time.Unix(input.CreatedAt, 0).UTC().Format("inputs/2006/01/02/") + service.ImageIdentityHash(input.InputId)[:32] + extension
-		intent := model.ImageUploadIntent{IntentKey: input.IntentKey, Class: "temporary", UserId: token.UserId, TokenId: token.Id, ProfileId: store.Profile.ProfileId, ObjectKey: key, ContentType: image.ContentType, ByteSize: int64(len(data)), Checksum: image.Checksum, Status: "pending", CreatedAt: now}
+		intent := model.ImageUploadIntent{IntentKey: input.IntentKey, Class: "temporary", UserId: token.UserId, TokenId: token.Id, ProfileId: store.Profile.ProfileId, ObjectKey: key, ContentType: image.ContentType, ByteSize: int64(len(image.Data)), Checksum: image.Checksum, Status: "pending", CreatedAt: now}
 		writeCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
 		object, err = service.StoreImageIntent(writeCtx, intent, image, input.ExpiresAt)
 		cancel()

@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,14 +22,20 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 type taskPollingFetchAdaptor struct {
 	mu           sync.Mutex
 	taskIDs      []string
+	publicIDs    []string
+	keys         []string
 	fetched      chan string
 	blockTaskID  string
 	blockStarted chan struct{}
@@ -40,14 +48,18 @@ type batchPollingAdaptor struct {
 	batchCalls int
 	batchIDs   []string
 	results    map[string]*BatchTaskResult
+	batchKeys  []string
+	publicIDs  []string
 }
 
 func (a *batchPollingAdaptor) FetchMode() string { return "batch" }
-func (a *batchPollingAdaptor) FetchBatchTasks(_ string, _ string, tasks []*model.Task, _ string) (*http.Response, error) {
+func (a *batchPollingAdaptor) FetchBatchTasks(_ string, key string, tasks []*model.Task, _ string) (*http.Response, error) {
 	a.batchCalls++
+	a.batchKeys = append(a.batchKeys, key)
 	a.batchIDs = a.batchIDs[:0]
 	for _, task := range tasks {
 		a.batchIDs = append(a.batchIDs, task.GetUpstreamTaskID())
+		a.publicIDs = append(a.publicIDs, task.TaskID)
 	}
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))}, nil
 }
@@ -64,7 +76,7 @@ func (a *batchPollingAdaptor) ParseBatchResult(_ []*model.Task, _ *http.Response
 
 func (a *taskPollingFetchAdaptor) Init(_ *relaycommon.RelayInfo) {}
 
-func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task, _ string) (*http.Response, error) {
+func (a *taskPollingFetchAdaptor) FetchTask(_ string, key string, task *model.Task, _ string) (*http.Response, error) {
 	taskID := ""
 	if task != nil {
 		taskID = task.GetUpstreamTaskID()
@@ -80,6 +92,10 @@ func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task
 
 	a.mu.Lock()
 	a.taskIDs = append(a.taskIDs, taskID)
+	if task != nil {
+		a.publicIDs = append(a.publicIDs, task.TaskID)
+	}
+	a.keys = append(a.keys, key)
 	a.mu.Unlock()
 	if a.fetched != nil {
 		select {
@@ -196,6 +212,209 @@ func seedPollingTask(t *testing.T, channelID int, publicID string, upstreamID st
 	}
 	require.NoError(t, model.DB.Create(task).Error)
 	return task
+}
+
+func setupTaskPollingDatabase(t *testing.T) {
+	t.Helper()
+	var driver gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "polling.db"))
+	if dsn := os.Getenv("ASYNC_IMAGE_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_test", "use a disposable image test database")
+		driver = mysql.Open(dsn)
+	} else if dsn := os.Getenv("ASYNC_IMAGE_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_test") || strings.Contains(dsn, "/new_api_image_test"), "use a disposable image test database")
+		driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+	}
+	db, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("polling_%d_", time.Now().UnixNano())}})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	if db.Dialector.Name() == "sqlite" {
+		connection.SetMaxOpenConns(1)
+	}
+	previousDB, previousLogDB, previousCache := model.DB, model.LOG_DB, common.MemoryCacheEnabled
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousPollingCursor, previousTimeoutCursor := taskPollingCursor.Swap(0), taskTimeoutCursor.Swap(0)
+	model.DB, model.LOG_DB, common.MemoryCacheEnabled = db, db, false
+	common.SetDatabaseTypes(common.DatabaseType(db.Dialector.Name()), common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.MemoryCacheEnabled = previousDB, previousLogDB, previousCache
+		common.SetDatabaseTypes(previousType, previousLogType)
+		taskPollingCursor.Store(previousPollingCursor)
+		taskTimeoutCursor.Store(previousTimeoutCursor)
+		assert.NoError(t, db.Migrator().DropTable(&model.Task{}, &model.Channel{}, &model.User{}, &model.Log{}))
+		assert.NoError(t, connection.Close())
+	})
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}, &model.Log{}))
+	}
+}
+
+func TestRunTaskPollingOnceKeepsProviderIDsScopedToChannelAndCredential(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%t", batch), func(t *testing.T) {
+			setupTaskPollingDatabase(t)
+			previousFactory, previousLimit := GetTaskAdaptorFunc, constant.TaskQueryLimit
+			t.Cleanup(func() {
+				GetTaskAdaptorFunc, constant.TaskQueryLimit = previousFactory, previousLimit
+			})
+			constant.TaskQueryLimit = 100
+			for _, id := range []int{1201, 1202} {
+				seedTaskPollingChannel(t, id, true)
+			}
+			publicIDs := []string{"task_account_a", "task_account_b", "task_channel_b"}
+			for index, id := range []int{1201, 1201, 1202} {
+				task := seedPollingTask(t, id, publicIDs[index], "same-provider-id")
+				task.PrivateData.Key = fmt.Sprintf("credential-%d", index)
+				task.SubmitTime = time.Now().Unix()
+				require.NoError(t, task.Update())
+			}
+			perTask := &taskPollingFetchAdaptor{}
+			batchAdaptor := &batchPollingAdaptor{}
+			GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+				if batch {
+					return batchAdaptor
+				}
+				return perTask
+			}
+			summary := RunTaskPollingOnce(t.Context(), nil)
+			assert.Equal(t, 3, summary.UnfinishedTasks)
+			if batch {
+				assert.ElementsMatch(t, publicIDs, batchAdaptor.publicIDs)
+				assert.ElementsMatch(t, []string{"credential-0", "credential-1", "credential-2"}, batchAdaptor.batchKeys)
+			} else {
+				assert.ElementsMatch(t, publicIDs, perTask.publicIDs)
+				assert.ElementsMatch(t, []string{"credential-0", "credential-1", "credential-2"}, perTask.keys)
+			}
+		})
+	}
+}
+
+func TestTaskPollingUsesPersistedSubmissionCredential(t *testing.T) {
+	setupTaskPollingDatabase(t)
+	channel := &model.Channel{
+		Id: 1210, Type: constant.ChannelTypeSora, Name: "multi-key", Status: common.ChannelStatusEnabled,
+		Key: "account-a\naccount-b", ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+	}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	require.NoError(t, model.DB.Create(channel).Error)
+	info := &relaycommon.RelayInfo{
+		UserId: 1, TaskRelayInfo: &relaycommon.TaskRelayInfo{},
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id, ChannelType: channel.Type, ApiKey: "account-b"},
+	}
+	task := model.InitTask("sora", info)
+	task.PrivateData.UpstreamTaskID = "account-b-video"
+	require.NoError(t, task.Insert())
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+
+	adaptor := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+	require.NoError(t, UpdateVideoTasks(t.Context(), "sora", map[int][]string{channel.Id: {"task-ref"}}, map[string]*model.Task{"task-ref": &persisted}))
+	assert.Equal(t, []string{"account-b"}, adaptor.keys)
+}
+
+func TestTaskPollingKeepsAmbiguousLegacyAccountsPending(t *testing.T) {
+	for _, keys := range []string{"account-a\naccount-b", `[{"account":"a"},{"account":"b"}]`} {
+		t.Run(keys, func(t *testing.T) {
+			setupTaskPollingDatabase(t)
+			previousTimeout := constant.TaskTimeoutMinutes
+			constant.TaskTimeoutMinutes = 1
+			t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+			channel := &model.Channel{
+				Id: 1220, Type: constant.ChannelTypeSora, Name: "legacy-accounts", Key: keys,
+				Status: common.ChannelStatusEnabled, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+			}
+			require.NoError(t, model.DB.Create(channel).Error)
+			task := seedPollingTask(t, channel.Id, "task_legacy_no_account", "provider-id")
+			task.Quota = 50
+			task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+			require.NoError(t, task.Update())
+			before := task.Snapshot()
+			perTask := &taskPollingFetchAdaptor{}
+			err := updateVideoSingleTask(t.Context(), perTask, channel, "task-ref", map[string]*model.Task{"task-ref": task})
+			require.ErrorContains(t, err, "reconcile its original credential")
+			batch := &batchPollingAdaptor{}
+			require.NoError(t, updateBatchTasks(t.Context(), batch, channel.Id, []string{"task-ref"}, map[string]*model.Task{"task-ref": task}))
+			sweepTimedOutTasks(t.Context())
+			assert.Zero(t, perTask.fetchCount())
+			assert.Zero(t, batch.batchCalls)
+			var persisted model.Task
+			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+			assert.True(t, before.Equal(persisted.Snapshot()))
+			assert.Equal(t, 50, persisted.Quota)
+		})
+	}
+}
+
+func TestTaskPollingAdvancesPastHeldLegacyAccounts(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run(fmt.Sprintf("timeout=%t", timeout), func(t *testing.T) {
+			setupTaskPollingDatabase(t)
+			previousFactory, previousLimit, previousTimeout := GetTaskAdaptorFunc, constant.TaskQueryLimit, constant.TaskTimeoutMinutes
+			t.Cleanup(func() {
+				GetTaskAdaptorFunc, constant.TaskQueryLimit, constant.TaskTimeoutMinutes = previousFactory, previousLimit, previousTimeout
+			})
+			constant.TaskQueryLimit, constant.TaskTimeoutMinutes = 100, 0
+			if timeout {
+				constant.TaskTimeoutMinutes = 1
+			}
+			channel := &model.Channel{
+				Id: 1230, Type: constant.ChannelTypeSora, Name: "held-legacy-backlog", Key: "account-a\naccount-b",
+				Status: common.ChannelStatusEnabled, UsedQuota: 5050, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+			}
+			channel.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+			require.NoError(t, model.DB.Create(channel).Error)
+			require.NoError(t, model.DB.Create(&model.User{Id: 1, Username: "backlog-user", Quota: 10000, UsedQuota: 5050, RequestCount: 101}).Error)
+			for index := range 101 {
+				task := seedPollingTask(t, channel.Id, fmt.Sprintf("task_backlog_%d", index), fmt.Sprintf("provider-%d", index))
+				task.Quota = 50
+				task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+				if index == 100 {
+					task.PrivateData.Key = "account-a"
+					task.PrivateData.SubmitAccountingRecorded = true
+				}
+				require.NoError(t, task.Update())
+			}
+			adaptor := &taskPollingFetchAdaptor{}
+			GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return adaptor }
+			for range 3 {
+				if timeout {
+					sweepTimedOutTasks(t.Context())
+				} else {
+					RunTaskPollingOnce(t.Context(), nil)
+				}
+			}
+			var known model.Task
+			require.NoError(t, model.DB.Where("task_id = ?", "task_backlog_100").First(&known).Error)
+			var user model.User
+			require.NoError(t, model.DB.First(&user, 1).Error)
+			if timeout {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), known.Status)
+				assert.Zero(t, known.Quota)
+				assert.Equal(t, 10050, user.Quota)
+				assert.Equal(t, 5000, user.UsedQuota)
+				assert.Zero(t, adaptor.fetchCount())
+			} else {
+				assert.Equal(t, []string{"task_backlog_100"}, adaptor.publicIDs)
+				assert.Equal(t, []string{"account-a"}, adaptor.keys)
+				assert.Equal(t, 50, known.Quota)
+				assert.Equal(t, 10000, user.Quota)
+				assert.Equal(t, 5050, user.UsedQuota)
+			}
+			var held []*model.Task
+			require.NoError(t, model.DB.Where("task_id != ?", known.TaskID).Order("id").Find(&held).Error)
+			require.Len(t, held, 100)
+			for _, task := range held {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), task.Status)
+				assert.Equal(t, "30%", task.Progress)
+				assert.Equal(t, 50, task.Quota)
+				assert.Zero(t, task.FinishTime)
+				assert.Zero(t, task.PrivateData.PollFailures)
+			}
+		})
+	}
 }
 
 func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {

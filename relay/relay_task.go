@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -75,6 +77,9 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	if !exist {
 		return service.TaskErrorWrapperLocal(errors.New("task_origin_not_exist"), "task_not_exist", http.StatusBadRequest)
 	}
+	if info.Action == constant.TaskActionRemix && originTask.Status != model.TaskStatusSuccess {
+		return service.TaskErrorWrapperLocal(errors.New("the origin video is not completed"), "task_origin_not_ready", http.StatusBadRequest)
+	}
 
 	// 从原始任务推导模型名称
 	if info.OriginModelName == "" {
@@ -100,25 +105,55 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 		return service.TaskErrorWrapperLocal(errors.New("the channel of the origin task is disabled"), "task_channel_disable", http.StatusBadRequest)
 	}
 	info.LockedChannel = ch
-
-	if originTask.ChannelId != info.ChannelId {
-		key, _, newAPIError := ch.GetNextEnabledKey()
-		if newAPIError != nil {
-			return service.TaskErrorWrapper(newAPIError, "channel_no_available_key", newAPIError.StatusCode)
-		}
-		common.SetContextKey(c, constant.ContextKeyChannelKey, key)
-		common.SetContextKey(c, constant.ContextKeyChannelType, ch.Type)
-		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, ch.GetBaseURL())
-		common.SetContextKey(c, constant.ContextKeyChannelId, originTask.ChannelId)
-
-		info.ChannelBaseUrl = ch.GetBaseURL()
-		info.ChannelId = originTask.ChannelId
-		info.ChannelType = ch.Type
-		info.ApiKey = key
+	if originTask.PrivateData.Key == "" && ch.ChannelInfo.IsMultiKey && len(ch.GetKeys()) != 1 {
+		return service.TaskErrorWrapperLocal(errors.New("the origin video account requires credential reconciliation"), "origin_task_key_unavailable", http.StatusBadRequest)
 	}
+	if setupErr := middleware.SetupContextForSelectedChannel(c, ch, info.OriginModelName); setupErr != nil {
+		return service.TaskErrorWrapperLocal(setupErr.Err, "setup_origin_channel_failed", http.StatusBadRequest)
+	}
+	if originTask.PrivateData.Key != "" {
+		keys := []string{ch.Key}
+		if ch.ChannelInfo.IsMultiKey {
+			keys = ch.GetKeys()
+		}
+		index := slices.Index(keys, originTask.PrivateData.Key)
+		status, hasStatus := ch.ChannelInfo.MultiKeyStatusList[index]
+		if index < 0 || hasStatus && status != common.ChannelStatusEnabled {
+			return service.TaskErrorWrapperLocal(errors.New("the origin video account is unavailable"), "origin_task_key_unavailable", http.StatusBadRequest)
+		}
+		common.SetContextKey(c, constant.ContextKeyChannelKey, originTask.PrivateData.Key)
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
+	}
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, info.OriginModelName)
+	info.InitChannelMeta(c)
+	service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: ch.Id, Source: "origin_task", Rank: 30, RetryMode: dto.PinRetrySingleAttempt})
 
 	// 提取 remix 参数（时长、分辨率 → OtherRatios）
 	if info.Action == constant.TaskActionRemix {
+		var originData map[string]any
+		_ = common.Unmarshal(originTask.Data, &originData)
+		if originData == nil {
+			originData = make(map[string]any)
+		}
+		if billing := originTask.PrivateData.BillingContext; billing != nil {
+			if billing.TieredSnapshot != nil {
+				for _, field := range []string{"seconds", "size"} {
+					if value, exists := billing.TieredSnapshot.UsageFacts[field]; exists {
+						originData[field] = value
+					}
+				}
+			} else if seconds := billing.OtherRatios["seconds"]; seconds > 0 {
+				originData["seconds"] = seconds
+			}
+		}
+		encodedOrigin, err := common.Marshal(originData)
+		if err != nil {
+			return service.TaskErrorWrapperLocal(err, "origin_task_invalid", http.StatusBadRequest)
+		}
+		info.OriginTasks = []relaycommon.OriginTaskRef{{
+			TaskID: originTask.TaskID, UpstreamTaskID: originTask.GetUpstreamTaskID(),
+			Action: originTask.Action, Status: string(originTask.Status), Data: encodedOrigin,
+		}}
 		if originTask.PrivateData.BillingContext != nil {
 			// 新的 remix 逻辑：直接从原始任务的 BillingContext 中提取 OtherRatios（如果存在）
 			for s, f := range originTask.PrivateData.BillingContext.OtherRatios {
@@ -144,6 +179,7 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 				info.PriceData.AddOtherRatio("size", 1.666667)
 			}
 		}
+		c.Set("origin_task_billing_ratios", info.PriceData.OtherRatios())
 	}
 
 	return nil
@@ -299,7 +335,25 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			} else {
 				facts = provider.ExtractUsageFacts(c, info)
 			}
-			cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+			requestInput, requestErr := helper.ResolveIncomingBillingExprRequestInput(c, info)
+			if requestErr != nil {
+				return nil, service.TaskErrorWrapperLocal(requestErr, "model_price_error", http.StatusBadRequest)
+			}
+			// Multipart requests have no JSON body. Their canonical task request
+			// preserves parsed scalar parameters without serializing file bytes.
+			if len(requestInput.Body) == 0 {
+				if request, exists := c.Get("task_request"); exists {
+					requestInput.Body, requestErr = common.Marshal(request)
+					if requestErr != nil {
+						return nil, service.TaskErrorWrapperLocal(requestErr, "model_price_error", http.StatusBadRequest)
+					}
+				}
+			}
+			frozenRequest, requestErr := billingexpr.FreezeTaskRequestInput(exprStr, requestInput, info.StartTime)
+			if requestErr != nil {
+				return nil, service.TaskErrorWrapperLocal(requestErr, "model_price_error", http.StatusBadRequest)
+			}
+			cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts, Frozen: frozenRequest})
 			if runErr != nil || cost < 0 {
 				if runErr == nil {
 					runErr = fmt.Errorf("negative task expression result")
@@ -310,7 +364,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			quota, clamp := common.QuotaRoundChecked(cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 			noteTaskQuotaClamp(info, clamp)
 			priceData = types.PriceData{Quota: quota, QuotaToPreConsume: quota, GroupRatioInfo: groupRatioInfo}
-			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts, TaskRequest: frozenRequest}
 		} else {
 			priceData, err = helper.ModelPriceHelperPerCall(c, info)
 			if err != nil {
@@ -323,6 +377,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		//    必须在 ModelPriceHelperPerCall 之后调用（它会重建 PriceData）。
 		//    ResolveOriginTask 可能已在 remix 路径中预设了 OtherRatios，此处合并。
 		if info.TieredBillingSnapshot == nil {
+			if originRatios, ok := common.GetContextKeyType[map[string]float64](c, "origin_task_billing_ratios"); ok {
+				for key, ratio := range originRatios {
+					info.PriceData.AddOtherRatio(key, ratio)
+				}
+			}
 			var estimatedRatios map[string]float64
 			if validatedProvider, ok := adaptor.(channel.TaskValidatedBillingProvider); ok {
 				estimatedRatios, err = validatedProvider.EstimateBillingValidated(c, info)

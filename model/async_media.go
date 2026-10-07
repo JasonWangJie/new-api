@@ -58,6 +58,16 @@ type MediaArtifactObject struct {
 	Status       string `json:"-" gorm:"size:16"`
 }
 
+// GetDueAsyncMediaJobs rotates pending work by its next eligible attempt. A
+// long-running upstream job must not monopolize every worker slot while newer
+// submissions or completed results wait behind it.
+func GetDueAsyncMediaJobs(ctx context.Context, now int64, limit int) ([]AsyncMediaJob, error) {
+	var jobs []AsyncMediaJob
+	err := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, now, now).
+		Order("CASE WHEN next_attempt_at = 0 THEN created_at ELSE next_attempt_at END").Order("created_at").Order("id").Limit(limit).Find(&jobs).Error
+	return jobs, err
+}
+
 func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, bool, error) {
 	reused := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

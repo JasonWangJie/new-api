@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -93,6 +94,62 @@ func TestApplyChannelPinPreservesOriginTasksAndRetryMode(t *testing.T) {
 			assert.Equal(t, []byte(originTask.Data), info.OriginTasks[0].Data)
 		})
 	}
+}
+
+func TestSoraRemixUsesOriginVideoAccountIDAndBillingUsage(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Task{}))
+	saveBillingConfig(t)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		billing_setting.PluginBillingExprOption: `{"sora::sora-2-pro":"tier(\"video\", u(\"seconds\") * 0.5)"}`,
+	}))
+	channel := &model.Channel{
+		Name: "origin-accounts", Key: "account-a\naccount-b", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeSora,
+		ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+	}
+	require.NoError(t, database.Create(channel).Error)
+	origin := &model.Task{
+		TaskID: "task_public_origin", UserId: 1, ChannelId: channel.Id, Status: model.TaskStatusSuccess,
+		Properties: model.Properties{OriginModelName: "sora-2-pro", UpstreamModelName: "sora-2-pro"},
+		PrivateData: model.TaskPrivateData{
+			Key: "account-b", UpstreamTaskID: "video_upstream_origin",
+			BillingContext: &model.TaskBillingContext{TieredSnapshot: &billingexpr.BillingSnapshot{
+				UsageFacts: map[string]any{"seconds": float64(8), "size": "1792x1024"},
+			}},
+		},
+		Data: []byte(`{"id":"video_upstream_origin","seconds":"4","size":"720x1280"}`),
+	}
+	require.NoError(t, database.Create(origin).Error)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos/task_public_origin/remix", strings.NewReader(`{"prompt":"remix this video"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "video_id", Value: origin.TaskID}}
+	c.Set("group", "default")
+	c.Set("async_media_prepare", true)
+	info := &relaycommon.RelayInfo{UserId: 1, UserGroup: "default", UsingGroup: "default", TaskRelayInfo: &relaycommon.TaskRelayInfo{}, ChannelMeta: &relaycommon.ChannelMeta{}}
+	require.Nil(t, ResolveOriginTask(c, info))
+	_, adaptor := getTaskAdaptorForRequest(c, constant.TaskPlatform("sora"))
+	require.NotNil(t, adaptor)
+	adaptor.Init(info)
+	require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+	upstreamURL, err := adaptor.BuildRequestURL(info)
+	require.NoError(t, err)
+	assert.Equal(t, "https://api.openai.com/v1/videos/video_upstream_origin/remix", upstreamURL)
+	assert.Equal(t, constant.TaskActionRemix, info.Action)
+	assert.Equal(t, "account-b", info.ApiKey)
+	assert.True(t, service.GetChannelConstraints(c).SuppressesRetry())
+
+	result, taskErr := RelayTaskSubmit(c, info)
+	require.Nil(t, taskErr)
+	require.NotNil(t, result)
+	assert.Equal(t, common.QuotaRound(4*common.QuotaPerUnit), result.Quota)
+	assert.Equal(t, map[string]any{"seconds": float64(8), "size": "1792x1024"}, info.TieredBillingSnapshot.UsageFacts)
+
+	channel.ChannelInfo.MultiKeyStatusList = map[int]int{1: common.ChannelStatusManuallyDisabled}
+	require.NoError(t, channel.SaveChannelInfo())
+	taskErr = ResolveOriginTask(c, info)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "origin_task_key_unavailable", taskErr.Code)
 }
 
 func TestTaskModel2DtoNormalizesLegacyAction(t *testing.T) {
@@ -398,6 +455,115 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
 			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+		})
+	}
+}
+
+func TestTaskConditionalPricingFreezesRequestThroughCompletion(t *testing.T) {
+	const expression = `tier("seconds", u("seconds") * 0.1) * (param("metadata.priority") == true ? 2 : 1) * (header("X-Video-Tier") == "fast" ? 3 : 1) * (hour("UTC") == 3 && minute("UTC") == 4 && weekday("UTC") == 0 && month("UTC") == 1 && day("UTC") == 2 ? 5 : 1) * (u("seconds") > 2 ? (param("metadata.discount") == true ? 0.5 : 1) : 1)`
+	for _, tc := range []struct {
+		name, contentType, tier string
+		priority                bool
+		wantCost                float64
+	}{
+		{name: "JSON matched request conditions", contentType: "application/json", tier: "fast", priority: true, wantCost: 6},
+		{name: "JSON unmatched request conditions", contentType: "application/json", tier: "standard", wantCost: 1},
+		{name: "multipart canonical parameters", contentType: "multipart/form-data; boundary=test", tier: "fast", priority: true, wantCost: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveBillingConfig(t)
+			rawExprs, err := common.Marshal(map[string]string{"bill-fallback::declared-model": expression})
+			require.NoError(t, err)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(rawExprs)}))
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			c.Set("async_media_prepare", true)
+			info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
+			info.StartTime = time.Date(2000, time.January, 2, 3, 4, 0, 0, time.UTC)
+			info.RequestHeaders = map[string]string{"X-Video-Tier": tc.tier, "Authorization": "Bearer usable-client-secret", "Cookie": "session=usable-session-secret"}
+			request := map[string]any{
+				"metadata": map[string]any{"priority": tc.priority, "discount": true},
+				"prompt":   "private-video-prompt", "input_reference": "private-reference-url", "api_key": "private-body-secret",
+			}
+			c.Set("task_request", request)
+			body, err := common.Marshal(request)
+			require.NoError(t, err)
+			if tc.contentType == "application/json" {
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(string(body)))
+			}
+			c.Request.Header.Set("Content-Type", tc.contentType)
+			pinMappingOrderPlugin(t, c, billingFallbackPlugin+`export function extractUsage(){return {seconds:2};}`)
+			submission, taskErr := RelayTaskSubmit(c, info)
+			require.Nil(t, taskErr)
+			require.NotNil(t, info.TieredBillingSnapshot)
+			assert.Equal(t, common.QuotaRound(tc.wantCost*common.QuotaPerUnit), submission.Quota)
+
+			// The scanner round trip is the persisted billing contract. Neither
+			// the request payload nor unrelated credential headers belong in it.
+			private := model.TaskPrivateData{BillingContext: &model.TaskBillingContext{TieredSnapshot: info.TieredBillingSnapshot}}
+			stored, err := private.Value()
+			require.NoError(t, err)
+			storedJSON, ok := stored.(string)
+			require.True(t, ok)
+			for _, secret := range []string{"usable-client-secret", "usable-session-secret", "private-video-prompt", "private-reference-url", "private-body-secret"} {
+				assert.NotContains(t, storedJSON, secret)
+			}
+			var persisted model.TaskPrivateData
+			require.NoError(t, persisted.Scan(stored))
+			publicJSON, err := common.Marshal(&model.Task{PrivateData: persisted})
+			require.NoError(t, err)
+			assert.NotContains(t, string(publicJSON), "task_request")
+			assert.NotContains(t, string(publicJSON), "X-Video-Tier")
+
+			// Completion has no HTTP request. Configuration and the original
+			// request may have changed while the task was pending.
+			info.RequestHeaders["X-Video-Tier"] = "changed"
+			request["metadata"].(map[string]any)["priority"] = !tc.priority
+			request["metadata"].(map[string]any)["discount"] = false
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`}))
+			snap := persisted.BillingContext.TieredSnapshot
+			before, err := common.Marshal(snap)
+			require.NoError(t, err)
+			result, usage, err := service.EvaluateTaskCompletionUsage(snap, map[string]any{"seconds": float64(4)})
+			require.NoError(t, err)
+			// Twice the seconds enters a previously skipped discount branch,
+			// while every body, header, and time condition remains frozen.
+			assert.Equal(t, submission.Quota, result.ActualQuotaAfterGroup)
+			assert.Equal(t, float64(4), usage["seconds"])
+			after, err := common.Marshal(snap)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+
+			// Deferred dispatch uses the same acceptance snapshot even when its
+			// reconstructed request has different headers and a later start time.
+			c.Set("async_media_billing", service.MediaBillingSnapshot{Price: info.PriceData, Tiered: snap})
+			info.StartTime = time.Date(2000, time.February, 7, 12, 0, 0, 0, time.UTC)
+			replayed, taskErr := RelayTaskSubmit(c, info)
+			require.Nil(t, taskErr)
+			assert.Equal(t, submission.Quota, replayed.Quota)
+		})
+	}
+}
+
+func TestTaskConditionalPricingRejectsUnsafeRequestSnapshots(t *testing.T) {
+	for _, expression := range []string{
+		`tier("seconds", u("seconds") * 0.1) * (header("Authorization") == "Bearer usable-client-secret" ? 2 : 1)`,
+		`tier("seconds", u("seconds") * 0.1) * (param(header("X-Price-Field")) == true ? 2 : 1)`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			saveBillingConfig(t)
+			rawExprs, err := common.Marshal(map[string]string{"bill-fallback::declared-model": expression})
+			require.NoError(t, err)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: string(rawExprs)}))
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			c.Set("async_media_prepare", true)
+			info.UserGroup, info.UsingGroup, info.OriginModelName = "default", "default", "declared-model"
+			info.RequestHeaders = map[string]string{"Authorization": "Bearer usable-client-secret", "X-Price-Field": "priority"}
+			pinMappingOrderPlugin(t, c, billingFallbackPlugin+`export function extractUsage(){return {seconds:2};}`)
+			_, taskErr := RelayTaskSubmit(c, info)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, "model_price_error", taskErr.Code)
+			assert.NotContains(t, taskErr.Error.Error(), "usable-client-secret")
+			assert.Nil(t, info.TieredBillingSnapshot)
 		})
 	}
 }

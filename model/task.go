@@ -245,10 +245,7 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 	properties := Properties{}
 	privateData := TaskPrivateData{}
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
-		if relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeGemini ||
-			relayInfo.ChannelMeta.ChannelType == constant.ChannelTypeVertexAi {
-			privateData.Key = relayInfo.ChannelMeta.ApiKey
-		}
+		privateData.Key = relayInfo.ChannelMeta.ApiKey
 		if relayInfo.UpstreamModelName != "" {
 			properties.UpstreamModelName = relayInfo.UpstreamModelName
 		}
@@ -384,6 +381,21 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 		return nil
 	}
 	return tasks
+}
+
+// GetUnfinishedSyncTaskPage walks unfinished tasks by primary key. A positive
+// cutoff restricts the page to timed-out tasks; zero includes every pending task.
+func GetUnfinishedSyncTaskPage(ctx context.Context, afterID, cutoffUnix int64, limit int) ([]*Task, error) {
+	var tasks []*Task
+	query := DB.WithContext(ctx).
+		Where("progress != ?", "100%").
+		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Where("id > ?", afterID)
+	if cutoffUnix > 0 {
+		query = query.Where("submit_time < ?", cutoffUnix)
+	}
+	err := query.Order("id").Limit(max(limit, 1)).Find(&tasks).Error
+	return tasks, err
 }
 
 // HasUnfinishedSyncTasks reports whether at least one async (Suno/video) task is

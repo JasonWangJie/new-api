@@ -59,8 +59,8 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			if err := CleanupMediaObjects(ctx); err != nil {
 				common.SysError("media cleanup: " + err.Error())
 			}
-			var jobs []model.AsyncMediaJob
-			if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, time.Now().Unix(), time.Now().Unix()).Order("created_at").Limit(cfg.DownloadConcurrency).Find(&jobs).Error; err != nil {
+			jobs, err := model.GetDueAsyncMediaJobs(ctx, time.Now().Unix(), cfg.DownloadConcurrency)
+			if err != nil {
 				common.SysError("media queue: " + err.Error())
 				continue
 			}

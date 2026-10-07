@@ -339,9 +339,11 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		videos = videos.Where("1 = 0")
 	}
 	if kind := c.Query("request_type"); kind != "" {
-		if kind == "text_to_video" {
+		if kind == "video" {
+			images = images.Where("1 = 0")
+		} else if kind == "text_to_video" {
 			videos = videos.Where("NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.action <> ?)", kind)
-		} else if kind == "image_to_video" {
+		} else if kind == "image_to_video" || kind == "remix" || kind == "extend" || kind == "video_to_video" {
 			videos = videos.Where("EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.action = ?)", kind)
 		} else {
 			videos = videos.Where("1 = 0")

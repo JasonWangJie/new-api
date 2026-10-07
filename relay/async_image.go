@@ -157,18 +157,31 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 }
 
 func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+	// A known upstream job has already consumed provider resources. Revoking
+	// submission permissions must not cancel its internal polling or accounting.
+	accepted := task.UpstreamTaskId != ""
+	tokenQuery := model.DB.WithContext(ctx)
+	if accepted {
+		tokenQuery = tokenQuery.Unscoped()
+	}
 	var token model.Token
-	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
+	if err := tokenQuery.Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
-	if limits := token.GetIpLimits(); len(limits) > 0 && request.ClientIP != "" {
+	if limits := token.GetIpLimits(); !accepted && len(limits) > 0 && request.ClientIP != "" {
 		ip := net.ParseIP(request.ClientIP)
 		if ip == nil || !common.IsIpInCIDRList(ip, limits) {
 			return nil, model.AsyncImageBill{}, errors.New("client address is outside Token permissions")
 		}
 	}
 	var user model.User
-	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", task.UserId, common.UserStatusEnabled).Take(&user).Error; err != nil {
+	userQuery := model.DB.WithContext(ctx).Where("id = ?", task.UserId)
+	if accepted {
+		userQuery = userQuery.Unscoped()
+	} else {
+		userQuery = userQuery.Where("status = ?", common.UserStatusEnabled)
+	}
+	if err := userQuery.Take(&user).Error; err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
 	limit := int64(dto.MaxImageN) * cfg.DownloadMaxBytes * 2
@@ -288,9 +301,13 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		parsed = imageRequest
 	} else {
-		parts, err := buildGeminiAsyncImageParts(ctx, task, request, cfg)
-		if err != nil {
-			return nil, model.AsyncImageBill{}, err
+		var parts []dto.GeminiPart
+		if !accepted {
+			var err error
+			parts, err = buildGeminiAsyncImageParts(ctx, task, request, cfg)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
 		}
 		geminiReferenceFallbackEligible = cfg.GeminiReferenceMode == "passthrough_fallback_local" && task.ReferenceRetryCount == 0 && slices.ContainsFunc(parts, func(part dto.GeminiPart) bool {
 			return part.FileData != nil

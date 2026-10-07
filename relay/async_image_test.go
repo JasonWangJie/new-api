@@ -362,7 +362,7 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
 	user := model.User{Username: "gemini-submit-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
-	token := model.Token{UserId: user.Id, Key: "gemini-submit-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	token := model.Token{Id: 17, UserId: user.Id, Key: "gemini-submit-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
 	require.NoError(t, db.Create(&token).Error)
 	service.InitHttpClient()
 	for _, tc := range []struct {
@@ -429,6 +429,18 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 			}
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			assert.Equal(t, "vendor-job", task.UpstreamTaskId)
+			request.Reservation, err = model.GetAsyncImageReservation(t.Context(), task)
+			require.NoError(t, err)
+			require.NotNil(t, request.Reservation)
+			request.ClientIP = "192.0.2.10"
+			request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: "https://expired.invalid/reference.png"})
+			require.NoError(t, db.Model(&token).Update("allow_ips", "198.51.100.0/24").Error)
+			require.NoError(t, db.Model(&user).Update("status", common.UserStatusDisabled).Error)
+			require.NoError(t, db.Delete(&token).Error)
+			defer func() {
+				require.NoError(t, db.Unscoped().Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"deleted_at": nil, "allow_ips": nil}).Error)
+				require.NoError(t, db.Model(&user).Update("status", common.UserStatusEnabled).Error)
+			}()
 			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error { dispatches++; return nil })
 			require.ErrorAs(t, err, &pending)
 			assert.Equal(t, 1, dispatches, "polling must not cross the submission barrier again")

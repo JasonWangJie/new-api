@@ -53,6 +53,267 @@ func asyncImageBytesFixture(t *testing.T) ImageBytes {
 	return valid
 }
 
+func asyncImageWorkerFixture(t *testing.T) (*gorm.DB, model.AsyncImageTask, AsyncImageRequest, ImageRuntimeConfig, model.Channel) {
+	t.Helper()
+	asyncImageKeyFixture(t)
+	previousDB, previousRedis, previousEnabled := model.DB, common.RDB, common.RedisEnabled
+	previousType := common.MainDatabaseType()
+	previousCapability, previousEstimate, previousExecute := ImageChannelCapabilityFunc, EstimateAsyncImageQuotaFunc, ExecuteAsyncImageFunc
+	dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "worker.db")))
+	if dsn := os.Getenv("IMAGE_WORKER_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_worker_test", "use the dedicated disposable image worker database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_WORKER_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_worker_test") || strings.Contains(dsn, "/new_api_image_worker_test"), "use the dedicated disposable image worker database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	entities := []any{&model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.Token{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}}
+	t.Cleanup(func() {
+		model.DB, common.RDB, common.RedisEnabled = previousDB, previousRedis, previousEnabled
+		common.SetMainDatabaseType(previousType)
+		ImageChannelCapabilityFunc, EstimateAsyncImageQuotaFunc, ExecuteAsyncImageFunc = previousCapability, previousEstimate, previousExecute
+		assert.NoError(t, client.Close())
+		assert.NoError(t, db.Migrator().DropTable(entities...))
+		connection, openErr := db.DB()
+		if assert.NoError(t, openErr) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, db.AutoMigrate(entities...))
+	cfg := DefaultImageRuntimeConfig()
+	cfg.AsyncEnabled, cfg.CircuitBreaker, cfg.RetryJitter = true, true, 0
+	require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+	ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+		return dto.ImageCapability{Provider: "openai", Protocol: "openai_images", Generate: true, Edit: true}
+	}
+	EstimateAsyncImageQuotaFunc = func(context.Context, model.Token, AsyncImageRequest, string) (int, error) {
+		return 100, nil
+	}
+	user := model.User{Username: "worker-test", Group: "default", Quota: 1000, Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "worker-token-key", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000}
+	require.NoError(t, db.Create(&token).Error)
+	aPriority, bPriority := int64(100), int64(10)
+	a := model.Channel{Key: "upstream-key-a", Status: common.ChannelStatusEnabled, Type: 1, Group: "default", Models: "image-model", Priority: &aPriority}
+	b := model.Channel{Key: "upstream-key-b", Status: common.ChannelStatusEnabled, Type: 1, Group: "default", Models: "image-model", Priority: &bPriority}
+	require.NoError(t, db.Create(&a).Error)
+	require.NoError(t, db.Create(&b).Error)
+	require.NoError(t, db.Create(&[]model.Ability{{Group: "default", Model: "image-model", ChannelId: a.Id, Enabled: true}, {Group: "default", Model: "image-model", ChannelId: b.Id, Enabled: true}}).Error)
+	catalog, err := common.Marshal([]ImageModelCapability{{Id: "image-model", MaxOutputImages: 1, MaxReferenceImages: 1}})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.ImageGroupPolicy{PolicyKey: ImageIdentityHash("default", "openai"), Group: "default", Platform: "openai", Enabled: true, AsyncEnabled: true, PoolMode: "resolution", Models: string(catalog)}).Error)
+	require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "worker-local", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}).Error)
+	now := time.Now().Unix()
+	task := model.AsyncImageTask{TaskId: "asyncimg_worker_test", UserId: user.Id, TokenId: token.Id, Group: "default", Dialect: "async", Platform: "openai", Provider: "openai", ExecutionProtocol: "openai_images", Model: "image-model", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker-lease", LeaseExpiresAt: now + 120, StartedAt: now, CreatedAt: now, ChannelId: a.Id}
+	request := AsyncImageRequest{Dialect: "async", Platform: "openai", Provider: "openai", PolicyPlatform: "openai", Model: "image-model", Count: 1, Kind: "text_to_image", SourcePath: "/v1/images/generations_async", Billing: &MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.0002, QuotaToPreConsume: 100}, Ratios: map[string]float64{"n": 1}}}
+	data, err := common.Marshal(request)
+	require.NoError(t, err)
+	task.RequestCipher, err = EncryptImagePayload(data, "task:"+task.TaskId)
+	require.NoError(t, err)
+	data, err = common.Marshal(a)
+	require.NoError(t, err)
+	task.SelectedChannelCipher, err = EncryptImagePayload(data, "image-channel:"+task.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&task).Error)
+	return db, task, request, cfg, b
+}
+
+func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "selected key disabled before first dispatch"} {
+		t.Run(condition, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
+			attempts := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, Code: 606}}
+			switch condition {
+			case "reference account exhausted":
+				attempts = nil
+				for range cfg.ReferenceRetries + 1 {
+					attempts = append(attempts, ImageChannelAttempt{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, ReferenceFailure: true, Code: 602})
+				}
+			case "channel circuit open":
+				for range cfg.FailureThreshold {
+					require.NoError(t, RecordImageCircuit(t.Context(), "async", task.ChannelId, false, cfg))
+				}
+			case "selected key disabled before first dispatch":
+				attempts = nil
+				channelInfo := model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("channel_info", channelInfo).Error)
+			}
+			encoded, err := common.Marshal(attempts)
+			require.NoError(t, err)
+			task.Attempts = string(encoded)
+			require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("attempts", task.Attempts).Error)
+			var selected model.Channel
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				selected = *channel
+				assert.Equal(t, request.Billing, outbound.Billing, "retry must preserve the admitted price")
+				require.NoError(t, beforeInvoke())
+				require.NoError(t, db.WithContext(ctx).Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("upstream_task_id", "accepted-alternate-job").Error)
+				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+			}
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			assert.Equal(t, alternate.Id, selected.Id)
+			assert.Equal(t, alternate.Key, selected.Key)
+			var saved model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			assert.Equal(t, alternate.Id, saved.ChannelId)
+			data, err := DecryptImagePayload(saved.SelectedChannelCipher, "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			var frozen model.Channel
+			require.NoError(t, common.Unmarshal(data, &frozen))
+			assert.Equal(t, alternate.Id, frozen.Id, "subsequent polls must use the accepted retry account")
+			assert.Equal(t, alternate.Key, frozen.Key)
+		})
+	}
+}
+
+func TestAsyncImageWorkerPolicyChangeOnlyRejectsNewSubmissions(t *testing.T) {
+	for _, accepted := range []bool{false, true} {
+		t.Run(strconv.FormatBool(accepted), func(t *testing.T) {
+			db, task, request, cfg, _ := asyncImageWorkerFixture(t)
+			if accepted {
+				task.UpstreamTaskId, task.DispatchedAt = "accepted-original-job", time.Now().Unix()-1
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+			}
+			require.NoError(t, db.Model(&model.User{}).Where("id = ?", task.UserId).Update("quota", 900).Error)
+			require.NoError(t, db.Model(&model.Token{}).Where("id = ?", task.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+			require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: task.TaskId, BillingRequestId: "async-image:" + task.TaskId, UserId: task.UserId, TokenId: task.TokenId, FundingSource: "wallet", ReservedAt: time.Now().Unix(), ReservedQuota: 100, ReservedTokenQuota: 100, Status: "reserved"}).Error)
+			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where(map[string]any{"group": "default"}).Updates(map[string]any{"async_enabled": false, "models": "[]"}).Error)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"status": common.ChannelStatusManuallyDisabled, "key": "replacement-key"}).Error)
+			cfg.AsyncEnabled = false
+			calls := 0
+			ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, _ func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Equal(t, task.UpstreamTaskId, current.UpstreamTaskId)
+				assert.Equal(t, task.ChannelId, channel.Id)
+				assert.Equal(t, "upstream-key-a", channel.Key, "polling must keep the account that accepted the job")
+				assert.Equal(t, request.Billing, outbound.Billing)
+				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+			}
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			var saved model.AsyncImageTask
+			var bill model.AsyncImageBill
+			var user model.User
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			if accepted {
+				assert.Equal(t, 1, calls)
+				assert.Equal(t, model.ImageTaskInvoking, saved.Status)
+				assert.Equal(t, "reserved", bill.Status)
+				assert.Equal(t, 900, user.Quota)
+				assert.Greater(t, saved.NextAttemptAt, time.Now().Unix())
+			} else {
+				assert.Zero(t, calls)
+				assert.Equal(t, model.ImageTaskFailed, saved.Status)
+				assert.Equal(t, "refunded", bill.Status)
+				assert.Equal(t, 1000, user.Quota)
+			}
+		})
+	}
+}
+
+func TestAsyncImageWorkerAcceptedTaskRequiresDurableBillingAndChannel(t *testing.T) {
+	for _, missing := range []string{"billing reservation", "frozen channel configuration", "invalid encrypted image payload", "request could not be decrypted", "request is invalid"} {
+		t.Run(missing, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			task.UpstreamTaskId, task.DispatchedAt = "accepted-job", time.Now().Unix()-1
+			updates := map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}
+			switch missing {
+			case "frozen channel configuration", "invalid encrypted image payload":
+				task.SelectedChannelCipher = nil
+				if missing == "invalid encrypted image payload" {
+					task.SelectedChannelCipher = []byte{0}
+				}
+				updates["selected_channel_cipher"] = task.SelectedChannelCipher
+			case "request could not be decrypted":
+				task.RequestCipher = []byte{0}
+				updates["request_cipher"] = task.RequestCipher
+			case "request is invalid":
+				var err error
+				task.RequestCipher, err = EncryptImagePayload([]byte(`{`), "task:"+task.TaskId)
+				require.NoError(t, err)
+				updates["request_cipher"] = task.RequestCipher
+			}
+			if missing != "billing reservation" {
+				require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ReservedAt: time.Now().Unix(), ReservedQuota: 100, FundingSource: "wallet", Status: "reserved"}).Error)
+			}
+			require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(updates).Error)
+			calls := 0
+			ExecuteAsyncImageFunc = func(context.Context, model.AsyncImageTask, AsyncImageRequest, *model.Channel, ImageRuntimeConfig, func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+			}
+			require.ErrorContains(t, invokeAsyncImageTask(t.Context(), &task, cfg), missing)
+			assert.Zero(t, calls, "incomplete accepted-job state must not create a new reservation or change accounts")
+			var saved model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			assert.Equal(t, model.ImageTaskInvoking, saved.Status)
+			if missing != "billing reservation" {
+				var bill model.AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				assert.Equal(t, "reserved", bill.Status, "missing reconciliation data must not refund accepted work")
+			}
+		})
+	}
+}
+
+func TestAsyncImageWorkerAcceptedTaskWaitsForLocalCapacityWithoutRefund(t *testing.T) {
+	for _, capacity := range []string{"global", "channel"} {
+		t.Run(capacity, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			cfg.ImageConcurrency, cfg.TotalRetries, cfg.CapacityRetries = 1, 0, 0
+			task.UpstreamTaskId, task.DispatchedAt = "accepted-capacity-job", time.Now().Unix()-1
+			require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+			require.NoError(t, db.Model(&model.User{}).Where("id = ?", task.UserId).Update("quota", 900).Error)
+			require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ReservedAt: time.Now().Unix(), ReservedQuota: 100, FundingSource: "wallet", Status: "reserved"}).Error)
+			busyKey := ImageRedisKey("invoke-slots")
+			if capacity == "channel" {
+				busyKey = ImageChannelConcurrencyKey(task.ChannelId)
+			}
+			require.NoError(t, common.RDB.ZAdd(t.Context(), busyKey, &redis.Z{Score: float64(time.Now().Unix() + 120), Member: "busy-worker"}).Err())
+			calls := 0
+			ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, _ AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, _ func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Equal(t, "accepted-capacity-job", current.UpstreamTaskId)
+				assert.Equal(t, "upstream-key-a", channel.Key)
+				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+			}
+			for range 3 {
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, model.ImageTaskInvoking, task.Status)
+				assert.Zero(t, task.RetryCount)
+				assert.Zero(t, task.CapacityRetryCount)
+				assert.Equal(t, "accepted-capacity-job", task.UpstreamTaskId)
+				assert.Empty(t, task.LeaseToken)
+				assert.Greater(t, task.NextAttemptAt, time.Now().Unix())
+				var bill model.AsyncImageBill
+				var user model.User
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				require.NoError(t, db.First(&user, task.UserId).Error)
+				assert.Equal(t, "reserved", bill.Status)
+				assert.Equal(t, 900, user.Quota)
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("next_attempt_at", time.Now().Unix()).Error)
+				var err error
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), 120)
+				require.NoError(t, err)
+			}
+			assert.Zero(t, calls)
+			require.NoError(t, common.RDB.ZRem(t.Context(), busyKey, "busy-worker").Err())
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			assert.Equal(t, 1, calls, "released capacity resumes the original upstream job")
+		})
+	}
+}
+
 func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T) {
 	ctx := context.Background()
 	previousDB, previousRedis, previousType := model.DB, common.RDB, common.MainDatabaseType()
@@ -780,6 +1041,75 @@ func TestAsyncImageProtocolDimensionsAndRawIdempotency(t *testing.T) {
 	for _, body := range []string{`{"prompt":"x","n":0}`, `{"prompt":"x","n":129}`, `{"prompt":"x","n":18446744073709551615}`, `{"prompt":"x","stream":true}`, `{"prompt":"x","mask":{"image_url":"x"}}`} {
 		_, err := ParseAsyncImageRequest([]byte(body), "application/json", "/v1/images/generations_oa", DefaultImageRuntimeConfig())
 		assert.Error(t, err, body)
+	}
+}
+
+func TestAsyncImageUnifiedCountAndGeminiDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		count       int
+		provider    string
+		resolution  string
+		aspectRatio string
+		references  int
+		routeGemini bool
+		wantError   bool
+	}{
+		{name: "provider count is billed and sent", body: `{"model":"image-model","prompt":"draw","create_count":2}`, count: 2},
+		{name: "zero provider count", body: `{"model":"image-model","prompt":"draw","create_count":0}`, wantError: true},
+		{name: "negative provider count", body: `{"model":"image-model","prompt":"draw","create_count":-1}`, wantError: true},
+		{name: "provider count exceeds maximum", body: `{"model":"image-model","prompt":"draw","create_count":` + strconv.Itoa(dto.MaxImageN+1) + `}`, wantError: true},
+		{name: "provider count overflows uint", body: `{"model":"image-model","prompt":"draw","create_count":18446744073709551616}`, wantError: true},
+		{name: "provider count exceeds billing bound", body: `{"model":"image-model","prompt":"draw","create_count":18446744073709551615}`, wantError: true},
+		{name: "explicit n conflicts with provider count", body: `{"model":"image-model","prompt":"draw","n":1,"create_count":2}`, wantError: true},
+		{name: "provider count conflicts with batch", body: `{"model":"image-model","prompt":"draw","create_count":1,"batch_size":2}`, wantError: true},
+		{name: "batch conflicts with provider count", body: `{"model":"image-model","prompt":"draw","batch_size":2,"create_count":1}`, wantError: true},
+		{name: "parameters count is billed and sent", body: `{"model":"image-model","prompt":"draw","parameters":{"n":2}}`, count: 2},
+		{name: "explicit count conflicts with parameters", body: `{"model":"image-model","prompt":"draw","n":2,"parameters":{"n":1}}`, wantError: true},
+		{name: "gemini half K resolution preserves edit count", body: `{"provider":"gemini","model":"image-model","prompt":"edit","resolution":"0.5K","n":2,"images":[{"image_url":"https://example.com/input.png"}]}`, count: 2, provider: "gemini", resolution: "0.5K", references: 1},
+		{name: "gemini half K size preserves edit count", body: `{"provider":"gemini","model":"image-model","prompt":"edit","size":"0.5K","n":2,"image_urls":["https://example.com/input.png"]}`, count: 2, provider: "gemini", resolution: "0.5K", references: 1},
+		{name: "gemini ratio alias", body: `{"provider":"gemini","model":"image-model","prompt":"draw","resolution":"0.5K","n":2,"ratio":"4:5"}`, count: 2, provider: "gemini", resolution: "0.5K", aspectRatio: "4:5"},
+		{name: "providerless half K resolution routes to gemini", body: `{"model":"image-model","prompt":"edit","resolution":"0.5K","ratio":"4:5","n":2,"images":[{"image_url":"https://example.com/input.png"}]}`, count: 2, resolution: "0.5K", aspectRatio: "4:5", references: 1, routeGemini: true},
+		{name: "providerless half K size routes to gemini", body: `{"model":"image-model","prompt":"edit","size":"0.5K","ratio":"16:9","n":2,"image_urls":["https://example.com/input.png"]}`, count: 2, resolution: "0.5K", aspectRatio: "16:9", references: 1, routeGemini: true},
+		{name: "openai half K resolution rejected", body: `{"provider":"openai","model":"image-model","prompt":"draw","resolution":"0.5K"}`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request, err := ParseAsyncImageRequest([]byte(tc.body), "application/json", "/v1/images/generations_async", DefaultImageRuntimeConfig())
+			if tc.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.count, request.Count)
+			assert.Equal(t, strconv.Itoa(tc.count), string(request.Native["n"]), "native upstream count must match reservation count")
+			assert.Equal(t, tc.references, request.ReferenceImageCount())
+			if tc.resolution != "" {
+				assert.Equal(t, tc.resolution, request.Resolution)
+				assert.Equal(t, tc.provider, request.Provider)
+			}
+			if tc.aspectRatio != "" {
+				assert.Equal(t, tc.aspectRatio, request.AspectRatio)
+			}
+			if tc.routeGemini {
+				db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+				ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+					return dto.ImageCapability{Provider: "gemini", Protocol: "gemini_native", Generate: true, Edit: true}
+				}
+				catalog, err := common.Marshal([]ImageModelCapability{{Id: "image-model", AllowHalfK: true, MaxOutputImages: 2, MaxReferenceImages: 1}})
+				require.NoError(t, err)
+				require.NoError(t, db.Create(&model.ImageGroupPolicy{PolicyKey: ImageIdentityHash("default", "gemini"), Group: "default", Platform: "gemini", Enabled: true, AsyncEnabled: true, PoolMode: "resolution", Models: string(catalog)}).Error)
+				var token model.Token
+				require.NoError(t, db.First(&token, task.TokenId).Error)
+				policy, _, err := ValidateAsyncImageEligibility(t.Context(), token, request, cfg)
+				require.NoError(t, err)
+				assert.Equal(t, "gemini", policy.Platform)
+				assert.Equal(t, "gemini", policy.AsyncProvider)
+				selected, _, err := PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+				require.NoError(t, err)
+				assert.Equal(t, "gemini", ImageChannelCapability(*selected, request.Model).Provider)
+			}
+		})
 	}
 }
 

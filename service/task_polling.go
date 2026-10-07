@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -72,6 +73,33 @@ type BatchTaskResult struct {
 // 打破 service -> relay -> relay/channel -> service 的循环依赖。
 var GetTaskAdaptorFunc func(platform constant.TaskPlatform) TaskPollingAdaptor
 
+var taskPollingCursor, taskTimeoutCursor atomic.Int64
+
+// nextUnfinishedTaskPage rotates bounded pages so tasks held for manual
+// reconciliation cannot permanently hide later tasks from polling or timeout.
+func nextUnfinishedTaskPage(ctx context.Context, cursor *atomic.Int64, cutoff int64, limit int) ([]*model.Task, error) {
+	limit = max(limit, 1)
+	afterID := cursor.Load()
+	tasks, err := model.GetUnfinishedSyncTaskPage(ctx, afterID, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 && afterID != 0 {
+		tasks, err = model.GetUnfinishedSyncTaskPage(ctx, 0, cutoff, limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var nextID int64
+	if len(tasks) >= limit {
+		nextID = tasks[len(tasks)-1].ID
+	}
+	// An overlapping pass may already have advanced the cursor. Its progress
+	// must not be overwritten by this pass's older page.
+	cursor.CompareAndSwap(afterID, nextID)
+	return tasks, nil
+}
+
 // sweepTimedOutTasks 在主轮询之前独立清理超时任务。
 // 每次最多处理 100 条，剩余的下个周期继续处理。
 // 使用 per-task CAS (UpdateWithStatus) 防止覆盖被正常轮询已推进的任务。
@@ -80,7 +108,11 @@ func sweepTimedOutTasks(ctx context.Context) {
 		return
 	}
 	cutoff := time.Now().Unix() - int64(constant.TaskTimeoutMinutes)*60
-	tasks := model.GetTimedOutUnfinishedTasks(cutoff, 100)
+	tasks, err := nextUnfinishedTaskPage(ctx, &taskTimeoutCursor, cutoff, 100)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks query error: %v", err))
+		return
+	}
 	if len(tasks) == 0 {
 		return
 	}
@@ -91,6 +123,14 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.PrivateData.Key == "" {
+			if channel, err := model.CacheGetChannel(task.ChannelId); err == nil {
+				if _, credentialErr := taskPollingCredential(task, channel); credentialErr != nil {
+					logger.LogWarn(ctx, credentialErr.Error())
+					continue
+				}
+			}
+		}
 		isLegacy := task.SubmitTime > 0 && task.SubmitTime < model.TaskRefundLegacyCutoff
 		if !isLegacy {
 			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
@@ -167,7 +207,15 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 
 	common.SysLog("任务进度轮询开始")
 	sweepTimedOutTasks(ctx)
-	allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
+	queryLimit := constant.TaskQueryLimit
+	if queryLimit <= 0 {
+		queryLimit = 1000
+	}
+	allTasks, err := nextUnfinishedTaskPage(ctx, &taskPollingCursor, 0, queryLimit)
+	if err != nil {
+		logger.LogError(ctx, fmt.Sprintf("task polling query error: %v", err))
+		return summary
+	}
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
@@ -216,8 +264,11 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 				nullTaskIds = append(nullTaskIds, task.ID)
 				continue
 			}
-			taskM[upstreamID] = task
-			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], upstreamID)
+			// Provider identifiers are scoped to their account, not globally
+			// unique across channels or credentials. Keep persisted rows distinct.
+			taskRef := fmt.Sprint(task.ID)
+			taskM[taskRef] = task
+			taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], taskRef)
 		}
 		if len(nullTaskIds) > 0 {
 			summary.NullTasksFailed += len(nullTaskIds)
@@ -342,25 +393,46 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		return err
 	}
-	proxy := ch.GetSetting().Proxy
+	tasksByKey := make(map[string][]*model.Task)
+	for _, upstreamID := range taskIds {
+		if task := taskM[upstreamID]; task != nil {
+			key, keyErr := taskPollingCredential(task, ch)
+			if keyErr != nil {
+				logger.LogWarn(ctx, keyErr.Error())
+				continue
+			}
+			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
+				return err
+			}
+			tasksByKey[key] = append(tasksByKey[key], task)
+		}
+	}
+	for key, tasks := range tasksByKey {
+		if err := updateBatchTaskGroup(ctx, adaptor, ch, key, tasks); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("渠道 #%d 更新异步任务失败: %s", channelId, err.Error()))
+		}
+	}
+	return ctx.Err()
+}
+
+// Batch endpoints authenticate once for the whole request, so tasks belonging
+// to different credentials must never share a query or response lookup.
+func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, ch *model.Channel, key string, tasks []*model.Task) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	baseURL := ch.GetBaseURL()
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(ch.Type)
 	}
-	tasks := make([]*model.Task, 0, len(taskIds))
-	for _, upstreamID := range taskIds {
-		if task := taskM[upstreamID]; task != nil {
-			if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
-				return err
-			}
-			tasks = append(tasks, task)
-		}
-	}
-	info := &relaycommon.RelayInfo{}
-	info.ChannelMeta = &relaycommon.ChannelMeta{ChannelBaseUrl: baseURL}
-	info.ApiKey = ch.Key
-	adaptor.Init(info)
-	resp, err := adaptor.FetchBatchTasks(baseURL, ch.Key, tasks, proxy)
+	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
+		ChannelType:          ch.Type,
+		ChannelBaseUrl:       baseURL,
+		ApiKey:               key,
+		ChannelSetting:       ch.GetSetting(),
+		ChannelOtherSettings: ch.GetOtherSettings(),
+	}})
+	resp, err := adaptor.FetchBatchTasks(baseURL, key, tasks, ch.GetSetting().Proxy)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
@@ -375,7 +447,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	case pollClassNotFound:
 		return failTasksFromPoll(ctx, adaptor, tasks, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
 	case pollClassAuth:
-		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d http=%d", channelId, resp.StatusCode))
+		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d http=%d", ch.Id, resp.StatusCode))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassAuth, resp.StatusCode, "")
 	case pollClassTransient:
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransient, resp.StatusCode, "")
@@ -384,13 +456,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 	if err != nil {
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassHookError, resp.StatusCode, err.Error())
 	}
-	for upstreamID, responseItem := range responseItems {
+	for _, task := range tasks {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		task := taskM[upstreamID]
-		if task == nil {
-			logger.LogWarn(ctx, fmt.Sprintf("Batch task response ignored: unknown task_id=%s", upstreamID))
+		responseItem := responseItems[task.GetUpstreamTaskID()]
+		if responseItem == nil {
 			continue
 		}
 		snap := task.Snapshot()
@@ -625,14 +696,12 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
+	key, keyErr := taskPollingCredential(task, ch)
+	if keyErr != nil {
+		return keyErr
+	}
 	if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
 		return err
-	}
-	key := ch.Key
-
-	privateData := task.PrivateData
-	if privateData.Key != "" {
-		key = privateData.Key
 	}
 	adaptor.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{
 		ChannelType:          ch.Type,
@@ -898,6 +967,20 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	return nil
+}
+
+func taskPollingCredential(task *model.Task, channel *model.Channel) (string, error) {
+	if task.PrivateData.Key != "" {
+		return task.PrivateData.Key, nil
+	}
+	if channel.ChannelInfo.IsMultiKey {
+		keys := channel.GetKeys()
+		if len(keys) != 1 {
+			return "", fmt.Errorf("task %s has no stored upstream account; reconcile its original credential before polling", task.TaskID)
+		}
+		return keys[0], nil
+	}
+	return channel.Key, nil
 }
 
 func redactVideoResponseBody(body []byte) []byte {

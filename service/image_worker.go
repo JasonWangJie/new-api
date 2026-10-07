@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -286,25 +285,24 @@ func RunAsyncImageTask(parent context.Context, id string) (runError error) {
 }
 
 func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg ImageRuntimeConfig) error {
+	knownUpstreamTask := task.UpstreamTaskId != ""
 	data, err := DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
 	if err != nil {
+		if knownUpstreamTask {
+			return fmt.Errorf("accepted upstream image task request could not be decrypted: %w", err)
+		}
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "request_decryption_failed", Message: "Encrypted request is unavailable"}, cfg)
 	}
 	var request AsyncImageRequest
 	if err := common.Unmarshal(data, &request); err != nil {
+		if knownUpstreamTask {
+			return fmt.Errorf("accepted upstream image task request is invalid: %w", err)
+		}
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Persisted request is invalid"}, cfg)
 	}
 	request.Reservation, err = model.GetAsyncImageReservation(ctx, *task)
 	if err != nil {
 		return err
-	}
-	var token model.Token
-	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
-		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Token is unavailable"}, cfg)
-	}
-	policy, _, err := ValidateAsyncImageEligibility(ctx, token, request, cfg)
-	if err != nil || policy.Group != task.Group {
-		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "eligibility_changed", Message: "Image eligibility or platform group changed before execution"}, cfg)
 	}
 	var attempts []ImageChannelAttempt
 	if task.Attempts != "" {
@@ -312,12 +310,17 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return err
 		}
 	}
-	routing := ImageAccountAttemptRouting(attempts, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
-	if routing.Stop {
-		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 602, InternalCode: "reference_accounts_exhausted", Message: "Upstream reference-image fetch retries are exhausted"}, cfg)
-	}
-	channel, account, err := PickImageChannel(ctx, policy, request, routing)
-	if len(task.SelectedChannelCipher) > 0 {
+	var channel *model.Channel
+	var account ImageAccount
+	if knownUpstreamTask {
+		if request.Reservation == nil {
+			return errors.New("accepted upstream image task is missing its billing reservation")
+		}
+		// Poll an accepted job with the account and provider configuration that
+		// created it, even when administrators disable new submissions.
+		if len(task.SelectedChannelCipher) == 0 {
+			return errors.New("accepted upstream image task is missing its frozen channel configuration")
+		}
 		data, decodeErr := DecryptImagePayload(task.SelectedChannelCipher, "image-channel:"+task.TaskId)
 		if decodeErr != nil {
 			return decodeErr
@@ -327,20 +330,25 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return decodeErr
 		}
 		account = ImageAccount{Fingerprint: ImageIdentityHash("image-account", strconv.Itoa(channel.Id), channel.Key)}
-		err = nil
-	}
-	if err != nil {
-		return failAsyncImageInvocation(ctx, *task, ClassifyAsyncImageFailure(err, 0), cfg)
-	}
-	if task.DispatchedAt == 0 {
-		eligible, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
-		if err != nil {
-			return err
+	} else {
+		var token model.Token
+		if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
+			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Token is unavailable"}, cfg)
 		}
-		if !slices.ContainsFunc(eligible, func(candidate model.Channel) bool {
-			return candidate.Id == channel.Id && ImageCapabilitySupportsRequest(ImageChannelCapability(candidate, request.Model), request)
-		}) {
-			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Selected image channel is no longer eligible"}, cfg)
+		policy, _, err := ValidateAsyncImageEligibility(ctx, token, request, cfg)
+		if err != nil || policy.Group != task.Group {
+			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "eligibility_changed", Message: "Image eligibility or platform group changed before execution"}, cfg)
+		}
+		routing := ImageAccountAttemptRouting(attempts, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+		if routing.Stop {
+			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 602, InternalCode: "reference_accounts_exhausted", Message: "Upstream reference-image fetch retries are exhausted"}, cfg)
+		}
+		// A safe retry has no accepted upstream job. Select from the current
+		// enabled keys, retry exclusions and circuit state instead of restoring
+		// the prior attempt's channel snapshot.
+		channel, account, err = PickImageChannel(ctx, policy, request, routing)
+		if err != nil {
+			return failAsyncImageInvocation(ctx, *task, ClassifyAsyncImageFailure(err, 0), cfg)
 		}
 	}
 	now := time.Now().Unix()
@@ -350,6 +358,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return err
 	}
 	if slot != 1 {
+		if knownUpstreamTask {
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, now+10, "capacity_wait", "Image execution capacity is busy")
+		}
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "capacity_wait", Message: "Image execution capacity is busy"}, cfg)
 	}
 	defer common.RDB.ZRem(context.WithoutCancel(ctx), slotKey, task.LeaseToken)
@@ -359,13 +370,16 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return err
 	}
 	if channelSlot != 1 {
+		if knownUpstreamTask {
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, now+10, "capacity_wait", "Channel image execution capacity is busy")
+		}
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, Message: "Channel image execution capacity is busy"}, cfg)
 	}
 	defer common.RDB.ZRem(context.WithoutCancel(ctx), channelSlotKey, task.LeaseToken)
 	task.ChannelId = channel.Id
 	capability := ImageChannelCapability(*channel, request.Model)
 	upstreamAsyncConfigured := channel.GetOtherSettings().UpstreamAsync != nil
-	if task.Provider == "" && (task.Dialect == "async" || capability.Provider == "ali" || capability.Provider == "replicate" || upstreamAsyncConfigured) {
+	if !knownUpstreamTask && (len(task.SelectedChannelCipher) > 0 || task.Dialect == "async" || capability.Provider == "ali" || capability.Provider == "replicate" || upstreamAsyncConfigured) {
 		encodedChannel, err := common.Marshal(channel)
 		if err != nil {
 			return err
@@ -378,7 +392,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if provider == "" && upstreamAsyncConfigured {
 			provider = "upstream_async"
 		}
-		if err := model.TransitionImageTask(ctx, *task, map[string]any{"provider": provider, "execution_protocol": capability.Protocol, "selected_channel_cipher": cipher}, "provider_selected", "", ""); err != nil {
+		if err := model.TransitionImageTask(ctx, *task, map[string]any{"channel_id": channel.Id, "provider": provider, "execution_protocol": capability.Protocol, "selected_channel_cipher": cipher}, "provider_selected", "", ""); err != nil {
 			return err
 		}
 		if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {

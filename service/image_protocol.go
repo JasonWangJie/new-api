@@ -420,7 +420,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 				}
 			}
 		}
-		if request.Platform == "gemini" {
+		if request.Platform == "gemini" || request.Dialect == "async" {
 			if value, ok := fields["ratio"]; ok && request.AspectRatio == "" {
 				if err := common.Unmarshal(value, &request.AspectRatio); err != nil {
 					return request, errors.New("ratio must be a string")
@@ -479,7 +479,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 			}
 			if request.Dialect == "async" {
 				quantities := make(map[string]common.RawMessage)
-				for _, key := range []string{"batch_size", "num_outputs"} {
+				for _, key := range []string{"create_count", "batch_size", "num_outputs"} {
 					if raw, exists := fields[key]; exists {
 						quantities[key] = raw
 					}
@@ -493,6 +493,15 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 						quantities["input.num_outputs"] = count
 					}
 				}
+				if raw, exists := fields["parameters"]; exists {
+					var parameters map[string]common.RawMessage
+					if common.Unmarshal(raw, &parameters) != nil {
+						return request, errors.New("invalid image parameters")
+					}
+					if count, exists := parameters["n"]; exists {
+						quantities["parameters.n"] = count
+					}
+				}
 				if raw, exists := fields["sequential_image_generation_options"]; exists {
 					var options map[string]common.RawMessage
 					if err := common.Unmarshal(raw, &options); err != nil {
@@ -502,18 +511,17 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 						quantities["sequential_image_generation_options.max_images"] = count
 					}
 				}
+				_, quantitySet := fields["n"]
 				for name, raw := range quantities {
 					var count uint
 					if common.Unmarshal(raw, &count) != nil || count < 1 || count > dto.MaxImageN {
 						return request, fmt.Errorf("%s must be an integer between 1 and %d", name, dto.MaxImageN)
 					}
-					if _, exists := fields["n"]; exists && int(count) != request.Count {
-						return request, fmt.Errorf("%s conflicts with image n", name)
-					}
-					if request.Count != 1 && int(count) != request.Count {
+					if quantitySet && int(count) != request.Count {
 						return request, errors.New("conflicting image quantities")
 					}
 					request.Count = int(count)
+					quantitySet = true
 				}
 			}
 			if value, present := fields["parameters"]; present {
@@ -584,7 +592,12 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 	}
 	if request.Platform == "openai" {
-		if request.Dialect != "async" || request.Size == "" {
+		halfK := strings.EqualFold(strings.TrimSpace(request.Resolution), "0.5K") || strings.EqualFold(strings.TrimSpace(request.Size), "0.5K")
+		if request.Dialect == "async" && (request.Provider == "gemini" || request.Provider == "" && halfK) {
+			if err := normalizeAsyncGeminiDimensions(&request); err != nil {
+				return request, err
+			}
+		} else if request.Dialect != "async" || request.Size == "" {
 			if err := normalizeAsyncOpenAIDimensions(&request); err != nil {
 				return request, err
 			}

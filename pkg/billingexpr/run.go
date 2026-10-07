@@ -9,6 +9,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/parser"
 	"github.com/expr-lang/expr/vm"
 	"github.com/tidwall/gjson"
 )
@@ -56,6 +58,13 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 		RequestRules: append([]RequestRuleTrace(nil), requestRules...),
 	}
 	headers := normalizeHeaders(request.Headers)
+	now := time.Now()
+	if request.Frozen != nil {
+		headers = request.Frozen.Headers
+		if !request.Frozen.RequestedAt.IsZero() {
+			now = request.Frozen.RequestedAt
+		}
+	}
 	imageCount := 1
 	if usedVars["image_count"] {
 		if request.ImageCount != nil {
@@ -113,6 +122,9 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 		},
 		"param": func(path string) any {
 			path = strings.TrimSpace(path)
+			if request.Frozen != nil {
+				return request.Frozen.Params[path]
+			}
 			if path == "" || len(request.Body) == 0 {
 				return nil
 			}
@@ -134,11 +146,11 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 			}
 			return strings.Contains(fmt.Sprint(source), substr)
 		},
-		"hour":    func(tz string) int { return timeInZone(tz).Hour() },
-		"minute":  func(tz string) int { return timeInZone(tz).Minute() },
-		"weekday": func(tz string) int { return int(timeInZone(tz).Weekday()) },
-		"month":   func(tz string) int { return int(timeInZone(tz).Month()) },
-		"day":     func(tz string) int { return timeInZone(tz).Day() },
+		"hour":    func(tz string) int { return timeInZone(tz, now).Hour() },
+		"minute":  func(tz string) int { return timeInZone(tz, now).Minute() },
+		"weekday": func(tz string) int { return int(timeInZone(tz, now).Weekday()) },
+		"month":   func(tz string) int { return int(timeInZone(tz, now).Month()) },
+		"day":     func(tz string) int { return timeInZone(tz, now).Day() },
 		"max":     math.Max,
 		"min":     math.Min,
 		"abs":     math.Abs,
@@ -157,16 +169,75 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 	return f, trace, nil
 }
 
-func timeInZone(tz string) time.Time {
+func timeInZone(tz string, now time.Time) time.Time {
 	tz = strings.TrimSpace(tz)
 	if tz == "" {
-		return time.Now().UTC()
+		return now.UTC()
 	}
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		return time.Now().UTC()
+		return now.UTC()
 	}
-	return time.Now().In(loc)
+	return now.In(loc)
+}
+
+// FreezeTaskRequestInput resolves every literal request probe before execution,
+// including probes in branches that measured usage may enter only on completion.
+// Dynamic probe names cannot be frozen safely without persisting the whole
+// request, and authentication headers must never enter persisted billing state.
+func FreezeTaskRequestInput(exprStr string, request RequestInput, requestedAt time.Time) (*RequestSnapshot, error) {
+	_, body := ParseExprVersion(exprStr)
+	tree, err := parser.Parse(body)
+	if err != nil {
+		return nil, fmt.Errorf("task request pricing expression is invalid: %w", err)
+	}
+	if requestedAt.IsZero() {
+		requestedAt = time.Now()
+	}
+	snapshot := &RequestSnapshot{RequestedAt: requestedAt, Headers: map[string]string{}, Params: map[string]any{}}
+	headers := normalizeHeaders(request.Headers)
+	var probeErr error
+	ast.Find(tree.Node, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallNode)
+		if !ok {
+			return false
+		}
+		callee, ok := call.Callee.(*ast.IdentifierNode)
+		if !ok || (callee.Value != "param" && callee.Value != "header") {
+			return false
+		}
+		if len(call.Arguments) != 1 {
+			probeErr = fmt.Errorf("task request pricing probes require one literal string argument")
+			return true
+		}
+		literal, ok := call.Arguments[0].(*ast.StringNode)
+		if !ok {
+			probeErr = fmt.Errorf("task request pricing probes require literal string arguments")
+			return true
+		}
+		key := strings.TrimSpace(literal.Value)
+		if callee.Value == "header" {
+			key = strings.ToLower(key)
+			switch key {
+			case "authorization", "proxy-authorization", "cookie", "set-cookie", "api-key", "x-api-key", "x-goog-api-key", "x-auth-token":
+				probeErr = fmt.Errorf("task request pricing must not reference authentication headers")
+				return true
+			}
+			snapshot.Headers[key] = headers[key]
+			return false
+		}
+		if key != "" {
+			result := gjson.GetBytes(request.Body, key)
+			if result.Exists() {
+				snapshot.Params[key] = result.Value()
+			}
+		}
+		return false
+	})
+	if probeErr != nil {
+		return nil, probeErr
+	}
+	return snapshot, nil
 }
 
 func normalizeHeaders(headers map[string]string) map[string]string {

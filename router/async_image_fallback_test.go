@@ -198,7 +198,7 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 			requestBytes, err := common.Marshal(request)
 			require.NoError(t, err)
 			now := time.Now().Unix()
-			task := model.AsyncImageTask{TaskId: "asyncimg_fallback", UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", Platform: "openai", Dialect: "async", Model: request.Model, Status: model.ImageTaskQueued, BillingStatus: "pending", Version: 1, UpstreamTaskId: "vendor-job", Provider: "upstream_async", DispatchedAt: now, StartedAt: now, CreatedAt: now, NextAttemptAt: now, ExpiresAt: now + 3600, RequestedResolution: "2K"}
+			task := model.AsyncImageTask{TaskId: "asyncimg_fallback", UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", Platform: "openai", Dialect: "async", Model: request.Model, Status: model.ImageTaskInvoking, BillingStatus: "pending", Version: 1, UpstreamTaskId: "vendor-job", Provider: "upstream_async", DispatchedAt: now, StartedAt: now, CreatedAt: now, NextAttemptAt: now, ExpiresAt: now + 3600, RequestedResolution: "2K", LeaseToken: "seed-reservation", LeaseExpiresAt: now + 120}
 			task.RequestCipher, err = service.EncryptImagePayload(requestBytes, "task:"+task.TaskId)
 			require.NoError(t, err)
 			channelBytes, err := common.Marshal(channel)
@@ -206,6 +206,17 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelBytes, "image-channel:"+task.TaskId)
 			require.NoError(t, err)
 			require.NoError(t, model.DB.Create(&task).Error)
+			// An accepted upstream job has crossed the durable reservation barrier.
+			// The shortfall case deliberately underestimates the final bill to
+			// verify that an unaffordable completion cannot release unpaid results.
+			reserveQuota := frozen.Price.QuotaToPreConsume
+			if tc.lowBalance {
+				reserveQuota = 0
+			}
+			funding, err := model.SelectImageFunding(t.Context(), user.Id, reserveQuota, user.GetSetting().BillingPreference)
+			require.NoError(t, err)
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, reserveQuota, funding))
+			require.NoError(t, model.DB.Model(&task).Updates(map[string]any{"lease_token": "", "lease_expires_at": 0}).Error)
 			// Change live pricing after admission. Completion must use the frozen
 			// expression and group multiplier rather than the new administrator value.
 			if tc.expression != "" {

@@ -680,14 +680,25 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	require.NoError(t, model.DB.Model(&model.ImageGroupPolicy{}).Where("id = ?", geminiPolicy.Id).Update("async_enabled", true).Error)
 	cfg.UploadsPerMinute = 4
 	require.NoError(t, service.SaveImageRuntimeConfig(context.Background(), cfg))
-	upload := imageUploadRequest(t, engine, valid.Data, "../original.png", "upload-1", token.Key)
+	// The validator accepts a short trailer and stores only the canonical image.
+	uploadBytes := append(append([]byte(nil), valid.Data...), []byte("trailer")...)
+	upload := imageUploadRequest(t, engine, uploadBytes, "../original.png", "upload-1", token.Key)
 	require.Equal(t, 200, upload.Code, upload.Body.String())
+	var input model.ImageInputObject
+	require.NoError(t, model.DB.Where("token_id = ? AND key_hash = ?", token.Id, service.ImageIdentityHash("upload-1")).Take(&input).Error)
+	assert.EqualValues(t, len(valid.Data), input.ByteSize)
+	var uploadObject model.ImageStorageObject
+	require.NoError(t, model.DB.Where("object_id = ?", input.ObjectId).Take(&uploadObject).Error)
+	assert.EqualValues(t, len(valid.Data), uploadObject.ByteSize)
+	var uploadIntent model.ImageUploadIntent
+	require.NoError(t, model.DB.Where("intent_key = ?", input.IntentKey).Take(&uploadIntent).Error)
+	assert.EqualValues(t, len(valid.Data), uploadIntent.ByteSize)
 	var uploaded struct {
 		URL       string `json:"url"`
 		CreatedAt int64  `json:"created_at"`
 	}
 	require.NoError(t, common.Unmarshal(upload.Body.Bytes(), &uploaded))
-	replayUpload := imageUploadRequest(t, engine, valid.Data, "original.png", "upload-1", token.Key)
+	replayUpload := imageUploadRequest(t, engine, uploadBytes, "original.png", "upload-1", token.Key)
 	require.Equal(t, 200, replayUpload.Code, replayUpload.Body.String())
 	var resigned struct {
 		URL       string `json:"url"`

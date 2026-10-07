@@ -119,7 +119,8 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	if _, exists := c.Get("task_request"); !exists {
-		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, "image_to_video"); taskErr != nil {
+		action := cmp.Or(info.Action, constant.TaskActionImageToVideo)
+		if taskErr := relaycommon.ValidateBasicTaskRequest(c, info, action); taskErr != nil {
 			return taskErr
 		}
 	}
@@ -1424,6 +1425,12 @@ func (a *TaskAdaptor) submitContext(c *gin.Context, info *relaycommon.RelayInfo)
 	ctx["files"] = files
 	ctx["action"] = info.Action
 	ctx["originTaskId"] = info.OriginTaskID
+	for _, origin := range info.OriginTasks {
+		if origin.TaskID == info.OriginTaskID {
+			ctx["originTaskId"] = origin.UpstreamTaskID
+			break
+		}
+	}
 	if info.TaskRelayInfo != nil && len(info.OriginTasks) > 0 {
 		originTasks := make([]map[string]any, 0, len(info.OriginTasks))
 		for _, ref := range info.OriginTasks {

@@ -3,6 +3,7 @@ package billingexpr
 import (
 	"crypto/sha256"
 	"fmt"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 )
@@ -11,9 +12,21 @@ type RequestInput struct {
 	Headers map[string]string
 	Body    []byte
 	Usage   map[string]any
+	// Frozen supplies only the request probes needed by a persisted task. Its
+	// timestamp keeps request conditions stable until asynchronous settlement.
+	Frozen *RequestSnapshot
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int
+}
+
+// RequestSnapshot stores expression-referenced inputs without retaining an
+// entire request body or its authentication headers. It belongs in private
+// billing state, never in task responses or consume logs.
+type RequestSnapshot struct {
+	Headers     map[string]string `json:"headers,omitempty"`
+	Params      map[string]any    `json:"params,omitempty"`
+	RequestedAt time.Time         `json:"requested_at"`
 }
 
 // TokenParams holds all token dimensions passed into an Expr evaluation.
@@ -62,23 +75,24 @@ type TraceResult struct {
 // auto-group retry and settlement. It is fully serializable and contains no
 // compiled program pointers.
 type BillingSnapshot struct {
-	EstimatedImageCount       *int           `json:"estimated_image_count,omitempty"`
-	BillingMode               string         `json:"billing_mode"`
-	ModelName                 string         `json:"model_name"`
-	ExprString                string         `json:"expr_string"`
-	ExprHash                  string         `json:"expr_hash"`
-	GroupRatio                float64        `json:"group_ratio"`
-	EstimatedPromptTokens     int            `json:"estimated_prompt_tokens"`
-	EstimatedCompletionTokens int            `json:"estimated_completion_tokens"`
-	EstimatedQuotaBeforeGroup float64        `json:"estimated_quota_before_group"`
-	EstimatedQuotaAfterGroup  int            `json:"estimated_quota_after_group"`
-	EstimatedTier             string         `json:"estimated_tier"`
-	EstimatedBillingUnit      BillingUnit    `json:"estimated_billing_unit,omitempty"`
-	EstimatedFixedPrice       *float64       `json:"estimated_fixed_price,omitempty"`
-	QuotaPerUnit              float64        `json:"quota_per_unit"`
-	ExprVersion               int            `json:"expr_version"`
-	TaskUsageBilling          bool           `json:"task_usage_billing,omitempty"`
-	UsageFacts                map[string]any `json:"usage_facts,omitempty"`
+	EstimatedImageCount       *int             `json:"estimated_image_count,omitempty"`
+	BillingMode               string           `json:"billing_mode"`
+	ModelName                 string           `json:"model_name"`
+	ExprString                string           `json:"expr_string"`
+	ExprHash                  string           `json:"expr_hash"`
+	GroupRatio                float64          `json:"group_ratio"`
+	EstimatedPromptTokens     int              `json:"estimated_prompt_tokens"`
+	EstimatedCompletionTokens int              `json:"estimated_completion_tokens"`
+	EstimatedQuotaBeforeGroup float64          `json:"estimated_quota_before_group"`
+	EstimatedQuotaAfterGroup  int              `json:"estimated_quota_after_group"`
+	EstimatedTier             string           `json:"estimated_tier"`
+	EstimatedBillingUnit      BillingUnit      `json:"estimated_billing_unit,omitempty"`
+	EstimatedFixedPrice       *float64         `json:"estimated_fixed_price,omitempty"`
+	QuotaPerUnit              float64          `json:"quota_per_unit"`
+	ExprVersion               int              `json:"expr_version"`
+	TaskUsageBilling          bool             `json:"task_usage_billing,omitempty"`
+	UsageFacts                map[string]any   `json:"usage_facts,omitempty"`
+	TaskRequest               *RequestSnapshot `json:"task_request,omitempty"`
 }
 
 // TieredResult holds everything needed after running tiered settlement.
