@@ -10,9 +10,11 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -24,6 +26,7 @@ import (
 )
 
 func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
 			var dialector gorm.Dialector
@@ -64,7 +67,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					return dto.ImageCapability{}
 				}
 			}
-			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}}
+			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
 				service.ImageChannelCapabilityFunc = previousCapability
@@ -95,11 +98,14 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			catalog, err := common.Marshal([]service.ImageModelCapability{{Id: "image-alpha", Label: "Image Alpha", MaxOutputImages: 1}})
 			require.NoError(t, err)
 			require.NoError(t, db.Create(&model.ImageGroupPolicy{
-				PolicyKey: service.ImageIdentityHash("default", "openai"),
-				Group:     "default",
-				Platform:  "openai",
-				PoolMode:  "model",
-				Models:    string(catalog),
+				PolicyKey:    service.ImageIdentityHash("default", "openai"),
+				Group:        "default",
+				Platform:     "openai",
+				PoolMode:     "model",
+				Models:       string(catalog),
+				Enabled:      true,
+				AsyncEnabled: true,
+				Version:      1,
 			}).Error)
 
 			optionsRecorder := httptest.NewRecorder()
@@ -156,6 +162,93 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			SaveImageChannelPool(invalidModelContext)
 			assert.Equal(t, http.StatusBadRequest, invalidModelRecorder.Code)
 			assert.Contains(t, invalidModelRecorder.Body.String(), "Pool model is not enabled")
+
+			otherPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("Default", "openai"), Group: "Default", Platform: "openai", Models: "[]", PoolMode: "model", Version: 1}
+			require.NoError(t, db.Create(&otherPolicy).Error)
+			require.NoError(t, db.Create(&model.Channel{Id: 14, Type: 1, Name: "OpenAI secondary", Key: "secondary-secret", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: "default"}).Error)
+			require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "image-alpha", ChannelId: 14, Enabled: true}).Error)
+			closedKey := service.ImagePoolBindingKey(model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "hidden-model", "")
+			otherKey := service.ImagePoolBindingKey(otherPolicy, "image-alpha", "")
+			require.NoError(t, db.Create(&[]model.ImageChannelPool{
+				{BindingKey: saved.BindingKey, Group: "default", Platform: "openai", Mode: "model", Model: "image-alpha", ChannelId: 14},
+				{BindingKey: closedKey, Group: "default", Platform: "openai", Mode: "model", Model: "hidden-model"},
+				{BindingKey: otherKey, Group: "Default", Platform: "openai", Mode: "model", Model: "image-alpha", ChannelId: 11},
+			}).Error)
+
+			deleteRequest := func(path string, body any, role int) *httptest.ResponseRecorder {
+				encoded, encodeErr := common.Marshal(body)
+				require.NoError(t, encodeErr)
+				engine := gin.New()
+				engine.Use(func(c *gin.Context) {
+					c.Set("id", 730001)
+					c.Set("role", role)
+				})
+				engine.DELETE("/policy", middleware.RequirePermission(authz.ImageConfigManage), DeleteImagePolicy)
+				engine.DELETE("/pool/:binding_key", middleware.RequirePermission(authz.ImageConfigManage), DeleteImageChannelPool)
+				recorder := httptest.NewRecorder()
+				engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, path, bytes.NewReader(encoded)))
+				return recorder
+			}
+			policyBody := gin.H{"group": "default", "platform": "openai", "version": 1}
+			for _, path := range []string{"/policy", "/pool/" + saved.BindingKey} {
+				recorder := deleteRequest(path, policyBody, common.RoleCommonUser)
+				assert.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+			}
+			for _, body := range []gin.H{
+				{"group": "", "platform": "openai", "version": 1},
+				{"group": "default", "platform": "openai"},
+				{"group": "default", "platform": "openai", "version": -1},
+			} {
+				assert.Equal(t, http.StatusBadRequest, deleteRequest("/policy", body, common.RoleRootUser).Code)
+			}
+			assert.Equal(t, http.StatusConflict, deleteRequest("/policy", gin.H{"group": "default", "platform": "openai", "version": 0}, common.RoleRootUser).Code)
+			for _, key := range []string{"invalid", strings.Repeat("z", 64)} {
+				assert.Equal(t, http.StatusBadRequest, deleteRequest("/pool/"+key, nil, common.RoleRootUser).Code)
+			}
+			var policies []model.ImageGroupPolicy
+			var pools []model.ImageChannelPool
+			require.NoError(t, db.Find(&policies).Error)
+			require.NoError(t, db.Find(&pools).Error)
+			assert.Len(t, policies, 2, "denied, invalid and stale requests retain policies")
+			assert.Len(t, pools, 4, "denied and invalid requests retain every pool row")
+
+			recorder := deleteRequest("/policy", policyBody, common.RoleRootUser)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.NoError(t, db.Find(&policies).Error)
+			assert.Equal(t, []model.ImageGroupPolicy{otherPolicy}, policies, "case-sensitive sibling policy is retained")
+			require.NoError(t, db.Find(&pools).Error)
+			assert.Len(t, pools, 4, "deleting a policy does not cascade to channel pools")
+			resolved, models, err := service.ResolveImagePolicy(t.Context(), model.Token{Group: "default"}, "openai")
+			require.NoError(t, err)
+			assert.False(t, resolved.Enabled)
+			assert.False(t, resolved.AsyncEnabled)
+			assert.Empty(t, models)
+			assert.Equal(t, http.StatusNotFound, deleteRequest("/policy", policyBody, common.RoleRootUser).Code)
+
+			recorder = deleteRequest("/pool/"+saved.BindingKey, nil, common.RoleRootUser)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.NoError(t, db.Order("id").Find(&pools).Error)
+			require.Len(t, pools, 2, "all channel rows of the selected binding are removed")
+			assert.Equal(t, closedKey, pools[0].BindingKey)
+			assert.Equal(t, otherKey, pools[1].BindingKey)
+			candidates, err := service.ImageCandidateChannels(t.Context(), model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "image-alpha", "")
+			require.NoError(t, err)
+			require.Len(t, candidates, 2, "missing binding restores eligible group channels")
+			assert.ElementsMatch(t, []int{11, 14}, []int{candidates[0].Id, candidates[1].Id})
+			assert.Equal(t, http.StatusNotFound, deleteRequest("/pool/"+saved.BindingKey, nil, common.RoleRootUser).Code)
+
+			candidates, err = service.ImageCandidateChannels(t.Context(), model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "hidden-model", "")
+			require.NoError(t, err)
+			assert.Empty(t, candidates, "an explicit empty binding remains closed until deleted")
+			recorder = deleteRequest("/pool/"+closedKey, nil, common.RoleRootUser)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			candidates, err = service.ImageCandidateChannels(t.Context(), model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "hidden-model", "")
+			require.NoError(t, err)
+			require.Len(t, candidates, 1)
+			assert.Equal(t, 11, candidates[0].Id)
+			require.NoError(t, db.Find(&pools).Error)
+			require.Len(t, pools, 1)
+			assert.Equal(t, otherKey, pools[0].BindingKey)
 		})
 	}
 }

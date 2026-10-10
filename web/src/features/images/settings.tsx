@@ -16,11 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { StaticDataTable } from '@/components/data-table'
 import { JsonCodeEditor } from '@/components/json-code-editor'
 import { MultiSelect } from '@/components/multi-select'
@@ -47,6 +48,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
 import { hasPermission } from '@/lib/admin-permissions'
+import { handleServerError } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
@@ -859,6 +861,12 @@ function ImagePolicyForm({
   onSuccess: () => Promise<unknown>
 }) {
   const { t } = useTranslation()
+  const user = useAuthStore((state) => state.auth.user)
+  const canManage = hasPermission(user, 'image_config', 'manage')
+  const queryClient = useQueryClient()
+  const [deleting, setDeleting] = useState<
+    ImageConfiguration['policies'][number] | null
+  >(null)
   const [group, setGroup] = useState('default')
   const [platform, setPlatform] = useState('openai')
   const [mode, setMode] = useState('resolution')
@@ -884,6 +892,24 @@ function ImagePolicyForm({
     )
   )
   const [busy, setBusy] = useState(false)
+  const deletion = useMutation({
+    mutationFn: (policy: ImageConfiguration['policies'][number]) =>
+      imageRequest('/api/option/images/policy', 'DELETE', {
+        group: policy.group,
+        platform: policy.platform,
+        version: policy.version,
+      }),
+    onSuccess: async () => {
+      setDeleting(null)
+      await Promise.all([
+        onSuccess(),
+        queryClient.invalidateQueries({ queryKey: ['image-pool-options'] }),
+        queryClient.invalidateQueries({ queryKey: ['image-capabilities'] }),
+      ])
+      toast.success(t('Deleted'))
+    },
+    onError: (error) => handleServerError(error, t('Image request failed')),
+  })
   const save = async () => {
     setBusy(true)
     try {
@@ -984,7 +1010,7 @@ function ImagePolicyForm({
           value={models}
           onChange={(event) => setModels(event.target.value)}
         />
-        <Button disabled={busy} type='submit'>
+        <Button disabled={busy || deletion.isPending} type='submit'>
           {t('Save')}
         </Button>
         <StaticDataTable
@@ -1007,26 +1033,66 @@ function ImagePolicyForm({
               id: 'edit',
               header: t('Actions'),
               cell: (item) => (
-                <Button
-                  type='button'
-                  size='sm'
-                  variant='outline'
-                  onClick={() => {
-                    setGroup(item.group)
-                    setPlatform(item.platform)
-                    setMode(item.pool_mode)
-                    setModels(item.models)
-                    setEnabled(item.enabled)
-                    setAsyncEnabled(item.async_enabled)
-                  }}
-                >
-                  {t('Edit')}
-                </Button>
+                <div className='flex flex-wrap gap-2'>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    disabled={busy || deletion.isPending}
+                    onClick={() => {
+                      setGroup(item.group)
+                      setPlatform(item.platform)
+                      setMode(item.pool_mode)
+                      setModels(item.models)
+                      setEnabled(item.enabled)
+                      setAsyncEnabled(item.async_enabled)
+                    }}
+                  >
+                    {t('Edit')}
+                  </Button>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='destructive'
+                    disabled={!canManage || busy || deletion.isPending}
+                    onClick={() => setDeleting(item)}
+                  >
+                    {t('Delete')}
+                  </Button>
+                </div>
               ),
             },
           ]}
         />
       </form>
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletion.isPending) setDeleting(null)
+        }}
+        title={t('Delete platform policy')}
+        desc={
+          <div className='flex flex-col gap-2'>
+            <p className='break-words'>
+              {deleting?.group} / {deleting?.platform}
+            </p>
+            <p>
+              {t(
+                'This removes the platform settings and model capabilities for this group. Channel pool bindings are kept.'
+              )}
+            </p>
+          </div>
+        }
+        disabled={!canManage || busy}
+        confirmText={t('Delete')}
+        destructive
+        isLoading={deletion.isPending}
+        handleConfirm={() => {
+          if (deleting && canManage && !busy && !deletion.isPending) {
+            deletion.mutate(deleting)
+          }
+        }}
+      />
     </SettingsCard>
   )
 }
@@ -1039,6 +1105,12 @@ export function ImagePoolForm({
   onSuccess: () => Promise<unknown>
 }) {
   const { t } = useTranslation()
+  const user = useAuthStore((state) => state.auth.user)
+  const canManage = hasPermission(user, 'image_config', 'manage')
+  const queryClient = useQueryClient()
+  const [deleting, setDeleting] = useState<
+    ImageConfiguration['pools'][number] | null
+  >(null)
   const [group, setGroup] = useState('default')
   const [platform, setPlatform] = useState('openai')
   const [mode, setMode] = useState('resolution')
@@ -1047,6 +1119,23 @@ export function ImagePoolForm({
   const [channelIds, setChannelIds] = useState<number[]>([])
   const [priorities, setPriorities] = useState<Record<number, number>>({})
   const [busy, setBusy] = useState(false)
+  const deletion = useMutation({
+    mutationFn: (binding: ImageConfiguration['pools'][number]) =>
+      imageRequest(
+        `/api/option/images/pool/${encodeURIComponent(binding.binding_key)}`,
+        'DELETE'
+      ),
+    onSuccess: async () => {
+      setDeleting(null)
+      await Promise.all([
+        onSuccess(),
+        queryClient.invalidateQueries({ queryKey: ['image-pool-options'] }),
+        queryClient.invalidateQueries({ queryKey: ['image-capabilities'] }),
+      ])
+      toast.success(t('Deleted'))
+    },
+    onError: (error) => handleServerError(error, t('Image request failed')),
+  })
   const poolOptions = useQuery({
     queryKey: ['image-pool-options', group, platform],
     queryFn: ({ signal }) => {
@@ -1302,6 +1391,7 @@ export function ImagePoolForm({
           <Button
             disabled={
               busy ||
+              deletion.isPending ||
               poolOptions.isLoading ||
               poolOptions.isError ||
               !group.trim()
@@ -1349,32 +1439,75 @@ export function ImagePoolForm({
             id: 'edit',
             header: t('Actions'),
             cell: (binding) => (
-              <Button
-                type='button'
-                size='sm'
-                variant='outline'
-                onClick={() => {
-                  setGroup(binding.group)
-                  setPlatform(binding.platform)
-                  setMode(binding.mode)
-                  setModel(binding.model)
-                  setResolution(binding.resolution || '1K')
-                  setChannelIds(binding.channels.map((row) => row.channel_id))
-                  setPriorities(
-                    Object.fromEntries(
-                      binding.channels.map((row) => [
-                        row.channel_id,
-                        row.priority,
-                      ])
+              <div className='flex flex-wrap gap-2'>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='outline'
+                  disabled={busy || deletion.isPending}
+                  onClick={() => {
+                    setGroup(binding.group)
+                    setPlatform(binding.platform)
+                    setMode(binding.mode)
+                    setModel(binding.model)
+                    setResolution(binding.resolution || '1K')
+                    setChannelIds(binding.channels.map((row) => row.channel_id))
+                    setPriorities(
+                      Object.fromEntries(
+                        binding.channels.map((row) => [
+                          row.channel_id,
+                          row.priority,
+                        ])
+                      )
                     )
-                  )
-                }}
-              >
-                {t('Edit')}
-              </Button>
+                  }}
+                >
+                  {t('Edit')}
+                </Button>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='destructive'
+                  disabled={!canManage || busy || deletion.isPending}
+                  onClick={() => setDeleting(binding)}
+                >
+                  {t('Delete')}
+                </Button>
+              </div>
             ),
           },
         ]}
+      />
+      <ConfirmDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletion.isPending) setDeleting(null)
+        }}
+        title={t('Delete channel pool binding')}
+        desc={
+          <div className='flex flex-col gap-2'>
+            <p className='break-words'>
+              {deleting?.group} / {deleting?.platform} ·{' '}
+              {deleting && t(imageLabel(deleting.mode))}
+              {deleting?.model && ` · ${deleting.model}`}
+              {deleting?.resolution && ` · ${deleting.resolution}`}
+            </p>
+            <p>
+              {t(
+                'Deleting this binding restores automatic channel selection. To close the binding, save an empty channel list instead.'
+              )}
+            </p>
+          </div>
+        }
+        disabled={!canManage || busy}
+        confirmText={t('Delete')}
+        destructive
+        isLoading={deletion.isPending}
+        handleConfirm={() => {
+          if (deleting && canManage && !busy && !deletion.isPending) {
+            deletion.mutate(deleting)
+          }
+        }}
       />
     </SettingsCard>
   )

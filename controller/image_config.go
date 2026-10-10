@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"image"
 	"image/png"
@@ -204,6 +205,47 @@ func SaveImagePolicy(c *gin.Context) {
 	imageManagementData(c, policy)
 }
 
+func DeleteImagePolicy(c *gin.Context) {
+	var input struct {
+		Group    string `json:"group"`
+		Platform string `json:"platform"`
+		Version  *int64 `json:"version"`
+	}
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<16), &input); err != nil {
+		imageManagementError(c, http.StatusBadRequest, err)
+		return
+	}
+	if input.Group == "" || len(input.Group) > 64 || input.Platform == "" || len(input.Platform) > 32 || input.Version == nil || *input.Version < 0 {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image policy deletion"))
+		return
+	}
+	ctx := c.Request.Context()
+	var policy model.ImageGroupPolicy
+	err := model.DB.WithContext(ctx).Where("policy_key = ?", service.ImageIdentityHash(input.Group, input.Platform)).Take(&policy).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		imageManagementError(c, http.StatusNotFound, errors.New("Image policy was not found"))
+		return
+	}
+	if err != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image configuration is unavailable"))
+		return
+	}
+	if policy.Version != *input.Version {
+		imageManagementError(c, http.StatusConflict, model.ErrImageConflict)
+		return
+	}
+	result := model.DB.WithContext(ctx).Where("id = ? AND version = ?", policy.Id, *input.Version).Delete(&model.ImageGroupPolicy{})
+	if result.Error != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image policy could not be deleted"))
+		return
+	}
+	if result.RowsAffected != 1 {
+		imageManagementError(c, http.StatusConflict, model.ErrImageConflict)
+		return
+	}
+	imageManagementData(c, nil)
+}
+
 func SaveImageChannelPool(c *gin.Context) {
 	var input struct {
 		Group      string `json:"group"`
@@ -303,6 +345,29 @@ func SaveImageChannelPool(c *gin.Context) {
 		return
 	}
 	imageManagementData(c, rows)
+}
+
+func DeleteImageChannelPool(c *gin.Context) {
+	key := c.Param("binding_key")
+	if len(key) != 64 {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image channel pool binding"))
+		return
+	}
+	if _, err := hex.DecodeString(key); err != nil {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image channel pool binding"))
+		return
+	}
+	// A binding includes every channel row, or the explicit closed placeholder.
+	result := model.DB.WithContext(c.Request.Context()).Where("binding_key = ?", key).Delete(&model.ImageChannelPool{})
+	if result.Error != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image channel pool could not be deleted"))
+		return
+	}
+	if result.RowsAffected == 0 {
+		imageManagementError(c, http.StatusNotFound, errors.New("Image channel pool binding was not found"))
+		return
+	}
+	imageManagementData(c, nil)
 }
 
 func SaveImageStorage(c *gin.Context) {
