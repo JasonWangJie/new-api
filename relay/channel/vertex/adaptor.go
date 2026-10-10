@@ -386,5 +386,6 @@ func (a *Adaptor) GetChannelName() string {
 
 func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
 	models := []string{"imagen-*", "gemini-2.0-flash-exp-image-generation", "gemini-2.0-flash-preview-image-generation", "gemini-2.5-flash-image*", "gemini-3-pro-image*", "gemini-3.1-flash-image*"}
+	models = append(models, model_setting.GetGeminiSettings().SupportedImagineModels...)
 	return dto.ImageCapability{Models: models, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "vertex", Protocol: "gemini_native", Generate: model == "" || dto.ImageCapability{Models: models}.DeclaresModel(model), Edit: !strings.HasPrefix(strings.ToLower(model), "imagen")}
 }

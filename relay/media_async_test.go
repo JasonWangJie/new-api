@@ -18,6 +18,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,6 +125,45 @@ func TestAsyncImageAdaptorCapabilitiesAndConversion(t *testing.T) {
 	advanced := imageChannelCapability(model.Channel{Type: constant.ChannelTypeAdvancedCustom, OtherSettings: string(advancedSettings)}, "private-image-model")
 	assert.True(t, advanced.Generate)
 	assert.Equal(t, "advanced_custom", advanced.Provider)
+}
+
+func TestConfiguredGeminiImageModelsAreEligibleForMediaRouting(t *testing.T) {
+	settings := model_setting.GetGeminiSettings()
+	originalModels := settings.SupportedImagineModels
+	t.Cleanup(func() { settings.SupportedImagineModels = originalModels })
+	for _, item := range []struct {
+		channel  int
+		provider string
+	}{
+		{constant.ChannelTypeGemini, "gemini"},
+		{constant.ChannelTypeVertexAi, "vertex"},
+	} {
+		t.Run(item.provider, func(t *testing.T) {
+			channel := model.Channel{Type: item.channel}
+			settings.SupportedImagineModels = nil
+			assert.False(t, imageChannelCapability(channel, "gemini-nano-banana-2.1").Generate)
+			assert.True(t, imageChannelCapability(channel, "gemini-2.5-flash-image-preview").Generate)
+
+			settings.SupportedImagineModels = []string{"gemini-nano-banana-2.1"}
+			capability := imageChannelCapability(channel, "gemini-nano-banana-2.1")
+			require.True(t, capability.Generate)
+			assert.True(t, capability.Edit)
+			assert.Equal(t, item.provider, capability.Provider)
+			assert.Equal(t, "gemini_native", capability.Protocol)
+			assert.True(t, service.ImageChannelSupportsPlatform(channel, "gemini-nano-banana-2.1", "gemini"))
+			assert.False(t, service.ImageChannelSupportsPlatform(channel, "gemini-nano-banana-2.1", "openai"))
+			assert.False(t, imageChannelCapability(channel, "gemini-nano-banana-2.1-unconfigured").Generate)
+			assert.False(t, imageChannelCapability(channel, "gemini-2.5-pro").Generate)
+			mapping, err := common.Marshal(map[string]string{"studio-alias": "gemini-nano-banana-2.1"})
+			require.NoError(t, err)
+			mappingText := string(mapping)
+			channel.ModelMapping = &mappingText
+			assert.Equal(t, capability, imageChannelCapability(channel, "studio-alias"))
+
+			settings.SupportedImagineModels = nil
+			assert.False(t, imageChannelCapability(channel, "studio-alias").Generate)
+		})
+	}
 }
 
 func TestUpstreamAsyncImageOperationUsesPublicAsyncPath(t *testing.T) {
