@@ -27,7 +27,7 @@ func imageTaskListQuery(c *gin.Context, admin bool) (*gorm.DB, error) {
 			}
 		}
 	}
-	for param, column := range map[string]string{"task_id": "task_id", "protocol": "dialect", "platform": "platform", "request_type": "request_type", "billing_status": "billing_status", "model": "model", "group": "group"} {
+	for param, column := range map[string]string{"task_id": "task_id", "protocol": "dialect", "platform": "platform", "request_type": "request_type", "billing_status": "billing_status", "group": "group"} {
 		if value := c.Query(param); value != "" {
 			query = query.Where(clause.Eq{Column: column, Value: value})
 		}
@@ -50,10 +50,16 @@ func imageTaskListQuery(c *gin.Context, admin bool) (*gorm.DB, error) {
 			query = query.Where("status = ?", status)
 		}
 	}
-	if term := c.Query("q"); term != "" {
-		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(term)
-		pattern := "%" + escaped + "%"
-		query = query.Where("task_id LIKE ? ESCAPE '!' OR model LIKE ? ESCAPE '!' OR prompt_summary LIKE ? ESCAPE '!'", pattern, pattern, pattern)
+	if pattern := mediaTaskSearchPattern(c.Query("model")); pattern != "" {
+		query = query.Where("LOWER(model) LIKE ? ESCAPE '!'", pattern)
+	}
+	if pattern := mediaTaskSearchPattern(c.Query("q")); pattern != "" {
+		matches := model.DB.WithContext(c.Request.Context()).Where("LOWER(task_id) LIKE ? ESCAPE '!' OR LOWER(model) LIKE ? ESCAPE '!' OR LOWER(prompt_summary) LIKE ? ESCAPE '!' OR LOWER(requested_resolution) LIKE ? ESCAPE '!' OR LOWER(requested_size) LIKE ? ESCAPE '!' OR LOWER(actual_size) LIKE ? ESCAPE '!' OR LOWER(aspect_ratio) LIKE ? ESCAPE '!'", pattern, pattern, pattern, pattern, pattern, pattern, pattern)
+		if admin {
+			channels := model.DB.WithContext(c.Request.Context()).Model(&model.Channel{}).Select("id").Where("LOWER(name) LIKE ? ESCAPE '!'", pattern)
+			matches = matches.Or("channel_id IN (?)", channels)
+		}
+		query = query.Where(matches)
 	}
 	if provider := c.Query("storage_provider"); provider != "" {
 		sub := model.DB.Model(&model.AsyncImageResult{}).Select("async_image_results.task_id").Joins("JOIN image_storage_objects ON image_storage_objects.object_id = async_image_results.object_id").Joins("JOIN image_storage_profiles ON image_storage_profiles.profile_id = image_storage_objects.profile_id").Where("image_storage_profiles.provider = ?", provider)

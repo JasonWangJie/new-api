@@ -6127,6 +6127,8 @@
     "Task ID": "ID de la tâche",
     "Task ID path": "Chemin de l’ID de tâche",
     "Task ID path is required": "Le chemin de l’ID est obligatoire",
+    "Task ID, model or specifications": "ID de tâche, modèle ou spécifications",
+    "Task ID, model, specifications or channel name": "ID de tâche, modèle, spécifications ou nom du canal",
     "Task ID:": "ID de tâche :",
     "Task logs": "Journaux des tâches",
     "Task Logs": "Journaux de tâches",

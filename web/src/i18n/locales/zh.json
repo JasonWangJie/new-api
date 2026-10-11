@@ -6127,6 +6127,8 @@
     "Task ID": "任务 ID",
     "Task ID path": "任务号路径",
     "Task ID path is required": "任务号路径不能为空",
+    "Task ID, model or specifications": "任务 ID、模型或规格",
+    "Task ID, model, specifications or channel name": "任务 ID、模型、规格或渠道名称",
     "Task ID:": "任务 ID：",
     "Task logs": "任务日志",
     "Task Logs": "任务日志",

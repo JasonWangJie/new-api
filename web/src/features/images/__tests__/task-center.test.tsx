@@ -208,6 +208,38 @@ test('keeps primary filters visible while advanced fields start collapsed and pr
 })
 
 test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'admin=$admin mobile=$mobile search describes available fields and submits a trimmed keyword on Enter',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await waitFor(() => expect(getImageTasks).toHaveBeenCalled())
+    const search = screen.getByRole('textbox', { name: 'Search tasks' })
+    expect(search).toHaveAttribute(
+      'placeholder',
+      admin
+        ? 'Task ID, model, specifications or channel name'
+        : 'Task ID, model or specifications'
+    )
+    await user.type(search, '  2K  {Enter}')
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('q')).toBe(
+        '2K'
+      )
+    )
+    expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[0]).toBe(admin)
+    expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
+      '1'
+    )
+  }
+)
+
+test.each([
   { admin: false, scope: 'user' },
   { admin: true, scope: 'administrator' },
 ])(

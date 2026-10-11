@@ -3,6 +3,7 @@ package controller
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,98 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageObject{ObjectId: "presentation-output", ProfileId: "presentation-profile", ObjectKey: "private-object-canary", Width: 2048, Height: 1186, Status: "active"}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: "presentation-output"}).Error)
+
+			t.Run("task search", func(t *testing.T) {
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"requested_size": "1792x1024", "aspect_ratio": "16:9", "prompt_summary": "A futuristic city"}).Error)
+				require.NoError(t, db.Create(&model.Channel{Id: 302, Name: "Studio_%! upstream", Key: "search-channel-secret"}).Error)
+				searchImages := []model.AsyncImageTask{
+					{TaskId: "asyncimg_search_literal", UserId: 101, TokenId: 201, ChannelId: 302, Model: "literal_%!image", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_search_decoy", UserId: 101, TokenId: 201, Model: "literalXYZ!image", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_search_foreign", UserId: 102, TokenId: 202, ChannelId: 302, Model: "literal_%!image", Status: model.ImageTaskQueued, CreatedAt: now},
+				}
+				searchVideos := []model.AsyncMediaJob{
+					{TaskId: "video_search_owned", IdentityHash: "search-owned", UserId: 101, TokenId: 201, ChannelId: 301, Model: "SearchVideo-Model", Status: "queued", StorageStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "video_search_foreign", IdentityHash: "search-foreign", UserId: 102, TokenId: 202, ChannelId: 302, Model: "SearchVideo-Model", Status: "queued", StorageStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600},
+				}
+				require.NoError(t, db.Create(&searchImages).Error)
+				require.NoError(t, db.Create(&searchVideos).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&searchImages).Error)
+					assert.NoError(t, db.Delete(&searchVideos).Error)
+					assert.NoError(t, db.Delete(&model.Channel{}, 302).Error)
+				})
+				for _, handler := range []struct {
+					name  string
+					media bool
+					list  func(*gin.Context, bool)
+				}{{"images", false, ListImageTasks}, {"media", true, ListMediaTasks}} {
+					t.Run(handler.name, func(t *testing.T) {
+						for _, tc := range []struct {
+							name     string
+							admin    bool
+							params   url.Values
+							imageIDs []string
+							videoIDs []string
+						}{
+							{name: "complete task ID", params: url.Values{"q": {task.TaskId}}, imageIDs: []string{task.TaskId}},
+							{name: "partial task ID", params: url.Values{"q": {"upstream_poll"}}, imageIDs: []string{polling.TaskId}},
+							{name: "partial model ignores case and surrounding whitespace", params: url.Values{"q": {"  IMAGE-2.5-SUN  "}}, imageIDs: []string{task.TaskId}},
+							{name: "model filter accepts partial names", params: url.Values{"model": {"2.5-SUN"}}, imageIDs: []string{task.TaskId}},
+							{name: "requested resolution", params: url.Values{"q": {"2k"}}, imageIDs: []string{task.TaskId}},
+							{name: "requested size", params: url.Values{"q": {"1792"}}, imageIDs: []string{task.TaskId}},
+							{name: "actual size", params: url.Values{"q": {"1186"}}, imageIDs: []string{task.TaskId}},
+							{name: "aspect ratio", params: url.Values{"q": {"16:9"}}, imageIDs: []string{task.TaskId}},
+							{name: "prompt remains searchable", params: url.Values{"q": {"futuristic"}}, imageIDs: []string{task.TaskId}},
+							{name: "administrator partial channel name", admin: true, params: url.Values{"q": {"BURST UP"}}, imageIDs: []string{task.TaskId, polling.TaskId}, videoIDs: []string{"video_search_owned"}},
+							{name: "owner cannot infer channel names", params: url.Values{"q": {"burst up"}}},
+							{name: "channel matches obey status filter", admin: true, params: url.Values{"q": {"burst up"}, "status": {"failed"}}},
+							{name: "channel matches obey date filter", admin: true, params: url.Values{"q": {"burst up"}, "start_date": {"2099-01-01"}, "end_date": {"2099-01-01"}}},
+							{name: "literal wildcards preserve ownership", params: url.Values{"q": {"literal_%!"}}, imageIDs: []string{"asyncimg_search_literal"}},
+							{name: "model filter treats wildcards literally", params: url.Values{"model": {"literal_%!"}}, imageIDs: []string{"asyncimg_search_literal"}},
+							{name: "channel wildcards are literal", admin: true, params: url.Values{"q": {"Studio_%!"}}, imageIDs: []string{"asyncimg_search_literal", "asyncimg_search_foreign"}, videoIDs: []string{"video_search_foreign"}},
+							{name: "other user task ID stays hidden", params: url.Values{"q": {"search_foreign"}}},
+							{name: "video model search preserves ownership", params: url.Values{"q": {"VIDEO-MOD"}}, videoIDs: []string{"video_search_owned"}},
+							{name: "video model filter accepts partial names", params: url.Values{"model": {"VIDEO-MOD"}}, videoIDs: []string{"video_search_owned"}},
+						} {
+							t.Run(tc.name, func(t *testing.T) {
+								date := time.Unix(now, 0).UTC().Format("2006-01-02")
+								if tc.params.Get("start_date") == "" {
+									tc.params.Set("start_date", date)
+									tc.params.Set("end_date", date)
+								}
+								tc.params.Set("timezone", "UTC")
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Set("id", 101)
+								c.Request = httptest.NewRequest(http.MethodGet, "/?"+tc.params.Encode(), nil)
+								handler.list(c, tc.admin)
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								var response struct {
+									Data struct {
+										Items []struct {
+											TaskID string `json:"task_id"`
+										}
+										Total int
+										Stats struct{ Total int }
+									}
+								}
+								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+								want := append([]string{}, tc.imageIDs...)
+								if handler.media {
+									want = append(want, tc.videoIDs...)
+								}
+								ids := make([]string, 0, len(response.Data.Items))
+								for _, item := range response.Data.Items {
+									ids = append(ids, item.TaskID)
+								}
+								assert.ElementsMatch(t, want, ids)
+								assert.Equal(t, len(want), response.Data.Total)
+								assert.Equal(t, len(want), response.Data.Stats.Total)
+							})
+						}
+					})
+				}
+			})
 
 			for _, admin := range []bool{true, false} {
 				t.Run(map[bool]string{true: "administrator", false: "owner"}[admin], func(t *testing.T) {

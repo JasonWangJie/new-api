@@ -116,6 +116,9 @@ function TaskCenterSession({
   admin: boolean
 }) {
   const { t } = useTranslation()
+  const searchPlaceholder = admin
+    ? t('Task ID, model, specifications or channel name')
+    : t('Task ID, model or specifications')
   const queryClient = useQueryClient()
   const isMobile = useMediaQuery('(max-width: 640px)')
   const user = useAuthStore((state) => state.auth.user)
@@ -481,6 +484,7 @@ function TaskCenterSession({
       <Input
         id={`task-filter-${key}`}
         type={type}
+        placeholder={key === 'q' ? searchPlaceholder : undefined}
         value={draft[key] || ''}
         onChange={(event) =>
           setDraft((previous) => ({ ...previous, [key]: event.target.value }))
@@ -557,7 +561,7 @@ function TaskCenterSession({
   }
   function applyFilters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setFilters(draft)
+    setFilters({ ...draft, q: draft.q.trim() })
     setPagination((previous) => ({ ...previous, pageIndex: 0 }))
     setSelection({})
     setMobileFiltersOpen(false)

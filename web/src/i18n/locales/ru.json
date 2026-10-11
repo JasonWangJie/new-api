@@ -6127,6 +6127,8 @@
     "Task ID": "ID задачи",
     "Task ID path": "Путь к ID задачи",
     "Task ID path is required": "Необходимо указать путь к ID задачи",
+    "Task ID, model or specifications": "ID задачи, модель или параметры",
+    "Task ID, model, specifications or channel name": "ID задачи, модель, параметры или название канала",
     "Task ID:": "ID задачи:",
     "Task logs": "Журналы задач",
     "Task Logs": "Журнал задач",

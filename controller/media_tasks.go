@@ -17,6 +17,16 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// mediaTaskSearchPattern keeps keywords literal and matches ASCII names
+// without depending on a database's default LIKE collation.
+func mediaTaskSearchPattern(term string) string {
+	term = strings.TrimSpace(term)
+	if term == "" {
+		return ""
+	}
+	return "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(strings.ToLower(term)) + "%"
+}
+
 func mediaStage(status string) string {
 	switch status {
 	case "queued":
@@ -324,7 +334,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	if mediaType == "video" {
 		images = images.Where("1 = 0")
 	}
-	for key, column := range map[string]string{"task_id": "task_id", "model": "model", "group": "group", "api_key_id": "token_id", "user_id": "user_id", "channel_id": "channel_id", "billing_status": "billing_status", "provider": "provider"} {
+	for key, column := range map[string]string{"task_id": "task_id", "group": "group", "api_key_id": "token_id", "user_id": "user_id", "channel_id": "channel_id", "billing_status": "billing_status", "provider": "provider"} {
 		if value := c.Query(key); value != "" {
 			videos = videos.Where(clause.Eq{Column: column, Value: value})
 		}
@@ -364,9 +374,16 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			videos = videos.Where("status = ?", status)
 		}
 	}
-	if term := c.Query("q"); term != "" {
-		pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(term) + "%"
-		videos = videos.Where("task_id LIKE ? ESCAPE '!' OR model LIKE ? ESCAPE '!'", pattern, pattern)
+	if pattern := mediaTaskSearchPattern(c.Query("model")); pattern != "" {
+		videos = videos.Where("LOWER(model) LIKE ? ESCAPE '!'", pattern)
+	}
+	if pattern := mediaTaskSearchPattern(c.Query("q")); pattern != "" {
+		matches := model.DB.WithContext(c.Request.Context()).Where("LOWER(task_id) LIKE ? ESCAPE '!' OR LOWER(model) LIKE ? ESCAPE '!'", pattern, pattern)
+		if admin {
+			channels := model.DB.WithContext(c.Request.Context()).Model(&model.Channel{}).Select("id").Where("LOWER(name) LIKE ? ESCAPE '!'", pattern)
+			matches = matches.Or("channel_id IN (?)", channels)
+		}
+		videos = videos.Where(matches)
 	}
 	location, err := time.LoadLocation(c.DefaultQuery("timezone", "UTC"))
 	if err != nil {
