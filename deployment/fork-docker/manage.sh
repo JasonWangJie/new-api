@@ -62,7 +62,7 @@ backup_runtime() {
   dc exec -T redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli SAVE' | grep -q OK
   dc stop --timeout 30 redis
   redis_stopped=1
-  tar -czf "$backup_dir/runtime-files.tar.gz" .env image.env compose.fork.yml compose-env.sh manage.sh data logs images redis-data
+  tar -czf "$backup_dir/runtime-files.tar.gz" .env image.env compose.fork.yml compose-env.sh manage.sh data logs redis-data
   tar -tzf "$backup_dir/runtime-files.tar.gz" > "$backup_dir/runtime-files-list.txt"
   dc up -d --no-deps --no-build --pull never --wait --wait-timeout 120 redis
   redis_stopped=0
