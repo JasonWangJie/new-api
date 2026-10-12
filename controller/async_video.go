@@ -303,6 +303,7 @@ func RouteAsyncVideo(c *gin.Context) {
 		channel model.Channel
 		group   string
 		binding pluginruntime.ProtocolBinding
+		weight  int
 	}
 	choices := make([]choice, 0)
 	videoRequest, videoFiles, videoAction, videoResolution, err := asyncVideoCapabilityRequest(c)
@@ -378,15 +379,17 @@ func RouteAsyncVideo(c *gin.Context) {
 				if matches, _ := model.ChannelSatisfiesFilters(&channel, pinned.Model, append(slices.Clone(constraints.Filters), filter)); !matches {
 					continue
 				}
+				// Automatic video routing retains its minimum global weight of one.
+				weight := max(1, min(channel.GetWeight(), 1_000_000_000))
 				if len(pools) > 0 {
 					index := slices.IndexFunc(pools, func(pool model.ImageChannelPool) bool { return pool.ChannelId == channel.Id })
 					if index < 0 {
 						continue
 					}
-					priority := int64(pools[index].Priority)
-					channel.Priority = &priority
+					service.ApplyMediaChannelPoolWeight(&channel, pools[index].Priority)
+					weight = channel.GetWeight()
 				}
-				choices = append(choices, choice{channel: channel, group: group, binding: binding})
+				choices = append(choices, choice{channel: channel, group: group, binding: binding, weight: weight})
 			}
 		}
 	}
@@ -405,19 +408,17 @@ func RouteAsyncVideo(c *gin.Context) {
 		priority = max(priority, choice.channel.GetPriority())
 	}
 	choices = slices.DeleteFunc(choices, func(choice choice) bool { return choice.channel.GetPriority() != priority })
-	var weight float64
-	for _, choice := range choices {
-		weight += float64(max(1, min(choice.channel.GetWeight(), 1_000_000_000)))
+	weights := make([]int, len(choices))
+	for i := range choices {
+		weights[i] = choices[i].weight
 	}
-	pick := rand.Float64() * weight
-	selected := choices[len(choices)-1]
-	for _, choice := range choices {
-		pick -= float64(max(1, min(choice.channel.GetWeight(), 1_000_000_000)))
-		if pick < 0 {
-			selected = choice
-			break
-		}
+	index := service.PickMediaChannelByWeight(weights, rand.Float64())
+	if index < 0 {
+		AsyncImagePublicError(c, 503, "provider_unavailable", "Video channel selection failed")
+		c.Abort()
+		return
 	}
+	selected := choices[index]
 	pinned.Candidates, pinned.Plugin, pinned.Protocol, pinned.Operation = []pluginruntime.ProtocolBinding{selected.binding}, selected.binding.Plugin, selected.binding.Protocol, selected.binding.Operation
 	c.Set(pluginruntime.ContextKeyPinnedEndpoint, pinned)
 	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: pinned.Generation, Plugin: pinned.Plugin})

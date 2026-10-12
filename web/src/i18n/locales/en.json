@@ -4684,6 +4684,7 @@
     "Polling request": "Polling request",
     "Polling response": "Polling response",
     "Pool binding": "Pool binding",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.",
     "Poor": "Poor",
     "Port": "Port",
     "Port must be a positive integer": "Port must be a positive integer",

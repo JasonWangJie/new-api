@@ -4684,6 +4684,7 @@
     "Polling request": "輪詢請求",
     "Polling response": "輪詢回應",
     "Pool binding": "渠道池綁定",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "依渠道池權重比例分配請求。全部為 0 時平均分配；存在正權重時，零權重渠道不參與分配。",
     "Poor": "差",
     "Port": "端口",
     "Port must be a positive integer": "端口必須為正整數",

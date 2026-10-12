@@ -4684,6 +4684,7 @@
     "Polling request": "ポーリング要求",
     "Polling response": "ポーリング応答",
     "Pool binding": "プールの対応付け",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "プール内の重みに比例してリクエストを分配します。すべて0なら均等に分配し、正の重みがある場合は重み0のチャネルを除外します。",
     "Poor": "悪い",
     "Port": "ポート",
     "Port must be a positive integer": "ポートは正の整数でなければなりません",

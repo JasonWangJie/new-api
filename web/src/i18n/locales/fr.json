@@ -4684,6 +4684,7 @@
     "Polling request": "Requête de suivi",
     "Polling response": "Réponse de suivi",
     "Pool binding": "Liaison du pool",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "Le trafic est réparti selon les poids du pool. Si tous valent zéro, la répartition est égale ; sinon, les canaux de poids zéro sont exclus.",
     "Poor": "Mauvais",
     "Port": "Port",
     "Port must be a positive integer": "Le port doit être un entier positif",

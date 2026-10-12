@@ -34,6 +34,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Combobox } from '@/components/ui/combobox'
+import { FieldDescription } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -1117,7 +1118,7 @@ export function ImagePoolForm({
   const [model, setModel] = useState('')
   const [resolution, setResolution] = useState('1K')
   const [channelIds, setChannelIds] = useState<number[]>([])
-  const [priorities, setPriorities] = useState<Record<number, number>>({})
+  const [weights, setWeights] = useState<Record<number, number>>({})
   const [busy, setBusy] = useState(false)
   const deletion = useMutation({
     mutationFn: (binding: ImageConfiguration['pools'][number]) =>
@@ -1227,7 +1228,7 @@ export function ImagePoolForm({
         resolution: mode === 'model' ? '' : resolution,
         channels: channelIds.map((id) => ({
           id,
-          priority: priorities[id] || 0,
+          priority: weights[id] ?? 0,
         })),
       })
       await onSuccess()
@@ -1263,7 +1264,7 @@ export function ImagePoolForm({
               setGroup(event.target.value)
               setModel('')
               setChannelIds([])
-              setPriorities({})
+              setWeights({})
             }}
           />
         </div>
@@ -1281,7 +1282,7 @@ export function ImagePoolForm({
             setPlatform(value)
             setModel('')
             setChannelIds([])
-            setPriorities({})
+            setWeights({})
           }}
         />
         <ImageSelect
@@ -1295,7 +1296,7 @@ export function ImagePoolForm({
             setMode(value)
             if (value === 'resolution') setModel('')
             setChannelIds([])
-            setPriorities({})
+            setWeights({})
           }}
         />
         {mode !== 'resolution' && (
@@ -1308,7 +1309,7 @@ export function ImagePoolForm({
               onValueChange={(value) => {
                 setModel(value || '')
                 setChannelIds([])
-                setPriorities({})
+                setWeights({})
               }}
               placeholder={
                 poolOptions.isLoading ? t('Loading...') : t('Select model')
@@ -1339,8 +1340,8 @@ export function ImagePoolForm({
             onChange={(values) => {
               const ids = values.map(Number)
               setChannelIds(ids)
-              setPriorities((previous) =>
-                Object.fromEntries(ids.map((id) => [id, previous[id] || 0]))
+              setWeights((previous) =>
+                Object.fromEntries(ids.map((id) => [id, previous[id] ?? 0]))
               )
             }}
             placeholder={
@@ -1367,17 +1368,18 @@ export function ImagePoolForm({
               columns={[
                 { id: 'channel', header: t('Channel'), cell: (id) => id },
                 {
-                  id: 'priority',
-                  header: t('Priority'),
+                  id: 'weight',
+                  header: t('Weight'),
                   cell: (id) => (
                     <Input
-                      aria-label={`${t('Priority')} ${id}`}
+                      aria-label={`${t('Weight')} ${id}`}
+                      aria-describedby='pool-weight-description'
                       type='number'
-                      min={-1000000}
+                      min={0}
                       max={1000000}
-                      value={priorities[id] || 0}
+                      value={weights[id] ?? 0}
                       onChange={(event) =>
-                        setPriorities((previous) => ({
+                        setWeights((previous) => ({
                           ...previous,
                           [id]: Number(event.target.value),
                         }))
@@ -1388,6 +1390,11 @@ export function ImagePoolForm({
               ]}
             />
           )}
+          <FieldDescription id='pool-weight-description' className='mb-3'>
+            {t(
+              'Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.'
+            )}
+          </FieldDescription>
           <Button
             disabled={
               busy ||
@@ -1432,7 +1439,9 @@ export function ImagePoolForm({
             header: t('Channel'),
             cell: (binding) =>
               binding.channels
-                .map((row) => `${row.channel_id} (${row.priority})`)
+                .map(
+                  (row) => `${row.channel_id} (${Math.max(0, row.priority)})`
+                )
                 .join(', ') || t('Disabled'),
           },
           {
@@ -1452,11 +1461,11 @@ export function ImagePoolForm({
                     setModel(binding.model)
                     setResolution(binding.resolution || '1K')
                     setChannelIds(binding.channels.map((row) => row.channel_id))
-                    setPriorities(
+                    setWeights(
                       Object.fromEntries(
                         binding.channels.map((row) => [
                           row.channel_id,
-                          row.priority,
+                          Math.max(0, row.priority),
                         ])
                       )
                     )

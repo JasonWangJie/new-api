@@ -283,6 +283,7 @@ export type ImageChannelPool = {
   model: string
   resolution: string
   channel_id: number
+  /** Relative pool weight; the API retains its legacy field name. */
   priority: number
 }
 export type VideoReadiness = {

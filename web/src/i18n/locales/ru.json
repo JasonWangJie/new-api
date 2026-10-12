@@ -4684,6 +4684,7 @@
     "Polling request": "Запрос состояния",
     "Polling response": "Ответ опроса",
     "Pool binding": "Привязка пула",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "Трафик распределяется пропорционально весам пула. Если все веса равны нулю, распределение равномерное; иначе каналы с нулевым весом исключаются.",
     "Poor": "Плохо",
     "Port": "Порт",
     "Port must be a positive integer": "Порт должен быть положительным целым числом",

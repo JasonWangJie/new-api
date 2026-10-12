@@ -149,7 +149,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           title: '启用条件与工作台',
           paragraphs: [
             '异步图片需要 Redis、稳定的 ASYNC_IMAGE_PAYLOAD_KEYS 和启用的 temporary 图片存储。异步视频默认关闭，还需要可写的本地目录、稳定的 CRYPTO_SECRET、文件上限、下载超时和下载并发配置。',
-            '平台策略和渠道池可按 resolution、model 或 model_resolution 绑定。优先级较高的渠道先用；相同优先级再按渠道全局权重分流。工作台、用户任务中心和管理员任务中心会统一展示图片与视频阶段，视频支持播放、下载和复制本站链接。',
+            '平台策略和渠道池可按 resolution、model 或 model_resolution 绑定。显式渠道池按池内权重分流，10、9、8 对应约 10:9:8 的调用比例；全部为 0 时平均随机分配，有正权重时排除零权重渠道。未配置渠道池时沿用渠道全局优先级和权重。工作台、用户任务中心和管理员任务中心会统一展示图片与视频阶段，视频支持播放、下载和复制本站链接。',
           ],
         },
       ]
@@ -245,7 +245,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
           title: 'Enablement and workbench behavior',
           paragraphs: [
             'Asynchronous images require Redis, stable ASYNC_IMAGE_PAYLOAD_KEYS and an enabled temporary image store. Asynchronous video is disabled by default and also requires a writable local directory, stable CRYPTO_SECRET, file-size limit, download timeout and download-concurrency settings.',
-            'Platform policies and channel pools bind by resolution, model or model_resolution. Higher priority is tried first; channels at the same priority share traffic by their global weights. The workbench and both task centers display image and video phases together, with video playback, download and gateway-link copying.',
+            'Platform policies and channel pools bind by resolution, model or model_resolution. Explicit pools share traffic by pool weights: 10, 9 and 8 give an approximate 10:9:8 ratio. All-zero weights share traffic equally; positive weights exclude zero-weight channels. Without a pool, global channel priorities and weights still apply. The workbench and both task centers display image and video phases together, with video playback, download and gateway-link copying.',
           ],
         },
       ]

@@ -288,7 +288,7 @@ func SaveImageChannelPool(c *gin.Context) {
 	seen := make(map[int]bool)
 	rows := make([]model.ImageChannelPool, 0, len(input.Channels))
 	for _, channel := range input.Channels {
-		if channel.Id < 1 || seen[channel.Id] || channel.Priority < -1000000 || channel.Priority > 1000000 {
+		if channel.Id < 1 || seen[channel.Id] || channel.Priority < 0 || channel.Priority > 1000000 {
 			imageManagementError(c, 400, errors.New("Invalid or duplicate pool channel"))
 			return
 		}

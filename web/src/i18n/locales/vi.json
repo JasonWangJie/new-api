@@ -4684,6 +4684,7 @@
     "Polling request": "Yêu cầu thăm dò",
     "Polling response": "Phản hồi thăm dò",
     "Pool binding": "Liên kết nhóm kênh",
+    "Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.": "Lưu lượng được phân bổ theo tỷ lệ trọng số trong nhóm kênh. Nếu tất cả bằng 0 thì phân bổ đều; nếu có trọng số dương thì loại các kênh có trọng số 0.",
     "Poor": "Nghèo",
     "Port": "Cảng",
     "Port must be a positive integer": "Cổng phải là số nguyên dương",

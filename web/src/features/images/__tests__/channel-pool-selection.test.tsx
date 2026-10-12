@@ -123,65 +123,77 @@ test('switching platform replaces the selectable models and channels', async () 
   ).toBeVisible()
 })
 
-test('editing a pool restores its model channels and priorities before saving', async () => {
-  vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
-    if (method === 'GET' && url.includes('platform=openai')) {
-      return openAIOptions
-    }
-    if (method === 'GET' && url.includes('platform=gemini')) {
-      return geminiOptions
-    }
-    if (method === 'PUT' && url === '/api/option/images/pool') {
-      return data
-    }
-    throw new Error(`Unexpected image request: ${method} ${url}`)
-  })
-  const user = userEvent.setup()
-  const { onSuccess } = renderPool([
-    {
-      binding_key: 'saved-pool',
-      group: 'premium',
-      platform: 'gemini',
-      mode: 'model',
-      model: 'image-beta',
-      resolution: '',
-      channel_id: 22,
-      priority: 7,
-    },
-  ])
-
-  await waitFor(() =>
-    expect(screen.getByRole('combobox', { name: 'Channels' })).toBeEnabled()
-  )
-  await user.click(screen.getByRole('button', { name: 'Edit' }))
-
-  await waitFor(() =>
-    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
-      'Image Beta'
-    )
-  )
-  expect(screen.getByRole('textbox', { name: 'Group' })).toHaveValue('premium')
-  expect(screen.getByRole('combobox', { name: 'Platform' })).toHaveTextContent(
-    'gemini'
-  )
-  expect(screen.getByText('#22 · Gemini account')).toBeVisible()
-  expect(screen.getByRole('spinbutton', { name: 'Priority 22' })).toHaveValue(7)
-
-  await user.click(screen.getByRole('button', { name: 'Save' }))
-
-  await waitFor(() =>
-    expect(imageRequest).toHaveBeenCalledWith(
-      '/api/option/images/pool',
-      'PUT',
+test.each([7, -3])(
+  'editing a pool restores its channels and normalizes saved weight %s before saving',
+  async (savedWeight) => {
+    vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
+      if (method === 'GET' && url.includes('platform=openai')) {
+        return openAIOptions
+      }
+      if (method === 'GET' && url.includes('platform=gemini')) {
+        return geminiOptions
+      }
+      if (method === 'PUT' && url === '/api/option/images/pool') {
+        return data
+      }
+      throw new Error(`Unexpected image request: ${method} ${url}`)
+    })
+    const user = userEvent.setup()
+    const { onSuccess } = renderPool([
       {
+        binding_key: 'saved-pool',
         group: 'premium',
         platform: 'gemini',
         mode: 'model',
         model: 'image-beta',
         resolution: '',
-        channels: [{ id: 22, priority: 7 }],
-      }
+        channel_id: 22,
+        priority: savedWeight,
+      },
+    ])
+
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Channels' })).toBeEnabled()
     )
-  )
-  expect(onSuccess).toHaveBeenCalledOnce()
-})
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
+        'Image Beta'
+      )
+    )
+    expect(screen.getByRole('textbox', { name: 'Group' })).toHaveValue(
+      'premium'
+    )
+    expect(
+      screen.getByRole('combobox', { name: 'Platform' })
+    ).toHaveTextContent('gemini')
+    expect(screen.getByText('#22 · Gemini account')).toBeVisible()
+    const weight = screen.getByRole('spinbutton', { name: 'Weight 22' })
+    expect(weight).toHaveValue(Math.max(0, savedWeight))
+    expect(weight).toHaveAttribute('min', '0')
+    expect(weight).toHaveAccessibleDescription(
+      'Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.'
+    )
+    await user.clear(weight)
+    await user.type(weight, '9')
+
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        '/api/option/images/pool',
+        'PUT',
+        {
+          group: 'premium',
+          platform: 'gemini',
+          mode: 'model',
+          model: 'image-beta',
+          resolution: '',
+          channels: [{ id: 22, priority: 9 }],
+        }
+      )
+    )
+    expect(onSuccess).toHaveBeenCalledOnce()
+  }
+)

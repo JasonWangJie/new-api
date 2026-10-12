@@ -218,12 +218,44 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 			if index < 0 {
 				continue
 			}
-			priority := int64(bindings[index].Priority)
-			channel.Priority = &priority
+			ApplyMediaChannelPoolWeight(&channel, bindings[index].Priority)
 		}
 		eligible = append(eligible, channel)
 	}
 	return eligible, nil
+}
+
+// ApplyMediaChannelPoolWeight uses the legacy pool priority field as a relative
+// weight. Pool candidates share one priority and ignore global channel weights.
+// Historical negative priorities behave as zero weights without a migration.
+func ApplyMediaChannelPoolWeight(channel *model.Channel, poolWeight int) {
+	priority := int64(0)
+	weight := uint(max(0, poolWeight))
+	channel.Priority = &priority
+	channel.Weight = &weight
+}
+
+// PickMediaChannelByWeight selects the interval containing position in [0, 1).
+// Zero weights are excluded unless all weights are zero, which shares traffic
+// equally. Callers pass a random position in production.
+func PickMediaChannelByWeight(weights []int, position float64) int {
+	var sum float64
+	for _, weight := range weights {
+		sum += float64(max(0, min(weight, 1_000_000_000)))
+	}
+	adjustment := 0.0
+	if sum == 0 {
+		sum = float64(len(weights))
+		adjustment = 1
+	}
+	pick := position * sum
+	for i, weight := range weights {
+		pick -= float64(max(0, min(weight, 1_000_000_000))) + adjustment
+		if pick < 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 type ImageAccount struct {
@@ -303,30 +335,22 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	slices.SortFunc(channels, func(a, b model.Channel) int { return cmp.Compare(b.GetPriority(), a.GetPriority()) })
 	priority := channels[0].GetPriority()
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return channel.GetPriority() != priority })
-	var sum float64
-	for _, channel := range channels {
-		sum += float64(max(0, min(channel.GetWeight(), 1_000_000_000)))
-	}
-	adjustment := 0.0
-	if sum == 0 {
-		sum = float64(len(channels))
-		adjustment = 1
-	}
-	weight := rand.Float64() * sum
+	weights := make([]int, len(channels))
 	for i := range channels {
-		weight -= float64(max(0, min(channels[i].GetWeight(), 1_000_000_000))) + adjustment
-		if weight < 0 {
-			accounts := ImageChannelAccounts(channels[i], routing)
-			account := accounts[rand.IntN(len(accounts))]
-			// Only this invocation uses the selected key. The stored channel and
-			// its key status remain unchanged; relay middleware cannot repick it.
-			channels[i].Key = account.Key
-			channels[i].Keys = []string{account.Key}
-			channels[i].ChannelInfo.IsMultiKey = false
-			return &channels[i], account, nil
-		}
+		weights[i] = channels[i].GetWeight()
 	}
-	return nil, ImageAccount{}, errors.New("image channel selection failed")
+	index := PickMediaChannelByWeight(weights, rand.Float64())
+	if index < 0 {
+		return nil, ImageAccount{}, errors.New("image channel selection failed")
+	}
+	accounts := ImageChannelAccounts(channels[index], routing)
+	account := accounts[rand.IntN(len(accounts))]
+	// Only this invocation uses the selected key. The stored channel and
+	// its key status remain unchanged; relay middleware cannot repick it.
+	channels[index].Key = account.Key
+	channels[index].Keys = []string{account.Key}
+	channels[index].ChannelInfo.IsMultiKey = false
+	return &channels[index], account, nil
 }
 
 func preferImageChannelsForReferenceCount(channels []model.Channel, referenceCount int) []model.Channel {

@@ -2,16 +2,19 @@ package controller
 
 import (
 	"bytes"
+	"cmp"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -67,7 +70,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					return dto.ImageCapability{}
 				}
 			}
-			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}}
+			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}, &model.User{}, &model.Token{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
 				service.ImageChannelCapabilityFunc = previousCapability
@@ -150,6 +153,114 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			assert.Contains(t, invalidRecorder.Body.String(), "not enabled for the selected group, platform, and model")
 			require.NoError(t, db.Where("channel_id = ?", 11).Take(&saved).Error)
 			assert.Equal(t, 7, saved.Priority, "an invalid edit must not replace the saved pool")
+
+			for _, weight := range []int{-1, 1000001} {
+				body, err := common.Marshal(gin.H{
+					"group": "default", "platform": "openai", "mode": "model", "model": "image-alpha",
+					"channels": []gin.H{{"id": 11, "priority": weight}},
+				})
+				require.NoError(t, err)
+				recorder := httptest.NewRecorder()
+				context, _ := gin.CreateTestContext(recorder)
+				context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+				SaveImageChannelPool(context)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code, "invalid weight %d", weight)
+				require.NoError(t, db.Where("channel_id = ?", 11).Take(&saved).Error)
+				assert.Equal(t, 7, saved.Priority, "invalid weights retain the saved binding")
+			}
+
+			t.Run("pool weights override global routing and preserve zero fallback", func(t *testing.T) {
+				globalPriority, globalWeight := int64(100), uint(999)
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 11).Updates(map[string]any{"priority": globalPriority, "weight": globalWeight}).Error)
+				require.NoError(t, db.Create(&[]model.Channel{
+					{Id: 21, Type: 1, Name: "Weighted second", Key: "second-key", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: "default"},
+					{Id: 22, Type: 1, Name: "Weighted third", Key: "third-key", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: "default"},
+				}).Error)
+				require.NoError(t, db.Create(&[]model.Ability{
+					{Group: "default", Model: "image-alpha", ChannelId: 21, Enabled: true},
+					{Group: "default", Model: "image-alpha", ChannelId: 22, Enabled: true},
+				}).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("binding_key = ?", saved.BindingKey).Delete(&model.ImageChannelPool{}).Error)
+					assert.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: saved.BindingKey, Group: "default", Platform: "openai", Mode: "model", Model: "image-alpha", ChannelId: 11, Priority: 7}).Error)
+					assert.NoError(t, db.Where("channel_id IN ?", []int{21, 22}).Delete(&model.Ability{}).Error)
+					assert.NoError(t, db.Where("id IN ?", []int{21, 22}).Delete(&model.Channel{}).Error)
+					assert.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 11).Updates(map[string]any{"priority": 0, "weight": 0}).Error)
+				})
+				policy := model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}
+				for _, tc := range []struct {
+					name     string
+					weights  []int
+					selected []int
+				}{
+					{name: "10:9:8", weights: []int{10, 9, 8}, selected: []int{11, 11, 21, 21, 22, 22}},
+					{name: "all zero", weights: []int{0, 0, 0}, selected: []int{11, 21, 21, 22, 22, 22}},
+					{name: "positive excludes zero", weights: []int{0, 9, 0}, selected: []int{21, 21, 21, 21, 21, 21}},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						body, err := common.Marshal(gin.H{
+							"group": "default", "platform": "openai", "mode": "model", "model": "image-alpha",
+							"channels": []gin.H{{"id": 11, "priority": tc.weights[0]}, {"id": 21, "priority": tc.weights[1]}, {"id": 22, "priority": tc.weights[2]}},
+						})
+						require.NoError(t, err)
+						recorder := httptest.NewRecorder()
+						context, _ := gin.CreateTestContext(recorder)
+						context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+						SaveImageChannelPool(context)
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						candidates, err := service.ImageCandidateChannels(t.Context(), policy, "image-alpha", "")
+						require.NoError(t, err)
+						require.Len(t, candidates, 3)
+						slices.SortFunc(candidates, func(a, b model.Channel) int { return cmp.Compare(a.Id, b.Id) })
+						weights := make([]int, len(candidates))
+						for i := range candidates {
+							assert.Zero(t, candidates[i].GetPriority(), "the pool overrides global priorities")
+							weights[i] = candidates[i].GetWeight()
+						}
+						assert.Equal(t, tc.weights, weights)
+						for i, position := range []float64{0, 0.37, 0.5, 0.70, 0.71, 0.99} {
+							index := service.PickMediaChannelByWeight(weights, position)
+							require.GreaterOrEqual(t, index, 0)
+							assert.Equal(t, tc.selected[i], candidates[index].Id, "position %g", position)
+						}
+					})
+				}
+				request := service.AsyncImageRequest{Model: "image-alpha", Platform: "openai", Provider: "openai", Count: 1, Kind: "text_to_image"}
+				selected, _, err := service.PickImageChannel(t.Context(), policy, request, service.ImageAccountRouting{})
+				require.NoError(t, err)
+				assert.Equal(t, 21, selected.Id, "zero pool weight ignores even a higher global priority and weight")
+				videoCatalog, err := common.Marshal([]service.ImageModelCapability{{Id: "image-alpha", MediaType: "video"}})
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", service.ImageIdentityHash("default", "openai")).Update("models", string(videoCatalog)).Error)
+				user := model.User{Username: "pool-video-user", Group: "default"}
+				require.NoError(t, db.Create(&user).Error)
+				token := model.Token{UserId: user.Id, Key: "pool-video-token", Group: "default"}
+				require.NoError(t, db.Create(&token).Error)
+				plugin := &jsplugin.LoadedPlugin{Meta: jsplugin.Meta{Key: "openai", Models: []string{"image-alpha"}, ChannelTypes: []int{1}}}
+				videoRecorder := httptest.NewRecorder()
+				videoContext, _ := gin.CreateTestContext(videoRecorder)
+				videoContext.Request = httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", nil)
+				videoContext.Set("id", user.Id)
+				videoContext.Set("token_id", token.Id)
+				videoContext.Set("task_request", map[string]any{"model": "image-alpha", "prompt": "weighted video", "seconds": 5, "resolution": "720p"})
+				videoContext.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{Model: "image-alpha", Candidates: []jsplugin.ProtocolBinding{{Plugin: plugin, Protocol: "openai_video"}}})
+				RouteAsyncVideo(videoContext)
+				require.False(t, videoContext.IsAborted(), videoRecorder.Body.String())
+				pin, pinned, _ := service.GetChannelConstraints(videoContext).ResolvedPin()
+				require.True(t, pinned)
+				assert.Equal(t, 21, pin.ChannelId, "video uses the same zero-weight exclusion as images")
+				require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", service.ImageIdentityHash("default", "openai")).Update("models", string(catalog)).Error)
+				require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id = ?", saved.BindingKey, 21).Update("priority", -9).Error)
+				candidates, err := service.ImageCandidateChannels(t.Context(), policy, "image-alpha", "")
+				require.NoError(t, err)
+				for i := range candidates {
+					assert.Zero(t, candidates[i].GetWeight(), "historical negative priorities are zero weights")
+				}
+				require.NoError(t, db.Where("binding_key = ?", saved.BindingKey).Delete(&model.ImageChannelPool{}).Error)
+				selected, _, err = service.PickImageChannel(t.Context(), policy, request, service.ImageAccountRouting{})
+				require.NoError(t, err)
+				assert.Equal(t, 11, selected.Id, "missing binding preserves global priority routing")
+			})
 
 			invalidModelBody, err := common.Marshal(gin.H{
 				"group": "default", "platform": "openai", "mode": "model", "model": "manual-model",
