@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -86,6 +89,57 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageObject{ObjectId: "presentation-output", ProfileId: "presentation-profile", ObjectKey: "private-object-canary", Width: 2048, Height: 1186, Status: "active"}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: "presentation-output"}).Error)
+			t.Run("reliability and encrypted request diagnostics", func(t *testing.T) {
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+				request := service.AsyncImageRequest{Model: "image-model", Prompt: "draw 山水 Bearer credential-canary", Size: "Bearer size-secret-canary", Resolution: "api_key=resolution-secret-canary", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://example.com/ref?signature=private-url-canary"}}, ClientIP: "client-ip-canary", Billing: &service.MediaBillingSnapshot{}}
+				plain, err := common.Marshal(request)
+				require.NoError(t, err)
+				cipher, err := service.EncryptImagePayload(plain, "task:asyncimg_diagnostics")
+				require.NoError(t, err)
+				diagnostics := model.AsyncImageTask{TaskId: "asyncimg_diagnostics", Status: model.ImageTaskFailed, UserId: 101, TokenId: 201, Group: "diagnostic-test", Model: "image-model", RequestCipher: cipher, RequestRetainUntil: now + 3600, CreatedAt: now}
+				require.NoError(t, db.Create(&diagnostics).Error)
+				second := diagnostics
+				second.Id, second.TaskId, second.Status = 0, diagnostics.TaskId+"_second", model.ImageTaskSucceeded
+				require.NoError(t, db.Create(&second).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("task_id IN ?", []string{diagnostics.TaskId, second.TaskId}).Delete(&model.AsyncImageTask{}).Error)
+				})
+				router := gin.New()
+				router.GET("/request/:task_id", GetImageRetainedRequest)
+				router.GET("/reliability", GetImageReliability)
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest("GET", "/request/"+diagnostics.TaskId, nil))
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+				assert.Contains(t, recorder.Body.String(), "山水")
+				for _, secret := range []string{"credential-canary", "size-secret-canary", "resolution-secret-canary", "private-url-canary", "client-ip-canary", "billing", "request_cipher"} {
+					assert.NotContains(t, recorder.Body.String(), secret)
+				}
+				query := "/reliability?group=diagnostic-test&page_size=1"
+				recorder = httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest("GET", query, nil))
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var report struct {
+					Data service.ImageReliabilityReport
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &report))
+				assert.Equal(t, int64(2), report.Data.Totals.Total, "statistics must not inherit the task page size")
+				assert.Equal(t, int64(1), report.Data.Totals.Failed)
+				assert.Equal(t, int64(1), report.Data.Totals.Succeeded)
+				assert.Zero(t, report.Data.Totals.Audited)
+				assert.Nil(t, report.Data.Totals.LocalFallback.Percent)
+				for _, dates := range []string{"&start_date=2026-01-01&end_date=2026-12-31", "&start_date=2026-01-01", "&timezone=invalid"} {
+					recorder = httptest.NewRecorder()
+					router.ServeHTTP(recorder, httptest.NewRequest("GET", query+dates, nil))
+					assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				}
+				require.NoError(t, db.Model(&diagnostics).Update("request_retain_until", now-1).Error)
+				recorder = httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest("GET", "/request/"+diagnostics.TaskId, nil))
+				assert.Equal(t, http.StatusNotFound, recorder.Code)
+				assert.NotContains(t, recorder.Body.String(), "山水")
+			})
 
 			t.Run("task search", func(t *testing.T) {
 				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"requested_size": "1792x1024", "aspect_ratio": "16:9", "prompt_summary": "A futuristic city"}).Error)
@@ -176,6 +230,134 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							})
 						}
 					})
+				}
+			})
+
+			t.Run("displayed platform filters", func(t *testing.T) {
+				images := []model.AsyncImageTask{
+					{TaskId: "asyncimg_platform_legacy_openai", UserId: 101, TokenId: 201, Group: "platform-filter", Platform: "openai", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_platform_legacy_gemini", UserId: 101, TokenId: 201, Group: "platform-filter", Platform: "gemini", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_platform_provider_gemini", UserId: 101, TokenId: 201, Group: "platform-filter", Platform: "openai", Provider: "gemini", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_platform_other_provider", UserId: 101, TokenId: 201, Group: "platform-filter", Platform: "openai", Provider: "doubao", Status: model.ImageTaskQueued, CreatedAt: now},
+					{TaskId: "asyncimg_platform_foreign", UserId: 102, TokenId: 202, Group: "platform-filter", Platform: "gemini", Provider: "gemini", Status: model.ImageTaskQueued, CreatedAt: now},
+				}
+				videos := []model.AsyncMediaJob{
+					{TaskId: "video_platform_openai", IdentityHash: "platform-openai", UserId: 101, TokenId: 201, Group: "platform-filter", Provider: "openai", Status: "queued", StorageStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "video_platform_gemini", IdentityHash: "platform-gemini", UserId: 101, TokenId: 201, Group: "platform-filter", Provider: "gemini", Status: "queued", StorageStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600},
+				}
+				require.NoError(t, db.Create(&images).Error)
+				require.NoError(t, db.Model(&images[1]).Update("provider", nil).Error)
+				require.NoError(t, db.Create(&videos).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&images).Error)
+					assert.NoError(t, db.Delete(&videos).Error)
+				})
+				for _, handler := range []struct {
+					name  string
+					media bool
+					list  func(*gin.Context, bool)
+				}{{"images", false, ListImageTasks}, {"media", true, ListMediaTasks}} {
+					t.Run(handler.name, func(t *testing.T) {
+						for _, tc := range []struct {
+							name     string
+							admin    bool
+							platform string
+							imageIDs []string
+							videoIDs []string
+						}{
+							{name: "OpenAI excludes a different displayed provider", platform: "openai", imageIDs: []string{images[0].TaskId}, videoIDs: []string{videos[0].TaskId}},
+							{name: "Gemini includes provider and legacy NULL fallback within owner", platform: "gemini", imageIDs: []string{images[1].TaskId, images[2].TaskId}, videoIDs: []string{videos[1].TaskId}},
+							{name: "administrator Gemini includes other users", admin: true, platform: "gemini", imageIDs: []string{images[1].TaskId, images[2].TaskId, images[4].TaskId}, videoIDs: []string{videos[1].TaskId}},
+							{name: "unselected platform includes all owner providers", imageIDs: []string{images[0].TaskId, images[1].TaskId, images[2].TaskId, images[3].TaskId}, videoIDs: []string{videos[0].TaskId, videos[1].TaskId}},
+							{name: "unmatched platform returns empty results and statistics", platform: "missing"},
+						} {
+							t.Run(tc.name, func(t *testing.T) {
+								date := time.Unix(now, 0).UTC().Format("2006-01-02")
+								params := url.Values{"group": {"platform-filter"}, "platform": {tc.platform}, "start_date": {date}, "end_date": {date}, "timezone": {"UTC"}}
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Set("id", 101)
+								c.Request = httptest.NewRequest(http.MethodGet, "/?"+params.Encode(), nil)
+								handler.list(c, tc.admin)
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								var response struct {
+									Data struct {
+										Items []struct {
+											TaskID string `json:"task_id"`
+										}
+										Total int
+										Stats struct{ Total int }
+									}
+								}
+								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+								want := append([]string{}, tc.imageIDs...)
+								if handler.media {
+									want = append(want, tc.videoIDs...)
+								}
+								ids := make([]string, 0, len(response.Data.Items))
+								for _, item := range response.Data.Items {
+									ids = append(ids, item.TaskID)
+								}
+								assert.ElementsMatch(t, want, ids)
+								assert.Equal(t, len(want), response.Data.Total)
+								assert.Equal(t, len(want), response.Data.Stats.Total)
+							})
+						}
+					})
+				}
+			})
+
+			t.Run("platform options follow configured channels instead of task rows", func(t *testing.T) {
+				previousCapability, previousRegistry := service.ImageChannelCapabilityFunc, jsplugin.DefaultRegistry
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				service.ImageChannelCapabilityFunc = func(channel model.Channel, modelName string) dto.ImageCapability {
+					if modelName != "image-model" {
+						return dto.ImageCapability{}
+					}
+					providers := map[int]string{constant.ChannelTypeOpenAI: "openai", constant.ChannelTypeGemini: "gemini", constant.ChannelTypeAzure: "azure"}
+					provider := providers[channel.Type]
+					return dto.ImageCapability{Provider: provider, Generate: provider != ""}
+				}
+				t.Cleanup(func() {
+					service.ImageChannelCapabilityFunc, jsplugin.DefaultRegistry = previousCapability, previousRegistry
+				})
+				require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverrides([]*jsplugin.LoadedPlugin{
+					{Meta: jsplugin.Meta{Key: "kling", Models: []string{"video-model"}, ChannelTypes: []int{constant.ChannelTypeKling}, Protocols: []jsplugin.ProtocolClaim{{Name: "openai_video"}}}},
+					{Meta: jsplugin.Meta{Key: "unconfigured-video", Models: []string{"video-model"}, Protocols: []jsplugin.ProtocolClaim{{Name: "openai_video"}}}},
+				}))
+				pluginSetting := `{"task_plugin_key":"kling"}`
+				channels := []model.Channel{
+					{Id: 401, Type: constant.ChannelTypeOpenAI, Models: "image-model", Name: "private-channel", Key: "private-key"},
+					{Id: 402, Type: constant.ChannelTypeOpenAI, Models: "image-model"},
+					{Id: 403, Type: constant.ChannelTypeGemini, Models: " image-model , chat-model "},
+					{Id: 404, Type: constant.ChannelTypeAzure, Models: "image-model", Status: common.ChannelStatusManuallyDisabled},
+					{Id: 405, Type: constant.ChannelTypeTaskPlugin, Models: "video-model", Setting: &pluginSetting},
+					{Id: 406, Type: constant.ChannelTypeKling, Models: "video-model"},
+					{Id: 407, Type: constant.ChannelTypeTaskPlugin, Models: "video-model"},
+					{Id: 408, Type: constant.ChannelTypeGemini, Models: "chat-model"},
+				}
+				require.NoError(t, db.Create(&channels).Error)
+				t.Cleanup(func() { assert.NoError(t, db.Delete(&channels).Error) })
+				for _, removeChannels := range []bool{false, true} {
+					if removeChannels {
+						require.NoError(t, db.Delete(&channels).Error)
+					}
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Request = httptest.NewRequest(http.MethodGet, "/api/user/media-tasks/platforms", nil)
+					GetMediaTaskPlatforms(c)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Success bool
+						Data    []string
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					require.True(t, response.Success)
+					if removeChannels {
+						assert.Equal(t, []string{}, response.Data, "existing task rows do not retain removed platform options")
+					} else {
+						assert.Equal(t, []string{"azure", "gemini", "kling", "openai"}, response.Data, "deduplicate configured providers and exclude unbound plugins and chat-only models")
+					}
 				}
 			})
 

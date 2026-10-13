@@ -2,6 +2,8 @@ package relay
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -67,6 +69,176 @@ func TestAsyncImageUnreadableReceiptDoesNotRepeatSubmission(t *testing.T) {
 					assert.False(t, failure.ExecutionUnknown, "known upstream jobs can safely retry polling")
 				}
 			}
+		})
+	}
+}
+
+func TestAsyncImageTerminalFailureClassification(t *testing.T) {
+	var profile dto.UpstreamAsyncProfile
+	require.NoError(t, common.UnmarshalJsonStr(`{"poll":{"response":{"status_path":"status","status_values":{"failed":["failed"]},"failure_reason_path":"reason","result_path":"urls"}}}`, &profile))
+	for _, tc := range []struct {
+		name, reason string
+		code         int
+	}{
+		{name: "service_timeout", reason: "Service timeout, please try again later", code: 606},
+		{name: "policy_precedes_timeout", reason: "图片审核失败，生成超时，请重试", code: 601},
+		{name: "prompt_length_limit", reason: "POST /: Your prompt cannot exceed 10000 characters.", code: 604},
+		{name: "unclassified_failure", reason: "provider-specific rejection", code: 610},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Set("async_image_resume_task", "accepted-job")
+			c.Set("async_image_response_limit", int64(1024))
+			body, err := common.Marshal(map[string]string{"status": "failed", "reason": tc.reason})
+			require.NoError(t, err)
+			response := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}
+			_, apiErr := handleUpstreamAsyncImageResponse(c, &relaycommon.RelayInfo{}, response, &profile)
+			var failure *service.AsyncImageFailure
+			require.ErrorAs(t, apiErr, &failure)
+			assert.Equal(t, tc.code, failure.Code)
+			assert.Equal(t, tc.reason, failure.Message)
+			assert.Equal(t, "upstream_job_failed", failure.InternalCode)
+			assert.True(t, failure.UpstreamTerminal)
+			assert.False(t, failure.ExecutionUnknown)
+		})
+	}
+}
+
+func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.T) {
+	previousDB, previousCount, previousRedis := model.DB, constant.CountToken, common.RedisEnabled
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "completion-recovery.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled = db, false, false
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.RedisEnabled = previousDB, previousCount, previousRedis
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "completion-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "completion-test")
+	user := model.User{Username: "completion-recovery-user", Status: common.UserStatusDisabled}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "completion-recovery-token", ModelLimitsEnabled: true, ModelLimits: "removed-model", UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	require.NoError(t, db.Delete(&token).Error)
+	var pngImage bytes.Buffer
+	require.NoError(t, png.Encode(&pngImage, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	imageData := base64.StdEncoding.EncodeToString(pngImage.Bytes())
+	for _, platform := range []string{"openai", "gemini"} {
+		t.Run(platform, func(t *testing.T) {
+			var response any = dto.ImageResponse{Data: []dto.ImageData{{B64Json: imageData}}}
+			channelType := constant.ChannelTypeOpenAI
+			if platform == "gemini" {
+				channelType = constant.ChannelTypeGemini
+				response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}}}}}}}
+			}
+			body, err := common.Marshal(response)
+			require.NoError(t, err)
+			completion := &service.AsyncImageCompletion{
+				Body: body, Usage: &dto.Usage{}, BillingBody: []byte(`{"n":1}`), UpstreamModel: "frozen-upstream", BillingModel: "frozen-billing",
+				Billing: service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
+			}
+			request := service.AsyncImageRequest{
+				Platform: platform, Model: "accepted-image", Count: 1, Kind: "image_to_image", Completion: completion,
+				Parts:       []service.AsyncImageInputPart{{Type: "image_url", URL: "https://expired.invalid/reference.png"}},
+				Native:      map[string]common.RawMessage{"ignored_after_completion": common.RawMessage(`invalid JSON`)},
+				Billing:     &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 999}},
+				Reservation: &model.AsyncImageBill{FundingSource: "wallet"},
+			}
+			invalidMapping := "invalid mapping"
+			unreachableURL := "http://127.0.0.1:1"
+			channel := &model.Channel{Id: 14, Type: channelType, Key: "frozen-key", BaseURL: &unreachableURL, Status: common.ChannelStatusManuallyDisabled, ModelMapping: &invalidMapping}
+			task := model.AsyncImageTask{TaskId: "completion-" + platform, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", UpstreamSucceededAt: time.Now().Unix()}
+			attemptContext, cancel := context.WithCancel(t.Context())
+			cancel()
+			dispatches := 0
+			output, bill, err := ExecuteAsyncImage(attemptContext, task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
+				dispatches++
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			require.Len(t, output.Images, 1)
+			assert.Equal(t, 2, output.Images[0].Width)
+			assert.Equal(t, 3, output.Images[0].Height)
+			assert.Equal(t, 5000, bill.Quota, "recovery must use the accepted price, even if current pricing changed")
+			var log model.Log
+			require.NoError(t, common.UnmarshalJsonStr(bill.LogPayload, &log))
+			assert.Equal(t, "frozen-billing", log.ModelName)
+			assert.Zero(t, dispatches, "accepted output must never generate or poll again")
+		})
+	}
+
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name, imageData string
+		valid           bool
+	}{
+		{name: "oversized_valid_output", imageData: imageData, valid: true},
+		{name: "oversized_invalid_output", imageData: base64.StdEncoding.EncodeToString([]byte("not an image"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := map[string]any{
+				"candidates":    []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: tc.imageData}}}}}},
+				"usageMetadata": map[string]int{"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+				"metadata":      "",
+			}
+			encoded, err := common.Marshal(response)
+			require.NoError(t, err)
+			response["metadata"] = strings.Repeat("x", (32<<20)+1-len(encoded))
+			encoded, err = common.Marshal(response)
+			require.NoError(t, err)
+			upstreamRequests := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamRequests <- struct{}{}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(encoded)
+			}))
+			defer upstream.Close()
+			freshUser := model.User{Username: tc.name, AffCode: tc.name, Status: common.UserStatusEnabled, Quota: 1000000}
+			require.NoError(t, db.Create(&freshUser).Error)
+			freshToken := model.Token{UserId: freshUser.Id, Key: tc.name, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&freshToken).Error)
+			request := service.AsyncImageRequest{
+				Platform: "gemini", Dialect: "async", Model: "gemini-image-test", Prompt: "draw", Count: 1,
+				Parts:   []service.AsyncImageInputPart{{Type: "text", Text: "draw"}},
+				Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
+			}
+			channel := &model.Channel{Id: 14, Type: constant.ChannelTypeGemini, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled}
+			task := model.AsyncImageTask{TaskId: tc.name, UserId: freshUser.Id, TokenId: freshToken.Id, ChannelId: channel.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "oversized-worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			requestBytes, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = service.EncryptImagePayload(requestBytes, "task:"+task.TaskId)
+			require.NoError(t, err)
+			channelBytes, err := common.Marshal(channel)
+			require.NoError(t, err)
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelBytes, "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
+				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			})
+			if tc.valid {
+				require.NoError(t, err)
+				require.NotNil(t, output)
+				require.Len(t, output.Images, 1)
+				assert.Equal(t, 2, output.Images[0].Width)
+				assert.Equal(t, 5000, bill.Quota, "large metadata must not prevent a valid current invocation from finishing")
+			} else {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.True(t, failure.ExecutionUnknown, "unsaved output cannot authorize a second generation")
+				assert.Equal(t, 608, failure.Code)
+				assert.Nil(t, output)
+			}
+			<-upstreamRequests
+			assert.Empty(t, upstreamRequests)
+			var stored model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+			assert.Zero(t, stored.UpstreamSucceededAt)
+			assert.Equal(t, task.RequestCipher, stored.RequestCipher, "oversized checkpoints must not overwrite the original request")
 		})
 	}
 }
@@ -359,19 +531,26 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, sqlDB.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	user := model.User{Username: "gemini-submit-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{Id: 17, UserId: user.Id, Key: "gemini-submit-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
 	require.NoError(t, db.Create(&token).Error)
 	service.InitHttpClient()
+	var referenceBytes bytes.Buffer
+	require.NoError(t, png.Encode(&referenceBytes, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	referenceBase64 := base64.StdEncoding.EncodeToString(referenceBytes.Bytes())
+	canonicalReference := "data:image/png;base64," + referenceBase64
+	sourceReference := "data:image/png;base64," + referenceBase64[:32] + "\n" + referenceBase64[32:]
 	for _, tc := range []struct {
-		name    string
-		body    map[string]any
-		invalid bool
+		name      string
+		body      map[string]any
+		reference bool
+		invalid   bool
 	}{
 		{name: "template", body: map[string]any{"prompt": "{request.prompt}", "n": "{request.n}"}},
 		{name: "native_body"},
+		{name: "converted_reference_template", body: map[string]any{"image_urls": "{request.image_urls}", "n": "{request.n}"}, reference: true},
 		{name: "conflicting_count", body: map[string]any{"n": float64(2)}, invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -399,6 +578,10 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 			channel := &model.Channel{Id: 1, Key: "upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeGemini, Status: common.ChannelStatusEnabled, Models: "gemini-image-test", Group: "default"}
 			channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &config})
 			request := service.AsyncImageRequest{Platform: "gemini", Model: "gemini-image-test", Prompt: "draw", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "text", Text: "draw"}}, Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+			if tc.reference {
+				channel.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: "local"})
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: sourceReference})
+			}
 			task := model.AsyncImageTask{TaskId: "gemini-submit-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
 			require.NoError(t, db.Create(&task).Error)
 			dispatches := 0
@@ -422,7 +605,11 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 			assert.Equal(t, "/custom/jobs", record.path)
 			assert.Equal(t, "upstream-key", record.auth)
 			assert.Equal(t, request.Model, record.query)
-			if tc.body != nil {
+			if tc.reference {
+				expected, err := common.Marshal(map[string]any{"image_urls": []string{canonicalReference}, "n": 1})
+				require.NoError(t, err)
+				assert.JSONEq(t, string(expected), record.body, "custom templates must receive the validated and converted reference")
+			} else if tc.body != nil {
 				assert.JSONEq(t, `{"prompt":"draw","n":1}`, record.body)
 			} else {
 				assert.Contains(t, record.body, `"contents"`)
@@ -566,14 +753,16 @@ func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.SetMainDatabaseType(previousType)
-		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageEvent{}, &model.AsyncImageTask{}))
+		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}))
 		connection, openErr := db.DB()
 		if openErr == nil {
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}))
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "checkpoint-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "checkpoint-test")
 
 	now := time.Now().Unix()
 	task := model.AsyncImageTask{
@@ -600,6 +789,156 @@ func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
 	var accepted int64
 	require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "upstream_accepted").Count(&accepted).Error)
 	assert.EqualValues(t, 1, accepted)
+
+	request := service.AsyncImageRequest{Platform: "openai", Model: "checkpoint-image", Count: 1}
+	completion := service.AsyncImageCompletion{EvaluatedAt: time.Date(2026, time.October, 13, 8, 15, 0, 0, time.UTC), Body: []byte(`{"data":[]}`), Usage: &dto.Usage{}}
+	for _, name := range []string{"current_lease_after_dispatch", "expired_lease", "superseded_lease", "admin_terminated"} {
+		t.Run(name, func(t *testing.T) {
+			checkpointTask := model.AsyncImageTask{TaskId: "checkpoint-" + name, Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "checkpoint-worker", LeaseExpiresAt: now + 120, ChannelId: 20}
+			requestBytes, err := common.Marshal(request)
+			require.NoError(t, err)
+			checkpointTask.RequestCipher, err = service.EncryptImagePayload(requestBytes, "task:"+checkpointTask.TaskId)
+			require.NoError(t, err)
+			checkpointTask.SelectedChannelCipher, err = service.EncryptImagePayload([]byte(`{"id":20,"key":"synthetic-key"}`), "image-channel:"+checkpointTask.TaskId)
+			require.NoError(t, err)
+			if name == "expired_lease" {
+				checkpointTask.LeaseExpiresAt = now - 1
+			}
+			require.NoError(t, db.Create(&checkpointTask).Error)
+			switch name {
+			case "current_lease_after_dispatch":
+				require.NoError(t, model.MarkAsyncImageDispatched(t.Context(), checkpointTask, checkpointTask.ChannelId))
+			case "superseded_lease":
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", checkpointTask.TaskId).Updates(map[string]any{"lease_token": "replacement-worker", "version": 2}).Error)
+			case "admin_terminated":
+				require.NoError(t, model.TerminateAsyncImageTask(t.Context(), checkpointTask))
+			}
+			var before model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", checkpointTask.TaskId).Take(&before).Error)
+			err = service.PersistAsyncImageCompletion(t.Context(), &checkpointTask, request, completion)
+			if name == "current_lease_after_dispatch" {
+				require.NoError(t, err, "a live owner must reload the version incremented by dispatch")
+				assert.Equal(t, before.Version+1, checkpointTask.Version)
+				assert.Equal(t, completion.EvaluatedAt.Unix(), checkpointTask.UpstreamSucceededAt)
+				data, err := service.DecryptImagePayload(checkpointTask.RequestCipher, "task:"+checkpointTask.TaskId)
+				require.NoError(t, err)
+				var recovered service.AsyncImageRequest
+				require.NoError(t, common.Unmarshal(data, &recovered))
+				require.NotNil(t, recovered.Completion)
+				assert.JSONEq(t, string(completion.Body), string(recovered.Completion.Body))
+				laterCompletion := completion
+				laterCompletion.EvaluatedAt = completion.EvaluatedAt.Add(time.Hour)
+				require.NoError(t, service.PersistAsyncImageCompletion(t.Context(), &checkpointTask, request, laterCompletion))
+				assert.Equal(t, completion.EvaluatedAt.Unix(), checkpointTask.UpstreamSucceededAt, "repeat checkpoints must retain the first provider completion time")
+				data, err = service.DecryptImagePayload(checkpointTask.RequestCipher, "task:"+checkpointTask.TaskId)
+				require.NoError(t, err)
+				var repeated service.AsyncImageRequest
+				require.NoError(t, common.Unmarshal(data, &repeated))
+				require.NotNil(t, repeated.Completion)
+				assert.True(t, completion.EvaluatedAt.Equal(repeated.Completion.EvaluatedAt), "the saved pricing time must match the first completion marker")
+				return
+			}
+			require.Error(t, err)
+			var after model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", checkpointTask.TaskId).Take(&after).Error)
+			assert.Equal(t, before.Status, after.Status)
+			assert.Equal(t, before.Version, after.Version)
+			assert.Equal(t, before.RequestCipher, after.RequestCipher)
+			assert.Equal(t, before.UpstreamSucceededAt, after.UpstreamSucceededAt, "a stale worker cannot revive or overwrite a task")
+		})
+	}
+
+	var pngImage bytes.Buffer
+	require.NoError(t, png.Encode(&pngImage, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	for _, tc := range []struct {
+		name  string
+		bytes int
+	}{
+		{name: "checkpoint_at_32_mib", bytes: 32 << 20},
+		{name: "checkpoint_above_32_mib", bytes: (32 << 20) + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if os.Getenv("IMAGE_UPSTREAM_JOB_TEST_SMALL_PACKET") != "" {
+				require.Equal(t, "mysql", db.Dialector.Name(), "small-packet mode requires the isolated MySQL fixture")
+				t.Skip("the isolated small-packet fixture exercises its lower checkpoint limit")
+			}
+			response := map[string]any{"data": []dto.ImageData{{B64Json: base64.StdEncoding.EncodeToString(pngImage.Bytes())}}, "metadata": ""}
+			body, err := common.Marshal(response)
+			require.NoError(t, err)
+			boundedCompletion := service.AsyncImageCompletion{EvaluatedAt: completion.EvaluatedAt, Body: body, Usage: &dto.Usage{}}
+			encodedRequest := request
+			encodedRequest.Completion = &boundedCompletion
+			baseEnvelope, err := common.Marshal(encodedRequest)
+			require.NoError(t, err)
+			response["metadata"] = strings.Repeat("x", tc.bytes-len(baseEnvelope))
+			boundedCompletion.Body, err = common.Marshal(response)
+			require.NoError(t, err)
+			checkpointTask := model.AsyncImageTask{TaskId: tc.name, Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "boundary-worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			requestBytes, err := common.Marshal(request)
+			require.NoError(t, err)
+			checkpointTask.RequestCipher, err = service.EncryptImagePayload(requestBytes, "task:"+checkpointTask.TaskId)
+			require.NoError(t, err)
+			checkpointTask.SelectedChannelCipher, err = service.EncryptImagePayload([]byte(`{"id":20,"key":"synthetic-key"}`), "image-channel:"+checkpointTask.TaskId)
+			require.NoError(t, err)
+			originalCipher := append([]byte(nil), checkpointTask.RequestCipher...)
+			require.NoError(t, db.Create(&checkpointTask).Error)
+			err = service.PersistAsyncImageCompletion(t.Context(), &checkpointTask, request, boundedCompletion)
+			if tc.name == "checkpoint_above_32_mib" {
+				require.ErrorIs(t, err, service.ErrAsyncImageCompletionTooLarge)
+			} else {
+				require.NoError(t, err)
+			}
+			var stored model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", checkpointTask.TaskId).Take(&stored).Error)
+			if err != nil {
+				assert.Equal(t, originalCipher, stored.RequestCipher)
+				assert.Zero(t, stored.UpstreamSucceededAt)
+				assert.EqualValues(t, 1, stored.Version)
+				return
+			}
+			assert.Positive(t, stored.UpstreamSucceededAt)
+			data, err := service.DecryptImagePayload(stored.RequestCipher, "task:"+stored.TaskId)
+			require.NoError(t, err)
+			var recovered service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(data, &recovered))
+			require.NotNil(t, recovered.Completion)
+			var imageResponse dto.ImageResponse
+			require.NoError(t, common.Unmarshal(recovered.Completion.Body, &imageResponse))
+			require.Len(t, imageResponse.Data, 1)
+			assert.Equal(t, base64.StdEncoding.EncodeToString(pngImage.Bytes()), imageResponse.Data[0].B64Json)
+		})
+	}
+	t.Run("checkpoint_respects_mysql_small_packet", func(t *testing.T) {
+		if os.Getenv("IMAGE_UPSTREAM_JOB_TEST_SMALL_PACKET") == "" {
+			t.Skip("requires an isolated MySQL instance configured with a 4 MiB packet")
+		}
+		require.Equal(t, "mysql", db.Dialector.Name())
+		var packetBytes int64
+		require.NoError(t, db.Raw("SELECT @@max_allowed_packet").Scan(&packetBytes).Error)
+		require.EqualValues(t, 4<<20, packetBytes, "configure the disposable instance before starting the test process")
+		response := map[string]any{"data": []dto.ImageData{{B64Json: base64.StdEncoding.EncodeToString(pngImage.Bytes())}}, "metadata": ""}
+		body, err := common.Marshal(response)
+		require.NoError(t, err)
+		response["metadata"] = strings.Repeat("x", (3<<20)-len(body))
+		body, err = common.Marshal(response)
+		require.NoError(t, err)
+		checkpointTask := model.AsyncImageTask{TaskId: "checkpoint-small-mysql-packet", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "small-packet-worker", LeaseExpiresAt: time.Now().Unix() + 120}
+		requestBytes, err := common.Marshal(request)
+		require.NoError(t, err)
+		checkpointTask.RequestCipher, err = service.EncryptImagePayload(requestBytes, "task:"+checkpointTask.TaskId)
+		require.NoError(t, err)
+		checkpointTask.SelectedChannelCipher, err = service.EncryptImagePayload([]byte(`{"id":20,"key":"synthetic-key"}`), "image-channel:"+checkpointTask.TaskId)
+		require.NoError(t, err)
+		originalCipher := append([]byte(nil), checkpointTask.RequestCipher...)
+		require.NoError(t, db.Create(&checkpointTask).Error)
+		err = service.PersistAsyncImageCompletion(t.Context(), &checkpointTask, request, service.AsyncImageCompletion{Body: body, Usage: &dto.Usage{}})
+		require.ErrorIs(t, err, service.ErrAsyncImageCompletionTooLarge)
+		var stored model.AsyncImageTask
+		require.NoError(t, db.Where("task_id = ?", checkpointTask.TaskId).Take(&stored).Error)
+		assert.Equal(t, originalCipher, stored.RequestCipher, "an output exceeding the server packet budget must not overwrite encrypted evidence")
+		assert.Zero(t, stored.UpstreamSucceededAt)
+		assert.EqualValues(t, 1, stored.Version)
+	})
 }
 
 func TestBuildGeminiAsyncImagePartsReferenceTransport(t *testing.T) {

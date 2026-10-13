@@ -60,6 +60,27 @@ type ImageChannelPool struct {
 	Priority   int    `json:"priority"`
 }
 
+// ImageRetryDecision records policy facts without provider payloads or account identities.
+type ImageRetryDecision struct {
+	Version       int    `json:"version"`
+	Stage         string `json:"stage"`
+	Action        string `json:"action"`
+	Reason        string `json:"reason"`
+	Rule          string `json:"rule"`
+	Budget        string `json:"budget,omitempty"`
+	Used          int    `json:"used"`
+	Limit         int    `json:"limit"`
+	TotalUsed     int    `json:"total_used"`
+	TotalLimit    int    `json:"total_limit"`
+	NextAttemptAt int64  `json:"next_attempt_at,omitempty"`
+	Deadline      int64  `json:"deadline,omitempty"`
+	RecordedAt    int64  `json:"recorded_at"`
+}
+
+func (task AsyncImageTask) FailedRequestRetainedAt(now int64) bool {
+	return (task.Status == ImageTaskFailed || task.Status == ImageTaskExpired || task.Status == ImageTaskExecutionUnknown) && task.RequestRetainUntil > now && len(task.RequestCipher) > 0 && (task.ExpiresAt == 0 || task.ExpiresAt > now)
+}
+
 type AsyncImageTask struct {
 	Provider              string `json:"provider,omitempty" gorm:"size:32"`
 	ExecutionProtocol     string `json:"protocol,omitempty" gorm:"size:32"`
@@ -80,6 +101,8 @@ type AsyncImageTask struct {
 	Version               int64  `json:"version"`
 	Progress              int    `json:"progress"`
 	RequestCipher         []byte `json:"-"`
+	RequestRetainUntil    int64  `json:"-" gorm:"type:bigint;index:idx_image_request_retention"`
+	RetryDecision         string `json:"-" gorm:"type:text"`
 	RequestHash           string `json:"-" gorm:"size:64"`
 	PromptSummary         string `json:"prompt_summary" gorm:"type:text"`
 	ReferenceUrls         string `json:"-" gorm:"type:text"`

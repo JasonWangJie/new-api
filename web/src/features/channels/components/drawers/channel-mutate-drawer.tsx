@@ -278,6 +278,7 @@ const SENSITIVE_FORM_FIELDS = [
   'http_protocol',
   'http2_connection_shards',
   'image_max_reference_images',
+  'image_reference_transport_mode',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
   'system_prompt',
@@ -1942,6 +1943,59 @@ export function ChannelMutateDrawer({
               <FormDescription>
                 {t(
                   'Async image tasks with more than 8 reference images prefer channels whose limit covers the request.'
+                )}
+              </FormDescription>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={form.control}
+          name='image_reference_transport_mode'
+          render={({ field }) => (
+            <FormItem className='sm:col-span-2'>
+              <FormLabel>{t('Reference transport')}</FormLabel>
+              <Select
+                disabled={sensitiveLocked}
+                value={field.value || 'inherit'}
+                onValueChange={(value) =>
+                  field.onChange(value === 'inherit' ? '' : value)
+                }
+                items={[
+                  { value: 'inherit', label: t('Inherit global setting') },
+                  { value: 'passthrough', label: t('Upstream URL fetch') },
+                  { value: 'local', label: t('Server download') },
+                  {
+                    value: 'passthrough_fallback_local',
+                    label: t('Upstream fetch with local fallback'),
+                  },
+                ]}
+              >
+                <FormControl>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                </FormControl>
+                <SelectContent alignItemWithTrigger={false}>
+                  <SelectGroup>
+                    <SelectItem value='inherit'>
+                      {t('Inherit global setting')}
+                    </SelectItem>
+                    <SelectItem value='passthrough'>
+                      {t('Upstream URL fetch')}
+                    </SelectItem>
+                    <SelectItem value='local'>
+                      {t('Server download')}
+                    </SelectItem>
+                    <SelectItem value='passthrough_fallback_local'>
+                      {t('Upstream fetch with local fallback')}
+                    </SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FormDescription>
+                {t(
+                  'Overrides reference transport for this channel. Bound images always use server download.'
                 )}
               </FormDescription>
               <FormMessage />

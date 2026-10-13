@@ -32,6 +32,7 @@ type DataTableMobileFilterPanelProps = {
   children: ReactNode
   summary?: ReactNode
   defaultOpen?: boolean
+  triggerLabel?: ReactNode
   actions: ReactNode
   compact?: boolean
   className?: string
@@ -42,6 +43,12 @@ export function DataTableMobileFilterPanel(
 ) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(props.defaultOpen ?? true)
+  let triggerLabel: string | undefined = open ? t('Collapse') : t('Expand')
+  let triggerClassName = props.compact ? 'size-9' : 'mr-auto size-7'
+  if (props.triggerLabel) {
+    triggerLabel = undefined
+    triggerClassName = 'h-9 px-2'
+  }
 
   return (
     <Collapsible
@@ -63,18 +70,19 @@ export function DataTableMobileFilterPanel(
         )}
       >
         <CollapsibleTrigger
-          aria-label={open ? t('Collapse') : t('Expand')}
+          aria-label={triggerLabel}
           render={
             <Button
               variant='ghost'
-              size='icon'
+              size={props.triggerLabel ? 'default' : 'icon'}
               className={cn(
                 'text-muted-foreground hover:text-foreground',
-                props.compact ? 'size-9' : 'mr-auto size-7'
+                triggerClassName
               )}
             />
           }
         >
+          {props.triggerLabel}
           <ChevronDown
             aria-hidden='true'
             className={cn(

@@ -31,32 +31,47 @@ import dayjs from '@/lib/dayjs'
 import { cn } from '@/lib/utils'
 
 interface CompactDateTimeRangePickerProps {
+  id?: string
   start?: Date
   end?: Date
+  precision?: 'day' | 'minute'
   onChange: (range: { start?: Date; end?: Date }) => void
   className?: string
 }
 
-function toInputValue(date?: Date): string {
-  return date ? dayjs(date).format('YYYY-MM-DDTHH:mm') : ''
+function toInputValue(
+  date: Date | undefined,
+  precision: 'day' | 'minute'
+): string {
+  return date
+    ? dayjs(date).format(
+        precision === 'day' ? 'YYYY-MM-DD' : 'YYYY-MM-DDTHH:mm'
+      )
+    : ''
 }
 
 function fromInputValue(value: string): Date | undefined {
   if (!value) return undefined
-  const date = new Date(value)
+  // Date-only values must retain the user's local day instead of parsing as UTC.
+  const date = dayjs(value).toDate()
   return Number.isNaN(date.getTime()) ? undefined : date
 }
 
 export function CompactDateTimeRangePicker({
+  id,
   start,
   end,
+  precision = 'minute',
   onChange,
   className,
 }: CompactDateTimeRangePickerProps) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
-  const [draftStart, setDraftStart] = useState(toInputValue(start))
-  const [draftEnd, setDraftEnd] = useState(toInputValue(end))
+  const [draftStart, setDraftStart] = useState(toInputValue(start, precision))
+  const [draftEnd, setDraftEnd] = useState(toInputValue(end, precision))
+  const dateOnly = precision === 'day'
+  const startLabel = dateOnly ? t('Start date') : t('Start Time')
+  const endLabel = dateOnly ? t('End date') : t('End Time')
 
   const label = useMemo(() => {
     if (!start && !end) return t('Date Range')
@@ -64,23 +79,25 @@ export function CompactDateTimeRangePicker({
     // precision, so seconds are always 00 (manual pick) or 59 (preset
     // end-of-day). Hide them in the trigger label to keep the button
     // width compact while still showing the meaningful timestamp.
-    const startText = start ? dayjs(start).format('YYYY-MM-DD HH:mm') : '-'
-    const endText = end ? dayjs(end).format('YYYY-MM-DD HH:mm') : '-'
+    const format = dateOnly ? 'YYYY-MM-DD' : 'YYYY-MM-DD HH:mm'
+    const startText = start ? dayjs(start).format(format) : '-'
+    const endText = end ? dayjs(end).format(format) : '-'
+    if (dateOnly && start && end && startText === endText) return startText
     return `${startText} ~ ${endText}`
-  }, [end, start, t])
+  }, [dateOnly, end, start, t])
 
   const mobileLabel = useMemo(() => {
-    if (!start || !end) return label
+    if (dateOnly || !start || !end) return label
     if (dayjs(start).isSame(end, 'day')) {
       return `${dayjs(start).format('MM/DD HH:mm')}–${dayjs(end).format('HH:mm')}`
     }
     return label
-  }, [start, end, label])
+  }, [dateOnly, start, end, label])
 
   const handleOpenChange = (nextOpen: boolean) => {
     if (nextOpen) {
-      setDraftStart(toInputValue(start))
-      setDraftEnd(toInputValue(end))
+      setDraftStart(toInputValue(start, precision))
+      setDraftEnd(toInputValue(end, precision))
     }
     setOpen(nextOpen)
   }
@@ -118,8 +135,8 @@ export function CompactDateTimeRangePicker({
       },
     }
     const range = presets[kind]
-    setDraftStart(toInputValue(range.start))
-    setDraftEnd(toInputValue(range.end))
+    setDraftStart(toInputValue(range.start, precision))
+    setDraftEnd(toInputValue(range.end, precision))
     onChange(range)
     setOpen(false)
   }
@@ -129,9 +146,10 @@ export function CompactDateTimeRangePicker({
       <PopoverTrigger
         render={
           <Button
+            id={id}
             type='button'
             variant='outline'
-            aria-label={label}
+            aria-label={dateOnly ? `${t('Date Range')}: ${label}` : label}
             className={cn(
               'w-full justify-start gap-2 px-2.5 text-sm leading-5 font-normal tabular-nums',
               !start && !end && 'text-muted-foreground',
@@ -140,7 +158,10 @@ export function CompactDateTimeRangePicker({
           />
         }
       >
-        <CalendarDays className='text-muted-foreground size-4 shrink-0' />
+        <CalendarDays
+          className='text-muted-foreground size-4 shrink-0'
+          aria-hidden
+        />
         <span className='hidden truncate sm:block'>{label}</span>
         <span className='min-w-0 [overflow-wrap:anywhere] whitespace-normal sm:hidden'>
           {mobileLabel}
@@ -148,18 +169,21 @@ export function CompactDateTimeRangePicker({
       </PopoverTrigger>
       <PopoverContent
         align='start'
-        className='w-[min(520px,calc(100vw-2rem))] p-3'
+        className={cn(
+          'w-[min(520px,calc(100vw-2rem))] p-3',
+          dateOnly &&
+            'sm:w-96 [&_button]:min-h-11 [&_input]:min-h-11 sm:[&_button]:min-h-8 sm:[&_input]:min-h-8'
+        )}
       >
         <div className='space-y-3'>
           <div className='grid gap-2 sm:grid-cols-[1fr_auto_1fr] sm:items-end'>
             <div className='space-y-1.5'>
-              <div className='text-muted-foreground text-xs'>
-                {t('Start Time')}
-              </div>
+              <div className='text-muted-foreground text-xs'>{startLabel}</div>
               <Input
-                type='datetime-local'
+                type={dateOnly ? 'date' : 'datetime-local'}
                 value={draftStart}
-                aria-label={t('Start Time')}
+                aria-label={startLabel}
+                max={dateOnly && draftEnd ? draftEnd : undefined}
                 onChange={(e) => setDraftStart(e.target.value)}
                 className='h-8 text-sm leading-5 tabular-nums'
               />
@@ -168,13 +192,12 @@ export function CompactDateTimeRangePicker({
               ~
             </span>
             <div className='space-y-1.5'>
-              <div className='text-muted-foreground text-xs'>
-                {t('End Time')}
-              </div>
+              <div className='text-muted-foreground text-xs'>{endLabel}</div>
               <Input
-                type='datetime-local'
+                type={dateOnly ? 'date' : 'datetime-local'}
                 value={draftEnd}
-                aria-label={t('End Time')}
+                aria-label={endLabel}
+                min={dateOnly && draftStart ? draftStart : undefined}
                 onChange={(e) => setDraftEnd(e.target.value)}
                 className='h-8 text-sm leading-5 tabular-nums'
               />
@@ -230,7 +253,15 @@ export function CompactDateTimeRangePicker({
           </div>
 
           <div className='flex justify-end'>
-            <Button size='sm' className='h-8' onClick={applyDraft}>
+            <Button
+              type='button'
+              size='sm'
+              className='h-8'
+              disabled={
+                dateOnly && !!draftStart && !!draftEnd && draftStart > draftEnd
+              }
+              onClick={applyDraft}
+            >
               {t('Confirm')}
             </Button>
           </div>

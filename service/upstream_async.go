@@ -377,7 +377,7 @@ func ParseUpstreamAsyncPollResponse(profile *relaydto.UpstreamAsyncProfile, body
 	if path := strings.TrimSpace(profile.Poll.Response.FailureReasonPath); path != "" {
 		reason := gjson.GetBytes(body, path)
 		if reason.Type == gjson.String {
-			result.Reason = sanitizeAsyncImageProviderDiagnostic(reason.Str, common.LocalLogContentLimit)
+			result.Reason = SanitizeAsyncImageDiagnostic(reason.Str, common.LocalLogContentLimit)
 		}
 	}
 	if result.Status == model.TaskStatusSuccess {

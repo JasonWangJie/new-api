@@ -1324,6 +1324,33 @@ test('edits and saves the image channel reference capacity from routing settings
   expect(JSON.parse(payload.setting).image_max_reference_images).toBe(12)
 })
 
+test('restores a channel reference transport override and saves global inheritance', async () => {
+  editingChannel = {
+    ...editingChannel,
+    setting: '{"image_reference_transport_mode":"local"}',
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const transport = screen.getByRole('combobox', {
+    name: 'Reference transport',
+  })
+  expect(transport).toHaveTextContent('Server download')
+  await user.click(transport)
+  await user.click(
+    screen.getByRole('option', { name: 'Inherit global setting' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  expect(
+    JSON.parse((put.mock.calls[0][1] as { setting: string }).setting)
+  ).not.toHaveProperty('image_reference_transport_mode')
+})
+
 test('saves an actual video seconds path in channel settings', async () => {
   editingChannel = {
     ...editingChannel,

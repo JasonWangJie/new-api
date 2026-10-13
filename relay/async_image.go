@@ -157,9 +157,20 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 }
 
 func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+	postprocessParent := request.PostprocessContext
+	if postprocessParent == nil {
+		postprocessParent = context.WithoutCancel(ctx)
+	}
+	postprocessCtx := postprocessParent
+	if request.Completion != nil {
+		var cancelPostprocess context.CancelFunc
+		postprocessCtx, cancelPostprocess = context.WithTimeout(postprocessParent, time.Duration(max(1, cfg.UploadTimeout, cfg.DownloadTimeout))*time.Second)
+		defer cancelPostprocess()
+		ctx = postprocessCtx
+	}
 	// A known upstream job has already consumed provider resources. Revoking
 	// submission permissions must not cancel its internal polling or accounting.
-	accepted := task.UpstreamTaskId != ""
+	accepted := task.UpstreamTaskId != "" || request.Completion != nil
 	tokenQuery := model.DB.WithContext(ctx)
 	if accepted {
 		tokenQuery = tokenQuery.Unscoped()
@@ -223,16 +234,44 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if err := middleware.SetupContextForSelectedChannel(c, channel, request.Model); err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
+	if completion := request.Completion; completion != nil {
+		var info *relaycommon.RelayInfo
+		if request.Platform == "openai" {
+			info = relaycommon.GenRelayInfoImage(c, nil)
+		} else {
+			info = relaycommon.GenRelayInfoGemini(c, nil)
+		}
+		info.InitChannelMeta(c)
+		info.UpstreamModelName, info.BillingModelName = completion.UpstreamModel, completion.BillingModel
+		info.PriceData = completion.Billing.Price
+		for key, ratio := range completion.Billing.Ratios {
+			info.PriceData.AddOtherRatio(key, ratio)
+		}
+		info.TieredBillingSnapshot, info.QuotaClamp, info.ImageQuotaBeforeGroup = completion.Billing.Tiered, completion.Billing.Clamp, completion.Billing.ImageQuotaBeforeGroup
+		if request.Reservation == nil {
+			var err error
+			request.Reservation, err = model.GetAsyncImageReservation(postprocessCtx, task)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, err
+			}
+		}
+		if request.Reservation == nil {
+			return nil, model.AsyncImageBill{}, errors.New("completed upstream image request is missing its billing reservation")
+		}
+		funding := model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}
+		return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, *completion, cfg, funding)
+	}
 	var parsed dto.Request
 	var nativeBody []byte
 	var submitImageURLs []string
+	remoteReferences, localReferences := false, false
 	geminiReferenceFallbackEligible := false
 	if request.Platform == "openai" {
 		var images []map[string]string
-		mode := service.ResolveImageReferenceTransportMode(cfg.OpenAIReferenceMode, task.ReferenceRetryCount)
+		mode := service.ImageChannelReferenceTransport(*channel, request.Platform, task.ReferenceRetryCount, cfg)
 		referenceIndex := 0
 		for _, part := range request.Parts {
-			if task.UpstreamTaskId != "" {
+			if accepted {
 				break
 			}
 			if part.Type != "image_url" && part.Type != "mask" {
@@ -250,6 +289,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 					return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 				}
 				reference = image.DataURL()
+				localReferences = true
+			} else {
+				remoteReferences = true
 			}
 			if part.Type == "mask" {
 				mask, err := common.Marshal(map[string]string{"image_url": reference})
@@ -301,6 +343,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		parsed = imageRequest
 	} else {
+		cfg.GeminiReferenceMode = service.ImageChannelReferenceTransport(*channel, request.Platform, 0, cfg)
 		var parts []dto.GeminiPart
 		if !accepted {
 			var err error
@@ -312,6 +355,15 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		geminiReferenceFallbackEligible = cfg.GeminiReferenceMode == "passthrough_fallback_local" && task.ReferenceRetryCount == 0 && slices.ContainsFunc(parts, func(part dto.GeminiPart) bool {
 			return part.FileData != nil
 		})
+		for _, part := range parts {
+			if part.FileData != nil {
+				remoteReferences = true
+				submitImageURLs = append(submitImageURLs, part.FileData.FileUri)
+			} else if part.InlineData != nil {
+				localReferences = true
+				submitImageURLs = append(submitImageURLs, "data:"+part.InlineData.MimeType+";base64,"+part.InlineData.Data)
+			}
+		}
 		imageConfig := map[string]string{}
 		if request.Resolution != "" {
 			imageConfig["imageSize"] = request.Resolution
@@ -337,11 +389,14 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if submitSource == nil {
 		submitSource = make(map[string]any)
 	}
-	if request.Platform != "openai" {
-		for _, part := range request.Parts {
-			if part.Type == "image_url" {
-				submitImageURLs = append(submitImageURLs, part.URL)
-			}
+	if request.ReferenceTransportUsed != nil {
+		switch {
+		case remoteReferences && localReferences:
+			*request.ReferenceTransportUsed = "mixed"
+		case remoteReferences:
+			*request.ReferenceTransportUsed = "remote"
+		case localReferences:
+			*request.ReferenceTransportUsed = "local"
 		}
 	}
 	submitSource["model"] = request.Model
@@ -367,7 +422,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		// multipart edits but do not implement JSON image references.
 		editFormat = request.InputFormat
 	}
-	if request.Platform == "openai" && request.Kind == "image_to_image" && editFormat == "multipart" && task.UpstreamTaskId == "" {
+	if request.Platform == "openai" && request.Kind == "image_to_image" && editFormat == "multipart" && !accepted {
 		var encoded bytes.Buffer
 		form := multipart.NewWriter(&encoded)
 		for key, raw := range request.Native {
@@ -413,6 +468,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, err
 		}
 		nativeBody, contentType = encoded.Bytes(), form.FormDataContentType()
+		if request.ReferenceTransportUsed != nil && referenceIndex > 0 {
+			*request.ReferenceTransportUsed = "local"
+		}
 	}
 	c.Request.Header.Set("Content-Type", contentType)
 	c.Request.Body = io.NopCloser(bytes.NewReader(nativeBody))
@@ -473,6 +531,14 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	var usage *dto.Usage
 	dispatched := false
 	upstreamBeforeInvoke := func() error {
+		if request.ReferenceTransportUsed != nil && *request.ReferenceTransportUsed != "" {
+			profile, custom := info.ChannelOtherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, upstreamAsyncImageOperation(c))
+			if len(info.ParamOverride) > 0 || custom && profile.Submit.Request != nil && profile.Submit.Request.Body != nil {
+				// Arbitrary administrator templates can replace reference fields.
+				// Do not infer transmitted transport from the prepared source.
+				*request.ReferenceTransportUsed = "unknown"
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -629,8 +695,15 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			}
 		}
 	}
-	var images []service.ImageBytes
-	var upstreamURLs []string
+	completion := service.AsyncImageCompletion{
+		EvaluatedAt: time.Now(),
+		Body:        writer.Body.Bytes(), Usage: usage,
+		Billing:     service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup},
+		BillingBody: nativeBody, UpstreamModel: info.UpstreamModelName, BillingModel: info.GetBillingModelName(),
+	}
+	if task.UpstreamSucceededAt > 0 {
+		completion.EvaluatedAt = time.Unix(task.UpstreamSucceededAt, 0)
+	}
 	if rawURLs, exists := c.Get(contextKeyUpstreamAsyncImageURLs); exists {
 		urls, valid := rawURLs.([]string)
 		profileValue, profileExists := c.Get(contextKeyUpstreamAsyncImageProfile)
@@ -638,6 +711,37 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if !valid || !profileExists || !profileValid {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: "Upstream image result metadata is invalid"}
 		}
+		completion.URLs, completion.Profile = append([]string(nil), urls...), profile
+	}
+	postprocessCtx, cancelPostprocess := context.WithTimeout(postprocessParent, time.Duration(max(1, cfg.UploadTimeout, cfg.DownloadTimeout))*time.Second)
+	defer cancelPostprocess()
+	if err := service.PersistAsyncImageCompletion(postprocessCtx, &task, request, completion); err != nil {
+		if errors.Is(err, service.ErrAsyncImageCompletionTooLarge) {
+			common.SysLog("async image completion exceeds its durable checkpoint limit: " + task.TaskId)
+			output, bill, finalizeErr := finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding)
+			if finalizeErr != nil {
+				// No response was saved. A local failure cannot authorize another
+				// generation; a known provider job can still be queried in place.
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "completion_unpersisted", Message: "Accepted image output could not finish local processing", ExecutionUnknown: true}
+			}
+			return output, bill, nil
+		}
+		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "completion_persist_failed", Message: "Upstream image completion could not be durably persisted", ExecutionUnknown: true}
+	}
+	return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding)
+}
+
+// finalizeAsyncImageCompletion consumes durable upstream evidence and never
+// crosses the submission barrier, including after a worker restart.
+func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task model.AsyncImageTask, info *relaycommon.RelayInfo, request service.AsyncImageRequest, completion service.AsyncImageCompletion, cfg service.ImageRuntimeConfig, funding model.ImageFundingSelection) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+	c.Request = c.Request.WithContext(ctx)
+	var images []service.ImageBytes
+	var upstreamURLs []string
+	var err error
+	if profile := completion.Profile; profile != nil {
+		urls := completion.URLs
+		c.Set(contextKeyUpstreamAsyncImageProfile, profile)
+		c.Set(contextKeyUpstreamAsyncImageURLs, urls)
 		publicURLs := make([]string, 0, len(urls))
 		if len(profile.Poll.Response.DownloadHeaders) == 0 {
 			for _, resultURL := range urls {
@@ -658,7 +762,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			APIKey:        info.ApiKey,
 		}, cfg)
 		if errors.Is(err, service.ErrUpstreamAsyncImageTransport) && len(publicURLs) == len(urls) &&
-			(task.TransientRetryCount >= cfg.TransientRetries || task.RetryCount >= cfg.TotalRetries) {
+			(task.StorageRetryCount >= cfg.StorageRetries || task.TransientRetryCount >= cfg.TransientRetries || task.RetryCount >= cfg.TotalRetries) {
 			upstreamURLs = publicURLs
 			// Only quantity and the original request specification are known when
 			// downloading fails. Do not invent output dimensions or token usage.
@@ -667,21 +771,22 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			err = nil
 		}
 	} else {
-		images, err = ExtractAsyncImageOutputs(ctx, writer.Body.Bytes(), request.Platform, cfg)
+		images, err = ExtractAsyncImageOutputs(ctx, completion.Body, request.Platform, cfg)
 	}
 	if err != nil {
 		return nil, model.AsyncImageBill{}, classifyAsyncImageOutputFailure(task, err)
 	}
+	usage := completion.Usage
 	if usage == nil {
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, Message: "Upstream usage is missing"}
 	}
-	info.BillingRequestInput = &billingexpr.RequestInput{Body: nativeBody, ImageCount: common.GetPointer(len(images))}
+	info.BillingRequestInput = &billingexpr.RequestInput{Body: completion.BillingBody, ImageCount: common.GetPointer(len(images)), EvaluationTime: &completion.EvaluatedAt}
 	bill, err := service.FixAsyncImageBill(c, task, info, usage, images, request, funding)
 	if err != nil {
 		if _, dynamic := c.Get(contextKeyUpstreamAsyncImageProfile); dynamic && usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing", Message: "Upstream image task did not report required billing usage"}
 		}
-		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "bill_preparation_failed", Message: err.Error(), ExecutionUnknown: true}
+		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "bill_preparation_failed", Message: err.Error()}
 	}
 	if len(upstreamURLs) > 0 {
 		return &service.AsyncImageOutput{UpstreamURLs: upstreamURLs}, bill, nil
@@ -690,7 +795,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 }
 
 func classifyAsyncImageOutputFailure(task model.AsyncImageTask, err error) *service.AsyncImageFailure {
-	if task.UpstreamTaskId != "" && errors.Is(err, service.ErrUpstreamAsyncImageTransport) {
+	if (task.UpstreamTaskId != "" || task.UpstreamSucceededAt > 0) &&
+		(errors.Is(err, service.ErrUpstreamAsyncImageTransport) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+			err.Error() == "image reference download failed" || err.Error() == "image reference read failed" || strings.HasPrefix(err.Error(), "image reference returned HTTP 5")) {
 		return &service.AsyncImageFailure{Code: 606, InternalCode: "result_download_failed", Message: "Upstream image result download was interrupted"}
 	}
 	return &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: err.Error()}

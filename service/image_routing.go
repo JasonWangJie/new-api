@@ -267,8 +267,11 @@ type ImageAccount struct {
 type ImageAccountRouting struct {
 	Pin              string
 	Excluded         []string
+	Avoid            string
 	PinChannel       int
 	ExcludedChannels []int
+	AvoidChannel     int
+	Cooling          map[string]bool
 	Stop             bool
 }
 
@@ -290,6 +293,9 @@ func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []
 			continue
 		}
 		fingerprint := ImageIdentityHash("image-account", strconv.Itoa(channel.Id), key)
+		if routing.Cooling[fingerprint] {
+			continue
+		}
 		if routing.Pin != "" && routing.Pin != fingerprint || slices.Contains(routing.Excluded, fingerprint) {
 			continue
 		}
@@ -315,6 +321,49 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	if err != nil {
 		return nil, ImageAccount{}, err
 	}
+	if cfg.CircuitBreaker || cfg.AccountCooldownSeconds > 0 {
+		if common.RDB == nil {
+			return nil, ImageAccount{}, errors.New("Redis is required for image retry controls")
+		}
+		if cfg.AccountCooldownSeconds > 0 && len(channels) > 0 {
+			fingerprints := make([]string, 0)
+			cooldownKeys := make([]string, 0)
+			for _, channel := range channels {
+				for _, account := range ImageChannelAccounts(channel, routing) {
+					fingerprints = append(fingerprints, account.Fingerprint)
+					cooldownKeys = append(cooldownKeys, ImageAccountCooldownKey(account.Fingerprint))
+				}
+			}
+			if len(cooldownKeys) > 0 {
+				states, err := common.RDB.MGet(ctx, cooldownKeys...).Result()
+				if err != nil {
+					return nil, ImageAccount{}, err
+				}
+				routing.Cooling = make(map[string]bool)
+				for i, state := range states {
+					routing.Cooling[fingerprints[i]] = state != nil
+				}
+				channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return len(ImageChannelAccounts(channel, routing)) == 0 })
+				if len(channels) == 0 {
+					var ttlCommands []*redis.DurationCmd
+					_, err := common.RDB.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+						for _, key := range cooldownKeys {
+							ttlCommands = append(ttlCommands, pipe.PTTL(ctx, key))
+						}
+						return nil
+					})
+					if err != nil {
+						return nil, ImageAccount{}, err
+					}
+					delay := time.Hour * 24
+					for _, command := range ttlCommands {
+						delay = min(delay, max(time.Second, command.Val()))
+					}
+					return nil, ImageAccount{}, &ImageAccountCooling{DelaySeconds: int((delay + time.Second - 1) / time.Second)}
+				}
+			}
+		}
+	}
 	if cfg.CircuitBreaker {
 		available := channels[:0]
 		for _, channel := range channels {
@@ -330,6 +379,34 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	}
 	if len(channels) == 0 {
 		return nil, ImageAccount{}, errors.New("no eligible image account in the selected pool")
+	}
+	// Prefer another healthy compatible account after a transient rejection.
+	// A pool with no alternative retains its bounded same-account retry path.
+	if routing.Avoid != "" || routing.AvoidChannel != 0 {
+		alternative := false
+		for _, channel := range channels {
+			if channel.Id == routing.AvoidChannel {
+				continue
+			}
+			for _, account := range ImageChannelAccounts(channel, routing) {
+				if account.Fingerprint != routing.Avoid {
+					alternative = true
+					break
+				}
+			}
+			if alternative {
+				break
+			}
+		}
+		if alternative {
+			if routing.Avoid != "" {
+				routing.Excluded = append(routing.Excluded, routing.Avoid)
+			}
+			if routing.AvoidChannel != 0 {
+				routing.ExcludedChannels = append(routing.ExcludedChannels, routing.AvoidChannel)
+			}
+			channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return len(ImageChannelAccounts(channel, routing)) == 0 })
+		}
 	}
 	channels = preferImageChannelsForReferenceCount(channels, request.ReferenceImageCount())
 	slices.SortFunc(channels, func(a, b model.Channel) int { return cmp.Compare(b.GetPriority(), a.GetPriority()) })
@@ -400,49 +477,74 @@ func RecordImageCircuit(ctx context.Context, scope string, channelId int, succes
 }
 
 type ImageChannelAttempt struct {
-	ChannelId         int    `json:"channel_id"`
-	KeyFingerprint    string `json:"key_fingerprint,omitempty"`
-	KeyIndex          int    `json:"key_index"`
-	StartedAt         int64  `json:"started_at"`
-	FinishedAt        int64  `json:"finished_at,omitempty"`
-	Dispatched        bool   `json:"dispatched"`
-	ReferenceMode     string `json:"reference_mode"`
-	Code              int    `json:"error_code,omitempty"`
-	HTTPStatus        int    `json:"http_status,omitempty"`
-	ErrorMessage      string `json:"error_message,omitempty"`
-	ProviderCode      string `json:"provider_code,omitempty"`
-	ProviderStatus    string `json:"provider_status,omitempty"`
-	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
-	ReferenceFailure  bool   `json:"upstream_reference_failure,omitempty"`
+	AuditVersion      int                 `json:"audit_version,omitempty"`
+	Decision          *ImageRetryDecision `json:"decision,omitempty"`
+	ChannelId         int                 `json:"channel_id"`
+	KeyFingerprint    string              `json:"key_fingerprint,omitempty"`
+	KeyIndex          int                 `json:"key_index"`
+	StartedAt         int64               `json:"started_at"`
+	FinishedAt        int64               `json:"finished_at,omitempty"`
+	Dispatched        bool                `json:"dispatched"`
+	ReferenceMode     string              `json:"reference_mode"`
+	TransportUsed     string              `json:"reference_transport_used,omitempty"`
+	ReferenceFallback bool                `json:"reference_fallback,omitempty"`
+	Code              int                 `json:"error_code,omitempty"`
+	HTTPStatus        int                 `json:"http_status,omitempty"`
+	ErrorMessage      string              `json:"error_message,omitempty"`
+	ProviderCode      string              `json:"provider_code,omitempty"`
+	ProviderStatus    string              `json:"provider_status,omitempty"`
+	UpstreamRequestID string              `json:"upstream_request_id,omitempty"`
+	UpstreamTaskID    string              `json:"upstream_task_id,omitempty"`
+	ReferenceFailure  bool                `json:"upstream_reference_failure,omitempty"`
 }
 
 func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, platform string, maxSwitches int) ImageAccountRouting {
 	routing := ImageAccountRouting{}
 	effectiveRetries := retries
 	for _, attempt := range attempts {
-		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 610 || attempt.Code == 613) {
+		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 602 || attempt.Code == 610 || attempt.Code == 613) {
 			effectiveRetries = max(effectiveRetries, 1)
 			break
 		}
 	}
 	var reference []ImageChannelAttempt
 	var last string
+	var lastAttempt ImageChannelAttempt
 	switches := 0
+	legacy, lastChannel, channelSwitches := false, 0, 0
 	for _, attempt := range attempts {
 		if !attempt.Dispatched {
 			continue
 		}
 		if attempt.KeyFingerprint == "" {
-			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
-			return routing
+			legacy = true
 		}
+		if lastChannel != 0 && lastChannel != attempt.ChannelId {
+			channelSwitches++
+		}
+		lastChannel = attempt.ChannelId
 		if last != "" && last != attempt.KeyFingerprint {
 			switches++
 		}
 		last = attempt.KeyFingerprint
+		lastAttempt = attempt
 		if attempt.ReferenceFailure {
 			reference = append(reference, attempt)
 		}
+	}
+	if legacy {
+		routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
+		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606) {
+			routing.AvoidChannel = lastAttempt.ChannelId
+		}
+		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches {
+			if slices.Contains(routing.ExcludedChannels, lastChannel) || routing.PinChannel != 0 && routing.PinChannel != lastChannel {
+				routing.Stop = true
+				return routing
+			}
+			routing.PinChannel, routing.AvoidChannel = lastChannel, 0
+		}
+		return routing
 	}
 	if len(reference) > 0 {
 		first := reference[0].KeyFingerprint
@@ -458,12 +560,16 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 			routing.Excluded = []string{first}
 		}
 	}
+	// Prefer another account only after a completed transient rejection.
+	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606) {
+		routing.Avoid = last
+	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches {
 		if slices.Contains(routing.Excluded, last) || routing.Pin != "" && routing.Pin != last {
 			routing.Stop = true
 			return routing
 		}
-		routing.Pin = last
+		routing.Pin, routing.Avoid = last, ""
 	}
 	return routing
 }
@@ -473,23 +579,27 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 func ImageAttemptRouting(attempts []ImageChannelAttempt, retries int) (pin int, excluded []int, stop bool) {
 	var reference []ImageChannelAttempt
 	for _, attempt := range attempts {
-		if attempt.Dispatched && attempt.ReferenceFailure {
+		if !attempt.Dispatched {
+			continue
+		}
+		if attempt.ReferenceFailure {
 			reference = append(reference, attempt)
 		}
 	}
-	if len(reference) == 0 {
-		return 0, nil, false
-	}
-	first := reference[0].ChannelId
-	for _, attempt := range reference {
-		if attempt.ChannelId != first {
-			return 0, []int{first}, true
+	if len(reference) > 0 {
+		first := reference[0].ChannelId
+		for _, attempt := range reference {
+			if attempt.ChannelId != first {
+				return 0, []int{first}, true
+			}
+		}
+		if len(reference) <= retries {
+			pin = first
+		} else {
+			excluded = []int{first}
 		}
 	}
-	if len(reference) <= retries {
-		return first, nil, false
-	}
-	return 0, []int{first}, false
+	return pin, excluded, false
 }
 
 func ImageRetryDelay(base, ceiling, count, jitter int, retryAfter time.Duration, retryAfterMax int) int {

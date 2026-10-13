@@ -18,7 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
 
-import type { ImageCapabilities, ImageTaskDetail, ImageTaskList } from './types'
+import type {
+  ImageCapabilities,
+  ImageTaskDetail,
+  ImageTaskList,
+  ImageRetainedRequest,
+  ImageReliabilityReport,
+} from './types'
 
 export async function imageRequest<T>(
   url: string,
@@ -45,8 +51,32 @@ export const getImageCapabilities = (id: number, signal?: AbortSignal) =>
   )
 export const imageTasksPath = (admin: boolean) =>
   `/api/${admin ? 'admin' : 'user'}/async-image-tasks`
+export const getImageRetainedRequest = (id: string, signal?: AbortSignal) =>
+  imageRequest<ImageRetainedRequest>(
+    `${imageTasksPath(true)}/${encodeURIComponent(id)}/request`,
+    'GET',
+    undefined,
+    signal
+  )
+export const getImageReliability = (
+  params: URLSearchParams,
+  signal?: AbortSignal
+) =>
+  imageRequest<ImageReliabilityReport>(
+    `${imageTasksPath(true)}/reliability?${params}`,
+    'GET',
+    undefined,
+    signal
+  )
 export const mediaTasksPath = (admin: boolean) =>
   `/api/${admin ? 'admin' : 'user'}/media-tasks`
+export const getMediaTaskPlatforms = (admin: boolean, signal?: AbortSignal) =>
+  imageRequest<string[]>(
+    `${mediaTasksPath(admin)}/platforms`,
+    'GET',
+    undefined,
+    signal
+  )
 export const getImageTasks = (
   admin: boolean,
   params: URLSearchParams,

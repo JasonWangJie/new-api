@@ -106,6 +106,19 @@ func ResolveImageReferenceTransportMode(configured string, referenceRetryCount i
 	return configured
 }
 
+// ImageChannelReferenceTransport keeps channel overrides and retry transitions
+// consistent in the relay and administrator attempt history.
+func ImageChannelReferenceTransport(channel model.Channel, platform string, referenceRetryCount int, cfg ImageRuntimeConfig) string {
+	mode := channel.GetSetting().ImageReferenceTransportMode
+	if mode == "" {
+		mode = cfg.OpenAIReferenceMode
+		if platform == "gemini" {
+			mode = cfg.GeminiReferenceMode
+		}
+	}
+	return ResolveImageReferenceTransportMode(mode, referenceRetryCount)
+}
+
 var imageReferenceCacheWrite = redis.NewScript(`local expired=redis.call('ZRANGEBYSCORE',KEYS[2],'-inf',ARGV[1],'LIMIT',0,100); local used=tonumber(redis.call('GET',KEYS[4]) or '0'); for _,id in ipairs(expired) do used=used-tonumber(redis.call('HGET',KEYS[3],id) or '0'); redis.call('HDEL',KEYS[1],id); redis.call('HDEL',KEYS[3],id); redis.call('ZREM',KEYS[2],id); end; used=math.max(0,used); local old=tonumber(redis.call('HGET',KEYS[3],ARGV[2]) or '0'); local size=tonumber(ARGV[4]); if used-old+size>tonumber(ARGV[5]) then redis.call('SET',KEYS[4],used,'EX',ARGV[7]);return 0 end; redis.call('HSET',KEYS[1],ARGV[2],ARGV[6]); redis.call('HSET',KEYS[3],ARGV[2],size);redis.call('ZADD',KEYS[2],ARGV[3],ARGV[2]);redis.call('SET',KEYS[4],used-old+size,'EX',ARGV[7]);for i=1,3 do redis.call('EXPIRE',KEYS[i],ARGV[7]);end;return 1`)
 
 // DownloadImageReferenceCached keeps private reference bytes encrypted and

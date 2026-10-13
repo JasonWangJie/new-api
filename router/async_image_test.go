@@ -462,6 +462,54 @@ func TestAsyncTaskStats(t *testing.T) {
 	})
 }
 
+func TestAsyncImageAdminDiagnosticsRejectUserCredentials(t *testing.T) {
+	previousDB, previousLogDB, previousRedis, previousLimit := model.DB, model.LOG_DB, common.RedisEnabled, common.GlobalApiRateLimitEnable
+	previousType := common.MainDatabaseType()
+	db := imageRouterDatabase(t, "admin-image-diagnostics")
+	model.DB, model.LOG_DB, common.RedisEnabled, common.GlobalApiRateLimitEnable = db, db, false, false
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled, common.GlobalApiRateLimitEnable = previousDB, previousLogDB, previousRedis, previousLimit
+		common.SetMainDatabaseType(previousType)
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.Option{}, &model.Channel{}))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+	rootPAT, userPAT := "diagnostic-root-pat", "diagnostic-user-pat"
+	root := model.User{Username: "diagnostic-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AccessToken: &rootPAT, AffCode: "diagnostic-root"}
+	user := model.User{Username: "diagnostic-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AccessToken: &userPAT, AffCode: "diagnostic-user"}
+	require.NoError(t, db.Create(&root).Error)
+	require.NoError(t, db.Create(&user).Error)
+	requestBody, err := common.Marshal(service.AsyncImageRequest{Model: "image-test", Prompt: "retained private prompt", Count: 1})
+	require.NoError(t, err)
+	cipher, err := service.EncryptImagePayload(requestBody, "task:asyncimg_admin_diagnostics")
+	require.NoError(t, err)
+	task := model.AsyncImageTask{TaskId: "asyncimg_admin_diagnostics", Status: model.ImageTaskFailed, UserId: user.Id, CreatedAt: time.Now().Unix(), RequestCipher: cipher, RequestRetainUntil: time.Now().Unix() + 3600}
+	require.NoError(t, db.Create(&task).Error)
+	engine := gin.New()
+	SetApiRouter(engine)
+	for _, path := range []string{"/api/admin/async-image-tasks/reliability", "/api/admin/async-image-tasks/" + task.TaskId + "/request"} {
+		for _, tc := range []struct {
+			name, credential string
+			status           int
+		}{{"unauthenticated", "", 401}, {"task owner", userPAT, 403}, {"root reader", rootPAT, 200}} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest("GET", path, nil)
+				if tc.credential != "" {
+					request.Header.Set("Authorization", "Bearer "+tc.credential)
+				}
+				engine.ServeHTTP(recorder, request)
+				assert.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+				if tc.status != 200 {
+					assert.NotContains(t, recorder.Body.String(), "retained private prompt")
+				}
+			})
+		}
+	}
+}
+
 func imageUploadRequest(t *testing.T, engine *gin.Engine, data []byte, filename, key, credential string) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
@@ -744,7 +792,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	}
 	assert.Error(t, service.RunAsyncImageTask(context.Background(), interrupted.TaskId))
 	require.NoError(t, model.DB.Model(&model.AsyncImageTask{}).Where("task_id = ?", interrupted.TaskId).Update("lease_expires_at", time.Now().Unix()-1).Error)
-	require.NoError(t, model.RecoverAsyncImageTasks(context.Background(), 100, cfg.ExecutionTimeout))
+	require.NoError(t, model.RecoverAsyncImageTasks(context.Background(), 100, cfg.ExecutionTimeout, 0))
 	var unknown model.AsyncImageTask
 	require.NoError(t, model.DB.Where("task_id = ?", interrupted.TaskId).Take(&unknown).Error)
 	assert.Equal(t, model.ImageTaskExecutionUnknown, unknown.Status)
@@ -873,7 +921,9 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
 		assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
 		assert.Zero(t, task.NextAttemptAt)
-		assert.Empty(t, task.RequestCipher)
+		assert.True(t, task.FailedRequestRetainedAt(time.Now().Unix()))
+		_, retainedErr := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+		require.NoError(t, retainedErr, "unknown execution retains encrypted diagnostics without enabling replay")
 		assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 		assert.EqualValues(t, 2, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
@@ -996,13 +1046,15 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 			require.NoError(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId))
 			task = model.AsyncImageTask{}
 			require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
-			assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+			assert.Equal(t, model.ImageTaskInvoking, task.Status)
+			assert.Positive(t, task.UpstreamSucceededAt, "usable outputs are known even when billing usage is missing")
+			assert.NotEmpty(t, task.RequestCipher, "local recovery keeps the accepted output")
 			assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 			var held model.AsyncImageBill
 			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&held).Error)
 			assert.Equal(t, "reserved", held.Status)
 			assert.Positive(t, held.ReservedQuota, "missing usage cannot turn accepted work into a free request")
-			require.NoError(t, model.TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
+			require.NoError(t, model.TerminateAsyncImageTask(t.Context(), task))
 		}
 		assert.EqualValues(t, 9, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)

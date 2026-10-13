@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -40,6 +41,7 @@ type AsyncImageFailure struct {
 	UpstreamRequestID          string
 	RetryAfter                 time.Duration
 	ExecutionUnknown           bool
+	UpstreamTerminal           bool `json:"-"`
 	ReferenceTransportFallback bool
 }
 
@@ -50,7 +52,7 @@ func (pending *AsyncImagePending) Error() string { return "upstream image job is
 func (failure *AsyncImageFailure) Error() string { return failure.Message }
 
 func NewImageReferenceFailure(index int, err error) *AsyncImageFailure {
-	diagnostic := sanitizeAsyncImageProviderDiagnostic(err.Error(), asyncImageProviderMessageLimit)
+	diagnostic := SanitizeAsyncImageDiagnostic(err.Error(), asyncImageProviderMessageLimit)
 	message := fmt.Sprintf("Reference image %d: %s", max(1, index), diagnostic)
 	var existing *AsyncImageFailure
 	if errors.As(err, &existing) {
@@ -74,7 +76,8 @@ func ImageRetryAfter(value string, now time.Time) time.Duration {
 	return 0
 }
 
-func sanitizeAsyncImageProviderDiagnostic(value string, limit int) string {
+// SanitizeAsyncImageDiagnostic bounds diagnostic text and masks credentials and URLs.
+func SanitizeAsyncImageDiagnostic(value string, limit int) string {
 	value = strings.TrimSpace(common.MaskSensitiveInfo(value))
 	value = asyncImageBearerCredentialPattern.ReplaceAllString(value, "${1}***")
 	value = asyncImageNamedCredentialPattern.ReplaceAllString(value, "${1}***")
@@ -163,18 +166,18 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	if common.Unmarshal(body, &envelope) == nil && common.GetJsonType(envelope.Error) == "object" {
 		_ = common.Unmarshal(envelope.Error, &providerError)
 	}
-	providerMessage := sanitizeAsyncImageProviderDiagnostic(providerError.Message, asyncImageProviderMessageLimit)
+	providerMessage := SanitizeAsyncImageDiagnostic(providerError.Message, asyncImageProviderMessageLimit)
 	providerCode := ""
 	switch common.GetJsonType(providerError.Code) {
 	case "string", "number":
 		providerCode = common.JsonRawMessageToString(providerError.Code)
 	}
-	classificationCode := sanitizeAsyncImageProviderDiagnostic(providerCode, asyncImageProviderCodeLimit)
+	classificationCode := SanitizeAsyncImageDiagnostic(providerCode, asyncImageProviderCodeLimit)
 	if providerCode == "" {
 		providerCode = providerError.Type
 	}
-	providerCode = sanitizeAsyncImageProviderDiagnostic(providerCode, asyncImageProviderCodeLimit)
-	providerStatus := sanitizeAsyncImageProviderDiagnostic(providerError.Status, asyncImageProviderCodeLimit)
+	providerCode = SanitizeAsyncImageDiagnostic(providerCode, asyncImageProviderCodeLimit)
+	providerStatus := SanitizeAsyncImageDiagnostic(providerError.Status, asyncImageProviderCodeLimit)
 	if providerCode == "" {
 		providerCode = providerStatus
 	}
@@ -197,7 +200,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 			}
 		}
 	}
-	requestID = sanitizeAsyncImageProviderDiagnostic(requestID, asyncImageProviderRequestIDLimit)
+	requestID = SanitizeAsyncImageDiagnostic(requestID, asyncImageProviderRequestIDLimit)
 
 	var normalizedErr error
 	if readErr != nil {
@@ -219,7 +222,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	if providerMessage != "" {
 		failure.Message = providerMessage
 	}
-	failure.Message = sanitizeAsyncImageProviderDiagnostic(failure.Message, asyncImageProviderMessageLimit)
+	failure.Message = SanitizeAsyncImageDiagnostic(failure.Message, asyncImageProviderMessageLimit)
 	failure.ProviderCode = providerCode
 	failure.ProviderStatus = providerStatus
 	failure.UpstreamRequestID = requestID
@@ -227,13 +230,18 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	return failure
 }
 
-// ShouldFallbackGeminiReferenceTransport identifies the narrow ambiguous
-// response emitted by some Gemini-compatible gateways when they cannot use a
-// remote fileData URI. Known count, missing-reference and parameter failures
-// remain terminal; the caller must also verify that URL fallback is configured
-// and that the request actually contained a remote fileData reference.
+// ShouldFallbackGeminiReferenceTransport accepts explicit reference fetch
+// failures without requiring Google's optional error envelope fields. Ambiguous
+// errors still require the narrow compatibility response. The caller must also
+// verify that fallback is configured and a remote fileData reference was sent.
 func ShouldFallbackGeminiReferenceTransport(failure *AsyncImageFailure) bool {
-	if failure == nil || failure.HTTPStatus != http.StatusBadRequest || !strings.EqualFold(failure.ProviderStatus, "INVALID_ARGUMENT") || failure.ProviderCode != "400" {
+	if failure == nil || failure.HTTPStatus != http.StatusBadRequest || failure.ExecutionUnknown {
+		return false
+	}
+	if failure.Code == 602 {
+		return true
+	}
+	if !strings.EqualFold(failure.ProviderStatus, "INVALID_ARGUMENT") || failure.ProviderCode != "400" {
 		return false
 	}
 	return failure.Code == 601 || failure.Code == 610 || failure.Code == 613
@@ -249,21 +257,28 @@ func ClassifyAsyncImageFailure(err error, status int) *AsyncImageFailure {
 	message := err.Error()
 	lowered := strings.ToLower(message)
 	code := 610
+	var networkError net.Error
 	switch {
-	case strings.Contains(lowered, "content_policy") || strings.Contains(lowered, "safety") || strings.Contains(lowered, "policy violation") || strings.Contains(lowered, "内容安全") || strings.Contains(lowered, "政策") || strings.Contains(lowered, "third-party"):
+	case strings.Contains(lowered, "content_policy") || strings.Contains(lowered, "safety") || strings.Contains(lowered, "policy violation") || strings.Contains(lowered, "内容安全") || strings.Contains(lowered, "内容审核") || strings.Contains(lowered, "安全审核") || strings.Contains(lowered, "图片审核失败") || strings.Contains(lowered, "政策") || strings.Contains(lowered, "third-party"):
 		code = 601
-	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取"):
-		code = 602
 	case strings.Contains(lowered, "at most") && strings.Contains(lowered, "images") || strings.Contains(lowered, "too_many_reference_images") || strings.Contains(lowered, "too_many_images"):
 		code = 611
 	case strings.Contains(lowered, "prompt or input images could not be processed") || strings.Contains(lowered, "prompt_or_input_images_could_not_be_processed") || strings.Contains(lowered, "input_image_processing_failed") || strings.Contains(lowered, "no_image") || strings.Contains(lowered, "输入图片无法"):
 		code = 613
 	case strings.Contains(lowered, "请上传") || strings.Contains(lowered, "未检测到参考图") || strings.Contains(lowered, "reference images are required") || strings.Contains(lowered, "missing reference image") || strings.Contains(lowered, "reference_image_required") || strings.Contains(lowered, "no_reference_image"):
 		code = 612
-	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel"):
-		code = 603
-	case strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_request") || strings.Contains(lowered, "eligibility"):
+	case strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
 		code = 604
+	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download failed") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "国内下载中转失败"):
+		code = 602
+	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel") || strings.Contains(lowered, "no eligible image account"):
+		code = 603
+	case strings.Contains(lowered, "invalid_request") || strings.Contains(lowered, "eligibility"):
+		code = 604
+	case (status == 0 || status == http.StatusBadRequest) && (strings.Contains(lowered, "service timeout, please try again later") || strings.Contains(lowered, "生成超时，请重试") || strings.Contains(lowered, "生成超时,请重试")):
+		code = 606
+	case status == 0 && (errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout()):
+		code = 606
 	case status == 429:
 		code = 605
 	case status >= 500:

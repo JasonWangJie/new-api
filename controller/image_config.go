@@ -91,7 +91,8 @@ func GetImageChannelPoolOptions(c *gin.Context) {
 }
 
 func UpdateImageRuntime(c *gin.Context) {
-	var cfg service.ImageRuntimeConfig
+	defaults := service.DefaultImageRuntimeConfig()
+	cfg := service.ImageRuntimeConfig{FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &cfg); err != nil {
 		imageManagementError(c, 400, err)
 		return

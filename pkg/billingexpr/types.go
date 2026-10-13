@@ -12,6 +12,9 @@ type RequestInput struct {
 	Headers map[string]string
 	Body    []byte
 	Usage   map[string]any
+	// EvaluationTime keeps time probes stable when local image settlement is
+	// resumed, while Body continues to supply each actual image specification.
+	EvaluationTime *time.Time
 	// Frozen supplies only the request probes needed by a persisted task. Its
 	// timestamp keeps request conditions stable until asynchronous settlement.
 	Frozen *RequestSnapshot

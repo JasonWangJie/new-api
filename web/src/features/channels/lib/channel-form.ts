@@ -288,6 +288,9 @@ export const channelFormSchema = z
       .min(0)
       .max(MAX_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES)
       .optional(),
+    image_reference_transport_mode: z
+      .enum(['', 'passthrough', 'local', 'passthrough_fallback_local'])
+      .optional(),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
@@ -479,6 +482,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   http_protocol: HTTP_PROTOCOL_AUTO,
   http2_connection_shards: 1,
   image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
+  image_reference_transport_mode: '',
   pass_through_body_enabled: false,
   responses_websocket_enabled: false,
   system_prompt: '',
@@ -523,6 +527,9 @@ export function transformChannelToFormDefaults(
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
     http2_connection_shards: 1,
     image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
+    image_reference_transport_mode: '' as NonNullable<
+      ChannelFormValues['image_reference_transport_mode']
+    >,
     pass_through_body_enabled: false,
     responses_websocket_enabled: false,
     system_prompt: '',
@@ -546,6 +553,13 @@ export function transformChannelToFormDefaults(
         image_max_reference_images: normalizeImageMaxReferenceImages(
           parsed.image_max_reference_images
         ),
+        image_reference_transport_mode: [
+          'passthrough',
+          'local',
+          'passthrough_fallback_local',
+        ].includes(parsed.image_reference_transport_mode)
+          ? parsed.image_reference_transport_mode
+          : '',
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         responses_websocket_enabled:
           parsed.responses_websocket_enabled === true,
@@ -699,6 +713,10 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   }
   if (imageMaxReferenceImages !== DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES) {
     settingObj.image_max_reference_images = imageMaxReferenceImages
+  }
+  if (formData.image_reference_transport_mode) {
+    settingObj.image_reference_transport_mode =
+      formData.image_reference_transport_mode
   }
 
   return JSON.stringify(settingObj)

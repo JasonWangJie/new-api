@@ -273,7 +273,7 @@ func TestRecoverAsyncImageTaskContinuesKnownUpstreamPolling(t *testing.T) {
 	task.LeaseExpiresAt = now - 1
 	require.NoError(t, db.Create(&task).Error)
 
-	require.NoError(t, RecoverAsyncImageTasks(context.Background(), 100, 60))
+	require.NoError(t, RecoverAsyncImageTasks(context.Background(), 100, 60, 0))
 
 	var recovered AsyncImageTask
 	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&recovered).Error)
@@ -282,11 +282,13 @@ func TestRecoverAsyncImageTaskContinuesKnownUpstreamPolling(t *testing.T) {
 	assert.Equal(t, task.RequestCipher, recovered.RequestCipher)
 	assert.Empty(t, recovered.LeaseToken)
 	assert.Zero(t, recovered.LeaseExpiresAt)
-	assert.Equal(t, now, recovered.NextAttemptAt)
+	assert.Positive(t, recovered.NextAttemptAt)
+	assert.LessOrEqual(t, recovered.NextAttemptAt, time.Now().Unix(), "recovered work is immediately eligible, even when the database crosses a clock second")
 
 	var outbox ImageOutbox
 	require.NoError(t, db.Where("aggregate_id = ? AND kind = ?", task.TaskId, "execute").Take(&outbox).Error)
 	assert.Equal(t, "pending", outbox.Status)
+	assert.Equal(t, recovered.NextAttemptAt, outbox.NextAttemptAt)
 }
 
 func TestAsyncImageSubscriptionSettlement(t *testing.T) {
@@ -427,7 +429,7 @@ func TestAsyncImageReservationRecoveryAndReconciliation(t *testing.T) {
 			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 600, ImageFundingSelection{Source: "wallet"}))
 			// Simulate a crash after terminal state persistence but before refund.
 			require.NoError(t, db.Model(&task).Update("status", status).Error)
-			require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60))
+			require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60, 0))
 			if status == ImageTaskExecutionUnknown {
 				assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
 				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
@@ -506,11 +508,11 @@ func TestAsyncImageReservationRefundRecoveryDoesNotStarve(t *testing.T) {
 	require.NoError(t, db.Model(&AsyncImageTask{}).Where("task_id IN ?", []string{task.TaskId, other.TaskId}).Update("status", ImageTaskFailed).Error)
 	// A corrupt older ledger must not occupy the head of every recovery batch.
 	require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("token_id", -1).Error)
-	assert.Error(t, RecoverAsyncImageTasks(t.Context(), 1, 60))
+	assert.Error(t, RecoverAsyncImageTasks(t.Context(), 1, 60, 0))
 	// Accepted-work refunds still apply to soft-deleted financial records.
 	require.NoError(t, db.Delete(&User{}, task.UserId).Error)
 	require.NoError(t, db.Delete(&Token{}, task.TokenId).Error)
-	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60))
+	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60, 0))
 	var user User
 	require.NoError(t, db.Unscoped().First(&user, task.UserId).Error)
 	assert.Equal(t, 900, user.Quota)
@@ -644,4 +646,62 @@ func TestAsyncImageReservationMigration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAsyncImageRetryAuditMigration(t *testing.T) {
+	for _, upgrade := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh", true: "upgrade"}[upgrade], func(t *testing.T) {
+			db := imageTestDatabase(t, "retry-audit-migration")
+			legacy := AsyncImageTask{TaskId: "legacy-retained", Status: ImageTaskFailed, RequestCipher: []byte("legacy-cipher"), Attempts: `[{"channel_id":7}]`, Quota: 123}
+			if upgrade {
+				// The audit base has exactly these task fields except the two new
+				// columns. Removing them reproduces that schema with existing data.
+				require.NoError(t, db.AutoMigrate(&AsyncImageTask{}))
+				require.NoError(t, db.Create(&legacy).Error)
+				require.NoError(t, db.Migrator().DropIndex(&AsyncImageTask{}, "idx_image_request_retention"))
+				require.NoError(t, db.Migrator().DropColumn(&AsyncImageTask{}, "request_retain_until"))
+				require.NoError(t, db.Migrator().DropColumn(&AsyncImageTask{}, "retry_decision"))
+			}
+			require.NoError(t, db.AutoMigrate(&AsyncImageTask{}))
+			trace := &imageReservationMigrationTrace{Interface: logger.Default.LogMode(logger.Silent)}
+			require.NoError(t, db.Session(&gorm.Session{Logger: trace}).AutoMigrate(&AsyncImageTask{}))
+			assert.Empty(t, trace.changes, "second startup must be idempotent")
+			if upgrade {
+				var saved AsyncImageTask
+				require.NoError(t, db.Where("task_id = ?", legacy.TaskId).Take(&saved).Error)
+				assert.Equal(t, legacy.RequestCipher, saved.RequestCipher)
+				assert.Equal(t, legacy.Attempts, saved.Attempts)
+				assert.Equal(t, legacy.Quota, saved.Quota)
+				assert.Zero(t, saved.RequestRetainUntil, "migration cannot revive historical failed requests")
+				legacy.Id = 0
+				assert.Error(t, db.Create(&legacy).Error, "task identity uniqueness must survive upgrade")
+			}
+		})
+	}
+}
+
+func TestAsyncImageFailedRequestRetentionDoesNotEraseActiveRecovery(t *testing.T) {
+	db, original, bill := imageDatabaseFixture(t)
+	require.NoError(t, db.Create(&bill).Error)
+	now := time.Now().Unix()
+	for _, status := range []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown, ImageTaskQueued, ImageTaskStorageFailed} {
+		task := original
+		task.Id, task.TaskId, task.Status = 0, "retain-"+status, status
+		task.RequestRetainUntil, task.RetryDecision = now-1, `{"version":1,"action":"stop"}`
+		require.NoError(t, db.Create(&task).Error)
+	}
+	require.NoError(t, EraseExpiredAsyncImageTaskContent(t.Context()))
+	for _, status := range []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown, ImageTaskQueued, ImageTaskStorageFailed} {
+		var task AsyncImageTask
+		require.NoError(t, db.Where("task_id = ?", "retain-"+status).Take(&task).Error)
+		if status == ImageTaskQueued || status == ImageTaskStorageFailed {
+			assert.Equal(t, original.RequestCipher, task.RequestCipher)
+		} else {
+			assert.Empty(t, task.RequestCipher)
+		}
+		assert.Equal(t, `{"version":1,"action":"stop"}`, task.RetryDecision)
+	}
+	var savedBill AsyncImageBill
+	require.NoError(t, db.Where("task_id = ?", bill.TaskId).Take(&savedBill).Error)
+	assert.Equal(t, bill.Status, savedBill.Status, "payload erasure must not settle or refund money")
 }

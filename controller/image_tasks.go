@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -27,10 +28,13 @@ func imageTaskListQuery(c *gin.Context, admin bool) (*gorm.DB, error) {
 			}
 		}
 	}
-	for param, column := range map[string]string{"task_id": "task_id", "protocol": "dialect", "platform": "platform", "request_type": "request_type", "billing_status": "billing_status", "group": "group"} {
+	for param, column := range map[string]string{"task_id": "task_id", "protocol": "dialect", "request_type": "request_type", "billing_status": "billing_status", "group": "group"} {
 		if value := c.Query(param); value != "" {
 			query = query.Where(clause.Eq{Column: column, Value: value})
 		}
+	}
+	if platform := c.Query("platform"); platform != "" {
+		query = query.Where("provider = ? OR (provider IS NULL OR provider = '') AND platform = ?", platform, platform)
 	}
 	for param, column := range map[string]string{"api_key_id": "token_id", "channel_id": "channel_id", "account_id": "channel_id", "user_id": "user_id"} {
 		if value := c.Query(param); value != "" {
@@ -249,18 +253,20 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 				history := make([]gin.H, 0, len(histories[task.TaskId]))
 				for _, attempt := range histories[task.TaskId] {
 					history = append(history, gin.H{
-						"channel_name":        channelNames[attempt.ChannelId],
-						"key_index":           attempt.KeyIndex,
-						"started_at":          attempt.StartedAt,
-						"finished_at":         attempt.FinishedAt,
-						"dispatched":          attempt.Dispatched,
-						"reference_mode":      attempt.ReferenceMode,
-						"error_code":          attempt.Code,
-						"http_status":         attempt.HTTPStatus,
-						"error_message":       attempt.ErrorMessage,
-						"provider_code":       attempt.ProviderCode,
-						"provider_status":     attempt.ProviderStatus,
-						"upstream_request_id": attempt.UpstreamRequestID,
+						"channel_name":             channelNames[attempt.ChannelId],
+						"key_index":                attempt.KeyIndex,
+						"started_at":               attempt.StartedAt,
+						"finished_at":              attempt.FinishedAt,
+						"dispatched":               attempt.Dispatched,
+						"reference_mode":           attempt.ReferenceMode,
+						"reference_transport_used": attempt.TransportUsed,
+						"retry_decision":           attempt.Decision,
+						"error_code":               attempt.Code,
+						"http_status":              attempt.HTTPStatus,
+						"error_message":            attempt.ErrorMessage,
+						"provider_code":            attempt.ProviderCode,
+						"provider_status":          attempt.ProviderStatus,
+						"upstream_request_id":      attempt.UpstreamRequestID,
 					})
 				}
 				data["attempt_history"] = history
@@ -279,10 +285,16 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	if task.ResultSource != "" {
 		data["result_source"] = task.ResultSource
 	}
+	var decision service.ImageRetryDecision
+	if common.UnmarshalJsonStr(task.RetryDecision, &decision) == nil && decision.Version == 1 {
+		data["retry_decision"] = decision
+	}
 	if task.FinishedAt > 0 {
 		data["duration_ms"] = max(0, task.FinishedAt-task.CreatedAt) * 1000
 	}
 	if admin {
+		data["retained_request_available"] = task.FailedRequestRetainedAt(time.Now().Unix())
+		data["request_retain_until"] = task.RequestRetainUntil
 		data["user_id"] = task.UserId
 		data["channel_id"] = task.ChannelId
 		data["attempts"] = task.Attempts
@@ -291,6 +303,91 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 		data["reconciliation_status"] = task.ReconciliationStatus
 	}
 	return data
+}
+
+// GetImageRetainedRequest exposes a diagnostic whitelist, never credentials,
+// billing snapshots, image bodies or usable signed reference URLs.
+func GetImageRetainedRequest(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	var task model.AsyncImageTask
+	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id")).Take(&task).Error; err != nil || !task.FailedRequestRetainedAt(time.Now().Unix()) {
+		imageManagementError(c, 404, errors.New("Retained image request is unavailable or expired"))
+		return
+	}
+	data, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+	if err != nil {
+		imageManagementError(c, 503, errors.New("Retained image request cannot be decrypted"))
+		return
+	}
+	var request service.AsyncImageRequest
+	if err := common.Unmarshal(data, &request); err != nil {
+		imageManagementError(c, 503, errors.New("Retained image request is invalid"))
+		return
+	}
+	// Existing masking removes credential patterns and reference URL secrets.
+	const maxPromptRunes = 65536
+	imageManagementData(c, gin.H{"task_id": task.TaskId, "retain_until": task.RequestRetainUntil, "request": gin.H{
+		"model":             service.SanitizeAsyncImageDiagnostic(request.Model, 256),
+		"prompt":            service.SanitizeAsyncImageDiagnostic(request.Prompt, maxPromptRunes),
+		"prompt_characters": utf8.RuneCountInString(request.Prompt),
+		"prompt_bytes":      len(request.Prompt),
+		"prompt_truncated":  utf8.RuneCountInString(request.Prompt) > maxPromptRunes,
+		"platform":          service.SanitizeAsyncImageDiagnostic(request.Platform, 64),
+		"kind":              service.SanitizeAsyncImageDiagnostic(request.Kind, 64),
+		"count":             request.Count,
+		"size":              service.SanitizeAsyncImageDiagnostic(request.Size, 128),
+		"resolution":        service.SanitizeAsyncImageDiagnostic(request.Resolution, 64),
+		"aspect_ratio":      service.SanitizeAsyncImageDiagnostic(request.AspectRatio, 64),
+		"reference_count":   request.ReferenceImageCount(),
+	}})
+}
+
+func GetImageReliability(c *gin.Context) {
+	query, err := imageTaskListQuery(c, true)
+	if err != nil {
+		imageManagementError(c, 400, err)
+		return
+	}
+	location, _ := time.LoadLocation(c.DefaultQuery("timezone", "UTC")) // Validated by the list query.
+	start, end := c.Query("start_date"), c.Query("end_date")
+	if start == "" && end == "" {
+		start = time.Now().In(location).Format("2006-01-02")
+		end = start
+	}
+	startTime, startErr := time.ParseInLocation("2006-01-02", start, location)
+	endTime, endErr := time.ParseInLocation("2006-01-02", end, location)
+	if startErr != nil || endErr != nil || endTime.AddDate(0, 0, 1).After(startTime.AddDate(0, 0, 31)) {
+		imageManagementError(c, 400, errors.New("Reliability statistics require a complete date range of at most 31 days"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	report, err := service.ImageReliability(query.WithContext(ctx))
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	channelIDs := make([]int, 0, len(report.Groups))
+	for _, group := range report.Groups {
+		if group.ChannelID > 0 {
+			channelIDs = append(channelIDs, group.ChannelID)
+		}
+	}
+	if len(channelIDs) > 0 {
+		var channels []model.Channel
+		if err := model.DB.WithContext(ctx).Select("id", "name").Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			imageManagementError(c, 503, err)
+			return
+		}
+		names := make(map[int]string, len(channels))
+		for _, channel := range channels {
+			names[channel.Id] = channel.Name
+		}
+		for i := range report.Groups {
+			report.Groups[i].ChannelName = names[report.Groups[i].ChannelID]
+		}
+	}
+	imageManagementData(c, report)
 }
 
 func GetImageTask(c *gin.Context, admin bool) {

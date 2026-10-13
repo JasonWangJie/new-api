@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -26,25 +27,43 @@ type AsyncImageInputPart struct {
 }
 
 type AsyncImageRequest struct {
-	Reservation    *model.AsyncImageBill        `json:"-"`
-	Billing        *MediaBillingSnapshot        `json:"billing,omitempty"`
-	Provider       string                       `json:"provider,omitempty"`
-	PolicyPlatform string                       `json:"policy_platform,omitempty"`
-	ClientIP       string                       `json:"client_ip,omitempty"`
-	Platform       string                       `json:"platform"`
-	Dialect        string                       `json:"dialect"`
-	SourcePath     string                       `json:"source_path"`
-	InputFormat    string                       `json:"input_format,omitempty"`
-	Model          string                       `json:"model"`
-	Prompt         string                       `json:"prompt"`
-	Kind           string                       `json:"kind"`
-	Size           string                       `json:"size,omitempty"`
-	Resolution     string                       `json:"resolution,omitempty"`
-	AspectRatio    string                       `json:"aspect_ratio,omitempty"`
-	ExplicitTier   bool                         `json:"explicit_tier"`
-	Count          int                          `json:"count"`
-	Parts          []AsyncImageInputPart        `json:"parts"`
-	Native         map[string]common.RawMessage `json:"native,omitempty"`
+	ReferenceTransportUsed *string                      `json:"-"`
+	Completion             *AsyncImageCompletion        `json:"completion,omitempty"`
+	PostprocessContext     context.Context              `json:"-"`
+	Reservation            *model.AsyncImageBill        `json:"-"`
+	Billing                *MediaBillingSnapshot        `json:"billing,omitempty"`
+	Provider               string                       `json:"provider,omitempty"`
+	PolicyPlatform         string                       `json:"policy_platform,omitempty"`
+	ClientIP               string                       `json:"client_ip,omitempty"`
+	Platform               string                       `json:"platform"`
+	Dialect                string                       `json:"dialect"`
+	SourcePath             string                       `json:"source_path"`
+	InputFormat            string                       `json:"input_format,omitempty"`
+	Model                  string                       `json:"model"`
+	Prompt                 string                       `json:"prompt"`
+	Kind                   string                       `json:"kind"`
+	Size                   string                       `json:"size,omitempty"`
+	Resolution             string                       `json:"resolution,omitempty"`
+	AspectRatio            string                       `json:"aspect_ratio,omitempty"`
+	ExplicitTier           bool                         `json:"explicit_tier"`
+	Count                  int                          `json:"count"`
+	Parts                  []AsyncImageInputPart        `json:"parts"`
+	Native                 map[string]common.RawMessage `json:"native,omitempty"`
+}
+
+// AsyncImageCompletion is private, encrypted evidence of an accepted output.
+// Recovery consumes this response and its frozen billing facts, never a second
+// generation. Keeping it in the request envelope needs no schema migration.
+type AsyncImageCompletion struct {
+	EvaluatedAt   time.Time                 `json:"evaluated_at"`
+	Body          common.RawMessage         `json:"body"`
+	Usage         *dto.Usage                `json:"usage"`
+	Billing       MediaBillingSnapshot      `json:"billing"`
+	BillingBody   []byte                    `json:"billing_body"`
+	UpstreamModel string                    `json:"upstream_model"`
+	BillingModel  string                    `json:"billing_model"`
+	URLs          []string                  `json:"urls,omitempty"`
+	Profile       *dto.UpstreamAsyncProfile `json:"profile,omitempty"`
 }
 
 func (request AsyncImageRequest) ReferenceImageCount() int {

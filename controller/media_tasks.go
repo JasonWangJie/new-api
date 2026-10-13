@@ -307,6 +307,15 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 	imageManagementData(c, gin.H{"task_id": c.Param("task_id")})
 }
 
+func GetMediaTaskPlatforms(c *gin.Context) {
+	platforms, err := service.ConfiguredMediaTaskPlatforms(c.Request.Context())
+	if err != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, err)
+		return
+	}
+	imageManagementData(c, platforms)
+}
+
 func ListMediaTasks(c *gin.Context, admin bool) {
 	page, pageErr := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, sizeErr := strconv.Atoi(c.DefaultQuery("page_size", "20"))

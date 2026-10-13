@@ -59,6 +59,9 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 	}
 	headers := normalizeHeaders(request.Headers)
 	now := time.Now()
+	if request.EvaluationTime != nil && !request.EvaluationTime.IsZero() {
+		now = *request.EvaluationTime
+	}
 	if request.Frozen != nil {
 		headers = request.Frozen.Headers
 		if !request.Frozen.RequestedAt.IsZero() {

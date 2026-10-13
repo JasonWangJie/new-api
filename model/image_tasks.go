@@ -15,9 +15,14 @@ const upstreamImageResultEvent = "upstream_result_received"
 // EraseExpiredAsyncImageTaskContent preserves accounting and idempotency
 // tombstones while removing expired prompt, payload and reference content.
 func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
-	return DB.WithContext(ctx).Model(&AsyncImageTask{}).
-		Where("expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", time.Now().Unix(), []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
+	now := time.Now().Unix()
+	taskError := DB.WithContext(ctx).Model(&AsyncImageTask{}).
+		Where("expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
 		Updates(map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}).Error
+	retentionError := DB.WithContext(ctx).Model(&AsyncImageTask{}).
+		Where("request_retain_until > 0 AND request_retain_until <= ? AND request_cipher IS NOT NULL AND status IN ?", now, []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
+		Update("request_cipher", nil).Error
+	return errors.Join(taskError, retentionError)
 }
 
 // AcceptAsyncImageTask serializes admission on its Token and commits the task,
@@ -91,13 +96,13 @@ func ClaimAsyncImageTask(ctx context.Context, id, lease string, seconds int) (As
 		return task, err
 	}
 	now := time.Now().Unix()
-	if task.Terminal() || (task.Status == ImageTaskInvoking && task.UpstreamTaskId == "") || task.NextAttemptAt <= 0 || task.NextAttemptAt > now || task.LeaseExpiresAt > now {
+	if task.Terminal() || (task.Status == ImageTaskInvoking && task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0) || task.NextAttemptAt <= 0 || task.NextAttemptAt > now || task.LeaseExpiresAt > now {
 		return task, ErrImageConflict
 	}
 	updates := map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds), "heartbeat_at": now}
 	if task.Status == ImageTaskQueued {
 		updates["status"] = ImageTaskInvoking
-		if task.UpstreamTaskId == "" {
+		if task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0 {
 			updates["channel_id"] = 0
 			updates["dispatched_at"] = 0
 		}
@@ -119,12 +124,27 @@ func ScheduleAsyncImagePoll(ctx context.Context, task AsyncImageTask, nextAttemp
 	if task.UpstreamTaskId == "" || nextAttemptAt <= 0 {
 		return ErrImageConflict
 	}
-	return TransitionImageTask(ctx, task, map[string]any{
+	updates := map[string]any{
 		"status":           ImageTaskInvoking,
 		"lease_token":      "",
 		"lease_expires_at": 0,
 		"next_attempt_at":  nextAttemptAt,
-	}, eventType, message, "execute")
+	}
+	var decision ImageRetryDecision
+	_ = common.UnmarshalJsonStr(task.RetryDecision, &decision)
+	decision.Version, decision.Stage, decision.Action, decision.Reason, decision.Rule = 1, "poll", "poll_same_job", "accepted_job", eventType
+	decision.Budget, decision.Used, decision.Limit = "poll", task.TransientRetryCount, 0
+	decision.NextAttemptAt, decision.RecordedAt = nextAttemptAt, time.Now().Unix()
+	encoded, err := common.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	updates["retry_decision"] = string(encoded)
+	if eventType == "upstream_pending" {
+		// Only a valid provider response resets consecutive polling failures.
+		updates["transient_retry_count"] = 0
+	}
+	return TransitionImageTask(ctx, task, updates, eventType, message, "execute")
 }
 
 // RecordAsyncImageUpstreamResult keeps one result milestone and refreshes its
@@ -192,7 +212,11 @@ func HeartbeatAsyncImageTask(ctx context.Context, id, lease string, seconds int)
 func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelId int) error {
 	now := time.Now().Unix()
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND status = ? AND version = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, ImageTaskInvoking, task.Version, task.LeaseToken, now).Updates(map[string]any{"channel_id": channelId, "dispatched_at": now, "progress": 20, "version": task.Version + 1, "updated_at": now})
+		updates := map[string]any{"channel_id": channelId, "dispatched_at": now, "progress": 20, "version": task.Version + 1, "updated_at": now}
+		if task.Attempts != "" {
+			updates["attempts"] = task.Attempts
+		}
+		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND status = ? AND version = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, ImageTaskInvoking, task.Version, task.LeaseToken, now).Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -283,10 +307,22 @@ func ResumeAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
 		return err
 	}
 	status := ImageTaskUpstreamSucceeded
+	kind := "postprocess"
+	if task.UpstreamSucceededAt > 0 && len(task.RequestCipher) > 0 && task.ImageCount == 0 {
+		if bill.Status != "reserved" {
+			return ErrImageConflict
+		}
+		status, kind = ImageTaskInvoking, "execute"
+	}
 	if task.ResultCount == task.ImageCount && task.ResultCount > 0 {
 		status = ImageTaskBillingPending
 	}
-	return TransitionImageTask(ctx, task, map[string]any{"status": status, "error_code": "", "error_message": "", "public_error_code": 0, "storage_retry_count": 0, "billing_retry_count": 0, "next_attempt_at": time.Now().Unix(), "lease_token": "", "lease_expires_at": 0}, "resumed", "Post-processing recovery; upstream generation is not repeated", "postprocess")
+	decision := ImageRetryDecision{Version: 1, Stage: "recovery", Action: "resume_output", Reason: "manual_recovery", Rule: "postprocess_resume", RecordedAt: time.Now().Unix(), NextAttemptAt: time.Now().Unix(), TotalUsed: task.RetryCount}
+	encoded, err := common.Marshal(decision)
+	if err != nil {
+		return err
+	}
+	return TransitionImageTask(ctx, task, map[string]any{"status": status, "error_code": "", "error_message": "", "public_error_code": 0, "retry_decision": string(encoded), "storage_retry_count": 0, "billing_retry_count": 0, "next_attempt_at": time.Now().Unix(), "lease_token": "", "lease_expires_at": 0}, "resumed", "Post-processing recovery; upstream generation is not repeated", kind)
 }
 
 func TerminateAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
@@ -316,7 +352,12 @@ func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reconcile
 		if current.Terminal() && !(reconciled && current.Status == ImageTaskExecutionUnknown) || current.Version != task.Version || current.Status != task.Status {
 			return ErrImageConflict
 		}
-		updates := map[string]any{"status": ImageTaskFailed, "request_cipher": nil, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "error_code": "admin_terminated", "public_error_code": 608, "error_message": "Task terminated by administrator", "reconciliation_status": "not_charged", "finished_at": time.Now().Unix()}
+		decision := ImageRetryDecision{Version: 1, Stage: "recovery", Action: "stop", Reason: "admin_terminated", Rule: "administrator_termination", RecordedAt: time.Now().Unix(), TotalUsed: task.RetryCount}
+		encoded, err := common.Marshal(decision)
+		if err != nil {
+			return err
+		}
+		updates := map[string]any{"status": ImageTaskFailed, "request_cipher": nil, "request_retain_until": 0, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "error_code": "admin_terminated", "public_error_code": 608, "error_message": "Task terminated by administrator", "reconciliation_status": "not_charged", "finished_at": time.Now().Unix()}
 		var bill AsyncImageBill
 		if err := lockForUpdate(tx).Where("task_id = ?", task.TaskId).Take(&bill).Error; err == nil && bill.Status == "applied" {
 			updates["reconciliation_status"] = "settled"
@@ -339,30 +380,52 @@ func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reconcile
 	return RefundAsyncImageReservation(context.WithoutCancel(ctx), task.TaskId)
 }
 
-func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int) error {
+func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRetentionHours int) error {
 	now := time.Now().Unix()
 	var tasks []AsyncImageTask
-	if err := DB.WithContext(ctx).Where("status = ? AND ((lease_token <> '' AND lease_expires_at <= ?) OR (started_at > 0 AND started_at <= ?))", ImageTaskInvoking, now, now-int64(timeout)).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
+	if err := DB.WithContext(ctx).Where("status = ? AND ((lease_token <> '' AND lease_expires_at <= ?) OR (started_at > 0 AND started_at <= ? AND COALESCE(upstream_succeeded_at, 0) = 0))", ImageTaskInvoking, now, now-int64(timeout)).Order("id").Limit(limit).Find(&tasks).Error; err != nil {
 		return err
 	}
 	for _, task := range tasks {
 		updates := map[string]any{"status": ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": now}
 		event, kind := "recovered", "execute"
-		if task.UpstreamTaskId != "" {
+		if task.UpstreamTaskId != "" || task.UpstreamSucceededAt > 0 {
 			updates["status"] = ImageTaskInvoking
 		} else if task.DispatchedAt > 0 {
 			updates["status"] = ImageTaskExecutionUnknown
 			updates["request_cipher"] = nil
+			if requestRetentionHours > 0 && len(task.RequestCipher) > 0 {
+				updates["request_cipher"] = task.RequestCipher
+				updates["request_retain_until"] = now + int64(min(requestRetentionHours, 168))*3600
+			}
 			updates["public_error_code"] = 608
 			updates["error_code"] = "execution_unknown"
 			updates["error_message"] = "Upstream execution may have completed; manual reconciliation is required"
 			updates["finished_at"] = now
 			event, kind = "execution_unknown", ""
 		}
+		var decision ImageRetryDecision
+		_ = common.UnmarshalJsonStr(task.RetryDecision, &decision)
+		decision.Version, decision.Stage, decision.RecordedAt, decision.Rule = 1, "recovery", now, "lease_recovery"
+		decision.Action, decision.Reason = "retry_submission", "not_dispatched"
+		decision.NextAttemptAt = now
+		if task.UpstreamTaskId != "" || task.UpstreamSucceededAt > 0 {
+			decision.Action, decision.Reason = "resume_output", "accepted_output"
+			if task.UpstreamSucceededAt == 0 {
+				decision.Action, decision.Reason = "poll_same_job", "accepted_job"
+			}
+		} else if task.DispatchedAt > 0 {
+			decision.Action, decision.Reason, decision.NextAttemptAt = "reconcile_unknown", "execution_unknown", 0
+		}
+		encoded, err := common.Marshal(decision)
+		if err != nil {
+			return err
+		}
+		updates["retry_decision"] = string(encoded)
 		if err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			updates["version"] = task.Version + 1
 			updates["updated_at"] = now
-			changed := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND (lease_expires_at <= ? OR (started_at > 0 AND started_at <= ?))", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now, now-int64(timeout)).Updates(updates)
+			changed := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ? AND lease_token = ? AND (lease_expires_at <= ? OR (started_at > 0 AND started_at <= ? AND COALESCE(upstream_succeeded_at, 0) = 0))", task.TaskId, task.Version, ImageTaskInvoking, task.LeaseToken, now, now-int64(timeout)).Updates(updates)
 			if changed.Error != nil {
 				return changed.Error
 			}

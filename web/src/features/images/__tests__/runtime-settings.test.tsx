@@ -31,6 +31,10 @@ afterEach(() => {
 
 const runtime = {
   async_enabled: true,
+  failed_request_retention_hours: 24,
+  account_cooldown_seconds: 60,
+  supplier_retry_capacity: 10,
+  supplier_retry_window_seconds: 60,
   auto_archive_to_library: false,
   worker_concurrency: 4,
   worker_lease_seconds: 120,
@@ -110,6 +114,35 @@ test('edits the global reference-image limit in the normal runtime form', async 
     )
   )
   expect(onSuccess).toHaveBeenCalledOnce()
+})
+
+test('saves disabled encrypted retention and bounded retry controls from the runtime form', async () => {
+  vi.mocked(imageRequest).mockResolvedValue(undefined)
+  render(<ImageRuntimeForm initial={runtime} onSuccess={vi.fn()} />)
+  const user = userEvent.setup()
+  const retention = screen.getByRole('spinbutton', {
+    name: 'Failed request retention (hours)',
+  })
+  expect(retention).toHaveAttribute('max', '168')
+  await user.clear(retention)
+  await user.type(retention, '0')
+  expect(
+    screen.getByRole('spinbutton', { name: 'Account cooldown (seconds)' })
+  ).toHaveValue(60)
+  expect(
+    screen.getByRole('spinbutton', { name: 'Supplier retry capacity' })
+  ).toHaveValue(10)
+  expect(
+    screen.getByRole('spinbutton', { name: 'Supplier retry window (seconds)' })
+  ).toHaveAttribute('min', '1')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/runtime',
+      'PUT',
+      { ...runtime, failed_request_retention_hours: 0 }
+    )
+  )
 })
 
 test('explains every advanced runtime field outside the strict JSON document', async () => {

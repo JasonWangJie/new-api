@@ -26,6 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { cn } from '@/lib/utils'
 
 export function ImageSelect({
   label,
@@ -33,16 +34,18 @@ export function ImageSelect({
   options,
   onChange,
   disabled,
+  className,
 }: {
   label: string
   value: string
   options: { value: string; label: string }[]
   onChange: (value: string) => void
   disabled?: boolean
+  className?: string
 }) {
   const id = useId()
   return (
-    <div className='min-w-0 space-y-2'>
+    <div className={cn('min-w-0 space-y-2', className)}>
       <Label htmlFor={id}>{label}</Label>
       <Select
         items={options}

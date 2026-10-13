@@ -84,6 +84,11 @@ export interface ChannelSettings {
   force_format?: boolean
   thinking_to_content?: boolean
   image_max_reference_images?: number
+  image_reference_transport_mode?:
+    | ''
+    | 'passthrough'
+    | 'local'
+    | 'passthrough_fallback_local'
   proxy?: string
   pass_through_body_enabled?: boolean
   responses_websocket_enabled?: boolean

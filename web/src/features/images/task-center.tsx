@@ -34,6 +34,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { CompactDateTimeRangePicker } from '@/components/compact-date-time-range-picker'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { CopyButton } from '@/components/copy-button'
 import {
@@ -51,6 +52,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { hasPermission } from '@/lib/admin-permissions'
+import dayjs from '@/lib/dayjs'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
@@ -58,6 +60,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import {
   getImageTask,
   getImageTasks,
+  getMediaTaskPlatforms,
   imageRequest,
   mediaTasksPath,
 } from './api'
@@ -66,6 +69,7 @@ import {
   ImageRequestTypeBadge,
   ImageStatusBadge,
 } from './components/image-badges'
+import { ImageReliabilityPanel } from './components/image-reliability-panel'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
@@ -90,13 +94,6 @@ const TASK_STATES = [
   'expired',
   'execution_unknown',
 ]
-const TASK_FILTER_FIELDS = [
-  { key: 'model', label: 'Model' },
-  { key: 'group', label: 'Group' },
-  { key: 'api_key_id', label: 'API Key ID' },
-  { key: 'task_id', label: 'Task ID' },
-] as const
-
 export function ImageTaskCenter({ admin = false }: { admin?: boolean }) {
   const userId = useAuthStore((state) => state.auth.user?.id)
   return userId ? (
@@ -134,13 +131,9 @@ function TaskCenterSession({
     q: '',
     status: '',
     platform: '',
-    protocol: '',
     billing_status: '',
     request_type: '',
-    storage_provider: '',
-    provider: '',
     media_type: '',
-    stage: '',
   })
   const [filters, setFilters] = useState(draft)
   const [pagination, setPagination] = useState<PaginationState>({
@@ -160,9 +153,6 @@ function TaskCenterSession({
     confirmUpstreamChecked?: boolean
   } | null>(null)
   const [busy, setBusy] = useState(false)
-  const [feedback, setFeedback] = useState<
-    { id: string; status: string; reason?: string }[]
-  >([])
   const params = new URLSearchParams({
     ...Object.fromEntries(
       Object.entries(filters).filter(([, value]) => !!value)
@@ -176,6 +166,10 @@ function TaskCenterSession({
     queryKey: ['image-task-center', userId, admin, params.toString()],
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
     refetchInterval: autoRefresh ? 10000 : false,
+  })
+  const platforms = useQuery({
+    queryKey: ['image-task-platforms', userId, admin],
+    queryFn: ({ signal }) => getMediaTaskPlatforms(admin, signal),
   })
   const openTask = useCallback((id: string) => {
     startTransition(() => setDetail(id))
@@ -501,7 +495,7 @@ function TaskCenterSession({
     setBusy(true)
     try {
       if (operation.action === 'batch-terminate') {
-        const items: { id: string; status: string; reason?: string }[] = []
+        const failures: { id: string; reason: string }[] = []
         for (const id of operation.ids) {
           try {
             await imageRequest(
@@ -511,17 +505,44 @@ function TaskCenterSession({
                 ? { confirm_upstream_checked: true }
                 : undefined
             )
-            items.push({ id, status: 'terminated' })
           } catch (error) {
-            items.push({
+            failures.push({
               id,
-              status: 'failed',
               reason:
                 error instanceof Error ? error.message : t('Operation failed'),
             })
           }
         }
-        setFeedback(items)
+        const succeeded = operation.ids.length - failures.length
+        if (failures.length) {
+          toast.error(
+            t('Task termination: {{succeeded}} succeeded, {{failed}} failed', {
+              succeeded,
+              failed: failures.length,
+            }),
+            {
+              description: (
+                <ul className='max-h-40 space-y-1 overflow-auto [overflow-wrap:anywhere]'>
+                  {failures.map((failure) => (
+                    <li key={failure.id}>
+                      {failure.id}: {failure.reason}
+                    </li>
+                  ))}
+                </ul>
+              ),
+              duration: 8000,
+              closeButton: true,
+            }
+          )
+        } else {
+          toast.success(
+            t('Tasks terminated: {{count}}', { count: succeeded }),
+            {
+              duration: 5000,
+              closeButton: true,
+            }
+          )
+        }
       } else {
         await imageRequest(
           `${mediaTasksPath(admin)}/${operation.ids[0]}/${operation.action}`,
@@ -578,15 +599,58 @@ function TaskCenterSession({
   }
   const primaryFilters = (
     <>
+      <div className='col-span-2 min-w-0 xl:col-span-5'>
+        {field('q', 'Search tasks')}
+      </div>
+      <div className='min-w-0 xl:col-span-2'>
+        <ImageSelect
+          className='flex flex-col gap-1.5 space-y-0'
+          label={t('Platform')}
+          value={draft.platform}
+          options={choices(platforms.data || [])}
+          disabled={platforms.isPending}
+          onChange={(value) =>
+            setDraft((previous) => ({ ...previous, platform: value }))
+          }
+        />
+      </div>
+      <div className='min-w-0 xl:col-span-2'>
+        <ImageSelect
+          className='flex flex-col gap-1.5 space-y-0'
+          label={t('Status')}
+          value={draft.status}
+          options={choices(TASK_STATES)}
+          onChange={(value) =>
+            setDraft((previous) => ({ ...previous, status: value }))
+          }
+        />
+      </div>
+      <div className='col-span-2 min-w-0 space-y-1.5 xl:col-span-3'>
+        <Label htmlFor='task-filter-date-range'>{t('Date Range')}</Label>
+        <CompactDateTimeRangePicker
+          id='task-filter-date-range'
+          precision='day'
+          start={
+            draft.start_date ? dayjs(draft.start_date).toDate() : undefined
+          }
+          end={draft.end_date ? dayjs(draft.end_date).toDate() : undefined}
+          className={cn('min-w-0', isMobile && 'min-h-11')}
+          onChange={({ start, end }) =>
+            setDraft((previous) => ({
+              ...previous,
+              start_date: start ? dayjs(start).format('YYYY-MM-DD') : '',
+              end_date: end ? dayjs(end).format('YYYY-MM-DD') : '',
+            }))
+          }
+        />
+      </div>
+    </>
+  )
+  const advancedFilters = (
+    <>
+      {field('model', 'Model')}
       <ImageSelect
-        label={t('Status')}
-        value={draft.status}
-        options={choices(TASK_STATES)}
-        onChange={(value) =>
-          setDraft((previous) => ({ ...previous, status: value }))
-        }
-      />
-      <ImageSelect
+        className='flex flex-col gap-1.5 space-y-0'
         label={t('Media type')}
         value={draft.media_type}
         options={[
@@ -602,22 +666,7 @@ function TaskCenterSession({
         }
       />
       <ImageSelect
-        label={t('Phase')}
-        value={draft.stage}
-        options={[
-          { value: '', label: t('All') },
-          { value: 'queued', label: t('Queued') },
-          { value: 'generating', label: t('Generating') },
-          { value: 'saving', label: t('Saving') },
-          { value: 'completed', label: t('Completed') },
-          { value: 'failed', label: t('Failed') },
-        ]}
-        onChange={(value) =>
-          setDraft((previous) => ({ ...previous, stage: value }))
-        }
-      />
-      {field('provider', 'Provider')}
-      <ImageSelect
+        className='flex flex-col gap-1.5 space-y-0'
         label={t('Request type')}
         value={draft.request_type}
         options={choices([
@@ -635,39 +684,7 @@ function TaskCenterSession({
         }
       />
       <ImageSelect
-        label={t('Storage provider')}
-        value={draft.storage_provider}
-        options={choices([
-          'local',
-          'aws',
-          'aliyun',
-          'tencent',
-          'qiniu',
-          'r2',
-          'custom_s3',
-        ])}
-        onChange={(value) =>
-          setDraft((previous) => ({
-            ...previous,
-            storage_provider: value,
-          }))
-        }
-      />
-    </>
-  )
-  const advancedFilters = (
-    <>
-      {field('start_date', 'Start date', 'date')}
-      {field('end_date', 'End date', 'date')}
-      <ImageSelect
-        label={t('Protocol')}
-        value={draft.protocol}
-        options={choices(['bb', 'sc'])}
-        onChange={(value) =>
-          setDraft((previous) => ({ ...previous, protocol: value }))
-        }
-      />
-      <ImageSelect
+        className='flex flex-col gap-1.5 space-y-0'
         label={t('Billing status')}
         value={draft.billing_status}
         options={choices(['pending', 'succeeded', 'not_billable', 'failed'])}
@@ -678,7 +695,8 @@ function TaskCenterSession({
           }))
         }
       />
-      {TASK_FILTER_FIELDS.map(({ key, label }) => field(key, label))}
+      {field('group', 'Group')}
+      {field('api_key_id', 'API Key ID', 'number')}
       {admin && (
         <>
           {field('channel_id', 'Channel ID', 'number')}
@@ -687,12 +705,42 @@ function TaskCenterSession({
       )}
     </>
   )
+  const advancedFilterCount = [
+    'model',
+    'group',
+    'api_key_id',
+    'media_type',
+    'request_type',
+    'billing_status',
+    'channel_id',
+    'user_id',
+  ].filter((key) => filters[key]).length
+  const moreFiltersLabel = (
+    <>
+      {t('More filters')}
+      {advancedFilterCount > 0 && (
+        <>
+          {' '}
+          <span className='bg-primary/10 text-primary rounded px-1.5 text-xs tabular-nums'>
+            {advancedFilterCount}
+          </span>
+        </>
+      )}
+    </>
+  )
   const filterActions = (
     <>
-      <Button type='button' variant='outline' onClick={resetFilters}>
+      <Button type='button' variant='ghost' onClick={resetFilters}>
         {t('Reset')}
       </Button>
-      <Button type='submit' form='image-task-filter-form'>
+      <Button
+        type='submit'
+        form={
+          mobileFiltersOpen
+            ? 'image-task-advanced-filter-form'
+            : 'image-task-filter-form'
+        }
+      >
         {t('Apply filters')}
       </Button>
     </>
@@ -796,7 +844,10 @@ function TaskCenterSession({
         <Button
           variant='outline'
           size='sm'
-          onClick={() => void tasks.refetch()}
+          onClick={() => {
+            void tasks.refetch()
+            void platforms.refetch()
+          }}
         >
           {t('Refresh')}
         </Button>
@@ -845,46 +896,50 @@ function TaskCenterSession({
               </div>
             ))}
           </dl>
+          {admin && filters.media_type !== 'video' && (
+            <ImageReliabilityPanel
+              userId={userId}
+              filters={filters}
+              autoRefresh={autoRefresh}
+            />
+          )}
           {isMobile ? (
             <>
               <form
-                className='grid grid-cols-2 items-end gap-2 rounded-lg border p-2.5'
+                id='image-task-filter-form'
+                className='bg-card/50 grid grid-cols-2 items-end gap-3 rounded-lg border p-3 [&_[data-slot=select-trigger]]:min-h-11 [&_input]:min-h-11'
                 onSubmit={applyFilters}
               >
-                <div className='col-span-2'>{field('q', 'Search tasks')}</div>
-                <Button
-                  type='button'
-                  variant='outline'
-                  className='min-h-11 min-w-0 whitespace-normal'
-                  aria-haspopup='dialog'
-                  aria-expanded={mobileFiltersOpen}
-                  onClick={() => setMobileFiltersOpen(true)}
-                >
-                  <Filter className='size-4' aria-hidden />
-                  {t('Filter')}
-                </Button>
-                <Button
-                  type='submit'
-                  className='min-h-11 min-w-0 whitespace-normal'
-                >
-                  {t('Apply filters')}
-                </Button>
+                {primaryFilters}
+                <div className='col-span-2 flex flex-wrap items-center gap-1.5 border-t pt-2.5 [&>button]:min-h-11 [&>button]:whitespace-normal'>
+                  <Button
+                    type='button'
+                    variant='outline'
+                    className='mr-auto min-w-0'
+                    aria-haspopup='dialog'
+                    aria-expanded={mobileFiltersOpen}
+                    onClick={() => setMobileFiltersOpen(true)}
+                  >
+                    <Filter className='size-4' aria-hidden />
+                    {moreFiltersLabel}
+                  </Button>
+                  {filterActions}
+                </div>
               </form>
               <Dialog
                 open={mobileFiltersOpen}
                 onOpenChange={setMobileFiltersOpen}
-                title={t('Filter')}
+                title={t('More filters')}
                 contentClassName='max-h-[calc(100dvh-2rem)]'
                 scrollAreaClassName='max-h-[calc(100dvh-12rem)]'
                 footerClassName='grid grid-cols-2 [&>button]:min-h-11'
                 footer={filterActions}
               >
                 <form
-                  id='image-task-filter-form'
+                  id='image-task-advanced-filter-form'
                   className='grid grid-cols-1 gap-3 min-[360px]:grid-cols-2 [&_[data-slot=select-trigger]]:min-h-11 [&_input]:min-h-11'
                   onSubmit={applyFilters}
                 >
-                  {primaryFilters}
                   {advancedFilters}
                 </form>
               </Dialog>
@@ -898,45 +953,25 @@ function TaskCenterSession({
               <DataTableMobileFilterPanel
                 compact
                 defaultOpen={false}
+                triggerLabel={moreFiltersLabel}
+                className='gap-3 p-3'
                 summary={
-                  <div className='grid grid-cols-2 gap-3 xl:grid-cols-6'>
-                    <div className='col-span-2'>
-                      {field('q', 'Search tasks')}
-                    </div>
+                  <div className='grid grid-cols-2 items-end gap-3 xl:grid-cols-12'>
                     {primaryFilters}
                   </div>
                 }
-                actions={
-                  <>
-                    <span className='text-muted-foreground mr-auto hidden text-xs sm:block'>
-                      {filters.start_date} — {filters.end_date}
-                    </span>
-                    {filterActions}
-                  </>
-                }
+                actions={filterActions}
               >
-                <div className='mt-3 grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto border-t p-1 pt-3 sm:grid-cols-3 xl:grid-cols-5'>
+                <div className='grid max-h-[32dvh] grid-cols-2 gap-3 overflow-y-auto border-t p-1 pt-3 lg:grid-cols-4'>
                   {advancedFilters}
                 </div>
               </DataTableMobileFilterPanel>
             </form>
           )}
-          {tasks.isError && (
+          {(tasks.isError || platforms.isError) && (
             <p role='alert' className='text-destructive shrink-0 text-sm'>
-              {tasks.error.message}
+              {tasks.error?.message || platforms.error?.message}
             </p>
-          )}
-          {feedback.length > 0 && (
-            <div
-              aria-live='polite'
-              className='bg-muted/30 max-h-24 shrink-0 overflow-auto rounded-lg p-2 text-xs'
-            >
-              {feedback.map((result) => (
-                <p key={result.id}>
-                  {result.id}: {t(imageLabel(result.status))} {result.reason}
-                </p>
-              ))}
-            </div>
           )}
           <div className={isMobile ? undefined : 'min-h-0 flex-1'}>
             <DataTablePage

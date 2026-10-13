@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -25,16 +26,28 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { toast, Toaster } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { getImageTask, getImageTasks, imageRequest } from '../api'
+import {
+  getImageTask,
+  getImageReliability,
+  getImageRetainedRequest,
+  getImageTasks,
+  getMediaTaskPlatforms,
+  imageRequest,
+} from '../api'
 import { ImageTaskDetails } from '../components/image-task-details'
 import { imageTaskSuccessRate } from '../lib/task-presentation'
 import { ImageTaskCenter } from '../task-center'
-import type { ImageTask, ImageTaskDetail } from '../types'
+import type {
+  ImageTask,
+  ImageTaskDetail,
+  ImageReliabilityStats,
+} from '../types'
 
 vi.mock('../api', () => ({
   mediaTasksPath: (admin: boolean) =>
@@ -43,7 +56,10 @@ vi.mock('../api', () => ({
     `/api/${admin ? 'admin' : 'user'}/async-image-tasks`,
   imageBlob: vi.fn(),
   getImageTasks: vi.fn(),
+  getMediaTaskPlatforms: vi.fn(),
   getImageTask: vi.fn(),
+  getImageReliability: vi.fn(),
+  getImageRetainedRequest: vi.fn(),
   imageRequest: vi.fn(),
 }))
 vi.mock('@/lib/lobe-icon', () => ({
@@ -129,6 +145,127 @@ const detail: ImageTaskDetail = {
     },
   ],
 }
+
+test('administrator recovery statistics use the full filter scope and keep unavailable rates unknown', async () => {
+  const totals: ImageReliabilityStats = {
+    total: 20,
+    succeeded: 9,
+    failed: 2,
+    expired: 1,
+    execution_unknown: 3,
+    pending: 3,
+    postprocess_pending: 1,
+    admin_terminated: 1,
+    audited_tasks: 12,
+    final_success: { succeeded: 9, resolved: 12, percent: 75 },
+    first_submission_success: { succeeded: 3, resolved: 12, percent: 25 },
+    retry_recovery: { succeeded: 6, resolved: 9, percent: 66.7 },
+    account_switch_recovery: { succeeded: 0, resolved: 0, percent: null },
+    local_fallback_recovery: { succeeded: 0, resolved: 0, percent: null },
+  }
+  vi.mocked(getImageReliability).mockResolvedValue({ totals, groups: [] })
+  mount(<ImageTaskCenter admin />)
+  const user = userEvent.setup()
+  expect(getImageReliability).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('button', { name: 'Image retry recovery statistics' })
+  )
+  const region = await screen.findByRole('region', {
+    name: 'Image retry recovery statistics',
+  })
+  expect(await within(region).findByText('75.0% (9/12)')).toBeVisible()
+  expect(within(region).getAllByText('— (0/0)')).toHaveLength(2)
+  const params = vi.mocked(getImageReliability).mock.calls[0]?.[0]
+  expect(params?.has('page')).toBe(false)
+  expect(params?.has('page_size')).toBe(false)
+  expect(params?.get('start_date')).toBeTruthy()
+  expect(params?.get('end_date')).toBeTruthy()
+  expect(region).toHaveTextContent('Unknown: 3')
+  expect(region).toHaveTextContent('Manually terminated: 1')
+})
+
+test.each([true, false])(
+  'retained failure diagnostics require administrator expansion (admin=%s)',
+  async (admin) => {
+    const until = Math.floor(Date.now() / 1000) + 3600
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      results: [],
+      task: {
+        ...task,
+        status: 'failed',
+        retained_request_available: true,
+        request_retain_until: until,
+        retry_decision: {
+          version: 1,
+          stage: 'submit',
+          action: 'stop',
+          reason: 'invalid_input',
+          rule: 'upstream_failed',
+          used: 0,
+          limit: 0,
+          total_used: 0,
+          total_limit: 16,
+          recorded_at: 1,
+        },
+      },
+    })
+    vi.mocked(getImageRetainedRequest)
+      .mockRejectedValueOnce(new Error('Retained request unavailable'))
+      .mockResolvedValue({
+        task_id: task.id,
+        retain_until: until,
+        request: {
+          model: task.model,
+          prompt: 'A complete retained prompt',
+          prompt_characters: 26,
+          prompt_bytes: 26,
+          prompt_truncated: false,
+          platform: 'openai',
+          kind: 'text_to_image',
+          count: 1,
+          size: '1K',
+          resolution: '1K',
+          aspect_ratio: '1:1',
+          reference_count: 0,
+        },
+      })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={admin}
+        userId={101}
+        onClose={vi.fn()}
+        canManage={false}
+        onManage={vi.fn()}
+      />
+    )
+    expect(await screen.findByText('Invalid input parameters')).toBeVisible()
+    expect(getImageRetainedRequest).not.toHaveBeenCalled()
+    const toggle = screen.queryByRole('button', {
+      name: 'View retained request',
+    })
+    if (!admin) {
+      expect(toggle).not.toBeInTheDocument()
+      return
+    }
+    const user = userEvent.setup()
+    await user.click(
+      screen.getByRole('button', { name: 'View retained request' })
+    )
+    expect(
+      await screen.findByText('Retained request unavailable')
+    ).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(
+      await screen.findByLabelText('Retained request diagnostics')
+    ).toHaveTextContent('A complete retained prompt')
+    expect(getImageRetainedRequest).toHaveBeenCalledWith(
+      task.id,
+      expect.any(AbortSignal)
+    )
+  }
+)
 function mount(content: React.ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -166,14 +303,312 @@ beforeEach(() => {
     },
   })
   vi.mocked(getImageTask).mockResolvedValue(detail)
+  vi.mocked(getMediaTaskPlatforms).mockResolvedValue([
+    'azure',
+    'gemini',
+    'kling',
+    'openai',
+  ])
   vi.mocked(imageRequest).mockResolvedValue({
     url: 'https://example.com/result.png',
   })
 })
 afterEach(() => {
+  toast.dismiss()
   for (const client of clients) client.clear()
   clients.length = 0
   useAuthStore.getState().auth.reset()
+})
+
+test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'admin=$admin mobile=$mobile configured platforms stay visible and apply from page one',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [task],
+      total: 45,
+      pages: 3,
+      stats: {},
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    const platform = screen.getByRole('combobox', { name: 'Platform' })
+    expect(platform).toBeVisible()
+    expect(platform).toHaveTextContent('All')
+    expect(vi.mocked(getMediaTaskPlatforms).mock.calls.at(-1)?.[0]).toBe(admin)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    if (!mobile) {
+      expect(
+        screen.getByRole('button', { name: /^More filters/ })
+      ).toHaveAttribute('aria-expanded', 'false')
+    }
+    await user.click(screen.getByRole('button', { name: 'Go to next page' }))
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
+        '2'
+      )
+    )
+    if (admin) {
+      await user.click(
+        screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
+      )
+    }
+
+    for (const option of [
+      { label: 'Gemini', value: 'gemini', previous: null },
+      { label: 'OpenAI', value: 'openai', previous: 'gemini' },
+      { label: 'azure', value: 'azure', previous: 'openai' },
+      { label: 'kling', value: 'kling', previous: 'azure' },
+      { label: 'All', value: null, previous: 'kling' },
+    ]) {
+      await user.click(platform)
+      expect(
+        screen.getAllByRole('option').map((item) => item.textContent)
+      ).toEqual(['All', 'azure', 'Gemini', 'kling', 'OpenAI'])
+      if (option.value === 'openai') {
+        await user.keyboard('{End}{Enter}')
+      } else {
+        await user.click(screen.getByRole('option', { name: option.label }))
+      }
+      expect(platform).toHaveTextContent(option.label)
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('platform')
+      ).toBe(option.previous)
+      await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+      await waitFor(() =>
+        expect(
+          vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('platform')
+        ).toBe(option.value)
+      )
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[0]).toBe(admin)
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
+        '1'
+      )
+      if (admin) {
+        expect(
+          screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
+        ).not.toBeChecked()
+      }
+    }
+  }
+)
+
+test.each([
+  { configured: [], labels: ['All'] },
+  { configured: ['azure'], labels: ['All', 'azure'] },
+])(
+  'configured=$configured omits unconfigured platforms even when the current page has OpenAI tasks',
+  async ({ configured, labels }) => {
+    vi.mocked(getMediaTaskPlatforms).mockResolvedValue(configured)
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+    expect(
+      screen.getAllByRole('option').map((item) => item.textContent)
+    ).toEqual(labels)
+  }
+)
+
+test('platform selection waits for configured options to load', async () => {
+  let complete!: (platforms: string[]) => void
+  vi.mocked(getMediaTaskPlatforms).mockReturnValue(
+    new Promise<string[]>((resolve) => {
+      complete = resolve
+    })
+  )
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter />)
+  await screen.findByRole('button', { name: task.id })
+  const platform = screen.getByRole('combobox', { name: 'Platform' })
+  expect(platform).toBeDisabled()
+  complete(['gemini'])
+  await waitFor(() => expect(platform).toBeEnabled())
+  await user.click(platform)
+  expect(screen.getAllByRole('option').map((item) => item.textContent)).toEqual(
+    ['All', 'Gemini']
+  )
+})
+
+test('platform lookup failure is visible without inventing configured options', async () => {
+  vi.mocked(getMediaTaskPlatforms).mockRejectedValue(
+    new Error('Platform lookup unavailable')
+  )
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter />)
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Platform lookup unavailable'
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+  expect(screen.getAllByRole('option').map((item) => item.textContent)).toEqual(
+    ['All']
+  )
+})
+
+test('refresh reloads platform options after the configured channels change', async () => {
+  vi.mocked(getMediaTaskPlatforms).mockResolvedValueOnce(['openai'])
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter />)
+  await screen.findByRole('button', { name: task.id })
+  const platform = screen.getByRole('combobox', { name: 'Platform' })
+  await user.click(platform)
+  expect(screen.getByRole('option', { name: 'OpenAI' })).toBeVisible()
+  await user.keyboard('{Escape}')
+  vi.mocked(getMediaTaskPlatforms).mockResolvedValue(['azure'])
+  await user.click(screen.getByRole('button', { name: 'Refresh' }))
+  await user.click(platform)
+  expect(await screen.findByRole('option', { name: 'azure' })).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: 'OpenAI' })
+  ).not.toBeInTheDocument()
+})
+
+test.each([false, true])(
+  'mobile=%s reset clears the platform along with other filters',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    const platform = screen.getByRole('combobox', { name: 'Platform' })
+    await user.click(platform)
+    await user.click(screen.getByRole('option', { name: 'OpenAI' }))
+    await user.type(screen.getByLabelText('Search tasks'), 'flare')
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('platform')
+      ).toBe('openai')
+    )
+    if (mobile) {
+      await user.click(screen.getByRole('button', { name: 'More filters' }))
+      const dialog = await screen.findByRole('dialog', { name: 'More filters' })
+      expect(
+        within(dialog).queryByRole('combobox', { name: 'Platform' })
+      ).not.toBeInTheDocument()
+    }
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    if (mobile) {
+      await user.click(screen.getByRole('button', { name: 'Close' }))
+      await waitFor(() =>
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      )
+    }
+    expect(platform).toHaveTextContent('All')
+    expect(screen.getByLabelText('Search tasks')).toHaveValue('')
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].has('platform')
+      ).toBe(false)
+    )
+    expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].has('q')).toBe(false)
+  }
+)
+
+test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'admin=$admin mobile=$mobile keeps dates together outside advanced filters and applies a date-only range',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('combobox', { name: 'Platform' })
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeVisible()
+    expect(
+      screen.queryByRole('combobox', { name: 'Media type' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Provider')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /^Date Range:/ }))
+    const start = screen.getByLabelText('Start date')
+    const end = screen.getByLabelText('End date')
+    expect(start).toHaveAttribute('type', 'date')
+    expect(end).toHaveAttribute('type', 'date')
+    fireEvent.change(start, { target: { value: '2026-09-01' } })
+    fireEvent.change(end, { target: { value: '2026-09-30' } })
+    await user.click(screen.getByRole('button', { name: 'Confirm' }))
+    expect(
+      screen.getByRole('button', { name: /^Date Range:/ })
+    ).toHaveTextContent('2026-09-01 ~ 2026-09-30')
+    expect(
+      vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('start_date')
+    ).not.toBe('2026-09-01')
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('start_date')
+      ).toBe('2026-09-01')
+    )
+    const params = vi.mocked(getImageTasks).mock.calls.at(-1)?.[1]
+    expect(params?.get('end_date')).toBe('2026-09-30')
+    expect(params?.get('timezone')).toBe(
+      Intl.DateTimeFormat().resolvedOptions().timeZone
+    )
+    await user.click(screen.getByRole('button', { name: 'More filters' }))
+    expect(screen.getByLabelText('Model')).toBeVisible()
+    expect(screen.queryByLabelText('Start date')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('End date')).not.toBeInTheDocument()
+  }
+)
+
+test('date presets keep query drafts until applied, reject reversed dates and reset to today', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date(2026, 9, 13, 12))
+  try {
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: /^Date Range:/ })
+    await user.click(screen.getByRole('button', { name: /^Date Range:/ }))
+    await user.click(screen.getByRole('button', { name: '7 Days' }))
+    expect(
+      screen.getByRole('button', { name: /^Date Range:/ })
+    ).toHaveTextContent('2026-10-07 ~ 2026-10-13')
+    expect(
+      vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('start_date')
+    ).toBe('2026-10-13')
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('start_date')
+      ).toBe('2026-10-07')
+    )
+    await user.click(screen.getByRole('button', { name: /^Date Range:/ }))
+    fireEvent.change(screen.getByLabelText('Start date'), {
+      target: { value: '2026-10-14' },
+    })
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('End date'), {
+      target: { value: '2026-10-15' },
+    })
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled()
+    await user.keyboard('{Escape}')
+    expect(
+      screen.getByRole('button', { name: /^Date Range:/ })
+    ).toHaveTextContent('2026-10-07 ~ 2026-10-13')
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    expect(
+      screen.getByRole('button', { name: /^Date Range:/ })
+    ).toHaveTextContent('2026-10-13')
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('start_date')
+      ).toBe('2026-10-13')
+    )
+    expect(
+      vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('end_date')
+    ).toBe('2026-10-13')
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 test('keeps primary filters visible while advanced fields start collapsed and preserve drafts', async () => {
@@ -182,14 +617,14 @@ test('keeps primary filters visible while advanced fields start collapsed and pr
   await screen.findAllByText('Sunburst upstream')
   expect(screen.getByLabelText('Search tasks')).toBeVisible()
   expect(screen.queryByLabelText('Start date')).not.toBeInTheDocument()
-  expect(screen.getByRole('button', { name: 'Expand' })).toHaveAttribute(
+  expect(screen.getByRole('button', { name: /^More filters/ })).toHaveAttribute(
     'aria-expanded',
     'false'
   )
   await user.type(screen.getByLabelText('Search tasks'), 'city')
-  await user.click(screen.getByRole('button', { name: 'Expand' }))
+  await user.click(screen.getByRole('button', { name: /^More filters/ }))
   await user.type(screen.getByLabelText('Model'), 'flare')
-  await user.click(screen.getByRole('button', { name: 'Collapse' }))
+  await user.click(screen.getByRole('button', { name: /^More filters/ }))
   expect(screen.getByLabelText('Search tasks')).toHaveValue('city')
   await user.click(screen.getByRole('button', { name: 'Apply filters' }))
   await waitFor(() =>
@@ -197,7 +632,7 @@ test('keeps primary filters visible while advanced fields start collapsed and pr
       'flare'
     )
   )
-  await user.click(screen.getByRole('button', { name: 'Expand' }))
+  await user.click(screen.getByRole('button', { name: /^More filters/ }))
   expect(screen.getByLabelText('Model')).toHaveValue('flare')
   const statistics = screen.getByLabelText('Task statistics')
   expect(statistics).toHaveTextContent('Success rate96.0%')
@@ -399,9 +834,7 @@ test.each([
     const user = userEvent.setup()
     mount(<ImageTaskCenter admin={admin} />)
     await screen.findByRole('button', { name: task.id })
-    expect(
-      screen.queryByRole('combobox', { name: 'Status' })
-    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Status' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Go to next page' }))
     await waitFor(() =>
       expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
@@ -409,8 +842,13 @@ test.each([
       )
     )
     await user.type(screen.getByLabelText('Search tasks'), 'city')
-    await user.click(screen.getByRole('button', { name: 'Filter' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Filter' })
+    await user.click(screen.getByRole('button', { name: /^Date Range:/ }))
+    fireEvent.change(screen.getByLabelText('Start date'), {
+      target: { value: '2026-10-01' },
+    })
+    await user.click(screen.getByRole('button', { name: 'Confirm' }))
+    await user.click(screen.getByRole('button', { name: 'More filters' }))
+    const dialog = await screen.findByRole('dialog', { name: 'More filters' })
     const model = within(dialog).getByLabelText('Model')
     const apply = within(dialog).getByRole('button', { name: 'Apply filters' })
     const fieldsScroll = model.closest<HTMLElement>('.overflow-y-auto')
@@ -422,9 +860,9 @@ test.each([
       within(dialog).getByRole('combobox', { name: 'Media type' })
     )
     await user.click(await screen.findByRole('option', { name: 'Video' }))
-    fireEvent.change(within(dialog).getByLabelText('Start date'), {
-      target: { value: '2026-10-01' },
-    })
+    expect(
+      within(dialog).queryByLabelText('Start date')
+    ).not.toBeInTheDocument()
     await user.click(apply)
 
     await waitFor(() =>
@@ -441,7 +879,7 @@ test.each([
     expect(request?.[1].get('media_type')).toBe('video')
     expect(request?.[1].get('start_date')).toBe('2026-10-01')
     expect(request?.[1].get('page')).toBe('1')
-    expect(screen.getByRole('button', { name: 'Filter' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'More filters 2' })).toBeVisible()
   }
 )
 
@@ -456,8 +894,8 @@ test.each([
     mount(<ImageTaskCenter admin={admin} />)
     await screen.findByRole('button', { name: task.id })
     await user.type(screen.getByLabelText('Search tasks'), 'city')
-    await user.click(screen.getByRole('button', { name: 'Filter' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Filter' })
+    await user.click(screen.getByRole('button', { name: 'More filters' }))
+    const dialog = await screen.findByRole('dialog', { name: 'More filters' })
     await user.type(within(dialog).getByLabelText('Model'), 'flare')
     await user.click(within(dialog).getByRole('button', { name: 'Close' }))
     await waitFor(() =>
@@ -466,8 +904,8 @@ test.each([
     expect(
       vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('model')
     ).toBeNull()
-    await user.click(screen.getByRole('button', { name: 'Filter' }))
-    const reopened = await screen.findByRole('dialog', { name: 'Filter' })
+    await user.click(screen.getByRole('button', { name: 'More filters' }))
+    const reopened = await screen.findByRole('dialog', { name: 'More filters' })
     expect(within(reopened).getByLabelText('Model')).toHaveValue('flare')
     await user.click(within(reopened).getByRole('button', { name: 'Reset' }))
     expect(within(reopened).getByLabelText('Model')).toHaveValue('')
@@ -659,6 +1097,78 @@ test('batch termination containing unknown work confirms upstream verification b
     { confirm_upstream_checked: true }
   )
 })
+
+test.each([
+  { failure: false, dismiss: false },
+  { failure: true, dismiss: false },
+  { failure: true, dismiss: true },
+])(
+  'batch termination failure=$failure dismiss=$dismiss shows a transient summary and retains failure details',
+  async ({ failure, dismiss }) => {
+    const user = userEvent.setup()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        task,
+        { ...task, id: 'asyncimg_second', task_id: 'asyncimg_second' },
+      ],
+      total: 2,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(imageRequest).mockResolvedValueOnce({})
+    if (failure) {
+      vi.mocked(imageRequest).mockRejectedValueOnce(
+        new Error('Termination unavailable')
+      )
+    } else {
+      vi.mocked(imageRequest).mockResolvedValueOnce({})
+    }
+    mount(
+      <>
+        <ImageTaskCenter admin />
+        <Toaster />
+      </>
+    )
+    await user.click(
+      await screen.findByRole('button', { name: 'Terminate current page (2)' })
+    )
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Terminate image tasks',
+    })
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    try {
+      fireEvent.click(
+        within(confirmation).getByRole('button', { name: 'Continue' })
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50)
+      })
+      const summary = failure
+        ? 'Task termination: 1 succeeded, 1 failed'
+        : 'Tasks terminated: 2'
+      expect(screen.getByText(summary)).toBeVisible()
+      if (failure) {
+        expect(
+          screen.getByText('asyncimg_second: Termination unavailable')
+        ).toBeVisible()
+      }
+      if (dismiss) {
+        fireEvent.click(screen.getByRole('button', { name: 'Close toast' }))
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(dismiss ? 400 : 8500)
+      })
+      expect(screen.queryByText(summary)).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('asyncimg_second: Termination unavailable')
+      ).not.toBeInTheDocument()
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    } finally {
+      toast.dismiss()
+      vi.useRealTimers()
+    }
+  }
+)
 
 test('user details hide admin routing, references and account history even if a fixture includes them', async () => {
   mount(

@@ -84,6 +84,45 @@ func RegisteredMediaProvider(provider string) bool {
 	return slices.Contains(RegisteredMediaProviders(), provider)
 }
 
+// ConfiguredMediaTaskPlatforms lists provider identities declared by configured
+// image and video channel models, including disabled channels for task history.
+func ConfiguredMediaTaskPlatforms(ctx context.Context) ([]string, error) {
+	var channels []model.Channel
+	if err := model.DB.WithContext(ctx).Select("id", "type", "models", "model_mapping", "setting", "settings").Find(&channels).Error; err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for i := range channels {
+		channel := &channels[i]
+		for modelName := range strings.SplitSeq(channel.Models, ",") {
+			modelName = strings.TrimSpace(modelName)
+			if modelName == "" {
+				continue
+			}
+			capability := ImageChannelCapability(*channel, modelName)
+			if capability.Generate && capability.Provider != "" {
+				seen[capability.Provider] = true
+			}
+			for _, candidate := range mediaVideoCandidates(modelName) {
+				if candidate.Plugin == nil || candidate.Protocol != "openai_video" {
+					continue
+				}
+				provider := candidate.Plugin.Meta.Key
+				filter := gatewaydto.ChannelFilter{Kind: gatewaydto.FilterTaskPluginIdentity, TaskPluginKey: provider, TaskPluginChannelTypes: candidate.Plugin.Meta.ChannelTypes}
+				if matches, _ := model.ChannelSatisfiesFilters(channel, modelName, []gatewaydto.ChannelFilter{filter}); matches {
+					seen[provider] = true
+				}
+			}
+		}
+	}
+	platforms := make([]string, 0, len(seen))
+	for platform := range seen {
+		platforms = append(platforms, platform)
+	}
+	slices.Sort(platforms)
+	return platforms, nil
+}
+
 // MediaChannelSupportsPlatform reports whether a channel can execute the
 // selected image provider/protocol family or video task-plugin provider.
 func MediaChannelSupportsPlatform(channel *model.Channel, modelName, platform string) bool {

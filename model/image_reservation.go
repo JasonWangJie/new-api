@@ -247,7 +247,7 @@ func RefundAsyncImageReservation(ctx context.Context, taskID string) error {
 		var bill AsyncImageBill
 		err := lockForUpdate(tx).Where("task_id = ?", taskID).Take(&bill).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
+			return tx.Model(&task).Update("billing_status", "not_charged").Error
 		}
 		if err != nil {
 			return err

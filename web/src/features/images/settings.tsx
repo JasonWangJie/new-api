@@ -72,6 +72,30 @@ type RuntimeField = {
   max?: number
 }
 const RUNTIME_FIELDS: readonly RuntimeField[] = [
+  {
+    key: 'failed_request_retention_hours',
+    label: 'Failed request retention (hours)',
+    min: 0,
+    max: 168,
+  },
+  {
+    key: 'account_cooldown_seconds',
+    label: 'Account cooldown (seconds)',
+    min: 0,
+    max: 3600,
+  },
+  {
+    key: 'supplier_retry_capacity',
+    label: 'Supplier retry capacity',
+    min: 0,
+    max: 1000,
+  },
+  {
+    key: 'supplier_retry_window_seconds',
+    label: 'Supplier retry window (seconds)',
+    min: 1,
+    max: 3600,
+  },
   { key: 'worker_concurrency', label: 'Workers', min: 1 },
   { key: 'image_concurrency', label: 'Image concurrency', min: 1 },
   {
@@ -114,6 +138,26 @@ type RuntimeFieldReference = {
 }
 
 const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
+  {
+    key: 'failed_request_retention_hours',
+    description:
+      'Hours to retain failed requests encrypted for administrator diagnostics. 0 disables retention.',
+  },
+  {
+    key: 'account_cooldown_seconds',
+    description:
+      'Cooldown after confirmed rate limits or temporary account failures. 0 disables account cooldown.',
+  },
+  {
+    key: 'supplier_retry_capacity',
+    description:
+      'Shared retry tokens per supplier origin. Initial submissions and accepted-job polls do not consume tokens. 0 disables this budget.',
+  },
+  {
+    key: 'supplier_retry_window_seconds',
+    description:
+      'Seconds to refill the supplier retry bucket from empty to full.',
+  },
   {
     key: 'async_enabled',
     description: 'Enables asynchronous image task APIs and workers.',

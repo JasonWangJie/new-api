@@ -1,9 +1,12 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"image"
+	"image/png"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +34,173 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestAsyncImageCompletionRecovery(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		name := "billing_query_failure"
+		if crash {
+			name = "worker_crash_after_receipt"
+		}
+		t.Run(name, func(t *testing.T) {
+			previousDB, previousLogs, previousRedis := model.DB, model.LOG_DB, common.RDB
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousEnabled, previousMemory, previousConsume, previousExport := common.RedisEnabled, common.MemoryCacheEnabled, common.LogConsumeEnabled, common.DataExportEnabled
+			previousExecute, previousEstimate := service.ExecuteAsyncImageFunc, service.EstimateAsyncImageQuotaFunc
+			previousCapability := service.ImageChannelCapabilityFunc
+			previousUnit := common.QuotaPerUnit
+			pricing := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+			previousPricing := *pricing
+			previousGroups, previousOverrides := ratio_setting.GroupRatio2JSONString(), ratio_setting.GroupGroupRatio2JSONString()
+			previousPrices, err := common.Marshal(ratio_setting.GetModelPriceCopy())
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB, common.RDB = previousDB, previousLogs, previousRedis
+				common.SetDatabaseTypes(previousMain, previousLog)
+				common.RedisEnabled, common.MemoryCacheEnabled, common.LogConsumeEnabled, common.DataExportEnabled = previousEnabled, previousMemory, previousConsume, previousExport
+				service.ExecuteAsyncImageFunc, service.EstimateAsyncImageQuotaFunc = previousExecute, previousEstimate
+				service.ImageChannelCapabilityFunc = previousCapability
+				common.QuotaPerUnit, *pricing = previousUnit, previousPricing
+				assert.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(previousPrices)))
+				assert.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousGroups))
+				assert.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(previousOverrides))
+			})
+			model.DB, model.LOG_DB = imageRouterDatabase(t, "completion-main"), imageRouterDatabase(t, "completion-logs")
+			common.SetDatabaseTypes(common.DatabaseType(model.DB.Dialector.Name()), common.DatabaseType(model.LOG_DB.Dialector.Name()))
+			imageLogs := model.LOG_DB
+			t.Setenv("LOG_SQL_DSN", "")
+			previousMaster := common.IsMasterNode
+			common.IsMasterNode = false
+			err = model.InitLogDB()
+			common.IsMasterNode = previousMaster
+			require.NoError(t, err)
+			model.LOG_DB = imageLogs
+			require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}))
+			require.NoError(t, model.MigrateImageModels(model.DB))
+			require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+			require.NoError(t, model.MigrateImageLogs(model.LOG_DB))
+			common.RedisEnabled, common.MemoryCacheEnabled, common.LogConsumeEnabled, common.DataExportEnabled = true, false, true, true
+			common.QuotaPerUnit = 500000
+			redisServer := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB = client
+			t.Cleanup(func() { assert.NoError(t, client.Close()) })
+			t.Setenv("ASYNC_IMAGE_REDIS_PREFIX", "completion:"+common.GetUUID())
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "completion:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "completion")
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"image-completion-model":0.01}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+			require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{}`))
+			*pricing = billing_setting.BillingSetting{}
+			service.ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+				return dto.ImageCapability{Provider: "openai", Protocol: "openai_images", Generate: true}
+			}
+			service.EstimateAsyncImageQuotaFunc = relay.EstimateAsyncImageQuota
+			cfg := service.DefaultImageRuntimeConfig()
+			cfg.AsyncEnabled, cfg.RetryJitter = true, 0
+			require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+			_, err = service.SaveImageStorageProfile(t.Context(), model.ImageStorageProfile{Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir(), Active: true}, nil)
+			require.NoError(t, err)
+			user := model.User{Username: "completion-user", Group: "default", Status: common.UserStatusEnabled, Quota: 100000}
+			require.NoError(t, model.DB.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "completion-token", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100000}
+			require.NoError(t, model.DB.Create(&token).Error)
+			var bitmap bytes.Buffer
+			require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+			response, err := common.Marshal(dto.ImageResponse{Data: []dto.ImageData{{B64Json: base64.StdEncoding.EncodeToString(bitmap.Bytes())}}})
+			require.NoError(t, err)
+			var submissions atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				submissions.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(response)
+			}))
+			t.Cleanup(upstream.Close)
+			channel := model.Channel{Type: constant.ChannelTypeOpenAI, Key: "completion-upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "image-completion-model", Group: "default"}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: "image-completion-model", ChannelId: channel.Id, Enabled: true}).Error)
+			catalog, err := common.Marshal([]service.ImageModelCapability{{Id: "image-completion-model", MaxOutputImages: 1}})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Create(&model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "openai"), Group: "default", Platform: "openai", Enabled: true, AsyncEnabled: true, PoolMode: "resolution", Models: string(catalog)}).Error)
+			request := service.AsyncImageRequest{Platform: "openai", Dialect: "openai", PolicyPlatform: "openai", Model: "image-completion-model", Prompt: "private completion prompt", Kind: "text_to_image", Count: 1, Native: map[string]common.RawMessage{"model": common.RawMessage(`"image-completion-model"`), "prompt": common.RawMessage(`"private completion prompt"`), "n": common.RawMessage(`1`)}}
+			frozen, err := relay.FreezeAsyncImageBilling(t.Context(), token, request, "default", &channel)
+			require.NoError(t, err)
+			request.Billing = &frozen
+			_, _, err = service.ValidateAsyncImageEligibility(t.Context(), token, request, cfg)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			now := time.Now().Unix()
+			task := model.AsyncImageTask{TaskId: "asyncimg_completion_" + common.GetUUID(), UserId: user.Id, TokenId: token.Id, Group: "default", Platform: "openai", Dialect: "openai", Model: request.Model, Status: model.ImageTaskQueued, BillingStatus: "pending", NextAttemptAt: now, CreatedAt: now, ExpiresAt: now + 3600}
+			task.RequestCipher, err = service.EncryptImagePayload(encoded, "task:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Create(&task).Error)
+			service.InitHttpClient()
+			service.ExecuteAsyncImageFunc = relay.ExecuteAsyncImage
+			if crash {
+				service.ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, req service.AsyncImageRequest, selected *model.Channel, runtime service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+					_, _, executeErr := relay.ExecuteAsyncImage(ctx, current, req, selected, runtime, dispatch)
+					require.NoError(t, executeErr)
+					panic("interrupted after durable output receipt")
+				}
+			} else {
+				var failBilling atomic.Bool
+				failBilling.Store(true)
+				db := model.DB
+				require.NoError(t, db.Callback().Query().Before("gorm:query").Register("completion_bill_failure", func(tx *gorm.DB) {
+					if tx.Statement.Table != "users" || !failBilling.Load() {
+						return
+					}
+					var received int64
+					if db.Model(&model.AsyncImageTask{}).Where("task_id = ? AND upstream_succeeded_at > 0", task.TaskId).Count(&received).Error == nil && received == 1 && failBilling.Swap(false) {
+						tx.AddError(errors.New("temporary billing database failure"))
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("completion_bill_failure")) })
+			}
+			runErr := service.RunAsyncImageTask(t.Context(), task.TaskId)
+			if crash {
+				require.Error(t, runErr)
+			} else {
+				require.NoError(t, runErr)
+			}
+			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			require.Equal(t, model.ImageTaskInvoking, task.Status, "failure: %s %s", task.ErrorCode, task.ErrorMessage)
+			assert.Positive(t, task.UpstreamSucceededAt)
+			assert.NotEmpty(t, task.RequestCipher)
+			assert.EqualValues(t, 1, submissions.Load())
+			var bill model.AsyncImageBill
+			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, "reserved", bill.Status)
+			assert.Equal(t, frozen.Price.QuotaToPreConsume, bill.ReservedQuota)
+			if crash {
+				require.NoError(t, model.DB.Model(&task).Updates(map[string]any{"lease_expires_at": now - 1}).Error)
+				require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 10, cfg.ExecutionTimeout, 0))
+			} else {
+				require.NoError(t, model.DB.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+			}
+			// New admissions and live pricing can change after the original output;
+			// recovery remains authorized only to finish that frozen execution.
+			require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			require.NoError(t, model.DB.Model(&model.ImageGroupPolicy{}).Where(map[string]any{"group": "default"}).Update("async_enabled", false).Error)
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"image-completion-model":9}`))
+			service.ExecuteAsyncImageFunc = relay.ExecuteAsyncImage
+			require.NoError(t, service.RunAsyncImageTask(t.Context(), task.TaskId))
+			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskSucceeded, task.Status)
+			assert.Equal(t, 1, task.ResultCount)
+			assert.Empty(t, task.RequestCipher)
+			assert.EqualValues(t, 1, submissions.Load(), "receipt recovery never repeats generation")
+			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, "applied", bill.Status)
+			assert.Equal(t, frozen.Price.QuotaToPreConsume, bill.Quota)
+			require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
+			assert.Equal(t, 100000-bill.Quota, user.Quota, "the original reservation is settled once")
+			var logCount int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("request_id = ?", "async-image:"+task.TaskId).Count(&logCount).Error)
+			assert.EqualValues(t, 1, logCount)
+		})
+	}
+}
 
 func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 	for _, tc := range []struct {
@@ -128,8 +298,10 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 			cfg := service.DefaultImageRuntimeConfig()
 			cfg.AsyncEnabled, cfg.AutoArchive = true, true
 			cfg.TransientRetries, cfg.TotalRetries, cfg.BillingRetries = 0, 0, 0
+			cfg.StorageRetries = 0
 			if tc.retry {
 				cfg.TransientRetries, cfg.TotalRetries = 1, 1
+				cfg.StorageRetries = 1
 			}
 			require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
 			_, err = service.SaveImageStorageProfile(t.Context(), model.ImageStorageProfile{Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir(), Active: true}, nil)
@@ -244,17 +416,23 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 			if tc.retry {
 				require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&task).Error)
 				assert.Equal(t, model.ImageTaskInvoking, task.Status)
-				assert.Equal(t, 1, task.TransientRetryCount)
+				assert.Equal(t, 1, task.StorageRetryCount)
+				assert.Zero(t, task.RetryCount, "local downloads do not consume the submission budget")
 				assert.Empty(t, fallbackQuery(t, task)["data"])
 				require.NoError(t, model.DB.Model(&task).Update("next_attempt_at", now).Error)
 				require.NoError(t, service.RunAsyncImageTask(t.Context(), task.TaskId))
 			}
 			require.NoError(t, model.DB.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			if tc.missingUsage || tc.privateURL || tc.downloadKey {
-				assert.Equal(t, model.ImageTaskFailed, task.Status, task.ErrorMessage)
+				paused := model.ImageTaskStorageFailed
+				if tc.missingUsage {
+					paused = model.ImageTaskBillingFailed
+				}
+				assert.Equal(t, paused, task.Status, task.ErrorMessage)
+				assert.NotEmpty(t, task.RequestCipher, "accepted outputs remain available for local recovery")
 				assert.Empty(t, fallbackQuery(t, task)["data"])
 				require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
-				assert.Equal(t, 100000, user.Quota)
+				assert.Equal(t, 100000-frozen.Price.QuotaToPreConsume, user.Quota, "the original hold is retained until the accepted output is reconciled")
 				assert.Zero(t, user.UsedQuota)
 				return
 			}
@@ -354,11 +532,7 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 			assert.Zero(t, localResults, "fallback media must not masquerade as stored objects")
 			assert.Zero(t, archives, "unvalidated remote media must not be automatically archived")
 			assert.EqualValues(t, 1, milestones)
-			expectedPolls := 1
-			if tc.retry {
-				expectedPolls++
-			}
-			assert.EqualValues(t, expectedPolls, polls.Load(), "billing recovery must not requery or resubmit the upstream")
+			assert.EqualValues(t, 1, polls.Load(), "output and billing recovery use the saved response without requerying or resubmitting")
 			for _, admin := range []bool{false, true} {
 				recorder := fallbackTaskDetail(t, task, admin)
 				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())

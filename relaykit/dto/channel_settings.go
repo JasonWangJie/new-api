@@ -11,15 +11,16 @@ import (
 )
 
 type ChannelSettings struct {
-	TaskPluginKey             string `json:"task_plugin_key,omitempty"`
-	ForceFormat               bool   `json:"force_format,omitempty"`
-	ThinkingToContent         bool   `json:"thinking_to_content,omitempty"`
-	ImageMaxReferenceImages   *int   `json:"image_max_reference_images,omitempty"`
-	Proxy                     string `json:"proxy"`
-	PassThroughBodyEnabled    bool   `json:"pass_through_body_enabled,omitempty"`
-	ResponsesWebSocketEnabled bool   `json:"responses_websocket_enabled,omitempty"`
-	SystemPrompt              string `json:"system_prompt,omitempty"`
-	SystemPromptOverride      bool   `json:"system_prompt_override,omitempty"`
+	TaskPluginKey               string `json:"task_plugin_key,omitempty"`
+	ForceFormat                 bool   `json:"force_format,omitempty"`
+	ThinkingToContent           bool   `json:"thinking_to_content,omitempty"`
+	ImageMaxReferenceImages     *int   `json:"image_max_reference_images,omitempty"`
+	ImageReferenceTransportMode string `json:"image_reference_transport_mode,omitempty"`
+	Proxy                       string `json:"proxy"`
+	PassThroughBodyEnabled      bool   `json:"pass_through_body_enabled,omitempty"`
+	ResponsesWebSocketEnabled   bool   `json:"responses_websocket_enabled,omitempty"`
+	SystemPrompt                string `json:"system_prompt,omitempty"`
+	SystemPromptOverride        bool   `json:"system_prompt_override,omitempty"`
 	// HTTPProtocol controls outbound HTTP version negotiation for this channel.
 	// Accepted values: "", "auto" (default), "http1".
 	HTTPProtocol string `json:"http_protocol,omitempty"`
@@ -30,11 +31,16 @@ type ChannelSettings struct {
 
 // ValidateImageGeneration validates save-time image generation channel settings.
 func (s *ChannelSettings) ValidateImageGeneration() error {
-	if s == nil || s.ImageMaxReferenceImages == nil {
+	if s == nil {
 		return nil
 	}
-	if *s.ImageMaxReferenceImages < 0 || *s.ImageMaxReferenceImages > MaxImageN {
+	if s.ImageMaxReferenceImages != nil && (*s.ImageMaxReferenceImages < 0 || *s.ImageMaxReferenceImages > MaxImageN) {
 		return fmt.Errorf("invalid image_max_reference_images: %d", *s.ImageMaxReferenceImages)
+	}
+	switch s.ImageReferenceTransportMode {
+	case "", "passthrough", "local", "passthrough_fallback_local":
+	default:
+		return fmt.Errorf("invalid image_reference_transport_mode: %s", s.ImageReferenceTransportMode)
 	}
 	return nil
 }

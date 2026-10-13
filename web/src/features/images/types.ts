@@ -118,6 +118,9 @@ export type ImageCapabilities = {
   }[]
 }
 export type ImageTask = {
+  retry_decision?: ImageRetryDecision
+  retained_request_available?: boolean
+  request_retain_until?: number
   media_type?: 'image' | 'video'
   provider?: string
   stage?: string
@@ -158,6 +161,8 @@ export type ImageTask = {
     dispatched: boolean
     reference_mode: string
     error_code: number
+    reference_transport_used?: string
+    retry_decision?: ImageRetryDecision
   }[]
   attempt_history_unavailable?: boolean
   retry_count: number
@@ -170,6 +175,69 @@ export type ImageTask = {
   error_message: string
   can_resume: boolean
   can_terminate: boolean
+}
+export type ImageRetryDecision = {
+  version: number
+  stage: string
+  action: string
+  reason: string
+  rule: string
+  budget?: string
+  used: number
+  limit: number
+  total_used: number
+  total_limit: number
+  next_attempt_at?: number
+  deadline?: number
+  recorded_at: number
+}
+export type ImageRetainedRequest = {
+  task_id: string
+  retain_until: number
+  request: {
+    model: string
+    prompt: string
+    prompt_characters: number
+    prompt_bytes: number
+    prompt_truncated: boolean
+    platform: string
+    kind: string
+    count: number
+    size: string
+    resolution: string
+    aspect_ratio: string
+    reference_count: number
+  }
+}
+export type ImageRecoveryRate = {
+  succeeded: number
+  resolved: number
+  percent: number | null
+}
+export type ImageReliabilityStats = {
+  total: number
+  succeeded: number
+  failed: number
+  expired: number
+  execution_unknown: number
+  pending: number
+  postprocess_pending: number
+  admin_terminated: number
+  audited_tasks: number
+  final_success: ImageRecoveryRate
+  first_submission_success: ImageRecoveryRate
+  retry_recovery: ImageRecoveryRate
+  account_switch_recovery: ImageRecoveryRate
+  local_fallback_recovery: ImageRecoveryRate
+}
+export type ImageReliabilityReport = {
+  totals: ImageReliabilityStats
+  groups: (ImageReliabilityStats & {
+    provider: string
+    model: string
+    channel_id: number
+    channel_name: string
+  })[]
 }
 export type ImageResult = {
   id: number

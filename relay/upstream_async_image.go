@@ -77,7 +77,11 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 		if message == "" {
 			message = "Upstream image task failed"
 		}
-		return nil, types.NewError(&service.AsyncImageFailure{Code: 610, InternalCode: "upstream_job_failed", Message: message}, types.ErrorCodeBadResponse)
+		failure := service.ClassifyAsyncImageFailure(errors.New(message), 0)
+		failure.Message = message
+		failure.InternalCode = "upstream_job_failed"
+		failure.UpstreamTerminal = true
+		return nil, types.NewError(failure, types.ErrorCodeBadResponse)
 	case "SUCCESS":
 	default:
 		return nil, types.NewError(&service.AsyncImageFailure{Code: 606, InternalCode: "upstream_status_unknown", Message: "Upstream image task returned an unknown status"}, types.ErrorCodeBadResponse)

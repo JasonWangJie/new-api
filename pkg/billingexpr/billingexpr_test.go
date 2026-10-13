@@ -4,12 +4,34 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestImageSettlementTimeAndActualSpecifications(t *testing.T) {
+	completedAt := time.Date(2034, time.January, 2, 7, 0, 0, 0, time.UTC)
+	expression := `(hour("UTC") == 7 && day("UTC") == 2 ? tier("completed", fixed(0.01)) : tier("changed", fixed(0.02))) * (param("resolution") == "4K" ? 3 : 1)`
+	for _, tc := range []struct {
+		resolution string
+		cost       float64
+	}{
+		{resolution: "4K", cost: 30000},
+		{resolution: "1K", cost: 10000},
+	} {
+		t.Run(tc.resolution, func(t *testing.T) {
+			body, err := common.Marshal(map[string]string{"resolution": tc.resolution})
+			require.NoError(t, err)
+			cost, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Body: body, EvaluationTime: &completedAt})
+			require.NoError(t, err)
+			assert.Equal(t, tc.cost, cost)
+			assert.Equal(t, "completed", trace.MatchedTier)
+		})
+	}
+}
 
 func TestFixedPriceBranches(t *testing.T) {
 	const expression = `(len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2 + c * 8)) * (param("fast") == true ? 2 : 1)`

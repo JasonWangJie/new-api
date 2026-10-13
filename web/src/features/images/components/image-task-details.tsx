@@ -18,12 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { ArrowUpRight, Ban, ChevronDown } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
+import { ErrorState } from '@/components/error-state'
+import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -35,7 +37,7 @@ import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-import { getImageTask, imageRequest } from '../api'
+import { getImageTask, getImageRetainedRequest, imageRequest } from '../api'
 import {
   imageLabel,
   imageTimelineDotClass,
@@ -47,6 +49,7 @@ import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
 } from '../lib/task-presentation'
+import type { ImageRetryDecision } from '../types'
 import {
   ImagePlatformBadge,
   ImageRequestTypeBadge,
@@ -97,6 +100,124 @@ function DetailSection(props: {
       </div>
       {props.children}
     </section>
+  )
+}
+
+function RetryDecisionFields({ decision }: { decision: ImageRetryDecision }) {
+  const { t } = useTranslation()
+  return (
+    <TaskDetailFields
+      items={[
+        { label: t('Retry decision'), value: t(imageLabel(decision.action)) },
+        { label: t('Decision reason'), value: t(imageLabel(decision.reason)) },
+        {
+          label: t('Retry budget'),
+          value:
+            decision.limit > 0 ? `${decision.used} / ${decision.limit}` : '—',
+        },
+        {
+          label: t('Total retries'),
+          value:
+            decision.total_limit > 0
+              ? `${decision.total_used} / ${decision.total_limit}`
+              : String(decision.total_used),
+        },
+        {
+          label: t('Next retry'),
+          value: formatTimestampToDate(decision.next_attempt_at || 0),
+        },
+        {
+          label: t('Execution deadline'),
+          value: formatTimestampToDate(decision.deadline || 0),
+        },
+      ]}
+    />
+  )
+}
+
+function RetainedImageRequest({
+  id,
+  until,
+  userId,
+}: {
+  id: string
+  until: number
+  userId: number
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [expired, setExpired] = useState(until * 1000 <= Date.now())
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setExpired(true),
+      Math.max(0, until * 1000 - Date.now())
+    )
+    return () => window.clearTimeout(timer)
+  }, [until])
+  const request = useQuery({
+    queryKey: ['image-retained-request', userId, id],
+    queryFn: ({ signal }) => getImageRetainedRequest(id, signal),
+    enabled: open && !expired,
+    gcTime: 0,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
+  })
+  return (
+    <Collapsible
+      open={open && !expired}
+      onOpenChange={setOpen}
+      className='overflow-hidden rounded-lg border'
+    >
+      <CollapsibleTrigger
+        disabled={expired}
+        render={
+          <Button
+            variant='ghost'
+            className='w-full justify-start rounded-none px-4'
+          />
+        }
+      >
+        <ChevronDown className='size-4' aria-hidden />
+        {t('View retained request')}
+      </CollapsibleTrigger>
+      <p className='text-muted-foreground px-4 pb-3 text-xs'>
+        {expired
+          ? t('Retained request expired')
+          : t(
+              'Encrypted retention ends at {{time}}. The diagnostic view masks credentials and omits image data.',
+              { time: formatTimestampToDate(until) }
+            )}
+      </p>
+      <CollapsibleContent>
+        <div className='space-y-3 border-t p-4'>
+          {request.isPending && <LoadingState className='min-h-24' size='sm' />}
+          {request.isError && (
+            <ErrorState
+              className='min-h-24'
+              description={request.error.message}
+              onRetry={() => void request.refetch()}
+            />
+          )}
+          {!request.isError && request.data && !expired && (
+            <>
+              <CopyButton
+                value={JSON.stringify(request.data.request, null, 2)}
+                variant='outline'
+                size='sm'
+              >
+                {t('Copy')}
+              </CopyButton>
+              <pre
+                className='bg-muted max-h-64 overflow-auto rounded-md p-3 text-xs break-words whitespace-pre-wrap'
+                aria-label={t('Retained request diagnostics')}
+              >
+                {JSON.stringify(request.data.request, null, 2)}
+              </pre>
+            </>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 
@@ -352,6 +473,14 @@ export function ImageTaskDetails(props: {
               </div>
             )}
           </section>
+          {data.retry_decision && (
+            <DetailSection
+              title={t('Retry decision')}
+              accentClassName='border-l-4 border-l-amber-500/70'
+            >
+              <RetryDecisionFields decision={data.retry_decision} />
+            </DetailSection>
+          )}
           <DetailSection
             title={t('Task time')}
             accentClassName='border-l-4 border-l-cyan-500/70'
@@ -499,6 +628,14 @@ export function ImageTaskDetails(props: {
                   {t('Attempt history is unavailable for this task.')}
                 </p>
               )}
+              {data.retained_request_available && data.request_retain_until && (
+                <RetainedImageRequest
+                  key={props.id}
+                  id={props.id}
+                  until={data.request_retain_until}
+                  userId={props.userId}
+                />
+              )}
               {attempts.length > 0 && (
                 <Collapsible
                   defaultOpen={false}
@@ -587,8 +724,35 @@ export function ImageTaskDetails(props: {
                         {
                           id: 'reference_mode',
                           header: t('Reference transport'),
+                          cell: (attempt) => (
+                            <div>
+                              <p>{t(imageLabel(attempt.reference_mode))}</p>
+                              {attempt.reference_transport_used && (
+                                <p className='text-muted-foreground'>
+                                  {t(
+                                    imageLabel(attempt.reference_transport_used)
+                                  )}
+                                </p>
+                              )}
+                            </div>
+                          ),
+                        },
+                        {
+                          id: 'retry_decision',
+                          header: t('Retry decision'),
                           cell: (attempt) =>
-                            t(imageLabel(attempt.reference_mode)),
+                            attempt.retry_decision ? (
+                              <div className='min-w-48 space-y-1'>
+                                <p>
+                                  {t(imageLabel(attempt.retry_decision.action))}
+                                </p>
+                                <p className='text-muted-foreground'>
+                                  {t(imageLabel(attempt.retry_decision.reason))}
+                                </p>
+                              </div>
+                            ) : (
+                              '—'
+                            ),
                         },
                       ]}
                     />

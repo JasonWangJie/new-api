@@ -55,6 +55,7 @@ const CONFIGURATION_BLOCKS = {
       'priority',
       'weight',
       'image_max_reference_images',
+      'image_reference_transport_mode',
       'test_model',
       'auto_ban',
     ],
@@ -149,6 +150,7 @@ export function getChannelConfigurationState(
   const configured: Record<ChannelConfigurationBlock, boolean> = {
     modelMapping: hasConfiguredJson(values.model_mapping),
     routingStrategy: Boolean(
+      values.image_reference_transport_mode ||
       values.priority ||
       values.weight ||
       (values.image_max_reference_images ??
