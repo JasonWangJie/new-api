@@ -29,6 +29,8 @@ import type {
   UserFormData,
   ManageUserAction,
   ManageUserQuotaPayload,
+  UserQuotaPreview,
+  UserQuotaAdjustmentResult,
   ApiResponse,
 } from './types'
 
@@ -135,9 +137,23 @@ export async function manageUser(
  */
 export async function adjustUserQuota(
   payload: ManageUserQuotaPayload
-): Promise<ApiResponse<Partial<User>>> {
+): Promise<ApiResponse<UserQuotaAdjustmentResult>> {
   const res = await api.post('/api/user/manage', payload)
   return res.data
+}
+
+export async function previewUserQuota(
+  payload: Pick<ManageUserQuotaPayload, 'id' | 'mode' | 'value'>,
+  signal?: AbortSignal
+): Promise<UserQuotaPreview> {
+  const res = await api.post<ApiResponse<UserQuotaPreview>>(
+    '/api/user/quota/preview',
+    payload,
+    { signal }
+  )
+  const response = requireServerSuccess(res.data)
+  if (!response.data) throw new Error('Missing quota preview')
+  return response.data
 }
 
 /**

@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -85,6 +86,52 @@ func createInvoiceTestTopUp(t *testing.T, userID int, tradeNo string, money floa
 	return topUp
 }
 
+// Matches QuantumNous/new-api v1.0.0-rc.44 and local baseline 4b1a76505.
+// https://raw.githubusercontent.com/QuantumNous/new-api/v1.0.0-rc.44/model/topup.go
+type legacyManualTopUp struct {
+	Id              int     `json:"id"`
+	UserId          int     `json:"user_id" gorm:"index"`
+	Amount          int64   `json:"amount"`
+	Money           float64 `json:"money"`
+	TradeNo         string  `json:"trade_no" gorm:"unique;type:varchar(255);index"`
+	PaymentMethod   string  `json:"payment_method" gorm:"type:varchar(50)"`
+	PaymentProvider string  `json:"payment_provider" gorm:"type:varchar(50);default:''"`
+	CreateTime      int64   `json:"create_time"`
+	CompleteTime    int64   `json:"complete_time"`
+	Status          string  `json:"status"`
+}
+
+func (legacyManualTopUp) TableName() string { return "top_ups" }
+
+func TestManualTopUpMigrationDatabaseMatrix(t *testing.T) {
+	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			db := invoiceDatabaseFixture(t, engine)
+			require.True(t, db.Migrator().HasColumn(&TopUp{}, "manual_adjustment"), "fresh database")
+			require.NoError(t, db.Migrator().DropTable(&TopUp{}))
+			require.NoError(t, db.AutoMigrate(&legacyManualTopUp{}))
+			legacy := legacyManualTopUp{UserId: 71, Amount: 10, Money: 12.34, TradeNo: "manual-migration-legacy", PaymentProvider: PaymentProviderEpay, PaymentMethod: "alipay", CreateTime: 100, CompleteTime: 200, Status: common.TopUpStatusSuccess}
+			require.NoError(t, db.Create(&legacy).Error)
+			require.NoError(t, db.AutoMigrate(&TopUp{}))
+			var preserved TopUp
+			require.NoError(t, db.First(&preserved, legacy.Id).Error)
+			assert.Nil(t, preserved.ManualAdjustment)
+			assert.Equal(t, legacy.UserId, preserved.UserId)
+			assert.Equal(t, legacy.TradeNo, preserved.TradeNo)
+			assert.Equal(t, legacy.Amount, preserved.Amount)
+			assert.Equal(t, legacy.Money, preserved.Money)
+			assert.Equal(t, legacy.PaymentProvider, preserved.PaymentProvider)
+			assert.Equal(t, legacy.CompleteTime, preserved.CompleteTime)
+			recorder := &migrationSQLRecorder{}
+			require.NoError(t, db.Session(&gorm.Session{Logger: recorder}).AutoMigrate(&TopUp{}))
+			assert.Empty(t, recorder.schemaMutations(), "second startup must not change the order schema")
+			assert.True(t, db.Migrator().HasIndex(&TopUp{}, "idx_top_ups_user_id"))
+			duplicate := TopUp{UserId: 72, TradeNo: legacy.TradeNo}
+			assert.Error(t, db.Create(&duplicate).Error, "order numbers remain unique after upgrade")
+		})
+	}
+}
+
 func TestInvoiceMigrationDatabaseMatrix(t *testing.T) {
 	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
@@ -136,6 +183,53 @@ func TestInvoiceWorkflow(t *testing.T) {
 }
 
 func runInvoiceWorkflow(t *testing.T) {
+	t.Run("manual credits invoice actual receipts and gifts remain ineligible", func(t *testing.T) {
+		clearInvoiceTestTables(t)
+		oldUnit := common.QuotaPerUnit
+		common.QuotaPerUnit = 500000
+		t.Cleanup(func() { common.QuotaPerUnit = oldUnit })
+		user := User{Id: 91, Username: "manual-invoice", Quota: 1000}
+		require.NoError(t, DB.Create(&user).Error)
+		paid := int64(1234)
+		adjustment, err := AdjustUserQuota(user.Id, common.RoleRootUser, "add", 250000, &ManualQuotaOrderInput{OperatorID: 9, OperatorUsername: "admin", PaymentAmountCents: &paid, IdempotencyKey: uuid.NewString(), ExpectedDeltaQuota: "250000"})
+		require.NoError(t, err)
+		zero := int64(0)
+		gift, err := AdjustUserQuota(user.Id, common.RoleRootUser, "add", 500000, &ManualQuotaOrderInput{OperatorID: 9, PaymentAmountCents: &zero, IdempotencyKey: uuid.NewString(), ExpectedDeltaQuota: "500000"})
+		require.NoError(t, err)
+		invalid := TopUp{UserId: user.Id, TradeNo: "MANUAL_invalid", Amount: 100, Money: 12.34, PaymentProvider: PaymentProviderManualBackend, PaymentMethod: PaymentMethodManualBackend, Status: common.TopUpStatusSuccess}
+		require.NoError(t, DB.Create(&invalid).Error)
+		common.QuotaPerUnit = 1000000 // Invoice amounts never follow subsequent pricing changes.
+		eligible, total, err := ListInvoiceEligibleOrders(user.Id, "", &common.PageInfo{Page: 1, PageSize: 20})
+		require.NoError(t, err)
+		require.Len(t, eligible, 1)
+		assert.EqualValues(t, 1, total)
+		assert.Equal(t, adjustment.Order.Id, eligible[0].TopUpId)
+		assert.EqualValues(t, 1234, eligible[0].AmountCents)
+		assert.Equal(t, PaymentMethodManualBackend, eligible[0].PaymentMethod)
+		for _, id := range []int{gift.Order.Id, invalid.Id} {
+			_, err := CreateUserInvoiceRequest(user.Id, []int{id}, "Company", "TAX-91", "manual@example.com", 0)
+			assert.ErrorIs(t, err, ErrInvoiceOrderInvalid)
+		}
+		_, err = CreateUserInvoiceRequest(92, []int{adjustment.Order.Id}, "Other", "TAX-92", "other@example.com", 0)
+		assert.ErrorIs(t, err, ErrInvoiceOrderInvalid)
+		_, err = CreateUserInvoiceRequest(user.Id, []int{adjustment.Order.Id}, "Company", "TAX-91", "manual@example.com", 1235)
+		assert.ErrorIs(t, err, ErrInvoiceAmountBelowMin)
+		request, err := CreateUserInvoiceRequest(user.Id, []int{adjustment.Order.Id}, "Company", "TAX-91", "manual@example.com", 1234)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1234, request.TotalAmountCents)
+		_, err = CreateHistoricalInvoiceRequest(user.Id, []int{adjustment.Order.Id}, "duplicate", InvoiceOperator{Id: 9, Username: "admin"})
+		assert.ErrorIs(t, err, ErrInvoiceOrderClaimed)
+		_, err = ProcessInvoiceRequest(request.Id, InvoiceStatusRejected, "update invoice title", InvoiceOperator{Id: 9, Username: "admin"})
+		require.NoError(t, err)
+		history, err := CreateHistoricalInvoiceRequest(user.Id, []int{adjustment.Order.Id}, "issued", InvoiceOperator{Id: 9, Username: "admin"})
+		require.NoError(t, err)
+		assert.Equal(t, InvoiceStatusCompleted, history.Status)
+		loaded, err := GetInvoiceRequest(history.Id, user.Id)
+		require.NoError(t, err)
+		require.Len(t, loaded.Items, 1)
+		assert.Equal(t, PaymentMethodManualBackend, loaded.Items[0].PaymentMethod)
+		assert.EqualValues(t, 1234, loaded.Items[0].AmountCents)
+	})
 	t.Run("eligible orders include verified legacy Epay and exclude unknown or subscription orders", func(t *testing.T) {
 		clearInvoiceTestTables(t)
 		explicit := createInvoiceTestTopUp(t, 61, "invoice-explicit", 10)

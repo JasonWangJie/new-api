@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
+import type { TopupRecord } from '@/features/wallet/types'
 import type { AdminPermissionMatrix } from '@/lib/admin-permissions'
 
 // ============================================================================
@@ -143,6 +144,27 @@ export interface ManageUserQuotaPayload {
   action: 'add_quota'
   mode: QuotaAdjustMode
   value: number
+  payment_amount_cents?: number
+  idempotency_key?: string
+  expected_delta_quota?: string
+}
+
+export interface UserQuotaPreview {
+  before: number
+  after: number
+  delta_quota: string
+  suggested_payment_amount_cents: number
+  payment_currency: 'CNY'
+  payment_method: 'manual_backend'
+}
+
+export interface UserQuotaAdjustmentResult {
+  user_id: number
+  before: number
+  after: number
+  delta_quota: string
+  order?: TopupRecord
+  replayed: boolean
 }
 
 // ============================================================================

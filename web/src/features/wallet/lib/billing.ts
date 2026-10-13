@@ -63,6 +63,22 @@ export const PAYMENT_METHOD_NAMES: Record<string, string> = {
   alipay: 'Alipay',
   wxpay: 'WeChat Pay',
   waffo: 'Waffo',
+  manual_backend: 'Manual backend',
+}
+
+/** Format confirmed RMB cents without floating-point rounding. */
+export function formatCnyCents(cents: number): string {
+  const integer = BigInt(cents)
+  return `${integer / 100n}.${String(integer % 100n).padStart(2, '0')}`
+}
+
+/** Money input is always RMB with at most two fractional digits. */
+export function parseCnyCents(input: string): number | null {
+  if (input.length > 32 || !/^\d+(?:\.\d{1,2})?$/.test(input)) return null
+  const [whole, fraction = ''] = input.split('.')
+  const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'))
+  if (cents > BigInt(Number.MAX_SAFE_INTEGER)) return null
+  return Number(cents)
 }
 
 /**

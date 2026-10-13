@@ -124,7 +124,7 @@ func isLegacyEpayInvoiceTopUp(topUp *TopUp) bool {
 		}
 	}
 	switch strings.ToLower(topUp.PaymentMethod) {
-	case PaymentMethodStripe, PaymentMethodCreem, PaymentMethodWaffo, PaymentMethodWaffoPancake, PaymentMethodBalance:
+	case PaymentMethodStripe, PaymentMethodCreem, PaymentMethodWaffo, PaymentMethodWaffoPancake, PaymentMethodBalance, PaymentMethodManualBackend:
 		return false
 	default:
 		return true
@@ -132,10 +132,27 @@ func isLegacyEpayInvoiceTopUp(topUp *TopUp) bool {
 }
 
 func isEpayInvoiceTopUp(topUp *TopUp) bool {
+	if topUp.PaymentMethod == PaymentMethodManualBackend {
+		return false
+	}
 	if topUp.PaymentProvider == PaymentProviderEpay {
 		return true
 	}
 	return topUp.PaymentProvider == "" && isLegacyEpayInvoiceTopUp(topUp)
+}
+
+func invoiceTopUpAmountCents(topUp *TopUp) (int64, error) {
+	if topUp.PaymentProvider == PaymentProviderManualBackend {
+		snapshot, err := topUp.manualQuotaSnapshot()
+		if err != nil || snapshot.PaymentAmountCents <= 0 {
+			return 0, ErrInvoiceOrderInvalid
+		}
+		return snapshot.PaymentAmountCents, nil
+	}
+	if !isEpayInvoiceTopUp(topUp) {
+		return 0, ErrInvoiceOrderInvalid
+	}
+	return topUpInvoiceAmountCents(topUp.Money)
 }
 
 func invoiceSearchPattern(value string) string {
@@ -151,7 +168,7 @@ func invoiceOrderQuery(tx *gorm.DB, userId int, keyword string) *gorm.DB {
 		Where("top_ups.user_id = ? AND top_ups.status = ? AND top_ups.money > 0", userId, common.TopUpStatusSuccess).
 		Where("invoice_order_claims.top_up_id IS NULL").
 		Where("NOT EXISTS (SELECT 1 FROM subscription_orders WHERE subscription_orders.trade_no = top_ups.trade_no)").
-		Where("(top_ups.payment_provider = ? OR (COALESCE(top_ups.payment_provider, '') = '' AND top_ups.trade_no LIKE ?))", PaymentProviderEpay, prefix)
+		Where("(top_ups.payment_provider = ? OR (top_ups.payment_provider = ? AND top_ups.payment_method = ? AND top_ups.manual_adjustment IS NOT NULL) OR (COALESCE(top_ups.payment_provider, '') = '' AND top_ups.trade_no LIKE ?))", PaymentProviderEpay, PaymentProviderManualBackend, PaymentMethodManualBackend, prefix)
 	if strings.TrimSpace(keyword) != "" {
 		query = query.Where("top_ups.trade_no LIKE ? ESCAPE '!'", invoiceSearchPattern(keyword))
 	}
@@ -166,10 +183,7 @@ func ListInvoiceEligibleOrders(userId int, keyword string, pageInfo *common.Page
 	}
 	eligible := make([]InvoiceEligibleOrder, 0, len(topUps))
 	for i := range topUps {
-		if !isEpayInvoiceTopUp(&topUps[i]) {
-			continue
-		}
-		amountCents, err := topUpInvoiceAmountCents(topUps[i].Money)
+		amountCents, err := invoiceTopUpAmountCents(&topUps[i])
 		if err != nil {
 			continue
 		}
@@ -255,10 +269,10 @@ func createInvoiceRequest(userId int, source string, orderIDs []int, companyName
 		var total int64
 		for i := range topUps {
 			topUp := &topUps[i]
-			if topUp.UserId != userId || topUp.Status != common.TopUpStatusSuccess || !isEpayInvoiceTopUp(topUp) {
+			if topUp.UserId != userId || topUp.Status != common.TopUpStatusSuccess {
 				return ErrInvoiceOrderInvalid
 			}
-			amountCents, err := topUpInvoiceAmountCents(topUp.Money)
+			amountCents, err := invoiceTopUpAmountCents(topUp)
 			if err != nil {
 				return err
 			}

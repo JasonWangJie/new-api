@@ -43,6 +43,8 @@ import { I18nextProvider } from 'react-i18next'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { BillingHistoryDialog } from '@/features/wallet/components/dialogs/billing-history-dialog'
+import { formatCnyCents, parseCnyCents } from '@/features/wallet/lib/billing'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { formatTimestampToDate } from '@/lib/format'
@@ -52,7 +54,8 @@ import {
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
-import type { User } from '../../types'
+import type { User, ManageUserQuotaPayload } from '../../types'
+import { UserQuotaDialog } from '../user-quota-dialog'
 import { useUsersColumns } from '../users-columns'
 import { UsersProvider } from '../users-provider'
 import { UsersTable } from '../users-table'
@@ -127,6 +130,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   cleanup()
+  vi.unstubAllGlobals()
   clients.splice(0).forEach((client) => client.clear())
   useAuthStore.getState().auth.reset()
   useSystemConfigStore
@@ -414,6 +418,300 @@ it('updates the header unit and converted amounts together when currency setting
   for (const cell of screen.getAllByRole('cell')) {
     expect(cell).not.toHaveTextContent('¥')
   }
+})
+
+function renderQuotaAdjustment() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const onSuccess = vi.fn()
+  const onOpenChange = vi.fn()
+  render(
+    <QueryClientProvider client={client}>
+      <I18nextProvider i18n={i18n}>
+        <UserQuotaDialog
+          open
+          onOpenChange={onOpenChange}
+          userId={2}
+          currentQuota={1000}
+          onSuccess={onSuccess}
+        />
+      </I18nextProvider>
+    </QueryClientProvider>
+  )
+  return { onSuccess, onOpenChange }
+}
+
+it('confirms received RMB independently of fractional credited quota', async () => {
+  const getRandomValues = crypto.getRandomValues.bind(crypto)
+  vi.stubGlobal('crypto', { getRandomValues })
+  const requests: ManageUserQuotaPayload[] = []
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/user/quota/preview') {
+      return {
+        data: {
+          success: true,
+          data: {
+            before: 1000,
+            after: 251000,
+            delta_quota: '250000',
+            suggested_payment_amount_cents: 730,
+          },
+        },
+      } as never
+    }
+    requests.push(body as ManageUserQuotaPayload)
+    return {
+      data: { success: true, data: { order: { trade_no: 'MANUAL_paid' } } },
+    } as never
+  })
+  const result = renderQuotaAdjustment()
+  const user = userEvent.setup()
+  await user.type(screen.getByRole('spinbutton', { name: /Amount/ }), '0.5')
+  const cash = await screen.findByLabelText('Received amount (CNY)')
+  expect(cash).toHaveValue('7.30')
+  await user.clear(cash)
+  await user.type(cash, '12.345')
+  expect(screen.getByRole('button', { name: 'Confirm' })).toBeDisabled()
+  await user.clear(cash)
+  await user.type(cash, '12.34')
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(result.onSuccess).toHaveBeenCalledOnce())
+  expect(requests).toHaveLength(1)
+  expect(requests[0]).toMatchObject({
+    id: 2,
+    action: 'add_quota',
+    mode: 'add',
+    value: 250000,
+    payment_amount_cents: 1234,
+    expected_delta_quota: '250000',
+  })
+  expect(requests[0].idempotency_key).toMatch(
+    /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/
+  )
+})
+
+it('preserves the exact confirmation request after an uncertain network result', async () => {
+  const requests: ManageUserQuotaPayload[] = []
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/user/quota/preview') {
+      return {
+        data: {
+          success: true,
+          data: {
+            before: 1000,
+            after: 501000,
+            delta_quota: '500000',
+            suggested_payment_amount_cents: 730,
+          },
+        },
+      } as never
+    }
+    requests.push(structuredClone(body as ManageUserQuotaPayload))
+    if (requests.length === 1) throw new Error('network result unavailable')
+    if (requests.length === 2) {
+      return {
+        data: { success: false, message: 'permission check unavailable' },
+      } as never
+    }
+    return {
+      data: {
+        success: true,
+        data: { replayed: true, order: { trade_no: 'MANUAL_original' } },
+      },
+    } as never
+  })
+  const result = renderQuotaAdjustment()
+  const user = userEvent.setup()
+  await user.type(screen.getByRole('spinbutton', { name: /Amount/ }), '1')
+  await screen.findByLabelText('Received amount (CNY)')
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  const retry = await screen.findByRole('button', {
+    name: 'Retry confirmation',
+  })
+  expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+  expect(screen.getByLabelText('Received amount (CNY)')).toBeDisabled()
+  await user.click(retry)
+  await waitFor(() => expect(requests).toHaveLength(2))
+  expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Retry confirmation' }))
+  await waitFor(() => expect(result.onSuccess).toHaveBeenCalledOnce())
+  expect(requests).toHaveLength(3)
+  expect(requests[1]).toEqual(requests[0])
+  expect(requests[2]).toEqual(requests[0])
+})
+
+it('creates a gift order with explicit zero cents', async () => {
+  const requests: ManageUserQuotaPayload[] = []
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/user/quota/preview') {
+      return {
+        data: {
+          success: true,
+          data: {
+            before: 1000,
+            after: 501000,
+            delta_quota: '500000',
+            suggested_payment_amount_cents: 730,
+          },
+        },
+      } as never
+    }
+    requests.push(body as ManageUserQuotaPayload)
+    return { data: { success: true } } as never
+  })
+  renderQuotaAdjustment()
+  const user = userEvent.setup()
+  await user.type(screen.getByRole('spinbutton', { name: /Amount/ }), '1')
+  const cash = await screen.findByLabelText('Received amount (CNY)')
+  await user.clear(cash)
+  await user.type(cash, '0')
+  expect(
+    screen.getByText(
+      'A zero payment creates a gift order that cannot be invoiced.'
+    )
+  ).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(requests).toHaveLength(1))
+  expect(requests[0].payment_amount_cents).toBe(0)
+})
+
+it('refreshes a stale override and keeps the edited received amount', async () => {
+  let conflict = false
+  const requests: ManageUserQuotaPayload[] = []
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/user/quota/preview') {
+      return {
+        data: {
+          success: true,
+          data: {
+            before: conflict ? 1100000 : 1000000,
+            after: 1500000,
+            delta_quota: conflict ? '400000' : '500000',
+            suggested_payment_amount_cents: conflict ? 584 : 730,
+          },
+        },
+      } as never
+    }
+    requests.push(body as ManageUserQuotaPayload)
+    if (!conflict) {
+      conflict = true
+      throw {
+        response: { status: 409, data: { code: 'MANUAL_QUOTA_CONFLICT' } },
+      }
+    }
+    return { data: { success: true } } as never
+  })
+  renderQuotaAdjustment()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Override' }))
+  await user.type(screen.getByRole('spinbutton', { name: /Amount/ }), '3')
+  const cash = await screen.findByLabelText('Received amount (CNY)')
+  await user.clear(cash)
+  await user.type(cash, '12.34')
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() =>
+    expect(screen.getByText(/Current quota/)).toHaveTextContent('2.2')
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled()
+  )
+  expect(cash).toHaveValue('12.34')
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(requests).toHaveLength(2))
+  expect(requests[1]).toMatchObject({
+    expected_delta_quota: '400000',
+    payment_amount_cents: 1234,
+  })
+  expect(requests[1].idempotency_key).not.toBe(requests[0].idempotency_key)
+})
+
+it('keeps decreasing overrides on the existing request contract', async () => {
+  const requests: ManageUserQuotaPayload[] = []
+  vi.spyOn(api, 'post').mockImplementation(async (url, body) => {
+    if (url === '/api/user/quota/preview') {
+      return {
+        data: {
+          success: true,
+          data: {
+            before: 1000,
+            after: 0,
+            delta_quota: '-1000',
+            suggested_payment_amount_cents: 0,
+          },
+        },
+      } as never
+    }
+    requests.push(body as ManageUserQuotaPayload)
+    return { data: { success: true } } as never
+  })
+  renderQuotaAdjustment()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Override' }))
+  await user.type(screen.getByRole('spinbutton', { name: /Amount/ }), '0')
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled()
+  )
+  expect(
+    screen.queryByLabelText('Received amount (CNY)')
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Confirm' }))
+  await waitFor(() => expect(requests).toHaveLength(1))
+  expect(requests[0]).toEqual({
+    id: 2,
+    action: 'add_quota',
+    mode: 'override',
+    value: 0,
+  })
+})
+
+it('round-trips confirmed cents without accepting excess precision or unsafe integers', () => {
+  expect(parseCnyCents('12.34')).toBe(1234)
+  expect(formatCnyCents(1234)).toBe('12.34')
+  expect(parseCnyCents('0')).toBe(0)
+  expect(parseCnyCents('12.345')).toBeNull()
+  expect(parseCnyCents('-1')).toBeNull()
+  expect(parseCnyCents('90071992547409.91')).toBe(Number.MAX_SAFE_INTEGER)
+  expect(formatCnyCents(Number.MAX_SAFE_INTEGER)).toBe('90071992547409.91')
+  expect(parseCnyCents('90071992547409.92')).toBeNull()
+})
+
+it('shows manual billing with exact credited amount and received RMB', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        total: 1,
+        items: [
+          {
+            id: 1,
+            user_id: 2,
+            amount: 250000,
+            money: 12.34,
+            trade_no: 'MANUAL_billing',
+            payment_method: 'manual_backend',
+            credited_quota: '250000',
+            credited_amount: '0.5',
+            payment_amount_cents: 1234,
+            payment_currency: 'CNY',
+            create_time: 1700000000,
+            complete_time: 1700000000,
+            status: 'success',
+          },
+        ],
+      },
+    },
+  })
+  render(
+    <I18nextProvider i18n={i18n}>
+      <BillingHistoryDialog open onOpenChange={vi.fn()} />
+    </I18nextProvider>
+  )
+  expect(await screen.findByText('Manual backend')).toBeInTheDocument()
+  expect(screen.getByText('0.5 USD')).toBeInTheDocument()
+  expect(screen.getByText('¥12.34')).toBeInTheDocument()
+  expect(screen.queryByText('manual_backend')).not.toBeInTheDocument()
 })
 
 it('labels raw quota mode as tokens without introducing a currency symbol', () => {

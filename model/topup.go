@@ -23,23 +23,31 @@ type TopUp struct {
 	CreateTime      int64   `json:"create_time"`
 	CompleteTime    int64   `json:"complete_time"`
 	Status          string  `json:"status"`
+	// ManualAdjustment is an immutable, private snapshot of a manual credit.
+	ManualAdjustment   *string `json:"-" gorm:"type:text"`
+	CreditedQuota      string  `json:"credited_quota,omitempty" gorm:"-:all"`
+	CreditedAmount     string  `json:"credited_amount,omitempty" gorm:"-:all"`
+	PaymentAmountCents *int64  `json:"payment_amount_cents,omitempty" gorm:"-:all"`
+	PaymentCurrency    string  `json:"payment_currency,omitempty" gorm:"-:all"`
 }
 
 const (
-	PaymentMethodStripe       = "stripe"
-	PaymentMethodCreem        = "creem"
-	PaymentMethodWaffo        = "waffo"
-	PaymentMethodWaffoPancake = "waffo_pancake"
-	PaymentMethodBalance      = "balance"
+	PaymentMethodStripe        = "stripe"
+	PaymentMethodCreem         = "creem"
+	PaymentMethodWaffo         = "waffo"
+	PaymentMethodWaffoPancake  = "waffo_pancake"
+	PaymentMethodBalance       = "balance"
+	PaymentMethodManualBackend = "manual_backend"
 )
 
 const (
-	PaymentProviderEpay         = "epay"
-	PaymentProviderStripe       = "stripe"
-	PaymentProviderCreem        = "creem"
-	PaymentProviderWaffo        = "waffo"
-	PaymentProviderWaffoPancake = "waffo_pancake"
-	PaymentProviderBalance      = "balance"
+	PaymentProviderEpay          = "epay"
+	PaymentProviderStripe        = "stripe"
+	PaymentProviderCreem         = "creem"
+	PaymentProviderWaffo         = "waffo"
+	PaymentProviderWaffoPancake  = "waffo_pancake"
+	PaymentProviderBalance       = "balance"
+	PaymentProviderManualBackend = "manual_backend"
 )
 
 var (
@@ -460,6 +468,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 	var quotaToAdd int
 	var payMoney float64
 	var paymentMethod string
+	completed := false
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		topUp := &TopUp{}
@@ -471,6 +480,9 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		// 幂等处理：已成功直接返回
 		if topUp.Status == common.TopUpStatusSuccess {
 			return nil
+		}
+		if topUp.PaymentProvider == PaymentProviderManualBackend || topUp.PaymentMethod == PaymentMethodManualBackend {
+			return ErrPaymentMethodMismatch
 		}
 
 		if topUp.Status != common.TopUpStatusPending {
@@ -509,6 +521,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		userId = topUp.UserId
 		payMoney = topUp.Money
 		paymentMethod = topUp.PaymentMethod
+		completed = true
 		return nil
 	})
 
@@ -517,6 +530,9 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 	}
 
 	// 事务外记录日志，避免阻塞
+	if !completed {
+		return nil
+	}
 	syncCreditUserQuotaCache(userId, quotaToAdd, "manual topup")
 	RecordTopupLog(userId, fmt.Sprintf("管理员补单成功，充值金额: %v，支付金额：%f", logger.FormatQuota(quotaToAdd), payMoney), callerIp, paymentMethod, "admin")
 	return nil

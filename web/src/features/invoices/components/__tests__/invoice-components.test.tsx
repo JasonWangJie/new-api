@@ -444,7 +444,7 @@ describe('invoice components', () => {
           request_id: 9,
           top_up_id: 2,
           trade_no: 'order-2',
-          payment_method: 'alipay',
+          payment_method: 'manual_backend',
           amount_cents: 1234,
           create_time: 1,
           complete_time: 2,
@@ -470,6 +470,7 @@ describe('invoice components', () => {
       screen.getByRole('button', { name: 'View invoice details' })
     )
     expect(await screen.findByText('Payment Method')).toBeInTheDocument()
-    expect(screen.getByText('Alipay')).toBeInTheDocument()
+    expect(screen.getByText('Manual backend')).toBeInTheDocument()
+    expect(screen.queryByText('manual_backend')).not.toBeInTheDocument()
   })
 })

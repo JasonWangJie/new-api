@@ -271,6 +271,11 @@ export interface TopupRecord {
   complete_time?: number
   /** Payment status */
   status: TopupStatus
+  /** Exact credited quota and USD amount for manual orders. */
+  credited_quota?: string
+  credited_amount?: string
+  payment_amount_cents?: number
+  payment_currency?: 'CNY'
 }
 
 /**

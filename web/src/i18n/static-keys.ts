@@ -19,6 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Manual backend',
+  'Retry confirmation',
+  'Confirm the received amount and quota preview before adding quota.',
+  'Quota or order details changed. Preview and confirm again.',
   // Channel-level upstream asynchronous task validation messages.
   'Path is required',
   'Path is too long',

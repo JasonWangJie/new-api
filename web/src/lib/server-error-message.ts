@@ -23,6 +23,10 @@ import i18next from 'i18next'
 export const safeServerErrorMessage = Symbol('safeServerErrorMessage')
 
 const serverErrorMessageKeys = {
+  MANUAL_PAYMENT_INVALID:
+    'Confirm the received amount and quota preview before adding quota.',
+  MANUAL_QUOTA_CONFLICT:
+    'Quota or order details changed. Preview and confirm again.',
   TELEGRAM_OAUTH_NOT_CONFIGURED:
     'Telegram OAuth is not configured or enabled. Please contact your administrator.',
   TELEGRAM_OAUTH_CONFLICT:

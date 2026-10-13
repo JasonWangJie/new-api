@@ -27,6 +27,9 @@ func GetTopUpInfo(c *gin.Context) {
 
 	// 获取支付方式
 	payMethods := operation_setting.PayMethods
+	payMethods = lo.Filter(payMethods, func(method map[string]string, _ int) bool {
+		return method["type"] != model.PaymentMethodManualBackend
+	})
 	if !complianceConfirmed {
 		payMethods = []map[string]string{}
 	}
@@ -272,6 +275,10 @@ func RequestEpay(c *gin.Context) {
 	err := c.ShouldBindJSON(&req)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "参数错误"})
+		return
+	}
+	if req.PaymentMethod == model.PaymentMethodManualBackend {
+		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "支付方式不存在"})
 		return
 	}
 	if req.Amount < getMinTopup() {
