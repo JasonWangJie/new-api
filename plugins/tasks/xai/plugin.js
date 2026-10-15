@@ -1,5 +1,5 @@
 const MODELS_15 = ["grok-imagine-video-1.5", "grok-imagine-video-1.5-preview", "grok-imagine-video-1.5-2026-05-30"];
-const ALL_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
+const ALL_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "5:2"];
 const IMAGE_SOURCES = ["url", "data_uri", "file_id", "upload"];
 const VIDEO_SOURCES = ["url", "data_uri", "file_id"];
 
@@ -31,7 +31,7 @@ const MODE_REFERENCE_15 = {
   defaultAspectRatio: "16:9",
   inputs: [
     { name: "image", kind: "image", sources: IMAGE_SOURCES, maxItems: 1 },
-    { name: "reference_images", kind: "image", sources: IMAGE_SOURCES, maxItems: 7 },
+    { name: "reference_images", kind: "image", sources: IMAGE_SOURCES, maxItems: 14 },
     { name: "reference_audios", kind: "audio", sources: ["voice_id"], maxItems: 3 },
     { name: "last_frame", kind: "image", sources: IMAGE_SOURCES, maxItems: 1 },
   ],
@@ -60,7 +60,7 @@ export const meta = {
     en: "xAI Grok video generation with text, image, references, and pinned frames",
     zh: "xAI Grok 视频生成，支持文本、图片、参考素材和首尾帧",
   },
-  version: "1.1.0",
+  version: "1.1.3",
   author: { name: "QuantumNous", url: "https://x.ai" },
   baseUrl: "https://api.x.ai",
   channelTypes: [48],
@@ -73,11 +73,14 @@ export const meta = {
       description: { en: "Video generation unit price", zh: "视频生成单价" },
     },
     resolution: {
-      enum: ["480p", "720p", "1080p"],
+      // Pricing rows may include disabled tiers; videoProfiles remain the
+      // authoritative generation limits and do not enable 4k output.
+      enum: ["480p", "720p", "1080p", "4k"],
       enumLabels: {
         "480p": { en: "480p", zh: "480p" },
         "720p": { en: "720p", zh: "720p" },
         "1080p": { en: "1080p", zh: "1080p" },
+        "4k": { en: "4k", zh: "4k" },
       },
       description: { en: "Output video resolution", zh: "输出视频分辨率" },
     },
@@ -128,6 +131,16 @@ export const meta = {
           aspectRatios: ALL_RATIOS,
           defaultAspectRatio: "16:9",
           inputs: [{ name: "image", kind: "image", sources: IMAGE_SOURCES, maxItems: 1, required: true }],
+          options: { generateAudio: true },
+        },
+        {
+          name: "reference_to_video",
+          duration: { min: 1, max: 10, step: 1, default: 5 },
+          resolutions: ["480p", "720p"],
+          defaultResolution: "480p",
+          aspectRatios: ALL_RATIOS,
+          defaultAspectRatio: "16:9",
+          inputs: [{ name: "reference_images", kind: "image", sources: IMAGE_SOURCES, maxItems: 7 }],
           options: { generateAudio: true },
         },
         {
@@ -197,8 +210,8 @@ function videoObject(value) {
     if (!/^data:video\/mp4(?:;|,)/i.test(url)) throw new Error("video data URI must use video/mp4");
     return video;
   }
-  const path = url.split(/[?#]/, 1)[0].toLowerCase();
-  if (!path.endsWith(".mp4")) throw new Error("video URL must point to an MP4 file");
+  // A signed media route may serve an MP4 without a filename extension.
+  // HTTPS URLs are fetched and format-checked by the upstream provider.
   return video;
 }
 
@@ -216,7 +229,7 @@ function videoOperationRequest(req, model, operation) {
   if (!hasOwn(req, "video")) throw new Error("video is required");
   rejectVideoOperationFields(req, ["action", "operation", "mode", "source_task_id"]);
   const metadata = req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
-  for (const name of ["model", "provider", "prompt", "video", "extension_direction"]) {
+  for (const name of ["model", "provider", "prompt", "video", "extension_direction", "duration", "seconds", "keyframes"]) {
     if (hasOwn(metadata, name)) throw new Error(`metadata.${name} cannot override a structured xAI video field`);
   }
   const body = { ...req, model, prompt, video: videoObject(req.video) };
@@ -234,6 +247,7 @@ function videoOperationRequest(req, model, operation) {
       "images",
       "input_reference",
       "last_frame",
+      "keyframes",
       "reference_images",
       "reference_videos",
       "reference_audios",
@@ -253,6 +267,7 @@ function videoOperationRequest(req, model, operation) {
     "images",
     "input_reference",
     "last_frame",
+    "keyframes",
     "reference_images",
     "reference_videos",
     "reference_audios",
@@ -279,6 +294,25 @@ function mediaList(value, name, maxItems) {
   });
 }
 
+function keyframeList(value, seconds) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error("keyframes must be an array");
+  if (value.length > 4) throw new Error("keyframes supports at most 4 items");
+  const slots = new Set();
+  return value.map(function (item, index) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`keyframes[${index}] must contain image and timestamp_s`);
+    const timestamp = item.timestamp_s;
+    if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) throw new Error(`keyframes[${index}].timestamp_s must be a finite number`);
+    if (timestamp <= 0 || timestamp >= seconds) throw new Error(`keyframes[${index}].timestamp_s must fall strictly inside the video duration`);
+    // The provider snaps times to thirds of a second. Preserve the requested
+    // timestamp on the wire and reject anchors that would occupy one slot.
+    const slot = Math.round(timestamp * 3);
+    if (slots.has(slot)) throw new Error("keyframes cannot round to the same 1/3-second slot");
+    slots.add(slot);
+    return { image: mediaObject(item.image, `keyframes[${index}].image`), timestamp_s: timestamp };
+  });
+}
+
 function audioList(value) {
   if (value === undefined || value === null || value === "") return [];
   const values = Array.isArray(value) ? value : [value];
@@ -301,6 +335,11 @@ function parseJSONField(value, name) {
 
 function validateRequest(req, model, fileCounts) {
   rejectVideoOperationFields(req, ["video", "source_task_id", "action", "operation", "mode"]);
+  const metadata = req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
+  for (const name of ["model", "provider", "prompt", "duration", "seconds", "resolution", "size", "aspect_ratio", "ratio", "image", "images", "input_reference", "last_frame", "keyframes", "reference_images", "reference_audios", "reference_videos", "generate_audio", "extension_direction"]) {
+    if (hasOwn(metadata, name)) throw new Error(`metadata.${name} cannot override a structured xAI video field`);
+  }
+  if (hasOwn(req, "duration") && hasOwn(req, "seconds")) throw new Error("duration and seconds cannot both be provided");
   const modern = isModel15(model);
   let duration = req.duration;
   if (duration === undefined) duration = req.seconds;
@@ -314,8 +353,10 @@ function validateRequest(req, model, fileCounts) {
   if (!modern && resolution === "1080p") throw new Error("grok-imagine-video supports only 480p or 720p");
   const image = req.image === undefined ? req.input_reference : req.image;
   const hasImage = (image !== undefined && image !== null && image !== "") || fileCounts.image > 0;
-  const references = mediaList(req.reference_images, "reference_images", 7);
+  const maxReferences = modern ? 14 : 7;
+  const references = mediaList(req.reference_images, "reference_images", maxReferences);
   const audios = audioList(req.reference_audios);
+  const keyframes = keyframeList(req.keyframes, seconds);
   const lastFrame = req.last_frame;
   const hasLastFrame = (lastFrame !== undefined && lastFrame !== null && lastFrame !== "") || fileCounts.lastFrame > 0;
   const referenceCount = references.length + fileCounts.references;
@@ -325,21 +366,23 @@ function validateRequest(req, model, fileCounts) {
   if ((lastFrame !== undefined && lastFrame !== null && lastFrame !== "" ? 1 : 0) + fileCounts.lastFrame > 1) {
     throw new Error("last_frame must be provided at most once");
   }
-  if (referenceCount > 7) throw new Error("reference_images supports at most 7 items");
+  if (referenceCount > maxReferences) throw new Error(`reference_images supports at most ${maxReferences} items`);
   if (req.reference_videos !== undefined && (!Array.isArray(req.reference_videos) || req.reference_videos.length > 0)) {
     throw new Error("xAI video generation does not support reference_videos");
   }
-  if (!modern && (referenceCount > 0 || audios.length > 0 || hasLastFrame)) throw new Error("reference inputs and last_frame require grok-imagine-video-1.5");
-  const referenceMode = referenceCount > 0 || audios.length > 0 || hasLastFrame;
+  if (!modern && (audios.length > 0 || hasLastFrame || keyframes.length > 0)) throw new Error("voice references, last_frame, and keyframes require grok-imagine-video-1.5");
+  if (!modern && referenceCount > 0 && hasImage) throw new Error("grok-imagine-video cannot combine image with reference_images");
+  if (!modern && referenceCount > 0 && seconds > 10) throw new Error("grok-imagine-video reference mode supports at most 10 seconds");
+  const referenceMode = referenceCount > 0 || audios.length > 0 || hasLastFrame || keyframes.length > 0;
   if (referenceMode && resolution === "1080p") throw new Error("reference and first/last-frame modes support at most 720p");
   const prompt = trimmed(req.prompt);
-  if (!prompt && !hasImage && !hasLastFrame && referenceCount === 0 && audios.length === 0) throw new Error("prompt is required for text-to-video");
+  if (!prompt && !hasImage && !hasLastFrame && referenceCount === 0 && audios.length === 0 && keyframes.length === 0) throw new Error("prompt is required for text-to-video");
   if (req.generate_audio !== undefined && typeof req.generate_audio !== "boolean") throw new Error("generate_audio must be a boolean");
   let action = "text_to_video";
-  if (referenceCount > 0 || audios.length > 0) action = "reference_to_video";
+  if (referenceCount > 0 || audios.length > 0 || keyframes.length > 0) action = "reference_to_video";
   else if (hasLastFrame) action = "first_last_frame";
   else if (hasImage) action = "image_to_video";
-  return { action, seconds, resolution, aspectRatio, references, audios };
+  return { action, seconds, resolution, aspectRatio, references, audios, keyframes };
 }
 
 function normalizedRequest(req, model, validation) {
@@ -361,6 +404,8 @@ function normalizedRequest(req, model, validation) {
   else delete body.reference_images;
   if (validation.audios.length) body.reference_audios = validation.audios;
   else delete body.reference_audios;
+  if (validation.keyframes.length) body.keyframes = validation.keyframes;
+  else delete body.keyframes;
   return body;
 }
 
@@ -382,7 +427,7 @@ function multipartRequest(ctx) {
     if (values.length > 1) throw new Error(`${name} must be provided once`);
     if (values.length) req[name] = parseJSONField(values[0], name);
   }
-  for (const name of ["reference_images", "reference_audios", "reference_videos"]) {
+  for (const name of ["reference_images", "reference_audios", "reference_videos", "keyframes"]) {
     const values = fields[name] || [];
     if (values.length === 1) {
       const parsed = parseJSONField(values[0], name);
@@ -393,7 +438,7 @@ function multipartRequest(ctx) {
       });
     }
   }
-  const known = new Set([...scalarFields, "image", "input_reference", "last_frame", "reference_images", "reference_audios", "reference_videos"]);
+  const known = new Set([...scalarFields, "image", "input_reference", "last_frame", "reference_images", "reference_audios", "reference_videos", "keyframes"]);
   for (const name of Object.keys(fields)) {
     if (!known.has(name)) throw new Error(`unexpected multipart field: ${name}`);
   }
@@ -447,11 +492,36 @@ export function buildSubmitRequest(ctx) {
   };
 }
 
-export function parseSubmitResponse(_ctx, response) {
+// Persist the duration source with the task for billing reconciliation.
+function completionState(ctx, body) {
+  const state = { ...(ctx.state || {}) };
+  const seconds = Number(body && body.video && body.video.duration);
+  const maximumSeconds = ctx.action === "edit_video" ? 8.7 : 15;
+  const measured = ctx.action !== "extend_video" && Number.isFinite(seconds) && (ctx.action === "edit_video" ? seconds > 0 : seconds >= 1) && seconds <= maximumSeconds;
+  state.duration_source = measured ? "upstream" : "request";
+  if (measured) state.billing_seconds = seconds;
+  else if (Number.isFinite(state.requested_seconds)) state.billing_seconds = state.requested_seconds;
+  return state;
+}
+
+export function parseSubmitResponse(ctx, response) {
   const body = response.body || {};
+  const estimate = extractUsage(ctx);
+  const state = { requested_seconds: estimate.seconds, requested_resolution: estimate.resolution };
+  const status = trimmed(body.status).toLowerCase();
+  const url = trimmed(body.video && body.video.url);
+  if (url && (status === "done" || !status)) {
+    const taskID = trimmed(body.request_id) || trimmed(ctx.publicTaskId) || utils.uuid();
+    return {
+      taskId: taskID,
+      taskData: { ...body, status: "done" },
+      state: completionState({ ...ctx, state }, body),
+      immediate: { taskId: taskID, status: "SUCCESS", progress: "100%", url },
+    };
+  }
   const taskID = trimmed(body.request_id);
   if (!taskID) throw new Error("request_id is empty");
-  return { taskId: taskID, taskData: body };
+  return { taskId: taskID, taskData: body, state };
 }
 
 export function buildQueryRequest(ctx) {
@@ -462,10 +532,14 @@ export function buildQueryRequest(ctx) {
   };
 }
 
-export function parseTaskResult(_ctx, body) {
+export function parseTaskResult(ctx, body) {
   const status = trimmed(body && body.status).toLowerCase();
   if (status === "pending") return { status: "QUEUED", progress: trimmed(body.progress) ? `${String(body.progress)}%` : "10%" };
-  if (status === "done") return { status: "SUCCESS", progress: "100%", url: body.video && body.video.url ? body.video.url : "" };
+  if (status === "done") {
+    const url = trimmed(body.video && body.video.url);
+    if (!url) throw new Error("completed xAI video has no video.url");
+    return { status: "SUCCESS", progress: "100%", url, state: completionState(ctx, body) };
+  }
   if (status === "failed" || status === "expired") {
     const reason = body && body.error && body.error.message ? body.error.message : status;
     return { status: "FAILURE", progress: "100%", reason };
@@ -487,7 +561,7 @@ export function extractUsage(ctx) {
   }
   if (ctx.action === "extend_video") {
     return {
-      seconds: Number(req.duration || 6),
+      seconds: Number(req.duration || req.seconds || 6),
       resolution: "720p",
       input_images: 0,
       input_video_seconds: 15,
@@ -503,7 +577,7 @@ export function extractUsage(ctx) {
   return {
     seconds: Number(req.duration || req.seconds || 5),
     resolution: normalizeResolution(req.resolution || req.size),
-    input_images: (image ? 1 : 0) + (req.last_frame ? 1 : 0) + references + files.image + files.lastFrame + files.references,
+    input_images: (image ? 1 : 0) + (req.last_frame ? 1 : 0) + references + (Array.isArray(req.keyframes) ? req.keyframes.length : 0) + files.image + files.lastFrame + files.references,
     input_video_seconds: 0,
     billing_source: "estimate",
     upstream_cost_credit: 0,
@@ -515,9 +589,9 @@ export function extractUsageOnComplete(task, _result, body) {
   const action = trimmed(task && task.action);
   const seconds = Number(body && body.video && body.video.duration);
   const maximumSeconds = action === "edit_video" ? 8.7 : 15;
-  if (action !== "extend_video" && Number.isFinite(seconds) && seconds >= 1 && seconds <= maximumSeconds) facts.seconds = seconds;
+  if (action !== "extend_video" && Number.isFinite(seconds) && (action === "edit_video" ? seconds > 0 : seconds >= 1) && seconds <= maximumSeconds) facts.seconds = seconds;
   const resolution = normalizeResolution(body && (body.resolution || (body.video && body.video.resolution)));
-  if (body && (body.resolution || (body.video && body.video.resolution))) facts.resolution = resolution;
+  if (resolution && body && (body.resolution || (body.video && body.video.resolution))) facts.resolution = resolution;
   const ticks = Number(body && body.usage && body.usage.cost_in_usd_ticks);
   if (Number.isFinite(ticks) && ticks >= 0) {
     facts.billing_source = "upstream";
@@ -537,6 +611,15 @@ export function buildContentRequest(ctx) {
   const data = artifactData(ctx);
   const url = trimmed(data.video && data.video.url);
   if (!url) throw new Error("artifact_not_found");
+  const baseUrl = trimmed(ctx.baseUrl).replace(/\/+$/, "");
+  const path = baseUrl && url.startsWith(baseUrl + "/") ? url.slice(baseUrl.length) : url;
+  // Some compatible providers return an authenticated content route instead of a CDN URL.
+  // Credentials belong only on this exact route at the configured upstream origin.
+  if (baseUrl && /^\/v1\/videos\/[a-zA-Z0-9_-]+\/content$/.test(path)) {
+    if (!/^https:\/\//i.test(baseUrl)) throw new Error("authenticated video content requires HTTPS");
+    return { url: baseUrl + path, method: ctx.clientRequest.method, headers: { Authorization: `Bearer ${ctx.apiKey}` } };
+  }
+  if (url.startsWith("/")) throw new Error("unsupported video content URL");
   return { url, method: ctx.clientRequest.method, credentialless: true };
 }
 

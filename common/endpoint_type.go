@@ -1,8 +1,12 @@
 package common
 
-import "github.com/QuantumNous/new-api/constant"
+import (
+	"strings"
 
-// GetEndpointTypesByChannelType 获取渠道最优先端点类型（所有的渠道都支持 OpenAI 端点）
+	"github.com/QuantumNous/new-api/constant"
+)
+
+// GetEndpointTypesByChannelType 按渠道与型号返回原生端点，媒体型号不声明聊天接口。
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
 	var endpointTypes []constant.EndpointType
 	switch channelType {
@@ -27,6 +31,12 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 	case constant.ChannelTypeOpenRouter: // OpenRouter 只支持 OpenAI 端点
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeXai:
+		if strings.HasPrefix(modelName, "grok-imagine-video") {
+			return []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+		}
+		if modelName == "grok-imagine" || strings.HasPrefix(modelName, "grok-imagine-image") || strings.HasPrefix(modelName, "grok-2-image") {
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
+		}
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeVLLM, constant.ChannelTypeSGLang:
 		endpointTypes = GetAdvancedCustomPreset(channelType).SupportedEndpointTypesForModel(modelName)

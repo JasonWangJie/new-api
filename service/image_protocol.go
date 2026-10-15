@@ -458,7 +458,17 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 			if common.Unmarshal(value, &one) == nil {
 				multiple = []string{one}
 			} else if common.Unmarshal(value, &multiple) != nil {
-				return request, errors.New("image must be a URL or array of URLs")
+				var image struct {
+					URL    string `json:"url"`
+					FileId string `json:"file_id"`
+				}
+				if common.Unmarshal(value, &image) != nil || strings.TrimSpace(image.URL) == "" {
+					return request, errors.New("image must be a URL, URL object, or array of URLs")
+				}
+				if image.FileId != "" {
+					return request, errors.New("file_id references are not supported")
+				}
+				multiple = []string{image.URL}
 			}
 			urls = append(urls, multiple...)
 			delete(fields, "image")
@@ -475,8 +485,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 		if request.Platform == "openai" {
 			var images []struct {
-				URL    string `json:"image_url"`
-				FileId string `json:"file_id"`
+				URL       string `json:"image_url"`
+				NativeURL string `json:"url"`
+				FileId    string `json:"file_id"`
 			}
 			if value, ok := fields["images"]; ok {
 				if err := common.Unmarshal(value, &images); err != nil {
@@ -486,6 +497,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 			for _, image := range images {
 				if image.FileId != "" {
 					return request, errors.New("file_id references are not supported")
+				}
+				if image.URL == "" {
+					image.URL = image.NativeURL
 				}
 				if value := strings.TrimSpace(image.URL); value != "" {
 					request.Parts = append(request.Parts, AsyncImageInputPart{Type: "image_url", URL: value})

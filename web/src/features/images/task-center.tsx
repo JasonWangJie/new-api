@@ -575,7 +575,7 @@ function TaskCenterSession({
     'Selected task IDs are fixed for this operation. Late results cannot change terminated tasks.'
   )
   if (operation?.confirmUpstreamChecked) {
-    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing and releases its reserved quota; it does not cancel the upstream task.')} ${confirmationDescription}`
+    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.')} ${confirmationDescription}`
   }
   if (operation?.action === 'resume') {
     confirmationDescription = t(
@@ -1052,7 +1052,7 @@ function TaskCenterSession({
             title={t(
               operation?.action === 'resume'
                 ? 'Resume media post-processing'
-                : 'Terminate image tasks'
+                : 'Terminate media tasks'
             )}
             desc={confirmationDescription}
             destructive={operation?.action !== 'resume'}

@@ -1673,6 +1673,10 @@ func TestAsyncImageUnifiedCountAndGeminiDimensions(t *testing.T) {
 		wantError   bool
 	}{
 		{name: "provider count is billed and sent", body: `{"model":"image-model","prompt":"draw","create_count":2}`, count: 2},
+		{name: "xai official single reference", body: `{"model":"grok-imagine-image-quality","prompt":"edit","n":1,"image":{"url":"https://example.com/input.png","type":"image_url"}}`, count: 1, references: 1},
+		{name: "xai official multiple references", body: `{"model":"grok-imagine-image-quality","prompt":"edit","n":1,"images":[{"url":"https://example.com/first.png","type":"image_url"},{"url":"https://example.com/second.png"}]}`, count: 1, references: 2},
+		{name: "empty image object rejected", body: `{"model":"grok-imagine-image-quality","prompt":"edit","n":1,"image":{}}`, wantError: true},
+		{name: "official reference cannot bypass file ID rejection", body: `{"model":"grok-imagine-image-quality","prompt":"edit","n":1,"images":[{"url":"https://example.com/input.png","file_id":"private-file"}]}`, wantError: true},
 		{name: "zero provider count", body: `{"model":"image-model","prompt":"draw","create_count":0}`, wantError: true},
 		{name: "negative provider count", body: `{"model":"image-model","prompt":"draw","create_count":-1}`, wantError: true},
 		{name: "provider count exceeds maximum", body: `{"model":"image-model","prompt":"draw","create_count":` + strconv.Itoa(dto.MaxImageN+1) + `}`, wantError: true},

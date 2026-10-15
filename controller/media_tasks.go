@@ -83,7 +83,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.ExpiresAt <= time.Now().Unix() {
 		status, progress = "expired", 100
 	}
-	view := gin.H{"id": job.TaskId, "task_id": job.TaskId, "media_type": "video", "platform": job.Provider, "provider": job.Provider, "protocol": "openai_video", "model": job.Model, "request_type": "text_to_video", "status": status, "stage": mediaStage(status), "progress": progress, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "cost": float64(job.Quota) / common.QuotaPerUnit, "group": job.Group, "api_key_id": job.TokenId, "image_count": 0, "result_count": 0, "created_at": job.CreatedAt, "started_at": job.DispatchedAt, "finished_at": int64(0), "expires_at": job.ExpiresAt, "next_attempt_at": job.NextAttemptAt, "retry_count": 0, "storage_retry_count": job.StorageRetries, "error_message": job.ErrorMessage, "error_code": "", "prompt_summary": "", "requested_size": "", "actual_size": "", "aspect_ratio": "", "can_resume": false, "can_terminate": job.Status == "queued" && job.DispatchedAt == 0 && job.LeaseExpiresAt <= time.Now().Unix(), "storage_providers": []string{"local"}}
+	canTerminate := job.LeaseExpiresAt <= time.Now().Unix() &&
+		(job.Status == "queued" && job.DispatchedAt == 0 || admin && job.Status == "execution_unknown")
+	view := gin.H{"id": job.TaskId, "task_id": job.TaskId, "media_type": "video", "platform": job.Provider, "provider": job.Provider, "protocol": "openai_video", "model": job.Model, "request_type": "text_to_video", "status": status, "stage": mediaStage(status), "progress": progress, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "cost": float64(job.Quota) / common.QuotaPerUnit, "group": job.Group, "api_key_id": job.TokenId, "image_count": 0, "result_count": 0, "created_at": job.CreatedAt, "started_at": job.DispatchedAt, "finished_at": int64(0), "expires_at": job.ExpiresAt, "next_attempt_at": job.NextAttemptAt, "retry_count": 0, "storage_retry_count": job.StorageRetries, "error_message": job.ErrorMessage, "error_code": "", "prompt_summary": "", "requested_size": "", "actual_size": "", "aspect_ratio": "", "can_resume": false, "can_terminate": canTerminate, "storage_providers": []string{"local"}}
 	if admin {
 		view["user_id"], view["channel_id"] = job.UserId, job.ChannelId
 	}
@@ -114,6 +116,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	var task model.Task
 	err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err == nil {
+		if job.Status == "execution_unknown" {
+			view["can_terminate"] = false
+		}
 		view["can_resume"] = task.Status == model.TaskStatusSuccess && job.ExpiresAt > time.Now().Unix() && job.LeaseExpiresAt <= time.Now().Unix() &&
 			(job.Status == "submitted" && job.StorageStatus == "failed" || job.Status == "succeeded" && job.StorageStatus == "upstream")
 		view["updated_at"] = task.UpdatedAt
@@ -289,8 +294,36 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		updates["status"], updates["storage_status"] = "submitted", "failed"
 		updates["next_attempt_at"], updates["storage_retries"], updates["error_message"] = 0, 0, ""
 	case "terminate":
-		query = query.Where("status = ? AND dispatched_at = 0", "queued")
-		updates["status"], updates["request_cipher"], updates["billing_status"] = "failed", nil, "not_billable"
+		var job model.AsyncMediaJob
+		if err := query.Session(&gorm.Session{}).Take(&job).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				imageManagementError(c, http.StatusConflict, errors.New("Media task cannot be changed in its current phase"))
+			} else {
+				imageManagementError(c, http.StatusServiceUnavailable, err)
+			}
+			return
+		}
+		if job.Status == "execution_unknown" {
+			if !admin {
+				imageManagementError(c, http.StatusForbidden, errors.New("Permission denied"))
+				return
+			}
+			var confirmation struct {
+				UpstreamChecked bool `json:"confirm_upstream_checked"`
+			}
+			if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &confirmation); err != nil || !confirmation.UpstreamChecked {
+				imageManagementError(c, http.StatusConflict, errors.New("Verify the upstream task before terminating local processing"))
+				return
+			}
+			query = query.Where("status = ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id)", "execution_unknown")
+			// Unknown submission does not prove whether upstream billing occurred.
+			updates["error_message"] = "Terminated by administrator after upstream verification"
+		} else {
+			query = query.Where("status = ? AND dispatched_at = 0", "queued")
+			updates["billing_status"] = "not_billable"
+		}
+		updates["status"], updates["request_cipher"] = "failed", nil
+		updates["lease_token"], updates["lease_expires_at"], updates["next_attempt_at"] = "", 0, 0
 	default:
 		imageManagementError(c, 400, errors.New("Invalid media task operation"))
 		return

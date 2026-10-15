@@ -277,7 +277,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		statusMapping              string
 		fileFormat                 string
 		passThrough                bool
+		xai                        bool
 	}{
+		{name: "xai_normalized_geometry", path: "/v1/images/generations_async", referenceField: "images", xai: true},
+		{name: "xai_provider_diagnostic", path: "/v1/images/generations_async", referenceField: "images", xai: true, status: http.StatusBadRequest, failureCode: 610, responseMessage: "unknown provider for model grok-imagine-image-2.0"},
 		{name: "edits_oa", path: "/v1/images/edits_oa", referenceField: "image_urls"},
 		{name: "edits_async", path: "/v1/images/edits_async", referenceField: "image"},
 		{name: "generations_oa_with_reference", path: "/v1/images/generations_oa", referenceField: "images"},
@@ -351,6 +354,11 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			parameters := `{"quality":"low","vendor_override":true}`
 			headers := `{"X-Image-Probe":"synthetic"}`
 			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
+			if tc.xai {
+				channel.Type = constant.ChannelTypeXai
+				mapping = `{"image-alias":"grok-imagine-image-quality"}`
+				channel.ParamOverride = nil
+			}
 			channel.StatusCodeMapping = &tc.statusMapping
 			channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
 			body := map[string]any{
@@ -359,6 +367,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				"mask":      map[string]string{"image_url": maskURL},
 				"watermark": false, "seed": 0, "custom_toggle": false,
 				"vendor_options": map[string]any{"strength": 0, "enabled": false},
+			}
+			if tc.xai {
+				delete(body, "mask")
+				body["resolution"], body["aspect_ratio"], body["size"] = "2K", "16:9", "2048x1152"
 			}
 			if tc.referenceField == "images" {
 				body[tc.referenceField] = []map[string]string{{"image_url": referenceURL}}
@@ -456,6 +468,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			assert.Equal(t, "/v1/images/edits", record.path)
 			assert.Equal(t, "Bearer synthetic-upstream-key", record.authorization)
 			assert.Equal(t, "synthetic", record.marker)
+			if tc.xai {
+				assert.JSONEq(t, `{"model":"grok-imagine-image-quality","prompt":"draw a river","n":1,"resolution":"2k","aspect_ratio":"16:9","response_format":"b64_json","image":{"url":"`+referenceURL+`","type":"image_url"}}`, string(record.body))
+				return
+			}
 			if tc.fileFormat != "" {
 				require.Contains(t, record.contentType, "multipart/form-data", "file uploads must retain their upstream transport format")
 				replayed := httptest.NewRequest(http.MethodPost, record.path, bytes.NewReader(record.body))

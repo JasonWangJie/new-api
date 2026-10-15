@@ -684,6 +684,90 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				assert.NotContains(t, expiredRecorder.Body.String(), latestURL)
 			}
 
+			t.Run("unknown video execution requires administrator reconciliation", func(t *testing.T) {
+				for _, item := range []struct {
+					name       string
+					status     string
+					admin      bool
+					body       string
+					leased     bool
+					expired    bool
+					accepted   bool
+					otherUser  bool
+					want       int
+					terminable bool
+				}{
+					{name: "confirmed administrator", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusOK, terminable: true},
+					{name: "missing confirmation", status: "execution_unknown", admin: true, body: `{}`, want: http.StatusConflict, terminable: true},
+					{name: "invalid confirmation", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":`, want: http.StatusConflict, terminable: true},
+					{name: "owner cannot reconcile", status: "execution_unknown", body: `{"confirm_upstream_checked":true}`, want: http.StatusForbidden},
+					{name: "active lease", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, leased: true, want: http.StatusConflict},
+					{name: "expired job", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, expired: true, want: http.StatusConflict},
+					{name: "accepted upstream task", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, accepted: true, want: http.StatusConflict},
+					{name: "other user", status: "queued", otherUser: true, want: http.StatusConflict, terminable: true},
+					{name: "queued owner", status: "queued", want: http.StatusOK, terminable: true},
+					{name: "submitted job", status: "submitted", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
+					{name: "failed job", status: "failed", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						job := model.AsyncMediaJob{TaskId: "video-terminate-" + strings.ReplaceAll(item.name, " ", "-"), IdentityHash: "terminate-" + item.name, UserId: 101, TokenId: 201, Status: item.status, StorageStatus: "pending", BillingStatus: "unknown", Quota: 500, RequestCipher: []byte("encrypted-video-request"), CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "expired-video-lease", NextAttemptAt: now + 30}
+						if item.status != "queued" {
+							job.DispatchedAt = now - 30
+						}
+						if item.leased {
+							job.LeaseExpiresAt = now + 120
+						}
+						if item.expired {
+							job.ExpiresAt = now - 1
+						}
+						require.NoError(t, db.Create(&job).Error)
+						if item.accepted {
+							require.NoError(t, db.Create(&model.Task{TaskID: job.TaskId, UserId: job.UserId, Status: model.TaskStatusSubmitted, Quota: job.Quota}).Error)
+						}
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", job.UserId)
+						if item.otherUser {
+							c.Set("id", 102)
+						}
+						c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+job.TaskId+"/terminate", strings.NewReader(item.body))
+						view, _, err := videoJobView(c, job, item.admin)
+						require.NoError(t, err)
+						assert.Equal(t, item.terminable, view["can_terminate"])
+						ManageMediaTask(c, item.admin, "terminate")
+						require.Equal(t, item.want, recorder.Code, recorder.Body.String())
+						var stored model.AsyncMediaJob
+						require.NoError(t, db.Where("id = ?", job.ID).Take(&stored).Error)
+						if item.want != http.StatusOK {
+							assert.Equal(t, job, stored, "rejected termination must leave the job unchanged")
+							return
+						}
+						assert.Equal(t, "failed", stored.Status)
+						assert.Empty(t, stored.RequestCipher)
+						if item.status == "execution_unknown" {
+							assert.Equal(t, job.BillingStatus, stored.BillingStatus)
+							assert.Equal(t, job.Quota, stored.Quota)
+							assert.Contains(t, stored.ErrorMessage, "Terminated by administrator")
+							assert.Zero(t, stored.NextAttemptAt)
+							assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted"}), model.ErrImageConflict, "an expired worker must not revive the terminated task")
+						} else {
+							assert.Equal(t, "not_billable", stored.BillingStatus)
+						}
+						view, _, err = videoJobView(c, stored, item.admin)
+						require.NoError(t, err)
+						assert.Equal(t, "failed", view["status"])
+						assert.Equal(t, false, view["can_terminate"])
+						repeated := httptest.NewRecorder()
+						repeatContext, _ := gin.CreateTestContext(repeated)
+						repeatContext.Set("id", job.UserId)
+						repeatContext.Params = c.Params
+						repeatContext.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(item.body))
+						ManageMediaTask(repeatContext, item.admin, "terminate")
+						assert.Equal(t, http.StatusConflict, repeated.Code, "termination must not be repeated")
+					})
+				}
+			})
 			t.Run("unknown execution requires administrator reconciliation", func(t *testing.T) {
 				unknown := model.AsyncImageTask{TaskId: "asyncimg_unknown_reconcile", UserId: 101, TokenId: 201, Status: model.ImageTaskExecutionUnknown, Version: 1, CreatedAt: now, ExpiresAt: now + 3600}
 				require.NoError(t, db.Create(&unknown).Error)

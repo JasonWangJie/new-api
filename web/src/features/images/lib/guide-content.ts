@@ -284,6 +284,108 @@ export function asyncImageGuide(
         },
       ]
 
+  sections.push({
+    id: 'xai-media',
+    title: t('xAI images and video'),
+    paragraphs: [
+      t(
+        'The gateway returns a durable task receipt even when the image or video upstream completes synchronously. Query query_url with the same API token and wait for succeeded before downloading the saved result.'
+      ),
+      t(
+        'Use provider=xai with the gateway *_async routes below. Do not send the official image deferred flag or query an upstream request_id through the gateway media API. The gateway task_id and query_url identify the saved task, including synchronous upstream results.'
+      ),
+      t(
+        'Imagine images: this gateway opens 1K/2K, up to 10 outputs and 3 edit references per request. The official 2.0 model allows 5 edit references, but the gateway policy stays at 3. 1.5K, 4K and masks are not enabled. Use JSON image URL objects or the gateway asynchronous upload form; single-image edits inherit the source aspect ratio.'
+      ),
+      t(
+        'grok-imagine-image-quality and its grok-imagine alias are scheduled for automatic upstream migration on 2026-11-02 to grok-imagine-image-2.0 with quality=low. Their names will continue to resolve. For new integrations, prefer grok-imagine-image-2.0; only 2.0 accepts quality=auto/low/medium on this gateway.'
+      ),
+      t(
+        'Video billing uses valid video.duration from the completed upstream response for generation and editing, with a validated estimate as fallback. Extension billing uses only the requested additional seconds, not the full returned clip. Waiting time is never billed as video duration. The price snapshot is frozen when the task is admitted.'
+      ),
+      t(
+        'Editing reserves 8.7 seconds at 720p; extension reserves the requested additional seconds at 720p. Valid completion measurements adjust editing duration and the resolution for both operations. Extension duration remains the requested additional seconds. If measurements are absent, the conservative estimates remain.'
+      ),
+      t(
+        'Generation defaults to 5 seconds on this gateway; the official API defaults to 8. Send duration or seconds explicitly, never both. Text and single-image clips accept 1–15 seconds: classic grok-imagine-video opens 480p/720p, while 1.5 also opens 1080p. 4K video is not supported.'
+      ),
+      t(
+        'Classic reference-to-video accepts up to 7 reference_images, 1–10 seconds and 480p/720p, without a first-frame image. 1.5 accepts up to 14 reference_images and 3 preset voice IDs; reference or pinned-frame output is limited to 480p/720p. No reference video or custom audio URL is enabled on this gateway.'
+      ),
+      t(
+        'For 1.5, image pins the first frame, last_frame pins the last, and keyframes accepts up to 4 objects shaped as {image:{url:"..."},timestamp_s:2}. Timestamps must be strictly inside the clip; the upstream rounds to a 1/3-second grid and duplicate slots are rejected. These inputs can be combined with reference images and preset voices. Supply keyframes through the API or additional JSON; do not treat a voice_id as an audio URL.'
+      ),
+      t(
+        'Video editing and extension are available only for classic grok-imagine-video. Both inherit source aspect ratio and resolution, capped at 720p; omit resolution, size, aspect_ratio and generate_audio. Use a directly readable MP4 URL encoded with H.264, H.265 or AV1. Official support does not guarantee that every upstream account has enabled these operations.'
+      ),
+    ],
+  })
+  const xaiExamples: MediaGuideExample[] = [
+    {
+      title: t('xAI: generate a 2K image'),
+      path: '/v1/images/generations_async',
+      body: {
+        provider: 'xai',
+        model: 'grok-imagine-image-2.0',
+        prompt: 'A ceramic vase in morning light',
+        n: 1,
+        resolution: '2K',
+        aspect_ratio: '1:1',
+      },
+    },
+    {
+      title: t('xAI: edit an image from a URL'),
+      path: '/v1/images/edits_async',
+      body: {
+        provider: 'xai',
+        model: 'grok-imagine-image-quality',
+        prompt: 'Render the scene as a pencil sketch',
+        n: 1,
+        resolution: '1K',
+        image: { url: 'https://cdn.example/reference.png' },
+      },
+    },
+    {
+      title: t('xAI: generate a video from text'),
+      path: '/v1/videos/generations_async',
+      body: {
+        provider: 'xai',
+        model: 'grok-imagine-video-1.5',
+        prompt: 'A paper boat drifting on a calm pond',
+        duration: 5,
+        resolution: '480p',
+        aspect_ratio: '16:9',
+      },
+    },
+    {
+      title: t('xAI 1.5: combine references and pinned frames'),
+      path: '/v1/videos/generations_async',
+      body: {
+        provider: 'xai',
+        model: 'grok-imagine-video-1.5',
+        prompt: 'The character greets the camera in a calm voice',
+        duration: 5,
+        resolution: '720p',
+        image: { url: 'https://cdn.example/first.png' },
+        last_frame: { url: 'https://cdn.example/last.png' },
+        keyframes: [
+          { image: { url: 'https://cdn.example/middle.png' }, timestamp_s: 2 },
+        ],
+        reference_images: [{ url: 'https://cdn.example/character.png' }],
+        reference_audios: [{ voice_id: 'eve' }],
+      },
+    },
+  ].map((example, index) => ({
+    title: example.title,
+    code: [
+      `curl -X POST '${base}${example.path}' \\`,
+      '  -H "Authorization: Bearer $NEW_API_TOKEN" \\',
+      "  -H 'Content-Type: application/json' \\",
+      `  -H 'Idempotency-Key: xai-media-${index + 1}-001' \\`,
+      `  --data '${JSON.stringify(example.body, null, 2)}'`,
+    ].join('\n'),
+  }))
+
   const asyncImage = JSON.stringify(
     {
       provider: 'openai',
@@ -742,7 +844,7 @@ export function asyncImageGuide(
     {
       title: t('xAI: generate from one image URL'),
       description: t(
-        'image is one first-frame image. This xAI model accepts either "image":"https://..." or "image":{"url":"https://..."}; the example uses the object form. seconds, resolution and aspect_ratio control the output, not the input image.'
+        'image is one first-frame image. This xAI model accepts either "image":"https://..." or "image":{"url":"https://..."}; the example uses the object form. The output inherits the source image aspect ratio; aspect_ratio is ignored. seconds and resolution control the output duration and resolution.'
       ),
       code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-image-url-001' \\\n  --data '${videoImage}'`,
     },
@@ -756,7 +858,7 @@ export function asyncImageGuide(
     {
       title: t('xAI 1.5: use multiple reference image URLs'),
       description: t(
-        'reference_images is a JSON array of ordinary references, not a single first frame. This xAI 1.5 example uses two URL objects at 720p; the classic model does not support this mode. Do not join URLs with commas inside one string.'
+        'reference_images is a JSON array of ordinary references, not a pinned first frame. This 1.5 example uses two URL objects at 720p and allows up to 14 references. Classic grok-imagine-video also supports references, capped at 7 images and 10 seconds. Do not join URLs with commas inside one string.'
       ),
       code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-reference-urls-001' \\\n  --data '${videoReferences}'`,
     },
@@ -806,9 +908,26 @@ export function asyncImageGuide(
     {
       title: t('xAI: edit a video as a durable task'),
       description: t(
-        'Edits require JSON and a direct source video, not source_task_id. Classic grok-imagine-video inherits source duration and dimensions, so this example omits seconds, size and resolution; 1.5 does not support editing. Query the returned durable task through /v1/media/tasks_async/{task_id}.'
+        'Use JSON and a direct source video no longer than 8.7 seconds, not source_task_id. Classic grok-imagine-video edits inherit source duration and geometry, capped at 720p. Omit duration, seconds, size, resolution and aspect_ratio; 1.5 does not support editing. Query the durable receipt through /v1/media/tasks_async/{task_id}.'
       ),
       code: `curl -X POST '${base}/v1/videos/edits_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-edit-example-001' \\\n  --data '${videoEdit}'`,
+    },
+    {
+      title: t('xAI: extend a video as a durable task'),
+      description: t(
+        'Use a 2–15-second source clip and request 2–10 additional seconds in duration; the default is 6. Classic grok-imagine-video inherits source geometry, capped at 720p. Omit seconds, resolution, size, aspect_ratio and generate_audio; 1.5 does not support extension. Billing counts only the additional seconds, not the full returned clip.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/extensions_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: xai-video-extension-001' \\\n  --data '${JSON.stringify(
+        {
+          provider: 'xai',
+          model: 'grok-imagine-video',
+          prompt: 'Continue the camera movement smoothly',
+          video: { url: 'https://cdn.example/source.mp4' },
+          duration: 2,
+        },
+        null,
+        2
+      )}'`,
     },
     {
       title: t('Doubao Seedance: extend a video as a durable task'),
@@ -832,13 +951,12 @@ export function asyncImageGuide(
       code: `curl -X POST '${base}/v1/videos/extensions' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoExtension}'`,
     },
   ]
-  return sections.map((section) => ({
-    ...section,
-    examples:
-      section.id === 'video'
-        ? videoExamples
-        : (examples[section.id] || []).map(
-            (code): MediaGuideExample => ({ code })
-          ),
-  }))
+  return sections.map((section) => {
+    let sectionExamples = (examples[section.id] || []).map(
+      (code): MediaGuideExample => ({ code })
+    )
+    if (section.id === 'video') sectionExamples = videoExamples
+    if (section.id === 'xai-media') sectionExamples = xaiExamples
+    return { ...section, examples: sectionExamples }
+  })
 }

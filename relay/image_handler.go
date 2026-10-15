@@ -109,7 +109,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 			}
 			if c.GetBool("async_image_execution") {
-				if info.ApiType != constant.APITypeAli && info.ApiType != constant.APITypeReplicate && info.ApiType != constant.APITypeGemini && info.ApiType != constant.APITypeVertexAi {
+				if info.ApiType != constant.APITypeAli && info.ApiType != constant.APITypeReplicate && info.ApiType != constant.APITypeGemini && info.ApiType != constant.APITypeVertexAi && info.ApiType != constant.APITypeXai {
 					var fields map[string]common.RawMessage
 					if err := common.Unmarshal(jsonData, &fields); err != nil {
 						return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
@@ -290,7 +290,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				if !reserve {
 					c.Set("async_image_retry_after", httpResp.Header.Get("Retry-After"))
 				}
-				if !reserve && c.GetBool("async_image_execution") && info.ApiType == constant.APITypeOpenAI {
+				if !reserve && c.GetBool("async_image_execution") && (info.ApiType == constant.APITypeOpenAI || info.ApiType == constant.APITypeXai) {
 					failure := service.ClassifyOpenAIAsyncImageHTTPFailure(c.Request.Context(), httpResp, statusCodeMappingStr)
 					return nil, types.NewErrorWithStatusCode(failure, types.ErrorCodeBadResponseStatusCode, failure.HTTPStatus)
 				}

@@ -41,6 +41,66 @@ afterEach(async () => {
   i18next.removeResourceBundle('zhTW', 'translation')
 })
 
+test('xAI examples explain native image geometry and duration-based async billing', () => {
+  render(<AsyncImageGuide />)
+  const image = screen.queryByRole('group', {
+    name: 'xAI: generate a 2K image',
+  })
+  expect(image).not.toBeNull()
+  expect(image).toHaveTextContent('"provider": "xai"')
+  expect(image).toHaveTextContent('"resolution": "2K"')
+  expect(image).toHaveTextContent('/v1/images/generations_async')
+  const edit = screen.getByRole('group', {
+    name: 'xAI: edit an image from a URL',
+  })
+  expect(edit).toHaveTextContent('/v1/images/edits_async')
+  expect(edit).toHaveTextContent('"image"')
+  const video = screen.getByRole('group', {
+    name: 'xAI: generate a video from text',
+  })
+  expect(video).toHaveTextContent('"duration": 5')
+  expect(video).toHaveTextContent('/v1/videos/generations_async')
+  expect(
+    screen.getByText(/Video billing uses valid video.duration/)
+  ).toBeVisible()
+  const references = screen.getByRole('group', {
+    name: 'xAI 1.5: combine references and pinned frames',
+  })
+  expect(references).toHaveTextContent('"keyframes"')
+  expect(references).toHaveTextContent('"timestamp_s": 2')
+  expect(screen.getByText(/Generation defaults to 5 seconds/)).toBeVisible()
+  expect(
+    screen.getByText(/grok-imagine-image-quality and its grok-imagine alias/)
+  ).toBeVisible()
+})
+
+test('xAI edit and extension examples inherit source geometry and distinguish extension billing', () => {
+  render(<AsyncImageGuide />)
+  const edit = screen.getByRole('group', {
+    name: 'xAI: edit a video as a durable task',
+  })
+  const extension = screen.getByRole('group', {
+    name: 'xAI: extend a video as a durable task',
+  })
+  expect(edit).toHaveTextContent('8.7')
+  expect(extension).toHaveTextContent('/v1/videos/extensions_async')
+  expect(extension).toHaveTextContent('additional seconds')
+  for (const example of [edit, extension]) {
+    const command = example.querySelector('pre code')?.textContent ?? ''
+    const body = JSON.parse(command.match(/--data '([\s\S]*)'$/)?.[1] ?? '{}')
+    expect(body).toMatchObject({
+      provider: 'xai',
+      model: 'grok-imagine-video',
+      video: { url: 'https://cdn.example/source.mp4' },
+    })
+    expect(body).not.toHaveProperty('resolution')
+    expect(body).not.toHaveProperty('aspect_ratio')
+    expect(body).not.toHaveProperty('seconds')
+    if (example === edit) expect(body).not.toHaveProperty('duration')
+    else expect(body.duration).toBe(2)
+  }
+})
+
 test.each(['E', 'F', 'G'])(
   'Drama %s provides text, image, video, audio and combined reference examples',
   (series) => {
@@ -94,7 +154,7 @@ test('video examples explain file uploads and URL references and copy only the s
   ).toBeVisible()
   expect(
     screen.getByRole('group', { name: 'xAI: generate from one image URL' })
-  ).toHaveTextContent('image')
+  ).toHaveTextContent('output inherits the source image aspect ratio')
   expect(
     screen.getByRole('group', { name: 'Drama F: use reference image URLs' })
   ).toHaveTextContent('reference_images')
@@ -166,4 +226,8 @@ test('Traditional Chinese shows translated video explanations while retaining th
       name: '非同步影片：生成、編輯、延長與本機儲存',
     })
   ).toHaveAttribute('href', '#image-guide-video')
+  expect(
+    screen.getByRole('group', { name: 'xAI：以持久化任務延長影片' })
+  ).toHaveTextContent('新增 2–10 秒')
+  expect(screen.getByText(/本站生成預設 5 秒/)).toBeVisible()
 })

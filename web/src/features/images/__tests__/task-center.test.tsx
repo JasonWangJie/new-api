@@ -1062,12 +1062,17 @@ test.each([
   }
 )
 
-test.each(['invoking', 'execution_unknown'])(
-  'terminates one fixed %s task after confirmation and retains the dialog when the request fails',
-  async (status) => {
+test.each([
+  { status: 'invoking', media_type: 'image' },
+  { status: 'execution_unknown', media_type: 'image' },
+  { status: 'execution_unknown', media_type: 'video' },
+] as const)(
+  'terminates one fixed $media_type $status task after confirmation and retains the dialog when the request fails',
+  async ({ status, media_type }) => {
     const user = userEvent.setup()
+    const id = media_type === 'video' ? 'video_unknown_execution' : task.id
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [{ ...task, status }],
+      items: [{ ...task, id, task_id: id, status, media_type }],
       total: 1,
       pages: 1,
       stats: {},
@@ -1079,11 +1084,11 @@ test.each(['invoking', 'execution_unknown'])(
     await user.click(terminate)
     expect(imageRequest).not.toHaveBeenCalled()
     const confirm = await screen.findByRole('alertdialog', {
-      name: 'Terminate image tasks',
+      name: 'Terminate media tasks',
     })
     if (status === 'execution_unknown') {
       expect(confirm).toHaveTextContent(
-        'Verify the upstream task before continuing. This stops local processing and releases its reserved quota; it does not cancel the upstream task.'
+        'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.'
       )
     }
     vi.mocked(imageRequest).mockRejectedValueOnce(
@@ -1102,13 +1107,35 @@ test.each(['invoking', 'execution_unknown'])(
       expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
     )
     expect(imageRequest).toHaveBeenLastCalledWith(
-      '/api/admin/media-tasks/asyncimg_display_contract/terminate',
+      `/api/admin/media-tasks/${id}/terminate`,
       'POST',
       status === 'execution_unknown' ? { confirm_upstream_checked: true } : {}
     )
     expect(getImageTasks).toHaveBeenCalledTimes(2)
   }
 )
+
+test('unknown video details offer termination with upstream verification', async () => {
+  const onManage = vi.fn()
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    task: { ...task, media_type: 'video', status: 'execution_unknown' },
+    results: [],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin
+      userId={101}
+      canManage
+      onClose={vi.fn()}
+      onManage={onManage}
+    />
+  )
+  const user = userEvent.setup()
+  await user.click(await screen.findByRole('button', { name: 'Terminate' }))
+  expect(onManage).toHaveBeenCalledWith('terminate', true)
+})
 
 test('admin details show named attempts and generated images without rendering raw fingerprints', async () => {
   const user = userEvent.setup()
@@ -1197,48 +1224,75 @@ test('admin details show named attempts and generated images without rendering r
   ).toBeVisible()
 })
 
-test('batch termination containing unknown work confirms upstream verification before releasing quota', async () => {
-  const user = userEvent.setup()
-  vi.mocked(getImageTasks).mockResolvedValue({
-    items: [
-      task,
-      {
-        ...task,
-        id: 'asyncimg_unknown',
-        task_id: 'asyncimg_unknown',
-        status: 'execution_unknown',
-      },
-    ],
-    total: 2,
-    pages: 1,
-    stats: {},
-  })
-  mount(<ImageTaskCenter admin />)
-  await user.click(
-    await screen.findByRole('button', { name: 'Terminate current page (2)' })
-  )
-  const confirmation = await screen.findByRole('alertdialog', {
-    name: 'Terminate image tasks',
-  })
-  expect(confirmation).toHaveTextContent(
-    'Verify the upstream task before continuing.'
-  )
-  expect(imageRequest).not.toHaveBeenCalled()
-  vi.mocked(imageRequest).mockResolvedValue({})
+test.each([
+  { videoOnly: false, mobile: false },
+  { videoOnly: true, mobile: false },
+  { videoOnly: true, mobile: true },
+])(
+  'batch termination confirms upstream verification when videoOnly=$videoOnly mobile=$mobile',
+  async ({ videoOnly, mobile }) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    const id = videoOnly ? 'video_unknown_execution' : 'asyncimg_unknown'
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        { ...task, can_terminate: !videoOnly },
+        {
+          ...task,
+          id,
+          task_id: id,
+          media_type: videoOnly ? 'video' : 'image',
+          status: 'execution_unknown',
+        },
+      ],
+      total: 2,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter admin />)
+    await user.click(
+      await screen.findByRole('button', {
+        name: `Terminate current page (${videoOnly ? 1 : 2})`,
+      })
+    )
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Terminate media tasks',
+    })
+    expect(confirmation).toHaveTextContent(
+      'Verify the upstream task before continuing.'
+    )
+    expect(confirmation).toHaveTextContent('video billing remains unchanged')
+    expect(imageRequest).not.toHaveBeenCalled()
+    vi.mocked(imageRequest).mockResolvedValue({})
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        { ...task, id, task_id: id, status: 'failed', can_terminate: false },
+      ],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
 
-  await user.click(
-    within(confirmation).getByRole('button', { name: 'Continue' })
-  )
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
 
-  await waitFor(() =>
-    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
-  )
-  expect(imageRequest).toHaveBeenCalledWith(
-    '/api/admin/media-tasks/asyncimg_unknown/terminate',
-    'POST',
-    { confirm_upstream_checked: true }
-  )
-})
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    )
+    expect(imageRequest).toHaveBeenCalledWith(
+      `/api/admin/media-tasks/${id}/terminate`,
+      'POST',
+      { confirm_upstream_checked: true }
+    )
+    expect(
+      await screen.findByRole('button', { name: 'Terminate current page (0)' })
+    ).toBeDisabled()
+    expect(
+      screen.queryByRole('button', { name: 'Terminate' })
+    ).not.toBeInTheDocument()
+  }
+)
 
 test.each([
   { failure: false, dismiss: false },
@@ -1275,7 +1329,7 @@ test.each([
       await screen.findByRole('button', { name: 'Terminate current page (2)' })
     )
     const confirmation = await screen.findByRole('alertdialog', {
-      name: 'Terminate image tasks',
+      name: 'Terminate media tasks',
     })
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
     try {

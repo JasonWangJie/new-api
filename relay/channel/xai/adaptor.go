@@ -39,10 +39,17 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	if strings.HasPrefix(request.Model, "grok-imagine-image") || request.Model == "grok-imagine" {
+		converted, err := convertImagineImageRequest(c, request)
+		if err != nil {
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		return converted, nil
+	}
 	xaiRequest := ImageRequest{
 		Model:          request.Model,
 		Prompt:         request.Prompt,
-		N:              int(lo.FromPtrOr(request.N, uint(1))),
+		N:              request.N,
 		ResponseFormat: request.ResponseFormat,
 	}
 	return xaiRequest, nil
@@ -142,5 +149,6 @@ func (a *Adaptor) GetChannelName() string {
 }
 
 func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
-	return dto.ImageCapability{Models: []string{"grok-2-image*", "grok-imagine-image*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "xai", Protocol: "openai_images", Generate: true, Edit: false}
+	modern := strings.HasPrefix(model, "grok-imagine-image") || model == "grok-imagine"
+	return dto.ImageCapability{Models: []string{"grok-2-image*", "grok-imagine-image*", "grok-imagine"}, Parameters: []string{"model", "prompt", "n", "size", "resolution", "aspect_ratio", "quality", "response_format", "provider_extensions"}, Provider: "xai", Protocol: "openai_images", Generate: true, Edit: modern, EditFormat: "json"}
 }
