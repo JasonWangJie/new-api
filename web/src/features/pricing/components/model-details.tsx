@@ -85,6 +85,7 @@ import {
   evaluateTaskUsageExamples,
   getTaskEnumFields,
   getTaskNumberFields,
+  tryParseTaskMatrixConfig,
 } from '../lib/task-expr'
 import { getTaskPricingDisplayTiers } from '../lib/task-matrix-display'
 import {
@@ -645,7 +646,7 @@ function ModelHeader(props: { model: PricingModel }) {
         <ModelBillingModeBadge model={model} />
       </div>
       {description && (
-        <p className='text-muted-foreground mt-2 text-sm leading-relaxed'>
+        <p className='text-muted-foreground mt-2 text-sm leading-relaxed break-words whitespace-pre-line'>
           {description}
         </p>
       )}
@@ -1128,7 +1129,8 @@ function ProviderGroupPricingSection(
     const dynamicTiers = props.model.billing_usage_schema
       ? getTaskPricingDisplayTiers(
           props.model.billing_expr,
-          props.model.billing_usage_schema
+          props.model.billing_usage_schema,
+          true
         )
       : getDynamicPricingTiers(props.model)
     const hasRequestPrice = dynamicTiers.some(
@@ -1136,6 +1138,25 @@ function ProviderGroupPricingSection(
     )
 
     if (dynamicTiers.length === 0) {
+      if (
+        props.model.billing_usage_schema?.resolution?.enum?.length &&
+        tryParseTaskMatrixConfig(
+          props.model.billing_expr,
+          props.model.billing_usage_schema
+        )
+      ) {
+        return (
+          <section>
+            {!props.hideTitle && (
+              <SectionTitle>{t('Pricing by Group')}</SectionTitle>
+            )}
+            <AutoGroupChain model={props.model} autoGroups={props.autoGroups} />
+            <p className='text-muted-foreground text-sm'>
+              {t('No published resolution prices')}
+            </p>
+          </section>
+        )
+      }
       return (
         <section>
           {!props.hideTitle && (
@@ -1491,7 +1512,8 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
   const simpleTaskPricing = hasSimpleTaskPricing(props.model)
   const taskTiers = getTaskPricingDisplayTiers(
     props.model.billing_expr,
-    props.model.billing_usage_schema
+    props.model.billing_usage_schema,
+    true
   )
   const showBasePrices =
     !props.model.billing_usage_schema ||
@@ -1535,6 +1557,7 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
             )}
             {isDynamic && !simpleTaskPricing && (
               <DynamicPricingBreakdown
+                publishedPricesOnly
                 billingExpr={props.model.billing_expr}
                 usageSchema={props.model.billing_usage_schema}
                 taskPriceOptions={{

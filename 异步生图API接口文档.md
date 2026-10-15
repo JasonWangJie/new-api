@@ -368,7 +368,505 @@ curl -i -sS "$BASE_URL/v1/videos/generations_async" \
   }'
 ```
 
-视频提交体最多读取 64 MiB；插件可对单个参考文件设更低限制。视频渠道池按 `size` 的**短边**归档：≤1024 为 1K，1025–2048 为 2K，>2048 为 4K；当前渠道池按模型和尺寸选路，不按时长选路。
+<a id="drama-a-h3-examples"></a>
+
+**示例 D7：Drama A 纯文本生成（插件 1.1.0 起）**
+
+适用：`provider=drama`，型号 `seedance2.0-A` 或 `seedance2.5-A`。下面显式填写默认值：4 秒、480p、16:9，不发送参考素材。两款按秒计费；已有 E/F/G 的管理员按[追加配置步骤](wiki/11-视频接入配置与注意事项.md#drama-add-a-h3)保存渠道、策略、池、售价和 Key 权限后再调用。
+
+| 型号 | 输出时长 | 输出分辨率 | 模式与比例 |
+| --- | --- | --- | --- |
+| `seedance2.0-A` | 4–15 秒 | 480p、720p、1080p、4k | 文生和普通参考可用六种固定比例、`Auto`；成对首尾帧仅 `Auto` |
+| `seedance2.5-A` | 4–30 秒 | 480p、720p | 文生和普通参考；六种固定比例，不支持 `Auto`，本次不开放首尾帧 |
+| `minimax-h3` | 4–15 秒 | 480p、720p、1080p | 文生和普通参考；仅 16:9、9:16，无首尾帧 |
+
+三款省略参数均为 4 秒、480p、16:9；`duration` 可代替 `seconds`，同时填写时必须一致。六种固定比例为 16:9、4:3、1:1、3:4、9:16、21:9。此处不含 A fast、Mini 或 `minimax-h3-2k`。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-a-text-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.0-A",
+    "prompt": "海面日出，镜头缓慢前移，电影感光影",
+    "seconds": 4,
+    "resolution": "480p",
+    "aspect_ratio": "16:9"
+  }'
+```
+
+**示例 D8：Drama A 按编号使用参考图片、视频和音频**
+
+适用：两款 A 的普通参考模式。`reference_images`、`reference_videos`、`reference_audios` 都是 **URL 字符串数组**；一个素材也保留方括号。每类从 1 编号，`@图1` / `@图片1` 对应图片数组第一项，`@视频1` 与 `@音频1` 分别对应各自数组第一项。编号不是整个请求的总序号，也不是 URL。
+
+每个普通参考素材都必须在 prompt 中引用。`@图01`、`@图0`、负数、小数、越界编号和未引用素材会被拒绝；同一素材可以多次引用。使用上游风格的 `references: [{"type":"image","role":"reference","source":"https://..."}]` 也可以，编号依每类普通素材的顺序计算；不要通过多个别名重复发送同一素材。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-a-references-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.5-A",
+    "prompt": "@图1 中的人自然行走，运镜参考@视频1，声音参考@音频1",
+    "reference_images": ["https://cdn.example.com/character.png"],
+    "reference_videos": ["https://cdn.example.com/motion.mp4"],
+    "reference_audios": ["https://cdn.example.com/voice.mp3"],
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "16:9"
+  }'
+```
+
+将三个示例 URL 分别替换成真实媒体文件的公网 HTTPS 地址，不要在 URL 前写 `@`；提示词中的 `@图1` 是 A 系列的素材引用语法。A 2.0 上限为 9 图、3 视频、3 音频、合计 12 项；A 2.5 为 30 图、10 视频、10 音频、合计 50 项。所有 URL 唯一，不接收本地文件、Data URI 或 `asset://`。真实媒体的 MIME、像素、时长和文件大小仍由上游检查。
+
+**示例 D9：Drama A 2.0 成对首尾帧**
+
+仅适用 `seedance2.0-A`。`image` 是首帧，`last_frame` 是尾帧，必须同时提供且 URL 不同；比例使用 `Auto`，不是 G 的 `adaptive`。不混入普通参考素材，不需要使用 `@图N`。省略比例时该模式会使用 `Auto`，但建议明确填写。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-a-frames-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.0-A",
+    "prompt": "从室内首帧平稳过渡到窗外城市尾帧",
+    "image": "https://cdn.example.com/first.png",
+    "last_frame": "https://cdn.example.com/last.png",
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "Auto"
+  }'
+```
+
+`first_image` / `last_image` 是兼容别名，不能与对应的 `image` / `last_frame` 重复填写。只想用一张普通参考图时，改用示例 D8 的 `reference_images` 并在 prompt 写 `@图1`；不要只传一个 `image`。
+
+**示例 D10：Drama minimax-h3 使用参考图并关闭音频**
+
+适用：小写 `minimax-h3`，`provider=drama`。普通图片参考用 URL 字符串数组，**不固定为首帧**；提示词可直接描述动作，不强制 A 系列的编号规则。`generate_audio: false` 会保留并传给上游；A 系列不支持此字段，不能把本例只改模型名后调用 A。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-h3-reference-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "minimax-h3",
+    "prompt": "参考图中的人物自然点头挥手，镜头缓慢推进",
+    "reference_images": ["https://cdn.example.com/character.png"],
+    "seconds": 6,
+    "resolution": "720p",
+    "aspect_ratio": "16:9",
+    "generate_audio": false
+  }'
+```
+
+H3 图片最多 9 张，视频与音频合计最多 3 项，总数最多 12 项，URL 不重复。可用 `references` 的普通 `reference` 或匹配类型的 `reference_image/reference_video/reference_audio` 角色，也可省略该角色；不接收 `first_frame`、`last_frame`。去掉 `reference_images` 即为纯文本生成。海螺官方 `MiniMax-H3` 走另一套协议，名称、渠道、分辨率不能混用；使用上表精确拼写，其他混合大小写不自动归一化。
+
+上述 D7–D10 均使用本站 `_async` 接口：HTTP 202 只确认受理，保存 `task_id/query_url`，用同一本站 Token 查询 `/v1/media/tasks_async/{task_id}`，等 `status=succeeded` 后下载 `data[].url`。失败时读取 `fail_reason`，不要重新生成来“查询”；标准 `/v1/videos` 则返回 `id` 并使用对应的标准查询路径。
+
+视频提交体最多读取 64 MiB；插件可对单个参考文件设更低限制。视频渠道池按 `size` 的**短边**归档：≤1024 为 1K，1025–2048 为 2K，>2048 为 4K；当前渠道池按模型和尺寸选路，不按时长选路。Drama 的 `resolution` 档位映射为 480p/720p → 1K、1080p → 2K、4k → 4K；池里的 2K 不表示 `minimax-h3` 支持 2k 输出。
+
+<a id="drama-efg-examples"></a>
+
+#### 5.1.3 E / F / G 各五种完整生成示例
+
+以下十五条命令分别覆盖 E、F、G 的纯文本、参考图、参考视频、参考音频和三者混合。站内 `/guide/async-image-api#image-guide-video` 提供相同示例与独立复制按钮。先按第 2 节设置 `BASE_URL` 和本站 `NEW_API_TOKEN`，将 `cdn.example` 替换为上游能够直接读取的公网 HTTPS 素材地址；这些占位 URL 不可直接生成。本站 Key 用于调用本站，上游 Key 仅保存在渠道中。
+
+每次新的生成使用新的 `Idempotency-Key`；重试同一个任务时保留原 Key 和完全相同的请求体。成功受理返回 HTTP 202 后，保存 `task_id` 并按第 6 节查询，最终从 `data` 获取结果链接。不要仅因生成时间长而重复提交。
+
+| 系列与本节型号 | 输出参数 | 计费用量与差异 |
+| --- | --- | --- |
+| E：`seedance2.5-E` | 8 秒、720p、16:9，不发送 `generate_audio` | 按条 `requests`，素材编号可选 |
+| F：`seedance2.5-F` | 8 秒、720p、16:9、`generate_audio=true` | 无参考视频时按 `seconds`；有参考视频时等待上游实际 `tokens`。`seedance2.0-F` 使用 `720px`，不能直接照搬此分辨率值 |
+| G：`seedance2.5-G` | 8 秒、720p、16:9、`generate_audio=true` | 按实际 `tokens`；本型号允许只参考音频，其他 G 型号还需图片或视频。普通参考图不等于首帧；首尾帧另见 D5/D6 |
+
+切换具体型号时，先核对该型号能力与实际激活插件的限制。价格编辑器按型号声明可用分辨率，不能通过填写 4K 价格让不支持 4K 的型号获得该能力。
+
+**E 系列：seedance2.5-E**
+
+**E1：文本生成视频**
+
+仅发送提示词和输出参数，不携带参考素材。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-e-text-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-E",
+  "prompt": "Sunrise over the sea, slow forward camera movement",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9"
+}'
+```
+
+**E2：参考图片 URL 生成**
+
+reference_images 是 HTTPS 图片 URL 字符串数组，用作普通参考，不固定为首帧。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-e-image-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-E",
+  "prompt": "Animate the character from the reference image",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_images": [
+    "https://cdn.example/character.png"
+  ]
+}'
+```
+
+**E3：参考视频 URL 生成**
+
+reference_videos 是 HTTPS 视频 URL 字符串数组，用于引导动作与运镜；本接口不编辑或延长原视频。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-e-video-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-E",
+  "prompt": "Follow the camera movement and action rhythm of the reference video",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_videos": [
+    "https://cdn.example/motion.mp4"
+  ]
+}'
+```
+
+**E4：参考音频 URL 生成**
+
+reference_audios 是 HTTPS 音频 URL 字符串数组，用于引导场景或声音。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-e-audio-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-E",
+  "prompt": "Let the reference audio guide the mood and movement of an ocean scene",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_audios": [
+    "https://cdn.example/voice.mp3"
+  ]
+}'
+```
+
+**E5：图片 + 视频 + 音频混合生成**
+
+references 是对象数组，type 指定媒体类型，role=reference 表示普通参考，source 填独立 HTTPS URL。不要再把同一素材填入 reference_images / reference_videos / reference_audios。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-e-mixed-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-E",
+  "prompt": "Keep the person from the image, follow the video movement and use the audio as voice guidance",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "references": [
+    {
+      "type": "image",
+      "role": "reference",
+      "source": "https://cdn.example/character.png"
+    },
+    {
+      "type": "video",
+      "role": "reference",
+      "source": "https://cdn.example/motion.mp4"
+    },
+    {
+      "type": "audio",
+      "role": "reference",
+      "source": "https://cdn.example/voice.mp3"
+    }
+  ]
+}'
+```
+
+**F 系列：seedance2.5-F**
+
+**F1：文本生成视频**
+
+仅发送提示词和输出参数，不携带参考素材。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-f-text-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-F",
+  "prompt": "Sunrise over the sea, slow forward camera movement",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "generate_audio": true
+}'
+```
+
+**F2：参考图片 URL 生成**
+
+reference_images 是 HTTPS 图片 URL 字符串数组，用作普通参考，不固定为首帧。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-f-image-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-F",
+  "prompt": "Animate the character from the reference image",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_images": [
+    "https://cdn.example/character.png"
+  ],
+  "generate_audio": true
+}'
+```
+
+**F3：参考视频 URL 生成**
+
+reference_videos 是 HTTPS 视频 URL 字符串数组，用于引导动作与运镜；本接口不编辑或延长原视频。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-f-video-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-F",
+  "prompt": "Follow the camera movement and action rhythm of the reference video",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_videos": [
+    "https://cdn.example/motion.mp4"
+  ],
+  "generate_audio": true
+}'
+```
+
+**F4：参考音频 URL 生成**
+
+reference_audios 是 HTTPS 音频 URL 字符串数组，用于引导场景或声音。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-f-audio-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-F",
+  "prompt": "Let the reference audio guide the mood and movement of an ocean scene",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_audios": [
+    "https://cdn.example/voice.mp3"
+  ],
+  "generate_audio": true
+}'
+```
+
+**F5：图片 + 视频 + 音频混合生成**
+
+references 是对象数组，type 指定媒体类型，role=reference 表示普通参考，source 填独立 HTTPS URL。不要再把同一素材填入 reference_images / reference_videos / reference_audios。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-f-mixed-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-F",
+  "prompt": "Keep the person from the image, follow the video movement and use the audio as voice guidance",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "references": [
+    {
+      "type": "image",
+      "role": "reference",
+      "source": "https://cdn.example/character.png"
+    },
+    {
+      "type": "video",
+      "role": "reference",
+      "source": "https://cdn.example/motion.mp4"
+    },
+    {
+      "type": "audio",
+      "role": "reference",
+      "source": "https://cdn.example/voice.mp3"
+    }
+  ],
+  "generate_audio": true
+}'
+```
+
+**G 系列：seedance2.5-G**
+
+**G1：文本生成视频**
+
+仅发送提示词和输出参数，不携带参考素材。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-g-text-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-G",
+  "prompt": "Sunrise over the sea, slow forward camera movement",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "generate_audio": true
+}'
+```
+
+**G2：参考图片 URL 生成**
+
+reference_images 是 HTTPS 图片 URL 字符串数组，用作普通参考，不固定为首帧。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-g-image-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-G",
+  "prompt": "Animate the character from the reference image",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_images": [
+    "https://cdn.example/character.png"
+  ],
+  "generate_audio": true
+}'
+```
+
+**G3：参考视频 URL 生成**
+
+reference_videos 是 HTTPS 视频 URL 字符串数组，用于引导动作与运镜；本接口不编辑或延长原视频。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-g-video-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-G",
+  "prompt": "Follow the camera movement and action rhythm of the reference video",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_videos": [
+    "https://cdn.example/motion.mp4"
+  ],
+  "generate_audio": true
+}'
+```
+
+**G4：参考音频 URL 生成**
+
+reference_audios 是 HTTPS 音频 URL 字符串数组，用于引导场景或声音。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-g-audio-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-G",
+  "prompt": "Let the reference audio guide the mood and movement of an ocean scene",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "reference_audios": [
+    "https://cdn.example/voice.mp3"
+  ],
+  "generate_audio": true
+}'
+```
+
+**G5：图片 + 视频 + 音频混合生成**
+
+references 是对象数组，type 指定媒体类型，role 分别使用 reference_image、reference_video、reference_audio，source 填独立 HTTPS URL。不要再把同一素材填入 reference_images / reference_videos / reference_audios。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-g-mixed-001' \
+  --data-binary '{
+  "provider": "drama",
+  "model": "seedance2.5-G",
+  "prompt": "Keep the person from the image, follow the video movement and use the audio as voice guidance",
+  "seconds": 8,
+  "resolution": "720p",
+  "aspect_ratio": "16:9",
+  "references": [
+    {
+      "type": "image",
+      "role": "reference_image",
+      "source": "https://cdn.example/character.png"
+    },
+    {
+      "type": "video",
+      "role": "reference_video",
+      "source": "https://cdn.example/motion.mp4"
+    },
+    {
+      "type": "audio",
+      "role": "reference_audio",
+      "source": "https://cdn.example/voice.mp3"
+    }
+  ],
+  "generate_audio": true
+}'
+```
 
 ### 5.2 视频编辑与延长
 

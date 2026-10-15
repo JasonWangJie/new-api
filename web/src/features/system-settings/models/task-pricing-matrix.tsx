@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { AlertTriangle, ChevronDown, PaintBucket } from 'lucide-react'
+import { AlertTriangle, ChevronDown, Eraser, PaintBucket } from 'lucide-react'
 import { useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -81,6 +81,7 @@ type TaskPricingMatrixProps = {
   matchedRowIndex: number | null
   onRowChange: (index: number, next: TaskMatrixRow) => void
   onFillColumn: (priceKey: string, value: number) => void
+  onClearRow?: (index: number) => void
 }
 
 type IndexedTaskMatrixRow = {
@@ -182,6 +183,7 @@ type TaskMatrixTableProps = {
     rowIndex: number,
     priceKey: string
   ) => void
+  onClearRow?: (index: number) => void
 }
 
 function TaskMatrixTable(props: TaskMatrixTableProps) {
@@ -259,6 +261,9 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
           <TableHead scope='col' className='w-10 px-1 text-center'>
             <span className='sr-only'>{t('Status')}</span>
           </TableHead>
+          {props.onClearRow && (
+            <TableHead scope='col'>{t('Clear price')}</TableHead>
+          )}
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -379,6 +384,23 @@ function TaskMatrixTable(props: TaskMatrixTableProps) {
                   </Tooltip>
                 ) : null}
               </TableCell>
+              {props.onClearRow && (
+                <TableCell>
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='sm'
+                    disabled={isFree}
+                    aria-label={t('Clear price for {{conditions}}', {
+                      conditions: rowLabel,
+                    })}
+                    onClick={() => props.onClearRow?.(entry.index)}
+                  >
+                    <Eraser aria-hidden='true' />
+                    {t('Clear price')}
+                  </Button>
+                </TableCell>
+              )}
             </TableRow>
           )
         })}
@@ -549,6 +571,7 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
                 matchedRowIndex={props.matchedRowIndex}
                 onRowChange={props.onRowChange}
                 onFillColumn={props.onFillColumn}
+                onClearRow={props.onClearRow}
                 onPriceKeyDown={handlePriceKeyDown}
               />
             ))}
@@ -564,6 +587,7 @@ export function TaskPricingMatrix(props: TaskPricingMatrixProps) {
             matchedRowIndex={props.matchedRowIndex}
             onRowChange={props.onRowChange}
             onFillColumn={props.onFillColumn}
+            onClearRow={props.onClearRow}
             onPriceKeyDown={handlePriceKeyDown}
           />
         )}

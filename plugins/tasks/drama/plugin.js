@@ -1,5 +1,8 @@
 const RATIOS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"];
 const MODELS = {
+  "seedance2.0-A": { series: "A", min: 4, max: 15, resolutions: ["480p", "720p", "1080p", "4k"], defaultResolution: "480p", aspectRatios: [...RATIOS, "Auto"], images: 9, videos: 3, audios: 3, maxReferences: 12 },
+  "seedance2.5-A": { series: "A", min: 4, max: 30, resolutions: ["480p", "720p"], defaultResolution: "480p", images: 30, videos: 10, audios: 10, maxReferences: 50 },
+  "minimax-h3": { series: "H3", min: 4, max: 15, resolutions: ["480p", "720p", "1080p"], defaultResolution: "480p", aspectRatios: ["16:9", "9:16"], images: 9, videos: 3, audios: 3, maxReferences: 12 },
   "seedance2.0-E-720p": { series: "legacy", min: 5, max: 15, resolutions: ["720p"], images: 9, videos: 3, audios: 3 },
   "seedance2.0-E-1080p": { series: "legacy", min: 5, max: 15, resolutions: ["1080p"], images: 9, videos: 3, audios: 3 },
   "seedance2.0-F-720p": { series: "legacy", min: 5, max: 15, resolutions: ["720p"], images: 9, videos: 0, audios: 3 },
@@ -42,13 +45,17 @@ function videoProfile(model, config) {
   const base = {
     duration: { min: config.min, max: config.max, step: 1, default: config.series === "G" ? 5 : config.min },
     resolutions: config.resolutions,
-    defaultResolution: config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0],
-    aspectRatios: config.series === "G" ? [...RATIOS, "adaptive"] : RATIOS,
+    defaultResolution: config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]),
+    aspectRatios: config.aspectRatios || (config.series === "G" ? [...RATIOS, "adaptive"] : RATIOS),
     defaultAspectRatio: config.series === "G" ? "adaptive" : "16:9",
   };
-  if (config.series === "F") base.options = { generateAudio: true };
+  if (config.series === "F" || config.series === "H3") base.options = { generateAudio: true };
   if (config.series === "G") base.options = { generateAudio: true, watermark: true, returnLastFrame: true };
   const modes = [{ ...base, name: "text_to_video" }, { ...base, name: "reference_to_video", inputs: referenceInputs }];
+  if (model === "seedance2.0-A") {
+    const frame = { name: "image", kind: "image", sources, maxItems: 1, required: true };
+    modes.push({ ...base, name: "first_last_frame", aspectRatios: ["Auto"], defaultAspectRatio: "Auto", inputs: [frame, { ...frame, name: "last_frame" }] });
+  }
   if (config.series === "G") {
     const frame = { name: "image", kind: "image", sources, maxItems: 1, required: true };
     const pinned = model === "seedance2.5-G" ? { ...base, aspectRatios: ["adaptive"], defaultAspectRatio: "adaptive" } : base;
@@ -68,37 +75,46 @@ function videoProfile(model, config) {
 export const meta = {
   apiVersion: 1,
   key: "drama",
-  name: "Drama Seedance E / F / G",
+  name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.0.0",
+  version: "1.1.3",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
-  description: { en: "Drama Seedance E, F, and G video generation", zh: "Drama Seedance E、F、G 系列视频生成" },
+  description: { en: "Drama Seedance A, E, F, G and MiniMax H3 video generation", zh: "Drama Seedance A、E、F、G 与 MiniMax H3 视频生成" },
   models: Object.keys(MODELS),
   fetchMode: "per_task",
   protocols: ["openai_video"],
   usageSchema: VIDEO_USAGE_SCHEMA,
   usageExamples: [{ label: "720p · 5s", facts: { seconds: 5, tokens: 108000, resolution: "720p", video_input: "none" } }],
-  usageProfiles: [
-    {
-      models: Object.keys(MODELS).filter((model) => MODELS[model].series === "E"),
-      schema: {
+  usageProfiles: Object.entries(MODELS).map(([model, config]) => {
+    // Pricing includes the four standard rows and any provider-specific values.
+    // Actual generation limits remain in config.resolutions and videoProfiles.
+    const resolution = { ...RESOLUTION_SCHEMA, enum: [...new Set(["480p", "720p", "1080p", "4k", ...config.resolutions])] };
+    let schema = { ...VIDEO_USAGE_SCHEMA, resolution };
+    if (config.series === "E") {
+      schema = {
         requests: { type: "number", unit: "count", unitLabel: { en: "video", zh: "条" }, description: { en: "Video generation unit price", zh: "视频生成单价" } },
-        resolution: RESOLUTION_SCHEMA,
-      },
-    },
-    {
-      models: Object.keys(MODELS).filter((model) => MODELS[model].series === "legacy"),
-      schema: { seconds: SECONDS_SCHEMA, resolution: RESOLUTION_SCHEMA, video_input: VIDEO_INPUT_SCHEMA },
-    },
-  ],
+        resolution,
+      };
+    } else if (config.series === "legacy") {
+      schema = { seconds: SECONDS_SCHEMA, resolution, video_input: VIDEO_INPUT_SCHEMA };
+    } else if (["A", "H3"].includes(config.series)) {
+      schema = { seconds: SECONDS_SCHEMA, resolution };
+    }
+    const profile = { models: [model], schema };
+    if (Object.hasOwn(schema, "tokens")) {
+      const sampleResolution = config.resolutions.includes("720p") ? "720p" : config.resolutions[0];
+      profile.examples = [{ label: sampleResolution + " · 5s", facts: { seconds: 5, tokens: 108000, resolution: sampleResolution, video_input: "none" } }];
+    }
+    return profile;
+  }),
   videoProfiles: Object.keys(MODELS).map((model) => videoProfile(model, MODELS[model])),
 };
 
 const REQUEST_FIELDS = new Set([
   "model", "prompt", "seconds", "duration", "resolution", "size", "aspect_ratio", "ratio", "aspectRatio", "references",
-  "image", "input_reference", "last_frame", "video", "reference_images", "reference_videos", "reference_audios",
+  "image", "input_reference", "last_frame", "first_image", "last_image", "video", "reference_images", "reference_videos", "reference_audios",
   "images", "image_urls", "referenceImages", "videos", "video_urls", "referenceVideos", "audios", "audio_urls", "referenceAudios",
   "generate_audio", "watermark", "return_last_frame", "task_mode", "omni_reference_task_type", "extension_direction",
   "priority", "output_format", "execution_expires_after", "service_tier", "safety_identifier", "callback_url", "metadata",
@@ -129,6 +145,22 @@ function mediaSource(value, type, config) {
   throw new Error("Media source is not supported by this Drama model");
 }
 
+function validateAReferencePrompt(prompt, references) {
+  const counts = { image: 0, video: 0, audio: 0 };
+  const mentioned = { image: new Set(), video: new Set(), audio: new Set() };
+  for (const reference of references) counts[reference.type]++;
+  const types = { "图": "image", "图片": "image", "视频": "video", "音频": "audio" };
+  for (const match of prompt.matchAll(/@(图片|图|视频|音频)([+-]?[0-9]+(?:\.[0-9]+)?)/g)) {
+    const type = types[match[1]];
+    const index = Number(match[2]);
+    if (!/^[1-9][0-9]*$/.test(match[2]) || !Number.isSafeInteger(index) || index > counts[type]) throw new Error("A series reference index must be a positive integer without leading zeros and within the supplied media count");
+    mentioned[type].add(index);
+  }
+  for (const type of ["image", "video", "audio"]) {
+    if (mentioned[type].size !== counts[type]) throw new Error("Every A series reference must be mentioned in prompt with @图N, @图片N, @视频N or @音频N");
+  }
+}
+
 function normalizeRequest(request, model, operation) {
   const config = modelConfig(model);
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("JSON object required");
@@ -136,6 +168,17 @@ function normalizeRequest(request, model, operation) {
     if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by this Drama model");
   }
   const req = Object.assign({}, request);
+  if (req.first_image !== undefined || req.last_image !== undefined) {
+    if (model !== "seedance2.0-A") throw new Error("first_image and last_image require seedance2.0-A");
+    if (req.first_image !== undefined) {
+      if (req.image !== undefined || req.input_reference !== undefined) throw new Error("first_image conflicts with image or input_reference");
+      req.image = req.first_image;
+    }
+    if (req.last_image !== undefined) {
+      if (req.last_frame !== undefined) throw new Error("last_image conflicts with last_frame");
+      req.last_frame = req.last_image;
+    }
+  }
   if (req.metadata !== undefined) {
     if (!req.metadata || typeof req.metadata !== "object" || Array.isArray(req.metadata)) throw new Error("metadata must be an object");
     for (const name of Object.keys(req.metadata)) {
@@ -169,16 +212,18 @@ function normalizeRequest(request, model, operation) {
     if (!Number.isInteger(seconds) || seconds < config.min || seconds > config.max) throw new Error("seconds must be between " + config.min + " and " + config.max);
   }
   const rawResolution = aliasedValue(req, ["resolution", "size"]);
-  const defaultResolution = config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0];
+  const defaultResolution = config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]);
   const resolution = rawResolution === undefined ? defaultResolution : typeof rawResolution === "string" ? rawResolution.toLowerCase() : "";
   if (!config.resolutions.includes(resolution)) throw new Error("resolution is not supported by this Drama model");
   const rawRatio = aliasedValue(req, ["aspect_ratio", "ratio", "aspectRatio"]);
-  const ratio = rawRatio === undefined ? config.series === "G" ? "adaptive" : "16:9" : rawRatio;
-  if (![...RATIOS, ...(config.series === "G" ? ["adaptive"] : [])].includes(ratio)) throw new Error("aspect_ratio is not supported by this Drama model");
+  let ratio = rawRatio === undefined ? config.series === "G" ? "adaptive" : "16:9" : rawRatio;
+  if (model === "seedance2.0-A" && typeof ratio === "string" && ratio.toLowerCase() === "auto") ratio = "Auto";
+  const ratios = config.aspectRatios || [...RATIOS, ...(config.series === "G" ? ["adaptive"] : [])];
+  if (!ratios.includes(ratio)) throw new Error("aspect_ratio is not supported by this Drama model");
 
   const references = [];
   if (req.references !== undefined) {
-    if (!Array.isArray(req.references) || req.references.length > config.images + config.videos + config.audios) throw new Error("references exceeds this Drama model's media limit");
+    if (!Array.isArray(req.references) || req.references.length > (config.maxReferences || config.images + config.videos + config.audios)) throw new Error("references exceeds this Drama model's media limit");
     for (const reference of req.references) {
       if (!reference || typeof reference !== "object" || Array.isArray(reference) || !["image", "video", "audio"].includes(reference.type)) throw new Error("Invalid reference media type");
       for (const name of Object.keys(reference)) {
@@ -187,7 +232,8 @@ function normalizeRequest(request, model, operation) {
       let role = reference.role;
       if (config.series === "G") {
         if (!["reference_" + reference.type, ...(reference.type === "image" ? ["first_frame", "last_frame"] : [])].includes(role)) throw new Error("G series references require an explicit matching role");
-      } else {
+      } else if (!(model === "seedance2.0-A" && reference.type === "image" && ["first_frame", "last_frame"].includes(role))) {
+        if (config.series === "H3" && role === undefined) role = "reference";
         if (!["reference", "reference_" + reference.type].includes(role)) throw new Error("This Drama model only supports ordinary references");
         role = "reference";
       }
@@ -207,9 +253,9 @@ function normalizeRequest(request, model, operation) {
   }
   if (req.image !== undefined && req.input_reference !== undefined) throw new Error("image and input_reference cannot both be provided");
   const first = req.image === undefined ? req.input_reference : req.image;
-  if (first !== undefined) references.push({ type: "image", role: config.series === "G" ? "first_frame" : "reference", source: mediaSource(first, "image", config) });
+  if (first !== undefined) references.push({ type: "image", role: config.series === "G" || model === "seedance2.0-A" ? "first_frame" : "reference", source: mediaSource(first, "image", config) });
   if (req.last_frame !== undefined) {
-    if (config.series !== "G") throw new Error("This Drama model does not support last_frame");
+    if (config.series !== "G" && model !== "seedance2.0-A") throw new Error("This Drama model does not support last_frame");
     references.push({ type: "image", role: "last_frame", source: mediaSource(req.last_frame, "image", config) });
   }
   if (req.video !== undefined) {
@@ -232,16 +278,23 @@ function normalizeRequest(request, model, operation) {
       lastFrame = reference.source;
     }
   }
-  if (counts.image > config.images || counts.video > config.videos || counts.audio > config.audios || (config.series === "F" && counts.video + counts.audio > 3)) throw new Error("Reference media exceeds this Drama model's limits");
+  if (counts.image > config.images || counts.video > config.videos || counts.audio > config.audios || ((config.series === "F" || config.series === "H3") && counts.video + counts.audio > 3) || (config.maxReferences && references.length > config.maxReferences)) throw new Error("Reference media exceeds this Drama model's limits");
   if (lastFrame && !firstFrame) throw new Error("last_frame requires first_frame");
   if (firstFrame && references.length !== (lastFrame ? 2 : 1)) throw new Error("Pinned frames cannot be mixed with reference media");
   if (firstFrame && requestedType === "reference") throw new Error("omni_reference_task_type reference cannot use pinned frames");
+  if (model === "seedance2.0-A" && firstFrame) {
+    if (!lastFrame) throw new Error("A 2.0 first_frame requires last_frame");
+    if (rawRatio === undefined) ratio = "Auto";
+    if (ratio !== "Auto") throw new Error("A 2.0 paired frames require aspect_ratio Auto");
+  }
+  if (config.series === "A" && !firstFrame) validateAReferencePrompt(prompt, references);
   if (config.series === "G" && model !== "seedance2.5-G" && counts.audio && !counts.image && !counts.video) throw new Error("Audio references require an image or video reference");
   if (action && (!counts.video || firstFrame)) throw new Error("Video editing and extension require a reference video");
   if (model === "seedance2.5-G" && (action || firstFrame) && ratio !== "adaptive") throw new Error("This video mode requires aspect_ratio adaptive");
   if (req.extension_direction !== undefined && (action !== "extend_video" || req.extension_direction !== "backward")) throw new Error("Only backward video extension is supported");
   if (!action) action = lastFrame ? "first_last_frame" : firstFrame ? "image_to_video" : references.length ? "reference_to_video" : "text_to_video";
-  if (req.task_mode !== undefined && ![references.length ? "references" : "text"].includes(req.task_mode)) throw new Error("task_mode conflicts with the supplied media");
+  const taskMode = model === "seedance2.0-A" && firstFrame ? "first_last_frame" : references.length ? "references" : "text";
+  if (req.task_mode !== undefined && req.task_mode !== taskMode) throw new Error("task_mode conflicts with the supplied media");
 
   const body = { model: req.model, prompt, resolution, aspect_ratio: ratio };
   if (action !== "edit_video") body.seconds = seconds;
@@ -259,7 +312,7 @@ function normalizeRequest(request, model, operation) {
   for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
     if (req[name] === undefined) continue;
     if (typeof req[name] !== "boolean") throw new Error(name + " must be a boolean");
-    if (config.series !== "G" && !(config.series === "F" && name === "generate_audio")) throw new Error(name + " is not supported by this Drama model");
+    if (config.series !== "G" && !(["F", "H3"].includes(config.series) && name === "generate_audio")) throw new Error(name + " is not supported by this Drama model");
     body[name] = req[name];
   }
   for (const name of G_FIELDS) {
@@ -299,6 +352,7 @@ export function extractUsage(ctx) {
   const resolution = prepared.body.resolution;
   if (config.series === "E") return { requests: 1, resolution };
   const seconds = prepared.action === "edit_video" ? config.max : prepared.body.seconds;
+  if (config.series === "A" || config.series === "H3") return { seconds, resolution };
   const videoInput = prepared.references.some((reference) => reference.type === "video");
   const facts = { seconds, resolution, video_input: videoInput ? "video" : "none" };
   if (config.series === "F" || config.series === "G") {
@@ -331,7 +385,7 @@ function completionUsage(ctx, body) {
   const requiresTokens = config.series === "G" || (config.series === "F" && ((ctx.state || {}).video_input === "video" || billing.mode === "per_million_tokens"));
   if (requiresTokens && (billing.settle_state === "pending" || billing.settled === false)) return null;
   if (requiresTokens && billing.settle_state === "failed") throw new Error("Upstream video billing settlement failed");
-  if (config.series !== "legacy") {
+  if (config.series === "F" || config.series === "G") {
     const sources = config.series === "F" ? [metadata.usage, body.usage] : [body.usage, metadata.usage];
     for (const usage of sources) {
       if (usage === undefined || usage === null) continue;

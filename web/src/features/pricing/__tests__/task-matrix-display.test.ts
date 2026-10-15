@@ -17,10 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
-import { describe, test } from 'vitest'
+
+import { describe, expect, test } from 'vitest'
 
 import { getDynamicPriceEntries } from '../lib/dynamic-price'
-import { getTaskMatrixDisplayTiers } from '../lib/task-matrix-display'
+import {
+  getTaskMatrixDisplayTiers,
+  getTaskPricingDisplayTiers,
+} from '../lib/task-matrix-display'
 import type { BillingUsageSchema } from '../types'
 
 const resolutionSchema: BillingUsageSchema = {
@@ -39,6 +43,50 @@ const numberOnlySchema: BillingUsageSchema = {
 }
 
 describe('task matrix marketplace display rows', () => {
+  test('published resolution prices omit zero combinations while the editor retains them', () => {
+    const expression =
+      'u("resolution") == "480P" ? tier("480P", u("seconds") * 0) : u("resolution") == "720P" ? tier("720P", u("seconds") * 7) : tier("1080P", u("seconds") * 0)'
+    const published = getTaskPricingDisplayTiers(
+      expression,
+      resolutionSchema,
+      true
+    )
+    expect(published.map((tier) => tier.conditions)).toEqual([
+      [{ field: 'resolution', value: '720P' }],
+    ])
+    expect(
+      getTaskPricingDisplayTiers(expression, resolutionSchema)
+    ).toHaveLength(3)
+  })
+
+  test('published prices omit unreachable resolutions from older expressions', () => {
+    const expression =
+      'u("resolution") == "480P" ? tier("480P", u("seconds") * 4) : u("resolution") == "720P" ? tier("720P", u("seconds") * 7) : u("resolution") == "1080P" ? tier("1080P", u("seconds") * 9) : tier("4K", u("seconds") * 20)'
+    const published = getTaskPricingDisplayTiers(
+      expression,
+      {
+        ...resolutionSchema,
+        resolution: { enum: ['480P', '720P'] },
+      },
+      true
+    )
+    expect(published.map((tier) => tier.unitPrices.seconds)).toEqual([4, 7])
+    expect(published.map((tier) => tier.conditions[0].value)).toEqual([
+      '480P',
+      '720P',
+    ])
+  })
+
+  test('a nonzero additional charge keeps a resolution published even when usage is free', () => {
+    const published = getTaskPricingDisplayTiers(
+      'tier("base", 0.25 + u("seconds") * 0)',
+      resolutionSchema,
+      true
+    )
+    expect(published).toHaveLength(3)
+    expect(published.every((tier) => tier.constant === 0.25)).toBe(true)
+  })
+
   test('expands a uniform flat expression into every enum combination', () => {
     const rows = getTaskMatrixDisplayTiers(
       'tier("base", u("seconds") * 0.4)',

@@ -325,13 +325,21 @@ export function getCurrentTimePricingTiers(
 export function parseTaskTiersFromExpr(
   exprStr: string,
   schema: BillingUsageSchema | null | undefined,
-  includeBooleanConditions = false
+  includeBooleanConditions = false,
+  allowUnsupportedEnumValues = false
 ): ParsedTaskTier[] {
   if (!exprStr || !schema || Object.keys(schema).length === 0) return []
   const { billingExpr } = splitBillingExprAndRequestRules(exprStr)
   const compiled = compileBillingExpression(billingExpr)
   if (compiled.status !== 'ready') return []
-  return readTaskTierChain(compiled.ast, schema, includeBooleanConditions) ?? []
+  return (
+    readTaskTierChain(
+      compiled.ast,
+      schema,
+      includeBooleanConditions,
+      allowUnsupportedEnumValues
+    ) ?? []
+  )
 }
 
 export function normalizeTierLabel(label: string | undefined): string {

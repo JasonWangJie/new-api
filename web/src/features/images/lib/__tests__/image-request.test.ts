@@ -110,8 +110,73 @@ describe('capability-driven image request contracts', () => {
     expect(bodies).toContainEqual(
       expect.objectContaining({
         provider: 'drama',
+        model: 'seedance2.0-A',
+        seconds: 4,
+        resolution: '480p',
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.5-A',
+        prompt: expect.stringContaining('@图1'),
+        reference_images: ['https://cdn.example/character.png'],
+        reference_videos: ['https://cdn.example/motion.mp4'],
+        reference_audios: ['https://cdn.example/voice.mp3'],
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.0-A',
+        image: 'https://cdn.example/first.png',
+        last_frame: 'https://cdn.example/last.png',
+        aspect_ratio: 'Auto',
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'minimax-h3',
+        generate_audio: false,
+        reference_images: ['https://cdn.example/character.png'],
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
         model: 'seedance2.5-F',
         reference_images: ['https://cdn.example/character.png'],
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.5-E',
+        reference_videos: ['https://cdn.example/motion.mp4'],
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.5-E',
+        references: [
+          {
+            type: 'image',
+            role: 'reference',
+            source: 'https://cdn.example/character.png',
+          },
+          {
+            type: 'video',
+            role: 'reference',
+            source: 'https://cdn.example/motion.mp4',
+          },
+          {
+            type: 'audio',
+            role: 'reference',
+            source: 'https://cdn.example/voice.mp3',
+          },
+        ],
       })
     )
     expect(bodies).toContainEqual(

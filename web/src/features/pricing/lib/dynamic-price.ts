@@ -28,7 +28,6 @@ import type {
 import {
   BILLING_PRICING_VARS,
   getCurrentTimePricingTiers,
-  parseTaskTiersFromExpr,
   parseTiersFromExpr,
   splitBillingExprAndRequestRules,
   tryParseRequestRuleExpr,
@@ -42,8 +41,10 @@ import { withPluginPricing } from './plugin-pricing'
 import {
   evaluateTaskVisualConfig,
   getTaskNumberFields,
+  tryParseTaskMatrixConfig,
   tryParseTaskVisualConfig,
 } from './task-expr'
+import { getTaskPricingDisplayTiers } from './task-matrix-display'
 
 export type DynamicPriceOptions = {
   tokenUnit: TokenUnit
@@ -258,7 +259,11 @@ export function getDynamicPricingTiers(
     model.billing_expr || ''
   )
   if (isTaskUsagePricingModel(model)) {
-    return parseTaskTiersFromExpr(billingExpr, model.billing_usage_schema, true)
+    return getTaskPricingDisplayTiers(
+      billingExpr,
+      model.billing_usage_schema,
+      true
+    )
   }
   return parseTiersFromExpr(billingExpr)
 }
@@ -563,7 +568,14 @@ export function getDynamicPricingSummary(
     tier,
     tierCount: tiers.length,
     hasRequestRules: hasDynamicRequestRules(model),
-    isSpecialExpression: rawExpression.trim().length > 0 && tiers.length === 0,
+    isSpecialExpression:
+      rawExpression.trim().length > 0 &&
+      tiers.length === 0 &&
+      !(
+        isTaskUsage &&
+        model.billing_usage_schema?.resolution?.enum?.length &&
+        tryParseTaskMatrixConfig(baseExpression, model.billing_usage_schema)
+      ),
     rawExpression,
     entries,
     primaryEntries: isTaskUsage
@@ -617,6 +629,7 @@ export function getCardExamplePrice(
 
   const result = evaluateTaskVisualConfig(config, firstExample.facts, schema)
   if (!result) return null
+  if (schema.resolution?.enum?.length && result.total === 0) return null
 
   return {
     label: firstExample.label,

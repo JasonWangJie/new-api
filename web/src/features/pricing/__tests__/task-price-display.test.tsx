@@ -100,6 +100,123 @@ const model: PricingModel = {
 }
 const clients: QueryClient[] = []
 
+it('preserves complete multiline model restrictions in the details header', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const description =
+    '时长：固定15秒；分辨率：2K\n参考图≤9张、视频≤3条、音频≤3条；合计≤10份\n参考视频需填写duration_seconds，总计≤15秒\n提示词：1–6000字符；不支持首尾帧'
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{ ...model, model_name: 'minimax-h3-2k', description }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  const restrictions = screen.getByText(/时长：固定15秒/)
+  expect(restrictions).toHaveClass('whitespace-pre-line')
+  expect(restrictions.textContent).toBe(description)
+  expect(restrictions).toHaveTextContent('提示词：1–6000字符；不支持首尾帧')
+})
+
+it('hides zero and unsupported resolution quotes publicly while retaining free rows in request logs', () => {
+  const billingExpr =
+    'u("resolution") == "480p" ? tier("480p", u("requests") * 0) : u("resolution") == "720p" ? tier("720p", u("requests") * 7) : tier("1080p", u("requests") * 12)'
+  const usageSchema: BillingUsageSchema = {
+    resolution: { enum: ['480p', '720p'], description: 'Resolution' },
+    requests: { type: 'number', unit: 'count', description: 'Video price' },
+  }
+  const { rerender } = render(
+    <DynamicPricingBreakdown
+      billingExpr={billingExpr}
+      usageSchema={usageSchema}
+      publishedPricesOnly
+    />
+  )
+  expect(screen.queryByText(/Resolution: 480p/)).not.toBeInTheDocument()
+  expect(screen.queryByText(/1080p/)).not.toBeInTheDocument()
+  expect(screen.getAllByText('Resolution: 720p').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('$7/unit').length).toBeGreaterThan(0)
+  rerender(
+    <DynamicPricingBreakdown
+      billingExpr='tier("base", u("requests") * 0)'
+      usageSchema={usageSchema}
+      publishedPricesOnly
+    />
+  )
+  expect(screen.getByText('No published resolution prices')).toBeVisible()
+  expect(screen.queryByText(/tier\("base"/)).not.toBeInTheDocument()
+  rerender(
+    <DynamicPricingBreakdown
+      billingExpr='u("resolution") == "480p" ? tier("480p", u("requests") * 0) : tier("720p", u("requests") * 7)'
+      usageSchema={usageSchema}
+      usageFacts={{ resolution: '480p', requests: 1 }}
+      matchedTierLabel='480p'
+    />
+  )
+  expect(screen.getAllByText('Resolution: 480p').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('Matched').length).toBeGreaterThan(0)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const singlePricedResolution: PricingModel = {
+    ...model,
+    model_name: 'single-priced-video',
+    billing_expr:
+      'u("resolution") == "480p" ? tier("480p", u("requests") * 0) : tier("720p", u("requests") * 7)',
+    billing_usage_schema: usageSchema,
+  }
+  expect(hasSimpleTaskPricing(singlePricedResolution)).toBe(false)
+  rerender(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={singlePricedResolution}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.getAllByText('Resolution: 720p').length).toBeGreaterThan(0)
+  expect(screen.queryByText('Resolution: 480p')).not.toBeInTheDocument()
+  rerender(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...singlePricedResolution,
+          billing_expr: 'tier("base", u("requests") * 0)',
+        }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.queryByText(/tier\("base"/)).not.toBeInTheDocument()
+  expect(
+    screen.getAllByText('No published resolution prices').length
+  ).toBeGreaterThan(0)
+})
+
 it('falls back for omitted count labels and preserves canonical units for other quantities', () => {
   expect(taskUsageUnitLabel({ unit: 'count' }, 'zhCN', '次')).toBe('次')
   expect(

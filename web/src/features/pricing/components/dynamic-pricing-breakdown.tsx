@@ -53,6 +53,7 @@ import {
   type DynamicPriceLabelKind,
   type DynamicPriceOptions,
 } from '../lib/dynamic-price'
+import { tryParseTaskMatrixConfig } from '../lib/task-expr'
 import { getTaskPricingDisplayTiers } from '../lib/task-matrix-display'
 import {
   taskPriceLabel,
@@ -86,6 +87,8 @@ type DynamicPricingBreakdownProps = {
    */
   compact?: boolean
   usageSchema?: BillingUsageSchema
+  /** Public pricing omits unavailable and all-zero resolution combinations. */
+  publishedPricesOnly?: boolean
   taskPriceOptions?: Pick<
     DynamicPriceOptions,
     'showRechargePrice' | 'priceRate' | 'usdExchangeRate'
@@ -287,6 +290,7 @@ export function DynamicPricingBreakdown({
   hideCacheColumns = false,
   compact = false,
   usageSchema,
+  publishedPricesOnly = false,
   taskPriceOptions,
   usageFacts,
 }: DynamicPricingBreakdownProps) {
@@ -310,7 +314,11 @@ export function DynamicPricingBreakdown({
   const { tiers, ruleGroups } = useMemo(() => {
     const split = splitBillingExprAndRequestRules(expr)
     const parsedTiers = usageSchema
-      ? getTaskPricingDisplayTiers(split.billingExpr, usageSchema)
+      ? getTaskPricingDisplayTiers(
+          split.billingExpr,
+          usageSchema,
+          publishedPricesOnly
+        )
       : parseTiersFromExpr(split.billingExpr)
     let parsedRules =
       requestRules != null
@@ -332,7 +340,7 @@ export function DynamicPricingBreakdown({
       tiers: parsedTiers,
       ruleGroups: parsedRules || [],
     }
-  }, [expr, usageSchema, requestRules])
+  }, [expr, usageSchema, requestRules, publishedPricesOnly])
 
   const hasTiers = tiers.length > 0
   const hasRules = ruleGroups.length > 0
@@ -340,6 +348,20 @@ export function DynamicPricingBreakdown({
   if (!expr) return null
 
   if (!hasTiers) {
+    if (
+      publishedPricesOnly &&
+      usageSchema?.resolution?.enum?.length &&
+      tryParseTaskMatrixConfig(
+        splitBillingExprAndRequestRules(expr).billingExpr,
+        usageSchema
+      )
+    ) {
+      return (
+        <p className='text-muted-foreground py-3 text-sm'>
+          {t('No published resolution prices')}
+        </p>
+      )
+    }
     return (
       <section className={cn('min-w-0', !compact && 'py-4')}>
         {!compact && (

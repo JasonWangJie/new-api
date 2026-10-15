@@ -89,6 +89,12 @@ export function asyncImageGuide(
         'Drama E/F use reference_images for ordinary references; Drama G also supports image and last_frame. Current Drama and official Doubao Seedance plugins accept JSON media references, not multipart uploads.'
       ),
       t(
+        'Drama A ordinary references must each be mentioned in prompt with @图N or @图片N, @视频N and @音频N. Number each media type separately from 1; do not use leading zeros. A 2.0 paired frames use image plus last_frame with Auto; A 2.5 does not expose frame control here.'
+      ),
+      t(
+        'Drama minimax-h3 uses lowercase model spelling, public HTTPS references and seconds-based pricing. It does not require numbered prompt references or support pinned frames. The official Hailuo MiniMax-H3 uses a different protocol; do not interchange their configurations.'
+      ),
+      t(
         'Use public HTTPS image URLs that the upstream can read without browser cookies or authorization headers. Replace every example URL; a page URL, local path or bare Base64 string is not an image URL.'
       ),
       t(
@@ -374,18 +380,203 @@ export function asyncImageGuide(
     null,
     2
   )
-  const dramaReferences = JSON.stringify(
+  const dramaAText = JSON.stringify(
     {
       provider: 'drama',
-      model: 'seedance2.5-F',
-      prompt: 'Animate the character from the reference image',
+      model: 'seedance2.0-A',
+      prompt: 'Sunrise over the sea, slow forward camera movement',
+      seconds: 4,
+      resolution: '480p',
+      aspect_ratio: '16:9',
+    },
+    null,
+    2
+  )
+  const dramaAMedia = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'seedance2.5-A',
+      prompt:
+        '@图1 walks naturally, follow the movement of @视频1 and the voice of @音频1',
       reference_images: ['https://cdn.example/character.png'],
+      reference_videos: ['https://cdn.example/motion.mp4'],
+      reference_audios: ['https://cdn.example/voice.mp3'],
       seconds: 8,
       resolution: '720p',
       aspect_ratio: '16:9',
     },
     null,
     2
+  )
+  const dramaAFrames = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'seedance2.0-A',
+      prompt: 'Make a smooth transition from the first frame to the last frame',
+      image: 'https://cdn.example/first.png',
+      last_frame: 'https://cdn.example/last.png',
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: 'Auto',
+    },
+    null,
+    2
+  )
+  const dramaH3Reference = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'minimax-h3',
+      prompt: 'Animate the person from the reference image with a gentle wave',
+      reference_images: ['https://cdn.example/character.png'],
+      seconds: 6,
+      resolution: '720p',
+      aspect_ratio: '16:9',
+      generate_audio: false,
+    },
+    null,
+    2
+  )
+  const dramaScenarios = [
+    {
+      id: 'text',
+      prompt: 'Sunrise over the sea, slow forward camera movement',
+      media: {},
+      description: t(
+        'Send only prompt and output parameters. No reference media is attached.'
+      ),
+    },
+    {
+      id: 'image',
+      prompt: 'Animate the character from the reference image',
+      media: { reference_images: ['https://cdn.example/character.png'] },
+      description: t(
+        'reference_images is an array of public HTTPS image URL strings. These are ordinary references, not pinned first frames.'
+      ),
+    },
+    {
+      id: 'video',
+      prompt:
+        'Follow the camera movement and action rhythm of the reference video',
+      media: { reference_videos: ['https://cdn.example/motion.mp4'] },
+      description: t(
+        'reference_videos is an array of public HTTPS video URL strings. It guides motion and camera movement; it does not edit or extend the source clip.'
+      ),
+    },
+    {
+      id: 'audio',
+      prompt:
+        'Let the reference audio guide the mood and movement of an ocean scene',
+      media: { reference_audios: ['https://cdn.example/voice.mp3'] },
+      description: t(
+        'reference_audios is an array of public HTTPS audio URL strings. The audio guides the generated scene or voice.'
+      ),
+    },
+    {
+      id: 'mixed',
+      prompt:
+        'Keep the person from the image, follow the video movement and use the audio as voice guidance',
+      media: {
+        references: [
+          {
+            type: 'image',
+            role: 'reference',
+            source: 'https://cdn.example/character.png',
+          },
+          {
+            type: 'video',
+            role: 'reference',
+            source: 'https://cdn.example/motion.mp4',
+          },
+          {
+            type: 'audio',
+            role: 'reference',
+            source: 'https://cdn.example/voice.mp3',
+          },
+        ],
+      },
+      description: t(
+        'references combines image, video and audio objects. Each entry has type, role and a distinct public HTTPS source. Do not repeat these sources in alias arrays.'
+      ),
+    },
+  ]
+  const dramaSeriesExamples: MediaGuideExample[] = [
+    {
+      id: 'e',
+      model: 'seedance2.5-E',
+      options: {},
+      titles: [
+        t('Drama E: generate a video from text'),
+        t('Drama E: use reference image URLs'),
+        t('Drama E: use a reference video URL'),
+        t('Drama E: use a reference audio URL'),
+        t('Drama E: combine image, video and audio references'),
+      ],
+      description: t(
+        'This seedance2.5-E example is billed per video and does not send generate_audio. Numbered prompt references are optional.'
+      ),
+    },
+    {
+      id: 'f',
+      model: 'seedance2.5-F',
+      options: { generate_audio: true },
+      titles: [
+        t('Drama F: generate a video from text'),
+        t('Drama F: use reference image URLs'),
+        t('Drama F: use a reference video URL'),
+        t('Drama F: use a reference audio URL'),
+        t('Drama F: combine image, video and audio references'),
+      ],
+      description: t(
+        'This seedance2.5-F example uses 720p and generate_audio=true. Without a reference video it uses seconds; with a video it waits for actual token usage. seedance2.0-F uses 720px.'
+      ),
+    },
+    {
+      id: 'g',
+      model: 'seedance2.5-G',
+      options: { generate_audio: true },
+      titles: [
+        t('Drama G: generate a video from text'),
+        t('Drama G: use reference image URLs'),
+        t('Drama G: use a reference video URL'),
+        t('Drama G: use a reference audio URL'),
+        t('Drama G: combine image, video and audio references'),
+      ],
+      description: t(
+        'This seedance2.5-G example uses 720p and generate_audio=true and is billed by actual token usage. Audio-only references are supported by this model; other G models require an image or video too.'
+      ),
+    },
+  ].flatMap((series) =>
+    dramaScenarios.map((scenario, index) => ({
+      title: series.titles[index],
+      description: `${scenario.description} ${series.description}`,
+      code: [
+        `curl -X POST "${base}/v1/videos/generations_async" \\`,
+        '  -H "Authorization: Bearer $NEW_API_TOKEN" \\',
+        "  -H 'Content-Type: application/json' \\",
+        `  -H 'Idempotency-Key: drama-${series.id}-${scenario.id}-001' \\`,
+        `  --data '${JSON.stringify(
+          {
+            provider: 'drama',
+            model: series.model,
+            prompt: scenario.prompt,
+            seconds: 8,
+            resolution: '720p',
+            aspect_ratio: '16:9',
+            ...(scenario.media.references && series.id === 'g'
+              ? {
+                  references: scenario.media.references.map((reference) => ({
+                    ...reference,
+                    role: `reference_${reference.type}`,
+                  })),
+                }
+              : scenario.media),
+            ...series.options,
+          },
+          null,
+          2
+        )}'`,
+      ].join('\n'),
+    }))
   )
   const dramaFirstFrame = JSON.stringify(
     {
@@ -570,12 +761,34 @@ export function asyncImageGuide(
       code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-reference-urls-001' \\\n  --data '${videoReferences}'`,
     },
     {
-      title: t('Drama E/F: use reference image URLs'),
+      title: t('Drama A: generate a video from text'),
       description: t(
-        'For seedance2.5-F, reference_images is an array of public HTTPS URL strings. Images guide the content but are not pinned first frames. New E models use this ordinary-reference form too; seedance2.0-F requires 720px instead of 720p.'
+        'Use provider=drama and seedance2.0-A. The example explicitly sets the defaults: 4 seconds, 480p and 16:9. A 2.5 allows up to 30 seconds at 480p or 720p; do not copy E/F/G token pricing to these seconds-billed models.'
       ),
-      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-reference-urls-001' \\\n  --data '${dramaReferences}'`,
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-a-text-001' \\\n  --data '${dramaAText}'`,
     },
+    {
+      title: t('Drama A: reference images, video and audio by number'),
+      description: t(
+        'Each reference field is an array of public HTTPS URL strings. @图1, @视频1 and @音频1 refer to the first item of their respective arrays; @图片1 is equivalent to @图1. Every ordinary reference must be mentioned, and unused or out-of-range references are rejected.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-a-references-001' \\\n  --data '${dramaAMedia}'`,
+    },
+    {
+      title: t('Drama A 2.0: provide paired first and last frames'),
+      description: t(
+        'This mode requires both image and last_frame with aspect_ratio=Auto. Both URLs must be different and publicly readable; do not add ordinary references or numbered prompt references. A 2.5 and Drama minimax-h3 do not expose this mode.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-a-frames-001' \\\n  --data '${dramaAFrames}'`,
+    },
+    {
+      title: t('Drama minimax-h3: use a reference image without audio'),
+      description: t(
+        'Use lowercase minimax-h3 with provider=drama. reference_images contains ordinary references, not pinned frames; numbered prompt references are optional. generate_audio=false is sent upstream. Supported output is 4–15 seconds, 480p/720p/1080p and 16:9/9:16; 2k is a separate model.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-h3-reference-001' \\\n  --data '${dramaH3Reference}'`,
+    },
+    ...dramaSeriesExamples,
     {
       title: t('Drama G: use a first-frame image URL'),
       description: t(

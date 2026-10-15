@@ -372,6 +372,17 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     publishRows(nextRows)
   }
 
+  const handleClearRow = (index: number) => {
+    const row = matrixRows[index]
+    handleRowChange(index, {
+      ...row,
+      constant: 0,
+      unitPrices: Object.fromEntries(
+        Object.keys(row.unitPrices).map((field) => [field, 0])
+      ),
+    })
+  }
+
   const handleRawChange = (value: string) => {
     setRawExpr(value)
     const split = splitBillingExprAndRequestRules(value)
@@ -496,7 +507,19 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                   matchedRowIndex={matchedRowIndex}
                   onRowChange={handleRowChange}
                   onFillColumn={handleFillColumn}
+                  onClearRow={
+                    props.usageSchema.resolution?.enum?.length
+                      ? handleClearRow
+                      : undefined
+                  }
                 />
+                {props.usageSchema.resolution?.enum?.length ? (
+                  <p className='text-muted-foreground text-xs'>
+                    {t(
+                      'Clear a resolution price to hide it from the pricing page. To show it again, enter a nonzero price. A zero price still means free API requests.'
+                    )}
+                  </p>
+                ) : null}
               </div>
             ) : (
               <>

@@ -193,7 +193,9 @@ export function tryParseTaskMatrixConfig(
   schema: BillingUsageSchema
 ): TaskMatrixConfig | null {
   if (!expression) return null
-  const tiers = parseTaskTiersFromExpr(expression, schema)
+  // Older expressions can retain branches for capabilities the model no longer
+  // advertises. Project their first-match prices onto the current enum values.
+  const tiers = parseTaskTiersFromExpr(expression, schema, false, true)
   if (tiers.length === 0) return null
 
   const numberFields = getTaskNumberFields(schema)

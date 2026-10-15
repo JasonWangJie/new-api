@@ -88,7 +88,7 @@ export function AsyncImageGuide() {
             </header>
             <StaticDataTable
               data={[...ASYNC_IMAGE_ENDPOINTS]}
-              getRowKey={(row) => row[1]}
+              getRowKey={(row) => `${row[0]}:${row[1]}`}
               columns={[
                 {
                   id: 'method',

@@ -59,9 +59,55 @@ export function getTaskMatrixDisplayTiers(
  */
 export function getTaskPricingDisplayTiers(
   expression: string | null | undefined,
-  schema: BillingUsageSchema | null | undefined
+  schema: BillingUsageSchema | null | undefined,
+  publishedPricesOnly = false
 ): ParsedTaskTier[] {
-  const tiers = parseTaskTiersFromExpr(expression || '', schema, true)
+  const tiers = parseTaskTiersFromExpr(
+    expression || '',
+    schema,
+    true,
+    publishedPricesOnly
+  )
+  if (publishedPricesOnly && schema?.resolution?.enum?.length) {
+    const fields = new Set(
+      tiers.flatMap((tier) =>
+        tier.conditions.map((condition) => condition.field)
+      )
+    )
+    fields.add('resolution')
+    const displaySchema = Object.fromEntries(
+      Object.entries(schema).filter(
+        ([field, definition]) => !definition.enum?.length || fields.has(field)
+      )
+    )
+    const count = getTaskEnumFields(displaySchema).reduce(
+      (total, [, definition]) => total * (definition.enum?.length ?? 1),
+      1
+    )
+    const matrix =
+      count <= 256 ? tryParseTaskMatrixConfig(expression, displaySchema) : null
+    if (matrix) {
+      return matrix.rows
+        .filter(
+          (row) =>
+            row.constant > 0 ||
+            Object.values(row.unitPrices).some((price) => price > 0)
+        )
+        .map((row) => ({
+          label: taskMatrixRowLabel(row.combination),
+          conditions: Object.entries(row.combination)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([field, value]) => ({ field, value })),
+          constant: row.constant,
+          unitPrices: { ...row.unitPrices },
+        }))
+    }
+    return tiers.filter(
+      (tier) =>
+        tier.constant > 0 ||
+        Object.values(tier.unitPrices).some((price) => price > 0)
+    )
+  }
   const fallback = tiers.at(-1)
   if (!schema || tiers.length < 2 || !fallback) return tiers
   const previous = tiers.slice(0, -1)

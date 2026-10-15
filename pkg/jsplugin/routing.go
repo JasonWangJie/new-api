@@ -435,7 +435,8 @@ func (g *RoutingGeneration) SharedModel(model string) bool {
 
 // CanonicalModel returns the declared spelling for model. An exact byModel
 // hit wins and returns the input unchanged; otherwise the ASCII-folded
-// index is consulted. Miss and nil-receiver return ("", false).
+// index is consulted only when that spelling identifies one declared name.
+// Miss, ambiguous case variants and nil-receiver return ("", false).
 func (g *RoutingGeneration) CanonicalModel(model string) (string, bool) {
 	if g == nil || model == "" {
 		return "", false
@@ -444,7 +445,7 @@ func (g *RoutingGeneration) CanonicalModel(model string) (string, bool) {
 		return model, true
 	}
 	declared, ok := g.canonicalModelByFold[asciiFold(model)]
-	return declared, ok
+	return declared, ok && declared != ""
 }
 
 // LookupDeclaredRoute resolves a manifest path declaration. It does not match
@@ -894,11 +895,9 @@ func buildRoutingGenerationFromPlugins(effective map[string]*LoadedPlugin, numbe
 			folded := asciiFold(model)
 			if existing, exists := generation.canonicalModelByFold[folded]; exists {
 				if existing != model {
-					otherKey := plugin.Meta.Key
-					if other, ok := generation.byModel[existing]; ok {
-						otherKey = other.Meta.Key
-					}
-					return nil, fmt.Errorf("plugin %s model %q conflicts with plugin %s model %q", plugin.Meta.Key, model, otherKey, existing)
+					// Exact declarations have separate endpoint and metadata indexes.
+					// An empty entry prevents a folded alias from choosing one of them.
+					generation.canonicalModelByFold[folded] = ""
 				}
 				continue
 			}

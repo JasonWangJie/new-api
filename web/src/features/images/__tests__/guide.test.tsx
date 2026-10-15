@@ -41,6 +41,43 @@ afterEach(async () => {
   i18next.removeResourceBundle('zhTW', 'translation')
 })
 
+test.each(['E', 'F', 'G'])(
+  'Drama %s provides text, image, video, audio and combined reference examples',
+  (series) => {
+    render(<AsyncImageGuide />)
+    for (const scenario of [
+      'generate a video from text',
+      'use reference image URLs',
+      'use a reference video URL',
+      'use a reference audio URL',
+      'combine image, video and audio references',
+    ]) {
+      const title = `Drama ${series}: ${scenario}`
+      const example = screen.getByRole('group', { name: title })
+      expect(example).toHaveTextContent(`seedance2.5-${series}`)
+      expect(
+        within(example).getByRole('button', { name: `Copy ${title}` })
+      ).toBeEnabled()
+      const code = example.querySelector('pre code')?.textContent ?? ''
+      const body = JSON.parse(code.match(/--data '([\s\S]*)'$/)?.[1] ?? '{}')
+      expect(body).toMatchObject({
+        provider: 'drama',
+        model: `seedance2.5-${series}`,
+        resolution: '720p',
+      })
+      if (scenario === 'combine image, video and audio references') {
+        expect(
+          body.references.map((reference: { role: string }) => reference.role)
+        ).toEqual(
+          series === 'G'
+            ? ['reference_image', 'reference_video', 'reference_audio']
+            : ['reference', 'reference', 'reference']
+        )
+      }
+    }
+  }
+)
+
 test('video examples explain file uploads and URL references and copy only the selected command', async () => {
   render(<AsyncImageGuide />)
   const upload = screen.getByRole('group', {
@@ -59,7 +96,7 @@ test('video examples explain file uploads and URL references and copy only the s
     screen.getByRole('group', { name: 'xAI: generate from one image URL' })
   ).toHaveTextContent('image')
   expect(
-    screen.getByRole('group', { name: 'Drama E/F: use reference image URLs' })
+    screen.getByRole('group', { name: 'Drama F: use reference image URLs' })
   ).toHaveTextContent('reference_images')
   expect(
     screen.getByRole('group', { name: 'Drama G: use a first-frame image URL' })
@@ -82,13 +119,45 @@ test('video examples explain file uploads and URL references and copy only the s
   )
 })
 
+test('Drama A and H3 explain their separate reference rules and copy the paired-frame command', async () => {
+  render(<AsyncImageGuide />)
+  const numbered = screen.getByRole('group', {
+    name: 'Drama A: reference images, video and audio by number',
+  })
+  expect(numbered).toHaveTextContent(
+    'Every ordinary reference must be mentioned'
+  )
+  expect(numbered).toHaveTextContent('@图1')
+  const h3 = screen.getByRole('group', {
+    name: 'Drama minimax-h3: use a reference image without audio',
+  })
+  expect(h3).toHaveTextContent('numbered prompt references are optional')
+  expect(h3).toHaveTextContent('generate_audio=false')
+  const paired = screen.getByRole('group', {
+    name: 'Drama A 2.0: provide paired first and last frames',
+  })
+  expect(paired).toHaveTextContent('aspect_ratio=Auto')
+  const user = userEvent.setup()
+  await user.click(
+    within(paired).getByRole('button', {
+      name: 'Copy Drama A 2.0: provide paired first and last frames',
+    })
+  )
+  expect(copyToClipboard).toHaveBeenCalledWith(
+    expect.stringContaining('"aspect_ratio": "Auto"')
+  )
+  expect(vi.mocked(copyToClipboard).mock.calls[0][0]).not.toContain(
+    'This mode requires'
+  )
+})
+
 test('Traditional Chinese shows translated video explanations while retaining the video section link', async () => {
   i18next.addResourceBundle('zhTW', 'translation', zhTW.translation)
   await i18next.changeLanguage('zhTW')
   render(<AsyncImageGuide />)
 
   const referenceExample = screen.getByRole('group', {
-    name: 'Drama E/F：使用一般參考圖 URL',
+    name: 'Drama F：使用一般參考圖 URL',
   })
   expect(referenceExample).toHaveTextContent('不固定為首幀')
   expect(referenceExample).toHaveTextContent('reference_images')

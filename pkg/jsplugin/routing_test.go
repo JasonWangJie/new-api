@@ -145,6 +145,43 @@ func TestPerProtocolModelsAllowDisjointPluginsOnSharedProtocol(t *testing.T) {
 	assert.Same(t, right, boundB.Plugin)
 }
 
+func TestCaseVariantModelsKeepExactRoutesAndRejectAmbiguousAliases(t *testing.T) {
+	registry := NewRegistry()
+	videoExports := `export const protocols = {openai_video: {
+		decodeRequest: function(ctx) { return ctx; },
+		render: function(ctx, task) { return task; }
+	}};
+	export function listArtifacts() { return []; }
+	export function buildContentRequest() { return {method: "GET", url: "https://example.test/video"}; }`
+	lower := mustCompileRoutingPlugin(t, "case-lower", 0, `["minimax-h3"]`,
+		`protocols: ["openai_video"],`, videoExports)
+	upper := mustCompileRoutingPlugin(t, "case-upper", 0, `["MiniMax-H3"]`,
+		`protocols: ["openai_video"],`, videoExports)
+	require.NoError(t, registry.ReplaceOverrides([]*LoadedPlugin{upper, lower}))
+	generation := registry.Generation()
+	for _, tc := range []struct {
+		model  string
+		plugin *LoadedPlugin
+	}{{"minimax-h3", lower}, {"MiniMax-H3", upper}} {
+		declared, found := generation.CanonicalModel(tc.model)
+		require.True(t, found)
+		assert.Equal(t, tc.model, declared)
+		binding, found := generation.LookupEndpoint(http.MethodPost, "/v1/videos", tc.model)
+		require.True(t, found)
+		assert.Same(t, tc.plugin, binding.Plugin)
+		metadata, found := generation.GetByModel(tc.model)
+		require.True(t, found)
+		assert.Same(t, tc.plugin, metadata)
+	}
+	declared, found := generation.CanonicalModel("MINIMAX-H3")
+	assert.False(t, found)
+	assert.Empty(t, declared)
+	require.NoError(t, registry.ReplaceOverrides([]*LoadedPlugin{upper}))
+	declared, found = registry.Generation().CanonicalModel("MINIMAX-H3")
+	assert.True(t, found)
+	assert.Equal(t, "MiniMax-H3", declared)
+}
+
 func TestPreflightRoutingConflict(t *testing.T) {
 	first := mustCompileRoutingPlugin(t, "preflight-first", 90, `["model-a"]`, "", "")
 	second := mustCompileRoutingPlugin(t, "preflight-second", 90, `["model-b"]`, "", "")

@@ -322,7 +322,8 @@ export type TaskTier = {
 function taskConditions(
   node: ExpressionNode,
   schema: BillingUsageSchema,
-  includeBoolean: boolean
+  includeBoolean: boolean,
+  allowUnsupportedEnumValues: boolean
 ): TaskTier['conditions'] | null {
   const conditions: TaskTier['conditions'] = []
   for (const term of flattenBinary(node, '&&')) {
@@ -344,7 +345,8 @@ function taskConditions(
       if (!includeBoolean || typeof value !== 'boolean') return null
     } else if (
       typeof value !== 'string' ||
-      !definition?.enum?.includes(value)
+      !definition?.enum?.length ||
+      (!allowUnsupportedEnumValues && !definition.enum.includes(value))
     ) {
       return null
     }
@@ -415,7 +417,8 @@ function taskTier(
 export function readTaskTierChain(
   node: ExpressionNode,
   schema: BillingUsageSchema,
-  includeBoolean: boolean
+  includeBoolean: boolean,
+  allowUnsupportedEnumValues = false
 ): TaskTier[] | null {
   const tiers: TaskTier[] = []
   let remaining = node
@@ -423,7 +426,8 @@ export function readTaskTierChain(
     const conditions = taskConditions(
       remaining.condition,
       schema,
-      includeBoolean
+      includeBoolean,
+      allowUnsupportedEnumValues
     )
     if (!conditions) return null
     const tier = taskTier(remaining.yes, conditions, schema)

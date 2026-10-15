@@ -204,6 +204,7 @@ export function ModelPricingPanel(props: {
               </div>
               {isDynamicPricingModel(effectivePricing) ? (
                 <DynamicPricingBreakdown
+                  publishedPricesOnly
                   compact
                   billingExpr={effectivePricing.billing_expr}
                   usageSchema={entry.usage_schema}

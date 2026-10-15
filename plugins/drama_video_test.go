@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -52,13 +53,18 @@ func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 	for _, tc := range []struct {
 		model, resolution, path string
 	}{
+		{"seedance2.0-A", "4k", "/v1/videos"},
+		{"seedance2.5-A", "720p", "/v1/videos"},
+		{"minimax-h3", "1080p", "/v1/videos"},
 		{"seedance2.0-E-720p", "720p", "/v1/video/generations"},
 		{"seedance2.0-E-1080p", "1080p", "/v1/video/generations"},
 		{"seedance2.0-F-720p", "720p", "/v1/video/generations"},
 		{"seedance2.0-fast-F-720p", "720p", "/v1/video/generations"},
 		{"seedance2.0-G-720p", "720p", "/v1/video/generations"},
 		{"seedance2.0-E", "480p", "/v1/videos"},
+		{"seedance2.0-E", "4k", "/v1/videos"},
 		{"seedance2.0-fast-E", "720p", "/v1/videos"},
+		{"seedance2.0-fast-E", "4k", "/v1/videos"},
 		{"seedance2.0-Mini-E", "480p", "/v1/videos"},
 		{"seedance2.5-E", "1080p", "/v1/videos"},
 		{"seedance2.0-F", "720px", "/v1/videos"},
@@ -98,20 +104,140 @@ func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 			assert.Equal(t, "https://upstream.example"+tc.path+"/task%2Fprivate%3Fone", value.(map[string]any)["url"])
 		})
 	}
-	t.Run("mapping keeps client identity", func(t *testing.T) {
-		value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-			"model": "my-video", "upstreamModel": "seedance2.5-G", "operation": "create", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "waves", "seconds": 8}},
+	for _, modelName := range []string{"seedance2.5-G", "seedance2.0-A", "seedance2.5-A", "minimax-h3"} {
+		t.Run(modelName+" mapping keeps client identity", func(t *testing.T) {
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": "my-video", "upstreamModel": modelName, "operation": "create", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "waves", "seconds": 8}},
+			})
+			require.NoError(t, err)
+			intent := value.(map[string]any)
+			assert.Equal(t, "my-video", intent["model"])
+			value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+				"model": "my-video", "upstreamModel": modelName, "baseUrl": "https://upstream.example", "apiKey": "test-key", "requestBody": intent["requestBody"],
+			})
+			require.NoError(t, err)
+			assert.Equal(t, modelName, value.(map[string]any)["body"].(map[string]any)["model"])
+			assert.NotContains(t, value.(map[string]any), "model")
 		})
-		require.NoError(t, err)
-		intent := value.(map[string]any)
-		assert.Equal(t, "my-video", intent["model"])
-		value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
-			"model": "my-video", "upstreamModel": "seedance2.5-G", "baseUrl": "https://upstream.example", "apiKey": "test-key", "requestBody": intent["requestBody"],
+	}
+}
+
+func TestDramaVideoPricingRowsPreserveGenerationLimits(t *testing.T) {
+	plugin := loadDramaVideoPlugin(t)
+	for _, modelName := range plugin.Meta.Models {
+		t.Run(modelName, func(t *testing.T) {
+			profile, found := plugin.Meta.VideoProfileForModel(modelName)
+			require.True(t, found)
+			require.NotEmpty(t, profile.Modes)
+			schema, _ := plugin.Meta.UsageForModel(modelName)
+			expected := []string{"480p", "720p", "1080p", "4k"}
+			if modelName == "seedance2.0-F" {
+				expected = append(expected, "720px")
+			}
+			assert.Equal(t, expected, schema["resolution"].Enum,
+				"all video models retain four editable price rows and any provider-specific resolution")
+			for _, resolution := range schema["resolution"].Enum {
+				_, err := decodeDramaVideoRequest(t, plugin, modelName, "create", map[string]any{
+					"prompt": "waves at sunset", "seconds": 5, "resolution": resolution,
+				})
+				if slices.Contains(profile.Modes[0].Resolutions, resolution) {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "resolution is not supported")
+				}
+			}
 		})
-		require.NoError(t, err)
-		assert.Equal(t, "seedance2.5-G", value.(map[string]any)["body"].(map[string]any)["model"])
-		assert.NotContains(t, value.(map[string]any), "model")
-	})
+	}
+}
+
+func TestDramaVideoSecondBilledProfiles(t *testing.T) {
+	plugin := loadDramaVideoPlugin(t)
+	for _, tc := range []struct {
+		model       string
+		maxSeconds  int
+		resolutions []string
+	}{
+		{"seedance2.0-A", 15, []string{"480p", "720p", "1080p", "4k"}},
+		{"seedance2.5-A", 30, []string{"480p", "720p"}},
+		{"minimax-h3", 15, []string{"480p", "720p", "1080p"}},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			intent, err := decodeDramaVideoRequest(t, plugin, tc.model, "create", map[string]any{"prompt": "sunrise over the sea"})
+			require.NoError(t, err)
+			request := intent["requestBody"].(map[string]any)
+			assert.EqualValues(t, 4, request["seconds"])
+			assert.Equal(t, "480p", request["resolution"])
+			assert.Equal(t, "16:9", request["aspect_ratio"])
+			profile, found := plugin.Meta.VideoProfileForModel(tc.model)
+			require.True(t, found)
+			require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil))
+			assert.Equal(t, tc.maxSeconds, profile.Modes[0].Duration.Max)
+			assert.Equal(t, tc.resolutions, profile.Modes[0].Resolutions)
+			schema, _ := plugin.Meta.UsageForModel(tc.model)
+			assert.Len(t, schema, 2)
+			assert.Contains(t, schema, "seconds")
+			value, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"model": tc.model, "requestBody": request, "usagePurpose": "facts"})
+			require.NoError(t, err)
+			facts := value.(map[string]any)
+			assert.Len(t, facts, 2)
+			assert.EqualValues(t, 4, facts["seconds"])
+			assert.Equal(t, "480p", facts["resolution"])
+			for _, operation := range []string{"edit", "extend"} {
+				_, err = decodeDramaVideoRequest(t, plugin, tc.model, operation, map[string]any{"prompt": "sunrise"})
+				require.ErrorContains(t, err, "editing and extension require")
+			}
+			for _, invalid := range []any{3, tc.maxSeconds + 1, -1, true, "18446744073686646784"} {
+				_, err = decodeDramaVideoRequest(t, plugin, tc.model, "create", map[string]any{"prompt": "sunrise", "seconds": invalid})
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestDramaVideoReferenceLimits(t *testing.T) {
+	plugin := loadDramaVideoPlugin(t)
+	for _, tc := range []struct {
+		name, model            string
+		images, videos, audios int
+		valid                  bool
+	}{
+		{"A 2.0 total at limit", "seedance2.0-A", 8, 2, 2, true},
+		{"A 2.0 total over limit", "seedance2.0-A", 9, 3, 1, false},
+		{"A 2.5 total at limit", "seedance2.5-A", 30, 10, 10, true},
+		{"A 2.5 images over limit", "seedance2.5-A", 31, 0, 0, false},
+		{"H3 total at limit", "minimax-h3", 9, 2, 1, true},
+		{"H3 images over limit", "minimax-h3", 10, 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := map[string]any{}
+			var prompt strings.Builder
+			for _, media := range []struct {
+				field, label, extension string
+				count                   int
+			}{
+				{"reference_images", "图", "png", tc.images},
+				{"reference_videos", "视频", "mp4", tc.videos},
+				{"reference_audios", "音频", "mp3", tc.audios},
+			} {
+				if media.count == 0 {
+					continue
+				}
+				items := make([]any, media.count)
+				for i := range items {
+					items[i] = fmt.Sprintf("https://cdn.example/%d.%s", i+1, media.extension)
+					fmt.Fprintf(&prompt, "@%s%d ", media.label, i+1)
+				}
+				request[media.field] = items
+			}
+			request["prompt"] = prompt.String()
+			_, err := decodeDramaVideoRequest(t, plugin, tc.model, "create", request)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "media exceeds")
+			}
+		})
+	}
 }
 
 func TestDramaVideoMediaAndOperations(t *testing.T) {
@@ -121,7 +247,14 @@ func TestDramaVideoMediaAndOperations(t *testing.T) {
 		request                        map[string]any
 		wantReferences                 []any
 	}{
+		{"A ordinary image and video references", "seedance2.0-A", "create", "reference_to_video", map[string]any{"prompt": "@图片1 and @图2 follow @视频1 with @音频1", "reference_images": []any{"https://cdn.example/one.png", "https://cdn.example/two.png"}, "referenceVideos": []any{"https://cdn.example/motion.mp4"}, "referenceAudios": []any{"https://cdn.example/voice.mp3"}}, []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/one.png"}, map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/two.png"}, map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}, map[string]any{"type": "audio", "role": "reference", "source": "https://cdn.example/voice.mp3"}}},
+		{"A 2.5 typed references", "seedance2.5-A", "create", "reference_to_video", map[string]any{"prompt": "@图1 walks in the rain", "references": []any{map[string]any{"type": "image", "role": "reference_image", "source": "https://cdn.example/person.png"}}}, []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/person.png"}}},
+		{"A frame aliases infer Auto", "seedance2.0-A", "create", "first_last_frame", map[string]any{"first_image": "https://cdn.example/first.png", "last_image": "https://cdn.example/last.png"}, []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/first.png"}, map[string]any{"type": "image", "role": "last_frame", "source": "https://cdn.example/last.png"}}},
+		{"A typed frames normalize Auto", "seedance2.0-A", "create", "first_last_frame", map[string]any{"aspect_ratio": "auto", "references": []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/first.png"}, map[string]any{"type": "image", "role": "last_frame", "source": "https://cdn.example/last.png"}}}, []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/first.png"}, map[string]any{"type": "image", "role": "last_frame", "source": "https://cdn.example/last.png"}}},
+		{"H3 missing role and false audio", "minimax-h3", "create", "reference_to_video", map[string]any{"generate_audio": false, "references": []any{map[string]any{"type": "image", "source": "https://cdn.example/person.png"}}}, []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/person.png"}}},
 		{"E image is an ordinary reference", "seedance2.0-E", "create", "reference_to_video", map[string]any{"image": "https://cdn.example/image.png"}, []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/image.png"}}},
+		{"E video URL is an ordinary reference", "seedance2.0-E", "create", "reference_to_video", map[string]any{"reference_videos": []any{"https://cdn.example/motion.mp4"}}, []any{map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}}},
+		{"E 2.5 mixed typed references need no numbered prompt", "seedance2.5-E", "create", "reference_to_video", map[string]any{"references": []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/character.png"}, map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}, map[string]any{"type": "audio", "role": "reference", "source": "https://cdn.example/voice.mp3"}}}, []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/character.png"}, map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}, map[string]any{"type": "audio", "role": "reference", "source": "https://cdn.example/voice.mp3"}}},
 		{"F typed references and false audio", "seedance2.5-F", "create", "reference_to_video", map[string]any{"generate_audio": false, "references": []any{map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}}}, []any{map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/motion.mp4"}}},
 		{"G image and video references", "seedance2.5-G", "create", "reference_to_video", map[string]any{"reference_images": []any{"asset://asset-one"}, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, []any{map[string]any{"type": "image", "role": "reference_image", "source": "asset://asset-one"}, map[string]any{"type": "video", "role": "reference_video", "source": "https://cdn.example/motion.mp4"}}},
 		{"G first and last frame", "seedance2.5-G", "create", "first_last_frame", map[string]any{"image": "https://cdn.example/first.png", "last_frame": "https://cdn.example/last.png"}, []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/first.png"}, map[string]any{"type": "image", "role": "last_frame", "source": "https://cdn.example/last.png"}}},
@@ -169,6 +302,31 @@ func TestDramaVideoMediaAndOperations(t *testing.T) {
 		name, model, errorText string
 		request                map[string]any
 	}{
+		{"A index zero", "seedance2.0-A", "reference index", map[string]any{"prompt": "@图0", "reference_images": []any{"https://cdn.example/a.png"}}},
+		{"A leading zero", "seedance2.0-A", "reference index", map[string]any{"prompt": "@图01", "reference_images": []any{"https://cdn.example/a.png"}}},
+		{"A index outside array", "seedance2.5-A", "reference index", map[string]any{"prompt": "@图片2", "reference_images": []any{"https://cdn.example/a.png"}}},
+		{"A negative index", "seedance2.5-A", "reference index", map[string]any{"prompt": "@视频-1", "reference_videos": []any{"https://cdn.example/a.mp4"}}},
+		{"A fractional index", "seedance2.5-A", "reference index", map[string]any{"prompt": "@图1.5", "reference_images": []any{"https://cdn.example/a.png"}}},
+		{"A unused reference", "seedance2.0-A", "Every A series reference", map[string]any{"reference_images": []any{"https://cdn.example/a.png"}}},
+		{"A first frame alone", "seedance2.0-A", "requires last_frame", map[string]any{"image": "https://cdn.example/a.png"}},
+		{"A fixed ratio with frames", "seedance2.0-A", "require aspect_ratio Auto", map[string]any{"image": "https://cdn.example/a.png", "last_frame": "https://cdn.example/b.png", "aspect_ratio": "16:9"}},
+		{"A mixed pinned and ordinary references", "seedance2.0-A", "cannot be mixed", map[string]any{"image": "https://cdn.example/a.png", "last_frame": "https://cdn.example/b.png", "reference_images": []any{"https://cdn.example/c.png"}}},
+		{"A conflicting frame aliases", "seedance2.0-A", "first_image conflicts", map[string]any{"image": "https://cdn.example/a.png", "first_image": "https://cdn.example/b.png"}},
+		{"A 2.5 rejects frames", "seedance2.5-A", "ordinary references", map[string]any{"references": []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/a.png"}}}},
+		{"A 2.5 rejects Auto", "seedance2.5-A", "aspect_ratio is not supported", map[string]any{"aspect_ratio": "Auto"}},
+		{"A 2.5 rejects 1080p", "seedance2.5-A", "resolution is not supported", map[string]any{"resolution": "1080p"}},
+		{"A unsupported audio flag", "seedance2.0-A", "generate_audio is not supported", map[string]any{"generate_audio": false}},
+		{"A rejects HTTP", "seedance2.0-A", "not supported", map[string]any{"reference_images": []any{"http://cdn.example/a.png"}}},
+		{"A rejects asset", "seedance2.5-A", "not supported", map[string]any{"reference_images": []any{"asset://image-one"}}},
+		{"A duplicate reference", "seedance2.0-A", "Duplicate reference", map[string]any{"reference_images": []any{"https://cdn.example/a.png", "https://cdn.example/a.png"}}},
+		{"H3 combined audio video limit", "minimax-h3", "media exceeds", map[string]any{"reference_videos": []any{"https://cdn.example/1.mp4", "https://cdn.example/2.mp4"}, "reference_audios": []any{"https://cdn.example/1.mp3", "https://cdn.example/2.mp3"}}},
+		{"H3 first frame role", "minimax-h3", "ordinary references", map[string]any{"references": []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/a.png"}}}},
+		{"H3 last frame shortcut", "minimax-h3", "does not support last_frame", map[string]any{"last_frame": "https://cdn.example/a.png"}},
+		{"H3 ratio", "minimax-h3", "aspect_ratio is not supported", map[string]any{"aspect_ratio": "1:1"}},
+		{"H3 rejects 2k", "minimax-h3", "resolution is not supported", map[string]any{"resolution": "2k"}},
+		{"H3 rejects data URI", "minimax-h3", "not supported", map[string]any{"reference_images": []any{"data:image/png;base64,AA=="}}},
+		{"H3 duration aliases differ", "minimax-h3", "must match", map[string]any{"seconds": 5, "duration": 8}},
+		{"H3 metadata duration bypass", "minimax-h3", "metadata.seconds is not supported", map[string]any{"metadata": map[string]any{"seconds": 99999999999}}},
 		{"unsigned duration overflow", "seedance2.5-G", "seconds must be between", map[string]any{"seconds": "18446744073686646784"}},
 		{"boolean duration", "seedance2.5-G", "seconds must be an integer", map[string]any{"seconds": true}},
 		{"negative generation duration", "seedance2.5-G", "seconds must be between", map[string]any{"seconds": -1}},
@@ -209,6 +367,12 @@ func TestDramaVideoPollingAndActualUsage(t *testing.T) {
 		state, body                                map[string]any
 		wantFacts                                  map[string]any
 	}{
+		{name: "A completes without tokens or measured seconds", model: "seedance2.0-A", body: map[string]any{"status": "completed"}, wantStatus: "SUCCESS", wantFacts: map[string]any{}},
+		{name: "A actual seconds ignore unrelated token billing", model: "seedance2.5-A", body: map[string]any{"status": "completed", "seconds": "6", "usage": map[string]any{"total_tokens": -1}, "metadata": map[string]any{"billing": map[string]any{"settle_state": "pending"}}}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(6)}},
+		{name: "H3 actual duration", model: "minimax-h3", body: map[string]any{"status": "completed", "duration": 6.5}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": 6.5}},
+		{name: "H3 failed task", model: "minimax-h3", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantFacts: map[string]any{}},
+		{name: "A duration overflow", model: "seedance2.0-A", body: map[string]any{"status": "completed", "seconds": "18446744073686646784"}, errorText: "Invalid upstream video duration"},
+		{name: "H3 zero duration", model: "minimax-h3", body: map[string]any{"status": "completed", "duration": 0}, errorText: "Invalid upstream video duration"},
 		{name: "queued receipt", model: "seedance2.5-G", body: map[string]any{"status": "queued", "progress": 0}, wantStatus: "QUEUED", wantFacts: map[string]any{}},
 		{name: "unknown status cannot resolve inherited properties", model: "seedance2.5-G", body: map[string]any{"status": "constructor"}, wantStatus: "UNKNOWN", wantFacts: map[string]any{}},
 		{name: "failed task", model: "seedance2.5-G", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantFacts: map[string]any{}},
@@ -297,6 +461,9 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 		response          map[string]any
 		wantQuota         int
 	}{
+		{"seedance2.0-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed"}, 200000},
+		{"seedance2.5-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "6"}, 300000},
+		{"minimax-h3", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000},
 		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 5}, map[string]any{"status": "completed"}, 250000},
 		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed"}, 250000},
 		{"seedance2.5-F", `u("video_input") == "video" ? tier("tokens", u("tokens") * 10 / 1000000) : tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "8"}, 400000},
@@ -329,7 +496,7 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 
 func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
-	for _, modelName := range []string{"seedance2.0-E-720p", "seedance2.5-F", "seedance2.5-G"} {
+	for _, modelName := range []string{"seedance2.0-A", "seedance2.5-A", "minimax-h3", "seedance2.0-E-720p", "seedance2.5-F", "seedance2.5-G"} {
 		t.Run(modelName, func(t *testing.T) {
 			var submits, polls, downloads atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -357,6 +524,10 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 				writer.Header().Set("Content-Type", "application/json")
 				if poll == 1 {
 					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"in_progress","progress":40}`)
+					return
+				}
+				if modelName == "seedance2.0-A" || modelName == "seedance2.5-A" || modelName == "minimax-h3" {
+					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"completed","progress":100,"seconds":5}`)
 					return
 				}
 				_, _ = io.WriteString(writer, `{"id":"remote-task","status":"completed","progress":100,"seconds":5,"usage":{"total_tokens":12345},"metadata":{"url":"/v1/videos/remote-task/content"}}`)

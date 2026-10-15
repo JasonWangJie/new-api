@@ -173,6 +173,28 @@ describe('model cards', () => {
     expect(screen.getByRole('button', { name: 'Details' })).toBeEnabled()
   })
 
+  it('preserves capability line breaks and shows a longer summary for video models', () => {
+    const description =
+      '时长：4–30 秒；分辨率：480P / 720P\n参考素材：图片≤30张、视频≤10条、音频≤10条；合计≤50份\n每份素材须在提示词中引用'
+    const model = pricingModel({
+      description,
+      supported_endpoint_types: ['openai-video'],
+    })
+    const { rerender } = render(<ModelCard model={model} onClick={vi.fn()} />)
+    const summary = screen.getByText(/时长：4–30 秒/)
+    expect(summary).toHaveTextContent('合计≤50份')
+    expect(summary).toHaveClass('whitespace-pre-line', 'line-clamp-6')
+    expect(summary).not.toHaveClass('line-clamp-2')
+    rerender(
+      <ModelCard
+        model={{ ...model, supported_endpoint_types: ['openai'] }}
+        onClick={vi.fn()}
+      />
+    )
+    expect(summary).toHaveClass('line-clamp-2')
+    expect(summary).not.toHaveClass('line-clamp-6')
+  })
+
   it('uses fixed spacing between hourly status bars', () => {
     render(<ModelCard model={pricingModel()} onClick={vi.fn()} />)
     const statusStrip = screen.getByRole('img', {

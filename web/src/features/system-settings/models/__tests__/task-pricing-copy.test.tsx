@@ -22,6 +22,8 @@ import i18next from 'i18next'
 import { useState } from 'react'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { getTaskPricingDisplayTiers } from '@/features/pricing/lib/task-matrix-display'
+
 import { TaskUsagePricingEditor } from '../task-usage-pricing-editor'
 
 function renderPricing(unitLabel?: Record<string, string>) {
@@ -163,6 +165,62 @@ function TaskPricingDraft(props: {
     />
   )
 }
+
+it('clears every price in one resolution row and lets an administrator publish it again', async () => {
+  const onChange = vi.fn()
+  const usageSchema = {
+    resolution: { enum: ['480p', '720p'], description: 'Resolution' },
+    seconds: {
+      type: 'number' as const,
+      unit: 'second' as const,
+      description: 'Seconds price',
+    },
+    requests: {
+      type: 'number' as const,
+      unit: 'count' as const,
+      description: 'Video price',
+    },
+  }
+  render(
+    <TaskUsagePricingEditor
+      billingExpr='u("resolution") == "480p" ? tier("480p", u("seconds") * 0.35 + u("requests") * 1 + 0.25) : tier("720p", u("seconds") * 0.5)'
+      requestRuleExpr=''
+      usageSchema={usageSchema}
+      onBillingExprChange={onChange}
+      onRequestRuleExprChange={vi.fn()}
+    />
+  )
+  const user = userEvent.setup()
+  const clear = screen.getByRole('button', {
+    name: 'Clear price for Resolution: 480p',
+  })
+  await user.click(clear)
+  for (const name of ['Seconds price', 'Video price', 'Additional charge']) {
+    expect(
+      screen.getByRole('textbox', { name: `${name}: Resolution: 480p` })
+    ).toHaveValue('0')
+  }
+  expect(
+    screen.getByRole('textbox', { name: 'Seconds price: Resolution: 720p' })
+  ).toHaveValue('0.5')
+  expect(clear).toBeDisabled()
+  expect(
+    getTaskPricingDisplayTiers(
+      onChange.mock.lastCall?.[0],
+      usageSchema,
+      true
+    ).map((tier) => tier.conditions)
+  ).toEqual([[{ field: 'resolution', value: '720p' }]])
+  const price = screen.getByRole('textbox', {
+    name: 'Seconds price: Resolution: 480p',
+  })
+  await user.clear(price)
+  await user.type(price, '0.4')
+  expect(clear).toBeEnabled()
+  expect(
+    getTaskPricingDisplayTiers(onChange.mock.lastCall?.[0], usageSchema, true)
+  ).toHaveLength(2)
+})
 
 it('lets users cancel or discard an unsupported expression and its request rules', async () => {
   const user = userEvent.setup()
