@@ -41,7 +41,7 @@ export function AsyncImageGuide() {
     .replace(/\/+$/, '')
     .replace(/\/v1$/, '')
   const chinese = i18n.language.startsWith('zh')
-  const sections = asyncImageGuide(chinese, base)
+  const sections = asyncImageGuide(chinese, base, t)
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>
@@ -128,16 +128,36 @@ export function AsyncImageGuide() {
                 ))}
                 {section.examples.map((example) => (
                   <div
-                    key={example}
+                    key={example.code}
+                    role={example.title ? 'group' : undefined}
+                    aria-label={example.title}
                     className='bg-muted/40 overflow-hidden rounded-xl border'
                   >
-                    <div className='flex items-center justify-end border-b px-3 py-2'>
-                      <CopyButton value={example} size='sm'>
+                    <div className='flex flex-wrap items-center justify-end gap-2 border-b px-3 py-2'>
+                      {example.title && (
+                        <h3 className='min-w-0 flex-1 text-sm font-semibold'>
+                          {example.title}
+                        </h3>
+                      )}
+                      <CopyButton
+                        value={example.code}
+                        size='sm'
+                        aria-label={
+                          example.title
+                            ? t('Copy {{example}}', { example: example.title })
+                            : t('Copy example')
+                        }
+                      >
                         {t('Copy example')}
                       </CopyButton>
                     </div>
+                    {example.description && (
+                      <p className='text-muted-foreground px-4 pt-4 text-sm leading-7'>
+                        {example.description}
+                      </p>
+                    )}
                     <pre className='overflow-x-auto p-4 font-mono text-xs leading-6'>
-                      <code>{example}</code>
+                      <code>{example.code}</code>
                     </pre>
                   </div>
                 ))}

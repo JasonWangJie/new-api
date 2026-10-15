@@ -52,7 +52,7 @@ describe('capability-driven image request contracts', () => {
       const examples = asyncImageGuide(
         chinese,
         'https://gateway.example'
-      ).flatMap((section) => section.examples)
+      ).flatMap((section) => section.examples.map((example) => example.code))
       for (const example of examples) {
         if (example.startsWith('{')) {
           expect(() => JSON.parse(example)).not.toThrow()
@@ -86,6 +86,43 @@ describe('capability-driven image request contracts', () => {
       })
       expect(failed).not.toHaveProperty('error')
     }
+  })
+  it('explains every video example and keeps reference images distinct from pinned first frames', () => {
+    const video = asyncImageGuide(true, 'https://gateway.example').find(
+      (section) => section.id === 'video'
+    )
+    expect(video).toBeDefined()
+    const examples = video?.examples ?? []
+    for (const example of examples) {
+      expect(example.title).toBeTruthy()
+      expect(example.description).toBeTruthy()
+    }
+    const bodies = examples.flatMap((example) => {
+      const body = /--data '([\s\S]+)'$/.exec(example.code)?.[1]
+      return body ? [JSON.parse(body) as Record<string, unknown>] : []
+    })
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'xai',
+        image: { url: 'https://cdn.example/reference.png' },
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.5-F',
+        reference_images: ['https://cdn.example/character.png'],
+      })
+    )
+    expect(bodies).toContainEqual(
+      expect.objectContaining({
+        provider: 'drama',
+        model: 'seedance2.5-G',
+        image: 'https://cdn.example/first.png',
+        last_frame: 'https://cdn.example/last.png',
+        aspect_ratio: 'adaptive',
+      })
+    )
   })
   it('sends explicit async aliases and native realtime dimensions without switching mode', () => {
     const async = buildImageRequest(options)

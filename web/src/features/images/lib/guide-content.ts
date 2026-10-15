@@ -56,7 +56,52 @@ export const IMAGE_ERROR_CODES = [
   [613, 'Prompt or input image cannot be processed', '提示词或输入图无法处理'],
 ] as const
 
-export function asyncImageGuide(chinese: boolean, base: string) {
+export type MediaGuideExample = {
+  code: string
+  title?: string
+  description?: string
+}
+
+export function asyncImageGuide(
+  chinese: boolean,
+  base: string,
+  t: (key: string) => string = (key) => key
+) {
+  const videoSection = {
+    id: 'video',
+    title: t(
+      'Asynchronous video generation, editing, extension and persistence'
+    ),
+    paragraphs: [
+      t(
+        'Choose an enabled provider and model first. Model names, duration, resolution and media inputs are provider-specific; changing only provider does not convert a request.'
+      ),
+      t(
+        'Durable video workflow: submit to a *_async endpoint, keep task_id and query_url, query with the same API token, then download data[].url after status=succeeded and billing has settled. HTTP 202 only confirms admission.'
+      ),
+      t(
+        'Reference image URLs use JSON. A single image may be a URL string or a {"url":"https://..."} object; reference_images must be an array, not a comma-separated string. The model determines whether an image is a first frame or an ordinary reference.'
+      ),
+      t(
+        'Local image uploads use multipart file parts. @reference.png is curl file syntax, not a JSON URL. Let curl set Content-Type and boundary when using -F.'
+      ),
+      t(
+        'Drama E/F use reference_images for ordinary references; Drama G also supports image and last_frame. Current Drama and official Doubao Seedance plugins accept JSON media references, not multipart uploads.'
+      ),
+      t(
+        'Use public HTTPS image URLs that the upstream can read without browser cookies or authorization headers. Replace every example URL; a page URL, local path or bare Base64 string is not an image URL.'
+      ),
+      t(
+        'The Gemini SC upload endpoint is not a general video upload service. For a URL-only video model, upload the image to your own publicly readable storage first.'
+      ),
+      t(
+        'Each new generation is billable. Reuse the original Idempotency-Key only when retrying the same request; storage recovery reuses the existing result and does not generate again.'
+      ),
+      t(
+        'Shell examples use Bash. In Windows PowerShell, use curl.exe and put the JSON body in a UTF-8 file with --data-binary @request.json.'
+      ),
+    ],
+  }
   const sections = chinese
     ? [
         {
@@ -109,15 +154,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
             '上传使用独立 Idempotency-Key。返回的 URL 与上传 Token 绑定，必须原样放入后续 image_urls；不能删除或重排签名参数，也不能由其他 Token 使用。',
           ],
         },
-        {
-          id: 'video',
-          title: '异步视频生成、编辑、延长与本地保存',
-          paragraphs: [
-            'POST /v1/videos/generations_async 接受 OpenAI Video 形状的 JSON 或 multipart。POST /v1/videos/edits_async 和 POST /v1/videos/extensions_async 只接受 JSON，要求 model、prompt 和直接源 video；延长还接受互斥的 seconds/duration 与 extension_direction。标准任务插件兼容端点为 POST /v1/videos/edits 和 POST /v1/videos/extensions。',
-            'xAI 经典 grok-imagine-video 支持 HTTPS MP4、video/mp4 data URI 或 file_id 的编辑和向后延长；1.5 不支持。Seedance 2.0、Fast、Mini 和 2.5 支持公网 URL 或 asset:// 源视频及额外多模态参考，延长方向默认为 backward。浏览器视频上传和 source_task_id 不受支持。',
-            '可选 provider 只参与网关调度且不会发送到上游。视频渠道池按分辨率档位归档：480p/720p 为 1K，1080p 为 2K，4K 为 4K；xAI 编辑和延长固定按 1K 档路由。产物保存失败只重试保存，不会重新调用生成、编辑或延长，也不会再次计费。',
-          ],
-        },
+        videoSection,
         {
           id: 'query',
           title: '统一查询、状态与本地链接',
@@ -204,16 +241,7 @@ export function asyncImageGuide(chinese: boolean, base: string) {
             'Uploads have their own Idempotency-Key scope. The returned URL belongs to the uploading token and must be copied unchanged into image_urls. Do not remove or reorder its signature query and do not reuse it with another token.',
           ],
         },
-        {
-          id: 'video',
-          title:
-            'Asynchronous video generation, editing, extension and persistence',
-          paragraphs: [
-            'POST /v1/videos/generations_async accepts OpenAI Video-shaped JSON or multipart. POST /v1/videos/edits_async and POST /v1/videos/extensions_async accept JSON only and require model, prompt, and a direct video source; extension also accepts mutually exclusive seconds/duration and extension_direction. The standard task-plugin compatibility routes are POST /v1/videos/edits and POST /v1/videos/extensions.',
-            'Classic grok-imagine-video accepts HTTPS MP4, video/mp4 data URI, or file_id for editing and backward extension; 1.5 does not. Seedance 2.0, Fast, Mini, and 2.5 accept public URL or asset:// source videos plus optional multimodal references, with backward as the default extension direction. Browser video uploads and source_task_id are unsupported.',
-            'provider controls gateway routing and is never forwarded upstream. Video pools map 480p/720p to 1K, 1080p to 2K, and 4K to 4K; xAI edit and extension use the 1K tier. Storage recovery never repeats generation, editing, or extension and never charges again.',
-          ],
-        },
+        videoSection,
         {
           id: 'query',
           title: 'Unified queries, states and local links',
@@ -317,6 +345,75 @@ export function asyncImageGuide(chinese: boolean, base: string) {
     null,
     2
   )
+  const videoImage = JSON.stringify(
+    {
+      provider: 'xai',
+      model: 'grok-imagine-video-1.5',
+      prompt: 'Animate the scene with a slow camera push',
+      image: { url: 'https://cdn.example/reference.png' },
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: '16:9',
+    },
+    null,
+    2
+  )
+  const videoReferences = JSON.stringify(
+    {
+      provider: 'xai',
+      model: 'grok-imagine-video-1.5',
+      prompt: 'Keep the character and use the setting of the second image',
+      reference_images: [
+        { url: 'https://cdn.example/character.png' },
+        { url: 'https://cdn.example/setting.png' },
+      ],
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: '16:9',
+    },
+    null,
+    2
+  )
+  const dramaReferences = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'seedance2.5-F',
+      prompt: 'Animate the character from the reference image',
+      reference_images: ['https://cdn.example/character.png'],
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: '16:9',
+    },
+    null,
+    2
+  )
+  const dramaFirstFrame = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'seedance2.5-G',
+      prompt: 'Start from this image and move the camera forward',
+      image: 'https://cdn.example/first.png',
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: 'adaptive',
+    },
+    null,
+    2
+  )
+  const dramaFirstLastFrame = JSON.stringify(
+    {
+      provider: 'drama',
+      model: 'seedance2.5-G',
+      prompt: 'Make a smooth transition between the first and last frames',
+      image: 'https://cdn.example/first.png',
+      last_frame: 'https://cdn.example/last.png',
+      seconds: 8,
+      resolution: '720p',
+      aspect_ratio: 'adaptive',
+    },
+    null,
+    2
+  )
   const videoEdit = JSON.stringify(
     {
       provider: 'xai',
@@ -358,10 +455,6 @@ export function asyncImageGuide(chinese: boolean, base: string) {
     ],
     uploads: [
       `curl -X POST '${base}/v1/uploads/images_sc' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Idempotency-Key: upload-example-001' \\\n  -F 'file=@reference.png;type=image/png'`,
-    ],
-    video: [
-      `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-example-001' \\\n  --data '${video}'`,
-      `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Idempotency-Key: video-reference-001' \\\n  -F 'provider=sora' -F 'model=sora-2' \\\n  -F 'prompt=Animate this scene' -F 'seconds=4' -F 'size=1280x720' \\\n  -F 'input_reference=@reference.png;type=image/png'`,
     ],
     query: [
       `curl '${base}/v1/media/tasks_async/YOUR_TASK_ID' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN"`,
@@ -440,14 +533,99 @@ export function asyncImageGuide(chinese: boolean, base: string) {
       ),
     ],
   }
-  examples.video.push(
-    `curl -X POST '${base}/v1/videos/edits' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoEdit}'`,
-    `curl -X POST '${base}/v1/videos/edits_async' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' -H 'Idempotency-Key: video-edit-example-001' --data '${videoEdit}'`,
-    `curl -X POST '${base}/v1/videos/extensions' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoExtension}'`,
-    `curl -X POST '${base}/v1/videos/extensions_async' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' -H 'Idempotency-Key: video-extension-example-001' --data '${videoExtension}'`
-  )
+  const videoExamples: MediaGuideExample[] = [
+    {
+      title: t('Sora: generate a video from text'),
+      description: t(
+        'No reference image is sent. provider=sora selects a Sora channel; sora-2, seconds=4 and size=1280x720 are Sora example values. A successful submission returns a durable task_id and query_url.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-example-001' \\\n  --data '${video}'`,
+    },
+    {
+      title: t('Sora: upload a local reference image'),
+      description: t(
+        'Replace reference.png with a file on the machine running curl. input_reference is the file field; @ reads the file and type=image/png declares its MIME type. This Sora upload form is not supported by Drama or official Doubao Seedance.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Idempotency-Key: video-reference-001' \\\n  -F 'provider=sora' -F 'model=sora-2' \\\n  -F 'prompt=Animate this scene' -F 'seconds=4' -F 'size=1280x720' \\\n  -F 'input_reference=@reference.png;type=image/png'`,
+    },
+    {
+      title: t('xAI: generate from one image URL'),
+      description: t(
+        'image is one first-frame image. This xAI model accepts either "image":"https://..." or "image":{"url":"https://..."}; the example uses the object form. seconds, resolution and aspect_ratio control the output, not the input image.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-image-url-001' \\\n  --data '${videoImage}'`,
+    },
+    {
+      title: t('xAI: send an image URL in a multipart field'),
+      description: t(
+        'For this xAI form, image contains JSON object text. There is no @ before the URL and no file is uploaded. Do not replace a Sora file part with this field or use it with a JSON-only model.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Idempotency-Key: video-multipart-url-001' \\\n  -F 'provider=xai' -F 'model=grok-imagine-video-1.5' \\\n  -F 'prompt=Animate this scene' -F 'seconds=8' \\\n  -F 'resolution=720p' -F 'aspect_ratio=16:9' \\\n  -F 'image={"url":"https://cdn.example/reference.png"}'`,
+    },
+    {
+      title: t('xAI 1.5: use multiple reference image URLs'),
+      description: t(
+        'reference_images is a JSON array of ordinary references, not a single first frame. This xAI 1.5 example uses two URL objects at 720p; the classic model does not support this mode. Do not join URLs with commas inside one string.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-reference-urls-001' \\\n  --data '${videoReferences}'`,
+    },
+    {
+      title: t('Drama E/F: use reference image URLs'),
+      description: t(
+        'For seedance2.5-F, reference_images is an array of public HTTPS URL strings. Images guide the content but are not pinned first frames. New E models use this ordinary-reference form too; seedance2.0-F requires 720px instead of 720p.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-reference-urls-001' \\\n  --data '${dramaReferences}'`,
+    },
+    {
+      title: t('Drama G: use a first-frame image URL'),
+      description: t(
+        'Here image is the first frame, not an ordinary reference_images entry. seedance2.5-G requires aspect_ratio=adaptive in this mode and an explicit positive seconds value. Replace the image URL with your own publicly readable image.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-first-frame-001' \\\n  --data '${dramaFirstFrame}'`,
+    },
+    {
+      title: t('Drama G: specify both first and last image URLs'),
+      description: t(
+        'image supplies the first frame and last_frame supplies the last frame. For seedance2.5-G use adaptive, provide both frames, and do not mix this mode with ordinary image, video or audio references.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/generations_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: drama-first-last-frame-001' \\\n  --data '${dramaFirstLastFrame}'`,
+    },
+    {
+      title: t('xAI: edit a video as a durable task'),
+      description: t(
+        'Edits require JSON and a direct source video, not source_task_id. Classic grok-imagine-video inherits source duration and dimensions, so this example omits seconds, size and resolution; 1.5 does not support editing. Query the returned durable task through /v1/media/tasks_async/{task_id}.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/edits_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-edit-example-001' \\\n  --data '${videoEdit}'`,
+    },
+    {
+      title: t('Doubao Seedance: extend a video as a durable task'),
+      description: t(
+        'This example uses official doubao-seedance-2-5-260628, not a Drama model. Replace asset://source-video with an asset owned by the selected upstream account or a public source-video URL. seconds is the extension duration; forward is this example direction. Do not add duration as well.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/extensions_async' \\\n  -H "Authorization: Bearer $NEW_API_TOKEN" \\\n  -H 'Content-Type: application/json' \\\n  -H 'Idempotency-Key: video-extension-example-001' \\\n  --data '${videoExtension}'`,
+    },
+    {
+      title: t('Compatibility route: edit a standard video task'),
+      description: t(
+        'This standard task-plugin route returns a video task object with id. Query GET /v1/videos/{id}; it does not use the durable task_id/query_url receipt or the durable media query route. Use the *_async examples above for local persistence and recovery.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/edits' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoEdit}'`,
+    },
+    {
+      title: t('Compatibility route: extend a standard video task'),
+      description: t(
+        'This standard task-plugin route returns a video task object with id. Query GET /v1/videos/{id}; it does not use the durable task_id/query_url receipt or the durable media query route. Use the *_async examples above for local persistence and recovery.'
+      ),
+      code: `curl -X POST '${base}/v1/videos/extensions' -H "Authorization: Bearer $NEW_API_TOKEN" -H 'Content-Type: application/json' --data '${videoExtension}'`,
+    },
+  ]
   return sections.map((section) => ({
     ...section,
-    examples: examples[section.id] || [],
+    examples:
+      section.id === 'video'
+        ? videoExamples
+        : (examples[section.id] || []).map(
+            (code): MediaGuideExample => ({ code })
+          ),
   }))
 }

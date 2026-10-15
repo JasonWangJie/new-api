@@ -1,6 +1,6 @@
 # new-api 异步图片与视频 API 接口文档
 
-更新：2026-09-23。源码仓库：[JasonWangJie/new-api](https://github.com/JasonWangJie/new-api)。本文描述当前工作区已实现的接口；具体可用模型和参数取决于管理员配置的渠道、模型能力与任务插件。保留 new-api / QuantumNous 项目信息。渠道池配置另见 [异步图片与视频调度配置说明](./异步图片与视频调度配置说明.md)。
+更新：2026-10-15。源码仓库：[JasonWangJie/new-api](https://github.com/JasonWangJie/new-api)。本文描述当前工作区已实现的接口；具体可用模型和参数取决于管理员配置的渠道、模型能力与任务插件。保留 new-api / QuantumNous 项目信息。渠道池配置另见 [异步图片与视频调度配置说明](./异步图片与视频调度配置说明.md)。
 
 本文按**图片提交 → 视频提交 → 统一查询 → 错误与兼容**组织。下面的域名、Token、任务 ID、文件路径和结果链接均为示例，调用时替换为实际值。
 
@@ -170,22 +170,52 @@ curl -i -sS "$BASE_URL/v1/images/edits_async" \
 
 ## 5. 异步视频
 
+视频调用按 **选定插件与型号 → 提交 → 保存本地任务号 → 查询 → 下载结果** 执行。以下示例分别标明适用供应商和用途，不能只替换 `provider` 就把同一请求用于其他模型。先确认本站渠道、分组、模型权限、视频运行依赖和售价已配置；Drama 管理员操作见 [后台照填手册](wiki/11-视频接入配置与注意事项.md#drama-backend-setup)。
+
+`BASE_URL` 是**你自己的 new-api 网关根地址**，不带 `/v1`；`NEW_API_TOKEN` 是本站 API Key，不是上游渠道令牌。下列命令使用 Bash；Windows PowerShell 使用 `curl.exe`，JSON 请求体可另存为 UTF-8 文件，再用 `--data-binary '@video-request.json'` 提交。每个新请求使用新的幂等键；同一请求超时重试保留原键和原请求内容。
+
 ### 5.1 视频生成：`POST /v1/videos/generations_async`
 
-支持 JSON 和 multipart。视频由任务插件执行；时长、尺寸、参考素材、模型组合和扩展参数以所选插件及模型能力为准，不同供应商的参数不能互换。
+网关入口可读取 JSON 和 multipart，但**执行插件不一定同时支持两种格式**。例如 Sora / xAI 可接收本地参考图片文件；当前官方 `doubao` Seedance 和 `drama` 插件采用 JSON 素材引用，不接收 multipart 文件上传。上游本身异步时，仍由本站 worker 提交和轮询，客户端无需直接调用上游接口。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `model` | string，必需 | 用户可见视频模型名 |
 | `prompt` | string | 文本提示词；部分图生视频插件允许参考图作为主要输入 |
 | `provider` | string，可选 | 网关供应商筛选，不转发上游 |
-| `seconds` / `duration` | number，可选 | 时长字段及兼容别名；具体边界由模型能力与插件校验 |
+| `seconds` / `duration` | number，按模型要求 | 时长以秒为单位，选一个字段；新 Drama G 生成必须显式填写，具体边界由模型能力与插件校验 |
 | `size`、`resolution`、`aspect_ratio` | string，可选 | 仅使用该模型声明支持的维度与取值 |
-| `input_reference` / `image` | string 或文件，可选 | 首帧参考图；文件通过 multipart 提交 |
+| `input_reference` / `image` | URL string / object 或 multipart 文件，按模型要求 | xAI / Drama G 等可表示首帧；E / F 仅作普通参考。使用哪一个别名和来源取决于插件，不要重复发送同一图片 |
 | `last_frame`、`reference_images`、`reference_videos`、`reference_audios` | 供应商规定的素材类型，可选 | 仅在相应视频模式支持时使用 |
 | `generate_audio` 及其他扩展参数 | 供应商规定的类型，可选 | 由模型能力、插件与服务端校验 |
 
+#### 5.1.1 参考图文件和 URL 到底怎么写
+
+| 目的 | 写法 | 本节适用示例 |
+| --- | --- | --- |
+| 上传本机图片文件 | multipart 文件 part：`-F 'input_reference=@/实际路径/reference.png;type=image/png'` | 示例 D：Sora；此处的 `@` 是 curl 读取本机文件的语法 |
+| 单张首帧 URL，JSON 字符串 | `"image": "https://cdn.example.com/first.png"` | xAI、Drama G；Drama E / F 的普通参考使用下方数组 |
+| 单张首帧 URL，JSON 对象 | `"image": {"url": "https://cdn.example.com/first.png"}` | 示例 D1：xAI；Drama G 也接受这种 URL 对象 |
+| 多张普通参考图，URL 字符串数组 | `"reference_images": ["https://cdn.example.com/a.png", "https://cdn.example.com/b.png"]` | 示例 D4：Drama E / F；对应普通参考模式 |
+| 多张普通参考图，URL 对象数组 | `"reference_images": [{"url": "https://cdn.example.com/a.png"}, {"url": "https://cdn.example.com/b.png"}]` | 示例 D3：xAI 1.5 |
+| 首尾帧 | `"image": "https://cdn.example.com/first.png", "last_frame": "https://cdn.example.com/last.png"` | 示例 D6：Drama G 2.5；同时给两帧，比例用 `adaptive` |
+| xAI multipart 文本字段内放 URL | `-F 'image={"url":"https://cdn.example.com/first.png"}'` | 示例 D2：字段内容是 JSON 对象文本，不是上传文件；不能照搬到 Sora 或 JSON-only 插件 |
+
+注意：
+
+- **JSON 里传 URL 不加 `@`**；`"image": "@reference.png"`、`"image": "C:\\pics\\reference.png"` 都不会替你上传文件。裸 Base64 也不是 URL；完整 Data URI 仅在模型明确支持时使用，不能套用到所有 Seedance 型号。
+- `reference_images` 是数组，不写成 `"https://a.png,https://b.png"`，也不把数组整体包成一个 JSON 字符串。不要把聊天接口的 `messages[].content` 或图片接口的字段格式直接套到所有视频插件。
+- 图地址应直接返回图片内容，优先公网 HTTPS，可由上游服务器读取，无需浏览器登录、Cookie 或另加 Authorization。网盘分享页、需要登录的相册页、`localhost`、内网路径不能当作可访问的参考图地址；地址含签名查询参数时完整保留，并留足生成期间的有效期。
+- 图像格式、分辨率、大小、比例、张数及内容要求继续由具体上游校验。“浏览器能看见图片”不能代替上游可读取性检查。下列 `cdn.example.com` 均为占位地址，必须替换。
+- 当前 Drama E / F 普通参考用公网 HTTPS；Drama G 还可引用最终选中账号已有的 `asset://ID`。官方 `doubao` 也支持其账号内素材引用。`asset://ID` 是上游素材，不是本地文件路径或本站任务号。
+- `/v1/uploads/images_sc` 是 Gemini SC 专用临时上传接口，不是通用视频素材上传服务。使用 URL-only 的视频模型时，先上传到你自己的可公开读取的对象存储/图床，再传所得 URL。
+- 若在本站工作台操作：选择模型及生成模式后，单图输入框直接粘完整 URL，多图输入框每行一个 URL；不需要粘整段请求 JSON。只有当前模型提供上传能力时才选择本地文件。附加参数不能覆盖表单中已选择的结构化素材。
+
+#### 5.1.2 各种视频生成示例
+
 **示例 C：文生视频**
+
+适用：本站已配置的 `sora` 插件与 `sora-2`。本例没有参考图，生成 4 秒、1280×720 的视频。`size` 是输出尺寸，`seconds` 是输出时长；不能将这组参数直接当作 Drama 的分辨率配置。
 
 ```bash
 curl -i -sS "$BASE_URL/v1/videos/generations_async" \
@@ -203,6 +233,8 @@ curl -i -sS "$BASE_URL/v1/videos/generations_async" \
 
 **示例 D：上传参考图生成视频**
 
+适用：Sora 的文件参考图请求。将 `/实际路径/reference.png` 换成**执行 curl 的那台电脑**上的文件；`input_reference` 是文件字段名，`@` 使 curl 读取文件，`;type=image/png` 声明 MIME。JPEG 文件相应改为 `type=image/jpeg`。图片还需满足当前上游的图生视频要求。
+
 ```bash
 curl -i -sS "$BASE_URL/v1/videos/generations_async" \
   -H "Authorization: Bearer $NEW_API_TOKEN" \
@@ -213,6 +245,127 @@ curl -i -sS "$BASE_URL/v1/videos/generations_async" \
   -F 'seconds=4' \
   -F 'size=1280x720' \
   -F 'input_reference=@/实际路径/reference.png;type=image/png'
+```
+
+使用 `-F` 时由 curl 自动设置 `multipart/form-data` 与 boundary，**不要另加 `Content-Type: application/json`**。已有图片 URL 时，选择下面的 URL 示例；不要把本例的文件路径直接替换成 URL 并期待所有插件自动下载。
+
+**示例 D1：单张参考图 URL 作为首帧（xAI，JSON）**
+
+适用：`xai` 的 `grok-imagine-video-1.5`。本例 `image` 为 URL 对象，作为首帧；也可写成 `"image": "https://cdn.example.com/first.png"`，两种写法选一种。`720p` 和 `16:9` 是输出规格。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: video-image-url-001' \
+  --data-binary '{
+    "provider": "xai",
+    "model": "grok-imagine-video-1.5",
+    "prompt": "以参考图为首帧，镜头缓慢推进",
+    "image": {"url": "https://cdn.example.com/first.png"},
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "16:9"
+  }'
+```
+
+**示例 D2：multipart 中填写参考图 URL（仅此 xAI 写法）**
+
+适用：同一 xAI 型号。这里 `image` 是**文本字段**，内容为 JSON 对象文本。URL 前没有 `@`，请求不会从本机读取图片。与示例 D 的 Sora 文件 part 是两种不同格式；Drama 不接收本例的 multipart 请求。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Idempotency-Key: video-multipart-url-001' \
+  -F 'provider=xai' \
+  -F 'model=grok-imagine-video-1.5' \
+  -F 'prompt=以参考图为首帧，镜头缓慢推进' \
+  -F 'seconds=8' -F 'resolution=720p' -F 'aspect_ratio=16:9' \
+  -F 'image={"url":"https://cdn.example.com/first.png"}'
+```
+
+**示例 D3：多张普通参考图 URL（xAI 1.5，JSON）**
+
+适用：`grok-imagine-video-1.5` 的普通参考模式；经典 `grok-imagine-video` 不支持此多参考模式。两张图放入 `reference_images` 数组，分别提供人物和场景；它们不是两张“首帧”，也不是首尾帧。本例使用此模式允许的 720p。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: video-reference-urls-001' \
+  --data-binary '{
+    "provider": "xai",
+    "model": "grok-imagine-video-1.5",
+    "prompt": "保持第一张图的人物，使用第二张图的场景",
+    "reference_images": [
+      {"url": "https://cdn.example.com/character.png"},
+      {"url": "https://cdn.example.com/setting.png"}
+    ],
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "16:9"
+  }'
+```
+
+**示例 D4：Drama E / F 使用参考图 URL（JSON）**
+
+适用：`drama` 的新 E / F 系列普通参考模式。本例用 `seedance2.5-F`，`reference_images` 是 URL 字符串数组；增加图片时继续在数组中添加字符串。参考图用于内容引导，**不保证固定为首帧**。改用新 E 时需使用该 E 型号支持的分辨率；新 `seedance2.0-F` 必须使用 `720px`。E / F 不使用 G 的首尾帧功能。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-reference-urls-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.5-F",
+    "prompt": "让参考图中的人物自然挥手",
+    "reference_images": ["https://cdn.example.com/character.png"],
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "16:9"
+  }'
+```
+
+**示例 D5：Drama G 首帧 URL（JSON）**
+
+适用：`seedance2.5-G`。这里 `image` 明确指定首帧，比例必须为 `adaptive`，生成时显式提供正整数秒数。它与示例 D4 的 `reference_images` 普通参考含义不同。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-first-frame-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.5-G",
+    "prompt": "从首帧开始，镜头平稳向前移动",
+    "image": "https://cdn.example.com/first.png",
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "adaptive"
+  }'
+```
+
+**示例 D6：Drama G 首尾帧 URL（JSON）**
+
+适用：`seedance2.5-G`。`image` 是首帧，`last_frame` 是尾帧，必须同时提供；比例仍为 `adaptive`。不要混入 `reference_images`、参考视频或参考音频，也不要只给尾帧。
+
+```bash
+curl -i -sS "$BASE_URL/v1/videos/generations_async" \
+  -H "Authorization: Bearer $NEW_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: drama-first-last-frame-001' \
+  --data-binary '{
+    "provider": "drama",
+    "model": "seedance2.5-G",
+    "prompt": "从首帧平稳过渡到尾帧",
+    "image": "https://cdn.example.com/first.png",
+    "last_frame": "https://cdn.example.com/last.png",
+    "seconds": 8,
+    "resolution": "720p",
+    "aspect_ratio": "adaptive"
+  }'
 ```
 
 视频提交体最多读取 64 MiB；插件可对单个参考文件设更低限制。视频渠道池按 `size` 的**短边**归档：≤1024 为 1K，1025–2048 为 2K，>2048 为 4K；当前渠道池按模型和尺寸选路，不按时长选路。
@@ -230,6 +383,8 @@ curl -i -sS "$BASE_URL/v1/videos/generations_async" \
 
 **示例 E：编辑视频**
 
+用途：对现有源视频做内容修改，创建持久化媒体任务。替换 `video` 中的公网 MP4 URL；本例使用 URL 字符串，也可使用 `{"url":"..."}`。该经典 xAI 编辑模式继承源视频维度，所以不填 `seconds`、`size` 或 `resolution`。素材本身必须可读取，不能填本站 `task_id`。
+
 ```bash
 curl -i -sS "$BASE_URL/v1/videos/edits_async" \
   -H "Authorization: Bearer $NEW_API_TOKEN" \
@@ -244,6 +399,8 @@ curl -i -sS "$BASE_URL/v1/videos/edits_async" \
 ```
 
 **示例 F：延长视频**
+
+用途：在经典 xAI 模型支持的方向上延长源视频。`seconds: 6` 是本次延长时长，`backward` 是该插件支持的方向值；不要按其他插件的示例改成 `forward`。同一请求不再添加 `duration`。
 
 ```bash
 curl -i -sS "$BASE_URL/v1/videos/extensions_async" \
@@ -260,7 +417,24 @@ curl -i -sS "$BASE_URL/v1/videos/extensions_async" \
   }'
 ```
 
-以上三个视频提交接口都返回同样的 202 结构：`task_id` 和 `query_url`，并通过统一任务接口查询。
+以上三个持久化视频提交接口都返回同样的 202 结构：`task_id` 和 `query_url`。它们使用本站 API Key 查询本站任务，不能混用上游任务号。提交成功后的下一步：
+
+```json
+{
+  "task_id": "video_example_local_task",
+  "query_url": "https://your-new-api.example/v1/media/tasks_async/video_example_local_task"
+}
+```
+
+```bash
+TASK_ID='从受理回包复制真实的task_id'
+curl -sS "$BASE_URL/v1/media/tasks_async/$TASK_ID" \
+  -H "Authorization: Bearer $NEW_API_TOKEN"
+```
+
+间隔约 3 秒查询原任务。`status=succeeded`、有 `data[].url` 且账务已结算时，再下载真实返回的 URL；原生插件的 `completed` / `done` 状态不能代替本站持久化状态。G 与带参考视频的 F 还需等上游实际 Token 与账单就绪。不要因 HTTP 202、上游已生成但本地仍在结算、或下载保存失败而再次创建生成任务。
+
+站内指南还保留 `POST /v1/videos/edits` 和 `/v1/videos/extensions` 的标准兼容示例。**接口名没有 `_async` 时，回包是带 `id` 的标准视频任务对象，查询使用 `GET /v1/videos/{id}`**；不返回上面这套持久化 `task_id/query_url` 受理回包。需要本站持久保存与恢复时使用本节 `_async` 示例。
 
 ### 5.3 视频保存
 
