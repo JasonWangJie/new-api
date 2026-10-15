@@ -470,6 +470,148 @@ test('refresh reloads platform options after the configured channels change', as
 })
 
 test.each([false, true])(
+  'admin=%s manual refresh spins until both task and platform requests finish',
+  async (admin) => {
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    const refresh = screen.getByRole('button', { name: 'Refresh' })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    let finishTasks!: (value: Awaited<ReturnType<typeof getImageTasks>>) => void
+    let finishPlatforms!: (value: string[]) => void
+    vi.mocked(getImageTasks).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishTasks = resolve
+      })
+    )
+    vi.mocked(getMediaTaskPlatforms).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishPlatforms = resolve
+      })
+    )
+
+    await user.click(refresh)
+    await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'true'))
+    expect(refresh).toBeDisabled()
+    expect(refresh.querySelector('svg')).toHaveClass('animate-spin')
+    await user.click(refresh)
+    expect(getImageTasks).toHaveBeenCalledTimes(2)
+    expect(getMediaTaskPlatforms).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      finishTasks({ items: [task], total: 1, pages: 1, stats: {} })
+    })
+    expect(refresh).toHaveAttribute('aria-busy', 'true')
+    expect(refresh).toBeDisabled()
+    await act(async () => {
+      finishPlatforms(['azure'])
+    })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    expect(refresh).toHaveAttribute('aria-busy', 'false')
+    expect(refresh.querySelector('svg')).not.toHaveClass('animate-spin')
+  }
+)
+
+test.each(['tasks', 'platforms'])(
+  '%s request failure clears manual refresh loading and permits retry',
+  async (source) => {
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    const refresh = screen.getByRole('button', { name: 'Refresh' })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    let fail!: (reason: Error) => void
+    const pending = new Promise<never>((_, reject) => {
+      fail = reject
+    })
+    if (source === 'tasks') {
+      vi.mocked(getImageTasks).mockReturnValueOnce(pending)
+    } else {
+      vi.mocked(getMediaTaskPlatforms).mockReturnValueOnce(pending)
+    }
+
+    await user.click(refresh)
+    await waitFor(() => expect(refresh).toBeDisabled())
+    await act(async () => {
+      fail(new Error('Refresh unavailable'))
+    })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    expect(refresh).toHaveAttribute('aria-busy', 'false')
+    expect(refresh.querySelector('svg')).not.toHaveClass('animate-spin')
+    await user.click(refresh)
+    await waitFor(() => expect(getImageTasks).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(refresh).toBeEnabled())
+  }
+)
+
+test.each([false, true])(
+  'admin=%s dark mode auto refresh shows enabled status and a countdown that follows polling',
+  async (admin) => {
+    if (admin) setMobileViewport()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    const refresh = screen.getByRole('button', { name: 'Refresh' })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    const autoRefresh = screen.getByRole('button', { name: 'Auto refresh' })
+    expect(autoRefresh).toHaveAttribute('aria-pressed', 'false')
+    document.documentElement.classList.add('dark')
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+    try {
+      fireEvent.click(autoRefresh)
+      expect(autoRefresh).toHaveAttribute('aria-pressed', 'true')
+      expect(autoRefresh).toHaveClass('bg-primary', 'text-primary-foreground')
+      expect(autoRefresh).toHaveTextContent('Auto refresh enabled')
+      expect(autoRefresh).toHaveTextContent('10s')
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(autoRefresh).toHaveTextContent('9s')
+      let finishTasks!: (
+        value: Awaited<ReturnType<typeof getImageTasks>>
+      ) => void
+      vi.mocked(getImageTasks).mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishTasks = resolve
+        })
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(9000)
+      })
+      expect(getImageTasks).toHaveBeenCalledTimes(2)
+      await waitFor(() =>
+        expect(autoRefresh).toHaveTextContent('Refreshing...')
+      )
+      expect(refresh).toHaveAttribute('aria-busy', 'true')
+      await act(async () => {
+        finishTasks({ items: [task], total: 1, pages: 1, stats: {} })
+      })
+      await waitFor(() => expect(autoRefresh).toHaveTextContent('10s'))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000)
+      })
+      expect(autoRefresh).toHaveTextContent('7s')
+      fireEvent.click(refresh)
+      await waitFor(() => expect(getImageTasks).toHaveBeenCalledTimes(3))
+      await waitFor(() => expect(autoRefresh).toHaveTextContent('10s'))
+
+      fireEvent.click(autoRefresh)
+      expect(autoRefresh).toHaveAttribute('aria-pressed', 'false')
+      expect(autoRefresh).toHaveTextContent(/^Auto refresh$/)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(11000)
+      })
+      expect(getImageTasks).toHaveBeenCalledTimes(3)
+      fireEvent.click(autoRefresh)
+      expect(autoRefresh).toHaveTextContent('10s')
+      fireEvent.click(autoRefresh)
+    } finally {
+      document.documentElement.classList.remove('dark')
+      vi.useRealTimers()
+    }
+  }
+)
+
+test.each([false, true])(
   'mobile=%s reset clears the platform along with other filters',
   async (mobile) => {
     if (mobile) setMobileViewport()

@@ -23,7 +23,7 @@ import type {
   RowSelectionState,
   SortingState,
 } from '@tanstack/react-table'
-import { Ban, Eye, Filter, RefreshCw } from 'lucide-react'
+import { Ban, Eye, Filter } from 'lucide-react'
 import {
   startTransition,
   useCallback,
@@ -73,6 +73,7 @@ import { ImageReliabilityPanel } from './components/image-reliability-panel'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
+import { ImageTaskRefreshActions } from './components/image-task-refresh-actions'
 import { imageLabel } from './lib/image-labels'
 import {
   imageTaskElapsedSeconds,
@@ -81,6 +82,7 @@ import {
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
 
+const TASK_REFRESH_INTERVAL_SECONDS = 10
 const TASK_STATES = [
   'queued',
   'invoking',
@@ -165,7 +167,7 @@ function TaskCenterSession({
   const tasks = useQuery({
     queryKey: ['image-task-center', userId, admin, params.toString()],
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
-    refetchInterval: autoRefresh ? 10000 : false,
+    refetchInterval: autoRefresh ? TASK_REFRESH_INTERVAL_SECONDS * 1000 : false,
   })
   const platforms = useQuery({
     queryKey: ['image-task-platforms', userId, admin],
@@ -832,25 +834,18 @@ function TaskCenterSession({
         {t('Media task center')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Actions>
-        <Button
-          size='sm'
-          variant={autoRefresh ? 'secondary' : 'outline'}
-          aria-pressed={autoRefresh}
-          onClick={() => setAutoRefresh((previous) => !previous)}
-        >
-          <RefreshCw className='size-3.5' aria-hidden />
-          {t('Auto refresh')}
-        </Button>
-        <Button
-          variant='outline'
-          size='sm'
-          onClick={() => {
+        <ImageTaskRefreshActions
+          autoRefresh={autoRefresh}
+          refreshIntervalSeconds={TASK_REFRESH_INTERVAL_SECONDS}
+          tasksFetching={tasks.isFetching}
+          tasksUpdatedAt={Math.max(tasks.dataUpdatedAt, tasks.errorUpdatedAt)}
+          platformsFetching={platforms.isFetching}
+          onAutoRefreshChange={setAutoRefresh}
+          onRefresh={() => {
             void tasks.refetch()
             void platforms.refetch()
           }}
-        >
-          {t('Refresh')}
-        </Button>
+        />
         {!isMobile && batchActions}
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
