@@ -512,6 +512,10 @@ func AcceptAsyncVideo(c *gin.Context) {
 		return
 	}
 	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
+	request.Details = request.RequestDetails()
+	if provider := c.GetString("async_media_provider"); provider != "" && request.Details != nil {
+		request.Details.RequestParameters["provider"] = provider
+	}
 	if value, ok := c.Get(pluginruntime.ContextKeyPinnedPlugin); ok {
 		if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
 			request.PluginHash = pinned.Plugin.Engine.SourceFingerprint()

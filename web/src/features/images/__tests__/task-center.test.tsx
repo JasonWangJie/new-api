@@ -1137,6 +1137,140 @@ test('unknown video details offer termination with upstream verification', async
   expect(onManage).toHaveBeenCalledWith('terminate', true)
 })
 
+test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+])(
+  'video details show requested duration and reference links and open original parameters on demand (admin=$admin mobile=$mobile)',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    const parameters = {
+      model: 'video-model',
+      prompt: 'Continue the camera movement from the reference clip',
+      seconds: 8,
+      seed: 0,
+      generate_audio: false,
+    }
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: {
+        ...task,
+        media_type: 'video',
+        requested_seconds: 8,
+        request_parameters: parameters,
+        reference_media: [
+          { type: 'image', url: 'https://example.com/first-frame.png' },
+          { type: 'video', url: 'https://example.com/source.mp4' },
+          { type: 'audio', url: 'https://example.com/voice.mp3' },
+        ],
+      },
+      results: [],
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={admin}
+        userId={101}
+        canManage={false}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    const details = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    expect(await within(details).findByText('Requested duration')).toBeVisible()
+    expect(within(details).getByText('8s')).toBeVisible()
+    expect(within(details).getByText('Time spent')).toBeVisible()
+    for (const reference of [
+      {
+        label: 'Reference image 1',
+        url: 'https://example.com/first-frame.png',
+      },
+      { label: 'Reference video 2', url: 'https://example.com/source.mp4' },
+      { label: 'Reference audio 3', url: 'https://example.com/voice.mp3' },
+    ]) {
+      expect(
+        within(details).getByRole('button', {
+          name: `Copy URL · ${reference.label}`,
+        })
+      ).toHaveTextContent(reference.url)
+    }
+    expect(details.querySelector('img, video, audio')).toBeNull()
+    expect(imageRequest).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText('Original request parameters')).toBeNull()
+    const trigger = within(details).getByRole('button', {
+      name: 'View request parameters',
+    })
+    await user.click(trigger)
+    const parametersDialog = await screen.findByRole('dialog', {
+      name: 'Original request parameters',
+    })
+    expect(
+      within(parametersDialog).getByLabelText('Original request parameters')
+    ).toHaveTextContent('"generate_audio": false')
+    expect(
+      within(parametersDialog).getByLabelText('Original request parameters')
+    ).toHaveTextContent('"seed": 0')
+    await user.click(
+      within(parametersDialog).getByRole('button', {
+        name: 'Copy request parameters',
+      })
+    )
+    expect(await navigator.clipboard.readText()).toBe(
+      JSON.stringify(parameters, null, 2)
+    )
+    await user.keyboard('{Escape}')
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Original request parameters' })
+      ).not.toBeInTheDocument()
+    )
+    expect(details).toBeVisible()
+    await user.click(
+      within(details).getByRole('button', {
+        name: 'Copy all reference media URLs',
+      })
+    )
+    expect(await navigator.clipboard.readText()).toBe(
+      'https://example.com/first-frame.png\nhttps://example.com/source.mp4\nhttps://example.com/voice.mp3'
+    )
+  }
+)
+
+test('video details leave missing historical request data unavailable', async () => {
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    task: { ...task, media_type: 'video' },
+    results: [],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  expect(await screen.findByText('Requested duration')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'View request parameters' })
+  ).toBeDisabled()
+  expect(
+    screen.getByText(
+      'Original request parameters are unavailable for this task.'
+    )
+  ).toBeVisible()
+  expect(screen.queryByText('Reference media')).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('dialog', { name: 'Original request parameters' })
+  ).not.toBeInTheDocument()
+})
+
 test('admin details show named attempts and generated images without rendering raw fingerprints', async () => {
   const user = userEvent.setup()
   mount(

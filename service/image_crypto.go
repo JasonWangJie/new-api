@@ -11,7 +11,7 @@ import (
 )
 
 // Keys are configured as id:base64-32-byte-key pairs separated by commas.
-// Keep previous keys configured until all requests using them reach a terminal state.
+// Keep previous keys configured until all retained payloads using them expire.
 func ImageEncryptionAvailable() bool {
 	_, _, err := imagePayloadKeys()
 	return err == nil

@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { ArrowUpRight, Ban, ChevronDown } from 'lucide-react'
+import { ArrowUpRight, Ban, Braces, ChevronDown } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -33,7 +33,6 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
-import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -49,7 +48,7 @@ import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
 } from '../lib/task-presentation'
-import type { ImageRetryDecision } from '../types'
+import type { ImageRetryDecision, ImageTask } from '../types'
 import {
   ImagePlatformBadge,
   ImageRequestTypeBadge,
@@ -94,7 +93,7 @@ function DetailSection(props: {
         props.accentClassName
       )}
     >
-      <div className='flex items-center justify-between gap-3'>
+      <div className='flex flex-wrap items-center justify-between gap-3'>
         <h3 className='text-sm font-semibold'>{props.title}</h3>
         {props.action}
       </div>
@@ -233,7 +232,7 @@ export function ImageTaskDetails(props: {
   ) => void
 }) {
   const { t } = useTranslation()
-  const { copyToClipboard } = useCopyToClipboard()
+  const [requestParametersOpen, setRequestParametersOpen] = useState(false)
   const task = useQuery({
     queryKey: ['image-task-details', props.userId, props.admin, props.id],
     queryFn: ({ signal }) => getImageTask(props.admin, props.id, signal),
@@ -288,8 +287,13 @@ export function ImageTaskDetails(props: {
     staleTime: 60_000,
   })
   const data = task.data?.task
-  let references: string[] = []
-  if (props.admin && data?.reference_urls) {
+  const isVideo = data?.media_type === 'video'
+  let references: NonNullable<ImageTask['reference_media']> = isVideo
+    ? (data.reference_media || []).filter((reference) =>
+        /^https?:\/\//i.test(reference.url)
+      )
+    : []
+  if (!isVideo && props.admin && data?.reference_urls) {
     try {
       const parsed: unknown = JSON.parse(data.reference_urls)
       if (Array.isArray(parsed)) {
@@ -297,15 +301,19 @@ export function ImageTaskDetails(props: {
           ...new Set(
             parsed.filter((value): value is string => typeof value === 'string')
           ),
-        ]
+        ].map((url) => ({ type: 'image', url }))
       }
     } catch {
       references = []
     }
   }
-  const copyableReferenceUrls = references.filter((url) =>
-    /^https?:\/\//i.test(url)
-  )
+  const copyableReferenceUrls = references
+    .filter((reference) => /^https?:\/\//i.test(reference.url))
+    .map((reference) => reference.url)
+  const requestParameters =
+    requestParametersOpen && data?.request_parameters
+      ? JSON.stringify(data.request_parameters, null, 2)
+      : ''
   const attempts = props.admin ? data?.attempt_history || [] : []
   const canResume = Boolean(
     data?.can_resume && (props.canManage || !props.admin)
@@ -391,6 +399,18 @@ export function ImageTaskDetails(props: {
                 className='size-8 shrink-0'
               />
             </div>
+            {isVideo && (
+              <dl className='bg-background/70 inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-3 py-2 text-xs'>
+                <dt className='text-muted-foreground'>
+                  {t('Requested duration')}
+                </dt>
+                <dd className='font-semibold tabular-nums'>
+                  {data.requested_seconds != null
+                    ? t('{{seconds}}s', { seconds: data.requested_seconds })
+                    : '—'}
+                </dd>
+              </dl>
+            )}
             {data.prompt_summary && (
               <p className='text-muted-foreground text-sm break-words whitespace-pre-wrap'>
                 {data.prompt_summary}
@@ -409,7 +429,7 @@ export function ImageTaskDetails(props: {
               <div className='space-y-2'>
                 <div className='flex items-center justify-between gap-2'>
                   <h3 className='text-muted-foreground text-xs font-medium'>
-                    {t('Reference images')}
+                    {isVideo ? t('Reference media') : t('Reference images')}
                   </h3>
                   {copyableReferenceUrls.length > 0 && (
                     <CopyButton
@@ -417,50 +437,70 @@ export function ImageTaskDetails(props: {
                       size='sm'
                       variant='outline'
                       className='h-7 gap-1.5 px-2 text-xs'
-                      tooltip={t('Copy all reference image URLs')}
-                      aria-label={t('Copy all reference image URLs')}
+                      tooltip={
+                        isVideo
+                          ? t('Copy all reference media URLs')
+                          : t('Copy all reference image URLs')
+                      }
+                      aria-label={
+                        isVideo
+                          ? t('Copy all reference media URLs')
+                          : t('Copy all reference image URLs')
+                      }
                     >
                       {t('Copy All')}
                     </CopyButton>
                   )}
                 </div>
                 <p className='text-muted-foreground text-xs'>
-                  {t(
-                    'Click the URL to copy it. Use the button on the right to open the reference image in a new tab.'
-                  )}
+                  {isVideo
+                    ? t(
+                        'Click a URL to copy it. Open the reference in a new tab using the button on the right.'
+                      )
+                    : t(
+                        'Click the URL to copy it. Use the button on the right to open the reference image in a new tab.'
+                      )}
                 </p>
-                {references.map((url, index) => {
+                {references.map((reference, index) => {
+                  const url = reference.url
+                  let label = t('Reference image {{index}}', {
+                    index: index + 1,
+                  })
+                  if (reference.type === 'video') {
+                    label = t('Reference video {{index}}', { index: index + 1 })
+                  } else if (reference.type === 'audio') {
+                    label = t('Reference audio {{index}}', { index: index + 1 })
+                  }
                   if (!/^https?:\/\//i.test(url)) {
                     return (
                       <p key={url} className='text-muted-foreground text-xs'>
-                        {t('Reference image {{index}}', { index: index + 1 })} ·{' '}
-                        {t('Embedded image')}
+                        {label} · {t('Embedded image')}
                       </p>
                     )
                   }
                   return (
                     <div
-                      key={url}
-                      className='bg-background/70 flex min-h-10 max-w-3xl items-center gap-2 rounded-md border px-3 py-2 text-xs'
+                      key={`${reference.type}:${url}`}
+                      className='bg-background/70 flex min-h-10 max-w-3xl items-center gap-2 rounded-md border px-3 py-1 text-xs'
                     >
-                      <span className='text-primary shrink-0'>
-                        {t('Reference image {{index}}', { index: index + 1 })}
-                      </span>
-                      <button
-                        type='button'
-                        className='hover:text-primary min-w-0 flex-1 truncate text-left font-mono'
-                        title={url}
-                        aria-label={`${t('Copy URL')} · ${t('Reference image {{index}}', { index: index + 1 })}`}
-                        onClick={() => void copyToClipboard(url)}
+                      <span className='text-primary shrink-0'>{label}</span>
+                      <CopyButton
+                        value={url}
+                        size='sm'
+                        className='h-8 min-w-0 flex-1 justify-start px-1 font-mono text-xs font-normal'
+                        iconClassName='size-3 shrink-0'
+                        aria-label={`${t('Copy URL')} · ${label}`}
                       >
-                        {url}
-                      </button>
+                        <span className='truncate' title={url}>
+                          {url}
+                        </span>
+                      </CopyButton>
                       <Button
                         type='button'
                         size='icon'
                         variant='ghost'
                         className='size-8 shrink-0'
-                        aria-label={`${t('Open in new tab')} · ${t('Reference image {{index}}', { index: index + 1 })}`}
+                        aria-label={`${t('Open in new tab')} · ${label}`}
                         onClick={() =>
                           window.open(url, '_blank', 'noopener,noreferrer')
                         }
@@ -528,7 +568,28 @@ export function ImageTaskDetails(props: {
           <DetailSection
             title={t('Request and billing')}
             accentClassName='border-l-4 border-l-violet-500/70'
+            action={
+              isVideo && (
+                <Button
+                  size='sm'
+                  variant='outline'
+                  className='h-auto shrink-0 gap-1.5 px-2 py-1.5 text-xs'
+                  disabled={!data.request_parameters}
+                  onClick={() => setRequestParametersOpen(true)}
+                >
+                  <Braces className='size-3.5' aria-hidden />
+                  {t('View request parameters')}
+                </Button>
+              )
+            }
           >
+            {isVideo && !data.request_parameters && (
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Original request parameters are unavailable for this task.'
+                )}
+              </p>
+            )}
             <TaskDetailFields
               items={[
                 {
@@ -562,6 +623,41 @@ export function ImageTaskDetails(props: {
               ]}
             />
           </DetailSection>
+          {isVideo && requestParametersOpen && data.request_parameters && (
+            <Dialog
+              open
+              onOpenChange={setRequestParametersOpen}
+              title={t('Original request parameters')}
+              description={t('Credentials and embedded media are hidden.')}
+              contentClassName='sm:max-w-3xl'
+              footer={
+                <>
+                  <CopyButton
+                    value={requestParameters}
+                    size='sm'
+                    variant='outline'
+                    aria-label={t('Copy request parameters')}
+                  >
+                    {t('Copy')}
+                  </CopyButton>
+                  <Button
+                    size='sm'
+                    onClick={() => setRequestParametersOpen(false)}
+                  >
+                    {t('Close')}
+                  </Button>
+                </>
+              }
+            >
+              <pre
+                className='bg-muted/70 max-h-[60vh] overflow-auto rounded-lg border p-4 font-mono text-xs leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap'
+                aria-label={t('Original request parameters')}
+                tabIndex={0}
+              >
+                {requestParameters}
+              </pre>
+            </Dialog>
+          )}
           <DetailSection
             title={t('Scheduling context')}
             accentClassName='border-l-4 border-l-sky-500/70'

@@ -30,6 +30,7 @@ type AsyncVideoRequest struct {
 	Execution   *model.TaskExecutionSnapshot
 	Billing     MediaBillingSnapshot
 	PluginHash  string
+	Details     *AsyncVideoRequestDetails `json:"request_details,omitempty"`
 }
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
@@ -125,7 +126,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return err
 	}
 	if err == nil {
-		updates["status"], updates["quota"], updates["request_cipher"] = "submitted", task.Quota, nil
+		updates["status"], updates["quota"], updates["request_cipher"] = "submitted", task.Quota, retainAsyncVideoRequestDetails(job)
 		if job.BillingStatus != "failed" {
 			updates["billing_status"] = "reserved"
 			if task.Status == model.TaskStatusSuccess {
@@ -202,13 +203,13 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return err
 	}
 	if submitErr == nil {
-		updates["status"], updates["request_cipher"] = "submitted", nil
+		updates["status"], updates["request_cipher"] = "submitted", retainAsyncVideoRequestDetails(job)
 		return nil
 	}
 	// The durable Task barrier may have been crossed before a billing error.
 	var accepted model.Task
 	if err := model.DB.WithContext(context.WithoutCancel(parent)).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&accepted).Error; err == nil {
-		updates["status"], updates["billing_status"], updates["quota"], updates["request_cipher"], updates["error_message"] = "submitted", "failed", accepted.Quota, nil, "Task billing confirmation requires reconciliation"
+		updates["status"], updates["billing_status"], updates["quota"], updates["request_cipher"], updates["error_message"] = "submitted", "failed", accepted.Quota, retainAsyncVideoRequestDetails(job), "Task billing confirmation requires reconciliation"
 		return submitErr
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err

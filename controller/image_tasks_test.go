@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"bytes"
+	"context"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -684,6 +687,128 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				assert.NotContains(t, expiredRecorder.Body.String(), latestURL)
 			}
 
+			t.Run("video request details survive submission and storage", func(t *testing.T) {
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+				request := service.AsyncVideoRequest{
+					Body:        []byte(`{"model":"video-model","prompt":"A cinematic landscape","seconds":"8","image":"https://cdn.example.com/input.png?signature=owner-signature","reference_images":["https://cdn.example.com/input.png?signature=owner-signature"],"metadata":{"content":[{"type":"video_url","video_url":{"url":"https://cdn.example.com/reference.mp4"}},{"type":"audio_url","audio_url":{"url":"https://cdn.example.com/sound.mp3"}}],"authorization":"nested-secret-canary"},"watermark":false,"seed":0,"api_key":"body-key-canary","image_base64":"binary-canary"}`),
+					ContentType: "application/json", ClientIP: "client-ip-canary", Channel: model.Channel{Key: "channel-credential-canary"},
+					Execution: &model.TaskExecutionSnapshot{RequestID: "private-request-id-canary"},
+				}
+				request.Details = request.RequestDetails()
+				encoded, err := common.Marshal(request)
+				require.NoError(t, err)
+				job := model.AsyncMediaJob{TaskId: "task_video_request_details", IdentityHash: "video-request-details", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "test-video", Model: "video-model", Status: "queued", StorageStatus: "pending", BillingStatus: "pending", RequestCipher: nil, CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "video-details-lease", LeaseExpiresAt: now + 120}
+				job.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Create(&job).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("task_id = ?", job.TaskId).Delete(&model.AsyncMediaJob{}).Error)
+					assert.NoError(t, db.Where("task_id = ?", job.TaskId).Delete(&model.Task{}).Error)
+				})
+				previousSubmit, previousPersist := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc
+				t.Cleanup(func() { service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = previousSubmit, previousPersist })
+				service.SubmitAsyncVideoFunc = func(ctx context.Context, current model.AsyncMediaJob, submitted service.AsyncVideoRequest) error {
+					assert.Equal(t, request.Body, submitted.Body, "display filtering must not modify upstream request bytes")
+					assert.Equal(t, request.Channel.Key, submitted.Channel.Key)
+					return db.WithContext(ctx).Create(&model.Task{TaskID: current.TaskId, UserId: current.UserId, ChannelId: current.ChannelId, Status: model.TaskStatusSubmitted, Action: "reference_to_video", CreatedAt: now}).Error
+				}
+				cfg := service.DefaultMediaRuntimeConfig()
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				assert.Equal(t, "submitted", job.Status)
+				retained, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				var snapshot map[string]any
+				require.NoError(t, common.Unmarshal(retained, &snapshot))
+				assert.Len(t, snapshot, 1, "the execution envelope must be replaced by a display-only snapshot")
+				assert.Contains(t, snapshot, "request_details")
+				for _, secret := range []string{"client-ip-canary", "channel-credential-canary", "private-request-id-canary", "nested-secret-canary", "body-key-canary", "binary-canary", `"Channel"`, `"Billing"`, `"Body"`} {
+					assert.NotContains(t, string(retained), secret)
+				}
+				// Polling an accepted task and saving a completed video preserve
+				// the display snapshot without retaining the execution envelope.
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Updates(map[string]any{"status": model.TaskStatusSuccess, "finish_time": now}).Error)
+				service.PersistAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, *model.Task) error { return nil }
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				assert.Equal(t, "succeeded", job.Status)
+				assert.NotEmpty(t, job.RequestCipher)
+				// An upstream result avoids requiring a local artifact for this
+				// presentation fixture, while exercising the successful-task view.
+				require.NoError(t, db.Model(&job).Update("storage_status", "upstream").Error)
+				for _, item := range []struct {
+					name   string
+					userID int
+					admin  bool
+					want   int
+				}{{"owner", 101, false, http.StatusOK}, {"administrator", 102, true, http.StatusOK}, {"other user", 102, false, http.StatusNotFound}} {
+					t.Run(item.name, func(t *testing.T) {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", item.userID)
+						c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
+						GetMediaTask(c, item.admin)
+						require.Equal(t, item.want, recorder.Code, recorder.Body.String())
+						assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+						if item.want != http.StatusOK {
+							assert.NotContains(t, recorder.Body.String(), "owner-signature")
+							assert.NotContains(t, recorder.Body.String(), "A cinematic landscape")
+							return
+						}
+						var response struct {
+							Data struct {
+								Task service.AsyncVideoRequestDetails
+							}
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						require.NotNil(t, response.Data.Task.RequestedSeconds)
+						assert.Equal(t, float64(8), *response.Data.Task.RequestedSeconds)
+						assert.ElementsMatch(t, []service.AsyncVideoReferenceMedia{{Type: "image", URL: "https://cdn.example.com/input.png?signature=owner-signature"}, {Type: "video", URL: "https://cdn.example.com/reference.mp4"}, {Type: "audio", URL: "https://cdn.example.com/sound.mp3"}}, response.Data.Task.ReferenceMedia)
+						assert.Equal(t, false, response.Data.Task.RequestParameters["watermark"])
+						assert.Equal(t, float64(0), response.Data.Task.RequestParameters["seed"])
+					})
+				}
+				for _, list := range []bool{false, true} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Set("token_id", 201)
+					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/?task_id="+job.TaskId, nil)
+					if list {
+						ListMediaTasks(c, false)
+					} else {
+						QueryAsyncMedia(c)
+					}
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					for _, private := range []string{"request_parameters", "reference_media", "requested_seconds", "owner-signature", "A cinematic landscape"} {
+						assert.NotContains(t, recorder.Body.String(), private)
+					}
+				}
+				require.NoError(t, db.Model(&job).Update("expires_at", now-1).Error)
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				assert.Empty(t, job.RequestCipher, "existing expiration cleanup removes request details")
+				for _, expiresAt := range []int64{now - 1, now + 3600} {
+					require.NoError(t, db.Model(&job).Update("expires_at", expiresAt).Error)
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
+					GetMediaTask(c, false)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					for _, field := range []string{"request_parameters", "reference_media", "requested_seconds"} {
+						assert.NotContains(t, recorder.Body.String(), field, "expired and legacy tasks must not fabricate request parameters")
+					}
+				}
+			})
+
 			t.Run("unknown video execution requires administrator reconciliation", func(t *testing.T) {
 				for _, item := range []struct {
 					name       string
@@ -810,4 +935,80 @@ func TestAsyncImageExternalReferencePreview(t *testing.T) {
 		{Type: "mask", URL: "https://example.com/mask.png"},
 	}}
 	assert.Equal(t, []string{"https://example.com/reference.png", "http://example.com/reference2.png"}, request.ReferenceURLs())
+}
+
+func TestAsyncVideoRequestDetails(t *testing.T) {
+	for _, item := range []struct {
+		name    string
+		body    string
+		seconds float64
+		media   []service.AsyncVideoReferenceMedia
+		absent  []string
+	}{
+		{
+			name:    "nested generation settings and mixed references",
+			body:    `{"parameters":{"duration":6},"metadata":{"duration":9,"input":{"media":[{"type":"reference_video","url":"https://cdn.example.com/clip.mp4?signature=caller-owned"},{"type":"reference_audio","url":"https://cdn.example.com/audio.mp3"}]},"first_frame_url":"https://cdn.example.com/first.png","private_key":"private-key-canary"},"prompt":"landscape Bearer text-credential-canary","nested":{"x-api-key":"nested-key-canary"}}`,
+			seconds: 6,
+			media:   []service.AsyncVideoReferenceMedia{{Type: "video", URL: "https://cdn.example.com/clip.mp4?signature=caller-owned"}, {Type: "audio", URL: "https://cdn.example.com/audio.mp3"}, {Type: "image", URL: "https://cdn.example.com/first.png"}},
+			absent:  []string{"private-key-canary", "text-credential-canary", "nested-key-canary"},
+		},
+		{
+			name:  "reference duration does not become requested duration",
+			body:  `{"reference_videos":[{"url":"https://cdn.example.com/reference.mp4","duration":15}]}`,
+			media: []service.AsyncVideoReferenceMedia{{Type: "video", URL: "https://cdn.example.com/reference.mp4"}},
+		},
+		{
+			name:   "binary payloads and unsafe URLs stay hidden",
+			body:   `{"seconds":"NaN","image":"HTTPS://url-user:url-secret-canary@cdn.example.com/ref.png","video":"javascript:video-url-canary","audio":"data:audio/mp3;base64,inline-audio-canary","nested":{"image_base64":"raw-binary-canary"}}`,
+			absent: []string{"url-secret-canary", "inline-audio-canary", "raw-binary-canary"},
+		},
+		{
+			name:   "oversized fields are bounded",
+			body:   `{"prompt":"` + strings.Repeat("p", 65537) + `","image":"https://cdn.example.com/ref.png"}`,
+			media:  []service.AsyncVideoReferenceMedia{{Type: "image", URL: "https://cdn.example.com/ref.png"}},
+			absent: []string{strings.Repeat("p", 1024)},
+		},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			details := (service.AsyncVideoRequest{Body: []byte(item.body), ContentType: "application/json"}).RequestDetails()
+			require.NotNil(t, details)
+			if item.seconds == 0 {
+				assert.Nil(t, details.RequestedSeconds)
+			} else {
+				require.NotNil(t, details.RequestedSeconds)
+				assert.Equal(t, item.seconds, *details.RequestedSeconds)
+			}
+			assert.ElementsMatch(t, item.media, details.ReferenceMedia)
+			encoded, err := common.Marshal(details)
+			require.NoError(t, err)
+			for _, private := range item.absent {
+				assert.NotContains(t, string(encoded), private)
+			}
+			assert.Less(t, len(encoded), 256<<10)
+		})
+	}
+	t.Run("multipart keeps fields and file metadata without bytes", func(t *testing.T) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("seconds", "12"))
+		require.NoError(t, writer.WriteField("metadata", `{"audio_url":"https://cdn.example.com/sound.mp3","password":"form-secret-canary"}`))
+		file, err := writer.CreateFormFile("input_reference", "reference.png")
+		require.NoError(t, err)
+		_, err = file.Write([]byte("uploaded-file-bytes-canary"))
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+		details := (service.AsyncVideoRequest{Body: body.Bytes(), ContentType: writer.FormDataContentType()}).RequestDetails()
+		require.NotNil(t, details)
+		require.NotNil(t, details.RequestedSeconds)
+		assert.Equal(t, float64(12), *details.RequestedSeconds)
+		assert.Equal(t, []service.AsyncVideoReferenceMedia{{Type: "audio", URL: "https://cdn.example.com/sound.mp3"}}, details.ReferenceMedia)
+		encoded, err := common.Marshal(details)
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), "reference.png")
+		assert.NotContains(t, string(encoded), "uploaded-file-bytes-canary")
+		assert.NotContains(t, string(encoded), "form-secret-canary")
+	})
+	for _, request := range []service.AsyncVideoRequest{{Body: []byte(`{"model":`), ContentType: "application/json"}, {Body: []byte(`{}`), ContentType: "invalid"}} {
+		assert.Nil(t, request.RequestDetails())
+	}
 }

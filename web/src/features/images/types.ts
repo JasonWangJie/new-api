@@ -152,6 +152,12 @@ export type ImageTask = {
   channel_id?: number
   attempts?: string
   reference_urls?: string
+  requested_seconds?: number
+  reference_media?: {
+    type: 'image' | 'video' | 'audio'
+    url: string
+  }[]
+  request_parameters?: Record<string, unknown>
   reconciliation_status?: string
   attempt_history?: {
     channel_name: string

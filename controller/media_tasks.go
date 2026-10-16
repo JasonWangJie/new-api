@@ -239,6 +239,7 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		GetImageTask(c, admin)
 		return
 	}
+	c.Header("Cache-Control", "private, no-store")
 	query := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id"))
 	if !admin {
 		query = query.Where("user_id = ?", c.GetInt("id"))
@@ -252,6 +253,26 @@ func GetMediaTask(c *gin.Context, admin bool) {
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
+	}
+	// Request payloads are owner/admin detail data only. Public polling and list
+	// views never decrypt requests or include caller-owned signed reference URLs.
+	if job.ExpiresAt > time.Now().Unix() && len(job.RequestCipher) > 0 {
+		plain, decryptErr := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+		var request service.AsyncVideoRequest
+		if decryptErr == nil && common.Unmarshal(plain, &request) == nil {
+			if details := request.RequestDetails(); details != nil {
+				if details.RequestedSeconds != nil {
+					view["requested_seconds"] = *details.RequestedSeconds
+				}
+				if len(details.ReferenceMedia) > 0 {
+					view["reference_media"] = details.ReferenceMedia
+				}
+				view["request_parameters"] = details.RequestParameters
+				if prompt, ok := details.RequestParameters["prompt"].(string); ok {
+					view["prompt_summary"] = service.SanitizeAsyncImageDiagnostic(prompt, 512)
+				}
+			}
+		}
 	}
 	imageManagementData(c, gin.H{"task": view, "results": results, "events": []any{}})
 }
