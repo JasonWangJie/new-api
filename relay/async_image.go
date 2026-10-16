@@ -38,6 +38,11 @@ type asyncImageResponseWriter struct {
 	Limit   int64
 }
 
+const (
+	asyncImageUpstreamRequestIDContextKey = "async_image_upstream_request_id"
+	asyncImageUpstreamStatusContextKey    = "async_image_upstream_status"
+)
+
 func (writer *asyncImageResponseWriter) Header() http.Header { return writer.Headers }
 func (writer *asyncImageResponseWriter) WriteHeader(status int) {
 	if writer.Status == 0 {
@@ -266,6 +271,10 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	var submitImageURLs []string
 	remoteReferences, localReferences := false, false
 	geminiReferenceFallbackEligible := false
+	referenceCfg := cfg
+	if channelLimit := channel.GetSetting().ImageMaxReferenceBytes; channelLimit != nil && *channelLimit > 0 {
+		referenceCfg.DownloadMaxBytes = min(referenceCfg.DownloadMaxBytes, *channelLimit)
+	}
 	if request.Platform == "openai" {
 		var images []map[string]string
 		mode := service.ImageChannelReferenceTransport(*channel, request.Platform, task.ReferenceRetryCount, cfg)
@@ -284,7 +293,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
 			if bound || mode == "local" || strings.HasPrefix(strings.ToLower(reference), "data:") {
-				image, _, err := service.ResolveImageReference(ctx, task.TokenId, reference, cfg)
+				image, err := resolveAsyncImageReference(ctx, task.TokenId, reference, referenceCfg)
 				if err != nil {
 					return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 				}
@@ -343,16 +352,16 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		parsed = imageRequest
 	} else {
-		cfg.GeminiReferenceMode = service.ImageChannelReferenceTransport(*channel, request.Platform, 0, cfg)
+		referenceCfg.GeminiReferenceMode = service.ImageChannelReferenceTransport(*channel, request.Platform, 0, cfg)
 		var parts []dto.GeminiPart
 		if !accepted {
 			var err error
-			parts, err = buildGeminiAsyncImageParts(ctx, task, request, cfg)
+			parts, err = buildGeminiAsyncImageParts(ctx, task, request, referenceCfg)
 			if err != nil {
 				return nil, model.AsyncImageBill{}, err
 			}
 		}
-		geminiReferenceFallbackEligible = cfg.GeminiReferenceMode == "passthrough_fallback_local" && task.ReferenceRetryCount == 0 && slices.ContainsFunc(parts, func(part dto.GeminiPart) bool {
+		geminiReferenceFallbackEligible = referenceCfg.GeminiReferenceMode == "passthrough_fallback_local" && task.ReferenceRetryCount == 0 && slices.ContainsFunc(parts, func(part dto.GeminiPart) bool {
 			return part.FileData != nil
 		})
 		for _, part := range parts {
@@ -443,7 +452,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				continue
 			}
 			referenceIndex++
-			image, _, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
+			image, err := resolveAsyncImageReference(ctx, task.TokenId, part.URL, referenceCfg)
 			if err != nil {
 				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
@@ -554,22 +563,37 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if request.Platform == "openai" {
 		result, apiErr := ExecuteImageRequest(c, info, false, upstreamBeforeInvoke)
 		if apiErr != nil {
-			failure := service.ClassifyAsyncImageFailure(apiErr, apiErr.StatusCode)
 			var pending *service.AsyncImagePending
 			if errors.As(apiErr, &pending) {
 				return nil, model.AsyncImageBill{}, pending
 			}
 			var terminal *service.AsyncImageFailure
 			if errors.As(apiErr, &terminal) {
+				if terminal.UpstreamRequestID == "" {
+					terminal.UpstreamRequestID = c.GetString(asyncImageUpstreamRequestIDContextKey)
+				}
+				if terminal.HTTPStatus == 0 {
+					terminal.HTTPStatus = c.GetInt(asyncImageUpstreamStatusContextKey)
+				}
 				return nil, model.AsyncImageBill{}, terminal
 			}
+			if !dispatched && task.UpstreamTaskId == "" {
+				// Local preparation and reservation errors retain their cause so
+				// the worker can distinguish a missing cache from an uncertain debit.
+				return nil, model.AsyncImageBill{}, apiErr
+			}
+			failure := service.ClassifyAsyncImageFailure(apiErr, apiErr.StatusCode)
 			failure.RetryAfter = service.ImageRetryAfter(c.GetString("async_image_retry_after"), time.Now())
-			if dispatched {
-				switch apiErr.GetErrorCode() {
-				case types.ErrorCodeDoRequestFailed, types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponse, types.ErrorCodeBadResponseBody, types.ErrorCodeEmptyResponse:
-					failure.ExecutionUnknown = true
-					failure.Code = 608
-				}
+			upstreamHeaders := make(http.Header)
+			upstreamHeaders.Set(common.UpstreamRequestIdKey, c.GetString(asyncImageUpstreamRequestIDContextKey))
+			switch apiErr.GetErrorCode() {
+			case types.ErrorCodeDoRequestFailed:
+				failure = service.AsyncImageTransportFailure(apiErr, task, false, upstreamHeaders)
+			case types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponse, types.ErrorCodeBadResponseBody, types.ErrorCodeEmptyResponse:
+				failure = service.AsyncImageTransportFailure(apiErr, task, true, upstreamHeaders)
+			}
+			if upstreamStatus := c.GetInt(asyncImageUpstreamStatusContextKey); upstreamStatus > 0 {
+				failure.HTTPStatus = upstreamStatus
 			}
 			return nil, model.AsyncImageBill{}, failure
 		}
@@ -648,14 +672,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			response, err = adaptor.DoRequest(c, info, bytes.NewReader(body))
 		}
 		if err != nil {
-			if task.UpstreamTaskId != "" {
-				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "upstream_poll_failed", Message: "Upstream image task polling failed"}
-			}
-			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream transport failed after dispatch", ExecutionUnknown: true}
+			return nil, model.AsyncImageBill{}, service.AsyncImageTransportFailure(err, task, false, nil)
 		}
 		httpResponse, ok := response.(*http.Response)
 		if !ok || httpResponse == nil {
-			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, Message: "Upstream response is missing", ExecutionUnknown: true}
+			return nil, model.AsyncImageBill{}, service.AsyncImageTransportFailure(errors.New("upstream response is missing"), task, true, nil)
 		}
 		httpResponse.Body = struct {
 			io.Reader
@@ -677,6 +698,12 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				}
 				var failure *service.AsyncImageFailure
 				if errors.As(dynamicErr, &failure) {
+					if failure.UpstreamRequestID == "" {
+						failure.UpstreamRequestID = service.AsyncImageResponseRequestID(httpResponse.Header)
+					}
+					if failure.HTTPStatus == 0 {
+						failure.HTTPStatus = httpResponse.StatusCode
+					}
 					return nil, model.AsyncImageBill{}, failure
 				}
 				return nil, model.AsyncImageBill{}, dynamicErr
@@ -687,7 +714,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			if apiErr != nil {
 				// HTTP 200 already followed a dispatched generation. A response read
 				// or conversion failure cannot prove the request was not executed.
-				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Upstream image response could not be decoded after dispatch", ExecutionUnknown: true}
+				failure := service.AsyncImageTransportFailure(apiErr, task, true, httpResponse.Header)
+				failure.HTTPStatus = httpResponse.StatusCode
+				return nil, model.AsyncImageBill{}, failure
 			}
 			usage, ok = value.(*dto.Usage)
 			if !ok {
@@ -826,6 +855,16 @@ func recordAsyncImageUpstreamJob(ctx context.Context, task *model.AsyncImageTask
 	return model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error
 }
 
+// resolveAsyncImageReference applies the selected channel's effective input
+// limit while retaining the field index added by NewImageReferenceFailure.
+func resolveAsyncImageReference(ctx context.Context, tokenID int, reference string, cfg service.ImageRuntimeConfig) (service.ImageBytes, error) {
+	image, _, err := service.ResolveImageReference(ctx, tokenID, reference, cfg)
+	if err != nil && (strings.Contains(err.Error(), "byte limit exceeded") || err.Error() == "stored image exceeds read limit" || err.Error() == "invalid or oversized image data URI") {
+		return image, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_reference_image", Message: fmt.Sprintf("%s (reference image limit: %d bytes)", err.Error(), cfg.DownloadMaxBytes)}
+	}
+	return image, err
+}
+
 func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, cfg service.ImageRuntimeConfig) ([]dto.GeminiPart, error) {
 	parts := make([]dto.GeminiPart, 0, len(request.Parts))
 	mode := service.ResolveImageReferenceTransportMode(cfg.GeminiReferenceMode, task.ReferenceRetryCount)
@@ -844,7 +883,7 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 			parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{FileUri: part.URL}})
 			continue
 		}
-		image, _, err := service.ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
+		image, err := resolveAsyncImageReference(ctx, task.TokenId, part.URL, cfg)
 		if err != nil {
 			return nil, service.NewImageReferenceFailure(referenceIndex, err)
 		}

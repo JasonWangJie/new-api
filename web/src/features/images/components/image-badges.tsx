@@ -33,18 +33,24 @@ import {
 export function ImageStatusBadge(props: {
   status: string
   errorCode?: string | number | boolean | null
+  pendingAction?: 'retry' | 'wait'
   className?: string
 }) {
   const { t } = useTranslation()
+  const visualStatus = props.pendingAction ? 'queued' : props.status
+  let pendingLabel = ''
+  if (props.pendingAction === 'retry') pendingLabel = 'Retry scheduled'
+  if (props.pendingAction === 'wait') pendingLabel = 'Waiting'
   return (
     <Badge
-      variant={imageStatusBadgeVariant(props.status, props.errorCode)}
+      variant={imageStatusBadgeVariant(visualStatus, props.errorCode)}
       className={cn(
-        imageStatusBadgeClass(props.status, props.errorCode),
+        imageStatusBadgeClass(visualStatus, props.errorCode),
         props.className
       )}
     >
       {t(imageLabel(props.status))}
+      {pendingLabel && <span>· {t(pendingLabel)}</span>}
     </Badge>
   )
 }

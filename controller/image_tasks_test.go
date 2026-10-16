@@ -81,7 +81,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.Token{Id: 201, UserId: 101, Name: "Studio Key", Key: "token-secret-canary"}).Error)
 			require.NoError(t, db.Create(&model.Token{Id: 202, UserId: 102, Name: "Other user key", Key: "other-token-secret"}).Error)
 			require.NoError(t, db.Create(&model.Channel{Id: 301, Name: "Sunburst upstream", Key: "channel-secret-canary"}).Error)
-			attempts, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, KeyFingerprint: "fingerprint-canary", KeyIndex: 2, StartedAt: now - 40, FinishedAt: now - 10, Dispatched: true, HTTPStatus: http.StatusBadRequest, ErrorMessage: "sanitized provider detail", ProviderCode: "invalid_request", ProviderStatus: "INVALID_ARGUMENT", UpstreamRequestID: "provider-request-1"}})
+			attempts, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, KeyFingerprint: "fingerprint-canary", KeyIndex: 2, StartedAt: now - 40, FinishedAt: now - 10, Dispatched: true, HTTPStatus: http.StatusBadRequest, ErrorMessage: `{"message":"sanitized provider detail","input":"history-private-prompt"}`, ProviderCode: "invalid_request", ProviderStatus: "INVALID_ARGUMENT", UpstreamRequestID: "provider-request-1"}})
 			require.NoError(t, err)
 			task := model.AsyncImageTask{TaskId: "asyncimg_success", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "bb", RequestType: "image_to_image", Model: "gpt-image-2.5-sunburst", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 1, ResultCount: 1, CreatedAt: now - 50, StartedAt: now - 40, FinishedAt: now - 10, Attempts: string(attempts), ReferenceUrls: `["https://example.com/private-reference"]`, RequestedResolution: "2K", ActualSize: "2048x1186"}
 			require.NoError(t, db.Create(&task).Error)
@@ -92,10 +92,64 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageObject{ObjectId: "presentation-output", ProfileId: "presentation-profile", ObjectKey: "private-object-canary", Width: 2048, Height: 1186, Status: "active"}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: "presentation-output"}).Error)
+			t.Run("public image query failure semantics", func(t *testing.T) {
+				for _, tc := range []struct {
+					name, status, action, summary string
+					task                          model.AsyncImageTask
+					retryable                     bool
+				}{
+					{name: "quota_wait", status: "queued", action: "wait_local_dependency", summary: "Image quota checks are temporarily unavailable", retryable: true, task: model.AsyncImageTask{Status: model.ImageTaskQueued, ErrorCode: "quota_cache_unavailable", PublicErrorCode: 606, ErrorMessage: "Local wallet cache temporarily unavailable", NextAttemptAt: now + 10}},
+					{name: "capacity_wait", status: "queued", action: "wait_capacity", summary: "Image capacity is temporarily unavailable", retryable: true, task: model.AsyncImageTask{Status: model.ImageTaskQueued, ErrorCode: "local_capacity_busy", PublicErrorCode: 603, ErrorMessage: "Local image capacity is busy", NextAttemptAt: now + 10}},
+					{name: "material_rejected", status: "failed", summary: "Upstream rejected image input or parameters", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_job_failed", PublicErrorCode: 604, ErrorMessage: "参考图过大（25.4MB，上限 20MB）"}},
+					{name: "pending_job", status: "processing", task: model.AsyncImageTask{Status: model.ImageTaskQueued, UpstreamTaskId: "accepted", NextAttemptAt: now + 10}},
+					{name: "unknown", status: "failed", summary: "Upstream execution could not be confirmed", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_timeout", PublicErrorCode: 608, ErrorMessage: `{"error":{"message":"request timed out; Bearer private-token"},"input":"private-prompt"}`, DispatchedAt: now - 1}},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						tc.task.TaskId, tc.task.UserId, tc.task.TokenId = "public_notice_"+tc.name, 101, 201
+						if tc.action != "" {
+							decision, err := common.Marshal(service.ImageRetryDecision{Version: 1, Action: tc.action, Stage: "prepare"})
+							require.NoError(t, err)
+							tc.task.RetryDecision = string(decision)
+						}
+						require.NoError(t, db.Create(&tc.task).Error)
+						t.Cleanup(func() { assert.NoError(t, db.Delete(&tc.task).Error) })
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Set("token_id", 201)
+						c.Params = gin.Params{{Key: "task_id", Value: tc.task.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodGet, "/v1/images/tasks_async/"+tc.task.TaskId, nil)
+						QueryAsyncImage(c)
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						var response map[string]any
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						assert.Equal(t, tc.status, response["status"])
+						assert.EqualValues(t, tc.task.PublicErrorCode, response["failure_code"])
+						assert.Equal(t, tc.summary, response["error_summary"])
+						assert.Equal(t, tc.retryable, response["error_retryable"])
+						assert.Contains(t, response, "error_stage")
+						assert.NotContains(t, recorder.Body.String(), "private-token")
+						assert.NotContains(t, recorder.Body.String(), "private-prompt")
+						if tc.status == "failed" {
+							assert.EqualValues(t, tc.task.PublicErrorCode, response["error_code"])
+							assert.Equal(t, response["error_message"], response["fail_reason"])
+						} else {
+							assert.NotContains(t, response, "fail_reason")
+						}
+						if tc.name == "material_rejected" {
+							assert.Contains(t, response["fail_reason"], "上限 20MB")
+						}
+						if tc.retryable {
+							assert.NotEmpty(t, response["error_suggestion"])
+							assert.NotEmpty(t, response["error_message"])
+						}
+					})
+				}
+			})
 			t.Run("reliability and encrypted request diagnostics", func(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
-				request := service.AsyncImageRequest{Model: "image-model", Prompt: "draw 山水 Bearer credential-canary", Size: "Bearer size-secret-canary", Resolution: "api_key=resolution-secret-canary", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://example.com/ref?signature=private-url-canary"}}, ClientIP: "client-ip-canary", Billing: &service.MediaBillingSnapshot{}}
+				request := service.AsyncImageRequest{Model: "image-model", Prompt: `{"scene":"山水","note":"Bearer credential-canary"}`, Size: "Bearer size-secret-canary", Resolution: "api_key=resolution-secret-canary", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://example.com/ref?signature=private-url-canary"}}, ClientIP: "client-ip-canary", Billing: &service.MediaBillingSnapshot{}}
 				plain, err := common.Marshal(request)
 				require.NoError(t, err)
 				cipher, err := service.EncryptImagePayload(plain, "task:asyncimg_diagnostics")
@@ -116,6 +170,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
 				assert.Contains(t, recorder.Body.String(), "山水")
+				assert.Contains(t, recorder.Body.String(), `\"scene\":\"山水\"`, "retained request prompts preserve JSON-shaped user content")
 				for _, secret := range []string{"credential-canary", "size-secret-canary", "resolution-secret-canary", "private-url-canary", "client-ip-canary", "billing", "request_cipher"} {
 					assert.NotContains(t, recorder.Body.String(), secret)
 				}
@@ -438,6 +493,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Contains(t, string(history), `"provider_status":"INVALID_ARGUMENT"`)
 						assert.Contains(t, string(history), `"upstream_request_id":"provider-request-1"`)
 						assert.NotContains(t, string(history), "fingerprint-canary")
+						assert.NotContains(t, detailRecorder.Body.String(), "history-private-prompt", "both readable and legacy serialized history must redact echoed input")
 					} else {
 						assert.NotContains(t, detailRecorder.Body.String(), "Sunburst upstream")
 						assert.NotContains(t, detailRecorder.Body.String(), "routing-event-canary")
@@ -490,6 +546,64 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.Equal(t, http.StatusOK, ownerRecorder.Code, ownerRecorder.Body.String())
 			require.NoError(t, db.Where("task_id = ?", recoverable.TaskId).Take(&recoverable).Error)
 			assert.Equal(t, model.ImageTaskUpstreamSucceeded, recoverable.Status)
+			t.Run("uncertain billing requires administrator quota reconciliation", func(t *testing.T) {
+				for _, tc := range []struct {
+					name, body string
+					admin      bool
+					direct     bool
+					want       int
+				}{
+					{name: "administrator_missing_confirmation", admin: true, direct: true, body: `{}`, want: http.StatusBadRequest},
+					{name: "administrator_false_confirmation", admin: true, direct: true, body: `{"confirm_quota_reconciled":false}`, want: http.StatusBadRequest},
+					{name: "administrator_invalid_confirmation", admin: true, direct: true, body: `{"confirm_quota_reconciled":`, want: http.StatusBadRequest},
+					{name: "owner_cannot_resume", body: `{}`, want: http.StatusConflict},
+					{name: "owner_cannot_bypass_with_flag", body: `{"confirm_quota_reconciled":true}`, want: http.StatusConflict},
+					{name: "administrator_confirmed", admin: true, direct: true, body: `{"confirm_quota_reconciled":true}`, want: http.StatusOK},
+					{name: "unified_administrator_confirmed", admin: true, body: `{"confirm_quota_reconciled":true}`, want: http.StatusOK},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						uncertain := model.AsyncImageTask{TaskId: "asyncimg_billing_uncertain_" + tc.name, UserId: 101, TokenId: 201, Version: 1, Status: model.ImageTaskBillingFailed, BillingStatus: "failed", ErrorCode: "billing_quota_uncertain", ErrorMessage: "Quota mutation result needs reconciliation", PublicErrorCode: 609, UpstreamSucceededAt: now - 5, ImageCount: 1, ResultCount: 1, BillingRetryCount: 2, CreatedAt: now, ExpiresAt: now + 3600}
+						require.NoError(t, db.Create(&uncertain).Error)
+						bill := model.AsyncImageBill{TaskId: uncertain.TaskId, BillingRequestId: "uncertain-bill-" + tc.name, UserId: 101, TokenId: 201, Status: "reserved", CreatedAt: now}
+						require.NoError(t, db.Create(&bill).Error)
+						t.Cleanup(func() {
+							assert.NoError(t, db.Where("aggregate_id = ?", uncertain.TaskId).Delete(&model.ImageOutbox{}).Error)
+							assert.NoError(t, db.Where("task_id = ?", uncertain.TaskId).Delete(&model.AsyncImageEvent{}).Error)
+							assert.NoError(t, db.Delete(&bill).Error)
+							assert.NoError(t, db.Delete(&uncertain).Error)
+						})
+						assert.Equal(t, false, imageTaskDTO(uncertain, false)["can_resume"])
+						assert.Equal(t, true, imageTaskDTO(uncertain, true)["can_resume"])
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: uncertain.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+uncertain.TaskId+"/resume", strings.NewReader(tc.body))
+						if tc.direct {
+							ManageImageTask(c, "resume")
+						} else {
+							ManageMediaTask(c, tc.admin, "resume")
+						}
+						require.Equal(t, tc.want, recorder.Code, recorder.Body.String())
+						var stored model.AsyncImageTask
+						require.NoError(t, db.Where("id = ?", uncertain.Id).Take(&stored).Error)
+						var storedBill model.AsyncImageBill
+						require.NoError(t, db.Where("id = ?", bill.Id).Take(&storedBill).Error)
+						assert.Equal(t, bill, storedBill, "manual recovery must never mutate the wallet or replay billing in the HTTP handler")
+						if tc.want != http.StatusOK {
+							assert.Equal(t, uncertain, stored, "unconfirmed recovery must leave all accounting and task fields unchanged")
+							return
+						}
+						assert.Equal(t, model.ImageTaskBillingPending, stored.Status)
+						assert.Empty(t, stored.ErrorCode)
+						assert.Zero(t, stored.PublicErrorCode)
+						assert.Positive(t, stored.NextAttemptAt)
+						assert.Equal(t, uncertain.UpstreamSucceededAt, stored.UpstreamSucceededAt)
+						assert.Equal(t, uncertain.ImageCount, stored.ImageCount)
+						assert.Equal(t, uncertain.ResultCount, stored.ResultCount)
+					})
+				}
+			})
 
 			video := model.AsyncMediaJob{TaskId: "task-matrix-video", IdentityHash: "matrix-video", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", Group: "default", Status: "submitted", StorageStatus: "failed", BillingStatus: "settled", Quota: 500, CreatedAt: now, ExpiresAt: now + 3600}
 			video, reused, err := model.AcceptAsyncMediaJob(t.Context(), video)
@@ -923,6 +1037,50 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestImageTaskFailureNoticeContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, summary, suggestion, stage string
+		task                             model.AsyncImageTask
+		action, rule                     string
+		retryable                        bool
+	}{
+		{name: "material_limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 604, ErrorCode: "upstream_job_failed", ErrorMessage: "参考图过大（25.4MB，上限 20MB）", DispatchedAt: 1}, summary: "Upstream rejected image input or parameters", suggestion: "reduce the input size", stage: "submit"},
+		{name: "review_is_neutral", task: model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 601, ErrorCode: "upstream_job_failed", ErrorMessage: "guardrails detection failed", DispatchedAt: 1}, summary: "Upstream safety review did not pass", suggestion: "if the review failed unexpectedly", stage: "submit"},
+		{name: "generic_argument_not_user_fault", task: model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 610, ErrorCode: "upstream_failed", ErrorMessage: "Request contains an invalid argument.", DispatchedAt: 1}, summary: "Upstream rejected the request; the exact cause is not confirmed", suggestion: "service provider", stage: "submit"},
+		{name: "busy_recovery_committed", task: model.AsyncImageTask{Status: model.ImageTaskQueued, PublicErrorCode: 606, ErrorCode: "upstream_job_failed", ErrorMessage: "服务繁忙,请稍后重试", NextAttemptAt: 123}, action: "retry_submission", summary: "Temporary upstream image service failure", suggestion: "another submission within its retry limits", stage: "submit", retryable: true},
+		{name: "busy_no_recovery_committed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 606, ErrorCode: "upstream_job_failed", ErrorMessage: "服务繁忙,请稍后重试"}, summary: "Temporary upstream image service failure", suggestion: "service provider", stage: "routing"},
+		{name: "accepted_job_poll_only", task: model.AsyncImageTask{Status: model.ImageTaskQueued, UpstreamTaskId: "accepted", PublicErrorCode: 608, ErrorCode: "upstream_response_invalid", ErrorMessage: "poll response unavailable", NextAttemptAt: 123}, action: "poll_same_job", summary: "Upstream execution could not be confirmed", suggestion: "no new generation will be submitted", stage: "poll", retryable: true},
+		{name: "accepted_job_cannot_claim_submission", task: model.AsyncImageTask{Status: model.ImageTaskQueued, UpstreamTaskId: "accepted", PublicErrorCode: 606, ErrorCode: "upstream_failed", ErrorMessage: "transient", NextAttemptAt: 123}, action: "retry_submission", summary: "Temporary upstream image service failure", suggestion: "service provider", stage: "submit"},
+		{name: "output_processing_only", task: model.AsyncImageTask{Status: model.ImageTaskUploading, UpstreamSucceededAt: 1, PublicErrorCode: 607, ErrorCode: "upload_failed", ErrorMessage: "storage unavailable", NextAttemptAt: 123}, action: "resume_output", summary: "Image post-processing needs attention", suggestion: "generation will not be repeated", stage: "postprocess", retryable: true},
+		{name: "unknown_never_resubmits", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, PublicErrorCode: 608, ErrorCode: "upstream_transport_timeout", ErrorMessage: "timeout", DispatchedAt: 1, NextAttemptAt: 123}, action: "retry_submission", summary: "Upstream execution could not be confirmed", suggestion: "Do not submit again", stage: "submit"},
+		{name: "admin_ended_unknown_stays_conservative", task: model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 608, ErrorCode: "admin_terminated", ErrorMessage: "ended", DispatchedAt: 1}, action: "poll_same_job", rule: "recovered", summary: "Upstream execution could not be confirmed", suggestion: "Do not submit again", stage: "poll"},
+		{name: "local_quota_cache_wait", task: model.AsyncImageTask{Status: model.ImageTaskQueued, PublicErrorCode: 606, ErrorCode: "quota_cache_unavailable", ErrorMessage: "quota cache unavailable", NextAttemptAt: 123}, action: "wait_local_dependency", summary: "Image quota checks are temporarily unavailable", suggestion: "local dependency to recover before dispatch", stage: "prepare", retryable: true},
+		{name: "quota_unknown_is_local", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, PublicErrorCode: 608, ErrorCode: "quota_cache_uncertain", ErrorMessage: "quota cache uncertain"}, summary: "Image quota reservation could not be confirmed", suggestion: "reconcile the quota reservation", stage: "routing"},
+		{name: "local_capacity_wait", task: model.AsyncImageTask{Status: model.ImageTaskQueued, PublicErrorCode: 603, ErrorCode: "local_capacity_busy", ErrorMessage: "busy", NextAttemptAt: 123}, action: "wait_capacity", summary: "Image capacity is temporarily unavailable", suggestion: "waiting for capacity", stage: "routing", retryable: true},
+		{name: "expired_before_dispatch", task: model.AsyncImageTask{Status: model.ImageTaskExpired, PublicErrorCode: 608, ErrorCode: "execution_deadline", ErrorMessage: "deadline"}, summary: "Image execution deadline expired", suggestion: "expired before upstream dispatch", stage: "routing"},
+		{name: "healthy_poll_hides_old_error", task: model.AsyncImageTask{Status: model.ImageTaskQueued, UpstreamTaskId: "accepted", PublicErrorCode: 606, ErrorCode: "upstream_failed", ErrorMessage: "old poll failure", NextAttemptAt: 123}, action: "poll_same_job", rule: "upstream_pending", stage: "poll"},
+		{name: "succeeded_hides_old_error", task: model.AsyncImageTask{Status: model.ImageTaskSucceeded, PublicErrorCode: 606, ErrorCode: "upstream_failed", ErrorMessage: "old poll failure"}, stage: "routing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.action != "" {
+				decision, err := common.Marshal(service.ImageRetryDecision{Version: 1, Action: tc.action, Rule: tc.rule, Stage: tc.stage})
+				require.NoError(t, err)
+				tc.task.RetryDecision = string(decision)
+			}
+			data := imageTaskDTO(tc.task, false)
+			assert.Equal(t, tc.task.PublicErrorCode, data["failure_code"])
+			assert.Equal(t, tc.summary, data["error_summary"])
+			assert.Contains(t, data["error_suggestion"], tc.suggestion)
+			assert.Equal(t, tc.retryable, data["error_retryable"])
+			assert.Equal(t, tc.stage, data["error_stage"])
+		})
+	}
+	data := imageTaskDTO(model.AsyncImageTask{Status: model.ImageTaskFailed, PublicErrorCode: 610, ErrorMessage: `{"detail":{"message":"upstream rejected request; Bearer private-token"},"input":"private-prompt"}`}, false)
+	assert.Contains(t, data["error_message"], "upstream rejected request")
+	assert.NotContains(t, data["error_message"], "private-token")
+	assert.NotContains(t, data["error_message"], "private-prompt")
 }
 
 func TestAsyncImageExternalReferencePreview(t *testing.T) {

@@ -1242,14 +1242,25 @@ export function ImagePoolForm({
       }
     })
   }, [availableChannelIds, channelIds, poolOptions.data?.channels, t])
-  const bindings = [
-    ...new Set(config?.pools.map((pool) => pool.binding_key) || []),
-  ].flatMap((key) => {
-    const rows = config?.pools.filter((pool) => pool.binding_key === key) || []
-    const first = rows[0]
-    if (!first) return []
-    return [{ ...first, channels: rows.filter((pool) => pool.channel_id > 0) }]
-  })
+  const bindings = useMemo(() => {
+    const rowsByBinding = [
+      ...new Set(config?.pools.map((pool) => pool.binding_key) || []),
+    ].flatMap((key) => {
+      const rows =
+        config?.pools.filter((pool) => pool.binding_key === key) || []
+      const first = rows[0]
+      if (!first) return []
+      return [
+        { ...first, channels: rows.filter((pool) => pool.channel_id > 0) },
+      ]
+    })
+    const collator = new Intl.Collator('en', { numeric: true })
+    return rowsByBinding.sort(
+      (a, b) =>
+        collator.compare(a.model, b.model) ||
+        collator.compare(a.resolution, b.resolution)
+    )
+  }, [config?.pools])
   const save = async () => {
     setBusy(true)
     try {

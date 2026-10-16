@@ -17,6 +17,25 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 export const IMAGE_LABELS: Record<string, string> = {
+  prepare: 'Request preparation',
+  submit: 'Upstream submission',
+  poll: 'Polling',
+  storage: 'Saving media',
+  postprocess: 'Output processing',
+  download: 'Server download',
+  billing: 'Confirming billing',
+  scheduling: 'Scheduling',
+  routing: 'Scheduling',
+  recovery: 'Scheduling',
+  wait_local_dependency: 'Waiting',
+  routing_controls_unavailable: 'Waiting for image retry controls',
+  supplier_retry_budget_unavailable: 'Waiting for image retry controls',
+  quota_cache_unavailable: 'Image quota checks are temporarily unavailable',
+  quota_cache_reservation_unknown:
+    'Image quota reservation could not be confirmed',
+  quota_confirmation_unknown: 'Image quota reservation could not be confirmed',
+  quota_confirmed: 'Resolved',
+  local_capacity_busy: 'Image capacity is temporarily unavailable',
   initial_submission: 'First submission',
   same_account_retry: 'Retry same account',
   switch_account: 'Switch account',

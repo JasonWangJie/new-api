@@ -252,6 +252,7 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 			if includeAttempts {
 				history := make([]gin.H, 0, len(histories[task.TaskId]))
 				for _, attempt := range histories[task.TaskId] {
+					attempt = service.SanitizeAsyncImageAttempt(attempt)
 					history = append(history, gin.H{
 						"channel_name":             channelNames[attempt.ChannelId],
 						"key_index":                attempt.KeyIndex,
@@ -282,6 +283,14 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	displayStatus := task.DisplayStatus()
 	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(displayStatus), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": displayStatus, "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
+	if task.ErrorCode == "billing_quota_uncertain" && !admin {
+		data["can_resume"] = false
+	}
+	notice := service.ImageTaskFailureNotice(task)
+	data["failure_code"] = task.PublicErrorCode
+	data["error_message"] = service.SanitizeAsyncImageDiagnostic(task.ErrorMessage, common.LocalLogContentLimit)
+	data["error_summary"], data["error_suggestion"] = notice.Summary, notice.Suggestion
+	data["error_retryable"], data["error_stage"] = notice.Retryable, notice.Stage
 	if task.ResultSource != "" {
 		data["result_source"] = task.ResultSource
 	}
@@ -297,7 +306,16 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 		data["request_retain_until"] = task.RequestRetainUntil
 		data["user_id"] = task.UserId
 		data["channel_id"] = task.ChannelId
-		data["attempts"] = task.Attempts
+		data["attempts"] = ""
+		var attempts []service.ImageChannelAttempt
+		if common.UnmarshalJsonStr(task.Attempts, &attempts) == nil {
+			for i := range attempts {
+				attempts[i] = service.SanitizeAsyncImageAttempt(attempts[i])
+			}
+			if encoded, err := common.Marshal(attempts); err == nil {
+				data["attempts"] = string(encoded)
+			}
+		}
 		data["reference_urls"] = task.ReferenceUrls
 		data["can_terminate"] = !task.Terminal() || task.Status == model.ImageTaskExecutionUnknown
 		data["reconciliation_status"] = task.ReconciliationStatus
@@ -327,17 +345,17 @@ func GetImageRetainedRequest(c *gin.Context) {
 	// Existing masking removes credential patterns and reference URL secrets.
 	const maxPromptRunes = 65536
 	imageManagementData(c, gin.H{"task_id": task.TaskId, "retain_until": task.RequestRetainUntil, "request": gin.H{
-		"model":             service.SanitizeAsyncImageDiagnostic(request.Model, 256),
-		"prompt":            service.SanitizeAsyncImageDiagnostic(request.Prompt, maxPromptRunes),
+		"model":             service.SanitizeAsyncImageText(request.Model, 256),
+		"prompt":            service.SanitizeAsyncImageText(request.Prompt, maxPromptRunes),
 		"prompt_characters": utf8.RuneCountInString(request.Prompt),
 		"prompt_bytes":      len(request.Prompt),
 		"prompt_truncated":  utf8.RuneCountInString(request.Prompt) > maxPromptRunes,
-		"platform":          service.SanitizeAsyncImageDiagnostic(request.Platform, 64),
-		"kind":              service.SanitizeAsyncImageDiagnostic(request.Kind, 64),
+		"platform":          service.SanitizeAsyncImageText(request.Platform, 64),
+		"kind":              service.SanitizeAsyncImageText(request.Kind, 64),
 		"count":             request.Count,
-		"size":              service.SanitizeAsyncImageDiagnostic(request.Size, 128),
-		"resolution":        service.SanitizeAsyncImageDiagnostic(request.Resolution, 64),
-		"aspect_ratio":      service.SanitizeAsyncImageDiagnostic(request.AspectRatio, 64),
+		"size":              service.SanitizeAsyncImageText(request.Size, 128),
+		"resolution":        service.SanitizeAsyncImageText(request.Resolution, 64),
+		"aspect_ratio":      service.SanitizeAsyncImageText(request.AspectRatio, 64),
 		"reference_count":   request.ReferenceImageCount(),
 	}})
 }
@@ -558,7 +576,18 @@ func ManageImageTask(c *gin.Context, action string) {
 	}
 	var err error
 	if action == "resume" {
-		err = model.ResumeAsyncImageTask(c.Request.Context(), task)
+		if task.ErrorCode == "billing_quota_uncertain" {
+			var confirmation struct {
+				QuotaReconciled bool `json:"confirm_quota_reconciled"`
+			}
+			if decodeErr := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &confirmation); decodeErr != nil || !confirmation.QuotaReconciled {
+				imageManagementError(c, http.StatusBadRequest, errors.New("Confirm the quota reservation has been reconciled before resuming billing"))
+				return
+			}
+			err = model.ResumeAsyncImageTaskAfterQuotaReconciliation(c.Request.Context(), task)
+		} else {
+			err = model.ResumeAsyncImageTask(c.Request.Context(), task)
+		}
 	} else if task.Status == model.ImageTaskExecutionUnknown {
 		var confirmation struct {
 			UpstreamChecked bool `json:"confirm_upstream_checked"`

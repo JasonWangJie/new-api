@@ -316,7 +316,11 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 	})
 	if err != nil {
 		if !commitAttempted {
-			cached.compensate()
+			if compensationErr := cached.compensate(); compensationErr != nil {
+				return fmt.Errorf("%w: settlement: %v; compensation: %v", ErrImageQuotaCacheUncertain, err, compensationErr)
+			}
+		} else {
+			return fmt.Errorf("%w: settlement commit: %v", ErrImageQuotaCacheUncertain, err)
 		}
 		return err
 	}

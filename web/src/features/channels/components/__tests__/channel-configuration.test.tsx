@@ -1351,6 +1351,74 @@ test('restores a channel reference transport override and saves global inheritan
   ).not.toHaveProperty('image_reference_transport_mode')
 })
 
+test('channel image execution limits restore, update and clear to inherited defaults', async () => {
+  editingChannel = {
+    ...editingChannel,
+    setting: JSON.stringify({
+      image_max_reference_bytes: 8388608,
+      image_attempt_timeout_seconds: 120,
+      image_concurrency_limit: 3,
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const bytes = screen.getByRole('spinbutton', {
+    name: 'Maximum reference image bytes',
+  })
+  const timeout = screen.getByRole('spinbutton', {
+    name: 'Image attempt timeout (seconds)',
+  })
+  const concurrency = screen.getByRole('spinbutton', {
+    name: 'Image channel concurrency',
+  })
+  expect(bytes).toHaveValue(8388608)
+  expect(timeout).toHaveValue(120)
+  expect(concurrency).toHaveValue(3)
+  fireEvent.change(bytes, { target: { value: '4194304' } })
+  fireEvent.change(timeout, { target: { value: '90' } })
+  await user.clear(concurrency)
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const setting = JSON.parse(
+    (put.mock.calls[0][1] as { setting: string }).setting
+  )
+  expect(setting.image_max_reference_bytes).toBe(4194304)
+  expect(setting.image_attempt_timeout_seconds).toBe(90)
+  expect(setting).not.toHaveProperty('image_concurrency_limit')
+})
+
+test.each([
+  { label: 'Maximum reference image bytes', value: '67108865' },
+  { label: 'Image attempt timeout (seconds)', value: '86401' },
+  { label: 'Image channel concurrency', value: '0' },
+])(
+  'channel rejects an out-of-range $label without submitting',
+  async ({ label, value }) => {
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    render(<ConfigurationHarness currentRow={editingChannel} />)
+    await screen.findByDisplayValue('Existing channel')
+    await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+    fireEvent.change(screen.getByRole('spinbutton', { name: label }), {
+      target: { value },
+    })
+    await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+    expect(
+      await screen.findByText(
+        'Image limit must be a positive whole number within the allowed range'
+      )
+    ).toBeVisible()
+    expect(put).not.toHaveBeenCalled()
+  }
+)
+
 test('saves an actual video seconds path in channel settings', async () => {
   editingChannel = {
     ...editingChannel,

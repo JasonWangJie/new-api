@@ -323,7 +323,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	}
 	if cfg.CircuitBreaker || cfg.AccountCooldownSeconds > 0 {
 		if common.RDB == nil {
-			return nil, ImageAccount{}, errors.New("Redis is required for image retry controls")
+			return nil, ImageAccount{}, ErrImageLocalControlsUnavailable
 		}
 		if cfg.AccountCooldownSeconds > 0 && len(channels) > 0 {
 			fingerprints := make([]string, 0)
@@ -337,7 +337,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 			if len(cooldownKeys) > 0 {
 				states, err := common.RDB.MGet(ctx, cooldownKeys...).Result()
 				if err != nil {
-					return nil, ImageAccount{}, err
+					return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 				}
 				routing.Cooling = make(map[string]bool)
 				for i, state := range states {
@@ -353,7 +353,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 						return nil
 					})
 					if err != nil {
-						return nil, ImageAccount{}, err
+						return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 					}
 					delay := time.Hour * 24
 					for _, command := range ttlCommands {
@@ -369,7 +369,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		for _, channel := range channels {
 			allowed, err := ImageCircuitAllows(ctx, "async", channel.Id, cfg)
 			if err != nil {
-				return nil, ImageAccount{}, err
+				return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 			}
 			if allowed {
 				available = append(available, channel)
@@ -379,6 +379,36 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	}
 	if len(channels) == 0 {
 		return nil, ImageAccount{}, errors.New("no eligible image account in the selected pool")
+	}
+	// Prefer a channel with room before applying priority and weight. The worker
+	// still acquires its slot atomically, so this snapshot never authorizes a
+	// submission or bypasses the final concurrency check.
+	if common.RDB != nil {
+		counts := make([]*redis.IntCmd, 0, len(channels))
+		_, err := common.RDB.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			for _, channel := range channels {
+				counts = append(counts, pipe.ZCount(ctx, ImageChannelConcurrencyKey(channel.Id), strconv.FormatInt(time.Now().Unix()+1, 10), "+inf"))
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
+		}
+		available := make([]model.Channel, 0, len(channels))
+		for i, channel := range channels {
+			limit := cfg.ImageConcurrency
+			settings := channel.GetSetting()
+			if settings.ImageConcurrencyLimit != nil && *settings.ImageConcurrencyLimit > 0 {
+				limit = min(limit, *settings.ImageConcurrencyLimit)
+			}
+			if counts[i].Val() < int64(limit) {
+				available = append(available, channel)
+			}
+		}
+		if len(available) == 0 {
+			return nil, ImageAccount{}, ErrImageLocalCapacityBusy
+		}
+		channels = available
 	}
 	// Prefer another healthy compatible account after a transient rejection.
 	// A pool with no alternative retains its bounded same-account retry path.
@@ -534,7 +564,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	}
 	if legacy {
 		routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
-		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606) {
+		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches {
@@ -561,7 +591,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 	}
 	// Prefer another account only after a completed transient rejection.
-	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606) {
+	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches {

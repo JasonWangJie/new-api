@@ -13,6 +13,40 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestChannelImageExecutionSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{"inherit", `{}`, true},
+		{"configured", `{"image_max_reference_bytes":20971520,"image_attempt_timeout_seconds":600,"image_concurrency_limit":8}`, true},
+		{"zero bytes", `{"image_max_reference_bytes":0}`, false},
+		{"oversized bytes", `{"image_max_reference_bytes":67108865}`, false},
+		{"negative timeout", `{"image_attempt_timeout_seconds":-1}`, false},
+		{"oversized timeout", `{"image_attempt_timeout_seconds":86401}`, false},
+		{"zero capacity", `{"image_concurrency_limit":0}`, false},
+		{"oversized capacity", `{"image_concurrency_limit":10001}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var settings ChannelSettings
+			require.NoError(t, kitutil.Unmarshal([]byte(tc.input), &settings))
+			if tc.valid {
+				require.NoError(t, settings.ValidateImageGeneration())
+			} else {
+				require.Error(t, settings.ValidateImageGeneration())
+			}
+			if tc.name == "inherit" {
+				encoded, err := kitutil.Marshal(settings)
+				require.NoError(t, err)
+				assert.NotContains(t, string(encoded), "image_max_reference_bytes")
+				assert.NotContains(t, string(encoded), "image_attempt_timeout_seconds")
+				assert.NotContains(t, string(encoded), "image_concurrency_limit")
+			}
+		})
+	}
+}
+
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

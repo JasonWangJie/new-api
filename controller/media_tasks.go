@@ -269,7 +269,7 @@ func GetMediaTask(c *gin.Context, admin bool) {
 				}
 				view["request_parameters"] = details.RequestParameters
 				if prompt, ok := details.RequestParameters["prompt"].(string); ok {
-					view["prompt_summary"] = service.SanitizeAsyncImageDiagnostic(prompt, 512)
+					view["prompt_summary"] = service.SanitizeAsyncImageText(prompt, 512)
 				}
 			}
 		}
@@ -290,6 +290,10 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		var task model.AsyncImageTask
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", c.Param("task_id"), c.GetInt("id")).Take(&task).Error; err != nil {
 			imageManagementError(c, 404, errors.New("Image task was not found"))
+			return
+		}
+		if task.ErrorCode == "billing_quota_uncertain" {
+			imageManagementError(c, http.StatusConflict, errors.New("Quota reservation reconciliation by an administrator is required before resuming billing"))
 			return
 		}
 		if err := model.ResumeAsyncImageTask(c.Request.Context(), task); err != nil {

@@ -34,14 +34,14 @@ const PROCESSING_STATUSES = new Set([
   'upstream_succeeded',
   'uploading',
   'billing_pending',
-  'storage_failed',
-  'billing_failed',
 ])
 
 const FAILED_STATUSES = new Set([
   'failed',
   'expired',
   'execution_unknown',
+  'storage_failed',
+  'billing_failed',
 ])
 
 export function imageStatusBadgeClass(

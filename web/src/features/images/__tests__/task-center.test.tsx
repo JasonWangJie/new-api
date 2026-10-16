@@ -41,7 +41,11 @@ import {
   imageRequest,
 } from '../api'
 import { ImageTaskDetails } from '../components/image-task-details'
-import { imageTaskSuccessRate } from '../lib/task-presentation'
+import {
+  imageTaskIssue,
+  imageTaskProgress,
+  imageTaskSuccessRate,
+} from '../lib/task-presentation'
 import { ImageTaskCenter } from '../task-center'
 import type {
   ImageTask,
@@ -105,6 +109,8 @@ const task: ImageTask = {
       dispatched: true,
       reference_mode: 'local',
       error_code: 503,
+      http_status: 503,
+      error_message: 'Upstream image service temporarily unavailable',
     },
   ],
   retry_count: 1,
@@ -319,6 +325,362 @@ afterEach(() => {
   clients.length = 0
   useAuthStore.getState().auth.reset()
 })
+
+test.each([false, true])(
+  'final failures show their explanation and refund without stale progress (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        {
+          ...task,
+          status: 'failed',
+          billing_status: 'refunded',
+          error_code: 'upstream_failed',
+          error_message: 'Reference image exceeds the upstream 20MB limit.',
+          failure_code: 610,
+          error_summary:
+            'Upstream rejected the request; the exact cause is not confirmed',
+          error_suggestion:
+            'Ask the service provider to check the request format, model compatibility, and upstream request ID.',
+          error_retryable: false,
+          error_stage: 'submit',
+        },
+      ],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter />)
+    expect(
+      await screen.findByText(
+        'Upstream rejected the request; the exact cause is not confirmed'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByText('Reference image exceeds the upstream 20MB limit.')
+    ).toBeVisible()
+    expect(
+      screen.getByText(
+        'Ask the service provider to check the request format, model compatibility, and upstream request ID.'
+      )
+    ).toBeVisible()
+    expect(screen.getAllByText(/Refunded/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/20%/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+  }
+)
+
+test.each([
+  {
+    action: 'retry_submission',
+    rule: 'upstream_failed',
+    retryable: true,
+    visible: true,
+  },
+  {
+    action: 'poll_same_job',
+    rule: 'upstream_failed',
+    retryable: true,
+    visible: true,
+  },
+  {
+    action: 'poll_same_job',
+    rule: 'upstream_pending',
+    retryable: true,
+    visible: false,
+  },
+  {
+    action: 'manual_recovery',
+    rule: 'quota_cache_reservation_unknown',
+    retryable: false,
+    visible: true,
+  },
+])(
+  '$action/$rule shows only actual recovery and preserves accepted-job polling semantics',
+  async ({ action, rule, retryable, visible }) => {
+    const message = 'Previous upstream diagnostic'
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        {
+          ...task,
+          status: 'queued',
+          error_code: 'upstream_failed',
+          error_message: message,
+          error_retryable: retryable,
+          next_attempt_at: 1789600040,
+          retry_decision: {
+            version: 1,
+            stage: 'poll',
+            action,
+            reason: 'temporary_failure',
+            rule,
+            used: 1,
+            limit: 2,
+            total_used: 1,
+            total_limit: 4,
+            recorded_at: 1789600009,
+          },
+        },
+      ],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    if (!visible) {
+      expect(screen.queryByText(message)).not.toBeInTheDocument()
+      expect(screen.queryByText('Next retry')).not.toBeInTheDocument()
+      return
+    }
+    expect(screen.getByText(message)).toBeVisible()
+    if (!retryable) {
+      expect(screen.queryByText('Next retry')).not.toBeInTheDocument()
+      return
+    }
+    expect(screen.getByText('Next retry')).toBeVisible()
+    expect(screen.getByText('Total retries')).toBeVisible()
+    if (action === 'poll_same_job') {
+      expect(
+        screen.getByText(
+          'The existing upstream job will be checked again; no new generation will be submitted.'
+        )
+      ).toBeVisible()
+      expect(
+        screen.queryByText(
+          'The task is scheduled for another submission within its retry limits.'
+        )
+      ).not.toBeInTheDocument()
+    }
+  }
+)
+
+test.each([
+  'failed',
+  'expired',
+  'execution_unknown',
+  'storage_failed',
+  'billing_failed',
+  'succeeded',
+])(
+  '%s never shows a stale generation percentage or hides a final issue behind an old healthy poll',
+  (status) => {
+    const finalTask: ImageTask = {
+      ...task,
+      status,
+      error_code: 'old_diagnostic',
+      error_message: 'Stored diagnostic',
+      retry_decision: {
+        version: 1,
+        stage: 'poll',
+        action: 'poll_same_job',
+        reason: 'accepted_job',
+        rule: 'upstream_pending',
+        used: 0,
+        limit: 0,
+        total_used: 0,
+        total_limit: 4,
+        recorded_at: 1,
+      },
+    }
+    expect(imageTaskProgress(finalTask)).toBeNull()
+    if (status === 'succeeded') expect(imageTaskIssue(finalTask)).toBeNull()
+    else expect(imageTaskIssue(finalTask)).not.toBeNull()
+  }
+)
+
+test('public details separate a translated explanation from expandable upstream diagnostics', async () => {
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    results: [],
+    task: {
+      ...task,
+      status: 'failed',
+      billing_status: 'refunded',
+      error_code: 'upstream_failed',
+      failure_code: 610,
+      error_summary:
+        'Upstream rejected the request; the exact cause is not confirmed',
+      error_suggestion:
+        'Ask the service provider to check the request format, model compatibility, and upstream request ID.',
+      error_message: 'Request contains an invalid argument.',
+      error_stage: 'submit',
+      error_retryable: false,
+    },
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin={false}
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  expect(
+    await screen.findByText(
+      'Upstream rejected the request; the exact cause is not confirmed'
+    )
+  ).toBeVisible()
+  expect(screen.getByText('Upstream submission')).toBeVisible()
+  expect(
+    screen.queryByText('Request contains an invalid argument.')
+  ).not.toBeInTheDocument()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Upstream diagnostic' }))
+  expect(
+    screen.getByText('Request contains an invalid argument.')
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: /Attempt history/ })
+  ).not.toBeInTheDocument()
+})
+
+test('local routing dependency waits show readable decision and stage labels in public details', async () => {
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    results: [],
+    task: {
+      ...task,
+      status: 'queued',
+      error_code: 'routing_controls_unavailable',
+      error_message: 'Image routing controls are temporarily unavailable',
+      error_stage: 'routing',
+      error_retryable: true,
+      next_attempt_at: 1789600040,
+      retry_decision: {
+        version: 1,
+        stage: 'routing',
+        action: 'wait_local_dependency',
+        reason: 'routing_controls_unavailable',
+        rule: 'routing_controls_unavailable',
+        used: 0,
+        limit: 0,
+        total_used: 0,
+        total_limit: 4,
+        recorded_at: 1789600009,
+      },
+    },
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin={false}
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  expect(
+    await screen.findByText('Waiting for image retry controls')
+  ).toBeVisible()
+  expect(screen.getByText('Scheduling')).toBeVisible()
+  expect(
+    screen.queryByText('routing_controls_unavailable')
+  ).not.toBeInTheDocument()
+})
+
+test.each([false, true])(
+  'quota uncertainty prevents ordinary user recovery in lists and details (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const paused = {
+      ...task,
+      status: 'billing_failed',
+      error_code: 'billing_quota_uncertain',
+      can_resume: true,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [paused],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: paused,
+      results: [],
+    })
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    expect(
+      screen.queryByRole('button', { name: 'Resume' })
+    ).not.toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: task.id }))
+    const details = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    await within(details).findByText('Studio key')
+    expect(
+      screen.queryByRole('button', { name: 'Resume' })
+    ).not.toBeInTheDocument()
+    expect(imageRequest).not.toHaveBeenCalled()
+  }
+)
+
+test.each([
+  { source: 'list', code: 'billing_quota_uncertain', confirmQuota: true },
+  { source: 'details', code: 'billing_quota_uncertain', confirmQuota: true },
+  { source: 'list', code: 'storage_failed', confirmQuota: false },
+])(
+  'administrator quota uncertainty recovery requires explicit confirmation without changing ordinary post-processing recovery ($source/$code)',
+  async ({ source, code, confirmQuota }) => {
+    const paused = {
+      ...task,
+      status: 'billing_failed',
+      error_code: code,
+      can_resume: true,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [paused],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: paused,
+      results: [],
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    const user = userEvent.setup()
+    if (source === 'details') {
+      await user.click(screen.getByRole('button', { name: task.id }))
+      await screen.findByRole('dialog', { name: 'Media task details' })
+    }
+    await user.click(await screen.findByRole('button', { name: 'Resume' }))
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Resume media post-processing',
+    })
+    if (confirmQuota) {
+      expect(
+        within(confirmation).getByText(
+          /Ask an administrator to reconcile the quota reservation before trying again\./
+        )
+      ).toBeVisible()
+    } else {
+      expect(
+        within(confirmation).queryByText(/Ask an administrator to reconcile/)
+      ).not.toBeInTheDocument()
+    }
+    expect(imageRequest).not.toHaveBeenCalled()
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        `/api/admin/media-tasks/${task.id}/resume`,
+        'POST',
+        confirmQuota ? { confirm_quota_reconciled: true } : {}
+      )
+    )
+  }
+)
 
 test.each([
   { admin: false, mobile: false },
@@ -1287,6 +1649,10 @@ test('admin details show named attempts and generated images without rendering r
   await user.click(screen.getByRole('button', { name: /Attempt history/ }))
   expect(await screen.findByText('Previous upstream')).toBeVisible()
   expect(screen.getByText('Account slot 3')).toBeVisible()
+  expect(screen.getByText('HTTP status: 503')).toBeVisible()
+  expect(
+    screen.getByText('Upstream image service temporarily unavailable')
+  ).toBeVisible()
   expect(screen.getByText('Studio key')).toBeVisible()
   expect(
     screen.queryByText('secret-fingerprint-canary')

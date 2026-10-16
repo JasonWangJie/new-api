@@ -73,12 +73,16 @@ import { ImageReliabilityPanel } from './components/image-reliability-panel'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
+import { ImageTaskNotice } from './components/image-task-notice'
 import { ImageTaskRefreshActions } from './components/image-task-refresh-actions'
 import { imageLabel } from './lib/image-labels'
 import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
   imageTaskSuccessRate,
+  imageTaskIssue,
+  imageTaskProgress,
+  imageTaskCanResume,
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
 
@@ -153,6 +157,7 @@ function TaskCenterSession({
     ids: string[]
     action: 'resume' | 'terminate' | 'batch-terminate'
     confirmUpstreamChecked?: boolean
+    confirmQuotaReconciled?: boolean
   } | null>(null)
   const [busy, setBusy] = useState(false)
   const params = new URLSearchParams({
@@ -317,18 +322,28 @@ function TaskCenterSession({
         header: ({ column }) => (
           <DataTableColumnHeader column={column} title={t('Status')} />
         ),
-        cell: ({ row }) => (
-          <div className='space-y-1'>
-            <ImageStatusBadge
-              status={row.original.status}
-              errorCode={row.original.error_code}
-            />
-            <p className='text-muted-foreground text-xs'>
-              {row.original.progress}% ·{' '}
-              {t(imageLabel(row.original.billing_status))}
-            </p>
-          </div>
-        ),
+        cell: ({ row }) => {
+          const issue = imageTaskIssue(row.original)
+          const progress = imageTaskProgress(row.original)
+          return (
+            <div className={cn('space-y-2', issue && 'min-w-60 max-w-80')}>
+              <ImageStatusBadge
+                status={row.original.status}
+                errorCode={
+                  issue && !issue.pendingAction
+                    ? row.original.error_code
+                    : undefined
+                }
+                pendingAction={issue?.pendingAction}
+              />
+              <p className='text-muted-foreground text-xs'>
+                {progress !== null && <>{progress}% · </>}
+                {t(imageLabel(row.original.billing_status))}
+              </p>
+              <ImageTaskNotice task={row.original} />
+            </div>
+          )
+        },
         size: 108,
       },
       {
@@ -420,12 +435,18 @@ function TaskCenterSession({
               <Eye className='size-3.5' aria-hidden />
               {t('View')}
             </Button>
-            {(canManage || !admin) && row.original.can_resume && (
+            {imageTaskCanResume(row.original, admin, canManage) && (
               <Button
                 size='sm'
                 variant='outline'
                 onClick={() =>
-                  setOperation({ ids: [row.original.id], action: 'resume' })
+                  setOperation({
+                    ids: [row.original.id],
+                    action: 'resume',
+                    confirmQuotaReconciled:
+                      admin &&
+                      row.original.error_code === 'billing_quota_uncertain',
+                  })
                 }
               >
                 {t('Resume')}
@@ -546,12 +567,21 @@ function TaskCenterSession({
           )
         }
       } else {
+        const body: Record<string, boolean> = {}
+        if (operation.confirmUpstreamChecked) {
+          body.confirm_upstream_checked = true
+        }
+        if (
+          admin &&
+          operation.action === 'resume' &&
+          operation.confirmQuotaReconciled
+        ) {
+          body.confirm_quota_reconciled = true
+        }
         await imageRequest(
           `${mediaTasksPath(admin)}/${operation.ids[0]}/${operation.action}`,
           'POST',
-          operation.confirmUpstreamChecked
-            ? { confirm_upstream_checked: true }
-            : {}
+          body
         )
       }
       await queryClient.invalidateQueries({
@@ -581,6 +611,9 @@ function TaskCenterSession({
     confirmationDescription = t(
       'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
     )
+    if (operation.confirmQuotaReconciled) {
+      confirmationDescription = `${t('Ask an administrator to reconcile the quota reservation before trying again.')} ${confirmationDescription}`
+    }
   }
   function applyFilters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -1039,8 +1072,17 @@ function TaskCenterSession({
               userId={userId}
               onClose={() => setDetail('')}
               canManage={canManage}
-              onManage={(action, confirmUpstreamChecked) =>
-                setOperation({ ids: [detail], action, confirmUpstreamChecked })
+              onManage={(
+                action,
+                confirmUpstreamChecked,
+                confirmQuotaReconciled
+              ) =>
+                setOperation({
+                  ids: [detail],
+                  action,
+                  confirmUpstreamChecked,
+                  confirmQuotaReconciled,
+                })
               }
             />
           )}

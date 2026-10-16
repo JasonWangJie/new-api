@@ -15,6 +15,9 @@ type ChannelSettings struct {
 	ForceFormat                 bool   `json:"force_format,omitempty"`
 	ThinkingToContent           bool   `json:"thinking_to_content,omitempty"`
 	ImageMaxReferenceImages     *int   `json:"image_max_reference_images,omitempty"`
+	ImageMaxReferenceBytes      *int64 `json:"image_max_reference_bytes,omitempty"`
+	ImageAttemptTimeoutSeconds  *int   `json:"image_attempt_timeout_seconds,omitempty"`
+	ImageConcurrencyLimit       *int   `json:"image_concurrency_limit,omitempty"`
 	ImageReferenceTransportMode string `json:"image_reference_transport_mode,omitempty"`
 	Proxy                       string `json:"proxy"`
 	PassThroughBodyEnabled      bool   `json:"pass_through_body_enabled,omitempty"`
@@ -36,6 +39,15 @@ func (s *ChannelSettings) ValidateImageGeneration() error {
 	}
 	if s.ImageMaxReferenceImages != nil && (*s.ImageMaxReferenceImages < 0 || *s.ImageMaxReferenceImages > MaxImageN) {
 		return fmt.Errorf("invalid image_max_reference_images: %d", *s.ImageMaxReferenceImages)
+	}
+	if s.ImageMaxReferenceBytes != nil && (*s.ImageMaxReferenceBytes <= 0 || *s.ImageMaxReferenceBytes > 64<<20) {
+		return fmt.Errorf("invalid image_max_reference_bytes: %d", *s.ImageMaxReferenceBytes)
+	}
+	if s.ImageAttemptTimeoutSeconds != nil && (*s.ImageAttemptTimeoutSeconds <= 0 || *s.ImageAttemptTimeoutSeconds > 86400) {
+		return fmt.Errorf("invalid image_attempt_timeout_seconds: %d", *s.ImageAttemptTimeoutSeconds)
+	}
+	if s.ImageConcurrencyLimit != nil && (*s.ImageConcurrencyLimit <= 0 || *s.ImageConcurrencyLimit > 10000) {
+		return fmt.Errorf("invalid image_concurrency_limit: %d", *s.ImageConcurrencyLimit)
 	}
 	switch s.ImageReferenceTransportMode {
 	case "", "passthrough", "local", "passthrough_fallback_local":

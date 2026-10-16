@@ -56,6 +56,9 @@ const CONFIGURATION_BLOCKS = {
       'weight',
       'image_max_reference_images',
       'image_reference_transport_mode',
+      'image_max_reference_bytes',
+      'image_attempt_timeout_seconds',
+      'image_concurrency_limit',
       'test_model',
       'auto_ban',
     ],
@@ -151,6 +154,9 @@ export function getChannelConfigurationState(
     modelMapping: hasConfiguredJson(values.model_mapping),
     routingStrategy: Boolean(
       values.image_reference_transport_mode ||
+      values.image_max_reference_bytes ||
+      values.image_attempt_timeout_seconds ||
+      values.image_concurrency_limit ||
       values.priority ||
       values.weight ||
       (values.image_max_reference_images ??

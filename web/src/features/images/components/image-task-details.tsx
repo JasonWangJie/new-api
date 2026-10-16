@@ -47,6 +47,8 @@ import { imageDetailHeaderClass } from '../lib/image-visuals'
 import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
+  imageTaskIssue,
+  imageTaskCanResume,
 } from '../lib/task-presentation'
 import type { ImageRetryDecision, ImageTask } from '../types'
 import {
@@ -55,6 +57,7 @@ import {
   ImageStatusBadge,
 } from './image-badges'
 import { ImageResults } from './image-results'
+import { ImageTaskNotice } from './image-task-notice'
 import { VideoResults } from './video-results'
 
 function TaskDetailFields(props: {
@@ -228,7 +231,8 @@ export function ImageTaskDetails(props: {
   canManage: boolean
   onManage: (
     action: 'resume' | 'terminate',
-    confirmUpstreamChecked?: boolean
+    confirmUpstreamChecked?: boolean,
+    confirmQuotaReconciled?: boolean
   ) => void
 }) {
   const { t } = useTranslation()
@@ -315,8 +319,9 @@ export function ImageTaskDetails(props: {
       ? JSON.stringify(data.request_parameters, null, 2)
       : ''
   const attempts = props.admin ? data?.attempt_history || [] : []
+  const issue = data ? imageTaskIssue(data) : null
   const canResume = Boolean(
-    data?.can_resume && (props.canManage || !props.admin)
+    data && imageTaskCanResume(data, props.admin, props.canManage)
   )
   const canTerminate = Boolean(
     data?.can_terminate &&
@@ -355,7 +360,10 @@ export function ImageTaskDetails(props: {
               <div className='flex flex-wrap items-center gap-2'>
                 <ImageStatusBadge
                   status={data.status}
-                  errorCode={data.error_code}
+                  errorCode={
+                    issue && !issue.pendingAction ? data.error_code : undefined
+                  }
+                  pendingAction={issue?.pendingAction}
                 />
                 <ImagePlatformBadge platform={data.platform} />
                 <ImageRequestTypeBadge requestType={data.request_type} />
@@ -366,7 +374,13 @@ export function ImageTaskDetails(props: {
                     <Button
                       size='sm'
                       variant='outline'
-                      onClick={() => props.onManage('resume')}
+                      onClick={() => {
+                        if (data.error_code === 'billing_quota_uncertain') {
+                          props.onManage('resume', undefined, true)
+                        } else {
+                          props.onManage('resume')
+                        }
+                      }}
                     >
                       {t('Resume')}
                     </Button>
@@ -416,15 +430,7 @@ export function ImageTaskDetails(props: {
                 {data.prompt_summary}
               </p>
             )}
-            {data.error_message && (
-              <div
-                role='status'
-                className='text-destructive border-destructive/20 bg-destructive/5 space-y-1 rounded-lg border p-3 text-sm'
-              >
-                <p className='text-xs font-medium'>{t('Failure reason')}</p>
-                <p className='break-words'>{data.error_message}</p>
-              </div>
-            )}
+            <ImageTaskNotice task={data} diagnostics />
             {references.length > 0 && (
               <div className='space-y-2'>
                 <div className='flex items-center justify-between gap-2'>
@@ -816,6 +822,22 @@ export function ImageTaskDetails(props: {
                           id: 'error_code',
                           header: t('Error code'),
                           cell: (attempt) => attempt.error_code || '—',
+                        },
+                        {
+                          id: 'error_message',
+                          header: t('Failure reason'),
+                          cell: (attempt) => (
+                            <div className='max-w-96 min-w-48 space-y-1 wrap-anywhere whitespace-normal'>
+                              {attempt.http_status ? (
+                                <p>
+                                  {t('HTTP status')}: {attempt.http_status}
+                                </p>
+                              ) : null}
+                              <p className='whitespace-pre-wrap'>
+                                {attempt.error_message || '—'}
+                              </p>
+                            </div>
+                          ),
                         },
                         {
                           id: 'reference_mode',

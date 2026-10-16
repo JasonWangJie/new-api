@@ -11,6 +11,11 @@ import (
 	"gorm.io/gorm"
 )
 
+var (
+	ErrImageQuotaCacheUnavailable = errors.New("image quota cache is temporarily unavailable")
+	ErrImageQuotaCacheUncertain   = errors.New("image quota reservation could not be confirmed")
+)
+
 // Image reservations share the live quota cache with ordinary relays. A cache
 // miss during batch updates cannot safely be hydrated from a stale DB balance.
 func prepareAsyncImageQuotaCaches(ctx context.Context, userID, tokenID int) error {
@@ -18,7 +23,7 @@ func prepareAsyncImageQuotaCaches(ctx context.Context, userID, tokenID int) erro
 		return nil
 	}
 	if common.RDB == nil {
-		return errors.New("image quota cache is unavailable")
+		return ErrImageQuotaCacheUnavailable
 	}
 	var user User
 	if err := DB.WithContext(ctx).Unscoped().Where("id = ?", userID).Take(&user).Error; err != nil {
@@ -56,12 +61,15 @@ func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, walle
 		return nil
 	}
 	if common.RDB == nil {
-		return errors.New("image quota cache is unavailable")
+		return ErrImageQuotaCacheUnavailable
 	}
 	if wallet > 0 {
 		result, err := cacheTryReserveUserQuota(userID, int64(wallet))
-		if err != nil || result == cacheQuotaMiss {
-			return errors.New("image wallet quota cache is unavailable; dispatch was not authorized")
+		if err != nil {
+			return fmt.Errorf("%w: wallet: %v", ErrImageQuotaCacheUncertain, err)
+		}
+		if result == cacheQuotaMiss {
+			return ErrImageQuotaCacheUnavailable
 		}
 		if result != cacheQuotaOK {
 			return ErrImageInsufficientQuota
@@ -70,8 +78,11 @@ func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, walle
 	}
 	if tokenQuota > 0 && !token.DeletedAt.Valid {
 		result, err := cacheTryReserveTokenQuota(token.Id, token.Key, int64(tokenQuota))
-		if err != nil || result == cacheQuotaMiss {
-			return errors.New("image token quota cache is unavailable; dispatch was not authorized")
+		if err != nil {
+			return fmt.Errorf("%w: token: %v", ErrImageQuotaCacheUncertain, err)
+		}
+		if result == cacheQuotaMiss {
+			return ErrImageQuotaCacheUnavailable
 		}
 		if result != cacheQuotaOK {
 			return ErrImageInsufficientQuota
@@ -81,8 +92,8 @@ func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, walle
 	return nil
 }
 
-func (r *asyncImageQuotaCacheReservation) compensate() {
-	syncAsyncImageQuotaCache(r.userID, r.tokenID, r.tokenKey, r.wallet, r.token, 0)
+func (r *asyncImageQuotaCacheReservation) compensate() error {
+	return syncAsyncImageQuotaCache(r.userID, r.tokenID, r.tokenKey, r.wallet, r.token, 0)
 }
 
 // Refunds and failed-transaction compensation are deltas, never cache
@@ -90,13 +101,18 @@ func (r *asyncImageQuotaCacheReservation) compensate() {
 // If a process dies between the DB commit and a refund projection, the cache
 // remains conservatively lower until its normal expiry; the durable ledger
 // remains authoritative. Do not retry an ambiguous additive cache operation.
-func syncAsyncImageQuotaCache(userID, tokenID int, tokenKey string, wallet, tokenQuota, tokenUsage int) {
-	if !common.RedisEnabled || common.RDB == nil {
-		return
+func syncAsyncImageQuotaCache(userID, tokenID int, tokenKey string, wallet, tokenQuota, tokenUsage int) error {
+	if !common.RedisEnabled || wallet == 0 && tokenQuota == 0 && tokenUsage == 0 {
+		return nil
 	}
+	if common.RDB == nil {
+		return ErrImageQuotaCacheUnavailable
+	}
+	var projectionErrors []error
 	if wallet != 0 {
 		if _, err := cacheApplyUserQuotaDelta(userID, int64(wallet)); err != nil {
 			common.SysError(fmt.Sprintf("image wallet cache delta unavailable for user %d; retained conservative cache: %v", userID, err))
+			projectionErrors = append(projectionErrors, err)
 		}
 	}
 	if tokenQuota != 0 || tokenUsage != 0 {
@@ -106,8 +122,10 @@ redis.call('HINCRBY', KEYS[1], 'UsedQuota', ARGV[3])
 return 1`
 		if err := common.RDB.Eval(context.Background(), script, []string{getTokenCacheKey(tokenKey)}, tokenID, tokenQuota, tokenUsage-tokenQuota).Err(); err != nil {
 			common.SysError(fmt.Sprintf("image token cache delta unavailable for token %d; retained conservative cache: %v", tokenID, err))
+			projectionErrors = append(projectionErrors, err)
 		}
 	}
+	return errors.Join(projectionErrors...)
 }
 
 func GetAsyncImageReservation(ctx context.Context, task AsyncImageTask) (*AsyncImageBill, error) {
@@ -224,10 +242,15 @@ func ReserveAsyncImageQuota(ctx context.Context, task AsyncImageTask, amount int
 		return err
 	})
 	if err != nil && !commitAttempted {
-		cached.compensate()
+		if compensationErr := cached.compensate(); compensationErr != nil {
+			return fmt.Errorf("%w: reservation: %v; compensation: %v", ErrImageQuotaCacheUncertain, err, compensationErr)
+		}
 	}
 	// A commit acknowledgement can be lost after the DB committed. Keep the
 	// conservative cache hold in that case; never refund an uncertain commit.
+	if err != nil && commitAttempted {
+		return fmt.Errorf("%w: ledger commit: %v", ErrImageQuotaCacheUncertain, err)
+	}
 	return err
 }
 

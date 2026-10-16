@@ -82,7 +82,7 @@ func ImageAccountCooldownKey(fingerprint string) string {
 }
 
 func RecordImageAccountCooldown(ctx context.Context, fingerprint string, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
-	if fingerprint == "" || cfg.AccountCooldownSeconds == 0 || failure == nil || failure.Code != 605 && failure.Code != 606 {
+	if fingerprint == "" || cfg.AccountCooldownSeconds == 0 || failure == nil || failure.Code != 605 && failure.Code != 606 && failure.HTTPStatus != 429 {
 		return nil
 	}
 	if common.RDB == nil {
@@ -106,9 +106,17 @@ type ImageAccountCooling struct{ DelaySeconds int }
 
 func (wait *ImageAccountCooling) Error() string { return "Image accounts are temporarily cooling down" }
 
+var (
+	ErrImageLocalCapacityBusy        = errors.New("local image execution capacity is busy")
+	ErrImageLocalControlsUnavailable = errors.New("local image routing controls are temporarily unavailable")
+)
+
 // DeferAsyncImageSubmission waits for shared routing controls without spending
 // another generation attempt or discarding the original request and hold.
 func DeferAsyncImageSubmission(ctx context.Context, task model.AsyncImageTask, cfg ImageRuntimeConfig, reason string, delay, used, limit int) error {
+	if task.UpstreamTaskId != "" || task.UpstreamSucceededAt > 0 || task.DispatchedAt > 0 {
+		return model.ErrImageConflict
+	}
 	now := time.Now().Unix()
 	if task.StartedAt > 0 && now >= task.StartedAt+int64(cfg.ExecutionTimeout) {
 		return failAsyncImageInvocation(ctx, task, &AsyncImageFailure{Code: 608, InternalCode: "execution_deadline", Message: "Image execution deadline expired"}, cfg)
@@ -117,12 +125,44 @@ func DeferAsyncImageSubmission(ctx context.Context, task model.AsyncImageTask, c
 	if task.StartedAt > 0 {
 		decision.NextAttemptAt = min(decision.NextAttemptAt, decision.Deadline)
 	}
-	if reason == "supplier_retry_budget_exhausted" {
+	message, publicCode := "Waiting for image retry controls", 603
+	switch reason {
+	case "supplier_retry_budget_exhausted":
 		decision.Action, decision.Budget, decision.Used, decision.Limit = "wait_supplier_budget", "supplier", used, limit
+	case "supplier_retry_budget_unavailable":
+		decision.Action, decision.Budget = "wait_local_dependency", "supplier"
+		message = "Supplier retry control is temporarily unavailable"
+	case "routing_controls_unavailable":
+		decision.Action = "wait_local_dependency"
+		message = "Image routing controls are temporarily unavailable"
+	case "local_capacity_busy":
+		decision.Action = "wait_capacity"
+		message = "Waiting for local image execution capacity"
+	case "quota_cache_unavailable":
+		decision.Stage, decision.Action = "prepare", "wait_local_dependency"
+		message, publicCode = "The quota service is temporarily unavailable; generation has not started", 606
 	}
 	encoded, err := common.Marshal(decision)
 	if err != nil {
 		return err
 	}
-	return model.TransitionImageTask(ctx, task, map[string]any{"status": model.ImageTaskQueued, "channel_id": 0, "selected_channel_cipher": nil, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": decision.NextAttemptAt, "retry_decision": string(encoded), "error_code": reason, "error_message": "Waiting for image retry controls", "public_error_code": 603}, "retry_control_wait", "Waiting for image retry controls", "execute")
+	updates := map[string]any{"status": model.ImageTaskQueued, "channel_id": 0, "selected_channel_cipher": nil, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": decision.NextAttemptAt, "retry_decision": string(encoded), "error_code": reason, "error_message": message, "public_error_code": publicCode}
+	if task.Attempts != "" {
+		var attempts []ImageChannelAttempt
+		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
+			return err
+		}
+		if len(attempts) > 0 {
+			last := &attempts[len(attempts)-1]
+			if !last.Dispatched && last.FinishedAt == 0 && last.ChannelId == task.ChannelId {
+				last.FinishedAt, last.Code, last.ErrorMessage, last.Decision = now, publicCode, message, &decision
+				encodedAttempts, err := common.Marshal(attempts)
+				if err != nil {
+					return err
+				}
+				updates["attempts"] = string(encodedAttempts)
+			}
+		}
+	}
+	return model.TransitionImageTask(ctx, task, updates, "retry_control_wait", message, "execute")
 }

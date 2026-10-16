@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -11,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,6 +85,13 @@ func TestAsyncImageTerminalFailureClassification(t *testing.T) {
 		{name: "service_timeout", reason: "Service timeout, please try again later", code: 606},
 		{name: "policy_precedes_timeout", reason: "图片审核失败，生成超时，请重试", code: 601},
 		{name: "prompt_length_limit", reason: "POST /: Your prompt cannot exceed 10000 characters.", code: 604},
+		{name: "busy_ascii_comma", reason: "服务繁忙,请稍后重试", code: 606},
+		{name: "busy_fullwidth_comma", reason: "服务繁忙，请稍后重试", code: 606},
+		{name: "asset_busy", reason: "参考image上传失败：POST / 上游服务繁忙：asset name service busy, please try again later", code: 606},
+		{name: "internal_error", reason: "Internal error encountered.", code: 606},
+		{name: "oversize_before_busy", reason: "参考image上传失败：参考图过大（25.4MB，上限 20MB）；服务繁忙,请稍后重试", code: 604},
+		{name: "guardrail_before_busy", reason: "guardrails detection failed: 服务繁忙,请稍后重试", code: 601},
+		{name: "invalid_argument_remains_conservative", reason: "AI Studio ProxyUnaryCall 返回 HTTP 400、协议错误码 3: Request contains an invalid argument.", code: 610},
 		{name: "unclassified_failure", reason: "provider-specific rejection", code: 610},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,6 +109,65 @@ func TestAsyncImageTerminalFailureClassification(t *testing.T) {
 			assert.Equal(t, "upstream_job_failed", failure.InternalCode)
 			assert.True(t, failure.UpstreamTerminal)
 			assert.False(t, failure.ExecutionUnknown)
+		})
+	}
+}
+
+func TestAsyncImageFailureDiagnosticsAndTransportBarrier(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, message string
+		status, code        int
+	}{
+		{name: "nested_detail", body: `{"detail":[{"loc":["body","references",0,"source"],"msg":"reference image size exceeds 20MB","input":"private-prompt"}],"prompt":"private-prompt","request_id":"diagnostic-id"}`, message: "/body/references/0/source: reference image size exceeds 20MB", status: 400, code: 604},
+		{name: "encoded_json_error", body: `{"error":"{\"message\":\"服务繁忙,请稍后重试\",\"input\":\"private-prompt\"}"}`, message: "服务繁忙,请稍后重试", status: 400, code: 606},
+		{name: "malformed_json_error", body: `{"error":"{\"message\":\"broken\",\"input\":\"private-prompt\""}`, message: "Upstream image request failed", status: 400, code: 610},
+		{name: "no_diagnostic_fields", body: `{"input":{"request_id":"private-prompt"},"prompt":"private-prompt"}`, message: "Upstream image request failed", status: 400, code: 610},
+		{name: "explicit_busy_rejection", body: `{"error":{"message":"服务繁忙，请稍后重试"}}`, message: "服务繁忙，请稍后重试", status: 400, code: 606},
+		{name: "authorization_not_busy_contract", body: `{"error":{"message":"服务繁忙，请稍后重试"}}`, message: "服务繁忙，请稍后重试", status: 403, code: 610},
+		{name: "limit_not_busy", body: `{"error":{"message":"参考image上传失败：参考图过大（25.4MB，上限 20MB）；服务繁忙,请稍后重试"}}`, message: "25.4MB，上限 20MB", status: 400, code: 604},
+		{name: "refusal_not_busy", body: `{"error":{"message":"upstream refusal: 服务繁忙,请稍后重试"}}`, message: "upstream refusal", status: 400, code: 601},
+		{name: "generic_invalid_argument", body: `{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}`, message: "Request contains an invalid argument.", status: 400, code: 610},
+		{name: "third_party_unavailable_is_not_review", body: `{"error":{"message":"third-party service unavailable"}}`, message: "third-party service unavailable", status: 503, code: 606},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: tc.status, Header: http.Header{"X-Request-Id": []string{"header-diagnostic-id"}}, Body: io.NopCloser(strings.NewReader(tc.body))}
+			failure := service.ClassifyGeminiAsyncImageHTTPFailure(t.Context(), response)
+			assert.Equal(t, tc.code, failure.Code)
+			assert.Contains(t, failure.Message, tc.message)
+			assert.NotContains(t, failure.Message, "private-prompt")
+			assert.NotContains(t, failure.UpstreamRequestID, "private-prompt")
+			assert.NotEmpty(t, failure.UpstreamRequestID)
+			assert.False(t, failure.ExecutionUnknown)
+			assert.False(t, failure.UpstreamTerminal, "an HTTP query error cannot terminate an accepted upstream job")
+		})
+	}
+	assert.Empty(t, service.SanitizeAsyncImageDiagnostic(`{"input":"private-prompt"`, 1024))
+	for _, tc := range []struct {
+		name, internal string
+		err            error
+		response       bool
+	}{
+		{name: "deadline", internal: "upstream_transport_timeout", err: &url.Error{Op: "Post", URL: "https://signed.example/image?token=private-token", Err: context.DeadlineExceeded}},
+		{name: "disconnect", internal: "upstream_transport_disconnected", err: io.ErrUnexpectedEOF},
+		{name: "canceled", internal: "upstream_transport_canceled", err: context.Canceled},
+		{name: "parse", internal: "upstream_response_invalid", err: errors.New(`bad response contains private-prompt`), response: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, jobID := range []string{"", "accepted-job"} {
+				failure := service.AsyncImageTransportFailure(tc.err, model.AsyncImageTask{UpstreamTaskId: jobID}, tc.response, http.Header{"X-Request-Id": []string{"upstream-request-id"}})
+				assert.Equal(t, tc.internal, failure.InternalCode)
+				assert.Equal(t, "upstream-request-id", failure.UpstreamRequestID)
+				assert.NotContains(t, failure.Message, "signed.example")
+				assert.NotContains(t, failure.Message, "private-token")
+				assert.NotContains(t, failure.Message, "private-prompt")
+				assert.Equal(t, jobID == "", failure.ExecutionUnknown)
+				if jobID == "" {
+					assert.Equal(t, 608, failure.Code)
+				} else {
+					assert.Equal(t, 606, failure.Code)
+					assert.Contains(t, failure.Message, "only the existing upstream job may be polled again")
+				}
+			}
 		})
 	}
 }
@@ -270,6 +338,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		name, path, referenceField string
 		providerStatus, requestID  string
 		secrets                    []string
+		channelReferenceLimit      int64
+		localReferenceRejected     bool
+		unreadableResponse         bool
 		maxReferences              int
 		status, failureCode        int
 		responseMessage            string
@@ -292,6 +363,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "edits_async_multipart_jpeg_body_passthrough", path: "/v1/images/edits_async", fileFormat: "jpeg", passThrough: true},
 		{name: "edits_oa_multipart_png", path: "/v1/images/edits_oa", fileFormat: "png"},
 		{name: "multipart_mask_does_not_count_as_reference", path: "/v1/images/edits_async", fileFormat: "png", maxReferences: 1},
+		{name: "channel_reference_limit_before_dispatch", path: "/v1/images/edits_async", fileFormat: "png", channelReferenceLimit: 8, localReferenceRejected: true},
+		{name: "channel_reference_limit_keeps_remote_provider_reason", path: "/v1/images/edits_async", referenceField: "images", channelReferenceLimit: 8, status: http.StatusBadRequest, failureCode: 604, responseMessage: "参考image上传失败：参考图过大（25.4MB，上限 20MB）"},
+		{name: "accepted_response_parse_failure_keeps_request_id", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusOK, unreadableResponse: true},
 		{name: "reference_fetch_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 602, providerCode: "image_fetch_failed", responseMessage: "image_url fetch failed for https://example.com/private.png?token=secret-url; authorization=Bearer secret-bearer api_key=secret-key"},
 		{name: "upstream_service_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, providerCode: "overloaded", responseMessage: "upstream image worker unavailable"},
 		{name: "mapped_status_keeps_original_diagnostic", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 605, providerCode: "overloaded", responseMessage: "upstream image worker unavailable", statusMapping: `{"502":"429"}`},
@@ -336,6 +410,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			responseBody, err := common.Marshal(map[string]any{"error": providerError})
 			require.NoError(t, err)
+			if tc.unreadableResponse {
+				responseBody = []byte(`{"data":[`)
+			}
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, readErr := io.ReadAll(r.Body)
 				if !assert.NoError(t, readErr) {
@@ -360,7 +437,11 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				channel.ParamOverride = nil
 			}
 			channel.StatusCodeMapping = &tc.statusMapping
-			channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			channelSettings := dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough}
+			if tc.channelReferenceLimit > 0 {
+				channelSettings.ImageMaxReferenceBytes = &tc.channelReferenceLimit
+			}
+			channel.SetSetting(channelSettings)
 			body := map[string]any{
 				"model": "image-alias", "prompt": "draw a river", "n": 1,
 				"size": "1024x1024", "quality": "high", "response_format": "b64_json",
@@ -430,6 +511,28 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
 			})
 			require.Error(t, err)
+			if tc.localReferenceRejected {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, 604, failure.Code)
+				assert.Contains(t, failure.Message, "Reference image 1:")
+				assert.Contains(t, failure.Message, "reference image limit: 8 bytes")
+				assert.Zero(t, dispatches, "a known oversized reference must be rejected before quota reservation or upstream dispatch")
+				assert.Empty(t, received)
+				return
+			}
+			if tc.unreadableResponse {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, 608, failure.Code)
+				assert.Equal(t, "upstream_response_invalid", failure.InternalCode)
+				assert.Equal(t, http.StatusOK, failure.HTTPStatus, "a response parser error must retain the actual upstream status")
+				assert.True(t, failure.ExecutionUnknown)
+				assert.Equal(t, requestID, failure.UpstreamRequestID)
+				assert.Equal(t, 1, dispatches)
+				assert.Len(t, received, 1)
+				return
+			}
 			if tc.failureCode != 0 {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)

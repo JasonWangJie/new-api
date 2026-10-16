@@ -229,6 +229,11 @@ func QueryAsyncImage(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "no-store")
 	response := gin.H{"task_id": task.TaskId}
+	notice := service.ImageTaskFailureNotice(task)
+	response["failure_code"] = task.PublicErrorCode
+	response["error_summary"], response["error_suggestion"] = notice.Summary, notice.Suggestion
+	response["error_retryable"], response["error_stage"] = notice.Retryable, notice.Stage
+	response["error_message"] = service.SanitizeAsyncImageDiagnostic(task.ErrorMessage, common.LocalLogContentLimit)
 	if strings.Contains(c.Request.URL.Path, "/media/") {
 		displayStatus := task.DisplayStatus()
 		response["media_type"], response["provider"], response["protocol"] = "image", task.Provider, task.ExecutionProtocol
@@ -299,7 +304,7 @@ func QueryAsyncImage(c *gin.Context) {
 		}
 		response["status"] = "failed"
 		response["error_code"] = code
-		response["fail_reason"] = task.ErrorMessage
+		response["fail_reason"] = response["error_message"]
 		c.JSON(200, response)
 		return
 	}

@@ -17,7 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
@@ -77,6 +83,63 @@ afterEach(() => {
   for (const client of clients) client.clear()
   clients.length = 0
   vi.clearAllMocks()
+})
+
+test('pool rows follow model and resolution order while keeping their grouped channels and edit target', async () => {
+  vi.mocked(imageRequest).mockResolvedValue(openAIOptions)
+  const binding = {
+    group: 'default',
+    platform: 'openai',
+    mode: 'model_resolution',
+    model: 'image-2',
+    resolution: '2K',
+    channel_id: 11,
+    priority: 7,
+  }
+  renderPool([
+    {
+      ...binding,
+      binding_key: 'image-10-1k',
+      model: 'image-10',
+      resolution: '1K',
+    },
+    { ...binding, binding_key: 'image-2-10k', resolution: '10K' },
+    { ...binding, binding_key: 'image-2-4k', resolution: '4K' },
+    { ...binding, binding_key: 'image-2-2k' },
+    { ...binding, binding_key: 'image-2-1k', resolution: '1K' },
+    {
+      ...binding,
+      binding_key: 'image-2-2k',
+      channel_id: 22,
+      priority: 3,
+    },
+  ])
+
+  const rows = within(screen.getByRole('table')).getAllByRole('row').slice(1)
+  expect(
+    rows.map((row) => {
+      const cells = within(row).getAllByRole('cell')
+      return [cells[3].textContent, cells[4].textContent]
+    })
+  ).toEqual([
+    ['image-2', '1K'],
+    ['image-2', '2K'],
+    ['image-2', '4K'],
+    ['image-2', '10K'],
+    ['image-10', '1K'],
+  ])
+  expect(within(rows[1]).getByText('11 (7), 22 (3)')).toBeVisible()
+
+  const user = userEvent.setup()
+  await user.click(within(rows[1]).getByRole('button', { name: 'Edit' }))
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
+    'image-2 · Unavailable'
+  )
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution' })
+  ).toHaveTextContent('2K')
+  expect(screen.getByRole('spinbutton', { name: 'Weight 11' })).toHaveValue(7)
+  expect(screen.getByRole('spinbutton', { name: 'Weight 22' })).toHaveValue(3)
 })
 
 test('switching platform replaces the selectable models and channels', async () => {

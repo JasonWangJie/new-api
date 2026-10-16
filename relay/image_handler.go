@@ -266,13 +266,19 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, false, circuit)
 		}
 		if hasAsyncProfile && c.GetString("async_image_resume_task") != "" {
-			return nil, types.NewError(&service.AsyncImageFailure{Code: 606, InternalCode: "upstream_poll_failed", Message: "Upstream image task polling failed"}, types.ErrorCodeDoRequestFailed)
+			// The async executor owns the known-job barrier and retains the
+			// transport cause to distinguish timeouts from disconnections.
+			return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
 		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 	var httpResp *http.Response
 	if resp != nil {
 		httpResp = resp.(*http.Response)
+		if !reserve && c.GetBool("async_image_execution") {
+			c.Set(asyncImageUpstreamRequestIDContextKey, service.AsyncImageResponseRequestID(httpResp.Header))
+			c.Set(asyncImageUpstreamStatusContextKey, httpResp.StatusCode)
+		}
 		if !reserve {
 			if limit := c.GetInt64("async_image_response_limit"); limit > 0 {
 				httpResp.Body = struct {

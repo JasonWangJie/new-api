@@ -182,6 +182,7 @@ import {
   type ChannelConfigurationSection,
   type ChannelProviderTarget,
 } from '../../lib/channel-configuration'
+import { IMAGE_CHANNEL_EXECUTION_LIMITS } from '../../lib/channel-form'
 import {
   getChannelPluginExtensions,
   supportsChannelPluginExtensions,
@@ -279,6 +280,9 @@ const SENSITIVE_FORM_FIELDS = [
   'http2_connection_shards',
   'image_max_reference_images',
   'image_reference_transport_mode',
+  'image_max_reference_bytes',
+  'image_attempt_timeout_seconds',
+  'image_concurrency_limit',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
   'system_prompt',
@@ -1949,6 +1953,66 @@ export function ChannelMutateDrawer({
             </FormItem>
           )}
         />
+        {[
+          {
+            name: 'image_max_reference_bytes',
+            label: t('Maximum reference image bytes'),
+            description: t(
+              'Blank inherits the global limit. Maximum 67108864 bytes (64 MiB) per reference image.'
+            ),
+          },
+          {
+            name: 'image_attempt_timeout_seconds',
+            label: t('Image attempt timeout (seconds)'),
+            description: t(
+              'Blank inherits the global timeout. Maximum 86400 seconds; the task deadline still applies.'
+            ),
+          },
+          {
+            name: 'image_concurrency_limit',
+            label: t('Image channel concurrency'),
+            description: t(
+              'Blank inherits the global concurrency limit. Maximum 10000 active image requests per channel.'
+            ),
+          },
+        ].map((limit) => (
+          <FormField
+            key={limit.name}
+            control={form.control}
+            name={limit.name as keyof typeof IMAGE_CHANNEL_EXECUTION_LIMITS}
+            render={({ field }) => (
+              <FormItem className='sm:col-span-2'>
+                <FormLabel>{limit.label}</FormLabel>
+                <FormControl>
+                  <Input
+                    {...field}
+                    type='number'
+                    min={1}
+                    max={
+                      IMAGE_CHANNEL_EXECUTION_LIMITS[
+                        limit.name as keyof typeof IMAGE_CHANNEL_EXECUTION_LIMITS
+                      ]
+                    }
+                    step={1}
+                    value={field.value ?? ''}
+                    placeholder={t('Inherit global setting')}
+                    disabled={sensitiveLocked}
+                    onChange={(event) => {
+                      field.onChange(
+                        event.target.value === ''
+                          ? undefined
+                          : Number(event.target.value)
+                      )
+                      void form.trigger(field.name)
+                    }}
+                  />
+                </FormControl>
+                <FormDescription>{limit.description}</FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        ))}
         <FormField
           control={form.control}
           name='image_reference_transport_mode'

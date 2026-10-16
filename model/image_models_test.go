@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -494,8 +495,179 @@ func TestAsyncImageReservationSharesBatchQuotaAndCompensates(t *testing.T) {
 	other.Id, other.TaskId, other.Status = 0, "cold-cache-image", ImageTaskInvoking
 	require.NoError(t, db.Create(&other).Error)
 	server.Del(getUserCacheKey(task.UserId))
-	assert.ErrorContains(t, ReserveAsyncImageQuota(t.Context(), other, 100, ImageFundingSelection{Source: "wallet"}), "cache is unavailable")
+	assert.ErrorIs(t, ReserveAsyncImageQuota(t.Context(), other, 100, ImageFundingSelection{Source: "wallet"}), ErrImageQuotaCacheUnavailable)
 	assert.Equal(t, 400, getUserQuotaFromDB(t, task.UserId))
+}
+
+type imageReservationAckLossHook struct{ calls, loseAt int }
+
+func (*imageReservationAckLossHook) BeforeProcess(ctx context.Context, _ redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (hook *imageReservationAckLossHook) AfterProcess(_ context.Context, cmd redis.Cmder) error {
+	if (cmd.Name() == "eval" || cmd.Name() == "evalsha") && cmd.Err() == nil {
+		hook.calls++
+		if hook.calls == hook.loseAt {
+			return errors.New("injected lost reservation acknowledgement")
+		}
+	}
+	return nil
+}
+
+func (*imageReservationAckLossHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*imageReservationAckLossHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func TestAsyncImageQuotaCacheMissingAndUncertainReservation(t *testing.T) {
+	for _, condition := range []string{"missing wallet", "missing token", "lost acknowledgement", "lost compensation acknowledgement", "lost settlement acknowledgement", "cache recovered"} {
+		t.Run(condition, func(t *testing.T) {
+			db, task, bill := imageDatabaseFixture(t)
+			resetBatchUpdateTestState(t)
+			useUserCacheMiniRedis(t)
+			if address := os.Getenv("ASYNC_IMAGE_TEST_REDIS_ADDR"); address != "" {
+				require.Equal(t, "127.0.0.1:26380", address, "use the disposable local Redis instance")
+				previous := common.RDB
+				client := redis.NewClient(&redis.Options{Addr: address, DB: 15, MaxRetries: -1})
+				require.NoError(t, client.FlushDB(t.Context()).Err())
+				common.RDB = client
+				t.Cleanup(func() {
+					assert.NoError(t, client.FlushDB(context.Background()).Err())
+					assert.NoError(t, client.Close())
+					common.RDB = previous
+				})
+			}
+			_, err := GetUserCache(task.UserId)
+			require.NoError(t, err)
+			token, err := GetTokenByKey("image-test-key", true)
+			require.NoError(t, err)
+			common.BatchUpdateEnabled = true
+			if condition == "lost settlement acknowledgement" {
+				require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 50, ImageFundingSelection{Source: "wallet"}))
+				stageImageBillFixture(t, db, task, bill)
+				common.RDB.AddHook(&imageReservationAckLossHook{loseAt: 1})
+				assert.ErrorIs(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint), ErrImageQuotaCacheUncertain)
+				assert.Equal(t, 950, getUserQuotaFromDB(t, task.UserId), "an unconfirmed settlement does not commit the extra charge")
+				quota, readErr := common.RDB.HGet(t.Context(), getUserCacheKey(task.UserId), "Quota").Int()
+				require.NoError(t, readErr)
+				assert.Equal(t, 900, quota, "the unacknowledged extra cache deduction must not be compensated or repeated automatically")
+				var saved AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+				assert.Equal(t, "fixed", saved.Status)
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"status": ImageTaskBillingFailed, "error_code": "billing_quota_uncertain", "next_attempt_at": 0}).Error)
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.ErrorIs(t, ResumeAsyncImageTask(t.Context(), task), ErrImageConflict, "ordinary recovery must not replay an uncertain debit")
+				assert.Equal(t, 950, getUserQuotaFromDB(t, task.UserId))
+				// Simulate the administrator verifying the reserved DB hold and
+				// correcting its cache projection before explicitly resuming it.
+				require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(task.UserId), "Quota", 950).Err())
+				require.NoError(t, ResumeAsyncImageTaskAfterQuotaReconciliation(t.Context(), task))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, ImageTaskBillingPending, task.Status)
+				assert.Equal(t, "quota_confirmed", task.ReconciliationStatus)
+				for range 2 {
+					require.NoError(t, ApplyAsyncImageBill(t.Context(), task.TaskId, bill.Fingerprint))
+				}
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+				quota, readErr = common.RDB.HGet(t.Context(), getUserCacheKey(task.UserId), "Quota").Int()
+				require.NoError(t, readErr)
+				assert.Equal(t, 900, quota, "reconciled recovery settles the same bill once")
+				return
+			}
+			switch condition {
+			case "missing wallet", "cache recovered":
+				require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(task.UserId)).Err())
+			case "missing token":
+				require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheKey(token.Key)).Err())
+			case "lost acknowledgement":
+				common.RDB.AddHook(&imageReservationAckLossHook{loseAt: 1})
+			case "lost compensation acknowledgement":
+				require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheKey(token.Key)).Err())
+				common.RDB.AddHook(&imageReservationAckLossHook{loseAt: 3})
+			}
+			err = ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"})
+			if condition == "lost acknowledgement" || condition == "lost compensation acknowledgement" {
+				assert.ErrorIs(t, err, ErrImageQuotaCacheUncertain)
+				quota, readErr := common.RDB.HGet(t.Context(), getUserCacheKey(task.UserId), "Quota").Int()
+				require.NoError(t, readErr)
+				if condition == "lost acknowledgement" {
+					assert.Equal(t, 900, quota, "an unacknowledged deduction stays conservative and is not blindly compensated")
+				} else {
+					assert.Equal(t, 1000, quota, "an unacknowledged compensation is never repeated")
+				}
+			} else {
+				assert.ErrorIs(t, err, ErrImageQuotaCacheUnavailable)
+				if condition == "missing token" {
+					quota, readErr := common.RDB.HGet(t.Context(), getUserCacheKey(task.UserId), "Quota").Int()
+					require.NoError(t, readErr)
+					assert.Equal(t, 1000, quota, "the acknowledged wallet reservation is compensated when the token cache is missing")
+				}
+			}
+			assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+			var bills int64
+			require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&bills).Error)
+			assert.Zero(t, bills, "a failed reservation must not create a committed hold")
+			if condition == "cache recovered" {
+				// A verified cache projection can return independently of the worker;
+				// the worker must never reconstruct it from a stale batch DB balance.
+				require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(task.UserId), "Id", task.UserId, "CacheSchema", userCacheSchemaVersion, "Quota", 700).Err())
+				require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+				quota, readErr := common.RDB.HGet(t.Context(), getUserCacheKey(task.UserId), "Quota").Int()
+				require.NoError(t, readErr)
+				assert.Equal(t, 600, quota)
+			}
+		})
+	}
+}
+
+func TestAsyncImageQueuedDeadlineRecovery(t *testing.T) {
+	for _, condition := range []string{"not dispatched", "accepted job", "dispatched without job", "accepted output", "not started"} {
+		t.Run(condition, func(t *testing.T) {
+			db, task, _ := imageDatabaseFixture(t)
+			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+			task.Status, task.StartedAt, task.NextAttemptAt = ImageTaskQueued, time.Now().Unix()-120, time.Now().Unix()+300
+			task.LeaseToken, task.LeaseExpiresAt = "", 0
+			switch condition {
+			case "accepted job":
+				task.UpstreamTaskId = "accepted-job"
+			case "dispatched without job":
+				task.DispatchedAt = task.StartedAt
+			case "accepted output":
+				task.UpstreamSucceededAt = task.StartedAt + 1
+			case "not started":
+				task.StartedAt = 0
+			}
+			require.NoError(t, db.Model(&task).Select("status", "started_at", "next_attempt_at", "lease_token", "lease_expires_at", "upstream_task_id", "dispatched_at", "upstream_succeeded_at").Updates(&task).Error)
+			for range 2 {
+				require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60, 24))
+			}
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			if condition == "not started" || condition == "accepted output" {
+				assert.Equal(t, ImageTaskQueued, task.Status)
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+				return
+			}
+			assert.Zero(t, task.NextAttemptAt)
+			assert.NotEmpty(t, task.RequestCipher)
+			var decision ImageRetryDecision
+			require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+			if condition == "not dispatched" {
+				assert.Equal(t, ImageTaskExpired, task.Status)
+				assert.Equal(t, "stop", decision.Action)
+				assert.Equal(t, "refunded", task.BillingStatus)
+				assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+			} else {
+				assert.Equal(t, ImageTaskExecutionUnknown, task.Status)
+				assert.Equal(t, "reconcile_unknown", decision.Action)
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+			}
+		})
+	}
 }
 
 func TestAsyncImageReservationRefundRecoveryDoesNotStarve(t *testing.T) {

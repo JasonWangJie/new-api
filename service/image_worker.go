@@ -372,6 +372,12 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		// the prior attempt's channel snapshot.
 		channel, account, err = PickImageChannel(ctx, policy, request, routing)
 		if err != nil {
+			if errors.Is(err, ErrImageLocalControlsUnavailable) {
+				return DeferAsyncImageSubmission(ctx, *task, cfg, "routing_controls_unavailable", 10, 0, 0)
+			}
+			if errors.Is(err, ErrImageLocalCapacityBusy) {
+				return DeferAsyncImageSubmission(ctx, *task, cfg, "local_capacity_busy", 10, 0, 0)
+			}
 			var cooling *ImageAccountCooling
 			if errors.As(err, &cooling) {
 				return DeferAsyncImageSubmission(ctx, *task, cfg, "account_cooldown", cooling.DelaySeconds, 0, 0)
@@ -394,6 +400,14 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		slotKey := ImageRedisKey("invoke-slots")
 		channelSlotKey := ImageChannelConcurrencyKey(channel.Id)
 		slotTTL := cfg.AttemptTimeout + cfg.WorkerLease
+		settings := channel.GetSetting()
+		if settings.ImageAttemptTimeoutSeconds != nil && *settings.ImageAttemptTimeoutSeconds > 0 {
+			slotTTL = min(*settings.ImageAttemptTimeoutSeconds, 86400) + cfg.WorkerLease
+		}
+		channelConcurrency := cfg.ImageConcurrency
+		if settings.ImageConcurrencyLimit != nil && *settings.ImageConcurrencyLimit > 0 {
+			channelConcurrency = min(channelConcurrency, *settings.ImageConcurrencyLimit)
+		}
 		slot, err := imageInvocationAcquire.Run(ctx, common.RDB, []string{slotKey}, now, now+int64(slotTTL), cfg.ImageConcurrency, task.LeaseToken, slotTTL).Int()
 		if err != nil {
 			return err
@@ -402,10 +416,10 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if knownUpstreamTask {
 				return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, now+10, "capacity_wait", "Image execution capacity is busy")
 			}
-			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "capacity_wait", Message: "Image execution capacity is busy"}, cfg)
+			return DeferAsyncImageSubmission(ctx, *task, cfg, "local_capacity_busy", 10, 0, 0)
 		}
 		defer common.RDB.ZRem(context.WithoutCancel(ctx), slotKey, task.LeaseToken)
-		channelSlot, err := imageInvocationAcquire.Run(ctx, common.RDB, []string{channelSlotKey}, now, now+int64(slotTTL), cfg.ImageConcurrency, task.LeaseToken, slotTTL).Int()
+		channelSlot, err := imageInvocationAcquire.Run(ctx, common.RDB, []string{channelSlotKey}, now, now+int64(slotTTL), channelConcurrency, task.LeaseToken, slotTTL).Int()
 		if err != nil {
 			return err
 		}
@@ -413,7 +427,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if knownUpstreamTask {
 				return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, now+10, "capacity_wait", "Channel image execution capacity is busy")
 			}
-			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "capacity_wait", Message: "Channel image execution capacity is busy"}, cfg)
+			return DeferAsyncImageSubmission(ctx, *task, cfg, "local_capacity_busy", 10, 0, 0)
 		}
 		defer common.RDB.ZRem(context.WithoutCancel(ctx), channelSlotKey, task.LeaseToken)
 		leaseToken := task.LeaseToken
@@ -471,7 +485,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if previousDispatch && cfg.SupplierRetryCapacity > 0 {
 			wait, budgetErr := AcquireImageSupplierRetry(ctx, *channel, request.Model, cfg)
 			if budgetErr != nil {
-				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "supplier_retry_budget_unavailable", Message: "Supplier retry control is temporarily unavailable"}, cfg)
+				return DeferAsyncImageSubmission(ctx, *task, cfg, "supplier_retry_budget_unavailable", 10, 0, 0)
 			}
 			if wait > 0 {
 				return DeferAsyncImageSubmission(ctx, *task, cfg, "supplier_retry_budget_exhausted", wait, cfg.SupplierRetryCapacity, cfg.SupplierRetryCapacity)
@@ -516,9 +530,13 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		}
 	}
 	attemptCtx := ctx
+	attemptTimeout := int64(cfg.AttemptTimeout)
 	if request.Completion == nil {
 		var cancel context.CancelFunc
-		attemptTimeout := int64(cfg.AttemptTimeout)
+		settings := channel.GetSetting()
+		if settings.ImageAttemptTimeoutSeconds != nil && *settings.ImageAttemptTimeoutSeconds > 0 {
+			attemptTimeout = int64(min(*settings.ImageAttemptTimeoutSeconds, 86400))
+		}
 		if !acceptedOutput {
 			attemptTimeout = min(attemptTimeout, remaining)
 		}
@@ -561,7 +579,18 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			}
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "upstream_pending", "")
 		}
+		if task.DispatchedAt == 0 && task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0 {
+			if errors.Is(err, model.ErrImageQuotaCacheUnavailable) {
+				return DeferAsyncImageSubmission(context.WithoutCancel(ctx), *task, cfg, "quota_cache_unavailable", 10, 0, 0)
+			}
+			if errors.Is(err, model.ErrImageQuotaCacheUncertain) {
+				return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, &AsyncImageFailure{Code: 608, InternalCode: "quota_cache_uncertain", Message: "The quota reservation could not be confirmed; generation has not started and administrator reconciliation is required", ExecutionUnknown: true}, cfg)
+			}
+		}
 		failure := ClassifyAsyncImageFailure(err, 0)
+		if failure.InternalCode == "upstream_transport_timeout" && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			failure.Message = fmt.Sprintf("%s (local request timeout: %d seconds)", failure.Message, attemptTimeout)
+		}
 		if task.DispatchedAt == 0 {
 			diagnostic := SanitizeAsyncImageDiagnostic(err.Error(), asyncImageProviderMessageLimit)
 			common.SysError(fmt.Sprintf("async image local preparation failed: task=%s channel=%d cause=%s", task.TaskId, task.ChannelId, diagnostic))
@@ -579,7 +608,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
-		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.ExecutionUnknown) {
+		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
 			if task.UpstreamTaskId == "" || failure.UpstreamTerminal {
 				_ = RecordImageAccountCooldown(context.WithoutCancel(ctx), account.Fingerprint, failure, cfg)
@@ -787,6 +816,9 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				updates["retry_count"] = task.RetryCount + 1
 			}
 			updates["next_attempt_at"] = time.Now().Unix() + int64(delay)
+			if task.StartedAt > 0 {
+				updates["next_attempt_at"] = min(updates["next_attempt_at"].(int64), task.StartedAt+int64(cfg.ExecutionTimeout))
+			}
 			if !pollRetry {
 				updates["upstream_task_id"] = ""
 				updates["channel_id"] = 0
@@ -894,9 +926,10 @@ func scheduleImagePostprocessRetry(ctx context.Context, task model.AsyncImageTas
 	if storage {
 		status, key, count, limit = model.ImageTaskStorageFailed, "storage_retry_count", task.StorageRetryCount, cfg.StorageRetries
 	}
+	quotaUncertain := !storage && errors.Is(cause, model.ErrImageQuotaCacheUncertain)
 	next := int64(0)
 	kind := ""
-	if count < limit {
+	if count < limit && !quotaUncertain {
 		next = time.Now().Unix() + int64(cfg.RetryBackoff)*(1<<min(count, 10))
 		kind = "postprocess"
 	}
@@ -908,9 +941,17 @@ func scheduleImagePostprocessRetry(ctx context.Context, task model.AsyncImageTas
 	if next > 0 {
 		decision.Action, decision.Reason = "resume_output", "temporary_failure"
 	}
+	errorCode := status
+	if quotaUncertain {
+		errorCode, decision.Reason = "billing_quota_uncertain", "quota_confirmation_unknown"
+	}
 	encoded, err := common.Marshal(decision)
 	if err != nil {
 		return err
 	}
-	return model.TransitionImageTask(ctx, task, map[string]any{"status": status, key: count + 1, "next_attempt_at": next, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "public_error_code": 609, "error_code": status, "error_message": fmt.Sprintf("%s: confirmation is unavailable; existing images are retained", status)}, "postprocessing_failed", "", kind)
+	message := fmt.Sprintf("%s: confirmation is unavailable; existing images are retained", status)
+	if diagnostic := SanitizeAsyncImageDiagnostic(cause.Error(), asyncImageProviderMessageLimit); diagnostic != "" {
+		message = status + ": " + diagnostic
+	}
+	return model.TransitionImageTask(ctx, task, map[string]any{"status": status, key: count + 1, "next_attempt_at": next, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "public_error_code": 609, "error_code": errorCode, "error_message": message}, "postprocessing_failed", "", kind)
 }

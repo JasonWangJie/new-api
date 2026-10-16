@@ -29,6 +29,8 @@ import { imageLabel } from '../lib/image-labels'
 import {
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
+  imageTaskIssue,
+  imageTaskProgress,
 } from '../lib/task-presentation'
 import type { ImageTask } from '../types'
 import {
@@ -36,6 +38,7 @@ import {
   ImageRequestTypeBadge,
   ImageStatusBadge,
 } from './image-badges'
+import { ImageTaskNotice } from './image-task-notice'
 
 export function ImageTaskMobileCard(props: {
   row: Row<ImageTask>
@@ -50,9 +53,8 @@ export function ImageTaskMobileCard(props: {
   const selectCell = cells.find((cell) => cell.column.id === 'select')
   const costCell = cells.find((cell) => cell.column.id === 'quota')
   const actionsCell = cells.find((cell) => cell.column.id === 'actions')
-  const progress = Number.isFinite(task.progress)
-    ? Math.min(100, Math.max(0, task.progress))
-    : 0
+  const progress = imageTaskProgress(task)
+  const issue = imageTaskIssue(task)
   const active = [
     'queued',
     'invoking',
@@ -120,15 +122,23 @@ export function ImageTaskMobileCard(props: {
         <div className='flex items-center justify-between gap-2'>
           <ImageStatusBadge
             status={task.status}
-            errorCode={task.error_code}
+            errorCode={
+              issue && !issue.pendingAction ? task.error_code : undefined
+            }
+            pendingAction={issue?.pendingAction}
             className='h-auto min-w-0 shrink py-0.5 wrap-anywhere whitespace-normal'
           />
-          <span className='text-muted-foreground shrink-0 text-[11px] tabular-nums'>
-            {t('Progress')} {progress}%
-          </span>
+          {progress !== null && (
+            <span className='text-muted-foreground shrink-0 text-[11px] tabular-nums'>
+              {t('Progress')} {progress}%
+            </span>
+          )}
         </div>
-        {active && <Progress value={progress} aria-label={t('Progress')} />}
+        {active && progress !== null && (
+          <Progress value={progress} aria-label={t('Progress')} />
+        )}
       </div>
+      <ImageTaskNotice task={task} />
 
       <dl className='[&_dt]:text-muted-foreground grid grid-cols-2 gap-x-4 gap-y-2.5 text-xs [&_dd]:mt-1 [&_dd]:leading-4 [&_dd]:font-medium [&_dd]:wrap-anywhere [&_dt]:text-[11px] [&>div]:min-w-0'>
         <div>

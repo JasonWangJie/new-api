@@ -52,6 +52,23 @@ const SUPPORTED_PROXY_PROTOCOLS = new Set([
   'socks5h:',
 ])
 
+export const IMAGE_CHANNEL_EXECUTION_LIMITS = {
+  image_max_reference_bytes: 64 * 1024 * 1024,
+  image_attempt_timeout_seconds: 86400,
+  image_concurrency_limit: 10000,
+} as const
+
+function imageChannelLimitSchema(maximum: number) {
+  const message =
+    'Image limit must be a positive whole number within the allowed range'
+  return z
+    .number()
+    .int(message)
+    .min(1, message)
+    .max(maximum, message)
+    .optional()
+}
+
 function isOptionalProxyURL(value: string | undefined): boolean {
   const trimmedValue = value?.trim() || ''
   if (!trimmedValue) return true
@@ -291,6 +308,15 @@ export const channelFormSchema = z
     image_reference_transport_mode: z
       .enum(['', 'passthrough', 'local', 'passthrough_fallback_local'])
       .optional(),
+    image_max_reference_bytes: imageChannelLimitSchema(
+      IMAGE_CHANNEL_EXECUTION_LIMITS.image_max_reference_bytes
+    ),
+    image_attempt_timeout_seconds: imageChannelLimitSchema(
+      IMAGE_CHANNEL_EXECUTION_LIMITS.image_attempt_timeout_seconds
+    ),
+    image_concurrency_limit: imageChannelLimitSchema(
+      IMAGE_CHANNEL_EXECUTION_LIMITS.image_concurrency_limit
+    ),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
     system_prompt: z.string().optional(),
@@ -483,6 +509,9 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   http2_connection_shards: 1,
   image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   image_reference_transport_mode: '',
+  image_max_reference_bytes: undefined,
+  image_attempt_timeout_seconds: undefined,
+  image_concurrency_limit: undefined,
   pass_through_body_enabled: false,
   responses_websocket_enabled: false,
   system_prompt: '',
@@ -530,6 +559,12 @@ export function transformChannelToFormDefaults(
     image_reference_transport_mode: '' as NonNullable<
       ChannelFormValues['image_reference_transport_mode']
     >,
+    image_max_reference_bytes:
+      CHANNEL_FORM_DEFAULT_VALUES.image_max_reference_bytes,
+    image_attempt_timeout_seconds:
+      CHANNEL_FORM_DEFAULT_VALUES.image_attempt_timeout_seconds,
+    image_concurrency_limit:
+      CHANNEL_FORM_DEFAULT_VALUES.image_concurrency_limit,
     pass_through_body_enabled: false,
     responses_websocket_enabled: false,
     system_prompt: '',
@@ -561,6 +596,18 @@ export function transformChannelToFormDefaults(
           ? parsed.image_reference_transport_mode
           : '',
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
+        image_max_reference_bytes:
+          typeof parsed.image_max_reference_bytes === 'number'
+            ? parsed.image_max_reference_bytes
+            : undefined,
+        image_attempt_timeout_seconds:
+          typeof parsed.image_attempt_timeout_seconds === 'number'
+            ? parsed.image_attempt_timeout_seconds
+            : undefined,
+        image_concurrency_limit:
+          typeof parsed.image_concurrency_limit === 'number'
+            ? parsed.image_concurrency_limit
+            : undefined,
         responses_websocket_enabled:
           parsed.responses_websocket_enabled === true,
         system_prompt: parsed.system_prompt || '',
@@ -717,6 +764,11 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   if (formData.image_reference_transport_mode) {
     settingObj.image_reference_transport_mode =
       formData.image_reference_transport_mode
+  }
+  for (const field of Object.keys(
+    IMAGE_CHANNEL_EXECUTION_LIMITS
+  ) as (keyof typeof IMAGE_CHANNEL_EXECUTION_LIMITS)[]) {
+    if (formData[field] !== undefined) settingObj[field] = formData[field]
   }
 
   return JSON.stringify(settingObj)

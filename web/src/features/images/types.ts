@@ -118,6 +118,11 @@ export type ImageCapabilities = {
   }[]
 }
 export type ImageTask = {
+  failure_code?: number
+  error_summary?: string
+  error_suggestion?: string
+  error_retryable?: boolean
+  error_stage?: string
   retry_decision?: ImageRetryDecision
   retained_request_available?: boolean
   request_retain_until?: number
@@ -167,6 +172,8 @@ export type ImageTask = {
     dispatched: boolean
     reference_mode: string
     error_code: number
+    error_message?: string
+    http_status?: number
     reference_transport_used?: string
     retry_decision?: ImageRetryDecision
   }[]
