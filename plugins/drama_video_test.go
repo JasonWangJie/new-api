@@ -362,20 +362,34 @@ func TestDramaVideoMediaAndOperations(t *testing.T) {
 
 func TestDramaVideoPollingAndActualUsage(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
+	const missingFailureReason = "Video generation failed; upstream did not provide an error reason"
 	for _, tc := range []struct {
-		name, model, action, wantStatus, errorText string
-		state, body                                map[string]any
-		wantFacts                                  map[string]any
+		name, model, action, wantStatus, errorText, wantReason string
+		state, body                                            map[string]any
+		wantFacts                                              map[string]any
 	}{
 		{name: "A completes without tokens or measured seconds", model: "seedance2.0-A", body: map[string]any{"status": "completed"}, wantStatus: "SUCCESS", wantFacts: map[string]any{}},
 		{name: "A actual seconds ignore unrelated token billing", model: "seedance2.5-A", body: map[string]any{"status": "completed", "seconds": "6", "usage": map[string]any{"total_tokens": -1}, "metadata": map[string]any{"billing": map[string]any{"settle_state": "pending"}}}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(6)}},
 		{name: "H3 actual duration", model: "minimax-h3", body: map[string]any{"status": "completed", "duration": 6.5}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": 6.5}},
-		{name: "H3 failed task", model: "minimax-h3", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantFacts: map[string]any{}},
+		{name: "H3 failed task", model: "minimax-h3", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantReason: "generation rejected", wantFacts: map[string]any{}},
 		{name: "A duration overflow", model: "seedance2.0-A", body: map[string]any{"status": "completed", "seconds": "18446744073686646784"}, errorText: "Invalid upstream video duration"},
 		{name: "H3 zero duration", model: "minimax-h3", body: map[string]any{"status": "completed", "duration": 0}, errorText: "Invalid upstream video duration"},
 		{name: "queued receipt", model: "seedance2.5-G", body: map[string]any{"status": "queued", "progress": 0}, wantStatus: "QUEUED", wantFacts: map[string]any{}},
 		{name: "unknown status cannot resolve inherited properties", model: "seedance2.5-G", body: map[string]any{"status": "constructor"}, wantStatus: "UNKNOWN", wantFacts: map[string]any{}},
-		{name: "failed task", model: "seedance2.5-G", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantFacts: map[string]any{}},
+		{name: "failed task", model: "seedance2.5-G", body: map[string]any{"status": "failed", "error": "generation rejected"}, wantStatus: "FAILURE", wantReason: "generation rejected", wantFacts: map[string]any{}},
+		{name: "Mini E upstream image dimensions error", model: "seedance2.0-Mini-E", body: map[string]any{"status": "failed", "metadata": map[string]any{"url": "Error while downloading image, error: expected the width to be at most 6000px, but received a 6060x3476px image instead"}}, wantStatus: "FAILURE", wantReason: "Error while downloading image, error: expected the width to be at most 6000px, but received a 6060x3476px image instead", wantFacts: map[string]any{}},
+		{name: "A upstream busy error", model: "seedance2.5-A", body: map[string]any{"status": "failed", "metadata": map[string]any{"url": "系统繁忙，请稍后重试"}}, wantStatus: "FAILURE", wantReason: "系统繁忙，请稍后重试", wantFacts: map[string]any{}},
+		{name: "error string precedes metadata", model: "seedance2.5-A", body: map[string]any{"status": "failed", "error": "  primary error  ", "metadata": map[string]any{"url": "secondary error"}}, wantStatus: "FAILURE", wantReason: "primary error", wantFacts: map[string]any{}},
+		{name: "error message precedes metadata", model: "seedance2.5-A", body: map[string]any{"status": "failed", "error": map[string]any{"message": "primary message"}, "metadata": map[string]any{"url": "secondary error"}}, wantStatus: "FAILURE", wantReason: "primary message", wantFacts: map[string]any{}},
+		{name: "empty error string uses metadata", model: "seedance2.5-A", body: map[string]any{"status": "failed", "error": " ", "metadata": map[string]any{"url": "  系统繁忙，请稍后重试  "}}, wantStatus: "FAILURE", wantReason: "系统繁忙，请稍后重试", wantFacts: map[string]any{}},
+		{name: "empty error message uses metadata", model: "seedance2.5-A", body: map[string]any{"status": "failed", "error": map[string]any{"message": " "}, "metadata": map[string]any{"url": "系统繁忙，请稍后重试"}}, wantStatus: "FAILURE", wantReason: "系统繁忙，请稍后重试", wantFacts: map[string]any{}},
+		{name: "failed signed result URL is not an error", model: "seedance2.5-A", body: map[string]any{"status": "failed", "metadata": map[string]any{"url": "  HTTPS://cdn.example/video.mp4?signature=private-result-token  "}}, wantStatus: "FAILURE", wantReason: missingFailureReason, wantFacts: map[string]any{}},
+		{name: "failed data video URI is not an error", model: "seedance2.5-A", body: map[string]any{"status": "failed", "metadata": map[string]any{"url": "data:video/mp4;base64,cHJpdmF0ZS12aWRlbw=="}}, wantStatus: "FAILURE", wantReason: missingFailureReason, wantFacts: map[string]any{}},
+		{name: "failed relative result URL is not an error", model: "seedance2.5-A", body: map[string]any{"status": "failed", "metadata": map[string]any{"url": "/v1/videos/upstream/content"}}, wantStatus: "FAILURE", wantReason: missingFailureReason, wantFacts: map[string]any{}},
+		{name: "failed without details", model: "seedance2.5-A", body: map[string]any{"status": "failed"}, wantStatus: "FAILURE", wantReason: missingFailureReason, wantFacts: map[string]any{}},
+		{name: "failed with malformed details", model: "seedance2.5-A", body: map[string]any{"status": "failed", "error": map[string]any{"message": map[string]any{"input": "not-an-error"}}, "metadata": map[string]any{"url": []any{"not-an-error"}}}, wantStatus: "FAILURE", wantReason: missingFailureReason, wantFacts: map[string]any{}},
+		{name: "queued ignores metadata error text", model: "seedance2.5-A", body: map[string]any{"status": "queued", "metadata": map[string]any{"url": "系统繁忙，请稍后重试"}}, wantStatus: "QUEUED", wantFacts: map[string]any{}},
+		{name: "completed ignores metadata error text", model: "seedance2.0-Mini-E", body: map[string]any{"status": "completed", "metadata": map[string]any{"url": "系统繁忙，请稍后重试"}}, wantStatus: "SUCCESS", wantFacts: map[string]any{}},
 		{name: "E needs no seconds or tokens", model: "seedance2.0-E", body: map[string]any{"status": "completed", "metadata": map[string]any{"url": "/v1/videos/upstream/content"}}, wantStatus: "SUCCESS", wantFacts: map[string]any{}},
 		{name: "F seconds from bill", model: "seedance2.5-F", body: map[string]any{"status": "completed", "metadata": map[string]any{"billing": map[string]any{"seconds": 8}}}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(8)}},
 		{name: "F reference video actual tokens", model: "seedance2.5-F", state: map[string]any{"video_input": "video"}, body: map[string]any{"status": "completed", "seconds": "8", "metadata": map[string]any{"usage": map[string]any{"total_tokens": 600037, "output_tokens": 590000}, "billing": map[string]any{"settle_state": "settled"}}}, wantStatus: "SUCCESS", wantFacts: map[string]any{"seconds": float64(8), "tokens": float64(600037)}},
@@ -400,8 +414,23 @@ func TestDramaVideoPollingAndActualUsage(t *testing.T) {
 			require.NoError(t, err)
 			result := value.(map[string]any)
 			assert.Equal(t, tc.wantStatus, result["status"])
-			if tc.name == "failed task" {
-				assert.Equal(t, "generation rejected", result["reason"])
+			if tc.wantStatus == "FAILURE" {
+				assert.Equal(t, tc.wantReason, result["reason"])
+				adaptor := pluginadaptor.New(plugin)
+				adaptor.Init(&relaycommon.RelayInfo{})
+				public, renderErr := adaptor.ConvertToOpenAIVideo(&model.Task{TaskID: "task_public_failure", Status: model.TaskStatusFailure, FailReason: result["reason"].(string), Properties: model.Properties{OriginModelName: tc.model}})
+				require.NoError(t, renderErr)
+				var rendered struct {
+					Status string `json:"status"`
+					Error  struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				require.NoError(t, common.Unmarshal(public, &rendered))
+				assert.Equal(t, "failed", rendered.Status)
+				assert.Equal(t, tc.wantReason, rendered.Error.Message)
+			} else if tc.wantStatus != "UNKNOWN" {
+				assert.NotContains(t, result, "reason", "non-terminal and completed metadata must not become a failure reason")
 			}
 			value, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", ctx, result, tc.body)
 			require.NoError(t, err)

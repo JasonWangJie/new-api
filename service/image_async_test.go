@@ -132,7 +132,7 @@ func asyncImageWorkerFixture(t *testing.T) (*gorm.DB, model.AsyncImageTask, Asyn
 }
 
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
-	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry"} {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry"} {
 		t.Run(condition, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			wantChannelID, wantKey := alternate.Id, alternate.Key
@@ -148,7 +148,11 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				for range cfg.FailureThreshold {
 					require.NoError(t, RecordImageCircuit(t.Context(), "async", task.ChannelId, false, cfg))
 				}
-			case "busy channel uses alternate":
+			case "busy channel uses alternate", "namespaced busy channel uses alternate":
+				if condition == "namespaced busy channel uses alternate" {
+					common.RDB.AddHook(common.RedisNamespaceHook{Prefix: "image-worker-scope"})
+					require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+				}
 				attempts = nil
 				var primary model.Channel
 				require.NoError(t, db.First(&primary, task.ChannelId).Error)

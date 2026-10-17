@@ -19,7 +19,7 @@ func (hook RedisNamespaceHook) BeforeProcess(ctx context.Context, cmd redis.Cmde
 	var positions []int
 	switch strings.ToLower(cmd.Name()) {
 	case "ping", "info", "multi", "exec", "discard":
-	case "get", "getset", "set", "setnx", "setex", "hgetall", "hset", "hget", "hincrby", "hdel", "expire", "pexpire", "ttl", "pttl", "zadd", "zrem", "zrange", "zscore", "zrangebyscore", "zcard", "zremrangebyscore", "incr", "incrby", "decrby":
+	case "get", "getset", "set", "setnx", "setex", "hgetall", "hset", "hget", "hincrby", "hdel", "expire", "pexpire", "ttl", "pttl", "zadd", "zrem", "zrange", "zscore", "zrangebyscore", "zcard", "zcount", "zremrangebyscore", "incr", "incrby", "decrby":
 		positions = []int{1}
 	case "del", "mget", "exists", "watch":
 		for i := 1; i < len(args); i++ {

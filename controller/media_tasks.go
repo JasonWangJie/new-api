@@ -142,7 +142,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 			view["stage"], view["status"], view["progress"] = "saving", "upstream_succeeded", 70
 		}
 		if task.Status == model.TaskStatusFailure {
-			view["status"], view["stage"], view["error_message"] = "failed", "failed", task.FailReason
+			view["status"], view["stage"], view["error_message"] = "failed", "failed", service.PublicTaskFailureReason(&task)
 			if job.BillingStatus != "failed" {
 				view["billing_status"] = "refunded"
 			}

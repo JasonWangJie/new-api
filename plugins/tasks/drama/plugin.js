@@ -77,7 +77,7 @@ export const meta = {
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.3",
+  version: "1.1.4",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
@@ -138,7 +138,9 @@ function aliasedValue(request, names) {
 
 function mediaSource(value, type, config) {
   if (value && typeof value === "object" && !Array.isArray(value)) value = value.url || value.source;
+  // oxlint-disable no-control-regex -- Public media URLs must reject control characters
   if (typeof value !== "string" || !value || value !== value.trim() || /[\s\\\x00-\x1f]/.test(value)) throw new Error("Media source must be a public HTTPS URL");
+  // oxlint-enable no-control-regex
   if (/^https:\/\/[^/?#@]+(?:[/?#].*)?$/i.test(value)) return value;
   if (config.series === "G" && /^asset:\/\/[A-Za-z0-9_-]+$/.test(value)) return value;
   if (config.series === "legacy" && value.startsWith("data:" + type + "/") && /^data:[^;,]+;base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) return value;
@@ -417,7 +419,25 @@ export function parseTaskResult(ctx, body) {
   if (status === "SUCCESS" && completionUsage(ctx, body) === null) status = "IN_PROGRESS";
   const result = { status };
   if (typeof body.progress === "number" && Number.isFinite(body.progress) && body.progress >= 0 && body.progress <= 100) result.progress = (status === "IN_PROGRESS" ? Math.min(99, body.progress) : body.progress) + "%";
-  if (status === "FAILURE") result.reason = typeof body.error === "string" ? body.error : body.error && body.error.message ? body.error.message : "Video generation failed";
+  if (status === "FAILURE") {
+    let reason = "";
+    if (typeof body.error === "string") {
+      reason = body.error.trim();
+    } else if (body.error && typeof body.error.message === "string") {
+      reason = body.error.message.trim();
+    }
+    if (!reason) {
+      const metadata = body.metadata;
+      let candidate = "";
+      if (metadata && typeof metadata === "object" && !Array.isArray(metadata) && typeof metadata.url === "string") {
+        candidate = metadata.url.trim();
+      }
+      // Some failed Drama jobs place their diagnostic in the result URL field.
+      // Result locations themselves must not be exposed as an error reason.
+      if (candidate && !/^(?:(?:https?|data|blob|file|ftp|s3|gs):|\/)/i.test(candidate)) reason = candidate;
+    }
+    result.reason = reason || "Video generation failed; upstream did not provide an error reason";
+  }
   return result;
 }
 
