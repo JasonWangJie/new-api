@@ -365,6 +365,100 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 
+			t.Run("successful actual cost follows filters across every page", func(t *testing.T) {
+				images := []model.AsyncImageTask{
+					{TaskId: "cost_image_alpha", UserId: 101, TokenId: 201, ChannelId: 301, Group: "cost-summary", Platform: "openai", Model: "cost-alpha", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Quota: 125000, CreatedAt: now},
+					{TaskId: "cost_image_beta", UserId: 101, TokenId: 201, Group: "cost-summary", Platform: "gemini", Model: "cost-beta", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Quota: 375000, CreatedAt: now},
+					{TaskId: "cost_image_free", UserId: 101, TokenId: 201, Group: "cost-summary", Status: model.ImageTaskSucceeded, BillingStatus: "not_billable", CreatedAt: now},
+					{TaskId: "cost_image_unsettled", UserId: 101, TokenId: 201, Group: "cost-summary", Status: model.ImageTaskSucceeded, BillingStatus: "pending", Quota: 910000, CreatedAt: now},
+					{TaskId: "cost_image_pending", UserId: 101, TokenId: 201, Group: "cost-summary", Status: model.ImageTaskBillingPending, BillingStatus: "pending", Quota: 300000, CreatedAt: now},
+					{TaskId: "cost_image_failed", UserId: 101, TokenId: 201, Group: "cost-summary", Status: model.ImageTaskFailed, BillingStatus: "succeeded", Quota: 400000, CreatedAt: now},
+					{TaskId: "cost_image_refunded", UserId: 101, TokenId: 201, Group: "cost-summary", Status: model.ImageTaskFailed, BillingStatus: "refunded", Quota: 800000, CreatedAt: now},
+					{TaskId: "cost_image_foreign", UserId: 102, TokenId: 202, Group: "cost-summary", Platform: "openai", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Quota: 500000, CreatedAt: now},
+				}
+				videos := []model.AsyncMediaJob{
+					{TaskId: "cost_video_final", IdentityHash: "cost-video-final", UserId: 101, TokenId: 201, ChannelId: 301, Group: "cost-summary", Provider: "openai", Status: "succeeded", StorageStatus: "upstream", BillingStatus: "settled", Quota: 999999, CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "cost_video_standalone", IdentityHash: "cost-video-standalone", UserId: 101, TokenId: 201, Group: "cost-summary", Provider: "gemini", Status: "succeeded", StorageStatus: "upstream", BillingStatus: "settled", Quota: 250000, CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "cost_video_reserved", IdentityHash: "cost-video-reserved", UserId: 101, TokenId: 201, Group: "cost-summary", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: 900000, CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "cost_video_failed", IdentityHash: "cost-video-failed", UserId: 101, TokenId: 201, Group: "cost-summary", Status: "failed", StorageStatus: "pending", BillingStatus: "refunded", Quota: 800000, CreatedAt: now, ExpiresAt: now + 3600},
+					{TaskId: "cost_video_billing_failed", IdentityHash: "cost-video-billing-failed", UserId: 101, TokenId: 201, Group: "cost-summary", Status: "succeeded", StorageStatus: "upstream", BillingStatus: "failed", Quota: 700000, CreatedAt: now, ExpiresAt: now + 3600},
+				}
+				settled := model.Task{TaskID: videos[0].TaskId, UserId: 101, Status: model.TaskStatusSuccess, Quota: 625000, FinishTime: now}
+				require.NoError(t, db.Create(&images).Error)
+				require.NoError(t, db.Create(&videos).Error)
+				require.NoError(t, db.Create(&settled).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&images).Error)
+					assert.NoError(t, db.Delete(&videos).Error)
+					assert.NoError(t, db.Delete(&settled).Error)
+				})
+				for _, handler := range []struct {
+					name string
+					list func(*gin.Context, bool)
+				}{{"images", ListImageTasks}, {"media", ListMediaTasks}} {
+					t.Run(handler.name, func(t *testing.T) {
+						for _, tc := range []struct {
+							name       string
+							admin      bool
+							params     url.Values
+							imageQuota int64
+							videoQuota int64
+						}{
+							{name: "administrator all matches", admin: true, imageQuota: 1000000, videoQuota: 875000},
+							{name: "owner only", imageQuota: 500000, videoQuota: 875000},
+							{name: "last page keeps full summary", admin: true, params: url.Values{"page": {"2"}}, imageQuota: 1000000, videoQuota: 875000},
+							{name: "success filter", admin: true, params: url.Values{"status": {"succeeded"}}, imageQuota: 1000000, videoQuota: 875000},
+							{name: "failed excludes previously charged and refunded", admin: true, params: url.Values{"status": {"failed"}}},
+							{name: "billing filter", admin: true, params: url.Values{"billing_status": {"succeeded"}}, imageQuota: 1000000},
+							{name: "free successful tasks", admin: true, params: url.Values{"billing_status": {"not_billable"}}},
+							{name: "platform filter", admin: true, params: url.Values{"platform": {"openai"}}, imageQuota: 625000, videoQuota: 625000},
+							{name: "model filter", admin: true, params: url.Values{"model": {"cost-alpha"}}, imageQuota: 125000},
+							{name: "channel search", admin: true, params: url.Values{"q": {"Sunburst"}}, imageQuota: 125000, videoQuota: 625000},
+							{name: "API key filter", admin: true, params: url.Values{"api_key_id": {"202"}}, imageQuota: 500000},
+							{name: "date excludes all", admin: true, params: url.Values{"start_date": {"2099-01-01"}, "end_date": {"2099-01-01"}}},
+							{name: "no matches", admin: true, params: url.Values{"q": {"missing-cost-task"}}},
+						} {
+							t.Run(tc.name, func(t *testing.T) {
+								params := tc.params
+								if params == nil {
+									params = url.Values{}
+								}
+								params.Set("group", "cost-summary")
+								params.Set("page_size", "1")
+								params.Set("timezone", "UTC")
+								if params.Get("start_date") == "" {
+									date := time.Unix(now, 0).UTC().Format("2006-01-02")
+									params.Set("start_date", date)
+									params.Set("end_date", date)
+								}
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Set("id", 101)
+								c.Request = httptest.NewRequest(http.MethodGet, "/?"+params.Encode(), nil)
+								handler.list(c, tc.admin)
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								var response struct {
+									Data struct {
+										Items []gin.H
+										Stats struct {
+											SucceededCost *float64 `json:"succeeded_cost"`
+										}
+									}
+								}
+								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+								require.NotNil(t, response.Data.Stats.SucceededCost)
+								quota := tc.imageQuota
+								if handler.name == "media" {
+									quota += tc.videoQuota
+								}
+								assert.Equal(t, float64(quota)/common.QuotaPerUnit, *response.Data.Stats.SucceededCost)
+								assert.LessOrEqual(t, len(response.Data.Items), 1)
+							})
+						}
+					})
+				}
+			})
+
 			t.Run("platform options follow configured channels instead of task rows", func(t *testing.T) {
 				previousCapability, previousRegistry := service.ImageChannelCapabilityFunc, jsplugin.DefaultRegistry
 				jsplugin.DefaultRegistry = jsplugin.NewRegistry()

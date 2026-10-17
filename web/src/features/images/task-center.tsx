@@ -822,6 +822,18 @@ function TaskCenterSession({
       dot: 'bg-cyan-500',
     },
   ]
+  if (admin) {
+    statistics.push({
+      label: t('Successful task cost'),
+      value:
+        stats?.succeeded_cost == null
+          ? '—'
+          : `$${stats.succeeded_cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`,
+      color: 'text-primary',
+      shell: 'border-primary/20 bg-primary/10',
+      dot: 'bg-primary',
+    })
+  }
   const batchActions = canManage && (
     <>
       <Button
@@ -909,7 +921,8 @@ function TaskCenterSession({
                   isMobile
                     ? 'flex-col items-start gap-1'
                     : 'items-center gap-2',
-                  isMobile && (index < 3 ? 'col-span-2' : 'col-span-3')
+                  isMobile && (index < 3 ? 'col-span-2' : 'col-span-3'),
+                  isMobile && index === 5 && 'col-span-6'
                 )}
               >
                 <dt className='flex items-center gap-1.5'>

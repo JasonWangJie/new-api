@@ -130,6 +130,8 @@ func ListImageTasks(c *gin.Context, admin bool) {
 		Failed          int64    `json:"failed"`
 		ImageCount      int64    `json:"image_count"`
 		Quota           int64    `json:"quota"`
+		SucceededQuota  int64    `json:"-"`
+		SucceededCost   float64  `json:"succeeded_cost"`
 		AverageDuration *float64 `json:"average_duration_ms"`
 	}
 	selection := `COUNT(*) AS total,
@@ -139,11 +141,13 @@ COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END),0) AS succeeded,
 COALESCE(SUM(CASE WHEN status IN ('failed','expired','execution_unknown','storage_failed','billing_failed') THEN 1 ELSE 0 END),0) AS failed,
 COALESCE(SUM(CASE WHEN status = 'succeeded' THEN image_count ELSE 0 END),0) AS image_count,
 COALESCE(SUM(CASE WHEN billing_status IN ('succeeded','not_billable') THEN quota ELSE 0 END),0) AS quota,
+COALESCE(SUM(CASE WHEN status = 'succeeded' AND billing_status IN ('succeeded','not_billable') THEN quota ELSE 0 END),0) AS succeeded_quota,
 AVG(CASE WHEN status = 'succeeded' AND finished_at >= created_at THEN (finished_at-created_at)*1000.0 ELSE NULL END) AS average_duration`
 	if err := query.Session(&gorm.Session{}).Select(selection).Scan(&stats).Error; err != nil {
 		imageManagementError(c, 503, err)
 		return
 	}
+	stats.SucceededCost = float64(stats.SucceededQuota) / common.QuotaPerUnit
 	allowed := map[string]string{"created_at": "created_at", "submitted_at": "created_at", "finished_at": "finished_at", "updated_at": "updated_at", "status": "status", "quota": "quota", "image_count": "image_count", "duration_ms": "(CASE WHEN finished_at > 0 THEN finished_at-created_at ELSE 0 END)"}
 	column, ok := allowed[c.DefaultQuery("sort_by", "created_at")]
 	if !ok {

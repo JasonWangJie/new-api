@@ -6170,6 +6170,7 @@
     "Succeeded values": "Значения успеха",
     "Success": "Успешно",
     "Success rate": "Доля успешных запросов",
+    "Successful task cost": "Общая стоимость успешных задач",
     "Successfully created {{count}} API Key(s)": "Успешно создано {{count}} API-ключ(а/ей)",
     "Successfully created {{count}} redemption codes": "Успешно создано {{count}} кодов активации",
     "Successfully deleted {{count}} API key(s)": "Успешно удалено {{count}} API-ключ(а/ей)",

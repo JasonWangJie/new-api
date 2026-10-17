@@ -326,6 +326,103 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
+test.each([false, true])(
+  'administrator successful task cost uses all filtered results after average duration (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        {
+          ...task,
+          status: 'succeeded',
+          billing_status: 'succeeded',
+          cost: 0.12,
+        },
+      ],
+      total: 100,
+      pages: 5,
+      stats: { succeeded: 96, succeeded_cost: 12.3456789 },
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    const statistics = screen.getByLabelText('Task statistics')
+    const costLabel = within(statistics).getByText('Successful task cost')
+    expect(costLabel.nextElementSibling?.textContent).toBe('$12.345679')
+    expect(
+      within(statistics)
+        .getAllByRole('term')
+        .slice(-2)
+        .map((term) => term.textContent)
+    ).toEqual(['Average duration', 'Successful task cost'])
+    if (mobile) {
+      expect(costLabel.parentElement).toHaveClass('col-span-6')
+      expect(
+        within(statistics).getByText('Average duration').parentElement
+      ).toHaveClass('col-span-3')
+    }
+  }
+)
+
+test('administrator successful task cost follows applied filters and reset without using draft filters', async () => {
+  vi.mocked(getImageTasks).mockImplementation(async (_admin, params) => ({
+    items: [task],
+    total: 1,
+    pages: 1,
+    stats: { succeeded_cost: params.get('q') === 'flare' ? 0.25 : 0.75 },
+  }))
+  mount(<ImageTaskCenter admin />)
+  const statistics = screen.getByLabelText('Task statistics')
+  expect(await within(statistics).findByText('$0.75')).toBeVisible()
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('Search tasks'), 'flare')
+  expect(within(statistics).getByText('$0.75')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+  expect(await within(statistics).findByText('$0.25')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Reset' }))
+  expect(await within(statistics).findByText('$0.75')).toBeVisible()
+  expect(screen.getByLabelText('Search tasks')).toHaveValue('')
+})
+
+test.each([
+  { name: 'empty results', succeededCost: 0, expected: '$0' },
+  { name: 'missing total', succeededCost: undefined, expected: '—' },
+  { name: 'unavailable total', succeededCost: null, expected: '—' },
+])(
+  'administrator successful task cost displays $expected for $name',
+  async ({ succeededCost, expected }) => {
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [],
+      total: 0,
+      pages: 0,
+      stats:
+        succeededCost === undefined ? {} : { succeeded_cost: succeededCost },
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findByText('No image tasks found')
+    expect(
+      within(screen.getByLabelText('Task statistics')).getByText(
+        'Successful task cost'
+      ).nextElementSibling?.textContent
+    ).toBe(expected)
+  }
+)
+
+test('user task statistics do not expose the administrator successful task cost total', async () => {
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [task],
+    total: 1,
+    pages: 1,
+    stats: { succeeded_cost: 12.34 },
+  })
+  mount(<ImageTaskCenter />)
+  await screen.findByRole('button', { name: task.id })
+  const statistics = screen.getByLabelText('Task statistics')
+  expect(
+    within(statistics).queryByText('Successful task cost')
+  ).not.toBeInTheDocument()
+  expect(within(statistics).queryByText('$12.34')).not.toBeInTheDocument()
+})
+
 test.each([
   { mobile: false, status: 'failed' },
   { mobile: true, status: 'failed' },

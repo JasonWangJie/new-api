@@ -6170,6 +6170,7 @@
     "Succeeded values": "成功狀態值",
     "Success": "成功",
     "Success rate": "成功率",
+    "Successful task cost": "成功任務實際費用合計",
     "Successfully created {{count}} API Key(s)": "成功建立了 {{count}} 個 API 金鑰",
     "Successfully created {{count}} redemption codes": "成功建立了 {{count}} 個兌換碼",
     "Successfully deleted {{count}} API key(s)": "成功刪除了 {{count}} 個 API 金鑰",

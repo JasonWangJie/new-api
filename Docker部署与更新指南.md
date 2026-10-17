@@ -154,6 +154,7 @@ Cookie 的 HTTPS 和可信域名已由安装脚本配置。服务器地址仍需
 
 ```bash
 bash /opt/new-api/manage.sh update --ready
+bash /opt/new-api/update-confirm.sh
 ```
 
 脚本获取自己的新代码，先构建，再停止应用、备份、切换镜像，最后等待健康检查。构建时网站继续运行，备份和切换时短暂中断。`--ready` 表示你已经完成第 2 步。

@@ -6170,6 +6170,7 @@
     "Succeeded values": "成功の値",
     "Success": "成功",
     "Success rate": "成功率",
+    "Successful task cost": "成功タスクの実費合計",
     "Successfully created {{count}} API Key(s)": "{{count}}個のAPIキーが正常に作成されました",
     "Successfully created {{count}} redemption codes": "{{count}}件の引き換えコードが正常に作成されました",
     "Successfully deleted {{count}} API key(s)": "{{count}}個のAPIキーが正常に削除されました",
