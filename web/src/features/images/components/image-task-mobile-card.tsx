@@ -38,7 +38,6 @@ import {
   ImageRequestTypeBadge,
   ImageStatusBadge,
 } from './image-badges'
-import { ImageTaskNotice } from './image-task-notice'
 
 export function ImageTaskMobileCard(props: {
   row: Row<ImageTask>
@@ -138,7 +137,6 @@ export function ImageTaskMobileCard(props: {
           <Progress value={progress} aria-label={t('Progress')} />
         )}
       </div>
-      <ImageTaskNotice task={task} />
 
       <dl className='[&_dt]:text-muted-foreground grid grid-cols-2 gap-x-4 gap-y-2.5 text-xs [&_dd]:mt-1 [&_dd]:leading-4 [&_dd]:font-medium [&_dd]:wrap-anywhere [&_dt]:text-[11px] [&>div]:min-w-0'>
         <div>

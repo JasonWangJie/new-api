@@ -326,48 +326,83 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
-test.each([false, true])(
-  'final failures show their explanation and refund without stale progress (mobile=%s)',
-  async (mobile) => {
+test.each([
+  { mobile: false, status: 'failed' },
+  { mobile: true, status: 'failed' },
+  { mobile: false, status: 'execution_unknown' },
+  { mobile: true, status: 'execution_unknown' },
+])(
+  '$status keeps its status in the list and shows failure information only in details (mobile=$mobile)',
+  async ({ mobile, status }) => {
     if (mobile) setMobileViewport()
+    const failedTask = {
+      ...task,
+      status,
+      billing_status: status === 'failed' ? 'refunded' : 'pending',
+      error_code: 'upstream_failed',
+      error_message:
+        status === 'failed'
+          ? 'Reference image exceeds the upstream 20MB limit.'
+          : 'Upstream transport failed after dispatch',
+      failure_code: 610,
+      error_summary:
+        status === 'failed'
+          ? 'Upstream rejected the request; the exact cause is not confirmed'
+          : 'Upstream execution could not be confirmed',
+      error_suggestion:
+        'Do not submit again until an administrator has checked the upstream result and billing.',
+      error_retryable: false,
+      error_stage: 'submit',
+    } satisfies ImageTask
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [
-        {
-          ...task,
-          status: 'failed',
-          billing_status: 'refunded',
-          error_code: 'upstream_failed',
-          error_message: 'Reference image exceeds the upstream 20MB limit.',
-          failure_code: 610,
-          error_summary:
-            'Upstream rejected the request; the exact cause is not confirmed',
-          error_suggestion:
-            'Ask the service provider to check the request format, model compatibility, and upstream request ID.',
-          error_retryable: false,
-          error_stage: 'submit',
-        },
-      ],
+      items: [failedTask],
       total: 1,
       pages: 1,
       stats: {},
     })
-    mount(<ImageTaskCenter />)
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: failedTask,
+      results: [],
+    })
+    mount(<ImageTaskCenter admin />)
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    const listTask = mobile
+      ? screen.getByRole('article', { name: task.id })
+      : screen.getByRole('row', { name: new RegExp(task.id) })
     expect(
-      await screen.findByText(
-        'Upstream rejected the request; the exact cause is not confirmed'
+      within(listTask).getByText(
+        status === 'failed' ? 'Failed' : 'Execution unknown'
       )
     ).toBeVisible()
     expect(
-      screen.getByText('Reference image exceeds the upstream 20MB limit.')
-    ).toBeVisible()
-    expect(
-      screen.getByText(
-        'Ask the service provider to check the request format, model compatibility, and upstream request ID.'
-      )
-    ).toBeVisible()
-    expect(screen.getAllByText(/Refunded/).length).toBeGreaterThan(0)
+      screen.getAllByText(status === 'failed' ? 'Refunded' : 'Pending').length
+    ).toBeGreaterThan(0)
+    for (const message of [
+      failedTask.error_summary,
+      failedTask.error_message,
+      failedTask.error_suggestion,
+      'Task stage',
+    ]) {
+      expect(screen.queryByText(message)).not.toBeInTheDocument()
+    }
     expect(screen.queryByText(/20%/)).not.toBeInTheDocument()
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog')
+    expect(
+      await within(dialog).findByText(failedTask.error_summary)
+    ).toBeVisible()
+    expect(within(dialog).getByText(failedTask.error_suggestion)).toBeVisible()
+    expect(within(dialog).getByText('Upstream submission')).toBeVisible()
+    expect(
+      within(dialog).queryByText(failedTask.error_message)
+    ).not.toBeInTheDocument()
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Upstream diagnostic' })
+    )
+    expect(within(dialog).getByText(failedTask.error_message)).toBeVisible()
   }
 )
 
@@ -397,58 +432,74 @@ test.each([
     visible: true,
   },
 ])(
-  '$action/$rule shows only actual recovery and preserves accepted-job polling semantics',
+  '$action/$rule keeps recovery status in the list and recovery information in details',
   async ({ action, rule, retryable, visible }) => {
     const message = 'Previous upstream diagnostic'
+    const retryTask: ImageTask = {
+      ...task,
+      status: 'queued',
+      error_code: 'upstream_failed',
+      error_message: message,
+      error_retryable: retryable,
+      next_attempt_at: 1789600040,
+      retry_decision: {
+        version: 1,
+        stage: 'poll',
+        action,
+        reason: 'temporary_failure',
+        rule,
+        used: 1,
+        limit: 2,
+        total_used: 1,
+        total_limit: 4,
+        recorded_at: 1789600009,
+      },
+    }
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [
-        {
-          ...task,
-          status: 'queued',
-          error_code: 'upstream_failed',
-          error_message: message,
-          error_retryable: retryable,
-          next_attempt_at: 1789600040,
-          retry_decision: {
-            version: 1,
-            stage: 'poll',
-            action,
-            reason: 'temporary_failure',
-            rule,
-            used: 1,
-            limit: 2,
-            total_used: 1,
-            total_limit: 4,
-            recorded_at: 1789600009,
-          },
-        },
-      ],
+      items: [retryTask],
       total: 1,
       pages: 1,
       stats: {},
     })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: retryTask,
+      results: [],
+    })
     mount(<ImageTaskCenter />)
-    await screen.findByRole('button', { name: task.id })
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    expect(screen.queryByText(message)).not.toBeInTheDocument()
+    expect(screen.queryByText('Next retry')).not.toBeInTheDocument()
+    expect(screen.queryByText('Total retries')).not.toBeInTheDocument()
+    if (visible && retryable) {
+      expect(screen.getByText(/Retry scheduled/)).toBeVisible()
+    } else {
+      expect(screen.queryByText(/Retry scheduled/)).not.toBeInTheDocument()
+    }
+    const user = userEvent.setup()
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog')
     if (!visible) {
-      expect(screen.queryByText(message)).not.toBeInTheDocument()
-      expect(screen.queryByText('Next retry')).not.toBeInTheDocument()
+      await within(dialog).findByRole('heading', { name: 'Retry decision' })
+      expect(within(dialog).queryByRole('status')).not.toBeInTheDocument()
       return
     }
-    expect(screen.getByText(message)).toBeVisible()
+    const notice = await within(dialog).findByRole('status')
+    expect(within(notice).getByText(message)).toBeVisible()
     if (!retryable) {
-      expect(screen.queryByText('Next retry')).not.toBeInTheDocument()
+      expect(within(notice).queryByText('Next retry')).not.toBeInTheDocument()
       return
     }
-    expect(screen.getByText('Next retry')).toBeVisible()
-    expect(screen.getByText('Total retries')).toBeVisible()
+    expect(within(notice).getByText('Next retry')).toBeVisible()
+    expect(within(notice).getByText('Total retries')).toBeVisible()
     if (action === 'poll_same_job') {
       expect(
-        screen.getByText(
+        within(notice).getByText(
           'The existing upstream job will be checked again; no new generation will be submitted.'
         )
       ).toBeVisible()
       expect(
-        screen.queryByText(
+        within(notice).queryByText(
           'The task is scheduled for another submission within its retry limits.'
         )
       ).not.toBeInTheDocument()
@@ -829,6 +880,114 @@ test('refresh reloads platform options after the configured channels change', as
   expect(
     screen.queryByRole('option', { name: 'OpenAI' })
   ).not.toBeInTheDocument()
+})
+
+test.each([
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+])(
+  'floating refresh is absent for admin=$admin mobile=$mobile',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    expect(
+      screen.queryByRole('button', { name: 'Refresh · Media task center' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeVisible()
+  }
+)
+
+test('mobile administrator floating refresh shares loading, failure recovery and both refresh requests', async () => {
+  setMobileViewport()
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  const floating = await screen.findByRole('button', {
+    name: 'Refresh · Media task center',
+  })
+  const header = screen.getByRole('button', { name: 'Refresh' })
+  await waitFor(() => expect(floating).toBeEnabled())
+  let finishTasks!: (value: Awaited<ReturnType<typeof getImageTasks>>) => void
+  let failPlatforms!: (reason: Error) => void
+  vi.mocked(getImageTasks).mockReturnValueOnce(
+    new Promise((resolve) => {
+      finishTasks = resolve
+    })
+  )
+  vi.mocked(getMediaTaskPlatforms).mockReturnValueOnce(
+    new Promise((_, reject) => {
+      failPlatforms = reject
+    })
+  )
+
+  await user.click(floating)
+  for (const button of [floating, header]) {
+    await waitFor(() => expect(button).toBeDisabled())
+    expect(button).toHaveAttribute('aria-busy', 'true')
+    expect(button.querySelector('svg')).toHaveClass('animate-spin')
+  }
+  await user.click(floating)
+  expect(getImageTasks).toHaveBeenCalledTimes(2)
+  expect(getMediaTaskPlatforms).toHaveBeenCalledTimes(2)
+  await act(async () => {
+    finishTasks({ items: [task], total: 1, pages: 1, stats: {} })
+  })
+  expect(floating).toBeDisabled()
+  await act(async () => {
+    failPlatforms(new Error('Platform refresh unavailable'))
+  })
+  await waitFor(() => expect(floating).toBeEnabled())
+  expect(floating).toHaveAttribute('aria-busy', 'false')
+  expect(header).toBeEnabled()
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'Platform refresh unavailable'
+  )
+  await user.click(floating)
+  await waitFor(() => expect(getImageTasks).toHaveBeenCalledTimes(3))
+  expect(getMediaTaskPlatforms).toHaveBeenCalledTimes(3)
+  await waitFor(() => expect(floating).toBeEnabled())
+})
+
+test('mobile administrator floating refresh yields to filter and task detail dialogs', async () => {
+  setMobileViewport()
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  const buttonName = 'Refresh · Media task center'
+  expect(await screen.findByRole('button', { name: buttonName })).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'More filters' }))
+  expect(
+    screen.queryByRole('button', { name: buttonName })
+  ).not.toBeInTheDocument()
+  await user.keyboard('{Escape}')
+  expect(await screen.findByRole('button', { name: buttonName })).toBeVisible()
+  await user.click(screen.getByRole('button', { name: task.id }))
+  await screen.findByRole('dialog')
+  expect(
+    screen.queryByRole('button', { name: buttonName })
+  ).not.toBeInTheDocument()
+  await user.keyboard('{Escape}')
+  expect(await screen.findByRole('button', { name: buttonName })).toBeVisible()
+})
+
+test('mobile administrator floating refresh yields to bulk selection and returns when cleared', async () => {
+  setMobileViewport()
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  const buttonName = 'Refresh · Media task center'
+  expect(await screen.findByRole('button', { name: buttonName })).toBeVisible()
+  const selection = await screen.findByRole('checkbox', {
+    name: 'Select current page',
+  })
+  await user.click(selection)
+  expect(
+    screen.queryByRole('button', { name: buttonName })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', { name: 'Terminate selected' })
+  ).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Refresh' })).toBeVisible()
+  await user.click(selection)
+  expect(await screen.findByRole('button', { name: buttonName })).toBeVisible()
 })
 
 test.each([false, true])(

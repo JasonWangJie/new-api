@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { RefreshIcon } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
@@ -33,6 +34,49 @@ interface ImageTaskRefreshActionsProps {
   platformsFetching: boolean
   onAutoRefreshChange: (enabled: boolean) => void
   onRefresh: () => void
+  floating?: boolean
+}
+
+function ImageTaskRefreshButton(props: {
+  refreshing: boolean
+  onRefresh: () => void
+  floating?: boolean
+}) {
+  const { t } = useTranslation()
+  return (
+    <Button
+      type='button'
+      variant={props.floating ? 'default' : 'outline'}
+      size={props.floating ? 'icon' : 'sm'}
+      aria-label={
+        props.floating
+          ? `${t('Refresh')} · ${t('Media task center')}`
+          : undefined
+      }
+      title={t('Refresh')}
+      aria-busy={props.refreshing}
+      disabled={props.refreshing}
+      onClick={props.onRefresh}
+      className={cn(
+        props.floating &&
+          'fixed right-[calc(1rem+env(safe-area-inset-right))] bottom-[calc(5.5rem+env(safe-area-inset-bottom))] z-30 size-14 touch-manipulation rounded-full shadow-lg ring-4 ring-background/80 hover:bg-primary/90 active:scale-95 disabled:pointer-events-auto motion-reduce:transform-none motion-reduce:transition-none'
+      )}
+    >
+      <HugeiconsIcon
+        icon={RefreshIcon}
+        strokeWidth={2}
+        data-icon={props.floating ? undefined : 'inline-start'}
+        className={cn(
+          props.floating && 'size-6',
+          props.refreshing && 'animate-spin motion-reduce:animate-none'
+        )}
+        aria-hidden
+      />
+      <span className={props.floating ? 'sr-only' : undefined}>
+        {t('Refresh')}
+      </span>
+    </Button>
+  )
 }
 
 export function ImageTaskRefreshActions(props: ImageTaskRefreshActionsProps) {
@@ -80,22 +124,20 @@ export function ImageTaskRefreshActions(props: ImageTaskRefreshActionsProps) {
           </span>
         )}
       </Button>
-      <Button
-        variant='outline'
-        size='sm'
-        aria-busy={refreshing}
-        disabled={refreshing}
-        onClick={props.onRefresh}
-      >
-        <HugeiconsIcon
-          icon={RefreshIcon}
-          strokeWidth={2}
-          data-icon='inline-start'
-          className={cn(refreshing && 'animate-spin')}
-          aria-hidden
-        />
-        {t('Refresh')}
-      </Button>
+      <ImageTaskRefreshButton
+        refreshing={refreshing}
+        onRefresh={props.onRefresh}
+      />
+      {props.floating &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <ImageTaskRefreshButton
+            floating
+            refreshing={refreshing}
+            onRefresh={props.onRefresh}
+          />,
+          document.body
+        )}
     </>
   )
 }

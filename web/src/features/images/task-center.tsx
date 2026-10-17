@@ -73,7 +73,6 @@ import { ImageReliabilityPanel } from './components/image-reliability-panel'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
-import { ImageTaskNotice } from './components/image-task-notice'
 import { ImageTaskRefreshActions } from './components/image-task-refresh-actions'
 import { imageLabel } from './lib/image-labels'
 import {
@@ -326,7 +325,7 @@ function TaskCenterSession({
           const issue = imageTaskIssue(row.original)
           const progress = imageTaskProgress(row.original)
           return (
-            <div className={cn('space-y-2', issue && 'min-w-60 max-w-80')}>
+            <div className='space-y-2'>
               <ImageStatusBadge
                 status={row.original.status}
                 errorCode={
@@ -340,7 +339,6 @@ function TaskCenterSession({
                 {progress !== null && <>{progress}% · </>}
                 {t(imageLabel(row.original.billing_status))}
               </p>
-              <ImageTaskNotice task={row.original} />
             </div>
           )
         },
@@ -868,6 +866,14 @@ function TaskCenterSession({
       </SectionPageLayout.Title>
       <SectionPageLayout.Actions>
         <ImageTaskRefreshActions
+          floating={
+            admin &&
+            isMobile &&
+            !table.getSelectedRowModel().rows.length &&
+            !detail &&
+            !operation &&
+            !mobileFiltersOpen
+          }
           autoRefresh={autoRefresh}
           refreshIntervalSeconds={TASK_REFRESH_INTERVAL_SECONDS}
           tasksFetching={tasks.isFetching}
