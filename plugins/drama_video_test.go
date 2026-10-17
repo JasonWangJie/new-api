@@ -5,23 +5,31 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	pluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func loadDramaVideoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
@@ -443,6 +451,78 @@ func TestDramaVideoPollingAndActualUsage(t *testing.T) {
 	}
 }
 
+func TestDramaVideoPublicUpstreamProgress(t *testing.T) {
+	source, err := builtinplugins.Source("drama")
+	require.NoError(t, err)
+	spoofedSource := strings.Replace(source, "const result = {};", "const result = { upstream_progress: 88 };", 1)
+	require.NotEqual(t, source, spoofedSource)
+	plugin, err := jsplugin.NewRegistry().RegisterFactory(spoofedSource, jsplugin.Options{Key: "drama"})
+	require.NoError(t, err)
+	adaptor := pluginadaptor.New(plugin)
+	adaptor.Init(&relaycommon.RelayInfo{})
+	for _, tc := range []struct {
+		name, snapshot, path, privateSnapshot string
+		configured                            bool
+		want                                  any
+		taskStatus                            model.TaskStatus
+		wantStatus                            string
+	}{
+		{name: "queued provider progress", snapshot: `{"status":"queued","progress":0}`, taskStatus: model.TaskStatusQueued, wantStatus: "queued", want: float64(0)},
+		{name: "explicit zero", snapshot: `{"progress":0}`, want: float64(0)},
+		{name: "fractional progress", snapshot: `{"progress":42.5}`, want: 42.5},
+		{name: "upstream done before host settlement", snapshot: `{"status":"completed","progress":100}`, want: float64(100)},
+		{name: "missing progress cannot use host progress", snapshot: `{}`},
+		{name: "provider numeric string is not a percentage", snapshot: `{"progress":"42.5"}`},
+		{name: "negative progress", snapshot: `{"progress":-1}`},
+		{name: "progress over one hundred", snapshot: `{"progress":101}`},
+		{name: "null progress", snapshot: `{"progress":null}`},
+		{name: "boolean progress", snapshot: `{"progress":false}`},
+		{name: "configured numeric progress", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":31.5},"private_url":"https://private.example/result"}`, want: 31.5},
+		{name: "configured percentage string", configured: true, path: " job.progress ", privateSnapshot: `{"job":{"progress":" 42.5% "}}`, want: 42.5},
+		{name: "configured numeric string zero", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":" 0 "}}`, want: float64(0)},
+		{name: "configured missing path ignores public data", snapshot: `{"progress":80}`, configured: true, privateSnapshot: `{"progress":60}`},
+		{name: "configured missing value ignores public data", snapshot: `{"progress":80}`, configured: true, path: "job.progress", privateSnapshot: `{"progress":60}`},
+		{name: "configured invalid value ignores public data", snapshot: `{"progress":80}`, configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":"unavailable"}}`},
+		{name: "configured malformed snapshot", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":40}`},
+		{name: "configured nonfinite progress", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":"NaN"}}`},
+		{name: "configured infinite progress", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":"+Inf"}}`},
+		{name: "configured percentage over one hundred", configured: true, path: "job.progress", privateSnapshot: `{"job":{"progress":"101%"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, wantStatus := tc.taskStatus, tc.wantStatus
+			if status == "" {
+				status, wantStatus = model.TaskStatusInProgress, "in_progress"
+			}
+			task := &model.Task{
+				TaskID: "public-task", Platform: "drama", Status: status, Progress: "30%",
+				Properties: model.Properties{OriginModelName: "seedance2.5-G"},
+				Data:       []byte(tc.snapshot),
+			}
+			if tc.configured {
+				task.PrivateData.UpstreamAsync = &relaydto.UpstreamAsyncProfile{Poll: relaydto.UpstreamAsyncPoll{Response: relaydto.UpstreamAsyncPollResponse{ProgressPath: tc.path}}}
+				task.PrivateData.UpstreamAsyncResponse = []byte(tc.privateSnapshot)
+			}
+			public, err := adaptor.ConvertToOpenAIVideo(task)
+			require.NoError(t, err)
+			var rendered map[string]any
+			require.NoError(t, common.Unmarshal(public, &rendered))
+			assert.Equal(t, wantStatus, rendered["status"])
+			assert.Equal(t, float64(30), rendered["progress"])
+			if tc.want == nil {
+				assert.NotContains(t, rendered, "upstream_progress")
+			} else {
+				assert.Equal(t, tc.want, rendered["upstream_progress"])
+			}
+			assert.NotContains(t, string(public), "private.example")
+			assert.Equal(t, "30%", task.Progress)
+		})
+	}
+	_, ok := service.PublicTaskUpstreamProgress(&model.Task{Platform: "sora", Data: []byte(`{"progress":40}`)})
+	assert.False(t, ok)
+	_, ok = service.PublicTaskUpstreamProgress(nil)
+	assert.False(t, ok)
+}
+
 func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
 	adaptor := pluginadaptor.New(plugin)
@@ -525,6 +605,30 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 
 func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "drama-polling.db")), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	previousDB, previousLogDB, previousCache := model.DB, model.LOG_DB, common.MemoryCacheEnabled
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousFactory := service.GetTaskAdaptorFunc
+	model.DB, model.LOG_DB, common.MemoryCacheEnabled = db, db, false
+	common.SetDatabaseTypes(common.DatabaseType("sqlite"), common.DatabaseType("sqlite"))
+	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
+		if platform == "drama" {
+			return pluginadaptor.New(plugin)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.MemoryCacheEnabled = previousDB, previousLogDB, previousCache
+		common.SetDatabaseTypes(previousType, previousLogType)
+		service.GetTaskAdaptorFunc = previousFactory
+		assert.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "drama-polling", Quota: 1000}).Error)
 	for _, modelName := range []string{"seedance2.0-A", "seedance2.5-A", "minimax-h3", "seedance2.0-E-720p", "seedance2.5-F", "seedance2.5-G"} {
 		t.Run(modelName, func(t *testing.T) {
 			var submits, polls, downloads atomic.Int32
@@ -540,7 +644,7 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 					assert.Equal(t, modelName, body["model"])
 					assert.Equal(t, float64(5), body["seconds"])
 					writer.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"queued"}`)
+					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"queued","progress":0}`)
 					return
 				}
 				if request.URL.Path == "/v1/videos/remote-task/content" {
@@ -552,7 +656,15 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 				poll := polls.Add(1)
 				writer.Header().Set("Content-Type", "application/json")
 				if poll == 1 {
+					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"queued","progress":0}`)
+					return
+				}
+				if poll == 2 {
 					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"in_progress","progress":40}`)
+					return
+				}
+				if modelName == "seedance2.5-G" && poll == 3 {
+					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"completed","progress":100,"metadata":{"billing":{"settle_state":"pending"}}}`)
 					return
 				}
 				if modelName == "seedance2.0-A" || modelName == "seedance2.5-A" || modelName == "minimax-h3" {
@@ -583,21 +695,57 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 			require.NotNil(t, receipt)
 			assert.Equal(t, "remote-task", receipt.UpstreamTaskID)
 			require.NotEmpty(t, receipt.PluginState)
-			task := &model.Task{TaskID: "public-task", Action: info.Action, Status: model.TaskStatusSubmitted, Properties: model.Properties{OriginModelName: modelName, UpstreamModelName: modelName}, Data: receipt.TaskData, PrivateData: model.TaskPrivateData{UpstreamTaskID: receipt.UpstreamTaskID, PluginState: receipt.PluginState}}
-			for _, wantStatus := range []string{"IN_PROGRESS", "SUCCESS"} {
-				response, err = adaptor.FetchTaskContext(t.Context(), upstream.URL, "upstream-key", task, "")
-				require.NoError(t, err)
-				body, err := io.ReadAll(response.Body)
-				require.NoError(t, err)
-				require.NoError(t, response.Body.Close())
-				result, err := adaptor.ParseTaskResult(task, response, body)
-				require.NoError(t, err)
-				assert.Equal(t, wantStatus, result.Status)
-				task.Status = model.TaskStatus(result.Status)
-				task.Data = body
-				if wantStatus == "SUCCESS" && modelName == "seedance2.5-G" {
-					assert.Equal(t, float64(12345), result.UsageFacts["tokens"])
+			channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: modelName, Key: "upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled}
+			require.NoError(t, db.Create(channel).Error)
+			task := &model.Task{TaskID: "public-" + modelName, UserId: 1, ChannelId: channel.Id, Platform: "drama", Action: info.Action, Status: model.TaskStatusSubmitted, Progress: "0%", CreatedAt: common.GetTimestamp(), Properties: model.Properties{OriginModelName: modelName, UpstreamModelName: modelName}, Data: receipt.TaskData, PrivateData: model.TaskPrivateData{UpstreamTaskID: receipt.UpstreamTaskID, PluginState: receipt.PluginState, BillingContext: &model.TaskBillingContext{PerCallBilling: true}}}
+			require.NoError(t, db.Create(task).Error)
+			type pollingExpectation struct {
+				status           model.TaskStatus
+				publicStatus     string
+				progress         int
+				upstreamProgress float64
+			}
+			states := []pollingExpectation{{model.TaskStatusQueued, "queued", 0, 0}, {model.TaskStatusInProgress, "in_progress", 40, 40}}
+			if modelName == "seedance2.5-G" {
+				states = append(states, pollingExpectation{model.TaskStatusInProgress, "in_progress", 99, 100})
+			}
+			states = append(states, pollingExpectation{model.TaskStatusSuccess, "completed", 100, 100})
+			for _, expected := range states {
+				require.NoError(t, service.UpdateVideoTasks(t.Context(), "drama", map[int][]string{channel.Id: {receipt.UpstreamTaskID}}, map[string]*model.Task{receipt.UpstreamTaskID: task}))
+				var persisted model.Task
+				require.NoError(t, db.First(&persisted, task.ID).Error)
+				assert.Equal(t, expected.status, persisted.Status)
+				assert.Equal(t, fmt.Sprintf("%d%%", expected.progress), persisted.Progress)
+				percent, exists := service.PublicTaskUpstreamProgress(&persisted)
+				assert.True(t, exists)
+				assert.Equal(t, expected.upstreamProgress, percent)
+				recorder := httptest.NewRecorder()
+				query, _ := gin.CreateTestContext(recorder)
+				query.Set("id", 1)
+				query.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+				query.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID, nil)
+				require.Nil(t, relay.RelayTaskFetch(query, relayconstant.RelayModeVideoFetchByID))
+				require.Equal(t, http.StatusOK, recorder.Code)
+				var rendered map[string]any
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &rendered))
+				assert.Equal(t, task.TaskID, rendered["id"])
+				assert.Equal(t, expected.publicStatus, rendered["status"])
+				assert.Equal(t, float64(expected.progress), rendered["progress"])
+				assert.Equal(t, expected.upstreamProgress, rendered["upstream_progress"])
+				assert.NotContains(t, recorder.Body.String(), "remote-task")
+				assert.NotContains(t, recorder.Body.String(), "upstream-key")
+				if expected.status != model.TaskStatusSuccess {
+					contentRecorder := httptest.NewRecorder()
+					content, _ := gin.CreateTestContext(contentRecorder)
+					content.Set("id", 1)
+					content.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+					content.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID+"/content", nil)
+					controller.VideoProxy(content)
+					assert.Equal(t, http.StatusBadRequest, contentRecorder.Code)
+					assert.Contains(t, contentRecorder.Body.String(), "Task is not completed yet")
 				}
+				assert.Zero(t, downloads.Load(), "status polling must not fetch unfinished content")
+				*task = persisted
 			}
 			descriptor, err := adaptor.BuildContentRequest(task, "video", relaychannel.TaskArtifactClientRequest{Method: http.MethodGet})
 			require.NoError(t, err)
@@ -613,7 +761,7 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 			require.NoError(t, response.Body.Close())
 			assert.Equal(t, "upstream-video-bytes", string(body))
 			assert.EqualValues(t, 1, submits.Load())
-			assert.EqualValues(t, 2, polls.Load())
+			assert.EqualValues(t, len(states), polls.Load())
 			assert.EqualValues(t, 1, downloads.Load())
 		})
 	}

@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "Upstream path must be a full URL or a path starting with /",
     "Upstream price sync": "Upstream price sync",
     "Upstream prices fetched successfully": "Upstream prices fetched successfully",
+    "Upstream progress": "Upstream progress",
     "Upstream protocol plan": "Upstream protocol plan",
     "Upstream rate limit exceeded": "Upstream rate limit exceeded",
     "Upstream ratios fetched successfully": "Upstream ratios fetched successfully",

@@ -3,6 +3,8 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
@@ -59,7 +61,7 @@ func (hook imageRedisTestHook) BeforeProcess(ctx context.Context, cmd redis.Cmde
 	positions := []int{}
 	switch strings.ToLower(cmd.Name()) {
 	case "ping":
-	case "get", "set", "setnx", "setex", "hgetall", "hset", "hget", "hincrby", "expire", "pexpire", "ttl", "pttl", "zadd", "zrem", "zrange", "zcard", "zscore", "zremrangebyscore", "incr", "incrby", "exists":
+	case "get", "set", "setnx", "setex", "hgetall", "hset", "hget", "hincrby", "expire", "pexpire", "ttl", "pttl", "zadd", "zrem", "zrange", "zcard", "zcount", "zscore", "zremrangebyscore", "incr", "incrby", "exists":
 		positions = append(positions, 1)
 	case "del", "mget":
 		for i := 1; i < len(args); i++ {
@@ -624,6 +626,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	engine := gin.New()
 	require.NoError(t, engine.SetTrustedProxies(nil))
 	SetAsyncImagePublicRouter(engine)
+	SetApiRouter(engine)
 	request := func(method, path, body, key, credential string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -691,9 +694,33 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	}
 	require.NoError(t, common.Unmarshal(query.Body.Bytes(), &success))
 	assert.Equal(t, "succeeded", success.Status)
-	assert.Len(t, success.Data, 2)
+	require.Len(t, success.Data, 2)
 	assert.NotContains(t, query.Body.String(), "private image prompt")
 	assert.NotContains(t, query.Body.String(), profile.Root)
+	resultURL, err := url.Parse(success.Data[0]["url"])
+	require.NoError(t, err)
+	imageResponse := request(http.MethodGet, resultURL.RequestURI(), "", "", token.Key)
+	require.Equal(t, http.StatusOK, imageResponse.Code)
+	assert.Equal(t, valid.Data, imageResponse.Body.Bytes())
+	assert.Equal(t, "image/png", imageResponse.Header().Get("Content-Type"))
+	assert.Equal(t, "nosniff", imageResponse.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "private, no-store", imageResponse.Header().Get("Cache-Control"))
+	tamperedURL := *resultURL
+	tamperedQuery := tamperedURL.Query()
+	tamperedQuery.Set("signature", "invalid-signature")
+	tamperedURL.RawQuery = tamperedQuery.Encode()
+	assert.Equal(t, http.StatusNotFound, request(http.MethodGet, tamperedURL.RequestURI(), "", "", token.Key).Code)
+	expiredURL := *resultURL
+	expiredQuery := expiredURL.Query()
+	expiredTime := strconv.FormatInt(time.Now().Unix()-1, 10)
+	objectID := strings.TrimSuffix(strings.TrimPrefix(expiredURL.Path, "/api/image-objects/"), "/content")
+	mac := hmac.New(sha256.New, bytes.Repeat([]byte{4}, 32))
+	_, err = mac.Write([]byte("new-api:image-view:" + objectID + ":" + expiredTime))
+	require.NoError(t, err)
+	expiredQuery.Set("expires", expiredTime)
+	expiredQuery.Set("signature", base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+	expiredURL.RawQuery = expiredQuery.Encode()
+	assert.Equal(t, http.StatusNotFound, request(http.MethodGet, expiredURL.RequestURI(), "", "", token.Key).Code)
 	require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
 	assert.Equal(t, 950, user.Quota)
 	require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&token).Error)

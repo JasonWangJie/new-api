@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "上游路径必须是完整 URL，或以 / 开头的路径",
     "Upstream price sync": "上游价格同步",
     "Upstream prices fetched successfully": "已成功获取上游价格",
+    "Upstream progress": "上游进度",
     "Upstream protocol plan": "上游协议方案",
     "Upstream rate limit exceeded": "上游请求频率受限",
     "Upstream ratios fetched successfully": "上游比率获取成功",

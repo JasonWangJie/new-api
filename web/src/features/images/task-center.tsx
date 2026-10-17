@@ -81,6 +81,7 @@ import {
   imageTaskSuccessRate,
   imageTaskIssue,
   imageTaskProgress,
+  imageTaskUpstreamProgress,
   imageTaskCanResume,
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
@@ -324,6 +325,7 @@ function TaskCenterSession({
         cell: ({ row }) => {
           const issue = imageTaskIssue(row.original)
           const progress = imageTaskProgress(row.original)
+          const upstreamProgress = imageTaskUpstreamProgress(row.original)
           return (
             <div className='space-y-2'>
               <ImageStatusBadge
@@ -339,6 +341,11 @@ function TaskCenterSession({
                 {progress !== null && <>{progress}% · </>}
                 {t(imageLabel(row.original.billing_status))}
               </p>
+              {upstreamProgress !== null && (
+                <p className='text-muted-foreground text-xs wrap-anywhere whitespace-normal tabular-nums'>
+                  {t('Upstream progress')} {upstreamProgress}%
+                </p>
+              )}
             </div>
           )
         },

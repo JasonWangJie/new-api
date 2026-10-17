@@ -49,6 +49,7 @@ import {
   imageTaskSpecifications,
   imageTaskIssue,
   imageTaskCanResume,
+  imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
 import type { ImageRetryDecision, ImageTask } from '../types'
 import {
@@ -320,6 +321,7 @@ export function ImageTaskDetails(props: {
       : ''
   const attempts = props.admin ? data?.attempt_history || [] : []
   const issue = data ? imageTaskIssue(data) : null
+  const upstreamProgress = data ? imageTaskUpstreamProgress(data) : null
   const canResume = Boolean(
     data && imageTaskCanResume(data, props.admin, props.canManage)
   )
@@ -413,6 +415,11 @@ export function ImageTaskDetails(props: {
                 className='size-8 shrink-0'
               />
             </div>
+            {upstreamProgress !== null && (
+              <p className='text-muted-foreground text-xs wrap-anywhere tabular-nums'>
+                {t('Upstream progress')} {upstreamProgress}%
+              </p>
+            )}
             {isVideo && (
               <dl className='bg-background/70 inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-3 py-2 text-xs'>
                 <dt className='text-muted-foreground'>

@@ -63,6 +63,7 @@ func QueryAsyncMedia(c *gin.Context) {
 }
 
 func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, []gin.H, error) {
+	now := time.Now().Unix()
 	status, progress := job.Status, 0
 	if status == "submitting" || status == "submitted" {
 		status = "invoking"
@@ -122,6 +123,13 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		view["can_resume"] = task.Status == model.TaskStatusSuccess && job.ExpiresAt > time.Now().Unix() && job.LeaseExpiresAt <= time.Now().Unix() &&
 			(job.Status == "submitted" && job.StorageStatus == "failed" || job.Status == "succeeded" && job.StorageStatus == "upstream")
 		view["updated_at"] = task.UpdatedAt
+		if upstreamProgress, ok := service.PublicTaskUpstreamProgress(&task); ok {
+			view["upstream_progress"] = upstreamProgress
+		}
+		if job.Provider == "drama" && (job.Status == "submitting" || job.Status == "submitted") && job.StorageStatus == "pending" && job.ExpiresAt > now &&
+			slices.Contains([]model.TaskStatus{model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued}, task.Status) {
+			view["status"], view["stage"] = "queued", "queued"
+		}
 		if job.StorageStatus == "pending" && task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
 			if percent, err := strconv.Atoi(strings.TrimSuffix(task.Progress, "%")); err == nil {
 				view["progress"] = min(69, max(10, min(100, max(0, percent))*70/100))
@@ -149,6 +157,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, err
+	}
+	if job.Provider == "drama" && job.ExpiresAt <= now {
+		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
 	results := make([]gin.H, 0)
 	if job.StorageStatus == "upstream" && job.ExpiresAt > time.Now().Unix() {
@@ -429,17 +440,41 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	if storage := c.Query("storage_provider"); storage != "" && storage != "local" {
 		videos = videos.Where("1 = 0")
 	}
+	// The media job owns submission/storage scheduling; the linked task owns
+	// Drama's upstream queue. Use the same public state for filtering and stats.
+	now := time.Now().Unix()
+	dramaStatus := gorm.Expr(`CASE
+		WHEN expires_at <= ? THEN 'expired'
+		WHEN storage_status = 'succeeded' AND NOT EXISTS(SELECT 1 FROM media_artifact_objects
+			WHERE media_artifact_objects.task_id = async_media_jobs.task_id
+			AND media_artifact_objects.user_id = async_media_jobs.user_id
+			AND media_artifact_objects.status = 'active' AND media_artifact_objects.expires_at > ?) THEN 'expired'
+		WHEN EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
+			AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'FAILURE') THEN 'failed'
+		WHEN storage_status = 'pending' AND EXISTS(SELECT 1 FROM tasks
+			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
+			AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded'
+		WHEN status = 'succeeded' THEN 'succeeded'
+		WHEN storage_status = 'failed' THEN 'storage_failed'
+		WHEN storage_status = 'saving' THEN 'uploading'
+		WHEN status IN ('submitting','submitted') AND storage_status = 'pending'
+			AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
+				AND tasks.user_id = async_media_jobs.user_id
+				AND tasks.status IN ('NOT_START','SUBMITTED','QUEUED')) THEN 'queued'
+		WHEN status IN ('submitting','submitted') THEN 'invoking'
+		ELSE status END`, now, now)
 	if status := c.Query("status"); status != "" {
+		legacyStatus := model.DB.Where("status = ?", status)
 		switch status {
 		case "invoking":
-			videos = videos.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted"}, "pending")
+			legacyStatus = model.DB.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted"}, "pending")
 		case "uploading":
-			videos = videos.Where("storage_status = ?", "saving")
+			legacyStatus = model.DB.Where("storage_status = ?", "saving")
 		case "storage_failed":
-			videos = videos.Where("storage_status = ?", "failed")
-		default:
-			videos = videos.Where("status = ?", status)
+			legacyStatus = model.DB.Where("storage_status = ?", "failed")
 		}
+		videos = videos.Where(model.DB.Where("provider = ? AND (?) = ?", "drama", dramaStatus, status).
+			Or(model.DB.Where("provider IS NULL OR provider <> ?", "drama").Where(legacyStatus)))
 	}
 	if pattern := mediaTaskSearchPattern(c.Query("model")); pattern != "" {
 		videos = videos.Where("LOWER(model) LIKE ? ESCAPE '!'", pattern)
@@ -488,21 +523,24 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			return
 		}
 		images = images.Where("status IN ?", selected)
+		var legacyStage *gorm.DB
 		switch stage {
 		case "queued":
-			videos = videos.Where("status = ?", "queued")
+			legacyStage = model.DB.Where("status = ?", "queued")
 		case "generating":
-			videos = videos.Where("status IN ? AND storage_status = ? AND NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status IN ?)", []string{"submitting", "submitted"}, "pending", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure})
+			legacyStage = model.DB.Where("status IN ? AND storage_status = ? AND NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status IN ?)", []string{"submitting", "submitted"}, "pending", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure})
 		case "saving":
-			videos = videos.Where("storage_status IN ? OR (storage_status = ? AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", []string{"saving", "failed"}, "pending", model.TaskStatusSuccess)
+			legacyStage = model.DB.Where("storage_status IN ? OR (storage_status = ? AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", []string{"saving", "failed"}, "pending", model.TaskStatusSuccess)
 		case "completed":
-			videos = videos.Where("status = ?", "succeeded")
+			legacyStage = model.DB.Where("status = ?", "succeeded")
 		case "failed":
-			videos = videos.Where("status IN ? OR EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?)", []string{"failed", "execution_unknown", "expired"}, model.TaskStatusFailure)
+			legacyStage = model.DB.Where("status IN ? OR EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?)", []string{"failed", "execution_unknown", "expired"}, model.TaskStatusFailure)
 		}
+		videos = videos.Where(model.DB.Where("provider = ? AND (?) IN ?", "drama", dramaStatus, selected).
+			Or(model.DB.Where("provider IS NULL OR provider <> ?", "drama").Where(legacyStage)))
 	}
-	videoProjection := "task_id, created_at, CASE WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status = 'saving' THEN 'uploading' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, created_at AS updated_at, 'video' AS media_type"
-	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection))
+	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status = 'saving' THEN 'uploading' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
+	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, dramaStatus))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
 	var total int64
 	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {

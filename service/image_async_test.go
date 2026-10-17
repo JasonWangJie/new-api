@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -129,6 +130,66 @@ func asyncImageWorkerFixture(t *testing.T) (*gorm.DB, model.AsyncImageTask, Asyn
 	require.NoError(t, err)
 	require.NoError(t, db.Create(&task).Error)
 	return db, task, request, cfg, b
+}
+
+func asyncImageWorkerQuotaCacheFixture(t *testing.T, task model.AsyncImageTask) {
+	t.Helper()
+	previousBatch := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = previousBatch })
+	_, err := model.GetUserCache(task.UserId)
+	require.NoError(t, err)
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, task.TokenId).Error)
+	// Batch mode must use already initialized live quota rather than hydrate
+	// a database snapshot. Set the same quota fields used by ordinary relays.
+	require.NoError(t, common.RDB.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "Id", token.Id, "RemainQuota", token.RemainQuota, "UsedQuota", token.UsedQuota).Err())
+}
+
+func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
+	db, _, _, cfg, _ := asyncImageWorkerFixture(t)
+	encoded, err := common.Marshal(cfg)
+	require.NoError(t, err)
+	var legacy map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &legacy))
+	delete(legacy, "upstream_timeout_max_retries")
+	delete(legacy, "upstream_timeout_retry_base_seconds")
+	delete(legacy, "upstream_timeout_retry_max_seconds")
+	encoded, err = common.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.Option{}).Where(map[string]any{"key": "image_runtime_config"}).Update("value", string(encoded)).Error)
+	loaded, err := GetImageRuntimeConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, loaded.TimeoutRetries)
+	assert.Equal(t, 5, loaded.TimeoutRetryBase)
+	assert.Equal(t, 10, loaded.TimeoutRetryMax)
+	assert.Equal(t, cfg, loaded, "legacy configurations inherit only the newly added defaults")
+
+	disabled := loaded
+	disabled.TimeoutRetries = 0
+	require.NoError(t, SaveImageRuntimeConfig(t.Context(), disabled))
+	loaded, err = GetImageRuntimeConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, disabled, loaded, "an explicit zero must disable timeout account switching")
+	for _, tc := range []struct {
+		name                   string
+		retries, base, maximum int
+	}{
+		{name: "negative retries", retries: -1, base: 5, maximum: 10},
+		{name: "excessive retries", retries: 1001, base: 5, maximum: 10},
+		{name: "zero retry delay", base: 0, maximum: 10},
+		{name: "maximum below base", base: 5, maximum: 4},
+		{name: "excessive maximum delay", base: 5, maximum: 86401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalid := disabled
+			invalid.TimeoutRetries, invalid.TimeoutRetryBase, invalid.TimeoutRetryMax = tc.retries, tc.base, tc.maximum
+			require.Error(t, SaveImageRuntimeConfig(t.Context(), invalid))
+			preserved, err := GetImageRuntimeConfig(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, disabled, preserved, "a rejected setting must preserve the last working configuration")
+		})
+	}
 }
 
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
@@ -807,6 +868,7 @@ func TestAsyncImageWorkerCompletionRecoveryUsesLocalBudgets(t *testing.T) {
 	}{
 		{name: "download", failure: AsyncImageFailure{Code: 606, InternalCode: "result_download_failed"}, paused: model.ImageTaskStorageFailed},
 		{name: "billing", failure: AsyncImageFailure{Code: 606, InternalCode: "bill_preparation_failed"}, paused: model.ImageTaskBillingFailed},
+		{name: "saved output timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout"}, paused: model.ImageTaskStorageFailed},
 		{name: "invalid output", failure: AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing checkpoint", failure: AsyncImageFailure{Code: 607, InternalCode: "completion_checkpoint_invalid"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing usage re-queries the same job", failure: AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing"}, paused: model.ImageTaskBillingFailed, requeryUsage: true},
@@ -942,6 +1004,162 @@ func TestAsyncImageWorkerExhaustedSelectionRetainsAccountHistory(t *testing.T) {
 	assert.Zero(t, calls)
 }
 
+func TestAsyncImageWorkerTimeoutAccountSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		mode           string
+		timeoutRetries int
+		totalRetries   int
+		wantCalls      int
+		wantRetries    int
+		wantError      string
+	}{
+		{name: "wrapped timeout then success", timeoutRetries: 2, totalRetries: 16, wantCalls: 2, wantRetries: 1},
+		{name: "three accounts time out", mode: "all timeout", timeoutRetries: 2, totalRetries: 16, wantCalls: 3, wantRetries: 2, wantError: "timeout_retries_exhausted"},
+		{name: "no alternate account", mode: "disabled alternate", timeoutRetries: 2, totalRetries: 16, wantCalls: 1, wantRetries: 1, wantError: "timeout_accounts_exhausted"},
+		{name: "copied credential is not another account", mode: "copied credential", timeoutRetries: 2, totalRetries: 16, wantCalls: 1, wantRetries: 1, wantError: "timeout_accounts_exhausted"},
+		{name: "timeout retries disabled", timeoutRetries: 0, totalRetries: 16, wantCalls: 1, wantError: "timeout_retries_exhausted"},
+		{name: "total retry budget exhausted first", mode: "all timeout", timeoutRetries: 2, totalRetries: 1, wantCalls: 2, wantRetries: 1, wantError: "timeout_retries_exhausted"},
+		{name: "execution deadline wins", mode: "deadline", timeoutRetries: 2, totalRetries: 16, wantCalls: 1, wantError: "timeout_deadline_exhausted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			cfg.TimeoutRetries, cfg.TotalRetries = tc.timeoutRetries, tc.totalRetries
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			switch tc.mode {
+			case "all timeout":
+				third := model.Channel{Key: "upstream-key-c", Status: common.ChannelStatusEnabled, Type: 1, Group: task.Group, Models: request.Model}
+				require.NoError(t, db.Create(&third).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: task.Group, Model: request.Model, ChannelId: third.Id, Enabled: true}).Error)
+			case "disabled alternate":
+				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "copied credential":
+				require.NoError(t, db.Model(&alternate).Update("key", "upstream-key-a").Error)
+			}
+			outputEntities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+			if tc.wantError == "" {
+				require.NoError(t, db.AutoMigrate(outputEntities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(outputEntities...)) })
+			}
+			originalStartedAt := task.StartedAt
+			selected := make([]string, 0)
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				assert.NotContains(t, selected, channel.Key, "a task must never return to a timed-out credential")
+				selected = append(selected, channel.Key)
+				assert.Equal(t, request.Billing, outbound.Billing)
+				deadline, bounded := ctx.Deadline()
+				require.True(t, bounded)
+				assert.InDelta(t, 300, time.Until(deadline).Seconds(), 2)
+				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+				require.NoError(t, beforeInvoke())
+				var user model.User
+				require.NoError(t, db.First(&user, current.UserId).Error)
+				assert.Equal(t, 900, user.Quota, "account switching must reuse one financial reservation")
+				if len(selected) == 1 || tc.mode == "all timeout" {
+					if tc.mode == "deadline" {
+						require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("started_at", time.Now().Unix()-int64(cfg.ExecutionTimeout)-1).Error)
+					}
+					cause := &url.Error{Op: "Post", URL: "https://supplier.example/generate?api_key=private-token", Err: context.DeadlineExceeded}
+					wrapped := kittypes.NewError(cause, kittypes.ErrorCodeDoRequestFailed, kittypes.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+					wrapped = kittypes.NewError(wrapped, kittypes.ErrorCodeDoRequestFailed, kittypes.ErrOptionWithHideErrMsg("safe repeated message"))
+					assert.ErrorIs(t, wrapped, context.DeadlineExceeded)
+					var recovered *url.Error
+					require.ErrorAs(t, wrapped, &recovered)
+					assert.Same(t, cause, recovered)
+					assert.Equal(t, "safe repeated message", wrapped.Error())
+					assert.Equal(t, "safe repeated message", wrapped.ToOpenAIError().Message)
+					return nil, model.AsyncImageBill{}, wrapped
+				}
+				image := asyncImageBytesFixture(t)
+				return &AsyncImageOutput{Images: []ImageBytes{image}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "timeout-success-bill", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+			}
+			for range 4 {
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				if task.Status != model.ImageTaskQueued {
+					break
+				}
+				assert.Zero(t, task.ChannelId)
+				assert.Zero(t, task.DispatchedAt)
+				assert.Empty(t, task.SelectedChannelCipher)
+				assert.Equal(t, originalStartedAt, task.StartedAt)
+				assert.GreaterOrEqual(t, task.NextAttemptAt, time.Now().Unix()+4)
+				assert.LessOrEqual(t, task.NextAttemptAt, time.Now().Unix()+10)
+				var decision ImageRetryDecision
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+				assert.Equal(t, "switch_account", decision.Action)
+				assert.Equal(t, task.RetryCount, decision.Used, "the audit counts scheduled account switches")
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+				var err error
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+				require.NoError(t, err)
+			}
+			assert.Len(t, selected, tc.wantCalls)
+			assert.Equal(t, tc.wantRetries, task.RetryCount)
+			var history []ImageChannelAttempt
+			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
+			require.Len(t, history, tc.wantCalls)
+			for i, attempt := range history {
+				assert.True(t, attempt.Dispatched)
+				assert.True(t, attempt.RetryOnTimeout)
+				assert.NotEmpty(t, attempt.CredentialFingerprint)
+				assert.Equal(t, tc.wantError != "" || i == 0, attempt.TimedOut)
+				assert.NotContains(t, attempt.ErrorMessage, "private-token")
+			}
+			if tc.wantError == "" {
+				require.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+				require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "timeout-success-bill"))
+				require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "timeout-success-bill"))
+				require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("log_status", "disabled").Error)
+				require.NoError(t, model.CompleteAsyncImageTask(t.Context(), task, false))
+			} else {
+				assert.Equal(t, model.ImageTaskFailed, task.Status)
+				assert.Equal(t, tc.wantError, task.ErrorCode)
+				require.NoError(t, model.RefundAsyncImageReservation(t.Context(), task.TaskId))
+			}
+			var user model.User
+			var token model.Token
+			var bill model.AsyncImageBill
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			require.NoError(t, db.First(&token, task.TokenId).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			var bills, refunds int64
+			require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&bills).Error)
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+			assert.EqualValues(t, 1, bills)
+			cachedWallet, err := common.RDB.HGet(t.Context(), "user:"+strconv.Itoa(task.UserId), "Quota").Int()
+			require.NoError(t, err)
+			cachedToken, err := common.RDB.HGet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota").Int()
+			require.NoError(t, err)
+			assert.Equal(t, user.Quota, cachedWallet)
+			assert.Equal(t, token.RemainQuota, cachedToken)
+			if tc.wantError == "" {
+				assert.Equal(t, model.ImageTaskSucceeded, task.Status)
+				assert.Equal(t, "applied", bill.Status)
+				assert.Equal(t, 920, user.Quota)
+				assert.Equal(t, 920, token.RemainQuota)
+				assert.Equal(t, 80, token.UsedQuota)
+				assert.Equal(t, 1, user.RequestCount)
+				assert.Zero(t, refunds)
+			} else {
+				assert.Equal(t, "refunded", bill.Status)
+				assert.Equal(t, 1000, user.Quota)
+				assert.Equal(t, 1000, token.RemainQuota)
+				assert.Zero(t, token.UsedQuota)
+				assert.EqualValues(t, 1, refunds, "terminal retry and repeated refund must release the hold once")
+			}
+		})
+	}
+	wrapped := kittypes.NewError(context.DeadlineExceeded, kittypes.ErrorCodeDoRequestFailed, kittypes.ErrOptionWithHideErrMsg("safe error"))
+	wrapped.SetMessage("replacement")
+	assert.Equal(t, "replacement", wrapped.Error())
+	assert.NotErrorIs(t, wrapped, context.DeadlineExceeded, "SetMessage preserves its existing cause-resetting contract")
+}
+
 func TestAsyncImageWorkerSingleAccountTransientRetriesRemainBounded(t *testing.T) {
 	db, task, _, cfg, alternate := asyncImageWorkerFixture(t)
 	cfg.TransientRetries = 2
@@ -1003,16 +1221,9 @@ func TestAsyncImageAccountCooldownAndSupplierBudget(t *testing.T) {
 	assert.Equal(t, alternate.Id, selected.Id)
 	otherFingerprint := ImageIdentityHash("image-account", strconv.Itoa(alternate.Id), alternate.Key)
 	require.NoError(t, RecordImageAccountCooldown(ctx, otherFingerprint, &AsyncImageFailure{Code: 606}, cfg))
-	_, _, err = PickImageChannel(ctx, policy, request, ImageAccountRouting{})
-	var cooling *ImageAccountCooling
-	require.ErrorAs(t, err, &cooling)
-	require.NoError(t, DeferAsyncImageSubmission(ctx, task, cfg, "account_cooldown", cooling.DelaySeconds, 0, 0))
-	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
-	assert.Equal(t, model.ImageTaskQueued, task.Status)
-	assert.Zero(t, task.RetryCount)
-	assert.Zero(t, task.CapacityRetryCount)
-	assert.Empty(t, task.LeaseToken)
-	assert.NotEmpty(t, task.RequestCipher)
+	selected, _, err = PickImageChannel(ctx, policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, alternate.Id, selected.Id, "when all accounts cool down, use the earliest available credential without waiting")
 	// Distinct credentials on the same provider origin share a retry bucket.
 	assert.Equal(t, ImageSupplierRetryBudgetKey(primary, request.Model), ImageSupplierRetryBudgetKey(alternate, request.Model))
 	wait, err := AcquireImageSupplierRetry(ctx, primary, request.Model, cfg)
@@ -1029,6 +1240,156 @@ func TestAsyncImageAccountCooldownAndSupplierBudget(t *testing.T) {
 	alternate.BaseURL = &base
 	assert.NotEqual(t, ImageSupplierRetryBudgetKey(primary, request.Model), ImageSupplierRetryBudgetKey(alternate, request.Model))
 	assert.NotContains(t, ImageSupplierRetryBudgetKey(alternate, request.Model), "private")
+}
+
+func TestAsyncImageAllAccountCooldownRetainsRoutingControls(t *testing.T) {
+	for _, condition := range []string{"disabled channel", "disabled key", "open circuit", "full channel", "timed-out credential"} {
+		t.Run(condition, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			cfg.AccountCooldownSeconds = 60
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			primaryFingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
+			alternateFingerprint := ImageIdentityHash("image-account", strconv.Itoa(alternate.Id), alternate.Key)
+			require.NoError(t, common.RDB.Set(t.Context(), ImageAccountCooldownKey(primaryFingerprint), "cooling", 10*time.Second).Err())
+			require.NoError(t, common.RDB.Set(t.Context(), ImageAccountCooldownKey(alternateFingerprint), "cooling", time.Minute).Err())
+			routing := ImageAccountRouting{}
+			switch condition {
+			case "disabled channel":
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "disabled key":
+				info := model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("channel_info", info).Error)
+			case "open circuit":
+				for range cfg.FailureThreshold {
+					require.NoError(t, RecordImageCircuit(t.Context(), "async", task.ChannelId, false, cfg))
+				}
+			case "full channel":
+				for i := range cfg.ImageConcurrency {
+					require.NoError(t, common.RDB.ZAdd(t.Context(), ImageChannelConcurrencyKey(task.ChannelId), &redis.Z{Score: float64(time.Now().Unix() + 60), Member: strconv.Itoa(i)}).Err())
+				}
+			case "timed-out credential":
+				routing = ImageAccountAttemptRouting([]ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: primaryFingerprint, CredentialFingerprint: ImageIdentityHash("image-credential", "upstream-key-a"), Dispatched: true, FinishedAt: time.Now().Unix(), TimedOut: true}}, cfg.ReferenceRetries, "gemini", 0)
+				assert.Empty(t, routing.Pin, "an exhausted Gemini switch budget must never pin a timed-out account")
+			}
+			policy := model.ImageGroupPolicy{Group: task.Group, Platform: request.Platform, PoolMode: "resolution"}
+			selected, _, err := PickImageChannel(t.Context(), policy, request, routing)
+			require.NoError(t, err)
+			assert.Equal(t, alternate.Id, selected.Id, "the earliest cooldown is not permission to bypass other routing controls")
+		})
+	}
+}
+
+func TestAsyncImageWorkerTimeoutPreservesExecutionBarriers(t *testing.T) {
+	for _, condition := range []string{"accepted provider job", "parent cancellation", "unconfirmed response"} {
+		t.Run(condition, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+			if condition == "accepted provider job" {
+				task.UpstreamTaskId, task.DispatchedAt = "existing-provider-job", time.Now().Unix()-1
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			calls := 0
+			ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, _ AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Equal(t, "upstream-key-a", channel.Key)
+				if condition == "accepted provider job" {
+					assert.Equal(t, "existing-provider-job", current.UpstreamTaskId)
+					assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
+					return nil, model.AsyncImageBill{}, AsyncImageTransportFailure(context.DeadlineExceeded, current, false, nil)
+				}
+				require.NoError(t, beforeInvoke())
+				if condition == "parent cancellation" {
+					cancel()
+					return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout", ExecutionUnknown: true}
+				}
+				return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", ExecutionUnknown: true}
+			}
+			require.NoError(t, invokeAsyncImageTask(ctx, &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, 1, calls)
+			assert.Zero(t, task.RetryCount)
+			if condition == "accepted provider job" {
+				assert.Equal(t, model.ImageTaskInvoking, task.Status)
+				assert.Equal(t, "existing-provider-job", task.UpstreamTaskId)
+				assert.Greater(t, task.NextAttemptAt, time.Now().Unix())
+				cooling, err := common.RDB.Exists(t.Context(), ImageAccountCooldownKey(ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a"))).Result()
+				require.NoError(t, err)
+				assert.Zero(t, cooling, "poll timeouts must not cool down generation credentials")
+			} else {
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+				assert.Zero(t, task.NextAttemptAt)
+				var attempts []ImageChannelAttempt
+				require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &attempts))
+				require.Len(t, attempts, 1)
+				assert.False(t, attempts[0].TimedOut)
+			}
+			var bill model.AsyncImageBill
+			var user model.User
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			assert.Equal(t, "reserved", bill.Status)
+			assert.Equal(t, 900, user.Quota)
+		})
+	}
+}
+
+func TestAsyncImageTimeoutPolicyRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		policy, deadline, job, output bool
+		wantStatus                    string
+	}{
+		{name: "new timeout policy expires and refunds", policy: true, deadline: true, wantStatus: model.ImageTaskFailed},
+		{name: "legacy timeout remains unknown", deadline: true, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "lost lease stays unknown", policy: true, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "known job keeps polling", policy: true, job: true, wantStatus: model.ImageTaskInvoking},
+		{name: "known job deadline remains unknown", policy: true, job: true, deadline: true, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "saved completion keeps its hold", policy: true, output: true, deadline: true, wantStatus: model.ImageTaskInvoking},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+			now := time.Now().Unix()
+			updates := map[string]any{"dispatched_at": now - 5, "lease_expires_at": now - 1}
+			if tc.deadline {
+				updates["started_at"] = now - int64(cfg.ExecutionTimeout) - 1
+			}
+			if tc.job {
+				updates["upstream_task_id"] = "original-provider-job"
+			}
+			if tc.output {
+				updates["upstream_succeeded_at"] = now - 1
+			}
+			attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: task.ChannelId, Dispatched: true, RetryOnTimeout: tc.policy}})
+			require.NoError(t, err)
+			updates["attempts"] = string(attempts)
+			require.NoError(t, db.Model(&task).Updates(updates).Error)
+			for range 2 {
+				require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+			}
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, tc.wantStatus, task.Status)
+			var bill model.AsyncImageBill
+			var user model.User
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			if tc.wantStatus == model.ImageTaskFailed {
+				assert.Equal(t, "timeout_deadline_exhausted", task.ErrorCode)
+				assert.Equal(t, "refunded", bill.Status)
+				assert.Equal(t, 1000, user.Quota)
+				var count int64
+				require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&count).Error)
+				assert.EqualValues(t, 1, count)
+			} else {
+				assert.Equal(t, "reserved", bill.Status)
+				assert.Equal(t, 900, user.Quota)
+			}
+		})
+	}
 }
 
 func TestAsyncImageRetryDecisionsAndEncryptedFailureRetention(t *testing.T) {

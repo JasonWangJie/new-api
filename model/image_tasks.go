@@ -415,7 +415,25 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 		event, kind := "recovered", "execute"
 		deadlineExpired := task.UpstreamSucceededAt == 0 && task.StartedAt > 0 && task.StartedAt <= now-int64(timeout)
 		unknown := task.UpstreamSucceededAt == 0 && (task.DispatchedAt > 0 && task.UpstreamTaskId == "" || deadlineExpired && task.UpstreamTaskId != "")
-		if deadlineExpired && !unknown {
+		timeoutPolicyExpired := false
+		if deadlineExpired && task.UpstreamTaskId == "" && task.DispatchedAt > 0 {
+			var attempts []struct {
+				RetryOnTimeout bool `json:"retry_on_timeout"`
+			}
+			if common.UnmarshalJsonStr(task.Attempts, &attempts) == nil && len(attempts) > 0 {
+				timeoutPolicyExpired = attempts[len(attempts)-1].RetryOnTimeout
+			}
+		}
+		if timeoutPolicyExpired {
+			unknown = false
+			updates["status"] = ImageTaskFailed
+			updates["public_error_code"] = 606
+			updates["error_code"] = "timeout_deadline_exhausted"
+			updates["error_message"] = "Image execution deadline expired after request timeouts"
+			updates["reconciliation_status"] = "upstream_unconfirmed"
+			updates["finished_at"], updates["next_attempt_at"] = now, 0
+			event, kind = "execution_expired", ""
+		} else if deadlineExpired && !unknown {
 			updates["status"] = ImageTaskExpired
 			updates["public_error_code"] = 608
 			updates["error_code"] = "execution_deadline"
@@ -489,7 +507,7 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 		if err != nil && !errors.Is(err, ErrImageConflict) {
 			return err
 		}
-		if err == nil && updates["status"] == ImageTaskExpired {
+		if err == nil && (updates["status"] == ImageTaskExpired || updates["status"] == ImageTaskFailed) {
 			if err := RefundAsyncImageReservation(ctx, task.TaskId); err != nil {
 				return err
 			}

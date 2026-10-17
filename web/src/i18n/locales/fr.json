@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "Le chemin amont doit être une URL complète ou un chemin commençant par /",
     "Upstream price sync": "Synchronisation amont des prix",
     "Upstream prices fetched successfully": "Prix amont récupérés avec succès",
+    "Upstream progress": "Progression en amont",
     "Upstream protocol plan": "Plan de protocole amont",
     "Upstream rate limit exceeded": "Limite de débit en amont dépassée",
     "Upstream ratios fetched successfully": "Ratios en amont récupérés avec succès",

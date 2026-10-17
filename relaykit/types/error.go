@@ -98,6 +98,19 @@ type NewAPIError struct {
 	Metadata       json.RawMessage
 }
 
+type hiddenMessageError struct {
+	message string
+	cause   error
+}
+
+func (e *hiddenMessageError) Error() string {
+	return e.message
+}
+
+func (e *hiddenMessageError) Unwrap() error {
+	return e.cause
+}
+
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
 func (e *NewAPIError) Unwrap() error {
 	if e == nil {
@@ -401,7 +414,7 @@ func ErrOptionWithHideErrMsg(replaceStr string) NewAPIErrorOptions {
 		if kitutil.Debug.Load() {
 			fmt.Printf("ErrOptionWithHideErrMsg: %s, origin error: %s", replaceStr, e.Err)
 		}
-		e.Err = errors.New(replaceStr)
+		e.Err = &hiddenMessageError{message: replaceStr, cause: e.Err}
 	}
 }
 

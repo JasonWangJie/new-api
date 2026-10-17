@@ -922,6 +922,13 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	delete(rendered, "task_id")
 	rendered["status"] = host.Status
 	rendered["progress"] = host.Progress
+	if a.plugin.Meta.Key == "drama" {
+		if progress, ok := service.PublicTaskUpstreamProgress(task); ok {
+			rendered["upstream_progress"] = progress
+		} else {
+			delete(rendered, "upstream_progress")
+		}
+	}
 	rendered["created_at"] = host.CreatedAt
 	rendered["model"] = host.Model
 	if host.CompletedAt != 0 {

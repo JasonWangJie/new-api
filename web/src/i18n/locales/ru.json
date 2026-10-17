@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "Путь upstream должен быть полным URL или путем, начинающимся с /",
     "Upstream price sync": "Синхронизация цен upstream",
     "Upstream prices fetched successfully": "Цены провайдера успешно получены",
+    "Upstream progress": "Прогресс провайдера",
     "Upstream protocol plan": "Схема протокола поставщика",
     "Upstream rate limit exceeded": "Превышен лимит частоты запросов к провайдеру",
     "Upstream ratios fetched successfully": "Коэффициенты upstream успешно получены",

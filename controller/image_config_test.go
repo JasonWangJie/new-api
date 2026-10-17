@@ -18,8 +18,10 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -58,8 +60,14 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 			require.NoError(t, err)
 			previousDB := model.DB
+			previousType := common.MainDatabaseType()
+			previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
 			previousCapability := service.ImageChannelCapabilityFunc
 			model.DB = db
+			common.SetMainDatabaseType(common.DatabaseType(engine))
+			redisServer := miniredis.RunT(t)
+			redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB, common.RedisEnabled = redisClient, true
 			service.ImageChannelCapabilityFunc = func(channel model.Channel, _ string) dto.ImageCapability {
 				switch channel.Type {
 				case 1:
@@ -73,6 +81,9 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}, &model.User{}, &model.Token{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
+				common.SetMainDatabaseType(previousType)
+				common.RDB, common.RedisEnabled = previousRedis, previousRedisEnabled
+				assert.NoError(t, redisClient.Close())
 				service.ImageChannelCapabilityFunc = previousCapability
 				assert.NoError(t, db.Migrator().DropTable(entities...))
 				connection, closeErr := db.DB()

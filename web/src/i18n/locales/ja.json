@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "上流パスは完全な URL、または / で始まるパスである必要があります",
     "Upstream price sync": "アップストリーム価格同期",
     "Upstream prices fetched successfully": "上流価格を正常に取得しました",
+    "Upstream progress": "上流の進捗",
     "Upstream protocol plan": "上流プロトコルプラン",
     "Upstream rate limit exceeded": "上流のレート制限を超えました",
     "Upstream ratios fetched successfully": "アップストリーム比率が正常に取得されました",

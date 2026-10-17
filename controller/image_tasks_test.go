@@ -699,6 +699,251 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 
+			t.Run("Drama upstream queue and progress remain separate from local processing", func(t *testing.T) {
+				job := model.AsyncMediaJob{TaskId: "task_drama_progress", IdentityHash: "drama-progress", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Model: "seedance2.0-A", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", DispatchedAt: now - 5, CreatedAt: now, ExpiresAt: now + 3600}
+				upstream := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Action: "text_to_video", Status: model.TaskStatusQueued, Progress: "0%", Data: []byte(`{"status":"queued","progress":0,"id":"private-drama-id"}`)}
+				require.NoError(t, db.Create(&job).Error)
+				require.NoError(t, db.Create(&upstream).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&upstream).Error)
+					assert.NoError(t, db.Delete(&job).Error)
+				})
+				for _, tc := range []struct {
+					name, jobStatus, storage, provider, data, taskProgress, status, stage string
+					taskStatus                                                            model.TaskStatus
+					progress                                                              int
+					upstreamProgress                                                      any
+					expired                                                               bool
+					noTask, terminable                                                    bool
+					output                                                                string
+				}{
+					{name: "local queue before submission", jobStatus: "queued", noTask: true, terminable: true, status: "queued", stage: "queued", progress: 0},
+					{name: "submission before task receipt", jobStatus: "submitting", noTask: true, status: "invoking", stage: "generating", progress: 10},
+					{name: "not started", taskStatus: model.TaskStatusNotStart, taskProgress: "0%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 10, upstreamProgress: float64(0)},
+					{name: "submitted", taskStatus: model.TaskStatusSubmitted, taskProgress: "10%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 10, upstreamProgress: float64(0)},
+					{name: "queued", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 14, upstreamProgress: float64(0)},
+					{name: "generating", taskStatus: model.TaskStatusInProgress, taskProgress: "50%", data: `{"status":"in_progress","progress":37.5}`, status: "invoking", stage: "generating", progress: 35, upstreamProgress: float64(37.5)},
+					{name: "missing upstream progress", taskStatus: model.TaskStatusInProgress, taskProgress: "30%", data: `{"status":"in_progress"}`, status: "invoking", stage: "generating", progress: 21},
+					{name: "invalid upstream progress", taskStatus: model.TaskStatusInProgress, taskProgress: "30%", data: `{"status":"in_progress","progress":101}`, status: "invoking", stage: "generating", progress: 21},
+					{name: "awaiting upstream billing", taskStatus: model.TaskStatusInProgress, taskProgress: "99%", data: `{"status":"completed","progress":100}`, status: "invoking", stage: "generating", progress: 69, upstreamProgress: float64(100)},
+					{name: "upstream completed", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
+					{name: "completed awaiting storage", jobStatus: "succeeded", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
+					{name: "saving takes precedence", taskStatus: model.TaskStatusQueued, storage: "saving", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "uploading", stage: "saving", progress: 80, upstreamProgress: float64(0)},
+					{name: "storage failure takes precedence", taskStatus: model.TaskStatusQueued, storage: "failed", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "storage_failed", stage: "saving", progress: 80, upstreamProgress: float64(0)},
+					{name: "completed job takes precedence", taskStatus: model.TaskStatusQueued, jobStatus: "succeeded", storage: "upstream", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "succeeded", stage: "completed", progress: 100, upstreamProgress: float64(0)},
+					{name: "missing saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
+					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
+					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
+					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
+					{name: "expiry takes precedence", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "expired", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(0)},
+					{name: "other providers retain their status", taskStatus: model.TaskStatusQueued, provider: "sora", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "invoking", stage: "generating", progress: 14},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						job.Status, job.StorageStatus, job.Provider, job.ExpiresAt, job.DispatchedAt = "submitted", "pending", "drama", now+3600, now-5
+						if tc.jobStatus != "" {
+							job.Status = tc.jobStatus
+						}
+						if tc.storage != "" {
+							job.StorageStatus = tc.storage
+						}
+						if tc.provider != "" {
+							job.Provider = tc.provider
+						}
+						if tc.expired {
+							job.ExpiresAt = now - 1
+						}
+						if tc.terminable {
+							job.DispatchedAt = 0
+						}
+						upstream.Platform = constant.TaskPlatform(job.Provider)
+						upstream.Status, upstream.Progress, upstream.Data = tc.taskStatus, tc.taskProgress, []byte(tc.data)
+						require.NoError(t, db.Save(&job).Error)
+						if tc.noTask {
+							require.NoError(t, db.Delete(&upstream).Error)
+						} else {
+							require.NoError(t, db.Save(&upstream).Error)
+						}
+						if tc.output != "" {
+							object := model.MediaArtifactObject{ObjectId: "drama-output-" + tc.output, IdentityHash: "drama-output-" + tc.output, TaskId: job.TaskId, UserId: job.UserId, Status: "active", ExpiresAt: now + 3600}
+							if tc.output == "expired" {
+								object.ExpiresAt = now - 1
+							} else {
+								object.UserId = 102
+							}
+							require.NoError(t, db.Create(&object).Error)
+							t.Cleanup(func() { assert.NoError(t, db.Delete(&object).Error) })
+						}
+						for _, surface := range []string{"public", "owner", "administrator"} {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Set("id", 101)
+							c.Set("token_id", 201)
+							c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+							c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+							if surface == "public" {
+								QueryAsyncMedia(c)
+							} else {
+								GetMediaTask(c, surface == "administrator")
+							}
+							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							var view gin.H
+							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
+							if surface != "public" {
+								view = view["data"].(map[string]any)["task"].(map[string]any)
+							}
+							assert.Equal(t, tc.status, view["status"], surface)
+							assert.Equal(t, tc.stage, view["stage"], surface)
+							assert.Equal(t, float64(tc.progress), view["progress"], surface)
+							if tc.upstreamProgress == nil {
+								assert.NotContains(t, view, "upstream_progress", surface)
+							} else {
+								assert.Equal(t, tc.upstreamProgress, view["upstream_progress"], surface)
+							}
+							assert.Equal(t, tc.terminable, view["can_terminate"], surface)
+						}
+						for _, admin := range []bool{false, true} {
+							for _, filter := range []string{"", "&status=" + tc.status, "&stage=" + tc.stage, "&status=queued&stage=generating"} {
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Set("id", 101)
+								c.Request = httptest.NewRequest(http.MethodGet, "/?task_id="+job.TaskId+filter, nil)
+								ListMediaTasks(c, admin)
+								var response struct {
+									Data struct {
+										Items []gin.H
+										Total int
+										Stats map[string]float64
+									}
+								}
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+								if filter == "&status=queued&stage=generating" {
+									assert.Empty(t, response.Data.Items)
+									assert.Zero(t, response.Data.Total)
+									continue
+								}
+								require.Len(t, response.Data.Items, 1, filter)
+								assert.Equal(t, 1, response.Data.Total, filter)
+								assert.Equal(t, tc.status, response.Data.Items[0]["status"], filter)
+								stat := "processing"
+								if tc.status == "queued" || tc.status == "succeeded" {
+									stat = tc.status
+								}
+								if tc.stage == "failed" || tc.status == "storage_failed" {
+									stat = "failed"
+								}
+								assert.Equal(t, float64(1), response.Data.Stats[stat], filter)
+								if stat != "queued" {
+									assert.Zero(t, response.Data.Stats["queued"], filter)
+								}
+							}
+						}
+					})
+				}
+				require.NoError(t, db.Model(&job).Updates(map[string]any{"provider": "drama", "status": "submitted", "storage_status": "pending", "expires_at": now + 3600}).Error)
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", 101)
+				c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+				c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+				ManageMediaTask(c, false, "terminate")
+				assert.Equal(t, http.StatusConflict, recorder.Code, "an accepted upstream task must not become locally terminable")
+				var stored model.AsyncMediaJob
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&stored).Error)
+				assert.Equal(t, "submitted", stored.Status)
+				require.NoError(t, db.Delete(&upstream).Error)
+				require.NoError(t, db.Model(&job).Updates(map[string]any{"status": "queued", "dispatched_at": 0}).Error)
+				localRecorder := httptest.NewRecorder()
+				localContext, _ := gin.CreateTestContext(localRecorder)
+				localContext.Set("id", 101)
+				localContext.Params = c.Params
+				localContext.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+				ManageMediaTask(localContext, false, "terminate")
+				assert.Equal(t, http.StatusOK, localRecorder.Code, "a local queue without an upstream task remains terminable")
+			})
+
+			t.Run("mixed media queues preserve owner filters statistics and update ordering", func(t *testing.T) {
+				jobs := []model.AsyncMediaJob{
+					{TaskId: "mixed_drama_local", Provider: "drama", Status: "queued"},
+					{TaskId: "mixed_drama_upstream", Provider: "drama", Status: "submitted"},
+					{TaskId: "mixed_drama_running", Provider: "drama", Status: "submitted"},
+					{TaskId: "mixed_sora", Provider: "sora", Status: "submitted"},
+					{TaskId: "mixed_null_provider", Status: "submitted"},
+					{TaskId: "mixed_foreign", Provider: "drama", Status: "submitted", UserId: 102, TokenId: 202},
+					{TaskId: "mixed_foreign_task", Provider: "drama", Status: "submitted"},
+				}
+				for i := range jobs {
+					jobs[i].IdentityHash, jobs[i].Group = jobs[i].TaskId, "drama-mixed"
+					jobs[i].StorageStatus, jobs[i].CreatedAt, jobs[i].ExpiresAt = "pending", now-100+int64(i), now+3600
+					if jobs[i].UserId == 0 {
+						jobs[i].UserId, jobs[i].TokenId = 101, 201
+					}
+				}
+				upstreamTasks := []model.Task{
+					{TaskID: jobs[1].TaskId, UserId: 101, Platform: "drama", Status: model.TaskStatusQueued, UpdatedAt: now + 20, Data: []byte(`{"status":"queued","progress":0}`)},
+					{TaskID: jobs[2].TaskId, UserId: 101, Platform: "drama", Status: model.TaskStatusInProgress, UpdatedAt: now + 10, Data: []byte(`{"status":"in_progress","progress":40}`)},
+					{TaskID: jobs[3].TaskId, UserId: 101, Platform: "sora", Status: model.TaskStatusQueued},
+					{TaskID: jobs[5].TaskId, UserId: 102, Platform: "drama", Status: model.TaskStatusQueued},
+					{TaskID: jobs[6].TaskId, UserId: 102, Platform: "drama", Status: model.TaskStatusQueued, Data: []byte(`{"status":"queued","progress":99}`)},
+				}
+				images := []model.AsyncImageTask{
+					{TaskId: "asyncimg_mixed_queue", UserId: 101, TokenId: 201, Group: "drama-mixed", Status: model.ImageTaskQueued, CreatedAt: now - 80},
+					{TaskId: "asyncimg_mixed_running", UserId: 101, TokenId: 201, ChannelId: 301, Group: "drama-mixed", Status: model.ImageTaskInvoking, CreatedAt: now - 70},
+				}
+				require.NoError(t, db.Create(&jobs).Error)
+				require.NoError(t, db.Model(&jobs[4]).Update("provider", nil).Error)
+				require.NoError(t, db.Create(&upstreamTasks).Error)
+				require.NoError(t, db.Create(&images).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&images).Error)
+					assert.NoError(t, db.Delete(&upstreamTasks).Error)
+					assert.NoError(t, db.Delete(&jobs).Error)
+				})
+				for _, tc := range []struct {
+					name, filter              string
+					admin                     bool
+					ids                       []string
+					total, queued, processing int
+				}{
+					{name: "owner combined queues", filter: "status=queued", ids: []string{jobs[0].TaskId, jobs[1].TaskId, images[0].TaskId}, total: 3, queued: 3},
+					{name: "owner generating excludes both drama queues", filter: "stage=generating", ids: []string{jobs[2].TaskId, jobs[3].TaskId, jobs[4].TaskId, jobs[6].TaskId, images[1].TaskId}, total: 5, processing: 5},
+					{name: "administrator includes foreign queue", admin: true, filter: "stage=queued", ids: []string{jobs[0].TaskId, jobs[1].TaskId, jobs[5].TaskId, images[0].TaskId}, total: 4, queued: 4},
+					{name: "provider intersects queue and stage", filter: "provider=drama&stage=queued&status=queued", ids: []string{jobs[0].TaskId, jobs[1].TaskId}, total: 2, queued: 2},
+					{name: "sora queue status retains old classification", filter: "provider=sora&status=queued", total: 0},
+					{name: "last page keeps all matching statistics", filter: "status=queued&page=2&page_size=2&sort_by=created_at&sort_order=asc", ids: []string{images[0].TaskId}, total: 3, queued: 3},
+					{name: "updated sorting uses polled task timestamp", filter: "provider=drama&sort_by=updated_at&sort_order=desc&page_size=1", ids: []string{jobs[1].TaskId}, total: 4, queued: 2, processing: 2},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Request = httptest.NewRequest(http.MethodGet, "/?group=drama-mixed&start_date=2000-01-01&end_date=2100-01-01&"+tc.filter, nil)
+						ListMediaTasks(c, tc.admin)
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						var response struct {
+							Data struct {
+								Items []gin.H
+								Total int
+								Stats map[string]float64
+							}
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						ids := make([]string, 0, len(response.Data.Items))
+						for _, item := range response.Data.Items {
+							ids = append(ids, item["task_id"].(string))
+							if item["task_id"] == jobs[6].TaskId {
+								assert.NotContains(t, item, "upstream_progress", "another owner's task snapshot must not contribute progress")
+							}
+						}
+						assert.ElementsMatch(t, tc.ids, ids)
+						assert.Equal(t, tc.total, response.Data.Total)
+						assert.Equal(t, float64(tc.total), response.Data.Stats["total"])
+						assert.Equal(t, float64(tc.queued), response.Data.Stats["queued"])
+						assert.Equal(t, float64(tc.processing), response.Data.Stats["processing"])
+					})
+				}
+			})
+
 			video := model.AsyncMediaJob{TaskId: "task-matrix-video", IdentityHash: "matrix-video", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", Group: "default", Status: "submitted", StorageStatus: "failed", BillingStatus: "settled", Quota: 500, CreatedAt: now, ExpiresAt: now + 3600}
 			video, reused, err := model.AcceptAsyncMediaJob(t.Context(), video)
 			require.NoError(t, err)

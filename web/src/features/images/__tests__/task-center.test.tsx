@@ -45,6 +45,7 @@ import {
   imageTaskIssue,
   imageTaskProgress,
   imageTaskSuccessRate,
+  imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
 import { ImageTaskCenter } from '../task-center'
 import type {
@@ -325,6 +326,108 @@ afterEach(() => {
   clients.length = 0
   useAuthStore.getState().auth.reset()
 })
+
+test.each([
+  { admin: false, mobile: false, status: 'queued', upstreamProgress: 0 },
+  { admin: true, mobile: false, status: 'processing', upstreamProgress: 42.5 },
+  { admin: false, mobile: true, status: 'queued', upstreamProgress: 0 },
+  { admin: true, mobile: true, status: 'processing', upstreamProgress: 42.5 },
+  { admin: false, mobile: false, status: 'succeeded', upstreamProgress: 100 },
+  { admin: true, mobile: true, status: 'failed', upstreamProgress: 42.5 },
+])(
+  'admin=$admin mobile=$mobile shows independent upstream progress for $status in the list and details',
+  async ({ admin, mobile, status, upstreamProgress }) => {
+    if (mobile) setMobileViewport()
+    const upstreamTask = {
+      ...task,
+      media_type: 'video',
+      provider: 'drama',
+      status,
+      upstream_progress: upstreamProgress,
+    } satisfies ImageTask
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [upstreamTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: upstreamTask,
+      results: [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    const listTask = mobile
+      ? screen.getByRole('article', { name: task.id })
+      : screen.getByRole('row', { name: new RegExp(task.id) })
+    const upstreamLabel = `Upstream progress ${upstreamProgress}%`
+    expect(within(listTask).getByText(upstreamLabel)).toBeVisible()
+    if (status === 'queued') {
+      expect(within(listTask).getByText('Queued')).toBeVisible()
+      expect(within(listTask).queryByText('Processing')).not.toBeInTheDocument()
+    }
+    if (imageTaskProgress(upstreamTask) !== null) {
+      expect(within(listTask).getByText(/20%/)).toBeVisible()
+    }
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog')
+    expect(await within(dialog).findByText(upstreamLabel)).toBeVisible()
+  }
+)
+
+test.each([
+  { mobile: false, upstreamProgress: undefined },
+  { mobile: true, upstreamProgress: 101 },
+])(
+  'mobile=$mobile hides missing or invalid upstream progress in the list and details',
+  async ({ mobile, upstreamProgress }) => {
+    if (mobile) setMobileViewport()
+    const upstreamTask = { ...task, upstream_progress: upstreamProgress }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [upstreamTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: upstreamTask,
+      results: [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    expect(screen.queryByText(/Upstream progress/)).not.toBeInTheDocument()
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog')
+    expect(
+      within(dialog).queryByText(/Upstream progress/)
+    ).not.toBeInTheDocument()
+  }
+)
+
+test.each([
+  { upstreamProgress: undefined, expected: null },
+  { upstreamProgress: Number.NaN, expected: null },
+  { upstreamProgress: Infinity, expected: null },
+  { upstreamProgress: -1, expected: null },
+  { upstreamProgress: 101, expected: null },
+  { upstreamProgress: 0, expected: 0 },
+  { upstreamProgress: 42.5, expected: 42.5 },
+  { upstreamProgress: 100, expected: 100 },
+])(
+  'upstream progress $upstreamProgress preserves valid percentages and hides invalid values',
+  ({ upstreamProgress, expected }) => {
+    expect(
+      imageTaskUpstreamProgress({
+        ...task,
+        upstream_progress: upstreamProgress,
+      })
+    ).toBe(expected)
+  }
+)
 
 test.each([false, true])(
   'administrator successful task cost uses all filtered results after average duration (mobile=%s)',

@@ -6973,6 +6973,7 @@
     "Upstream path must be a full URL or a path starting with /": "Đường dẫn upstream phải là URL đầy đủ hoặc đường dẫn bắt đầu bằng /",
     "Upstream price sync": "Đồng bộ giá thượng nguồn",
     "Upstream prices fetched successfully": "Lấy giá upstream thành công",
+    "Upstream progress": "Tiến độ phía nhà cung cấp",
     "Upstream protocol plan": "Cấu hình giao thức thượng nguồn",
     "Upstream rate limit exceeded": "Vượt giới hạn tần suất của thượng nguồn",
     "Upstream ratios fetched successfully": "Đã lấy tỷ lệ upstream thành công",

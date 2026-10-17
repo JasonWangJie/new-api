@@ -139,6 +139,7 @@ export type ImageTask = {
   status: string
   billing_status: string
   progress: number
+  upstream_progress?: number
   image_count: number
   result_count: number
   cost: number

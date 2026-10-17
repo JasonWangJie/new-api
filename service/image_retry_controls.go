@@ -82,7 +82,10 @@ func ImageAccountCooldownKey(fingerprint string) string {
 }
 
 func RecordImageAccountCooldown(ctx context.Context, fingerprint string, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
-	if fingerprint == "" || cfg.AccountCooldownSeconds == 0 || failure == nil || failure.Code != 605 && failure.Code != 606 && failure.HTTPStatus != 429 {
+	if fingerprint == "" || cfg.AccountCooldownSeconds == 0 || failure == nil {
+		return nil
+	}
+	if failure.Code != 605 && failure.Code != 606 && failure.HTTPStatus != 429 && failure.InternalCode != "upstream_transport_timeout" {
 		return nil
 	}
 	if common.RDB == nil {
@@ -109,6 +112,7 @@ func (wait *ImageAccountCooling) Error() string { return "Image accounts are tem
 var (
 	ErrImageLocalCapacityBusy        = errors.New("local image execution capacity is busy")
 	ErrImageLocalControlsUnavailable = errors.New("local image routing controls are temporarily unavailable")
+	ErrImageTimeoutAccountsExhausted = errors.New("all eligible image accounts have timed out for this task")
 )
 
 // DeferAsyncImageSubmission waits for shared routing controls without spending

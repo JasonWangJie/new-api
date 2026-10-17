@@ -1,13 +1,57 @@
 package service
 
 import (
+	"math"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/tidwall/gjson"
 )
+
+// PublicTaskUpstreamProgress exposes only a valid Drama provider percentage,
+// independently of the host's lifecycle and settlement progress.
+func PublicTaskUpstreamProgress(task *model.Task) (float64, bool) {
+	if task == nil || task.Platform != "drama" {
+		return 0, false
+	}
+	snapshot := task.Data
+	path := "progress"
+	configured := task.PrivateData.UpstreamAsync != nil
+	if configured {
+		path = strings.TrimSpace(task.PrivateData.UpstreamAsync.Poll.Response.ProgressPath)
+		if path == "" {
+			return 0, false
+		}
+		snapshot = task.PrivateData.UpstreamAsyncResponse
+	}
+	if !gjson.ValidBytes(snapshot) {
+		return 0, false
+	}
+	value := gjson.GetBytes(snapshot, path)
+	var progress float64
+	switch {
+	case value.Type == gjson.Number:
+		progress = value.Num
+	case configured && value.Type == gjson.String:
+		text := strings.TrimSpace(value.Str)
+		text, _ = strings.CutSuffix(text, "%")
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err != nil {
+			return 0, false
+		}
+		progress = parsed
+	default:
+		return 0, false
+	}
+	if math.IsNaN(progress) || math.IsInf(progress, 0) || progress < 0 || progress > 100 {
+		return 0, false
+	}
+	return progress, true
+}
 
 // PublicTaskFailureReason recovers details from historical Drama snapshots whose
 // driver stored only a placeholder. It is presentation-only compatibility, not

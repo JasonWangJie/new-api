@@ -61,6 +61,19 @@ export function imageTaskProgress(task: ImageTask): number | null {
     : 0
 }
 
+export function imageTaskUpstreamProgress(task: ImageTask): number | null {
+  const progress = task.upstream_progress
+  if (
+    typeof progress !== 'number' ||
+    !Number.isFinite(progress) ||
+    progress < 0 ||
+    progress > 100
+  ) {
+    return null
+  }
+  return progress
+}
+
 export function imageTaskIssue(task: ImageTask): {
   summary: string
   suggestion: string

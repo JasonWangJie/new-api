@@ -31,6 +31,7 @@ import {
   imageTaskSpecifications,
   imageTaskIssue,
   imageTaskProgress,
+  imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
 import type { ImageTask } from '../types'
 import {
@@ -53,6 +54,7 @@ export function ImageTaskMobileCard(props: {
   const costCell = cells.find((cell) => cell.column.id === 'quota')
   const actionsCell = cells.find((cell) => cell.column.id === 'actions')
   const progress = imageTaskProgress(task)
+  const upstreamProgress = imageTaskUpstreamProgress(task)
   const issue = imageTaskIssue(task)
   const active = [
     'queued',
@@ -135,6 +137,11 @@ export function ImageTaskMobileCard(props: {
         </div>
         {active && progress !== null && (
           <Progress value={progress} aria-label={t('Progress')} />
+        )}
+        {upstreamProgress !== null && (
+          <p className='text-muted-foreground text-xs wrap-anywhere tabular-nums'>
+            {t('Upstream progress')} {upstreamProgress}%
+          </p>
         )}
       </div>
 

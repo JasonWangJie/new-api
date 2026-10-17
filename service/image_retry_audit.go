@@ -51,6 +51,24 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 			decision.Reason = "transient_retry_budget_exhausted"
 		}
 	}
+	if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && (failure.InternalCode == "upstream_transport_timeout" || failure.InternalCode == "timeout_accounts_exhausted") {
+		decision.Budget, decision.Used, decision.Limit = "timeout", 0, cfg.TimeoutRetries
+		var attempts []ImageChannelAttempt
+		history := task.Attempts
+		if updated, ok := updates["attempts"].(string); ok {
+			history = updated
+		}
+		if common.UnmarshalJsonStr(history, &attempts) == nil {
+			for _, attempt := range attempts {
+				if attempt.Decision != nil && attempt.Decision.Budget == "timeout" && attempt.Decision.Action == "switch_account" {
+					decision.Used++
+				}
+			}
+		}
+		if updates["status"] == model.ImageTaskQueued {
+			decision.Used++
+		}
+	}
 	localFallback := failure.ReferenceTransportFallback
 	if failure.ReferenceTransportFallback {
 		decision.Budget, decision.Used, decision.Limit = "reference", task.ReferenceRetryCount, 1
@@ -77,7 +95,9 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 	switch status {
 	case model.ImageTaskQueued, model.ImageTaskInvoking:
 		decision.Action, decision.Reason = "retry_submission", "temporary_failure"
-		if task.UpstreamSucceededAt > 0 {
+		if decision.Budget == "timeout" {
+			decision.Action = "switch_account"
+		} else if task.UpstreamSucceededAt > 0 {
 			decision.Action = "resume_output"
 			if failure.InternalCode == "billing_usage_missing" && task.UpstreamTaskId != "" {
 				decision.Action = "poll_same_job"
@@ -106,6 +126,16 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 	}
 	if failure.InternalCode == "reference_accounts_exhausted" || failure.InternalCode == "account_switches_exhausted" {
 		decision.Reason = "account_switch_limit"
+	}
+	if decision.Budget == "timeout" && status == model.ImageTaskFailed {
+		decision.Reason = "timeout_retry_budget_exhausted"
+		if failure.InternalCode == "timeout_accounts_exhausted" {
+			decision.Reason = "account_switch_limit"
+		} else if task.StartedAt > 0 && decision.RecordedAt >= decision.Deadline {
+			decision.Reason = "execution_deadline"
+		} else if task.RetryCount >= cfg.TotalRetries {
+			decision.Reason = "total_retry_budget_exhausted"
+		}
 	}
 	return decision
 }

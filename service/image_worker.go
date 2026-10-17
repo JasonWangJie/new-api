@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -372,6 +373,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		// the prior attempt's channel snapshot.
 		channel, account, err = PickImageChannel(ctx, policy, request, routing)
 		if err != nil {
+			if errors.Is(err, ErrImageTimeoutAccountsExhausted) {
+				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 606, InternalCode: "timeout_accounts_exhausted", Message: "No unused image account remains after request timeouts"}, cfg)
+			}
 			if errors.Is(err, ErrImageLocalControlsUnavailable) {
 				return DeferAsyncImageSubmission(ctx, *task, cfg, "routing_controls_unavailable", 10, 0, 0)
 			}
@@ -513,7 +517,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if referenceFallback {
 			selection.Action, selection.Reason = "local_reference_fallback", "reference_transport_fallback"
 		}
-		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
+		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: true, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
 			return err
@@ -588,6 +592,20 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			}
 		}
 		failure := ClassifyAsyncImageFailure(err, 0)
+		var networkError net.Error
+		if ctx.Err() != nil && failure.InternalCode == "upstream_transport_timeout" {
+			failure.InternalCode = "upstream_transport_canceled"
+			failure.Message = "Image execution was interrupted; upstream execution could not be confirmed"
+			failure.ExecutionUnknown = true
+		}
+		// A single-attempt timeout authorizes the configured account switch,
+		// while parent cancellation (shutdown or lost leases) still requires
+		// reconciliation. Preserve success milestones and accepted upstream IDs.
+		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && ctx.Err() == nil && (errors.Is(attemptCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() || failure.InternalCode == "upstream_transport_timeout") {
+			failure.Code, failure.InternalCode = 608, "upstream_transport_timeout"
+			failure.ExecutionUnknown = task.UpstreamTaskId == ""
+			failure.Message = "Upstream request timed out after dispatch; execution could not be confirmed"
+		}
 		if failure.InternalCode == "upstream_transport_timeout" && errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
 			failure.Message = fmt.Sprintf("%s (local request timeout: %d seconds)", failure.Message, attemptTimeout)
 		}
@@ -673,12 +691,17 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	status, kind := model.ImageTaskFailed, ""
 	updates := map[string]any{"public_error_code": failure.Code, "error_code": failure.InternalCode, "error_message": failure.Message, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "finished_at": time.Now().Unix(), "next_attempt_at": 0}
 	submissionTransientRetries := 0
+	timeoutRetries := 0
+	timeoutAttempt := task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && failure.InternalCode == "upstream_transport_timeout"
 	if task.Attempts != "" {
 		var attempts []ImageChannelAttempt
 		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
 			return err
 		}
 		for _, attempt := range attempts {
+			if attempt.Dispatched && attempt.FinishedAt > 0 && attempt.TimedOut {
+				timeoutRetries++
+			}
 			if attempt.Dispatched && attempt.FinishedAt > 0 && (attempt.Code == 605 || attempt.Code == 606) {
 				submissionTransientRetries++
 			}
@@ -692,6 +715,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 					last.FinishedAt = time.Now().Unix()
 				}
 				last.Dispatched = task.DispatchedAt > 0
+				last.TimedOut = timeoutAttempt
 				last.Code = failure.Code
 				last.HTTPStatus = failure.HTTPStatus
 				last.ErrorMessage = failure.Message
@@ -746,6 +770,42 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				updates["request_cipher"] = cipher
 			}
 		}
+	} else if timeoutAttempt {
+		// Unknown execution belongs to the attempt. The task may continue on
+		// another credential under the administrator's bounded retry policy.
+		updates["public_error_code"] = 606
+		updates["reconciliation_status"] = "upstream_unconfirmed"
+		now := time.Now().Unix()
+		deadline := task.StartedAt + int64(cfg.ExecutionTimeout)
+		reservation, err := model.GetAsyncImageReservation(ctx, task)
+		if err != nil {
+			return err
+		}
+		if reservation == nil || reservation.Status != "reserved" {
+			status = model.ImageTaskExecutionUnknown
+			updates["public_error_code"] = 608
+			updates["error_code"] = "quota_cache_uncertain"
+			updates["error_message"] = "The quota reservation could not be confirmed; administrator reconciliation is required"
+		} else if task.StartedAt > 0 && now >= deadline {
+			updates["error_code"] = "timeout_deadline_exhausted"
+			updates["error_message"] = "Image execution deadline expired after request timeouts"
+		} else if timeoutRetries >= cfg.TimeoutRetries || task.RetryCount >= cfg.TotalRetries {
+			updates["error_code"] = "timeout_retries_exhausted"
+			updates["error_message"] = "Image request timeout retry budget is exhausted"
+		} else {
+			delay := ImageRetryDelay(cfg.TimeoutRetryBase, cfg.TimeoutRetryMax, timeoutRetries, cfg.RetryJitter, 0, cfg.RetryAfterMax)
+			delay = min(max(delay, cfg.TimeoutRetryBase), cfg.TimeoutRetryMax)
+			status, kind = model.ImageTaskQueued, "execute"
+			updates["request_cipher"] = task.RequestCipher
+			updates["finished_at"] = 0
+			updates["retry_count"] = task.RetryCount + 1
+			updates["next_attempt_at"] = now + int64(delay)
+			if task.StartedAt > 0 {
+				updates["next_attempt_at"] = min(updates["next_attempt_at"].(int64), deadline)
+			}
+			updates["channel_id"], updates["dispatched_at"] = 0, 0
+			updates["selected_channel_cipher"] = nil
+		}
 	} else if failure.ExecutionUnknown {
 		status = model.ImageTaskExecutionUnknown
 		updates["public_error_code"] = 608
@@ -797,6 +857,9 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				count, maximum, base, maxDelay, key = submissionTransientRetries, cfg.TransientRetries, cfg.TransientRetryBase, cfg.TransientRetryMax, "transient_retry_count"
 				if task.UpstreamTaskId == "" {
 					count = max(count, task.TransientRetryCount)
+				}
+				if failure.InternalCode == "timeout_accounts_exhausted" {
+					maximum = 0
 				}
 			}
 		}

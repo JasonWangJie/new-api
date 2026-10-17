@@ -268,8 +268,10 @@ func TestRecoverAsyncImageTaskContinuesKnownUpstreamPolling(t *testing.T) {
 	now := time.Now().Unix()
 	task.Id = 0
 	task.TaskId = "known-upstream-recovery"
-	task.StartedAt = now - 120
-	task.DispatchedAt = now - 120
+	// Recover an expired worker lease while the accepted job is still within
+	// its execution deadline; deadline exhaustion requires reconciliation.
+	task.StartedAt = now - 30
+	task.DispatchedAt = now - 30
 	task.UpstreamTaskId = "upstream-image-task"
 	task.LeaseExpiresAt = now - 1
 	require.NoError(t, db.Create(&task).Error)
