@@ -783,6 +783,78 @@ test('public details show the translated explanation and concrete failure reason
   ).not.toBeInTheDocument()
 })
 
+test.each([
+  { diagnostics: false, original: '' },
+  { diagnostics: true, original: '' },
+  {
+    diagnostics: false,
+    original:
+      'The request failed because the output video may contain sensitive information.',
+  },
+  {
+    diagnostics: true,
+    original:
+      'The request failed because the output video may contain sensitive information.',
+  },
+])(
+  'structured video failure explains the original once without repeating the API message (diagnostics=$diagnostics, original=$original)',
+  ({ diagnostics, original }) => {
+    const summary =
+      '上游审核认为生成的视频可能包含敏感内容，已拦截输出；未提供具体敏感类别或画面位置。'
+    const suggestion =
+      '请检查提示词和参考素材是否符合上游内容规则，调整后再提交。'
+    const failedTask = {
+      ...task,
+      media_type: 'video' as const,
+      status: 'failed',
+      billing_status: 'refunded',
+      error_summary: summary,
+      error_suggestion: suggestion,
+      error_detail: original,
+      error_message: `${summary}\n处理建议：${suggestion}${original ? `\n原始错误：${original}` : ''}`,
+    }
+    render(<ImageTaskNotice task={failedTask} diagnostics={diagnostics} />)
+    const notice = screen.getByRole('status')
+    expect(within(notice).getByText(summary)).toBeVisible()
+    expect(within(notice).getByText(suggestion)).toBeVisible()
+    expect(notice.textContent?.split(summary)).toHaveLength(2)
+    expect(notice.textContent?.split(suggestion)).toHaveLength(2)
+    expect(
+      within(notice).queryByText(failedTask.error_message)
+    ).not.toBeInTheDocument()
+    if (original) {
+      expect(within(notice).getByText(original)).toBeVisible()
+    } else {
+      expect(
+        within(notice).queryByText('Failure reason')
+      ).not.toBeInTheDocument()
+    }
+  }
+)
+
+test.each([
+  { media_type: 'video', error_detail: undefined },
+  { media_type: 'image', error_detail: 'Unrelated structured diagnostic' },
+] as const)(
+  '$media_type failure preserves the existing diagnostic when structured video detail is unavailable',
+  ({ media_type, error_detail }) => {
+    const failedTask = {
+      ...task,
+      media_type,
+      status: 'failed',
+      error_summary: 'Recorded explanation',
+      error_message:
+        'The original failure from the existing API remains visible.',
+      error_detail,
+    }
+    render(<ImageTaskNotice task={failedTask} diagnostics />)
+    expect(screen.getByText(failedTask.error_message)).toBeVisible()
+    if (error_detail) {
+      expect(screen.queryByText(error_detail)).not.toBeInTheDocument()
+    }
+  }
+)
+
 test.each<{
   summary: string
   key: string

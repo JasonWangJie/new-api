@@ -12,10 +12,12 @@ import (
 
 var (
 	videoFailureURLPattern        = regexp.MustCompile(`(?i)\b(?:https?|ftp|s3|gs|file|blob|data):[^\s<>"']+`)
-	videoFailureCredentialPattern = regexp.MustCompile(`(?i)(\b(?:token|refresh[_ -]?token|signature|sig|passwd)\b["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
+	videoFailureCredentialPattern = regexp.MustCompile(`(?i)(\b(?:token|refresh[_ -]?token|signature|sig|passwd|password|api[_ -]?key|access[_ -]?token|secret|authorization)\b["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;"'}]+)`)
+	videoFailureAuthHeaderPattern = regexp.MustCompile(`(?i)(\bauthorization\b["']?\s*[:=]\s*["']?)(?:basic|bearer|digest|token)\s+[^\r\n,;"'}]+`)
+	videoFailureRequestPattern    = regexp.MustCompile(`(?i)(?:^|[;:\r\n])\s*(?:request[_ -]?(?:body|payload)|payload)\b["']?\s*[:=]\s*`)
 	videoFailureContentPattern    = regexp.MustCompile(`\bcontent\[[0-9]{1,10}\]`)
-	videoFailureRatioPattern      = regexp.MustCompile(`(?i)aspect ratio of .+? is ([0-9]{1,8}(?:\.[0-9]{1,32})?)\.\s*Required\s+([0-9]{1,8}(?:\.[0-9]{1,32})?)[ \t]*[-–—][ \t]*([0-9]{1,8}(?:\.[0-9]{1,32})?)`)
-	videoFailureDimensionsPattern = regexp.MustCompile(`(?i)expected the (width|height) to be (at most|at least) ([0-9]{1,8})px.*?received (?:a )?([0-9]{1,8})x([0-9]{1,8})px`)
+	videoFailureRatioPattern      = regexp.MustCompile(`(?is)aspect ratio of .+?\s+is\s+([0-9]{1,8}(?:\.[0-9]{1,32})?)\.\s*Required\s+([0-9]{1,8}(?:\.[0-9]{1,32})?)\s*[-–—]\s*([0-9]{1,8}(?:\.[0-9]{1,32})?)`)
+	videoFailureDimensionsPattern = regexp.MustCompile(`(?is)expected the (width|height) to be (at most|at least) ([0-9]{1,8})px.*?received (?:a )?([0-9]{1,8})x([0-9]{1,8})px`)
 )
 
 // VideoFailureNotice describes a failed video task without changing its stored
@@ -63,7 +65,7 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 		material = "视频"
 	}
 	switch {
-	case raw == "" || lower == "video generation failed" || lower == "task failed":
+	case isMissingVideoFailureReason(raw):
 		notice.Summary = "视频任务失败，未提供具体错误原因。"
 		notice.Suggestion = "请保留任务号并联系管理员检查任务记录；当前没有更多可确认的失败原因。"
 	case strings.Contains(lower, "generated video could not be saved locally") || lower == "storage_failed":
@@ -128,6 +130,15 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 	return sanitizeVideoFailureNotice(notice)
 }
 
+func isMissingVideoFailureReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "", "video generation failed", "task failed", "video generation failed; upstream did not provide an error reason":
+		return true
+	default:
+		return false
+	}
+}
+
 // sanitizeVideoFailureNotice protects both fresh classifications and restored
 // notices. Every field is sanitized, and the complete message stays bounded.
 func sanitizeVideoFailureNotice(notice VideoFailureNotice) VideoFailureNotice {
@@ -141,21 +152,54 @@ func sanitizeVideoFailureNotice(notice VideoFailureNotice) VideoFailureNotice {
 
 func sanitizeVideoFailureDiagnostic(raw string, limit int) string {
 	raw = strings.TrimSpace(raw)
-	if strings.HasPrefix(raw, "/") {
+	// Structured provider envelopes may follow a text prefix. Keep diagnostic
+	// fields only; never return an echoed request body from those envelopes.
+	for depth := range 6 {
+		previous := raw
+		for index, character := range raw {
+			if character != '{' && (character != '[' || index > 0 && !strings.ContainsAny(raw[index-1:index], " \t\r\n:=")) {
+				continue
+			}
+			if character == '[' && index > 0 {
+				following := strings.TrimSpace(raw[index+1:])
+				if following == "" || !strings.ContainsAny(following[:1], `{"[]`) {
+					continue
+				}
+			}
+			var envelope any
+			diagnostic := ""
+			if depth < 5 && common.DecodeJson(strings.NewReader(raw[index:]), &envelope) == nil {
+				diagnostic = asyncImageErrorMessage(envelope, 0)
+			}
+			raw = strings.TrimSpace(raw[:index] + " " + diagnostic)
+			break
+		}
+		if raw == previous {
+			break
+		}
+	}
+	if request := videoFailureRequestPattern.FindStringIndex(raw); request != nil {
+		raw = strings.TrimSpace(raw[:request[0]])
+	}
+	if strings.HasPrefix(raw, "/") && !strings.ContainsAny(raw, " \t\r\n") {
 		return ""
 	}
 	if parsed, err := url.Parse(raw); err == nil && (parsed.Host != "" || parsed.Scheme != "") {
+		if parsed.Host != "" {
+			return ""
+		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https", "data", "blob", "file", "ftp", "s3", "gs":
 			return ""
 		}
 	}
 	raw = videoFailureURLPattern.ReplaceAllString(raw, "[链接已隐藏]")
+	raw = videoFailureAuthHeaderPattern.ReplaceAllString(raw, "${1}***")
+	raw = videoFailureCredentialPattern.ReplaceAllString(raw, "${1}***")
 	if limit < 0 {
 		limit = len([]rune(raw))
 	}
-	raw = SanitizeAsyncImageDiagnostic(raw, limit)
-	return videoFailureCredentialPattern.ReplaceAllString(raw, "${1}***")
+	return SanitizeAsyncImageText(raw, limit)
 }
 
 // VideoTaskFailureReason provides the same explanation to API error.message,

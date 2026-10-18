@@ -34,6 +34,11 @@ export function ImageTaskNotice(props: {
   const { t } = useTranslation()
   const issue = imageTaskIssue(props.task)
   if (!issue) return null
+  const diagnostic =
+    props.task.media_type === 'video' &&
+    typeof props.task.error_detail === 'string'
+      ? props.task.error_detail
+      : props.task.error_message
   const retryCount =
     props.task.retry_decision?.total_used ?? props.task.retry_count
   return (
@@ -52,7 +57,7 @@ export function ImageTaskNotice(props: {
         {t(imageLabel(issue.summary), issue.summaryParams || {})}
       </AlertTitle>
       <AlertDescription className='space-y-2 text-xs leading-5'>
-        {props.task.error_message && (
+        {diagnostic && (
           <div className='space-y-1'>
             {props.diagnostics && (
               <div className='font-medium'>{t('Failure reason')}</div>
@@ -63,7 +68,7 @@ export function ImageTaskNotice(props: {
                 !props.diagnostics && 'line-clamp-2'
               )}
             >
-              {props.task.error_message}
+              {diagnostic}
             </div>
           </div>
         )}

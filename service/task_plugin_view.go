@@ -2,7 +2,6 @@ package service
 
 import (
 	"math"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,8 +79,7 @@ func PublicTaskFailureReason(task *model.Task) string {
 	if !video {
 		return task.FailReason
 	}
-	reason := strings.TrimSpace(task.FailReason)
-	if task.Platform != "drama" || reason != "" && reason != "Video generation failed" {
+	if task.Platform != "drama" || !isMissingVideoFailureReason(task.FailReason) {
 		return VideoTaskFailureReason(task.FailReason)
 	}
 	var snapshot map[string]any
@@ -92,9 +90,9 @@ func PublicTaskFailureReason(task *model.Task) string {
 	switch failure := snapshot["error"].(type) {
 	case string:
 		candidates = append(candidates, failure)
-	case map[string]any:
-		if message, ok := failure["message"].(string); ok {
-			candidates = append(candidates, message)
+	case map[string]any, []any:
+		if encoded, err := common.Marshal(failure); err == nil {
+			candidates = append(candidates, string(encoded))
 		}
 	}
 	if metadata, ok := snapshot["metadata"].(map[string]any); ok {
@@ -103,22 +101,11 @@ func PublicTaskFailureReason(task *model.Task) string {
 		}
 	}
 	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" || strings.HasPrefix(candidate, "/") {
+		candidate = sanitizeVideoFailureDiagnostic(candidate, -1)
+		if isMissingVideoFailureReason(candidate) {
 			continue
 		}
-		if parsed, err := url.Parse(candidate); err == nil {
-			if parsed.Host != "" {
-				continue
-			}
-			switch strings.ToLower(parsed.Scheme) {
-			case "http", "https", "data", "blob", "file", "ftp", "s3", "gs":
-				continue
-			}
-		}
-		if reason := SanitizeAsyncImageDiagnostic(candidate, common.LocalLogContentLimit); reason != "" {
-			return VideoTaskFailureReason(candidate)
-		}
+		return VideoTaskFailureReason(candidate)
 	}
 	return VideoTaskFailureReason(task.FailReason)
 }

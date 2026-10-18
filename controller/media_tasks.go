@@ -166,6 +166,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		if reason != "" || status == "failed" {
 			notice := service.VideoTaskFailureNotice(reason)
 			view["error_summary"], view["error_suggestion"] = notice.Summary, notice.Suggestion
+			view["error_detail"] = notice.Detail
 			view["error_message"] = service.VideoTaskFailureReason(reason)
 		}
 	}

@@ -1299,6 +1299,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Equal(t, "refunded", view["billing_status"])
 						assert.Contains(t, view["error_summary"], "敏感")
 						assert.NotEmpty(t, view["error_suggestion"])
+						assert.Equal(t, rawReason, view["error_detail"])
 						assert.Contains(t, view["error_message"], rawReason)
 						if endpoint == "public" {
 							publicReason = view["error_message"].(string)

@@ -25,8 +25,13 @@ func TestBuildTaskPluginViewRestoresLegacyDramaFailureReason(t *testing.T) {
 		{name: "empty saved reason", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "error string has priority", reason: placeholder, data: `{"status":"failed","error":" primary error ","metadata":{"url":"secondary error"}}`, want: "primary error"},
 		{name: "error message has priority", reason: placeholder, data: `{"status":"failed","error":{"message":" primary message "},"metadata":{"url":"secondary error"}}`, want: "primary message"},
+		{name: "nested error message", reason: placeholder, data: `{"status":"failed","error":{"error":{"message":"Rate limit exceeded"},"request":{"prompt":"private prompt"}}}`, want: "Rate limit exceeded"},
+		{name: "generic error falls back to metadata", reason: placeholder, data: `{"status":"failed","error":{"message":"Video generation failed"},"metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
+		{name: "legacy generic task reason", reason: "Task failed", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
+		{name: "explicit missing reason recovers metadata", reason: "Video generation failed; upstream did not provide an error reason", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "empty error falls back to metadata", reason: placeholder, data: `{"status":"failed","error":{"message":" "},"metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "specific saved reason is authoritative", reason: " Local billing settlement failed ", data: `{"status":"failed","error":"different upstream reason"}`, want: " Local billing settlement failed "},
+		{name: "saved storage failure is authoritative", reason: "Generated video could not be saved locally", data: `{"status":"failed","error":"The request failed because the output video may contain sensitive information."}`, want: "Generated video could not be saved locally"},
 		{name: "another provider remains unchanged", platform: "sora", reason: placeholder, data: `{"status":"failed","error":"not a Drama reason"}`, want: placeholder},
 		{name: "active task remains unchanged", status: "IN_PROGRESS", reason: placeholder, data: `{"status":"failed","error":"stale snapshot"}`, want: placeholder},
 		{name: "successful task remains unchanged", status: "SUCCESS", reason: placeholder, data: `{"status":"failed","error":"stale snapshot"}`, want: placeholder},
@@ -119,6 +124,11 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 		{name: "video aspect ratio", raw: `The aspect ratio of input video 'content[2]' is 3.0. Required 0.4-2.5.`, summary: "输入视频的宽高比", suggestion: "视频"},
 		{name: "unknown material aspect ratio", raw: `The aspect ratio of 'content[2]' is 3.0. Required 0.4-2.5.`, summary: "输入素材的宽高比", suggestion: "素材"},
 		{name: "image dimensions", raw: "Error while downloading image, error: expected the width to be at most 6000px, but received a 6060x3476px image instead", summary: "6060×3476", suggestion: "6000"},
+		{name: "multiline image dimensions", raw: "Error while downloading image: expected the height to be at least 300px,\nbut received a 600x200px image instead", summary: "600×200", suggestion: "增大图片"},
+		{name: "multiline aspect ratio", raw: "The aspect ratio of input video 'content[2]'\nis 3.0.\nRequired 0.4-2.5.", summary: "输入视频的宽高比为 3.000", suggestion: "视频"},
+		{name: "nested JSON with request echo", raw: `{"error":{"message":"The request failed because the output video may contain sensitive information."},"request":{"prompt":"private prompt"}}`, summary: "生成的视频可能包含敏感内容", suggestion: "提示词"},
+		{name: "nested echoed prompt does not classify", raw: `{"error":{"message":"Invalid parameter duration; request: {\"prompt\":\"The request failed because the output video may contain sensitive information.\"}"}}`, summary: "参数不符合上游要求", suggestion: "参数"},
+		{name: "plain payload validation explains reason", raw: "Invalid request payload: The request failed because the input image 'content[3]' may contain real person.", summary: "输入图片", suggestion: "图片"},
 		{name: "image inaccessible", raw: "Image download denied: HTTP 403", summary: "无法获取输入图片", suggestion: "访问"},
 		{name: "image invalid", raw: "Invalid image format", summary: "图片格式", suggestion: "图片"},
 		{name: "unsupported parameter", raw: "Invalid parameter: duration must be 5 or 10", summary: "参数不符合上游要求", suggestion: "参数"},
@@ -130,6 +140,7 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 		{name: "local storage status", raw: "storage_failed", summary: "视频结果未能保存到本地", suggestion: "不要重复发起视频生成"},
 		{name: "unknown", raw: "Unrecognized provider error Q102", summary: "未提供可识别的进一步原因", suggestion: "管理员"},
 		{name: "generic", raw: "Video generation failed", summary: "未提供具体错误原因", suggestion: "管理员"},
+		{name: "explicitly unavailable upstream reason", raw: "Video generation failed; upstream did not provide an error reason", summary: "未提供具体错误原因", suggestion: "管理员"},
 		{name: "empty", summary: "未提供具体错误原因", suggestion: "管理员"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,10 +188,24 @@ func TestVideoTaskFailureNoticeSanitizesDetails(t *testing.T) {
 			assert.NotContains(t, field, secret, "restored explanation fields must be sanitized too")
 		}
 	}
-	for _, url := range []string{"https://signed.example/private?token=secret", "/v1/videos/private/content", "data:video/mp4;base64,cHJpdmF0ZQ=="} {
+	for _, url := range []string{"https://signed.example/private?token=secret", "/v1/videos/private/content", "data:video/mp4;base64,cHJpdmF0ZQ==", "custom://signed.example/private?token=secret"} {
 		assert.Empty(t, VideoTaskFailureNotice(url).Detail)
 	}
 	assert.Empty(t, VideoTaskFailureNotice(`{"request":{"prompt":"private prompt"}}`).Detail)
+	for _, tc := range []struct{ name, raw, want, detail string }{
+		{name: "Basic authorization", raw: "Upstream rejected credentials; Authorization: Basic cHJpdmF0ZTpwYXNzd29yZA==", want: "cHJpdmF0ZTpwYXNzd29yZA==", detail: "Upstream rejected credentials"},
+		{name: "text request body", raw: `Invalid parameter: duration; request body: {"prompt":"private prompt","api_key":"private request key"}`, want: "private prompt", detail: "Invalid parameter: duration"},
+		{name: "prefixed JSON response", raw: `Upstream response: {"error":{"message":"Invalid parameter: duration"},"request":{"prompt":"private prompt"}}`, want: "private prompt", detail: "Invalid parameter: duration"},
+		{name: "JSON response followed by private request", raw: `Upstream response: {"error":{"message":"Invalid parameter: duration"}}; request body: private prompt`, want: "private prompt", detail: "Invalid parameter: duration"},
+		{name: "escaped quoted credential", raw: `Upstream failed: password="first \" private-tail"`, want: "private-tail", detail: "Upstream failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := VideoTaskFailureReason(tc.raw)
+			assert.NotContains(t, reason, tc.want)
+			assert.Contains(t, reason, tc.detail)
+			assert.Equal(t, reason, VideoTaskFailureReason(reason))
+		})
+	}
 }
 
 func TestPublicTaskFailureReasonAppliesOnlyToFailedVideoTasks(t *testing.T) {

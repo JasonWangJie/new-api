@@ -29,6 +29,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
 
@@ -610,10 +611,10 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 	connection, err := db.DB()
 	require.NoError(t, err)
 	connection.SetMaxOpenConns(1)
-	previousDB, previousLogDB, previousCache := model.DB, model.LOG_DB, common.MemoryCacheEnabled
+	previousDB, previousLogDB, previousCache, previousRedis := model.DB, model.LOG_DB, common.MemoryCacheEnabled, common.RedisEnabled
 	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
 	previousFactory := service.GetTaskAdaptorFunc
-	model.DB, model.LOG_DB, common.MemoryCacheEnabled = db, db, false
+	model.DB, model.LOG_DB, common.MemoryCacheEnabled, common.RedisEnabled = db, db, false, false
 	common.SetDatabaseTypes(common.DatabaseType("sqlite"), common.DatabaseType("sqlite"))
 	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
 		if platform == "drama" {
@@ -622,7 +623,7 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() {
-		model.DB, model.LOG_DB, common.MemoryCacheEnabled = previousDB, previousLogDB, previousCache
+		model.DB, model.LOG_DB, common.MemoryCacheEnabled, common.RedisEnabled = previousDB, previousLogDB, previousCache, previousRedis
 		common.SetDatabaseTypes(previousType, previousLogType)
 		service.GetTaskAdaptorFunc = previousFactory
 		assert.NoError(t, connection.Close())
@@ -763,6 +764,154 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 			assert.EqualValues(t, 1, submits.Load())
 			assert.EqualValues(t, len(states), polls.Load())
 			assert.EqualValues(t, 1, downloads.Load())
+		})
+	}
+
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}, &model.AsyncMediaJob{}, &model.AsyncImageTask{}, &model.MediaArtifactObject{}, &model.Option{}))
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), service.DefaultMediaRuntimeConfig()))
+	for _, tc := range []struct {
+		name, diagnostic, summary string
+	}{
+		{"input-person", "The request failed because the input image 'content[3]' may contain real person.", "输入图片（上游位置 content[3]，不等同于参考素材序号）可能包含真人"},
+		{"image-ratio", `The aspect ratio of "2_image_example.png" is 2.8458498023715415. Required 0.4–2.5.`, "输入图片的宽高比为 2.846"},
+		{"missing-reason", "", "视频任务失败，未提供具体错误原因"},
+	} {
+		t.Run("failure/"+tc.name, func(t *testing.T) {
+			var polls atomic.Int32
+			failure, err := common.Marshal(map[string]any{"id": "remote-failure", "status": "failed", "metadata": map[string]any{"url": tc.diagnostic}})
+			require.NoError(t, err)
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assert.Equal(t, http.MethodGet, request.Method)
+				assert.Equal(t, "/v1/videos/remote-failure", request.URL.Path)
+				assert.Equal(t, "Bearer upstream-key", request.Header.Get("Authorization"))
+				writer.Header().Set("Content-Type", "application/json")
+				if polls.Add(1) == 1 {
+					_, _ = io.WriteString(writer, `{"id":"remote-failure","status":"queued","progress":0}`)
+					return
+				}
+				_, _ = writer.Write(failure)
+			}))
+			t.Cleanup(upstream.Close)
+			// These balances represent a completed 100-quota reservation. Polling
+			// must refund the wallet, token and usage counters exactly once.
+			user := model.User{Username: tc.name, AffCode: tc.name, Quota: 900, UsedQuota: 100, RequestCount: 1}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "client-" + tc.name, Name: tc.name, RemainQuota: 900, UsedQuota: 100}
+			require.NoError(t, db.Create(&token).Error)
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: tc.name, Key: "upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, UsedQuota: 100}
+			require.NoError(t, db.Create(&channel).Error)
+			now := common.GetTimestamp()
+			task := model.Task{TaskID: "failure-" + tc.name, UserId: user.Id, ChannelId: channel.Id, Platform: "drama", Action: "text_to_video", Quota: 100, Status: model.TaskStatusSubmitted, Progress: "0%", CreatedAt: now, SubmitTime: now,
+				Properties:  model.Properties{OriginModelName: "seedance2.5-A", UpstreamModelName: "seedance2.5-A"},
+				PrivateData: model.TaskPrivateData{AsyncMedia: true, UpstreamTaskID: "remote-failure", TokenId: token.Id, BillingSource: "wallet", DurableBilling: true, SubmitAccountingRecorded: true, BillingContext: &model.TaskBillingContext{PerCallBilling: true}},
+			}
+			require.NoError(t, db.Create(&task).Error)
+			channelJSON, err := common.Marshal(channel)
+			require.NoError(t, err)
+			channelCipher, err := service.EncryptImagePayload(channelJSON, "media-channel:"+task.TaskID)
+			require.NoError(t, err)
+			job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: "drama", Model: "seedance2.5-A", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: 100, ChannelCipher: channelCipher, CreatedAt: now, ExpiresAt: now + 3600}
+			require.NoError(t, db.Create(&job).Error)
+			for _, status := range []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusFailure} {
+				require.NoError(t, service.UpdateVideoTasks(t.Context(), "drama", map[int][]string{channel.Id: {"remote-failure"}}, map[string]*model.Task{"remote-failure": &task}))
+				require.NoError(t, db.First(&task, task.ID).Error)
+				require.Equal(t, status, task.Status)
+			}
+			assert.Zero(t, task.Quota)
+			assert.Equal(t, "100%", task.Progress)
+			assert.Positive(t, task.FinishTime)
+			assert.JSONEq(t, string(failure), string(task.Data), "explanations must preserve the provider snapshot")
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			require.NoError(t, db.First(&channel, channel.Id).Error)
+			assert.Equal(t, 1000, user.Quota)
+			assert.Zero(t, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			assert.Equal(t, 1000, token.RemainQuota)
+			assert.Zero(t, token.UsedQuota)
+			assert.Zero(t, channel.UsedQuota)
+			var refundLogs []model.Log
+			require.NoError(t, db.Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Find(&refundLogs).Error)
+			require.Len(t, refundLogs, 1)
+			assert.Equal(t, 100, refundLogs[0].Quota)
+
+			// Exercise the real query handlers over HTTP with authenticated context
+			// supplied by the fixture; authentication itself is outside this test.
+			api := gin.New()
+			api.Use(func(c *gin.Context) {
+				c.Set("id", user.Id)
+				c.Set("token_id", token.Id)
+				c.Set("role", common.RoleAdminUser)
+			})
+			api.GET("/v1/media/tasks_async/:task_id", controller.QueryAsyncMedia)
+			api.GET("/v1/videos/:task_id", func(c *gin.Context) { assert.Nil(t, relay.RelayTaskFetch(c, relayconstant.RelayModeVideoFetchByID)) })
+			api.GET("/v1/video/generations/:task_id", func(c *gin.Context) { assert.Nil(t, relay.RelayTaskFetch(c, relayconstant.RelayModeVideoFetchByID)) })
+			api.GET("/v1/tasks/:key", controller.GetTask)
+			api.GET("/api/user/media-tasks/:task_id", func(c *gin.Context) { controller.GetMediaTask(c, false) })
+			api.GET("/api/admin/media-tasks/:task_id", func(c *gin.Context) { controller.GetMediaTask(c, true) })
+			api.GET("/api/user/media-tasks", func(c *gin.Context) { controller.ListMediaTasks(c, false) })
+			api.GET("/api/admin/media-tasks", func(c *gin.Context) { controller.ListMediaTasks(c, true) })
+			api.GET("/api/task/self", controller.GetUserTask)
+			api.GET("/api/task", controller.GetAllTask)
+			host := httptest.NewServer(api)
+			t.Cleanup(host.Close)
+			var beforeTask model.Task
+			require.NoError(t, db.First(&beforeTask, task.ID).Error)
+			var message string
+			for _, query := range []struct{ path, field string }{
+				{"/v1/media/tasks_async/" + task.TaskID, "error_message"},
+				{"/v1/videos/" + task.TaskID, "error.message"},
+				{"/v1/video/generations/" + task.TaskID, "data.fail_reason"},
+				{"/v1/tasks/" + task.TaskID, "fail_reason"},
+				{"/api/user/media-tasks/" + task.TaskID, "data.task.error_message"},
+				{"/api/admin/media-tasks/" + task.TaskID, "data.task.error_message"},
+				{"/api/user/media-tasks?media_type=video&task_id=" + task.TaskID, "data.items.0.error_message"},
+				{"/api/admin/media-tasks?media_type=video&task_id=" + task.TaskID, "data.items.0.error_message"},
+				{"/api/task/self?task_id=" + task.TaskID, "data.items.0.fail_reason"},
+				{"/api/task?task_id=" + task.TaskID, "data.items.0.fail_reason"},
+			} {
+				response, err := host.Client().Get(host.URL + query.path)
+				require.NoError(t, err)
+				body, err := io.ReadAll(response.Body)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				require.Equal(t, http.StatusOK, response.StatusCode, "%s: %s", query.path, body)
+				require.True(t, gjson.ValidBytes(body))
+				explanation := gjson.GetBytes(body, query.field).String()
+				if message == "" {
+					message = explanation
+				}
+				assert.Equal(t, message, explanation, query.path)
+				assert.Contains(t, explanation, tc.summary, query.path)
+				assert.Contains(t, explanation, "处理建议：", query.path)
+				if tc.diagnostic != "" {
+					assert.Contains(t, explanation, "原始错误："+tc.diagnostic, query.path)
+				}
+				if strings.Contains(query.field, "error_message") {
+					prefix, _ := strings.CutSuffix(query.field, "error_message")
+					assert.Contains(t, gjson.GetBytes(body, prefix+"error_summary").String(), tc.summary, query.path)
+					assert.NotEmpty(t, gjson.GetBytes(body, prefix+"error_suggestion").String(), query.path)
+					assert.Equal(t, "refunded", gjson.GetBytes(body, prefix+"billing_status").String(), query.path)
+					assert.Zero(t, gjson.GetBytes(body, prefix+"quota").Int(), query.path)
+				}
+			}
+			var afterTask model.Task
+			require.NoError(t, db.First(&afterTask, task.ID).Error)
+			assert.Equal(t, beforeTask, afterTask, "queries must not rewrite provider data or stored error reasons")
+			for _, row := range []struct {
+				before any
+				after  any
+				id     int
+			}{{&user, &model.User{}, user.Id}, {&token, &model.Token{}, token.Id}, {&channel, &model.Channel{}, channel.Id}, {&job, &model.AsyncMediaJob{}, job.ID}} {
+				require.NoError(t, db.First(row.after, row.id).Error)
+				assert.Equal(t, row.before, row.after, "queries must not modify billing or async job records")
+			}
+			var logCount int64
+			require.NoError(t, db.Model(&model.Log{}).Where("user_id = ?", user.Id).Count(&logCount).Error)
+			assert.EqualValues(t, 1, logCount, "queries must not issue another refund")
+			assert.EqualValues(t, 2, polls.Load(), "queries must not contact the upstream again")
 		})
 	}
 }
