@@ -161,6 +161,14 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.Provider == "drama" && job.ExpiresAt <= now {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
+	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) {
+		reason, _ := view["error_message"].(string)
+		if reason != "" || status == "failed" {
+			notice := service.VideoTaskFailureNotice(reason)
+			view["error_summary"], view["error_suggestion"] = notice.Summary, notice.Suggestion
+			view["error_message"] = service.VideoTaskFailureReason(reason)
+		}
+	}
 	results := make([]gin.H, 0)
 	if job.StorageStatus == "upstream" && job.ExpiresAt > time.Now().Unix() {
 		if link := service.PublicUpstreamAsyncVideoResultURL(&task); link != "" {

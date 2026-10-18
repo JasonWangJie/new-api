@@ -936,6 +936,14 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	} else {
 		delete(rendered, "completed_at")
 	}
+	if task.Status == model.TaskStatusFailure {
+		failure, ok := rendered["error"].(map[string]any)
+		if !ok {
+			failure = make(map[string]any)
+		}
+		failure["message"] = service.VideoTaskFailureReason(service.PublicTaskFailureReason(task))
+		rendered["error"] = failure
+	}
 	return common.Marshal(rendered)
 }
 

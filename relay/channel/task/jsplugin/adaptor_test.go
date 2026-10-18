@@ -706,10 +706,14 @@ func TestTaskAdaptorPreservesSoraVideoResponseFields(t *testing.T) {
 			assert.Equal(t, "720p", fields["resolution"])
 			assert.Equal(t, "16:9", fields["aspect_ratio"])
 			assert.Equal(t, []any{"https://cdn.example/reference.png"}, fields["reference_images"])
-			assert.Equal(t, map[string]any{
+			wantError := map[string]any{
 				"code": "provider_error", "message": "provider rejected request",
 				"detail": map[string]any{"retryable": false},
-			}, fields["error"])
+			}
+			if tc.status == model.TaskStatusFailure {
+				wantError["message"] = service.VideoTaskFailureReason(service.PublicTaskFailureReason(task))
+			}
+			assert.Equal(t, wantError, fields["error"])
 		})
 	}
 }
@@ -743,7 +747,52 @@ func TestTaskAdaptorPreservesOpenAIVideoFailureSlotsAndOwnsLifecycle(t *testing.
 	rendered, err := adaptor.ConvertToOpenAIVideo(task)
 
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"id":"task_public","object":"video","model":"origin-model","status":"failed","progress":0,"created_at":10,"error":{"message":"provider rejected request","code":"provider_error"}}`, string(rendered))
+	want, err := common.Marshal(map[string]any{
+		"id": "task_public", "object": "video", "model": "origin-model", "status": "failed", "progress": 0, "created_at": 10,
+		"error": map[string]any{"message": service.VideoTaskFailureReason(service.PublicTaskFailureReason(task)), "code": "provider_error"},
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, string(want), string(rendered))
+}
+
+func TestTaskAdaptorOwnsOpenAIVideoFailureMessageWhenRendererOmitsOrIgnoresReason(t *testing.T) {
+	const upstreamReason = "The request failed because the input image 'content[3]' may contain real person."
+	for _, tc := range []struct {
+		name, renderer string
+	}{
+		{name: "renderer omits error", renderer: `render: function() { return {}; }`},
+		{name: "renderer ignores reason", renderer: `render: function() { return {error:{code:"provider_error",message:"generic provider failure",detail:{retryable:false}}}; }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := strings.Replace(mockPlugin, `render: function(ctx, task) { return {id: task.task_id, status: "completed"}; }`, tc.renderer, 1)
+			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+			require.NoError(t, err)
+			task := &model.Task{
+				TaskID:     "task_public",
+				Platform:   "drama",
+				Status:     model.TaskStatusFailure,
+				FailReason: upstreamReason + " Bearer private-bearer; https://private.example/video?token=private-token",
+			}
+
+			rendered, err := New(plugin).ConvertToOpenAIVideo(task)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, common.Unmarshal(rendered, &fields))
+			errorFields, ok := fields["error"].(map[string]any)
+			require.True(t, ok, "failed tasks must expose an error even when their renderer omits it")
+			message, ok := errorFields["message"].(string)
+			require.True(t, ok)
+			assert.Contains(t, message, "真人")
+			assert.Contains(t, message, upstreamReason)
+			for _, secret := range []string{"private-bearer", "private.example", "private-token"} {
+				assert.NotContains(t, message, secret)
+			}
+			if tc.name == "renderer ignores reason" {
+				assert.Equal(t, "provider_error", errorFields["code"])
+				assert.Equal(t, map[string]any{"retryable": false}, errorFields["detail"])
+			}
+		})
+	}
 }
 
 func TestTaskAdaptorBoundsNativeUsageBeforeQuotaCalculation(t *testing.T) {

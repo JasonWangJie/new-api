@@ -22,6 +22,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -708,7 +709,14 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 			switch pinned.Operation.Name {
 			case "create", "edit", "extend":
 				diagnostics.present(outcome.Task, "openai_video_"+pinned.Operation.Name)
-				c.JSON(http.StatusOK, outcome.Task.ToOpenAIVideo())
+				video := outcome.Task.ToOpenAIVideo()
+				if outcome.Task.Status == model.TaskStatusFailure {
+					video.Error = &relaydto.OpenAIVideoError{
+						Code:    "video_generation_failed",
+						Message: service.VideoTaskFailureReason(service.PublicTaskFailureReason(outcome.Task)),
+					}
+				}
+				c.JSON(http.StatusOK, video)
 				return
 			}
 		}

@@ -18,6 +18,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -131,6 +132,22 @@ func TestPresentTaskSubmissionUsesHostOpenAIVideoReceipt(t *testing.T) {
 
 			assert.JSONEq(t, `{"id":"task_public","object":"video","model":"video-model","status":"queued","progress":0,"created_at":456}`, recorder.Body.String())
 			assert.NotContains(t, recorder.Body.String(), "task_id")
+
+			task.Status = model.TaskStatusFailure
+			task.FailReason = "The request failed because the output video may contain sensitive information."
+			failedRecorder := httptest.NewRecorder()
+			failedContext, _ := gin.CreateTestContext(failedRecorder)
+			failedContext.Set(pluginruntime.ContextKeyPinnedEndpoint, pluginruntime.PinnedEndpoint{
+				Protocol:  "openai_video",
+				Operation: pluginruntime.HostProtocolOperation{Name: operation},
+			})
+			presentTaskSubmission(failedContext, outcome)
+			var failedVideo relaydto.OpenAIVideo
+			require.NoError(t, common.Unmarshal(failedRecorder.Body.Bytes(), &failedVideo))
+			assert.Equal(t, "failed", failedVideo.Status)
+			require.NotNil(t, failedVideo.Error)
+			assert.Contains(t, failedVideo.Error.Message, "敏感")
+			assert.Contains(t, failedVideo.Error.Message, task.FailReason)
 		})
 	}
 }

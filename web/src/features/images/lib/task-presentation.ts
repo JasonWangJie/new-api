@@ -76,6 +76,7 @@ export function imageTaskUpstreamProgress(task: ImageTask): number | null {
 
 export function imageTaskIssue(task: ImageTask): {
   summary: string
+  summaryParams?: Record<string, string | number>
   suggestion: string
   stage: string
   pendingAction?: 'retry' | 'wait'
@@ -140,8 +141,10 @@ export function imageTaskIssue(task: ImageTask): {
   }
   return {
     summary:
+      task.error_summary_key ||
       task.error_summary ||
       (task.error_message ? 'Failure reason' : task.status),
+    summaryParams: task.error_summary_params,
     suggestion,
     stage: task.error_stage || decision?.stage || task.stage || '',
     pendingAction,

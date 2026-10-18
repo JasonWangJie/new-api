@@ -114,7 +114,8 @@ func TestTaskLogDTOKeepsFailureReasonAndDoesNotMarkPluginTaskLegacy(t *testing.T
 		FailReason: "provider rejected the request",
 	}
 	failedView := tasksToDto([]*model.Task{failed}, false, common.RoleCommonUser)[0]
-	assert.Equal(t, "provider rejected the request", failedView.FailReason)
+	assert.Contains(t, failedView.FailReason, "视频任务失败")
+	assert.Contains(t, failedView.FailReason, "原始错误：provider rejected the request")
 	assert.False(t, failedView.LegacyVideoAvailable)
 
 	pluginTask := &model.Task{

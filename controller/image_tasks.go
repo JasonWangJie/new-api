@@ -293,7 +293,10 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	notice := service.ImageTaskFailureNotice(task)
 	data["failure_code"] = task.PublicErrorCode
 	data["error_message"] = service.SanitizeAsyncImageDiagnostic(task.ErrorMessage, common.LocalLogContentLimit)
-	data["error_summary"], data["error_suggestion"] = notice.Summary, notice.Suggestion
+	data["error_summary"], data["error_suggestion"] = notice.SummaryText(), notice.Suggestion
+	if len(notice.SummaryParams) > 0 {
+		data["error_summary_key"], data["error_summary_params"] = notice.Summary, notice.SummaryParams
+	}
 	data["error_retryable"], data["error_stage"] = notice.Retryable, notice.Stage
 	if task.ResultSource != "" {
 		data["result_source"] = task.ResultSource

@@ -436,7 +436,7 @@ func TestDramaVideoPollingAndActualUsage(t *testing.T) {
 				}
 				require.NoError(t, common.Unmarshal(public, &rendered))
 				assert.Equal(t, "failed", rendered.Status)
-				assert.Equal(t, tc.wantReason, rendered.Error.Message)
+				assert.Equal(t, service.VideoTaskFailureReason(tc.wantReason), rendered.Error.Message)
 			} else if tc.wantStatus != "UNKNOWN" {
 				assert.NotContains(t, result, "reason", "non-terminal and completed metadata must not become a failure reason")
 			}

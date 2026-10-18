@@ -623,6 +623,221 @@ func TestAsyncImagePostprocessDiagnosticsAndUncertainQuota(t *testing.T) {
 	}
 }
 
+func TestAsyncImageFailureNoticePreservesSpecificCausesAndRecovery(t *testing.T) {
+	const reconcile = "Do not submit again until an administrator has checked the upstream result and billing."
+	const retrySubmission = "The task is scheduled for another submission within its retry limits."
+	const retryPoll = "The existing upstream job will be checked again; no new generation will be submitted."
+	testCases := []struct {
+		name       string
+		task       model.AsyncImageTask
+		decision   ImageRetryDecision
+		summary    string
+		suggestion string
+		retryable  bool
+	}{
+		{
+			name:    "connection loss keeps its cause without guessing from message",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_disconnected", PublicErrorCode: 608, ErrorMessage: "context deadline exceeded"},
+			summary: "Upstream connection closed before the result was confirmed", suggestion: reconcile,
+		},
+		{
+			name:    "unknown timeout",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_timeout", PublicErrorCode: 608},
+			summary: "Upstream request timed out", suggestion: reconcile,
+		},
+		{
+			name:    "interrupted request",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_canceled", PublicErrorCode: 608},
+			summary: "Upstream request was interrupted", suggestion: reconcile,
+		},
+		{
+			name:    "unreadable response",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_response_invalid", PublicErrorCode: 608},
+			summary: "Upstream response could not be read or parsed", suggestion: reconcile,
+		},
+		{
+			name:    "legacy unknown does not infer EOF from text",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "execution_unknown", PublicErrorCode: 608, ErrorMessage: "EOF"},
+			summary: "Upstream execution could not be confirmed", suggestion: reconcile,
+		},
+		{
+			name:    "unknown status with a legacy transient code remains conservative",
+			task:    model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_failed", PublicErrorCode: 606},
+			summary: "Upstream execution could not be confirmed", suggestion: reconcile,
+		},
+		{
+			name:     "timeout with another scheduled account",
+			task:     model.AsyncImageTask{Status: model.ImageTaskQueued, ErrorCode: "upstream_transport_timeout", PublicErrorCode: 606, NextAttemptAt: 100},
+			decision: ImageRetryDecision{Version: 1, Action: "switch_account", Stage: "submit"},
+			summary:  "Upstream request timed out", suggestion: retrySubmission, retryable: true,
+		},
+		{
+			name:    "account pool exhausted",
+			task:    model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "timeout_accounts_exhausted", PublicErrorCode: 606},
+			summary: "No unused image account remains after request timeouts", suggestion: "Add an eligible account for this model and resolution, or check why the existing account timed out.",
+		},
+		{
+			name:    "timeout retry limit reached",
+			task:    model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "timeout_retries_exhausted", PublicErrorCode: 606},
+			summary: "Image request timeout retry limit reached", suggestion: "Check upstream availability and account timeout settings before submitting again.",
+		},
+		{
+			name:    "timeout overall deadline reached",
+			task:    model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "timeout_deadline_exhausted", PublicErrorCode: 606},
+			summary: "Image execution deadline expired after request timeouts", suggestion: "Check upstream availability and account timeout settings before submitting again.",
+		},
+		{
+			name:     "known job timeout continues polling",
+			task:     model.AsyncImageTask{Status: model.ImageTaskInvoking, ErrorCode: "upstream_transport_timeout", PublicErrorCode: 606, UpstreamTaskId: "accepted-job", NextAttemptAt: 100},
+			decision: ImageRetryDecision{Version: 1, Action: "poll_same_job", Rule: "upstream_transient", Stage: "poll"},
+			summary:  "Upstream request timed out", suggestion: retryPoll, retryable: true,
+		},
+		{
+			name:     "pending known job is not presented as a failure",
+			task:     model.AsyncImageTask{Status: model.ImageTaskInvoking, ErrorCode: "upstream_transport_timeout", PublicErrorCode: 606, UpstreamTaskId: "accepted-job", NextAttemptAt: 100},
+			decision: ImageRetryDecision{Version: 1, Action: "poll_same_job", Rule: "upstream_pending", Stage: "poll"},
+		},
+		{
+			name:    "confirmed output remains a postprocess failure",
+			task:    model.AsyncImageTask{Status: model.ImageTaskStorageFailed, ErrorCode: "upstream_response_invalid", PublicErrorCode: 609, UpstreamSucceededAt: 50},
+			summary: "Image post-processing needs attention", suggestion: "Check storage or billing recovery; do not repeat generation.",
+		},
+		{
+			name:     "uncertain reservation is not automatically retried",
+			task:     model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "quota_cache_uncertain", PublicErrorCode: 608, NextAttemptAt: 100},
+			decision: ImageRetryDecision{Version: 1, Action: "switch_account", Stage: "prepare"},
+			summary:  "Image quota reservation could not be confirmed", suggestion: "Ask an administrator to reconcile the quota reservation before trying again.",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			task := testCase.task
+			if testCase.decision.Version != 0 {
+				encoded, err := common.Marshal(testCase.decision)
+				require.NoError(t, err)
+				task.RetryDecision = string(encoded)
+			}
+			notice := ImageTaskFailureNotice(task)
+			assert.Equal(t, testCase.summary, notice.Summary)
+			assert.Equal(t, testCase.suggestion, notice.Suggestion)
+			assert.Equal(t, testCase.retryable, notice.Retryable)
+			if testCase.decision.Stage != "" {
+				assert.Equal(t, testCase.decision.Stage, notice.Stage)
+			}
+		})
+	}
+}
+
+func TestAsyncImageFailureNoticeExplainsRecordedCauses(t *testing.T) {
+	testCases := []struct {
+		name        string
+		task        model.AsyncImageTask
+		attempts    []ImageChannelAttempt
+		summary     string
+		params      map[string]any
+		summaryText string
+	}{
+		{name: "safety rejection", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 601}, summary: "Upstream safety review did not pass"},
+		{name: "reference byte limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "image_url exceeds 50MB limit"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "50MB"}, summaryText: "Reference image exceeds the upstream limit of 50MB"},
+		{name: "measured size is not the limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "Reference image size 25.4MB exceeds limit 20MB"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "Reference image exceeds the upstream limit of 20MB"},
+		{name: "Chinese byte limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "参考图大小25.4MB，上限20MB"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "Reference image exceeds the upstream limit of 20MB"},
+		{name: "measured size without a limit is not guessed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "image_url rejected, image size 25.4MB"}, summary: "Upstream rejected image input or parameters"},
+		{name: "recorded timeout duration", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "timeout_accounts_exhausted", PublicErrorCode: 606}, attempts: []ImageChannelAttempt{{StartedAt: 100, FinishedAt: 400, Dispatched: true, TimedOut: true}}, summary: "The generation attempt timed out after {{seconds}} seconds, and no alternative account is available", params: map[string]any{"seconds": int64(300)}, summaryText: "The generation attempt timed out after 300 seconds, and no alternative account is available"},
+		{name: "undispatched time is not an upstream timeout", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "timeout_accounts_exhausted", PublicErrorCode: 606}, attempts: []ImageChannelAttempt{{StartedAt: 100, FinishedAt: 400, TimedOut: true}}, summary: "No unused image account remains after request timeouts"},
+		{name: "job rate limit shown without changing its public category", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_job_failed", PublicErrorCode: 610, ErrorMessage: "请求过于频繁,请稍后重试"}, summary: "Upstream rate limit exceeded"},
+		{name: "provider rate limit code", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_job_failed", PublicErrorCode: 610}, attempts: []ImageChannelAttempt{{ProviderCode: "rate_limit_exceeded", FinishedAt: 400}}, summary: "Upstream rate limit exceeded"},
+		{name: "explicit text response", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 610, ErrorMessage: "抱歉，我无法直接生成或编辑图片，但可以帮您整理提示词。"}, summary: "The upstream returned text instead of an image"},
+		{name: "prompt words are not a no-image diagnostic", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 610, ErrorMessage: "Please generate an image with the text no image"}, summary: "Upstream rejected the request; the exact cause is not confirmed"},
+		{name: "quoted prompt is not a text-only reply", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 610, ErrorMessage: "Invalid request: prompt contains 我无法直接生成图片"}, summary: "Upstream rejected the request; the exact cause is not confirmed"},
+		{name: "known empty output", task: model.AsyncImageTask{Status: model.ImageTaskStorageFailed, ErrorCode: "output_parse_failed", PublicErrorCode: 607, ErrorMessage: "Upstream image output is missing", UpstreamSucceededAt: 99}, summary: "The upstream did not return a usable image"},
+		{name: "local reference fetch failed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "reference_download_failed", PublicErrorCode: 602, ErrorMessage: "Reference image 1: image reference download failed"}, summary: "The reference image could not be downloaded locally"},
+		{name: "both reference transports failed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "reference_download_failed", PublicErrorCode: 602}, attempts: []ImageChannelAttempt{{Dispatched: true, FinishedAt: 20, TransportUsed: "remote", ReferenceFailure: true, Code: 602, HTTPStatus: 502}, {ReferenceMode: "local", ReferenceFallback: true, FinishedAt: 40, Code: 602}}, summary: "The upstream could not fetch the reference image, and the local download fallback also failed"},
+		{name: "fallback marker alone does not invent prior upstream failure", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "reference_download_failed", PublicErrorCode: 602}, attempts: []ImageChannelAttempt{{ReferenceMode: "local", ReferenceFallback: true, FinishedAt: 40, Code: 602}}, summary: "The reference image could not be downloaded locally"},
+		{name: "remote reference transport failed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 602}, attempts: []ImageChannelAttempt{{Dispatched: true, FinishedAt: 20, TransportUsed: "remote", ReferenceFailure: true, Code: 602}}, summary: "The upstream could not fetch the reference image"},
+		{name: "MIME mismatch is not a storage outage", task: model.AsyncImageTask{Status: model.ImageTaskStorageFailed, ErrorCode: "output_parse_failed", PublicErrorCode: 607, ErrorMessage: "declared image MIME does not match its bytes", UpstreamSucceededAt: 99}, summary: "The image format declared by the upstream does not match the image data"},
+		{name: "invalid image container", task: model.AsyncImageTask{Status: model.ImageTaskStorageFailed, ErrorCode: "output_parse_failed", PublicErrorCode: 607, ErrorMessage: "invalid image container or excessive trailing data", UpstreamSucceededAt: 99}, summary: "The upstream image container is invalid or contains excessive trailing data"},
+		{name: "manual termination does not invent a restart", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "admin_terminated", PublicErrorCode: 608}, summary: "The task was manually terminated"},
+		{name: "typed EOF diagnostic", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_disconnected", PublicErrorCode: 608, ErrorMessage: "Upstream connection was interrupted after dispatch; execution could not be confirmed (EOF)"}, summary: "The upstream connection ended before returning a result (EOF)"},
+		{name: "typed partial EOF diagnostic", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_disconnected", PublicErrorCode: 608, ErrorMessage: "Upstream connection was interrupted after dispatch; execution could not be confirmed (unexpected EOF)"}, summary: "The upstream connection ended before returning a complete result (unexpected EOF)"},
+		{name: "untrusted EOF mention does not become a diagnostic", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_disconnected", PublicErrorCode: 608, ErrorMessage: "provider echoed prompt EOF"}, summary: "Upstream connection closed before the result was confirmed"},
+		{name: "old safety attempt does not relabel a later disconnect", task: model.AsyncImageTask{Status: model.ImageTaskExecutionUnknown, ErrorCode: "upstream_transport_disconnected", PublicErrorCode: 608}, attempts: []ImageChannelAttempt{{Code: 601, ErrorMessage: "safety review failed", FinishedAt: 20}, {Code: 608, Dispatched: true, FinishedAt: 40}}, summary: "Upstream connection closed before the result was confirmed"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			task := testCase.task
+			if testCase.attempts != nil {
+				encoded, err := common.Marshal(testCase.attempts)
+				require.NoError(t, err)
+				task.Attempts = string(encoded)
+			}
+			original := task
+			notice := ImageTaskFailureNotice(task)
+			assert.Equal(t, testCase.summary, notice.Summary)
+			assert.Equal(t, testCase.params, notice.SummaryParams)
+			expectedText := testCase.summaryText
+			if expectedText == "" {
+				expectedText = testCase.summary
+			}
+			assert.Equal(t, expectedText, notice.SummaryText())
+			assert.NotContains(t, notice.SummaryText(), "{{")
+			assert.Equal(t, original, task, "presentation must not modify task evidence or policy")
+			assert.False(t, notice.Retryable)
+		})
+	}
+	for _, unsafe := range []any{"Bearer secret-value", "https://signed.example/?token=secret", 300, -1.0} {
+		notice := ImageFailureNotice{Summary: "Reference image exceeds the upstream limit of {{limit}}", SummaryParams: map[string]any{"limit": unsafe}}
+		assert.NotContains(t, notice.SummaryText(), "{{")
+		assert.NotContains(t, notice.SummaryText(), "secret")
+	}
+}
+
+func TestAsyncImageTransportFailureKeepsSafeEOFDiagnostics(t *testing.T) {
+	testCases := []struct {
+		name            string
+		cause           error
+		responseInvalid bool
+		knownJob        bool
+		internalCode    string
+		diagnostic      string
+	}{
+		{name: "EOF", cause: io.EOF, internalCode: "upstream_transport_disconnected", diagnostic: " (EOF)"},
+		{name: "unexpected EOF", cause: io.ErrUnexpectedEOF, internalCode: "upstream_transport_disconnected", diagnostic: " (unexpected EOF)"},
+		{name: "truncated response", cause: io.ErrUnexpectedEOF, responseInvalid: true, internalCode: "upstream_response_invalid", diagnostic: " (unexpected EOF)"},
+		{name: "known job EOF", cause: io.EOF, knownJob: true, internalCode: "upstream_transport_disconnected", diagnostic: " (EOF)"},
+		{name: "timeout priority", cause: errors.Join(context.DeadlineExceeded, io.EOF), internalCode: "upstream_transport_timeout", diagnostic: " (EOF)"},
+		{name: "response classification priority", cause: context.DeadlineExceeded, responseInvalid: true, internalCode: "upstream_response_invalid"},
+		{name: "canceled request", cause: context.Canceled, internalCode: "upstream_transport_canceled"},
+		{name: "untyped EOF text is not an EOF sentinel", cause: errors.New("EOF"), internalCode: "upstream_transport_disconnected"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cause := &url.Error{Op: "Post", URL: "https://private-user:private-password@upstream.example/generate?api_key=private-key", Err: testCase.cause}
+			wrapped := kittypes.NewError(cause, kittypes.ErrorCodeDoRequestFailed, kittypes.ErrOptionWithHideErrMsg("upstream request failed"))
+			task := model.AsyncImageTask{}
+			if testCase.knownJob {
+				task.UpstreamTaskId = "accepted-job"
+			}
+			failure := AsyncImageTransportFailure(wrapped, task, testCase.responseInvalid, nil)
+			assert.Equal(t, testCase.internalCode, failure.InternalCode)
+			assert.Equal(t, !testCase.knownJob, failure.ExecutionUnknown)
+			if testCase.knownJob {
+				assert.Equal(t, 606, failure.Code)
+				assert.Contains(t, failure.Message, "only the existing upstream job may be polled again")
+			} else {
+				assert.Equal(t, 608, failure.Code)
+			}
+			if testCase.diagnostic != "" {
+				assert.Contains(t, failure.Message, testCase.diagnostic)
+			} else {
+				assert.NotContains(t, failure.Message, "EOF")
+			}
+			for _, sensitive := range []string{"private-user", "private-password", "upstream.example", "api_key", "private-key"} {
+				assert.NotContains(t, failure.Message, sensitive)
+			}
+		})
+	}
+}
+
 func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T) {
 	ctx := context.Background()
 	previousDB, previousRedis, previousType := model.DB, common.RDB, common.MainDatabaseType()

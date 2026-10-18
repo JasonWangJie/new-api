@@ -1,6 +1,8 @@
 package service
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -8,10 +10,33 @@ import (
 )
 
 type ImageFailureNotice struct {
-	Summary    string
-	Suggestion string
-	Retryable  bool
-	Stage      string
+	Summary       string
+	SummaryParams map[string]any
+	Suggestion    string
+	Retryable     bool
+	Stage         string
+}
+
+var (
+	imageReferenceLimitNoticePattern = regexp.MustCompile(`(?i)(?:image_url|reference image|参考图|图片)[^\r\n]{0,100}?(?:exceeds?|上限|不得超过|不能超过|超过|(?:size\s+)?limit(?:\s+of)?|maximum(?:\s+size)?)\s*[:：]?\s*(?:the\s+)?(?:limit(?:\s+of)?\s*)?([0-9]{1,12}(?:\.[0-9]{1,6})?\s*(?:GB|MB|KB|B))(?:\b|$)`)
+	imageSizeNoticeParamPattern      = regexp.MustCompile(`^[0-9]{1,12}(?:\.[0-9]{1,6})?(?:GB|MB|KB|B)$`)
+	imageTextOnlyNoticePattern       = regexp.MustCompile(`(?i)^(?:(?:很)?抱歉[，,：:\s]*|(?:i['’]m sorry|i am sorry|sorry)[,\s]*(?:but\s+)?)?(?:我(?:无法|不能)直接(?:生成或编辑|生成|编辑)图片|i cannot directly (?:generate|edit) images)`)
+)
+
+// SummaryText keeps API summaries readable for clients that do not implement
+// translated summary keys. Only the recorded, bounded display parameters are used.
+func (notice ImageFailureNotice) SummaryText() string {
+	text := notice.Summary
+	if limit, ok := notice.SummaryParams["limit"].(string); ok && imageSizeNoticeParamPattern.MatchString(limit) {
+		text = strings.ReplaceAll(text, "{{limit}}", limit)
+	}
+	if seconds, ok := notice.SummaryParams["seconds"].(int64); ok && seconds > 0 && seconds <= 86400 {
+		text = strings.ReplaceAll(text, "{{seconds}}", strconv.FormatInt(seconds, 10))
+	}
+	if strings.Contains(text, "{{") || strings.Contains(text, "}}") {
+		return "Upstream rejected the request; the exact cause is not confirmed"
+	}
+	return text
 }
 
 // ImageTaskFailureNotice describes the committed recovery action. A transient
@@ -63,6 +88,103 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) ImageFailureNotice {
 	if notice.Summary == "" {
 		notice.Summary = "Upstream rejected the request; the exact cause is not confirmed"
 	}
+	internalSummaries := map[string]string{
+		"upstream_transport_disconnected": "Upstream connection closed before the result was confirmed",
+		"upstream_transport_timeout":      "Upstream request timed out",
+		"upstream_transport_canceled":     "Upstream request was interrupted",
+		"upstream_response_invalid":       "Upstream response could not be read or parsed",
+		"timeout_accounts_exhausted":      "No unused image account remains after request timeouts",
+		"timeout_retries_exhausted":       "Image request timeout retry limit reached",
+		"timeout_deadline_exhausted":      "Image execution deadline expired after request timeouts",
+	}
+	if summary, ok := internalSummaries[task.ErrorCode]; ok {
+		notice.Summary = summary
+	}
+	message := SanitizeAsyncImageDiagnostic(task.ErrorMessage, asyncImageProviderMessageLimit)
+	var attempts []ImageChannelAttempt
+	if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
+		attempts = nil
+	}
+	var lastAttempt ImageChannelAttempt
+	if len(attempts) > 0 {
+		lastAttempt = SanitizeAsyncImageAttempt(attempts[len(attempts)-1])
+	}
+	specificCause, specificOutputCause := false, false
+	switch task.ErrorCode {
+	case "upstream_transport_disconnected":
+		diagnostic, _ := strings.CutSuffix(message, "; only the existing upstream job may be polled again")
+		switch diagnostic {
+		case "Upstream connection was interrupted after dispatch; execution could not be confirmed (EOF)":
+			notice.Summary = "The upstream connection ended before returning a result (EOF)"
+		case "Upstream connection was interrupted after dispatch; execution could not be confirmed (unexpected EOF)":
+			notice.Summary = "The upstream connection ended before returning a complete result (unexpected EOF)"
+		}
+	case "timeout_accounts_exhausted":
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if !attempt.Dispatched || !attempt.TimedOut || attempt.StartedAt <= 0 || attempt.FinishedAt <= attempt.StartedAt {
+				continue
+			}
+			// StartedAt includes preparation. Describe the generation attempt's
+			// recorded elapsed time, never infer upstream wait or a historical limit.
+			seconds := attempt.FinishedAt - attempt.StartedAt
+			if seconds <= 86400 {
+				notice.Summary = "The generation attempt timed out after {{seconds}} seconds, and no alternative account is available"
+				notice.SummaryParams = map[string]any{"seconds": seconds}
+			}
+			break
+		}
+	case "reference_download_failed":
+		notice.Summary = "The reference image could not be downloaded locally"
+		if lastAttempt.ReferenceMode == "local" && lastAttempt.ReferenceFallback && !lastAttempt.Dispatched && lastAttempt.FinishedAt > 0 && lastAttempt.Code == 602 {
+			for _, attempt := range attempts[:len(attempts)-1] {
+				if attempt.Dispatched && attempt.FinishedAt > 0 && attempt.ReferenceFailure && (attempt.TransportUsed == "remote" || attempt.TransportUsed == "mixed") {
+					notice.Summary = "The upstream could not fetch the reference image, and the local download fallback also failed"
+					break
+				}
+			}
+		}
+	case "output_parse_failed":
+		switch message {
+		case "declared image MIME does not match its bytes":
+			notice.Summary = "The image format declared by the upstream does not match the image data"
+			specificOutputCause = true
+		case "invalid image container or excessive trailing data":
+			notice.Summary = "The upstream image container is invalid or contains excessive trailing data"
+			specificOutputCause = true
+		case "Upstream image output is missing":
+			notice.Summary = "The upstream did not return a usable image"
+			specificOutputCause = true
+		}
+	case "admin_terminated":
+		notice.Summary = "The task was manually terminated"
+		specificCause = true
+	case "upstream_failed", "upstream_job_failed", "invalid_reference_image":
+		switch {
+		case task.PublicErrorCode == 604:
+			if match := imageReferenceLimitNoticePattern.FindStringSubmatch(message); len(match) == 2 {
+				limit := strings.ToUpper(strings.Join(strings.Fields(match[1]), ""))
+				notice.Summary = "Reference image exceeds the upstream limit of {{limit}}"
+				notice.SummaryParams = map[string]any{"limit": limit}
+			}
+		case task.PublicErrorCode == 602 && lastAttempt.Dispatched && lastAttempt.ReferenceFailure && (lastAttempt.TransportUsed == "remote" || lastAttempt.TransportUsed == "mixed"):
+			notice.Summary = "The upstream could not fetch the reference image"
+		case task.PublicErrorCode == 610 || task.PublicErrorCode == 605:
+			lowered := strings.ToLower(message)
+			rateLimited := strings.Contains(lowered, "请求过于频繁") || strings.Contains(lowered, "请求太频繁") || strings.Contains(lowered, "rate limit exceeded") || strings.Contains(lowered, "too many requests")
+			switch strings.ToLower(lastAttempt.ProviderCode) {
+			case "429", "rate_limit_exceeded", "too_many_requests":
+				rateLimited = true
+			}
+			if rateLimited {
+				notice.Summary = "Upstream rate limit exceeded"
+				break
+			}
+			if imageTextOnlyNoticePattern.MatchString(message) {
+				notice.Summary = "The upstream returned text instead of an image"
+			}
+		}
+	}
 	notice.Suggestion = "Ask the service provider to check the request format, model compatibility, and upstream request ID."
 	switch task.PublicErrorCode {
 	case 601:
@@ -89,15 +211,28 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) ImageFailureNotice {
 	case task.ErrorCode == "request_preparation_failed" || task.ErrorCode == "request_preparation_timeout":
 		notice.Summary = "Image request preparation failed"
 		notice.Suggestion = "Contact the service provider to check local image request preparation."
+	case task.ErrorCode == "timeout_accounts_exhausted":
+		notice.Suggestion = "Add an eligible account for this model and resolution, or check why the existing account timed out."
+	case task.ErrorCode == "timeout_retries_exhausted" || task.ErrorCode == "timeout_deadline_exhausted":
+		notice.Suggestion = "Check upstream availability and account timeout settings before submitting again."
 	case task.Status == model.ImageTaskExpired && task.DispatchedAt == 0 && task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0:
 		notice.Summary = "Image execution deadline expired"
 		notice.Suggestion = "The task expired before upstream dispatch; submit a new request if it is still needed."
 	case task.UpstreamSucceededAt > 0 || task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed:
-		notice.Summary = "Image post-processing needs attention"
+		if !specificOutputCause {
+			notice.Summary = "Image post-processing needs attention"
+			notice.SummaryParams = nil
+		}
 		notice.Suggestion = "Check storage or billing recovery; do not repeat generation."
 	}
-	if task.Status == model.ImageTaskExecutionUnknown || task.PublicErrorCode == 608 && task.ErrorCode != "execution_deadline" && !(validDecision && decision.Action == "poll_same_job" && task.UpstreamTaskId != "" && !task.Terminal()) {
-		notice.Summary = "Upstream execution could not be confirmed"
+	if task.ErrorCode == "admin_terminated" {
+		notice.Suggestion = ""
+	}
+	if task.Status == model.ImageTaskExecutionUnknown || task.PublicErrorCode == 608 && task.ErrorCode != "execution_deadline" && task.ErrorCode != "admin_terminated" && !(validDecision && decision.Action == "poll_same_job" && task.UpstreamTaskId != "" && !task.Terminal()) {
+		if _, ok := internalSummaries[task.ErrorCode]; !ok && !specificCause {
+			notice.Summary = "Upstream execution could not be confirmed"
+			notice.SummaryParams = nil
+		}
 		notice.Suggestion = "Do not submit again until an administrator has checked the upstream result and billing."
 		return notice
 	}

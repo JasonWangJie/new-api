@@ -26,10 +26,12 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import i18next from 'i18next'
 import { toast, Toaster } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
+import zh from '@/i18n/locales/zh.json'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -41,6 +43,7 @@ import {
   imageRequest,
 } from '../api'
 import { ImageTaskDetails } from '../components/image-task-details'
+import { ImageTaskNotice } from '../components/image-task-notice'
 import {
   imageTaskIssue,
   imageTaskProgress,
@@ -596,12 +599,7 @@ test.each([
     ).toBeVisible()
     expect(within(dialog).getByText(failedTask.error_suggestion)).toBeVisible()
     expect(within(dialog).getByText('Upstream submission')).toBeVisible()
-    expect(
-      within(dialog).queryByText(failedTask.error_message)
-    ).not.toBeInTheDocument()
-    await user.click(
-      within(dialog).getByRole('button', { name: 'Upstream diagnostic' })
-    )
+    expect(within(dialog).getByText('Failure reason')).toBeVisible()
     expect(within(dialog).getByText(failedTask.error_message)).toBeVisible()
   }
 )
@@ -741,7 +739,7 @@ test.each([
   }
 )
 
-test('public details separate a translated explanation from expandable upstream diagnostics', async () => {
+test('public details show the translated explanation and concrete failure reason immediately', async () => {
   vi.mocked(getImageTask).mockResolvedValue({
     ...detail,
     results: [],
@@ -776,11 +774,7 @@ test('public details separate a translated explanation from expandable upstream 
     )
   ).toBeVisible()
   expect(screen.getByText('Upstream submission')).toBeVisible()
-  expect(
-    screen.queryByText('Request contains an invalid argument.')
-  ).not.toBeInTheDocument()
-  const user = userEvent.setup()
-  await user.click(screen.getByRole('button', { name: 'Upstream diagnostic' }))
+  expect(screen.getByText('Failure reason')).toBeVisible()
   expect(
     screen.getByText('Request contains an invalid argument.')
   ).toBeVisible()
@@ -788,6 +782,57 @@ test('public details separate a translated explanation from expandable upstream 
     screen.queryByRole('button', { name: /Attempt history/ })
   ).not.toBeInTheDocument()
 })
+
+test.each<{
+  summary: string
+  key: string
+  params: Record<string, string | number>
+  translated: string
+}>([
+  {
+    summary: 'Reference image exceeds the upstream limit of 50MB',
+    key: 'Reference image exceeds the upstream limit of {{limit}}',
+    params: { limit: '50MB' },
+    translated: '参考图超过上游 50MB 限制',
+  },
+  {
+    summary:
+      'The generation attempt timed out after 300 seconds, and no alternative account is available',
+    key: 'The generation attempt timed out after {{seconds}} seconds, and no alternative account is available',
+    params: { seconds: 300 },
+    translated: '本次生图尝试耗时 300 秒后超时，且没有备用账号可切换',
+  },
+])(
+  'concrete failure details translate recorded values: $summary',
+  async ({ summary, key, params, translated }) => {
+    const failedTask = {
+      ...task,
+      status: 'failed',
+      error_summary: summary,
+      error_summary_key: key,
+      error_summary_params: params,
+      error_message: 'Sanitized original upstream diagnostic',
+    }
+    i18next.addResourceBundle('zh', 'translation', zh.translation)
+    try {
+      render(<ImageTaskNotice task={failedTask} diagnostics />)
+      expect(screen.getByText(summary)).toBeVisible()
+      await act(async () => {
+        await i18next.changeLanguage('zh')
+      })
+      expect(screen.getByText(translated)).toBeVisible()
+      expect(
+        screen.queryByText(/\{\{(?:limit|seconds)\}\}/)
+      ).not.toBeInTheDocument()
+      expect(screen.getByText(failedTask.error_message)).toBeVisible()
+    } finally {
+      await act(async () => {
+        await i18next.changeLanguage('en')
+      })
+      i18next.removeResourceBundle('zh', 'translation')
+    }
+  }
+)
 
 test('local routing dependency waits show readable decision and stage labels in public details', async () => {
   vi.mocked(getImageTask).mockResolvedValue({

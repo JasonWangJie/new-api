@@ -171,6 +171,12 @@ func AsyncImageTransportFailure(err error, task model.AsyncImageTask, responseIn
 	case errors.Is(err, context.Canceled):
 		internal, message = "upstream_transport_canceled", "Upstream request was interrupted after dispatch; execution could not be confirmed"
 	}
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		message += " (unexpected EOF)"
+	case errors.Is(err, io.EOF):
+		message += " (EOF)"
+	}
 	unknown := task.UpstreamTaskId == ""
 	if !unknown {
 		code = 606

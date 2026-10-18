@@ -3,12 +3,14 @@ package service
 import (
 	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/tidwall/gjson"
 )
 
@@ -53,22 +55,38 @@ func PublicTaskUpstreamProgress(task *model.Task) (float64, bool) {
 	return progress, true
 }
 
-// PublicTaskFailureReason recovers details from historical Drama snapshots whose
-// driver stored only a placeholder. It is presentation-only compatibility, not
-// driver evaluation: it does not call JavaScript, poll upstream, or change tasks.
+// PublicTaskFailureReason explains video failures and recovers details from
+// historical Drama snapshots whose driver stored only a placeholder. It does
+// not call JavaScript, poll upstream, or change persisted tasks.
 func PublicTaskFailureReason(task *model.Task) string {
 	if task == nil {
 		return ""
 	}
-	if task.Platform != "drama" || task.Status != model.TaskStatusFailure {
+	if task.Status != model.TaskStatusFailure {
 		return task.FailReason
 	}
-	if reason := strings.TrimSpace(task.FailReason); reason != "" && reason != "Video generation failed" {
+	video := task.Platform == "drama" || task.PrivateData.AsyncMedia
+	if !video {
+		plugin, found := jsplugin.DefaultRegistry.Get(string(task.Platform))
+		if !found {
+			if channelType, err := strconv.Atoi(string(task.Platform)); err == nil {
+				plugin, found = jsplugin.DefaultRegistry.GetByChannelType(channelType)
+			}
+		}
+		if found {
+			video = slices.ContainsFunc(plugin.Meta.Protocols, func(claim jsplugin.ProtocolClaim) bool { return claim.Name == "openai_video" })
+		}
+	}
+	if !video {
 		return task.FailReason
+	}
+	reason := strings.TrimSpace(task.FailReason)
+	if task.Platform != "drama" || reason != "" && reason != "Video generation failed" {
+		return VideoTaskFailureReason(task.FailReason)
 	}
 	var snapshot map[string]any
 	if common.Unmarshal(task.Data, &snapshot) != nil || snapshot["status"] != "failed" {
-		return task.FailReason
+		return VideoTaskFailureReason(task.FailReason)
 	}
 	var candidates []string
 	switch failure := snapshot["error"].(type) {
@@ -99,10 +117,10 @@ func PublicTaskFailureReason(task *model.Task) string {
 			}
 		}
 		if reason := SanitizeAsyncImageDiagnostic(candidate, common.LocalLogContentLimit); reason != "" {
-			return reason
+			return VideoTaskFailureReason(candidate)
 		}
 	}
-	return task.FailReason
+	return VideoTaskFailureReason(task.FailReason)
 }
 
 // BuildTaskPluginView converts a persisted task into the deliberately narrow

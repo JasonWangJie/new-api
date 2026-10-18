@@ -19,12 +19,6 @@ For commercial licensing, please contact support@quantumnous.com
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
 import { formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -55,11 +49,14 @@ export function ImageTaskNotice(props: {
       )}
     >
       <AlertTitle className='text-xs leading-5'>
-        {t(imageLabel(issue.summary))}
+        {t(imageLabel(issue.summary), issue.summaryParams || {})}
       </AlertTitle>
       <AlertDescription className='space-y-2 text-xs leading-5'>
-        {props.task.error_message &&
-          (!props.diagnostics || !props.task.error_summary) && (
+        {props.task.error_message && (
+          <div className='space-y-1'>
+            {props.diagnostics && (
+              <div className='font-medium'>{t('Failure reason')}</div>
+            )}
             <div
               className={cn(
                 'whitespace-pre-wrap',
@@ -68,7 +65,8 @@ export function ImageTaskNotice(props: {
             >
               {props.task.error_message}
             </div>
-          )}
+          </div>
+        )}
         {issue.suggestion && <div>{t(issue.suggestion)}</div>}
         <dl className='flex flex-wrap gap-x-3 gap-y-1 text-[11px] [&>div]:flex [&>div]:gap-1'>
           {issue.stage && (
@@ -96,28 +94,6 @@ export function ImageTaskNotice(props: {
             </>
           )}
         </dl>
-        {props.diagnostics &&
-          props.task.error_summary &&
-          props.task.error_message && (
-            <Collapsible className='border-t pt-2'>
-              <CollapsibleTrigger
-                render={
-                  <Button
-                    variant='ghost'
-                    size='sm'
-                    className='h-auto px-0 text-xs'
-                  />
-                }
-              >
-                {t('Upstream diagnostic')}
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <p className='mt-2 whitespace-pre-wrap'>
-                  {props.task.error_message}
-                </p>
-              </CollapsibleContent>
-            </Collapsible>
-          )}
       </AlertDescription>
     </Alert>
   )

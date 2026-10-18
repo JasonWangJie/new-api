@@ -120,6 +120,8 @@ export type ImageCapabilities = {
 export type ImageTask = {
   failure_code?: number
   error_summary?: string
+  error_summary_key?: string
+  error_summary_params?: Record<string, string | number>
   error_suggestion?: string
   error_retryable?: boolean
   error_stage?: string
