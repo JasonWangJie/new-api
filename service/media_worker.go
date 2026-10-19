@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -179,7 +180,15 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return nil
 	}
 	if job.DispatchedAt > 0 || job.BillingStatus == "reserving" {
-		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; the video operation will not be repeated", 0
+		reason := "Upstream submission could not be confirmed; the video operation will not be repeated"
+		if detail := VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
+			if strings.Contains(detail, reason) {
+				reason = detail
+			} else {
+				reason += "\n" + detail
+			}
+		}
+		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "execution_unknown", "unknown", VideoTaskFailureReason(reason), 0
 		return nil
 	}
 	if SubmitAsyncVideoFunc == nil {
@@ -214,9 +223,12 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
-	updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "failed", "refunded", "Video submission failed", 0
+	reason := submitErr.Error()
+	updates["status"], updates["billing_status"], updates["next_attempt_at"] = "failed", "refunded", 0
 	if current.DispatchedAt > 0 {
-		updates["status"], updates["billing_status"], updates["error_message"] = "execution_unknown", "unknown", "Upstream submission could not be confirmed; the video operation will not be repeated"
+		updates["status"], updates["billing_status"] = "execution_unknown", "unknown"
+		reason = "Upstream submission could not be confirmed; the video operation will not be repeated\n" + reason
 	}
+	updates["error_message"] = VideoTaskFailureReason(reason)
 	return submitErr
 }

@@ -161,8 +161,11 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.Provider == "drama" && job.ExpiresAt <= now {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
-	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) {
+	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" {
 		reason, _ := view["error_message"].(string)
+		if status == "execution_unknown" && strings.TrimSpace(reason) == "" {
+			reason = "execution_unknown"
+		}
 		if reason != "" || status == "failed" {
 			notice := service.VideoTaskFailureNotice(reason)
 			view["error_summary"], view["error_suggestion"] = notice.Summary, notice.Suggestion
@@ -362,7 +365,11 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			}
 			query = query.Where("status = ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id)", "execution_unknown")
 			// Unknown submission does not prove whether upstream billing occurred.
-			updates["error_message"] = "Terminated by administrator after upstream verification"
+			reason := "Terminated by administrator after upstream verification"
+			if detail := service.VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
+				reason += "\n" + detail
+			}
+			updates["error_message"] = service.VideoTaskFailureReason(reason)
 		} else {
 			query = query.Where("status = ? AND dispatched_at = 0", "queued")
 			updates["billing_status"] = "not_billable"

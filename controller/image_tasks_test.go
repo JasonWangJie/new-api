@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -1264,56 +1265,176 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 
 			t.Run("video failures share readable details across queries", func(t *testing.T) {
 				const rawReason = "The request failed because the output video may contain sensitive information."
-				for _, withTask := range []bool{true, false} {
-					taskID := "video-readable-no-task"
-					storedReason := rawReason
-					if withTask {
-						taskID = "video-readable-history"
-						storedReason = "Video generation failed"
-						task := model.Task{TaskID: taskID, Platform: "drama", UserId: 101, Status: model.TaskStatusFailure, FailReason: storedReason, PrivateData: model.TaskPrivateData{AsyncMedia: true}, Data: []byte(`{"status":"failed","metadata":{"url":"` + rawReason + `"}}`)}
-						require.NoError(t, db.Create(&task).Error)
+				for _, item := range []struct {
+					name, raw, status, jobStatus, billing, summary, suggestion, detail string
+					withTask                                                           bool
+				}{
+					{name: "history", raw: rawReason, summary: "敏感", detail: rawReason, withTask: true},
+					{name: "no-task", raw: rawReason, summary: "敏感", detail: rawReason},
+					{name: "unknown-502", raw: "Upstream submission could not be confirmed; the video operation will not be repeated\nupstream video submission failed (HTTP 502, code task_submission_unknown): Task submission state is unknown.", status: "execution_unknown", billing: "unknown", summary: "提交结果尚未确认", suggestion: "不会自动再次提交", detail: "HTTP 502, code task_submission_unknown"},
+					{name: "unknown-no-receipt", raw: "Upstream submission could not be confirmed; the video operation will not be repeated", status: "execution_unknown", billing: "unknown", summary: "无法判断上游是否已受理", suggestion: "核对上游任务状态和费用", detail: "Upstream submission could not be confirmed"},
+					{name: "unknown-empty-reason", status: "execution_unknown", billing: "unknown", summary: "提交结果尚未确认", suggestion: "不会自动再次提交", detail: "execution_unknown"},
+					{name: "administrator-ended", raw: "Terminated by administrator after upstream verification", billing: "unknown", summary: "管理员已结束本地任务处理", suggestion: "不代表上游任务已取消或费用已退回", detail: "Terminated by administrator"},
+					{name: "billing-confirmation", raw: "Task billing confirmation requires reconciliation", status: "invoking", jobStatus: "submitted", billing: "failed", summary: "视频任务费用确认尚未完成", suggestion: "此状态不代表费用已退回", detail: "Task billing confirmation requires reconciliation"},
+					{name: "video-copyright", raw: "The request failed because the output video may be related to copyright restrictions.", summary: "生成的视频可能涉及版权限制", suggestion: "获准使用的素材", detail: "output video"},
+					{name: "duration", raw: "Video duration must be between 2s and 15 seconds.", summary: "2–15 秒", suggestion: "2–15 秒", detail: "between 2s and 15 seconds"},
+					{name: "missing-result-url", raw: "上游成功响应缺少有效成片地址", summary: "没有提供可用的成片地址", suggestion: "不要重复发起视频生成", detail: "缺少有效成片地址"},
+					{name: "upstream-busy", raw: "服务器繁忙，请稍后再试", summary: "上游服务当前繁忙", suggestion: "稍后手动重试", detail: "服务器繁忙"},
+					{name: "generic-422", raw: `{"error":{"code":"upstream_error","message":"生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。"},"data":{"upstream_status":422,"upstream_body":{"detail":"生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。","error_code":"generation_failed"}}}`, summary: "可能原因，未说明具体触发项", suggestion: "公网可达", detail: "是否侵犯了版权保护"},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						taskID, storedReason := "video-readable-"+item.name, item.raw
+						if item.withTask {
+							storedReason = "Video generation failed"
+							task := model.Task{TaskID: taskID, Platform: "drama", UserId: 101, Status: model.TaskStatusFailure, FailReason: storedReason, PrivateData: model.TaskPrivateData{AsyncMedia: true}, Data: []byte(`{"status":"failed","metadata":{"url":"` + item.raw + `"}}`)}
+							require.NoError(t, db.Create(&task).Error)
+						}
+						if item.status == "" {
+							item.status = "failed"
+						}
+						if item.billing == "" {
+							item.billing = "refunded"
+						}
+						if item.jobStatus == "" {
+							item.jobStatus = item.status
+						}
+						job := model.AsyncMediaJob{TaskId: taskID, IdentityHash: taskID, UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Status: item.jobStatus, StorageStatus: "pending", BillingStatus: item.billing, ErrorMessage: storedReason, CreatedAt: now, ExpiresAt: now + 3600}
+						require.NoError(t, db.Create(&job).Error)
+						var publicReason string
+						for _, endpoint := range []string{"public", "owner", "admin", "owner-list", "admin-list"} {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Set("id", job.UserId)
+							c.Set("token_id", job.TokenId)
+							c.Params = gin.Params{{Key: "task_id", Value: taskID}}
+							c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+taskID+"?task_id="+taskID, nil)
+							switch endpoint {
+							case "public":
+								QueryAsyncMedia(c)
+							case "owner-list", "admin-list":
+								ListMediaTasks(c, endpoint == "admin-list")
+							default:
+								GetMediaTask(c, endpoint == "admin")
+							}
+							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							var body map[string]any
+							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+							view := body
+							if strings.HasSuffix(endpoint, "-list") {
+								items := body["data"].(map[string]any)["items"].([]any)
+								require.Len(t, items, 1)
+								view = items[0].(map[string]any)
+							} else if endpoint != "public" {
+								view = body["data"].(map[string]any)["task"].(map[string]any)
+							}
+							assert.Equal(t, item.status, view["status"], endpoint)
+							assert.Equal(t, item.billing, view["billing_status"], endpoint)
+							assert.Contains(t, view["error_summary"], item.summary, endpoint)
+							assert.Contains(t, view["error_suggestion"], item.suggestion, endpoint)
+							assert.NotEmpty(t, view["error_suggestion"], endpoint)
+							assert.Contains(t, view["error_detail"], item.detail, endpoint)
+							assert.Contains(t, view["error_message"], item.detail, endpoint)
+							if item.name == "generic-422" {
+								assert.NotContains(t, view["error_summary"], "版权限制", "the upstream offered possibilities, not a confirmed copyright finding")
+							}
+							if endpoint == "public" {
+								publicReason = view["error_message"].(string)
+							} else {
+								assert.Equal(t, publicReason, view["error_message"], endpoint)
+							}
+							assert.Equal(t, publicReason, service.VideoTaskFailureReason(publicReason), "repeated query projection must be idempotent")
+						}
+						var persisted model.AsyncMediaJob
+						require.NoError(t, db.Where("task_id = ?", taskID).Take(&persisted).Error)
+						assert.Equal(t, job, persisted, "queries must leave historical diagnostics and accounting unchanged")
+					})
+				}
+			})
+
+			t.Run("video submission errors retain diagnostics without replay", func(t *testing.T) {
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+				previousSubmit := service.SubmitAsyncVideoFunc
+				t.Cleanup(func() { service.SubmitAsyncVideoFunc = previousSubmit })
+				for _, dispatched := range []bool{true, false} {
+					name, status, billing, summary := "before-dispatch", "failed", "refunded", "视频生成参数不符合上游要求"
+					diagnostic := "Invalid parameter: duration; Authorization: Basic cHJpdmF0ZS1jcmVkZW50aWFs; api_key=private-api-canary"
+					if dispatched {
+						name, status, billing, summary = "after-dispatch", "execution_unknown", "unknown", "视频提交结果尚未确认"
+						diagnostic = `video submission failed (HTTP 502, code fail_to_fetch_task): {"code":"task_submission_unknown","message":"task submission state is unknown","data":null,"request":{"prompt":"private-request-canary","api_key":"private-api-canary"}}`
 					}
-					job := model.AsyncMediaJob{TaskId: taskID, IdentityHash: taskID, UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Status: "failed", StorageStatus: "pending", BillingStatus: "refunded", ErrorMessage: storedReason, CreatedAt: now, ExpiresAt: now + 3600}
-					require.NoError(t, db.Create(&job).Error)
-					var publicReason string
-					for _, endpoint := range []string{"public", "owner", "admin"} {
+					t.Run(name, func(t *testing.T) {
+						request := service.AsyncVideoRequest{Body: []byte(`{"model":"video-model","prompt":"private-request-canary"}`), ContentType: "application/json"}
+						encoded, err := common.Marshal(request)
+						require.NoError(t, err)
+						job := model.AsyncMediaJob{TaskId: "video-submit-" + name, IdentityHash: "video-submit-" + name, UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Status: "queued", StorageStatus: "pending", BillingStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "video-submit-lease", LeaseExpiresAt: now + 120}
+						job.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+						require.NoError(t, err)
+						require.NoError(t, db.Create(&job).Error)
+						originalCipher := bytes.Clone(job.RequestCipher)
+						submissions := 0
+						submitErr := errors.New(diagnostic)
+						service.SubmitAsyncVideoFunc = func(ctx context.Context, current model.AsyncMediaJob, submitted service.AsyncVideoRequest) error {
+							submissions++
+							assert.Equal(t, request.Body, submitted.Body)
+							if dispatched {
+								require.NoError(t, model.UpdateAsyncMediaJob(ctx, current, map[string]any{"dispatched_at": now, "billing_status": "reserved", "quota": 120}))
+							}
+							return submitErr
+						}
+						require.ErrorIs(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()), submitErr)
+						require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+						assert.Equal(t, status, job.Status)
+						assert.Equal(t, billing, job.BillingStatus)
+						assert.Zero(t, job.NextAttemptAt)
+						assert.Empty(t, job.LeaseToken)
+						assert.Zero(t, job.LeaseExpiresAt)
+						assert.Equal(t, originalCipher, job.RequestCipher)
+						assert.Contains(t, job.ErrorMessage, "处理建议：")
+						if dispatched {
+							assert.Equal(t, now, job.DispatchedAt)
+							assert.Contains(t, job.ErrorMessage, "HTTP 502, code fail_to_fetch_task")
+							assert.Contains(t, job.ErrorMessage, "task_submission_unknown")
+							originalReason := job.ErrorMessage
+							require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
+							require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+							assert.Equal(t, originalReason, job.ErrorMessage, "lease recovery must retain the original sanitized submission diagnostic")
+							assert.Equal(t, "execution_unknown", job.Status)
+							assert.Equal(t, "unknown", job.BillingStatus)
+							assert.Zero(t, job.NextAttemptAt)
+							assert.Equal(t, originalCipher, job.RequestCipher)
+						}
+						assert.Equal(t, 1, submissions, "unknown dispatch must not submit the video again")
+						for _, private := range []string{"cHJpdmF0ZS1jcmVkZW50aWFs", "private-api-canary", "private-request-canary"} {
+							assert.NotContains(t, job.ErrorMessage, private)
+						}
 						recorder := httptest.NewRecorder()
 						c, _ := gin.CreateTestContext(recorder)
 						c.Set("id", job.UserId)
 						c.Set("token_id", job.TokenId)
-						c.Params = gin.Params{{Key: "task_id", Value: taskID}}
-						c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+taskID, nil)
-						if endpoint == "public" {
-							QueryAsyncMedia(c)
-						} else {
-							GetMediaTask(c, endpoint == "admin")
-						}
+						c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+						c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+job.TaskId, nil)
+						QueryAsyncMedia(c)
 						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-						var body map[string]any
-						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
-						view := body
-						if endpoint != "public" {
-							view = body["data"].(map[string]any)["task"].(map[string]any)
-						}
-						assert.Equal(t, "failed", view["status"])
-						assert.Equal(t, "refunded", view["billing_status"])
-						assert.Contains(t, view["error_summary"], "敏感")
+						var view map[string]any
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
+						assert.Equal(t, status, view["status"])
+						assert.Equal(t, billing, view["billing_status"])
+						assert.Contains(t, view["error_summary"], summary)
 						assert.NotEmpty(t, view["error_suggestion"])
-						assert.Equal(t, rawReason, view["error_detail"])
-						assert.Contains(t, view["error_message"], rawReason)
-						if endpoint == "public" {
-							publicReason = view["error_message"].(string)
-						} else {
-							assert.Equal(t, publicReason, view["error_message"])
+						if dispatched {
+							assert.Contains(t, view["error_detail"], "HTTP 502, code fail_to_fetch_task")
+							assert.Contains(t, view["error_detail"], "task_submission_unknown")
 						}
-					}
-					var persisted model.AsyncMediaJob
-					require.NoError(t, db.Where("task_id = ?", taskID).Take(&persisted).Error)
-					assert.Equal(t, storedReason, persisted.ErrorMessage, "queries must leave historical diagnostics unchanged")
+						for _, private := range []string{"cHJpdmF0ZS1jcmVkZW50aWFs", "private-api-canary", "private-request-canary"} {
+							assert.NotContains(t, recorder.Body.String(), private)
+						}
+					})
 				}
 			})
 
 			t.Run("unknown video execution requires administrator reconciliation", func(t *testing.T) {
+				const submissionDiagnostic = "video submission failed (HTTP 502, code fail_to_fetch_task): code task_submission_unknown: task submission state is unknown"
 				for _, item := range []struct {
 					name       string
 					status     string
@@ -1340,6 +1461,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				} {
 					t.Run(item.name, func(t *testing.T) {
 						job := model.AsyncMediaJob{TaskId: "video-terminate-" + strings.ReplaceAll(item.name, " ", "-"), IdentityHash: "terminate-" + item.name, UserId: 101, TokenId: 201, Status: item.status, StorageStatus: "pending", BillingStatus: "unknown", Quota: 500, RequestCipher: []byte("encrypted-video-request"), CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "expired-video-lease", NextAttemptAt: now + 30}
+						if item.status == "execution_unknown" {
+							job.ErrorMessage = service.VideoTaskFailureReason("Upstream submission could not be confirmed; the video operation will not be repeated\n" + submissionDiagnostic)
+						}
 						if item.status != "queued" {
 							job.DispatchedAt = now - 30
 						}
@@ -1378,6 +1502,10 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							assert.Equal(t, job.BillingStatus, stored.BillingStatus)
 							assert.Equal(t, job.Quota, stored.Quota)
 							assert.Contains(t, stored.ErrorMessage, "Terminated by administrator")
+							assert.Contains(t, stored.ErrorMessage, submissionDiagnostic, "ending local processing must retain the original upstream submission diagnostic")
+							assert.Equal(t, 1, strings.Count(stored.ErrorMessage, "处理建议："))
+							assert.Equal(t, 1, strings.Count(stored.ErrorMessage, "原始错误："))
+							assert.Equal(t, stored.ErrorMessage, service.VideoTaskFailureReason(stored.ErrorMessage))
 							assert.Zero(t, stored.NextAttemptAt)
 							assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted"}), model.ErrImageConflict, "an expired worker must not revive the terminated task")
 						} else {
@@ -1387,6 +1515,14 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, err)
 						assert.Equal(t, "failed", view["status"])
 						assert.Equal(t, false, view["can_terminate"])
+						if item.status == "execution_unknown" {
+							assert.Contains(t, view["error_summary"], "管理员已结束本地任务处理")
+							assert.Contains(t, view["error_suggestion"], "不代表上游任务已取消或费用已退回")
+							assert.Equal(t, "unknown", view["billing_status"])
+							assert.Equal(t, job.Quota, view["quota"])
+							assert.Contains(t, view["error_detail"], submissionDiagnostic)
+							assert.Equal(t, stored.ErrorMessage, view["error_message"], "query projection must not add another explanation layer")
+						}
 						repeated := httptest.NewRecorder()
 						repeatContext, _ := gin.CreateTestContext(repeated)
 						repeatContext.Set("id", job.UserId)

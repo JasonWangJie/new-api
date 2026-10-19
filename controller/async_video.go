@@ -665,7 +665,11 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 		})
 		_, taskErr := executeTaskSubmissionWith(c, info, relay.RelayTaskSubmit)
 		if taskErr != nil {
-			executionErr = taskErr.Error
+			cause := taskErr.Error
+			if cause == nil {
+				cause = errors.New(taskErr.Message)
+			}
+			executionErr = fmt.Errorf("video submission failed (HTTP %d, code %s): %w", taskErr.StatusCode, taskErr.Code, cause)
 		}
 	}}
 	engine.POST(path, handler...)

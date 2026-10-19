@@ -26,6 +26,8 @@ func TestBuildTaskPluginViewRestoresLegacyDramaFailureReason(t *testing.T) {
 		{name: "error string has priority", reason: placeholder, data: `{"status":"failed","error":" primary error ","metadata":{"url":"secondary error"}}`, want: "primary error"},
 		{name: "error message has priority", reason: placeholder, data: `{"status":"failed","error":{"message":" primary message "},"metadata":{"url":"secondary error"}}`, want: "primary message"},
 		{name: "nested error message", reason: placeholder, data: `{"status":"failed","error":{"error":{"message":"Rate limit exceeded"},"request":{"prompt":"private prompt"}}}`, want: "Rate limit exceeded"},
+		{name: "code-only error falls back to concrete metadata", reason: placeholder, data: `{"status":"failed","error":{"code":"generic_provider_code"},"metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
+		{name: "code with generic error falls back to concrete metadata", reason: placeholder, data: `{"status":"failed","error":{"code":"generic_provider_code","message":"Video generation failed"},"metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "generic error falls back to metadata", reason: placeholder, data: `{"status":"failed","error":{"message":"Video generation failed"},"metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "legacy generic task reason", reason: "Task failed", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "explicit missing reason recovers metadata", reason: "Video generation failed; upstream did not provide an error reason", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
@@ -118,6 +120,7 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 		{name: "input image person", raw: "The request failed because the input image 'content[3]' may contain real person.", summary: "输入图片", suggestion: "图片"},
 		{name: "input video person", raw: "The request failed because the input video 'content[2]' may contain real person.", summary: "输入视频", suggestion: "视频"},
 		{name: "output video safety", raw: "The request failed because the output video may contain sensitive information.", summary: "生成的视频可能包含敏感内容", suggestion: "提示词"},
+		{name: "output video copyright", raw: "The request failed because the output video may be related to copyright restrictions.", summary: "生成的视频可能涉及版权限制", suggestion: "版权规则"},
 		{name: "output audio copyright", raw: "The request failed because the output audio may be related to copyright restrictions.", summary: "生成的音频可能涉及版权限制", suggestion: "音频"},
 		{name: "safety without category", raw: "内容安全审核拦截", summary: "内容安全审核未通过", suggestion: "提示词"},
 		{name: "aspect ratio", raw: `The aspect ratio of "2_image_example.png" is 2.8458498023715415. Required 0.4–2.5.`, summary: "宽高比为 2.846", suggestion: "0.4–2.5"},
@@ -132,10 +135,20 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 		{name: "image inaccessible", raw: "Image download denied: HTTP 403", summary: "无法获取输入图片", suggestion: "访问"},
 		{name: "image invalid", raw: "Invalid image format", summary: "图片格式", suggestion: "图片"},
 		{name: "unsupported parameter", raw: "Invalid parameter: duration must be 5 or 10", summary: "参数不符合上游要求", suggestion: "参数"},
+		{name: "video duration supplied bounds", raw: "Video duration must be between 2s and 15 seconds.", summary: "2–15 秒", suggestion: "2–15 秒"},
 		{name: "rate limited", raw: "Rate limit exceeded", summary: "请求频率或并发数", suggestion: "并发"},
 		{name: "busy", raw: "系统繁忙，请稍后重试", summary: "服务当前繁忙", suggestion: "稍后"},
+		{name: "server busy", raw: "服务器繁忙，请稍后重试", summary: "服务当前繁忙", suggestion: "稍后"},
+		{name: "submission execution unknown", raw: "Upstream submission could not be confirmed; the video operation will not be repeated", summary: "提交结果尚未确认", suggestion: "不会自动再次提交"},
+		{name: "submission unknown nested response", raw: `{"error":{"code":"task_submission_unknown","message":"task submission state is unknown"},"data":null}`, summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
+		{name: "submission unknown upstream code", raw: "submission_unknown", summary: "提交结果尚未确认", suggestion: "不会自动再次提交"},
+		{name: "submission unknown Chinese upstream message", raw: "任务提交结果未知，请查询原任务，勿重复创建", summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
+		{name: "administrator ended local processing", raw: "Terminated by administrator after upstream verification", summary: "管理员已结束本地任务处理", suggestion: "不代表上游任务已取消或费用已退回"},
+		{name: "upstream success without video URL", raw: "上游成功响应缺少有效成片地址", summary: "没有提供可用的成片地址", suggestion: "不要重复发起视频生成"},
+		{name: "generic upstream validation", raw: `{"error":{"code":"upstream_error","message":"生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。"},"data":{"upstream_status":422,"upstream_body":{"detail":"生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。","error_code":"generation_failed"}}}`, summary: "可能原因，未说明具体触发项", suggestion: "公网可达"},
 		{name: "timeout", raw: "Upstream request timed out", summary: "超时", suggestion: "任务号"},
 		{name: "local settlement", raw: "Local billing settlement failed", summary: "结算失败", suggestion: "管理员"},
+		{name: "billing confirmation reconciliation", raw: "Task billing confirmation requires reconciliation", summary: "费用确认尚未完成，需要核对账单", suggestion: "不会自动再次提交视频生成"},
 		{name: "local storage", raw: "Generated video could not be saved locally: storage timeout", summary: "视频结果未能保存到本地", suggestion: "不要重复发起视频生成"},
 		{name: "local storage status", raw: "storage_failed", summary: "视频结果未能保存到本地", suggestion: "不要重复发起视频生成"},
 		{name: "unknown", raw: "Unrecognized provider error Q102", summary: "未提供可识别的进一步原因", suggestion: "管理员"},
@@ -159,6 +172,17 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 			}
 			if tc.name == "output video safety" || tc.name == "safety without category" {
 				assert.Contains(t, notice.Summary, "未提供具体")
+			}
+			if strings.Contains(tc.name, "submission") {
+				assert.NotContains(t, notice.Summary, "失败")
+				assert.NotContains(t, notice.Summary, "已拒绝")
+				assert.NotContains(t, notice.Summary, "已退款")
+				assert.Contains(t, notice.Suggestion, "避免重复")
+			}
+			if tc.name == "generic upstream validation" {
+				assert.NotContains(t, notice.Summary, "版权限制")
+				assert.NotContains(t, notice.Summary, "审核认为")
+				assert.Contains(t, notice.Detail, "是否侵犯了版权保护")
 			}
 		})
 	}
@@ -192,18 +216,26 @@ func TestVideoTaskFailureNoticeSanitizesDetails(t *testing.T) {
 		assert.Empty(t, VideoTaskFailureNotice(url).Detail)
 	}
 	assert.Empty(t, VideoTaskFailureNotice(`{"request":{"prompt":"private prompt"}}`).Detail)
+	assert.Empty(t, VideoTaskFailureNotice(`{"code":"generic_provider_code","request":{"prompt":"private prompt","code":"privatecode"}}`).Detail)
 	for _, tc := range []struct{ name, raw, want, detail string }{
 		{name: "Basic authorization", raw: "Upstream rejected credentials; Authorization: Basic cHJpdmF0ZTpwYXNzd29yZA==", want: "cHJpdmF0ZTpwYXNzd29yZA==", detail: "Upstream rejected credentials"},
 		{name: "text request body", raw: `Invalid parameter: duration; request body: {"prompt":"private prompt","api_key":"private request key"}`, want: "private prompt", detail: "Invalid parameter: duration"},
 		{name: "prefixed JSON response", raw: `Upstream response: {"error":{"message":"Invalid parameter: duration"},"request":{"prompt":"private prompt"}}`, want: "private prompt", detail: "Invalid parameter: duration"},
 		{name: "JSON response followed by private request", raw: `Upstream response: {"error":{"message":"Invalid parameter: duration"}}; request body: private prompt`, want: "private prompt", detail: "Invalid parameter: duration"},
 		{name: "escaped quoted credential", raw: `Upstream failed: password="first \" private-tail"`, want: "private-tail", detail: "Upstream failed"},
+		{name: "upstream JSON submission error code", raw: `video submission failed (HTTP 502, code fail_to_fetch_task): {"code":"task_submission_unknown","message":"task submission state is unknown","data":null,"request":{"prompt":"private prompt","code":"privatecode"}}`, want: "private", detail: "task_submission_unknown"},
+		{name: "nested upstream JSON submission error code", raw: `{"error":{"code":"task_submission_unknown","message":"task submission state is unknown"},"input":{"prompt":"private prompt","code":"privatecode"}}`, want: "private", detail: "task_submission_unknown"},
+		{name: "upstream JSON submission code without message", raw: `{"code":"submission_unknown","request":{"prompt":"private prompt","code":"privatecode"}}`, want: "private", detail: "submission_unknown"},
+		{name: "invalid upstream error code is omitted", raw: `{"code":"private code value","message":"Rate limit exceeded","request":{"code":"privatecode"}}`, want: "private", detail: "Rate limit exceeded"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reason := VideoTaskFailureReason(tc.raw)
 			assert.NotContains(t, reason, tc.want)
 			assert.Contains(t, reason, tc.detail)
 			assert.Equal(t, reason, VideoTaskFailureReason(reason))
+			if strings.Contains(tc.name, "submission") {
+				assert.Contains(t, VideoTaskFailureNotice(tc.raw).Summary, "提交结果尚未确认")
+			}
 		})
 	}
 }
