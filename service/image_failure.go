@@ -252,6 +252,18 @@ func ClassifyOpenAIAsyncImageHTTPFailure(ctx context.Context, response *http.Res
 	return classifyAsyncImageHTTPFailure(ctx, response, statusCodeMapping, false)
 }
 
+func isImageRouteCompatibilityRejection(status int, providerCode, message string) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(providerCode), "image_size_not_supported") && !strings.Contains(strings.ToLower(message), "no eligible upstream image provider supports the requested image size or resolution tier") {
+		return false
+	}
+	// A policy rejection must retain its terminal semantics even if the
+	// upstream response also mentions an unavailable size or route.
+	return ClassifyAsyncImageFailure(errors.New(providerCode+" "+message), status).Code != 601
+}
+
 func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response, statusCodeMapping string, classifyErrorType bool) *AsyncImageFailure {
 	if response == nil {
 		return ClassifyAsyncImageFailure(errors.New("upstream image response is missing"), 0)
@@ -322,6 +334,9 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	mappedStatus := types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, status)
 	ResetStatusCode(mappedStatus, statusCodeMapping)
 	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
+	if failure.Code != 601 && isImageRouteCompatibilityRejection(status, classificationCode, providerMessage) {
+		failure.Code, failure.InternalCode = 603, "upstream_image_route_incompatible"
+	}
 	failure.HTTPStatus = status
 	if providerMessage != "" {
 		failure.Message = providerMessage

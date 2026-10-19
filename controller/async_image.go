@@ -231,12 +231,16 @@ func QueryAsyncImage(c *gin.Context) {
 	response := gin.H{"task_id": task.TaskId}
 	notice := service.ImageTaskFailureNotice(task)
 	response["failure_code"] = task.PublicErrorCode
-	response["error_summary"], response["error_suggestion"] = notice.SummaryText(), notice.Suggestion
-	if len(notice.SummaryParams) > 0 {
+	response["error_summary"], response["error_suggestion"] = notice.SummaryText(), notice.SuggestionText()
+	if len(notice.SummaryParams) > 0 || notice.SummaryZh != "" {
 		response["error_summary_key"], response["error_summary_params"] = notice.Summary, notice.SummaryParams
 	}
+	if notice.SummaryZh != "" {
+		response["error_suggestion_key"] = notice.Suggestion
+		response["error_detail"] = service.SanitizeAsyncImageDiagnostic(task.ErrorMessage, common.LocalLogContentLimit)
+	}
 	response["error_retryable"], response["error_stage"] = notice.Retryable, notice.Stage
-	response["error_message"] = service.SanitizeAsyncImageDiagnostic(task.ErrorMessage, common.LocalLogContentLimit)
+	response["error_message"] = notice.MessageText(task.ErrorMessage)
 	if strings.Contains(c.Request.URL.Path, "/media/") {
 		displayStatus := task.DisplayStatus()
 		response["media_type"], response["provider"], response["protocol"] = "image", task.Provider, task.ExecutionProtocol

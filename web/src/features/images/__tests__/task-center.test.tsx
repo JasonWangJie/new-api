@@ -906,6 +906,56 @@ test.each<{
   }
 )
 
+test('structured image route incompatibility translates the explanation and shows the original once', async () => {
+  const summary =
+    'The selected upstream route does not support the requested image size or resolution'
+  const suggestion =
+    'This task stopped after the upstream rejection; no account switch is scheduled. Ask the administrator to enable a compatible route before submitting again.'
+  const summaryZh = '当前上游线路不支持本次请求的图片尺寸或分辨率档位。'
+  const suggestionZh =
+    '本任务在上游拒绝后已停止，没有安排自动换号。请管理员检查支持该尺寸或分辨率的线路及账号，确认可用后再提交。'
+  const original =
+    'No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route.'
+  const failedTask = {
+    ...task,
+    media_type: 'image' as const,
+    status: 'failed',
+    error_summary: summaryZh,
+    error_summary_key: summary,
+    error_suggestion: suggestionZh,
+    error_suggestion_key: suggestion,
+    error_detail: original,
+    error_message: `${summaryZh}\n处理建议：${suggestionZh}\n原始错误：${original}`,
+    error_retryable: false,
+  }
+  i18next.addResourceBundle('zh', 'translation', zh.translation)
+  try {
+    render(<ImageTaskNotice task={failedTask} diagnostics />)
+    const notice = screen.getByRole('status')
+    expect(within(notice).getByText(summary)).toBeVisible()
+    expect(within(notice).getByText(suggestion)).toBeVisible()
+    expect(within(notice).getByText(original)).toBeVisible()
+    expect(notice.textContent?.split(original)).toHaveLength(2)
+    expect(
+      within(notice).queryByText(failedTask.error_message)
+    ).not.toBeInTheDocument()
+    await act(async () => {
+      await i18next.changeLanguage('zh')
+    })
+    expect(within(notice).getByText(summaryZh)).toBeVisible()
+    expect(within(notice).getByText(suggestionZh)).toBeVisible()
+    expect(notice.textContent?.split(summaryZh)).toHaveLength(2)
+    expect(notice.textContent?.split(suggestionZh)).toHaveLength(2)
+    expect(notice.textContent?.split(original)).toHaveLength(2)
+    expect(within(notice).queryByText('Next retry')).not.toBeInTheDocument()
+  } finally {
+    await act(async () => {
+      await i18next.changeLanguage('en')
+    })
+    i18next.removeResourceBundle('zh', 'translation')
+  }
+})
+
 test('local routing dependency waits show readable decision and stage labels in public details', async () => {
   vi.mocked(getImageTask).mockResolvedValue({
     ...detail,

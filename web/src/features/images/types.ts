@@ -123,6 +123,7 @@ export type ImageTask = {
   error_summary_key?: string
   error_summary_params?: Record<string, string | number>
   error_suggestion?: string
+  error_suggestion_key?: string
   error_detail?: string
   error_retryable?: boolean
   error_stage?: string

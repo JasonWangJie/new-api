@@ -265,22 +265,27 @@ type ImageAccount struct {
 	Key                   string `json:"-"`
 }
 
+var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the requested size or resolution")
+
 type ImageAccountRouting struct {
-	Pin                 string
-	Excluded            []string
-	Avoid               string
-	PinChannel          int
-	ExcludedChannels    []int
-	AvoidChannel        int
-	Cooling             map[string]bool
-	TimedOutAccounts    []string
-	TimedOutCredentials []string
-	Stop                bool
+	Pin                     string
+	Excluded                []string
+	Avoid                   string
+	PinChannel              int
+	ExcludedChannels        []int
+	AvoidChannel            int
+	Cooling                 map[string]bool
+	TimedOutAccounts        []string
+	TimedOutCredentials     []string
+	IncompatibleAccounts    []string
+	IncompatibleCredentials []string
+	IncompatibleChannels    []int
+	Stop                    bool
 }
 
 // Account identity survives key reordering and never exposes a usable key.
 func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []ImageAccount {
-	if routing.PinChannel != 0 && routing.PinChannel != channel.Id || slices.Contains(routing.ExcludedChannels, channel.Id) {
+	if routing.PinChannel != 0 && routing.PinChannel != channel.Id || slices.Contains(routing.ExcludedChannels, channel.Id) || slices.Contains(routing.IncompatibleChannels, channel.Id) {
 		return nil
 	}
 	keys := []string{channel.Key}
@@ -298,6 +303,9 @@ func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []
 		fingerprint := ImageIdentityHash("image-account", strconv.Itoa(channel.Id), key)
 		credentialFingerprint := ImageIdentityHash("image-credential", key)
 		if slices.Contains(routing.TimedOutAccounts, fingerprint) || slices.Contains(routing.TimedOutCredentials, credentialFingerprint) {
+			continue
+		}
+		if slices.Contains(routing.IncompatibleAccounts, fingerprint) || slices.Contains(routing.IncompatibleCredentials, credentialFingerprint) {
 			continue
 		}
 		if routing.Cooling[fingerprint] {
@@ -323,8 +331,8 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		capability := ImageChannelCapability(channel, request.Model)
 		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
 	})
-	// Timeout exclusions belong to this task and must survive the global
-	// cooldown fallback, including copies of one credential in other channels.
+	// Rejected compatibility and timeout exclusions belong to this task and
+	// survive cooldown fallback, including copied credentials in other channels.
 	timeoutExcluded := false
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
 		if len(ImageChannelAccounts(channel, routing)) > 0 {
@@ -337,6 +345,9 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	})
 	if len(channels) == 0 && timeoutExcluded {
 		return nil, ImageAccount{}, ErrImageTimeoutAccountsExhausted
+	}
+	if len(channels) == 0 && (len(routing.IncompatibleAccounts) > 0 || len(routing.IncompatibleCredentials) > 0 || len(routing.IncompatibleChannels) > 0) {
+		return nil, ImageAccount{}, ErrImageCompatibleAccountsExhausted
 	}
 	cfg, err := GetImageRuntimeConfig(ctx)
 	if err != nil {
@@ -588,6 +599,19 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 				routing.TimedOutCredentials = append(routing.TimedOutCredentials, attempt.CredentialFingerprint)
 			}
 		}
+		if attempt.FinishedAt > 0 && attempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage) {
+			if attempt.KeyFingerprint != "" && !slices.Contains(routing.IncompatibleAccounts, attempt.KeyFingerprint) {
+				routing.IncompatibleAccounts = append(routing.IncompatibleAccounts, attempt.KeyFingerprint)
+			}
+			if attempt.CredentialFingerprint != "" && !slices.Contains(routing.IncompatibleCredentials, attempt.CredentialFingerprint) {
+				routing.IncompatibleCredentials = append(routing.IncompatibleCredentials, attempt.CredentialFingerprint)
+			}
+			// Legacy attempts cannot identify a reordered key safely. Exclude
+			// their entire channel instead of guessing an account identity.
+			if attempt.KeyFingerprint == "" && attempt.CredentialFingerprint == "" && !slices.Contains(routing.IncompatibleChannels, attempt.ChannelId) {
+				routing.IncompatibleChannels = append(routing.IncompatibleChannels, attempt.ChannelId)
+			}
+		}
 		if attempt.KeyFingerprint == "" {
 			legacy = true
 		}
@@ -605,10 +629,11 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
+	lastIncompatible := lastAttempt.FinishedAt > 0 && lastAttempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(lastAttempt.HTTPStatus, lastAttempt.ProviderCode, lastAttempt.ErrorMessage)
 	if legacy {
 		routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
 		for _, attempt := range attempts {
-			if attempt.Dispatched && attempt.TimedOut && attempt.FinishedAt > 0 && routing.PinChannel == attempt.ChannelId {
+			if attempt.Dispatched && attempt.FinishedAt > 0 && routing.PinChannel == attempt.ChannelId && (attempt.TimedOut || attempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)) {
 				routing.PinChannel = 0
 				break
 			}
@@ -617,7 +642,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut {
-			if slices.Contains(routing.ExcludedChannels, lastChannel) || routing.PinChannel != 0 && routing.PinChannel != lastChannel {
+			if lastIncompatible || slices.Contains(routing.ExcludedChannels, lastChannel) || routing.PinChannel != 0 && routing.PinChannel != lastChannel {
 				routing.Stop = true
 				return routing
 			}
@@ -634,7 +659,8 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 			}
 		}
 		firstTimedOut := slices.Contains(routing.TimedOutAccounts, first) || reference[0].CredentialFingerprint != "" && slices.Contains(routing.TimedOutCredentials, reference[0].CredentialFingerprint)
-		if !firstTimedOut {
+		firstIncompatible := slices.Contains(routing.IncompatibleAccounts, first) || reference[0].CredentialFingerprint != "" && slices.Contains(routing.IncompatibleCredentials, reference[0].CredentialFingerprint)
+		if !firstTimedOut && !firstIncompatible {
 			if len(reference) <= effectiveRetries {
 				routing.Pin = first
 			} else {
@@ -647,7 +673,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		routing.Avoid = last
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut {
-		if slices.Contains(routing.Excluded, last) || routing.Pin != "" && routing.Pin != last {
+		if lastIncompatible || slices.Contains(routing.Excluded, last) || routing.Pin != "" && routing.Pin != last {
 			routing.Stop = true
 			return routing
 		}

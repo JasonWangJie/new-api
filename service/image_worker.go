@@ -373,6 +373,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		// the prior attempt's channel snapshot.
 		channel, account, err = PickImageChannel(ctx, policy, request, routing)
 		if err != nil {
+			if errors.Is(err, ErrImageCompatibleAccountsExhausted) {
+				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "image_compatible_accounts_exhausted", Message: "No other eligible image account supports the requested size or resolution"}, cfg)
+			}
 			if errors.Is(err, ErrImageTimeoutAccountsExhausted) {
 				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 606, InternalCode: "timeout_accounts_exhausted", Message: "No unused image account remains after request timeouts"}, cfg)
 			}
@@ -693,6 +696,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	submissionTransientRetries := 0
 	timeoutRetries := 0
 	timeoutAttempt := task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && failure.InternalCode == "upstream_transport_timeout"
+	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible"
 	if task.Attempts != "" {
 		var attempts []ImageChannelAttempt
 		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
@@ -820,7 +824,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		resubmit := task.UpstreamTaskId == ""
 		if failure.UpstreamTerminal {
 			resubmit = false
-			if task.ImageCount == 0 && task.ResultCount == 0 && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
+			if !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
 				reservation, err := model.GetAsyncImageReservation(ctx, task)
 				if err != nil {
 					return err
@@ -850,7 +854,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				}
 			case 603:
 				count, maximum, base, maxDelay, key = task.CapacityRetryCount, cfg.CapacityRetries, cfg.CapacityRetryBase, cfg.CapacityRetryMax, "capacity_retry_count"
-				if failure.InternalCode == "account_switches_exhausted" {
+				if failure.InternalCode == "account_switches_exhausted" || failure.InternalCode == "image_compatible_accounts_exhausted" {
 					maximum = 0
 				}
 			case 605, 606:

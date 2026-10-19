@@ -193,7 +193,7 @@ func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
 }
 
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
-	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry"} {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection"} {
 		t.Run(condition, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			wantChannelID, wantKey := alternate.Id, alternate.Key
@@ -231,6 +231,9 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				attempts[0].Code, attempts[0].HTTPStatus, attempts[0].FinishedAt = 603, 429, time.Now().Unix()
 			case "completed upstream transient rejection":
 				attempts[0].FinishedAt = time.Now().Unix()
+			case "legacy compatibility rejection":
+				attempts[0].KeyFingerprint, attempts[0].Code, attempts[0].HTTPStatus = "", 610, http.StatusUnprocessableEntity
+				attempts[0].ProviderCode, attempts[0].FinishedAt = "image_size_not_supported", time.Now().Unix()
 			case "single healthy account retains transient retry":
 				attempts[0].FinishedAt = time.Now().Unix()
 				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
@@ -791,6 +794,68 @@ func TestAsyncImageFailureNoticeExplainsRecordedCauses(t *testing.T) {
 	}
 }
 
+func TestAsyncImageFailureNoticeCompatibility(t *testing.T) {
+	const raw = "No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route. Bearer private-key https://signed.example/image?token=private"
+	const summary = "The selected upstream route does not support the requested image size or resolution"
+	for _, tc := range []struct {
+		name       string
+		status     string
+		code       string
+		publicCode int
+		action     string
+		reason     string
+		upstreamID string
+		successAt  int64
+		nextAt     int64
+		wantKey    string
+		wantText   string
+		wantAdvice string
+		retryable  bool
+	}{
+		{name: "historical rejection explains why no retry occurred", status: model.ImageTaskFailed, code: "upstream_failed", publicCode: 610, action: "stop", reason: "unknown_error", wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "本任务在上游拒绝后已停止，没有安排自动换号。请管理员检查支持该尺寸或分辨率的线路及账号，确认可用后再提交。"},
+		{name: "scheduled failover preserves dimensions", status: model.ImageTaskQueued, code: "upstream_image_route_incompatible", publicCode: 603, action: "switch_account", reason: "incompatible_image_route", nextAt: 100, wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "本任务已安排在重试限额内换号重试，并跳过不兼容账号；保留原图片尺寸和分辨率，不自动降低画质。", retryable: true},
+		{name: "exhausted compatible accounts", status: model.ImageTaskFailed, code: "image_compatible_accounts_exhausted", publicCode: 603, action: "stop", reason: "no_compatible_account", wantKey: "No other eligible image account supports the requested size or resolution", wantText: "当前没有其他可用上游账号支持本次请求的图片尺寸或分辨率，已停止自动重试。", wantAdvice: "请管理员添加或启用支持该尺寸或分辨率的账号；也可自行选择受支持的尺寸或分辨率后新建任务。"},
+		{name: "compatibility budget exhausted", status: model.ImageTaskFailed, code: "upstream_image_route_incompatible", publicCode: 603, action: "stop", reason: "compatibility_retry_budget_exhausted", wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "自动重试次数已达到配置的预算上限，已停止继续提交。请管理员检查兼容线路和重试设置后再新建任务。"},
+		{name: "total budget exhausted", status: model.ImageTaskFailed, code: "upstream_image_route_incompatible", publicCode: 603, action: "stop", reason: "total_retry_budget_exhausted", wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "自动重试次数已达到配置的预算上限，已停止继续提交。请管理员检查兼容线路和重试设置后再新建任务。"},
+		{name: "deadline prevents another submission", status: model.ImageTaskExpired, code: "execution_deadline", publicCode: 608, action: "stop", reason: "execution_deadline", wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "任务已达到执行截止时间，已停止继续提交。请管理员检查兼容线路，确认后再新建任务。"},
+		{name: "old size rejection cannot override unknown execution", status: model.ImageTaskExecutionUnknown, code: "upstream_transport_disconnected", publicCode: 608, action: "reconcile_unknown", reason: "execution_unknown", wantKey: "Upstream connection closed before the result was confirmed", wantAdvice: "Do not submit again until an administrator has checked the upstream result and billing."},
+		{name: "known job continues polling without another generation", status: model.ImageTaskInvoking, code: "upstream_failed", publicCode: 610, action: "poll_same_job", reason: "accepted_job", upstreamID: "accepted-job", nextAt: 100, wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "将继续查询原上游任务，不会提交新的生成请求。", retryable: true},
+		{name: "accepted terminal job never promises another submission", status: model.ImageTaskFailed, code: "upstream_job_failed", publicCode: 603, action: "stop", upstreamID: "accepted-job", wantKey: summary, wantText: "当前上游线路不支持本次请求的图片尺寸或分辨率档位。", wantAdvice: "管理员核查上游结果和计费前，请勿再次提交。"},
+		{name: "saved output never becomes size failover", status: model.ImageTaskStorageFailed, code: "upstream_image_route_incompatible", publicCode: 609, action: "manual_recovery", successAt: 90, wantKey: "Image post-processing needs attention", wantAdvice: "Check storage or billing recovery; do not repeat generation."},
+		{name: "safety review cannot be relabeled as compatibility", status: model.ImageTaskFailed, code: "upstream_image_route_incompatible", publicCode: 601, action: "stop", wantKey: "Upstream safety review did not pass", wantAdvice: "Review the upstream message; contact the service provider if the review failed unexpectedly."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			history, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 4, Dispatched: true, FinishedAt: 50, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", ErrorMessage: raw}})
+			require.NoError(t, err)
+			decision, err := common.Marshal(ImageRetryDecision{Version: 1, Action: tc.action, Reason: tc.reason, Stage: "submit"})
+			require.NoError(t, err)
+			task := model.AsyncImageTask{Status: tc.status, ErrorCode: tc.code, PublicErrorCode: tc.publicCode, ErrorMessage: raw, Attempts: string(history), RetryDecision: string(decision), UpstreamTaskId: tc.upstreamID, UpstreamSucceededAt: tc.successAt, NextAttemptAt: tc.nextAt}
+			original := task
+			notice := ImageTaskFailureNotice(task)
+			assert.Equal(t, tc.wantKey, notice.Summary)
+			assert.Equal(t, tc.wantAdvice, notice.SuggestionText())
+			assert.Equal(t, tc.retryable, notice.Retryable)
+			if tc.wantText != "" {
+				assert.Equal(t, tc.wantText, notice.SummaryText())
+				assert.Contains(t, notice.MessageText(raw), tc.wantText+"\n处理建议："+tc.wantAdvice+"\n原始错误：")
+			} else {
+				assert.Empty(t, notice.SummaryZh)
+				assert.Equal(t, tc.wantKey, notice.SummaryText())
+			}
+			assert.Contains(t, notice.MessageText(raw), "No eligible upstream image provider")
+			assert.NotContains(t, notice.MessageText(raw), "private-key")
+			assert.NotContains(t, notice.MessageText(raw), "signed.example")
+			assert.Equal(t, original, task, "readable explanations cannot alter historical retry evidence")
+		})
+	}
+	notice := ImageTaskFailureNotice(model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_image_route_incompatible", PublicErrorCode: 603})
+	message := notice.MessageText(raw + " password=private-password " + strings.Repeat("x", common.LocalLogContentLimit))
+	assert.LessOrEqual(t, len([]rune(message)), common.LocalLogContentLimit)
+	assert.True(t, strings.HasPrefix(message, "当前上游线路不支持本次请求的图片尺寸或分辨率档位。\n处理建议："))
+	assert.NotContains(t, message, "private-key")
+	assert.NotContains(t, message, "private-password")
+}
+
 func TestAsyncImageTransportFailureKeepsSafeEOFDiagnostics(t *testing.T) {
 	testCases := []struct {
 		name            string
@@ -977,6 +1042,8 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		{name: "poll deadline retains the accepted hold", failure: AsyncImageFailure{Code: 608, InternalCode: "execution_deadline"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "unrecoverable query rejection requires reconciliation", failure: AsyncImageFailure{Code: 610, HTTPStatus: http.StatusForbidden}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "unknown execution retains its hold", failure: AsyncImageFailure{Code: 608, ExecutionUnknown: true}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
+		{name: "compatibility rejection cannot replace an accepted job", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
+		{name: "terminal accepted compatibility failure cannot resubmit", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "a settled bill cannot fund another submission", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "applied", wantStatus: model.ImageTaskFailed, wantBill: "applied"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1084,6 +1151,7 @@ func TestAsyncImageWorkerCompletionRecoveryUsesLocalBudgets(t *testing.T) {
 		{name: "download", failure: AsyncImageFailure{Code: 606, InternalCode: "result_download_failed"}, paused: model.ImageTaskStorageFailed},
 		{name: "billing", failure: AsyncImageFailure{Code: 606, InternalCode: "bill_preparation_failed"}, paused: model.ImageTaskBillingFailed},
 		{name: "saved output timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout"}, paused: model.ImageTaskStorageFailed},
+		{name: "size rejection after output acceptance remains local", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, paused: model.ImageTaskStorageFailed},
 		{name: "invalid output", failure: AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing checkpoint", failure: AsyncImageFailure{Code: 607, InternalCode: "completion_checkpoint_invalid"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing usage re-queries the same job", failure: AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing"}, paused: model.ImageTaskBillingFailed, requeryUsage: true},
@@ -1414,6 +1482,167 @@ func TestAsyncImageWorkerSingleAccountTransientRetriesRemainBounded(t *testing.T
 	}
 	assert.Equal(t, cfg.TransientRetries+1, calls)
 	assert.Equal(t, cfg.TransientRetries, task.RetryCount)
+}
+
+func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
+	const compatibilityMessage = "No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."
+	for _, tc := range []struct {
+		name       string
+		mode       string
+		wantCalls  int
+		wantRetry  int
+		wantError  string
+		wantReason string
+	}{
+		{name: "explicit rejection then compatible success", wantCalls: 2, wantRetry: 1},
+		{name: "copied credential cannot become an alternative", mode: "copied credential", wantCalls: 2, wantRetry: 1},
+		{name: "no compatible account remains", mode: "no alternate", wantCalls: 1, wantRetry: 1, wantError: "image_compatible_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "all compatible accounts reject", mode: "all reject", wantCalls: 2, wantRetry: 2, wantError: "image_compatible_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "capacity retries disabled", mode: "no capacity retry", wantCalls: 1, wantError: "upstream_image_route_incompatible", wantReason: "compatibility_retry_budget_exhausted"},
+		{name: "total retries disabled", mode: "no total retry", wantCalls: 1, wantError: "upstream_image_route_incompatible", wantReason: "total_retry_budget_exhausted"},
+		{name: "ordinary invalid dimensions remain terminal", mode: "invalid dimensions", wantCalls: 1, wantError: "upstream_failed", wantReason: "invalid_input"},
+		{name: "safety rejection remains terminal", mode: "safety", wantCalls: 1, wantError: "upstream_failed", wantReason: "content_policy"},
+		{name: "unknown execution is never resubmitted", mode: "unknown", wantCalls: 1, wantError: "upstream_image_route_incompatible", wantReason: "execution_unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			request.Size, request.Resolution = "4096x3272", "4K"
+			catalog, err := common.Marshal([]ImageModelCapability{{Id: request.Model, Resolutions: []string{"4K"}, MaxOutputImages: 1, MaxReferenceImages: 1}})
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", ImageIdentityHash("default", "openai")).Update("models", string(catalog)).Error)
+			payload, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = EncryptImagePayload(payload, "task:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
+			primaryID, startedAt := task.ChannelId, task.StartedAt
+			switch tc.mode {
+			case "copied credential":
+				priority := int64(90)
+				duplicate := model.Channel{Key: "upstream-key-a", Status: common.ChannelStatusEnabled, Type: 1, Group: task.Group, Models: task.Model, Priority: &priority}
+				require.NoError(t, db.Create(&duplicate).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: task.Group, Model: task.Model, ChannelId: duplicate.Id, Enabled: true}).Error)
+			case "no alternate":
+				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "no capacity retry":
+				cfg.CapacityRetries = 0
+			case "no total retry":
+				cfg.TotalRetries = 0
+			}
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			outputEntities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+			if tc.wantError == "" {
+				require.NoError(t, db.AutoMigrate(outputEntities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(outputEntities...)) })
+			}
+			code, message := "image_size_not_supported", compatibilityMessage
+			switch tc.mode {
+			case "invalid dimensions":
+				code, message = "invalid_request", "unsupported_image_dimensions: dimensions must be even"
+			case "safety":
+				code, message = "content_policy_violation", "Upstream safety review rejected the image"
+			}
+			body, err := common.Marshal(map[string]any{"error": map[string]string{"code": code, "message": message}})
+			require.NoError(t, err)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = w.Write(body)
+			}))
+			t.Cleanup(upstream.Close)
+			var selected []string
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				assert.NotContains(t, selected, channel.Key, "a rejected credential cannot be reused for the same dimensions")
+				selected = append(selected, channel.Key)
+				assert.Equal(t, request.Size, outbound.Size, "failover never reduces image dimensions")
+				assert.Equal(t, request.Resolution, outbound.Resolution)
+				assert.Equal(t, request.Billing, outbound.Billing, "failover retains the admitted price")
+				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+				require.NoError(t, beforeInvoke())
+				var user model.User
+				require.NoError(t, db.First(&user, current.UserId).Error)
+				assert.Equal(t, 900, user.Quota, "all attempts share one reservation")
+				if len(selected) == 1 || tc.mode == "all reject" {
+					httpRequest, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL, nil)
+					require.NoError(t, requestErr)
+					response, responseErr := upstream.Client().Do(httpRequest)
+					require.NoError(t, responseErr)
+					failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, response, "")
+					if tc.mode == "unknown" {
+						failure.ExecutionUnknown = true
+					}
+					return nil, model.AsyncImageBill{}, failure
+				}
+				assert.Equal(t, alternate.Id, channel.Id)
+				return &AsyncImageOutput{Images: []ImageBytes{asyncImageBytesFixture(t)}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "compatible-success-bill", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+			}
+			for range 3 {
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				if task.Status != model.ImageTaskQueued {
+					break
+				}
+				var decision ImageRetryDecision
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+				assert.Equal(t, "switch_account", decision.Action)
+				assert.Equal(t, "incompatible_image_route", decision.Reason)
+				assert.Equal(t, "capacity", decision.Budget)
+				assert.Zero(t, task.DispatchedAt)
+				assert.Equal(t, startedAt, task.StartedAt)
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+				require.NoError(t, err)
+			}
+			assert.Len(t, selected, tc.wantCalls)
+			assert.Equal(t, tc.wantRetry, task.RetryCount)
+			if tc.wantError == "" {
+				require.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+				require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "compatible-success-bill"))
+				require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "compatible-success-bill"))
+				require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("log_status", "disabled").Error)
+				require.NoError(t, model.CompleteAsyncImageTask(t.Context(), task, false))
+			} else {
+				var decision ImageRetryDecision
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+				assert.Equal(t, tc.wantError, task.ErrorCode)
+				assert.Equal(t, tc.wantReason, decision.Reason)
+				if tc.mode == "unknown" {
+					assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+					assert.Equal(t, "reconcile_unknown", decision.Action)
+				} else {
+					assert.Equal(t, model.ImageTaskFailed, task.Status)
+					assert.Equal(t, "stop", decision.Action)
+					require.NoError(t, model.RefundAsyncImageReservation(t.Context(), task.TaskId))
+				}
+			}
+			var user model.User
+			var bill model.AsyncImageBill
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			var bills, refunds int64
+			require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&bills).Error)
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+			assert.EqualValues(t, 1, bills)
+			wantQuota, wantBill, wantRefunds := 1000, "refunded", int64(1)
+			if tc.wantError == "" {
+				wantQuota, wantBill, wantRefunds = 920, "applied", 0
+			} else if tc.mode == "unknown" {
+				wantQuota, wantBill, wantRefunds = 900, "reserved", 0
+			}
+			assert.Equal(t, wantQuota, user.Quota)
+			assert.Equal(t, wantBill, bill.Status)
+			assert.Equal(t, wantRefunds, refunds)
+			if tc.mode != "invalid dimensions" && tc.mode != "safety" && tc.mode != "unknown" {
+				stateKeys := []string{ImageRedisKey("breaker", "async", strconv.Itoa(primaryID)) + ":count", ImageAccountCooldownKey(ImageIdentityHash("image-account", strconv.Itoa(primaryID), "upstream-key-a"))}
+				states, stateErr := common.RDB.Exists(t.Context(), stateKeys...).Result()
+				require.NoError(t, stateErr)
+				assert.Zero(t, states, "dimension incompatibility cannot penalize unrelated requests through global circuit or cooldown state")
+			}
+		})
+	}
 }
 
 func TestAsyncImageAccountCooldownAndSupplierBudget(t *testing.T) {
@@ -1816,6 +2045,7 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	assert.Equal(t, "account-b", ImageAccountAttemptRouting([]ImageChannelAttempt{accountA, accountB}, 2, "gemini", 1).Pin)
 	transientA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 606}
 	rateLimitedB := ImageChannelAttempt{ChannelId: 20, KeyFingerprint: "account-b", Dispatched: true, FinishedAt: 1, Code: 605}
+	incompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}
 	for _, tc := range []struct {
 		name        string
 		history     []ImageChannelAttempt
@@ -1832,6 +2062,11 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		{name: "incomplete dispatch never authorizes switching", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, Code: 606}}, platform: "openai"},
 		{name: "legacy transient failure prefers another channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 606}}, platform: "openai", want: ImageAccountRouting{AvoidChannel: 10}},
 		{name: "transient failure preserves a reference pin", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, ReferenceFailure: true, Code: 602}, transientA}, platform: "openai", want: ImageAccountRouting{Pin: "account-a", Avoid: "account-a"}},
+		{name: "size rejection permanently excludes this task's credential", history: []ImageChannelAttempt{incompatibleA}, platform: "openai", want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "Gemini zero switches stops size failover", history: []ImageChannelAttempt{incompatibleA}, platform: "gemini", want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
+		{name: "legacy size rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai", want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
+		{name: "accepted jobs cannot authorize size failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTaskID: "accepted-job"}}, platform: "openai"},
+		{name: "unfinished rejection cannot exclude an account", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, ImageAccountAttemptRouting(tc.history, 2, tc.platform, tc.maxSwitches))
@@ -1989,7 +2224,14 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		message      string
 		fallback     bool
 		httpStatus   int
+		internalCode string
 	}{
+		{name: "size compatibility rejection", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."}}`, expectedCode: 603, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusUnprocessableEntity, internalCode: "upstream_image_route_incompatible"},
+		{name: "compatibility rejection without provider code", body: `{"error":{"message":"No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."}}`, expectedCode: 603, message: "resolution tier", internalCode: "upstream_image_route_incompatible"},
+		{name: "ordinary dimension rejection stays terminal", body: `{"error":{"code":"invalid_request","message":"unsupported_image_dimensions: dimensions must be even"}}`, expectedCode: 604, providerCode: "invalid_request", message: "dimensions must be even", httpStatus: http.StatusUnprocessableEntity},
+		{name: "compatibility wording cannot override safety", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier; safety review did not pass"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "safety review", httpStatus: http.StatusUnprocessableEntity},
+		{name: "provider safety status precedes compatibility code", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier.","status":"SAFETY"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusUnprocessableEntity},
+		{name: "authorization is not compatibility rejection", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier."}}`, expectedCode: 610, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusForbidden},
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
 		{name: "reference fetch without Google envelope fields", body: `{"error":{"message":"reference image fetch: Get https://signed.example/image?token=private: i/o timeout"}}`, expectedCode: 602, message: "reference image fetch", fallback: true},
 		{name: "reference download proxy failure", body: `{"error":{"code":400,"message":"Proxy error: Reference image download failed; direct=timeout; proxy=502"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download failed", fallback: true},
@@ -2056,6 +2298,9 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 
 			require.NotNil(t, failure)
 			assert.Equal(t, testCase.expectedCode, failure.Code)
+			if testCase.internalCode != "" {
+				assert.Equal(t, testCase.internalCode, failure.InternalCode)
+			}
 			assert.Equal(t, status, failure.HTTPStatus)
 			assert.Equal(t, testCase.providerCode, failure.ProviderCode)
 			assert.Equal(t, testCase.requestID, failure.UpstreamRequestID)
@@ -2065,6 +2310,24 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			assert.LessOrEqual(t, len([]rune(failure.Message)), asyncImageProviderMessageLimit)
 			assert.Equal(t, testCase.fallback, ShouldFallbackGeminiReferenceTransport(failure))
 			assert.False(t, failure.UpstreamTerminal, "an HTTP error alone does not prove a persisted upstream job is terminal")
+		})
+	}
+	for _, tc := range []struct {
+		name       string
+		status     int
+		mapping    string
+		wantCode   int
+		wantCompat bool
+	}{
+		{name: "actual rejection despite server error mapping", status: 422, mapping: `{"422":"500"}`, wantCode: 603, wantCompat: true},
+		{name: "mapped server error is not a compatibility rejection", status: 500, mapping: `{"500":"422"}`, wantCode: 610},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"image_size_not_supported","message":"This route does not support the requested size"}}`))}
+			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), response, tc.mapping)
+			assert.Equal(t, tc.wantCode, failure.Code)
+			assert.Equal(t, tc.status, failure.HTTPStatus)
+			assert.Equal(t, tc.wantCompat, failure.InternalCode == "upstream_image_route_incompatible")
 		})
 	}
 	assert.Equal(t, 603, ClassifyAsyncImageFailure(errors.New("no eligible image account in the selected pool"), 0).Code)

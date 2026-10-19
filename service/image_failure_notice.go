@@ -13,6 +13,8 @@ type ImageFailureNotice struct {
 	Summary       string
 	SummaryParams map[string]any
 	Suggestion    string
+	SummaryZh     string
+	SuggestionZh  string
 	Retryable     bool
 	Stage         string
 }
@@ -26,6 +28,9 @@ var (
 // SummaryText keeps API summaries readable for clients that do not implement
 // translated summary keys. Only the recorded, bounded display parameters are used.
 func (notice ImageFailureNotice) SummaryText() string {
+	if notice.SummaryZh != "" {
+		return notice.SummaryZh
+	}
 	text := notice.Summary
 	if limit, ok := notice.SummaryParams["limit"].(string); ok && imageSizeNoticeParamPattern.MatchString(limit) {
 		text = strings.ReplaceAll(text, "{{limit}}", limit)
@@ -37,6 +42,30 @@ func (notice ImageFailureNotice) SummaryText() string {
 		return "Upstream rejected the request; the exact cause is not confirmed"
 	}
 	return text
+}
+
+func (notice ImageFailureNotice) SuggestionText() string {
+	if notice.SuggestionZh != "" {
+		return notice.SuggestionZh
+	}
+	return notice.Suggestion
+}
+
+// MessageText preserves the original diagnostic while making route compatibility
+// failures readable to API clients that do not translate the optional keys.
+func (notice ImageFailureNotice) MessageText(raw string) string {
+	detail := SanitizeAsyncImageDiagnostic(raw, common.LocalLogContentLimit)
+	if notice.SummaryZh == "" {
+		return detail
+	}
+	message := notice.SummaryText()
+	if suggestion := notice.SuggestionText(); suggestion != "" {
+		message += "\n处理建议：" + suggestion
+	}
+	if detail != "" {
+		message += "\n原始错误：" + detail
+	}
+	return SanitizeAsyncImageText(message, common.LocalLogContentLimit)
 }
 
 // ImageTaskFailureNotice describes the committed recovery action. A transient
@@ -236,6 +265,43 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) ImageFailureNotice {
 		notice.Suggestion = "Do not submit again until an administrator has checked the upstream result and billing."
 		return notice
 	}
+	compatibilityFailure := task.ErrorCode == "upstream_image_route_incompatible" || task.ErrorCode == "image_compatible_accounts_exhausted"
+	switch task.ErrorCode {
+	case "upstream_failed", "upstream_job_failed", "account_switches_exhausted", "execution_deadline":
+		compatibilityFailure = isImageRouteCompatibilityRejection(lastAttempt.HTTPStatus, lastAttempt.ProviderCode, message) || isImageRouteCompatibilityRejection(lastAttempt.HTTPStatus, lastAttempt.ProviderCode, lastAttempt.ErrorMessage)
+	}
+	if compatibilityFailure && task.PublicErrorCode != 601 && task.UpstreamSucceededAt == 0 && task.ErrorCode != "admin_terminated" && task.Status != model.ImageTaskStorageFailed && task.Status != model.ImageTaskBillingFailed && task.Status != model.ImageTaskBillingPending {
+		notice.Summary = "The selected upstream route does not support the requested image size or resolution"
+		notice.SummaryZh = "当前上游线路不支持本次请求的图片尺寸或分辨率档位。"
+		notice.Suggestion = "No account switch is currently scheduled. Check the task status and compatible route configuration before submitting again."
+		notice.SuggestionZh = "当前没有安排换号重试。请先核对任务状态及兼容线路配置，再决定是否重新提交。"
+		switch {
+		case task.UpstreamTaskId != "":
+			notice.Suggestion = "Do not submit again until an administrator has checked the upstream result and billing."
+			notice.SuggestionZh = "管理员核查上游结果和计费前，请勿再次提交。"
+			if !task.Terminal() && task.NextAttemptAt > 0 && validDecision && decision.Action == "poll_same_job" {
+				notice.Suggestion = "The existing upstream job will be checked again; no new generation will be submitted."
+				notice.SuggestionZh = "将继续查询原上游任务，不会提交新的生成请求。"
+			}
+		case task.ErrorCode == "image_compatible_accounts_exhausted":
+			notice.Summary = "No other eligible image account supports the requested size or resolution"
+			notice.SummaryZh = "当前没有其他可用上游账号支持本次请求的图片尺寸或分辨率，已停止自动重试。"
+			notice.Suggestion = "Ask the administrator to add or enable a compatible account, or explicitly choose a supported size or resolution before submitting a new task."
+			notice.SuggestionZh = "请管理员添加或启用支持该尺寸或分辨率的账号；也可自行选择受支持的尺寸或分辨率后新建任务。"
+		case task.Terminal() && (task.Status == model.ImageTaskExpired || validDecision && decision.Reason == "execution_deadline"):
+			notice.Suggestion = "The task execution deadline was reached, so no further submission is scheduled. Check compatible routes before creating a new task."
+			notice.SuggestionZh = "任务已达到执行截止时间，已停止继续提交。请管理员检查兼容线路，确认后再新建任务。"
+		case task.Terminal() && validDecision && (decision.Reason == "compatibility_retry_budget_exhausted" || decision.Reason == "total_retry_budget_exhausted" || decision.Reason == "account_switch_limit"):
+			notice.Suggestion = "Automatic retries stopped because the configured retry limit was reached. Check compatible routes and retry settings before creating a new task."
+			notice.SuggestionZh = "自动重试次数已达到配置的预算上限，已停止继续提交。请管理员检查兼容线路和重试设置后再新建任务。"
+		case task.Terminal():
+			notice.Suggestion = "This task stopped after the upstream rejection; no account switch is scheduled. Ask the administrator to enable a compatible route before submitting again."
+			notice.SuggestionZh = "本任务在上游拒绝后已停止，没有安排自动换号。请管理员检查支持该尺寸或分辨率的线路及账号，确认可用后再提交。"
+		case task.NextAttemptAt > 0 && validDecision && decision.Action == "switch_account":
+			notice.Suggestion = "The task is scheduled to try another eligible account within its retry limits, skipping incompatible accounts and preserving the requested size and resolution."
+			notice.SuggestionZh = "本任务已安排在重试限额内换号重试，并跳过不兼容账号；保留原图片尺寸和分辨率，不自动降低画质。"
+		}
+	}
 	if task.Terminal() || task.NextAttemptAt <= 0 || !validDecision {
 		return notice
 	}
@@ -243,7 +309,9 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) ImageFailureNotice {
 	case "retry_submission", "switch_account", "same_account_retry", "local_reference_fallback":
 		if task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0 {
 			notice.Retryable = true
-			notice.Suggestion = "The task is scheduled for another submission within its retry limits."
+			if notice.SuggestionZh == "" {
+				notice.Suggestion = "The task is scheduled for another submission within its retry limits."
+			}
 		}
 	case "poll_same_job":
 		if task.UpstreamTaskId != "" {

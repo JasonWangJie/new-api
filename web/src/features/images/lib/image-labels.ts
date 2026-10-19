@@ -53,6 +53,10 @@ export const IMAGE_LABELS: Record<string, string> = {
   reference_transport_fallback: 'Remote reference fetch failed',
   temporary_failure: 'Temporary failure is retryable',
   no_available_capacity: 'No available capacity',
+  incompatible_image_route: 'The selected image route is incompatible',
+  compatibility_retry_budget_exhausted:
+    'Image compatibility retry budget exhausted',
+  no_compatible_account: 'No compatible image account is available',
   accepted_job: 'Upstream task already accepted',
   content_policy: 'Content policy rejection',
   invalid_input: 'Invalid input parameters',

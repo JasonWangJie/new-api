@@ -113,7 +113,7 @@ export function imageTaskIssue(task: ImageTask): {
     if (WAIT_ACTIONS.has(decision.action)) pendingAction = 'wait'
     if (RETRY_ACTIONS.has(decision.action)) pendingAction = 'retry'
   }
-  let suggestion = task.error_suggestion || ''
+  let suggestion = task.error_suggestion_key || task.error_suggestion || ''
   if (!suggestion && pendingAction) {
     if (decision?.action === 'poll_same_job') {
       suggestion =

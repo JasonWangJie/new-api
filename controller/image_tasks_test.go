@@ -147,6 +147,92 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					})
 				}
 			})
+			t.Run("image size compatibility explanations share the committed retry decision", func(t *testing.T) {
+				const upstreamReason = "No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."
+				for _, item := range []struct {
+					name, status, internal, action, reason, suggestion string
+					publicCode                                         int
+					retryable                                          bool
+				}{
+					{"legacy", model.ImageTaskFailed, "upstream_failed", "stop", "unknown_error", "停止", 610, false},
+					{"switch", model.ImageTaskQueued, "upstream_image_route_incompatible", "switch_account", "incompatible_image_route", "安排", 603, true},
+					{"exhausted", model.ImageTaskFailed, "image_compatible_accounts_exhausted", "stop", "no_compatible_account", "管理员", 603, false},
+					{"budget", model.ImageTaskFailed, "upstream_image_route_incompatible", "stop", "compatibility_retry_budget_exhausted", "预算", 603, false},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						history, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, Dispatched: true, FinishedAt: now - 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", ErrorMessage: upstreamReason}})
+						require.NoError(t, err)
+						decision := service.ImageRetryDecision{Version: 1, Stage: "submit", Action: item.action, Reason: item.reason, Rule: item.internal, Budget: "capacity", Used: 1, Limit: 3, TotalUsed: 1, TotalLimit: 16}
+						current := model.AsyncImageTask{TaskId: "asyncimg_compatibility_" + item.name, UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Model: "image-model", Platform: "openai", Dialect: "async", Status: item.status, BillingStatus: "refunded", PublicErrorCode: item.publicCode, ErrorCode: item.internal, ErrorMessage: upstreamReason + "; Bearer compatibility-secret-canary", Attempts: string(history), RequestedSize: "2048x1152", RequestedResolution: "2K", CreatedAt: now, ExpiresAt: now + 3600}
+						if item.retryable {
+							current.NextAttemptAt, current.BillingStatus = now+10, "reserved"
+							decision.NextAttemptAt = current.NextAttemptAt
+						}
+						encoded, err := common.Marshal(decision)
+						require.NoError(t, err)
+						current.RetryDecision = string(encoded)
+						require.NoError(t, db.Create(&current).Error)
+						t.Cleanup(func() {
+							assert.NoError(t, db.Where("task_id = ?", current.TaskId).Delete(&model.AsyncImageTask{}).Error)
+						})
+						var explanation string
+						for _, endpoint := range []string{"image-public", "media-public", "owner", "admin", "owner-list", "admin-list", "media-list"} {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Set("id", current.UserId)
+							c.Set("token_id", current.TokenId)
+							c.Params = gin.Params{{Key: "task_id", Value: current.TaskId}}
+							path := "/v1/images/tasks_async/" + current.TaskId
+							if endpoint != "image-public" {
+								path = "/v1/media/tasks_async/" + current.TaskId
+							}
+							c.Request = httptest.NewRequest(http.MethodGet, path+"?task_id="+current.TaskId+"&media_type=image", nil)
+							switch endpoint {
+							case "image-public", "media-public":
+								QueryAsyncImage(c)
+							case "owner-list", "admin-list":
+								ListImageTasks(c, endpoint == "admin-list")
+							case "media-list":
+								ListMediaTasks(c, false)
+							default:
+								GetMediaTask(c, endpoint == "admin")
+							}
+							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							var body map[string]any
+							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+							view := body
+							if strings.HasSuffix(endpoint, "-list") {
+								items := body["data"].(map[string]any)["items"].([]any)
+								require.Len(t, items, 1, endpoint)
+								view = items[0].(map[string]any)
+							} else if endpoint == "owner" || endpoint == "admin" {
+								view = body["data"].(map[string]any)["task"].(map[string]any)
+							}
+							assert.Contains(t, view["error_summary"], "上游", endpoint)
+							assert.Contains(t, view["error_summary"], "分辨率", endpoint)
+							assert.Contains(t, view["error_suggestion"], item.suggestion, endpoint)
+							assert.NotEmpty(t, view["error_summary_key"], endpoint)
+							assert.NotEmpty(t, view["error_suggestion_key"], endpoint)
+							assert.Equal(t, item.retryable, view["error_retryable"], endpoint)
+							assert.Contains(t, view["error_detail"], upstreamReason, endpoint)
+							assert.Contains(t, view["error_message"], view["error_summary"], endpoint)
+							assert.Contains(t, view["error_message"], view["error_suggestion"], endpoint)
+							assert.NotContains(t, recorder.Body.String(), "compatibility-secret-canary")
+							if explanation == "" {
+								explanation = view["error_message"].(string)
+							} else {
+								assert.Equal(t, explanation, view["error_message"], endpoint)
+							}
+							if strings.HasSuffix(endpoint, "public") && !item.retryable {
+								assert.Equal(t, explanation, view["fail_reason"])
+							}
+						}
+						var persisted model.AsyncImageTask
+						require.NoError(t, db.Where("task_id = ?", current.TaskId).Take(&persisted).Error)
+						assert.Equal(t, current, persisted, "readable errors must not change historical retry or billing records")
+					})
+				}
+			})
 			t.Run("reliability and encrypted request diagnostics", func(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
