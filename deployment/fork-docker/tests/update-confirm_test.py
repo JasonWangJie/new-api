@@ -69,6 +69,10 @@ def fake_command(tool, arguments):
             raise RuntimeError(f"Unexpected git command: {args}")
         return 0
     if tool == "docker":
+        if args == ["buildx", "version"]:
+            return int(not state.get("buildx_available", True))
+        if args in (["buildx", "prune", "--all", "--force"], ["builder", "prune", "--all", "--force"]):
+            return int(state.get("prune_fail", False))
         if args[0] == "inspect":
             template = args[args.index("--format") + 1]
             if template == "{{.Config.Image}}":
@@ -184,11 +188,12 @@ class UpdateConfirmTest(unittest.TestCase):
         self.original_image_env = f"APP_IMAGE_TAG={OLD_SHA}\nAPP_IMAGE_REPOSITORY=new-api-fork\n"
         (self.root / "image.env").write_text(self.original_image_env, encoding="utf-8")
         (self.root / "data" / "retained.txt").write_text("existing runtime data", encoding="utf-8")
-        self.write_state({
+        self.initial_state = {
             "head": OLD_SHA, "next_sha": NEW_SHA, "container": "container-old",
             "active_image": OLD_IMAGE, "active_id": OLD_ID,
             "app_running": True, "redis_running": True,
-        })
+        }
+        self.write_state(self.initial_state)
         wrapper = '#!/usr/bin/env bash\nexec "$TEST_PYTHON" "$TEST_DRIVER" --fake "${0##*/}" "$@"\n'
         for command in ("docker", "git", "flock", "curl"):
             path = self.root / "bin" / command
@@ -232,7 +237,7 @@ class UpdateConfirmTest(unittest.TestCase):
     def output(self):
         return (self.root / "output.txt").read_text(encoding="utf-8", errors="replace")
 
-    def start(self):
+    def start(self, entrypoint="confirm"):
         self.stop_process()
         self.output_file.seek(0)
         self.output_file.truncate()
@@ -241,9 +246,11 @@ class UpdateConfirmTest(unittest.TestCase):
         state.pop("built_id", None)
         self.write_state(state)
         bin_directory = '"$(cygpath -u "$TEST_ROOT")/bin"' if os.name == "nt" else '"$TEST_ROOT/bin"'
+        script = "update-confirm.sh" if entrypoint == "confirm" else "manage.sh"
+        arguments = "" if entrypoint == "confirm" else " update --ready"
         launcher = (f'export PATH={bin_directory}:"$PATH"; '
                     'printf "%s" "$BASHPID" > "$TEST_ROOT/bash.pid"; '
-                    'exec /usr/bin/bash "$NEWAPI_DEPLOY_DIR/update-confirm.sh"')
+                    f'exec /usr/bin/bash "$NEWAPI_DEPLOY_DIR/{script}"{arguments}')
         self.process = subprocess.Popen([self.bash, "-c", launcher], stdin=subprocess.PIPE,
                                         stdout=self.output_file, stderr=subprocess.STDOUT,
                                         env=self.environment)
@@ -278,6 +285,20 @@ class UpdateConfirmTest(unittest.TestCase):
         self.assertEqual([], changes, self.output())
         self.assertEqual(self.original_image_env, (self.root / "image.env").read_text(encoding="utf-8"))
         self.assertFalse((self.root / "backups").exists(), self.output())
+        self.assert_no_cache_cleanup()
+
+    def assert_no_cache_cleanup(self):
+        self.assertFalse(any(event[0] == "docker" and "prune" in event for event in self.events()), self.output())
+
+    def reset_deployment(self, entrypoint, **changes):
+        self.write_state({**self.initial_state, **changes})
+        (self.root / "image.env").write_text(self.original_image_env, encoding="utf-8")
+        backups = self.root / "backups"
+        if backups.exists():
+            shutil.rmtree(backups)
+        if entrypoint == "ready":
+            backups.mkdir()
+        self.environment["NEWAPI_PORT"] = "4040"
 
     def test_build_waits_for_confirmation(self):
         self.start()
@@ -378,6 +399,7 @@ class UpdateConfirmTest(unittest.TestCase):
                 self.assertEqual(OLD_IMAGE, self.state()["active_image"])
                 self.assertEqual(self.original_image_env, (self.root / "image.env").read_text(encoding="utf-8"))
                 self.assertIn(["compose", "start", "new-api"], self.events())
+                self.assert_no_cache_cleanup()
                 if failure == "redis_up_fail":
                     self.assertIn(["compose", "start", "redis"], self.events())
                 self.change_state(**{failure: False})
@@ -392,10 +414,45 @@ class UpdateConfirmTest(unittest.TestCase):
                 self.assertNotEqual(0, self.finish(), self.output())
                 self.assertIn(f"APP_IMAGE_TAG={NEW_SHA}\n", (self.root / "image.env").read_text(encoding="utf-8"))
                 self.assertNotIn(["compose", "start", "new-api"], self.events())
+                self.assert_no_cache_cleanup()
                 self.assertTrue(any((directory / "COMPLETE").exists() for directory in (self.root / "backups").iterdir()))
                 self.change_state(**{failure: False}, app_running=True, active_image=OLD_IMAGE, active_id=OLD_ID)
                 (self.root / "image.env").write_text(self.original_image_env, encoding="utf-8")
                 shutil.rmtree(self.root / "backups")
+
+    def test_success_cleans_build_cache_after_health_check(self):
+        for entrypoint in ("confirm", "ready"):
+            for buildx_available in (True, False):
+                for prune_fail in (False, True):
+                    with self.subTest(entrypoint=entrypoint, buildx_available=buildx_available, prune_fail=prune_fail):
+                        self.reset_deployment(entrypoint, buildx_available=buildx_available, prune_fail=prune_fail)
+                        self.start(entrypoint)
+                        self.assertEqual(0, self.finish(), self.output())
+                        events = self.events()
+                        prune = ["docker", "buildx" if buildx_available else "builder", "prune", "--all", "--force"]
+                        self.assertEqual([prune], [event for event in events if event[0] == "docker" and "prune" in event], self.output())
+                        health_index = next(index for index, event in enumerate(events) if event[0] == "curl")
+                        self.assertLess(health_index, events.index(prune), self.output())
+                        self.assertEqual(NEW_IMAGE, self.state()["active_image"])
+                        self.assertTrue(self.state()["app_running"])
+                        self.assertNotIn(["compose", "start", "new-api"], events)
+                        warning = "警告：Docker 构建缓存清理失败，更新已成功；请检查上方错误并稍后手动清理。"
+                        self.assertEqual(prune_fail, warning in self.output(), self.output())
+
+    def test_unsuccessful_or_unnecessary_updates_do_not_clean_cache(self):
+        failures = ("no_update", "build_fail", "dump_fail", "redis_up_fail", "app_up_fail", "health_fail")
+        for entrypoint in ("confirm", "ready"):
+            for failure in failures:
+                with self.subTest(entrypoint=entrypoint, failure=failure):
+                    changes = {"next_sha": OLD_SHA} if failure == "no_update" else {failure: True}
+                    self.reset_deployment(entrypoint, **changes)
+                    self.start(entrypoint)
+                    result = self.finish()
+                    if failure == "no_update":
+                        self.assertEqual(0, result, self.output())
+                    else:
+                        self.assertNotEqual(0, result, self.output())
+                    self.assert_no_cache_cleanup()
 
 
 if __name__ == "__main__":

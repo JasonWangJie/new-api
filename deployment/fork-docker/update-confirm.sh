@@ -140,3 +140,11 @@ address=$(dc port --index 1 new-api 3000)
 curl --fail --silent --show-error --max-time 15 "http://$address/api/status" | python3 -c 'import json,sys; assert json.load(sys.stdin).get("success") is True'
 echo "更新成功。当前提交：$next_sha"
 echo "更新前备份：$backup_dir"
+echo '正在清理 Docker 构建缓存；保留应用镜像、容器和数据卷。'
+cache_prune=(docker builder prune --all --force)
+if docker buildx version >/dev/null 2>&1; then
+  cache_prune=(docker buildx prune --all --force)
+fi
+if ! "${cache_prune[@]}"; then
+  echo '警告：Docker 构建缓存清理失败，更新已成功；请检查上方错误并稍后手动清理。' >&2
+fi
