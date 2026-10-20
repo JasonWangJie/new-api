@@ -662,6 +662,7 @@
     "async": "async",
     "Async": "非同期",
     "Async generation and automatic server archiving are disabled by default.": "非同期生成とサーバーへの自動保存は初期設定で無効です。",
+    "Async image API docs": "非同期画像生成APIドキュメント",
     "Async Image API Guide": "非同期画像APIガイド",
     "Async Image Tasks": "非同期画像タスク",
     "Async image tasks with more than 8 reference images prefer channels whose limit covers the request.": "参照画像が 8 枚を超える非同期画像生成タスクでは、要求数を満たす上限のチャネルが優先されます。",

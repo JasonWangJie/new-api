@@ -53,6 +53,7 @@ export default defineConfig(({ envMode }) => {
       },
     },
     source: {
+      assetsInclude: /\.md$/i,
       entry: {
         index: './src/main.tsx',
       },

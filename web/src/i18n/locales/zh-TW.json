@@ -662,6 +662,7 @@
     "async": "async",
     "Async": "異步",
     "Async generation and automatic server archiving are disabled by default.": "非同步生圖與自動伺服器封存預設關閉。",
+    "Async image API docs": "非同步生圖API文件",
     "Async Image API Guide": "非同步生圖 API 指南",
     "Async Image Tasks": "非同步圖片任務",
     "Async image tasks with more than 8 reference images prefer channels whose limit covers the request.": "參考圖超過 8 張的非同步生圖任務，會優先選擇上限可涵蓋該請求的渠道。",

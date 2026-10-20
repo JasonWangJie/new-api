@@ -662,6 +662,7 @@
     "async": "async",
     "Async": "Async",
     "Async generation and automatic server archiving are disabled by default.": "Async generation and automatic server archiving are disabled by default.",
+    "Async image API docs": "Async image API docs",
     "Async Image API Guide": "Async Image API Guide",
     "Async Image Tasks": "Async Image Tasks",
     "Async image tasks with more than 8 reference images prefer channels whose limit covers the request.": "Async image tasks with more than 8 reference images prefer channels whose limit covers the request.",

@@ -86,6 +86,10 @@ export function useTopNavLinks(): TopNavLink[] {
   // Docs always open the in-app documentation module.
   if (modules?.docs !== false) {
     links.push({ title: t('Docs'), href: '/docs' })
+    links.push({
+      title: t('Async image API docs'),
+      href: '/async-image-api-docs',
+    })
   }
 
   // About

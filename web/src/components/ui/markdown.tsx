@@ -28,6 +28,10 @@ import { cn } from '@/lib/utils'
 interface MarkdownProps {
   /** Resolve relative document links against their source, never the dashboard URL. */
   baseUrl?: string
+  /** Add heading anchors and keep fragment links in the current document. */
+  documentNavigation?: boolean
+  /** Display links outside the current document as plain text. */
+  fragmentLinksOnly?: boolean
   breaks?: boolean
   children: string
   className?: string
@@ -720,7 +724,12 @@ const markdownParser = new Marked({
 
 markdownParser.use(...markdownExtensions)
 
-function addExternalLinkAttributes(html: string, baseUrl?: string): string {
+function prepareMarkdownNavigation(
+  html: string,
+  baseUrl?: string,
+  documentNavigation = false,
+  fragmentLinksOnly = false
+): string {
   if (typeof window === 'undefined') {
     return html
   }
@@ -728,7 +737,36 @@ function addExternalLinkAttributes(html: string, baseUrl?: string): string {
   const template = document.createElement('template')
   template.innerHTML = html
 
+  if (documentNavigation) {
+    const headingIds = new Set<string>()
+    template.content
+      .querySelectorAll('h1, h2, h3, h4, h5, h6')
+      .forEach((heading) => {
+        const slug = (heading.textContent ?? '')
+          .trim()
+          .toLowerCase()
+          .replaceAll(/[^\p{L}\p{N}\p{M}_\s-]/gu, '')
+          .replaceAll(/\s/g, '-')
+        let id = slug
+        let suffix = 0
+        while (headingIds.has(id)) {
+          id = `${slug}-${++suffix}`
+        }
+        heading.id = id
+        headingIds.add(id)
+      })
+  }
+
   template.content.querySelectorAll('a[href]').forEach((link) => {
+    if (fragmentLinksOnly && !link.getAttribute('href')?.startsWith('#')) {
+      link.replaceWith(...link.childNodes)
+      return
+    }
+    if (documentNavigation && link.getAttribute('href')?.startsWith('#')) {
+      link.removeAttribute('target')
+      link.removeAttribute('rel')
+      return
+    }
     if (baseUrl) {
       try {
         const url = new URL(link.getAttribute('href') ?? '', baseUrl)
@@ -751,7 +789,9 @@ function addExternalLinkAttributes(html: string, baseUrl?: string): string {
 function renderMarkdown(
   markdown: string,
   breaks = false,
-  baseUrl?: string
+  baseUrl?: string,
+  documentNavigation = false,
+  fragmentLinksOnly = false
 ): string {
   const parsedHtml = markdownParser.parse(markdown, {
     ...markdownOptions,
@@ -759,13 +799,31 @@ function renderMarkdown(
   })
   const html = DOMPurify.sanitize(parsedHtml, sanitizeOptions)
 
-  return addExternalLinkAttributes(html, baseUrl)
+  return prepareMarkdownNavigation(
+    html,
+    baseUrl,
+    documentNavigation,
+    fragmentLinksOnly
+  )
 }
 
 export function Markdown(props: MarkdownProps) {
   const html = useMemo(
-    () => renderMarkdown(props.children, props.breaks, props.baseUrl),
-    [props.breaks, props.children, props.baseUrl]
+    () =>
+      renderMarkdown(
+        props.children,
+        props.breaks,
+        props.baseUrl,
+        props.documentNavigation,
+        props.fragmentLinksOnly
+      ),
+    [
+      props.breaks,
+      props.children,
+      props.baseUrl,
+      props.documentNavigation,
+      props.fragmentLinksOnly,
+    ]
   )
 
   return (

@@ -662,6 +662,7 @@
     "async": "async",
     "Async": "Асинхронный",
     "Async generation and automatic server archiving are disabled by default.": "Асинхронная генерация и автоматическое архивирование по умолчанию отключены.",
+    "Async image API docs": "Документация API асинхронной генерации изображений",
     "Async Image API Guide": "Руководство API асинхронных изображений",
     "Async Image Tasks": "Асинхронные задачи изображений",
     "Async image tasks with more than 8 reference images prefer channels whose limit covers the request.": "Для асинхронных задач с более чем 8 референсными изображениями приоритет получают каналы с подходящим лимитом.",

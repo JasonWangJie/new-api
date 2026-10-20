@@ -1,5 +1,9 @@
 # new-api 补充说明与功能索引
 
+## 公开异步生图 API 文档与完整顶部导航（2026-10-20，待提交，未发布）
+
+顶部新增「异步生图API文档」，指向无需登录即可访问的 `/async-image-api-docs`；首页、公开页和控制台共用同一入口，菜单可见性沿用现有「文档」开关。页面使用独立公开文档 `web/src/features/docs/data/async-image-api.zh.md`，保留图片、视频、查询及错误说明、表格、代码和章节跳转，去掉仓库来源地址与管理员手册提示；不展示 GitHub 或仓库文档链接。原根目录 `异步生图API接口文档.md` 不改动，公开副本以后单独维护。公开导航固定在顶部，滚动时不再缩成窄条；桌面菜单完整显示文字，窄屏使用展开菜单。七语菜单及更多说明见[公开 API 文档](wiki/07-站内文档中心.md#public-async-image-api-docs)，验证见[10 月台账](wiki/10-2026年10月代码变更台账.md#public-async-image-api-docs-change)。
+
 ## 发布成功后自动清理 Docker 构建缓存（2026-10-20，待提交，脚本已同步）
 
 `manage.sh update --ready` 和 `update-confirm.sh` 在新版本启动、`/api/status` 健康检查成功后自动清理构建缓存。优先执行当前 builder 的 `docker buildx prune --all --force`，没有 Buildx 时使用 `docker builder prune --all --force`；仅清理可回收构建缓存，保留应用镜像、容器、数据卷和备份。清理失败输出警告，已经成功的更新仍正常结束；取消、无需更新或发布失败不执行清理。清理后下次构建可能变慢；与其他项目共用 builder 时也会清理其可回收缓存。北京时间 2026-10-20 20:06:59 已按用户指令将本次清理改动同步至服务器 `/opt/new-api/` 的两份脚本，各增加 8 行并保留服务器原有逻辑；原文件已备份，语法、哈希及容器运行状态核对通过。本次未执行应用更新、重启或实际缓存清理，下次正常发布成功后自动清理。操作见[构建缓存清理说明](wiki/04-首页与部署.md#docker-build-cache-cleanup)，验证范围见[10 月台账](wiki/10-2026年10月代码变更台账.md#docker-build-cache-cleanup-change)。
