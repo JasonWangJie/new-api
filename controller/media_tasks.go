@@ -57,6 +57,10 @@ func QueryAsyncMedia(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "storage_unavailable", "Media results are unavailable")
 		return
 	}
+	if view["status"] == "execution_unknown" {
+		view["status"], view["stage"] = "failed", "failed"
+		view["error_code"], view["error_retryable"] = "execution_unknown", false
+	}
 	c.Header("Cache-Control", "no-store")
 	view["data"] = results
 	c.JSON(http.StatusOK, view)

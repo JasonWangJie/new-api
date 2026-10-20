@@ -806,6 +806,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}{
 					{name: "local queue before submission", jobStatus: "queued", noTask: true, terminable: true, status: "queued", stage: "queued", progress: 0},
 					{name: "submission before task receipt", jobStatus: "submitting", noTask: true, status: "invoking", stage: "generating", progress: 10},
+					{name: "unknown submission is a public terminal failure", jobStatus: "execution_unknown", noTask: true, status: "execution_unknown", stage: "failed", progress: 0},
 					{name: "not started", taskStatus: model.TaskStatusNotStart, taskProgress: "0%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 10, upstreamProgress: float64(0)},
 					{name: "submitted", taskStatus: model.TaskStatusSubmitted, taskProgress: "10%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 10, upstreamProgress: float64(0)},
 					{name: "queued", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "queued", stage: "queued", progress: 14, upstreamProgress: float64(0)},
@@ -814,6 +815,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "invalid upstream progress", taskStatus: model.TaskStatusInProgress, taskProgress: "30%", data: `{"status":"in_progress","progress":101}`, status: "invoking", stage: "generating", progress: 21},
 					{name: "awaiting upstream billing", taskStatus: model.TaskStatusInProgress, taskProgress: "99%", data: `{"status":"completed","progress":100}`, status: "invoking", stage: "generating", progress: 69, upstreamProgress: float64(100)},
 					{name: "upstream completed", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
+					{name: "known completion supersedes unknown submission", jobStatus: "execution_unknown", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
 					{name: "completed awaiting storage", jobStatus: "succeeded", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
 					{name: "saving takes precedence", taskStatus: model.TaskStatusQueued, storage: "saving", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "uploading", stage: "saving", progress: 80, upstreamProgress: float64(0)},
 					{name: "storage failure takes precedence", taskStatus: model.TaskStatusQueued, storage: "failed", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "storage_failed", stage: "saving", progress: 80, upstreamProgress: float64(0)},
@@ -827,8 +829,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				} {
 					t.Run(tc.name, func(t *testing.T) {
 						job.Status, job.StorageStatus, job.Provider, job.ExpiresAt, job.DispatchedAt = "submitted", "pending", "drama", now+3600, now-5
+						job.BillingStatus, job.Quota, job.ErrorMessage = "reserved", 0, ""
 						if tc.jobStatus != "" {
 							job.Status = tc.jobStatus
+						}
+						if job.Status == "execution_unknown" {
+							job.BillingStatus, job.Quota = "unknown", 2250000
+							job.ErrorMessage = "Upstream submission could not be confirmed; the video operation will not be repeated"
 						}
 						if tc.storage != "" {
 							job.StorageStatus = tc.storage
@@ -878,7 +885,28 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							if surface != "public" {
 								view = view["data"].(map[string]any)["task"].(map[string]any)
 							}
-							assert.Equal(t, tc.status, view["status"], surface)
+							expectedStatus := tc.status
+							expectedTerminable := tc.terminable
+							if tc.status == "execution_unknown" {
+								assert.Equal(t, "unknown", view["billing_status"], surface)
+								assert.Equal(t, float64(job.Quota), view["quota"], surface)
+								assert.Equal(t, 4.5, view["cost"], surface)
+								assert.Zero(t, view["finished_at"], surface)
+								assert.False(t, view["can_resume"].(bool), surface)
+								if surface == "public" {
+									expectedStatus = "failed"
+									assert.Equal(t, "execution_unknown", view["error_code"])
+									assert.Equal(t, false, view["error_retryable"])
+								} else {
+									expectedTerminable = surface == "administrator"
+									assert.Empty(t, view["error_code"], surface)
+									assert.NotContains(t, view, "error_retryable", surface)
+								}
+							} else {
+								assert.NotEqual(t, "execution_unknown", view["error_code"], surface)
+								assert.NotContains(t, view, "error_retryable", surface)
+							}
+							assert.Equal(t, expectedStatus, view["status"], surface)
 							assert.Equal(t, tc.stage, view["stage"], surface)
 							assert.Equal(t, float64(tc.progress), view["progress"], surface)
 							if tc.upstreamProgress == nil {
@@ -886,8 +914,11 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							} else {
 								assert.Equal(t, tc.upstreamProgress, view["upstream_progress"], surface)
 							}
-							assert.Equal(t, tc.terminable, view["can_terminate"], surface)
+							assert.Equal(t, expectedTerminable, view["can_terminate"], surface)
 						}
+						var persisted model.AsyncMediaJob
+						require.NoError(t, db.Where("id = ?", job.ID).Take(&persisted).Error)
+						assert.Equal(t, job, persisted, "queries must preserve the job, quotation, billing and scheduling state")
 						for _, admin := range []bool{false, true} {
 							for _, filter := range []string{"", "&status=" + tc.status, "&stage=" + tc.stage, "&status=queued&stage=generating"} {
 								recorder := httptest.NewRecorder()
@@ -1413,7 +1444,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							} else if endpoint != "public" {
 								view = body["data"].(map[string]any)["task"].(map[string]any)
 							}
-							assert.Equal(t, item.status, view["status"], endpoint)
+							expectedStatus := item.status
+							if endpoint == "public" && item.status == "execution_unknown" {
+								expectedStatus = "failed"
+								assert.Equal(t, "execution_unknown", view["error_code"])
+								assert.Equal(t, false, view["error_retryable"])
+							}
+							assert.Equal(t, expectedStatus, view["status"], endpoint)
 							assert.Equal(t, item.billing, view["billing_status"], endpoint)
 							assert.Contains(t, view["error_summary"], item.summary, endpoint)
 							assert.Contains(t, view["error_suggestion"], item.suggestion, endpoint)
@@ -1504,7 +1541,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 						var view map[string]any
 						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
-						assert.Equal(t, status, view["status"])
+						expectedPublicStatus := status
+						if dispatched {
+							expectedPublicStatus = "failed"
+							assert.Equal(t, "execution_unknown", view["error_code"])
+							assert.Equal(t, false, view["error_retryable"])
+						}
+						assert.Equal(t, expectedPublicStatus, view["status"])
 						assert.Equal(t, billing, view["billing_status"])
 						assert.Contains(t, view["error_summary"], summary)
 						assert.NotEmpty(t, view["error_suggestion"])
