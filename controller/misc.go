@@ -45,12 +45,14 @@ func GetStatus(c *gin.Context) {
 
 	cs := console_setting.GetConsoleSetting()
 	passkeySetting := system_setting.PasskeySettingsSnapshot()
+	canvasSetting := system_setting.InfiniteCanvasSettingsSnapshot()
 	common.OptionMapRWMutex.RLock()
 	defer common.OptionMapRWMutex.RUnlock()
 
 	legalSetting := system_setting.GetLegalSettings()
 
 	data := gin.H{
+		"infinite_canvas":             canvasSetting,
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,

@@ -199,6 +199,10 @@ func GetTokenKey(c *gin.Context) {
 	}
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
+	if model.IsCanvasTokenKey(token.Key) {
+		common.ApiErrorMsg(c, "Managed Infinite Canvas credentials cannot be displayed")
+		return
+	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	common.ApiSuccess(c, gin.H{
 		"key": token.GetFullKey(),
@@ -416,6 +420,17 @@ func UpdateToken(c *gin.Context) {
 	}
 	params["name"] = cleanToken.Name
 	previous := *cleanToken
+	if model.IsCanvasTokenKey(cleanToken.Key) {
+		if statusOnly == "" || token.Status != common.TokenStatusDisabled {
+			common.ApiErrorMsg(c, "Managed Infinite Canvas credentials can only be disabled or deleted")
+			return
+		}
+		var grant model.CanvasGrant
+		if err := model.DB.Where("token_id = ?", cleanToken.Id).Take(&grant).Error; err != nil || service.RevokeCanvasGrant(c.Request.Context(), grant.ID) != nil {
+			common.ApiErrorMsg(c, "Could not revoke Infinite Canvas authorization")
+			return
+		}
+	}
 	if token.Status == common.TokenStatusEnabled {
 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
 			common.ApiErrorI18n(c, i18n.MsgTokenExpiredCannotEnable)
@@ -542,6 +557,9 @@ func GetTokenKeysBatch(c *gin.Context) {
 	keysMap := make(map[int]string)
 	returnedIDs := make([]int, 0, len(tokens))
 	for _, t := range tokens {
+		if model.IsCanvasTokenKey(t.Key) {
+			continue
+		}
 		keysMap[t.Id] = t.GetFullKey()
 		returnedIDs = append(returnedIDs, t.Id)
 	}

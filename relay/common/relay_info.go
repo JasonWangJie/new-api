@@ -86,6 +86,7 @@ type RelayInfo struct {
 	TokenKey          string
 	TokenGroup        string
 	UserId            int
+	CanvasSubject     string
 	UsingGroup        string // 使用的分组，当auto跨分组重试时，会变动
 	UserGroup         string // 用户所在分组
 	TokenUnlimited    bool
@@ -589,12 +590,13 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		Request:         request,
 		ReasoningEffort: reasoningEffort,
 
-		RequestId:  reqId,
-		UserId:     common.GetContextKeyInt(c, constant.ContextKeyUserId),
-		UsingGroup: common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
-		UserGroup:  common.GetContextKeyString(c, constant.ContextKeyUserGroup),
-		UserQuota:  common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
-		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
+		RequestId:     reqId,
+		UserId:        common.GetContextKeyInt(c, constant.ContextKeyUserId),
+		CanvasSubject: c.GetString("canvas_subject"),
+		UsingGroup:    common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
+		UserGroup:     common.GetContextKeyString(c, constant.ContextKeyUserGroup),
+		UserQuota:     common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
+		UserEmail:     common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
 		OriginModelName: originModelName,
 

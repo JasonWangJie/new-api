@@ -25,6 +25,24 @@ import (
 
 const authIdentityContextKey = "auth_identity"
 
+// CanvasIntegrationCredentials runs before dashboard PAT auditing: confidential
+// client credentials are never mistaken for a user PAT or copied downstream.
+func CanvasIntegrationCredentials() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.Path == "/api/integrations/canvas/authorize" && strings.HasPrefix(strings.ToLower(c.GetHeader("Authorization")), "basic ") {
+			c.Request.Header.Del("Authorization")
+		}
+		if strings.HasPrefix(c.Request.URL.Path, "/api/integrations/canvas/") && c.Request.URL.Path != "/api/integrations/canvas/authorize" {
+			c.Set("canvas_client_authenticated", len(c.Request.Header.Values("Authorization")) == 1 && service.AuthenticateCanvasClient(c.GetHeader("Authorization")))
+			c.Set("canvas_request_grant", c.GetHeader(service.CanvasGrantHeader))
+			c.Request.Header.Del("Authorization")
+			c.Request.Header.Del(service.CanvasGrantHeader)
+		}
+		c.Request.Header.Del(service.CanvasClientProofHeader)
+		c.Next()
+	}
+}
+
 type dashboardCredentialKind int
 
 const (
@@ -287,6 +305,12 @@ func TokenOrUserAuth() func(c *gin.Context) {
 // 仍然检查用户是否被封禁。
 func TokenAuthReadOnly() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		canvasProof := c.GetHeader(service.CanvasClientProofHeader)
+		if len(c.Request.Header.Values(service.CanvasClientProofHeader)) != 1 {
+			canvasProof = ""
+		}
+		c.Request.Header.Del(service.CanvasClientProofHeader)
+		c.Request.Header.Del(service.CanvasGrantHeader)
 		key := c.Request.Header.Get("Authorization")
 		if key == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{
@@ -303,7 +327,16 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		parts := strings.Split(key, "-")
 		key = parts[0]
 
-		token, err := model.GetTokenByKey(key, false)
+		var token *model.Token
+		var err error
+		if model.IsCanvasTokenKey(key) {
+			token, _, err = authenticateCanvasRelay(c, key, canvasProof)
+			if err != nil {
+				return
+			}
+		} else {
+			token, err = model.GetTokenByKey(key, false)
+		}
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusUnauthorized, gin.H{
@@ -360,6 +393,12 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		canvasProof := c.GetHeader(service.CanvasClientProofHeader)
+		if len(c.Request.Header.Values(service.CanvasClientProofHeader)) != 1 {
+			canvasProof = ""
+		}
+		c.Request.Header.Del(service.CanvasClientProofHeader)
+		c.Request.Header.Del(service.CanvasGrantHeader)
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
 		// 检查path包含/v1/messages 或 /v1/models
@@ -402,7 +441,21 @@ func TokenAuth() func(c *gin.Context) {
 			parts = strings.Split(key, "-")
 			key = parts[0]
 		}
-		token, err := model.ValidateUserToken(key)
+		var token *model.Token
+		var canvasUser *model.UserBase
+		var err error
+		if model.IsCanvasTokenKey(key) {
+			if len(parts) > 1 || c.Query("key") != "" {
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, "Infinite Canvas credentials require the application server")
+				return
+			}
+			token, canvasUser, err = authenticateCanvasRelay(c, key, canvasProof)
+			if err != nil {
+				return
+			}
+		} else {
+			token, err = model.ValidateUserToken(key)
+		}
 		if token != nil {
 			id := c.GetInt("id")
 			if id == 0 {
@@ -437,7 +490,10 @@ func TokenAuth() func(c *gin.Context) {
 			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
 		}
 
-		userCache, err := model.GetUserCache(token.UserId)
+		userCache := canvasUser
+		if userCache == nil {
+			userCache, err = model.GetUserCache(token.UserId)
+		}
 		if err != nil {
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
 			abortWithOpenAiMessage(c, http.StatusInternalServerError,
@@ -477,6 +533,21 @@ func TokenAuth() func(c *gin.Context) {
 		}
 		c.Next()
 	}
+}
+
+func authenticateCanvasRelay(c *gin.Context, key, proof string) (*model.Token, *model.UserBase, error) {
+	token, user, grant, err := service.ValidateCanvasCredential(c.Request.Context(), key, proof, c.Request.Method, c.Request.URL.Path)
+	if err != nil {
+		status := http.StatusUnauthorized
+		if errors.Is(err, service.ErrCanvasUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		abortWithOpenAiMessage(c, status, err.Error())
+		return nil, nil, err
+	}
+	c.Set(service.CanvasGrantContextKey, grant)
+	c.Set("canvas_subject", grant.Subject)
+	return token, user, nil
 }
 
 func applyWebSocketSubprotocolAuthorization(header http.Header) bool {

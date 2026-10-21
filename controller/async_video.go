@@ -692,6 +692,9 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 }
 
 func validateMediaToken(ctx context.Context, token model.Token, ipAddress string) error {
+	if model.IsCanvasTokenKey(token.Key) {
+		return errors.New("managed media requires the Infinite Canvas content bridge")
+	}
 	if token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted || token.ExpiredTime != -1 && token.ExpiredTime <= time.Now().Unix() {
 		return errors.New("media Token is unavailable")
 	}

@@ -45,6 +45,9 @@ var (
 
 func GetTask(c *gin.Context) {
 	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
+	if exists && !service.CanvasTaskAccess(c, task) {
+		exists = false
+	}
 	if err != nil {
 		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
 		return
@@ -74,6 +77,9 @@ func GetTask(c *gin.Context) {
 
 func GetTaskArtifacts(c *gin.Context) {
 	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
+	if exists && !service.CanvasTaskAccess(c, task) {
+		exists = false
+	}
 	if err != nil {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
 		return
@@ -288,6 +294,12 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 		if err != nil || !exists || task == nil {
 			return task, exists, err
 		}
+		if task.PrivateData.TokenId > 0 {
+			var canvasCount int64
+			if err := model.DB.WithContext(c.Request.Context()).Model(&model.CanvasGrant{}).Where("token_id = ?", task.PrivateData.TokenId).Count(&canvasCount).Error; err != nil || canvasCount > 0 {
+				return nil, false, err
+			}
+		}
 		owner, err := model.GetUserCache(task.UserId)
 		if err != nil || owner == nil || owner.Status != common.UserStatusEnabled {
 			return nil, false, err
@@ -297,7 +309,11 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
 		return model.GetByOnlyTaskId(taskID)
 	}
-	return model.GetByTaskId(c.GetInt("id"), taskID)
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), taskID)
+	if exists && !service.CanvasTaskAccess(c, task) {
+		return nil, false, nil
+	}
+	return task, exists, err
 }
 
 func writeTaskArtifactProjectionError(c *gin.Context, err error) {
@@ -472,6 +488,41 @@ func GetUserTask(c *gin.Context) {
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp}
+	var owner model.User
+	if err := model.DB.WithContext(c.Request.Context()).First(&owner, userID).Error; err != nil {
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
+	subject := ""
+	if owner.CanvasSubject != nil {
+		subject = *owner.CanvasSubject
+	}
+	var previousAccounts []model.CanvasGrant
+	if err := model.DB.WithContext(c.Request.Context()).Select("token_id").Where("user_id = ? AND subject <> ?", userID, subject).Find(&previousAccounts).Error; err != nil {
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
+	if len(previousAccounts) > 0 {
+		// Numeric ID reuse is rare. Filter before pagination so neither rows nor
+		// total counts reveal a previous account's application task history.
+		foreignTokens := make(map[int]struct{}, len(previousAccounts))
+		for _, grant := range previousAccounts {
+			foreignTokens[grant.TokenID] = struct{}{}
+		}
+		candidates := model.TaskGetAllUserTask(userID, 0, -1, queryParams)
+		items := make([]*model.Task, 0, len(candidates))
+		for _, task := range candidates {
+			if _, foreign := foreignTokens[task.PrivateData.TokenId]; !foreign {
+				items = append(items, task)
+			}
+		}
+		pageInfo.SetTotal(len(items))
+		start := min(max(0, pageInfo.GetStartIdx()), len(items))
+		end := min(start+max(0, pageInfo.GetPageSize()), len(items))
+		pageInfo.SetItems(tasksToDto(items[start:end], false, common.RoleCommonUser))
+		common.ApiSuccess(c, pageInfo)
+		return
+	}
 	items := model.TaskGetAllUserTask(userID, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	pageInfo.SetTotal(int(model.TaskCountAllUserTask(userID, queryParams)))
 	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))

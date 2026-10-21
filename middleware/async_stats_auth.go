@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -24,6 +25,8 @@ func AsyncTaskStatsAuth() gin.HandlerFunc {
 		rateLimit = rateLimitFactory(common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration, "AST")
 	}
 	return func(c *gin.Context) {
+		c.Request.Header.Del(service.CanvasClientProofHeader)
+		c.Request.Header.Del(service.CanvasGrantHeader)
 		c.Header("Cache-Control", "no-store")
 		if rateLimit != nil {
 			rateLimit(c)
@@ -43,6 +46,10 @@ func AsyncTaskStatsAuth() gin.HandlerFunc {
 			return
 		}
 		key := strings.TrimPrefix(parts[1], "sk-")
+		if model.IsCanvasTokenKey(key) {
+			abortAsyncTaskStatsAuth(c, http.StatusUnauthorized, "application_scope_denied")
+			return
+		}
 		if key == "" || len(key) > 128 || strings.ContainsAny(key, ",\r\n") {
 			abortAsyncTaskStatsAuth(c, http.StatusUnauthorized, "invalid_authorization")
 			return

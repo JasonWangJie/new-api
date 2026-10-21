@@ -74,7 +74,7 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	if err != nil {
 		return service.TaskErrorWrapper(err, "get_origin_task_failed", http.StatusInternalServerError)
 	}
-	if !exist {
+	if !exist || !service.CanvasTaskAccess(c, originTask) {
 		return service.TaskErrorWrapperLocal(errors.New("task_origin_not_exist"), "task_not_exist", http.StatusBadRequest)
 	}
 	if info.Action == constant.TaskActionRemix && originTask.Status != model.TaskStatusSuccess {
@@ -687,7 +687,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		taskResp = service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
 		return
 	}
-	if !exist {
+	if !exist || !service.CanvasTaskAccess(c, originTask) {
 		taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusBadRequest)
 		return
 	}

@@ -464,6 +464,46 @@ func TestAsyncTaskStats(t *testing.T) {
 	})
 }
 
+func TestCanvasControlPlaneRetainsNormalRateBudget(t *testing.T) {
+	oldRedis, oldEnabled := common.RDB, common.RedisEnabled
+	oldGlobal, oldCritical, oldCount := common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.CriticalRateLimitNum
+	oldSettings := system_setting.InfiniteCanvasSettingsSnapshot()
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.CriticalRateLimitNum = false, true, 2
+	t.Setenv("INFINITE_CANVAS_CLIENT_SECRET", strings.Repeat("fixture", 8))
+	require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"enabled": "true", "url": "https://canvas.example.test", "client_id": "infinite-canvas"}))
+	t.Cleanup(func() {
+		require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"enabled": strconv.FormatBool(oldSettings.Enabled), "url": oldSettings.URL, "client_id": oldSettings.ClientID}))
+		common.RDB, common.RedisEnabled = oldRedis, oldEnabled
+		common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable, common.CriticalRateLimitNum = oldGlobal, oldCritical, oldCount
+		require.NoError(t, client.Close())
+	})
+	engine := gin.New()
+	SetApiRouter(engine)
+	for _, route := range []struct {
+		path, address string
+		statuses      []int
+	}{
+		{"introspect", "203.0.113.155:1234", []int{200, 200, 200}},
+		{"exchange", "203.0.113.155:1234", []int{401, 401, 429}},
+		{"authorize", "203.0.113.156:1234", []int{401, 401, 429}},
+	} {
+		for _, status := range route.statuses {
+			request := httptest.NewRequest(http.MethodPost, "/api/integrations/canvas/"+route.path, strings.NewReader(`{}`))
+			request.RemoteAddr = route.address
+			request.Header.Set("Content-Type", "application/json")
+			if route.path != "authorize" {
+				request.SetBasicAuth("infinite-canvas", system_setting.CanvasClientSecret())
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, status, response.Code, route.path+": "+response.Body.String())
+		}
+	}
+}
+
 func TestAsyncImageAdminDiagnosticsRejectUserCredentials(t *testing.T) {
 	previousDB, previousLogDB, previousRedis, previousLimit := model.DB, model.LOG_DB, common.RedisEnabled, common.GlobalApiRateLimitEnable
 	previousType := common.MainDatabaseType()
@@ -564,7 +604,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	require.NoError(t, err)
 	model.LOG_DB = imageLogs
 	common.MemoryCacheEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, true, true
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.QuotaData{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.QuotaData{}))
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	require.NoError(t, model.MigrateImageLogs(model.LOG_DB))
 	require.NoError(t, model.MigrateImageModels(model.DB))
@@ -1012,14 +1052,16 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		gmRejectedQuery := request("GET", "/v1/tasks_sc/"+nativeTask.TaskId, "", "", token.Key)
 		require.Equal(t, 200, gmRejectedQuery.Code, gmRejectedQuery.Body.String())
 		var rejectedResult struct {
-			Status     string `json:"status"`
-			ErrorCode  int    `json:"error_code"`
-			FailReason string `json:"fail_reason"`
+			Status       string `json:"status"`
+			ErrorCode    int    `json:"error_code"`
+			ErrorMessage string `json:"error_message"`
+			FailReason   string `json:"fail_reason"`
 		}
 		require.NoError(t, common.Unmarshal(gmRejectedQuery.Body.Bytes(), &rejectedResult))
 		assert.Equal(t, "failed", rejectedResult.Status)
 		assert.Equal(t, 611, rejectedResult.ErrorCode)
-		assert.Equal(t, task.ErrorMessage, rejectedResult.FailReason)
+		assert.Equal(t, rejectedResult.ErrorMessage, rejectedResult.FailReason)
+		assert.Contains(t, rejectedResult.FailReason, task.ErrorMessage)
 		responseStatus.Store(http.StatusOK)
 		responseRequestID.Store("")
 		responseBody.Store(`{"candidates":[`)

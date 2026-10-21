@@ -29,7 +29,15 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 		if current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.Quota != task.Quota {
 			return errors.New("measured task accounting inputs do not match persisted task")
 		}
-		userResult := tx.Unscoped().Model(&User{}).Where("id = ?", task.UserId).Updates(map[string]any{
+		subject, err := CanvasBillingSubject(tx, current.PrivateData.TokenId, task.UserId)
+		if err != nil {
+			return err
+		}
+		userQuery := tx.Unscoped().Model(&User{}).Where("id = ?", task.UserId)
+		if subject != "" {
+			userQuery = userQuery.Where("canvas_subject = ?", subject)
+		}
+		userResult := userQuery.Updates(map[string]any{
 			"used_quota":    gorm.Expr("used_quota + ?", task.Quota),
 			"request_count": gorm.Expr("request_count + 1"),
 		})
@@ -101,7 +109,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		}
 		updated.PrivateData.BillingContext = &copied
 	}
-	var tokenKey string
+	var tokenKey, subject, generation string
 	// Cache reservations are made while holding the task row lock. Track them
 	// separately so a database rollback or token rejection compensates exactly
 	// the cache changes made by this attempt.
@@ -123,6 +131,14 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			return errors.New("task settlement identity mismatch")
 		}
 		privateData := current.PrivateData
+		var subjectErr error
+		subject, subjectErr = CanvasBillingSubject(tx, privateData.TokenId, task.UserId)
+		if subjectErr != nil {
+			return subjectErr
+		}
+		if err := LockCanvasBillingOwner(tx, task.UserId, subject); err != nil {
+			return err
+		}
 		var subscription UserSubscription
 		samePeriod := true
 		if privateData.BillingSource == "subscription" {
@@ -142,6 +158,15 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			}
 			tokenKey = token.Key
 		}
+		var ownerErr error
+		subject, ownerErr = ValidateCanvasBillingOwner(tx, token, user)
+		if ownerErr != nil {
+			return ownerErr
+		}
+		generation, ownerErr = canvasQuotaCacheGeneration(user.Id, subject)
+		if ownerErr != nil || common.RedisEnabled && subject != "" && generation == "" && delta > 0 && privateData.BillingSource != "subscription" {
+			return ErrImageQuotaCacheUnavailable
+		}
 		affordable := true
 		if delta > 0 {
 			if privateData.BillingSource == "subscription" {
@@ -150,7 +175,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			} else if user.Quota < delta {
 				affordable = false
 			} else if common.RedisEnabled {
-				result, cacheErr := cacheTryReserveUserQuota(task.UserId, int64(delta))
+				result, cacheErr := cacheTryReserveUserQuota(task.UserId, int64(delta), subject, generation)
 				if cacheErr != nil || result == cacheQuotaMiss {
 					if common.BatchUpdateEnabled {
 						return errors.New("task settlement wallet cache unavailable during batch updates")
@@ -209,6 +234,9 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			}
 			userUpdates := map[string]any{"used_quota": gorm.Expr("used_quota + ?", delta)}
 			userQuery := tx.Unscoped().Model(&User{}).Where("id = ?", task.UserId)
+			if subject != "" {
+				userQuery = userQuery.Where("canvas_subject = ?", subject)
+			}
 			if current.PrivateData.SubmitAccountingRecorded && credit > 0 {
 				userQuery = userQuery.Where("used_quota >= ?", credit)
 			}
@@ -285,7 +313,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		*task = updated
 	}
 	if task.PrivateData.BillingSource != "subscription" {
-		syncDurableUserQuotaCache(task.UserId, cacheDelta+userCacheReserved)
+		syncDurableUserQuotaCache(task.UserId, cacheDelta+userCacheReserved, subject, generation)
 	}
 	if tokenKey != "" {
 		syncDurableTokenQuotaCache(task.PrivateData.TokenId, tokenKey, cacheDelta+tokenCacheReserved)

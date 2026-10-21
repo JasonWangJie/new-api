@@ -48,11 +48,13 @@ func prepareAsyncImageQuotaCaches(ctx context.Context, userID, tokenID int) erro
 }
 
 type asyncImageQuotaCacheReservation struct {
-	userID   int
-	tokenID  int
-	tokenKey string
-	wallet   int
-	token    int
+	userID     int
+	tokenID    int
+	tokenKey   string
+	subject    string
+	generation string
+	wallet     int
+	token      int
 }
 
 func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, wallet, tokenQuota int) error {
@@ -63,8 +65,13 @@ func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, walle
 	if common.RDB == nil {
 		return ErrImageQuotaCacheUnavailable
 	}
+	var generationErr error
+	r.generation, generationErr = canvasQuotaCacheGeneration(userID, r.subject)
+	if generationErr != nil {
+		return ErrImageQuotaCacheUnavailable
+	}
 	if wallet > 0 {
-		result, err := cacheTryReserveUserQuota(userID, int64(wallet))
+		result, err := cacheTryReserveUserQuota(userID, int64(wallet), r.subject, r.generation)
 		if err != nil {
 			return fmt.Errorf("%w: wallet: %v", ErrImageQuotaCacheUncertain, err)
 		}
@@ -93,7 +100,7 @@ func (r *asyncImageQuotaCacheReservation) reserve(userID int, token Token, walle
 }
 
 func (r *asyncImageQuotaCacheReservation) compensate() error {
-	return syncAsyncImageQuotaCache(r.userID, r.tokenID, r.tokenKey, r.wallet, r.token, 0)
+	return syncAsyncImageQuotaCache(r.userID, r.tokenID, r.tokenKey, r.wallet, r.token, 0, r.subject, r.generation)
 }
 
 // Refunds and failed-transaction compensation are deltas, never cache
@@ -101,7 +108,7 @@ func (r *asyncImageQuotaCacheReservation) compensate() error {
 // If a process dies between the DB commit and a refund projection, the cache
 // remains conservatively lower until its normal expiry; the durable ledger
 // remains authoritative. Do not retry an ambiguous additive cache operation.
-func syncAsyncImageQuotaCache(userID, tokenID int, tokenKey string, wallet, tokenQuota, tokenUsage int) error {
+func syncAsyncImageQuotaCache(userID, tokenID int, tokenKey string, wallet, tokenQuota, tokenUsage int, subjects ...string) error {
 	if !common.RedisEnabled || wallet == 0 && tokenQuota == 0 && tokenUsage == 0 {
 		return nil
 	}
@@ -110,7 +117,7 @@ func syncAsyncImageQuotaCache(userID, tokenID int, tokenKey string, wallet, toke
 	}
 	var projectionErrors []error
 	if wallet != 0 {
-		if _, err := cacheApplyUserQuotaDelta(userID, int64(wallet)); err != nil {
+		if _, err := cacheApplyUserQuotaDelta(userID, int64(wallet), subjects...); err != nil {
 			common.SysError(fmt.Sprintf("image wallet cache delta unavailable for user %d; retained conservative cache: %v", userID, err))
 			projectionErrors = append(projectionErrors, err)
 		}
@@ -177,6 +184,10 @@ func ReserveAsyncImageQuota(ctx context.Context, task AsyncImageTask, amount int
 		}
 		var token Token
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
+			return err
+		}
+		cached.subject, err = ValidateCanvasBillingOwner(tx, token, user)
+		if err != nil {
 			return err
 		}
 		walletDelta, tokenDelta := 0, 0
@@ -258,7 +269,7 @@ func ReserveAsyncImageQuota(ctx context.Context, task AsyncImageTask, amount int
 // failure. Execution-unknown holds require an explicit administrator decision.
 func RefundAsyncImageReservation(ctx context.Context, taskID string) error {
 	var userID, tokenID, walletRefund, tokenRefund int
-	var tokenKey string
+	var tokenKey, subject, generation string
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task AsyncImageTask
 		if err := lockForUpdate(tx).Where("task_id = ?", taskID).Take(&task).Error; err != nil {
@@ -288,6 +299,14 @@ func RefundAsyncImageReservation(ctx context.Context, taskID string) error {
 		var token Token
 		if err := lockForUpdate(tx.Unscoped()).Where("id = ? AND user_id = ?", bill.TokenId, bill.UserId).Take(&token).Error; err != nil {
 			return err
+		}
+		subject, err = ValidateCanvasBillingOwner(tx, token, user)
+		if err != nil {
+			return err
+		}
+		generation, err = canvasQuotaCacheGeneration(user.Id, subject)
+		if err != nil {
+			return ErrImageQuotaCacheUnavailable
 		}
 		if bill.FundingSource == "wallet" {
 			if user.Quota > math.MaxInt64-bill.ReservedQuota {
@@ -334,7 +353,7 @@ func RefundAsyncImageReservation(ctx context.Context, taskID string) error {
 		return tx.Create(&AsyncImageEvent{TaskId: taskID, EventKey: common.GetUUID(), EventType: "reservation_refunded", Status: task.Status, Message: "Reserved image quota released", CreatedAt: time.Now().Unix()}).Error
 	})
 	if err == nil {
-		syncAsyncImageQuotaCache(userID, tokenID, tokenKey, walletRefund, tokenRefund, 0)
+		syncAsyncImageQuotaCache(userID, tokenID, tokenKey, walletRefund, tokenRefund, 0, subject, generation)
 	}
 	return err
 }

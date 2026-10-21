@@ -133,6 +133,9 @@ export type SystemTaskListResponse = {
 }
 
 export type SiteSettings = {
+  'infinite_canvas.enabled': boolean
+  'infinite_canvas.url': string
+  'infinite_canvas.client_id': string
   Notice: string
   SystemName: string
   Logo: string

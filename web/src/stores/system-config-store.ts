@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
+import type { CanvasIntegration } from '@/features/infinite-canvas/config'
 import { DEFAULT_SYSTEM_NAME, DEFAULT_LOGO } from '@/lib/constants'
 
 export type CurrencyDisplayType = 'USD' | 'CNY' | 'TOKENS' | 'CUSTOM'
@@ -44,6 +45,7 @@ export interface SystemConfig {
   footerHtml?: string
   demoSiteEnabled?: boolean
   displayTokenStatEnabled?: boolean
+  infiniteCanvas?: CanvasIntegration
   currency: CurrencyConfig
 }
 

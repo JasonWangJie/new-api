@@ -1299,7 +1299,7 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 }
 
 // PreConsumeUserSubscription pre-consumes from any active subscription total quota.
-func PreConsumeUserSubscription(requestId string, userId int, modelName string, quotaType int, amount int64) (*SubscriptionPreConsumeResult, error) {
+func PreConsumeUserSubscription(requestId string, userId int, modelName string, quotaType int, amount int64, subjects ...string) (*SubscriptionPreConsumeResult, error) {
 	if userId <= 0 {
 		return nil, errors.New("invalid userId")
 	}
@@ -1314,6 +1314,11 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 	returnValue := &SubscriptionPreConsumeResult{}
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if len(subjects) > 0 {
+			if err := LockCanvasBillingOwner(tx, userId, subjects[0]); err != nil {
+				return err
+			}
+		}
 		var existing SubscriptionPreConsumeRecord
 		query := tx.Where("request_id = ?", requestId).Limit(1).Find(&existing)
 		if query.Error != nil {
@@ -1407,10 +1412,30 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 
 // RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota by requestId.
 func RefundSubscriptionPreConsume(requestId string, periodStart ...int64) error {
+	return refundSubscriptionPreConsume(requestId, "", periodStart...)
+}
+
+func RefundCanvasSubscriptionPreConsume(requestId, subject string, periodStart ...int64) error {
+	if subject == "" {
+		return ErrCanvasBillingOwner
+	}
+	return refundSubscriptionPreConsume(requestId, subject, periodStart...)
+}
+
+func refundSubscriptionPreConsume(requestId, subject string, periodStart ...int64) error {
 	if strings.TrimSpace(requestId) == "" {
 		return errors.New("requestId is empty")
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		if subject != "" {
+			var owner SubscriptionPreConsumeRecord
+			if err := tx.Where("request_id = ?", requestId).Take(&owner).Error; err != nil {
+				return err
+			}
+			if err := LockCanvasBillingOwner(tx, owner.UserId, subject); err != nil {
+				return err
+			}
+		}
 		var record SubscriptionPreConsumeRecord
 		if err := lockForUpdate(tx).
 			Where("request_id = ?", requestId).First(&record).Error; err != nil {
@@ -1526,6 +1551,17 @@ func GetSubscriptionPlanInfoByUserSubscriptionId(userSubscriptionId int) (*Subsc
 
 // Update subscription used amount by delta (positive consume more, negative refund).
 func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64, periodStart ...int64) error {
+	return postConsumeUserSubscriptionDelta(userSubscriptionId, delta, "", periodStart...)
+}
+
+func PostConsumeCanvasSubscriptionDelta(userSubscriptionId int, delta int64, subject string, periodStart ...int64) error {
+	if subject == "" {
+		return ErrCanvasBillingOwner
+	}
+	return postConsumeUserSubscriptionDelta(userSubscriptionId, delta, subject, periodStart...)
+}
+
+func postConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64, subject string, periodStart ...int64) error {
 	if userSubscriptionId <= 0 {
 		return errors.New("invalid userSubscriptionId")
 	}
@@ -1533,6 +1569,15 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64, perio
 		return nil
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
+		if subject != "" {
+			var owner UserSubscription
+			if err := tx.Where("id = ?", userSubscriptionId).Take(&owner).Error; err != nil {
+				return err
+			}
+			if err := LockCanvasBillingOwner(tx, owner.UserId, subject); err != nil {
+				return err
+			}
+		}
 		var sub UserSubscription
 		if err := lockForUpdate(tx).
 			Where("id = ?", userSubscriptionId).

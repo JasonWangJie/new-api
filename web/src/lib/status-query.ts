@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { queryOptions, type QueryClient } from '@tanstack/react-query'
 
+import { canvasIntegration } from '@/features/infinite-canvas/config'
 import { getStatus } from '@/lib/api'
 import { DEFAULT_SYSTEM_NAME, DEFAULT_LOGO } from '@/lib/constants'
 import {
@@ -100,6 +101,7 @@ export function mapStatusDataToConfig(
       | boolean
       | undefined,
     currency,
+    infiniteCanvas: canvasIntegration(data),
   }
 }
 

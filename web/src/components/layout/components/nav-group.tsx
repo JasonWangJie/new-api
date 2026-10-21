@@ -130,7 +130,7 @@ function SidebarMenuLink({ item, href }: { item: NavLink; href: string }) {
         render={
           <Link
             to={item.url}
-            preload={isMobile ? false : undefined}
+            preload={isMobile || item.url === '/canvas' ? false : undefined}
             onClick={() => setOpenMobile(false)}
           />
         }

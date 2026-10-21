@@ -460,6 +460,10 @@ func UpdateTokenImageMappings(c *gin.Context) {
 		imageManagementError(c, 404, errors.New("Token was not found"))
 		return
 	}
+	if model.IsCanvasTokenKey(token.Key) {
+		imageManagementError(c, 403, errors.New("Managed Infinite Canvas credentials cannot change image groups"))
+		return
+	}
 	var input map[string]*string
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<16), &input); err != nil {
 		imageManagementError(c, 400, err)

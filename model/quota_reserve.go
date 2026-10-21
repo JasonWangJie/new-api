@@ -18,6 +18,8 @@ const (
 )
 
 const userQuotaReserveScript = `
+if ARGV[4] ~= '' and redis.call('HGET',KEYS[1],'CanvasSubject') ~= ARGV[4] then return -1 end
+if ARGV[4] ~= '' and (ARGV[5] == '' or redis.call('HGET',KEYS[1],'CanvasQuotaGeneration') ~= ARGV[5]) then return -1 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[3])
   or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
@@ -31,6 +33,8 @@ redis.call('HINCRBY', KEYS[1], 'Quota', -tonumber(ARGV[1]))
 return 1`
 
 const userQuotaDeltaScript = `
+if ARGV[4] ~= '' and redis.call('HGET',KEYS[1],'CanvasSubject') ~= ARGV[4] then return -1 end
+if ARGV[4] ~= '' and (ARGV[5] == '' or redis.call('HGET',KEYS[1],'CanvasQuotaGeneration') ~= ARGV[5]) then return -1 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[3])
   or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
@@ -79,15 +83,29 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 	}
 }
 
-func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
+func cacheTryReserveUserQuota(userID int, amount int64, subjects ...string) (cacheQuotaResult, error) {
+	subject, generation := "", ""
+	if len(subjects) > 0 {
+		subject = subjects[0]
+	}
+	if len(subjects) > 1 {
+		generation = subjects[1]
+	}
 	result, err := common.RDB.Eval(context.Background(), userQuotaReserveScript,
-		[]string{getUserCacheKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID)}, amount, userID, userCacheSchemaVersion, subject, generation).Int()
 	return quotaResultFromLua(result, err)
 }
 
-func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error) {
+func cacheApplyUserQuotaDelta(userID int, delta int64, subjects ...string) (cacheQuotaResult, error) {
+	subject, generation := "", ""
+	if len(subjects) > 0 {
+		subject = subjects[0]
+	}
+	if len(subjects) > 1 {
+		generation = subjects[1]
+	}
 	result, err := common.RDB.Eval(context.Background(), userQuotaDeltaScript,
-		[]string{getUserCacheKey(userID)}, delta, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID)}, delta, userID, userCacheSchemaVersion, subject, generation).Int()
 	return quotaResultFromLua(result, err)
 }
 
@@ -360,13 +378,18 @@ func AdjustUserQuotaDurable(id int, delta int) error {
 // Applying the committed delta to a live cache preserves other quota changes
 // that still reside in the ordinary batch queue. Deleting that cache would
 // rehydrate from a database that may not yet include those changes.
-func syncDurableUserQuotaCache(id, delta int) {
+func syncDurableUserQuotaCache(id, delta int, subjects ...string) {
 	if !common.RedisEnabled || delta == 0 {
 		return
 	}
-	result, err := cacheApplyUserQuotaDelta(id, int64(delta))
+	result, err := cacheApplyUserQuotaDelta(id, int64(delta), subjects...)
 	if err != nil {
 		common.SysError("durable task user quota cache sync failed: " + err.Error())
+		if len(subjects) > 0 && subjects[0] != "" {
+			// An ambiguous managed delta must not evict another account's cache
+			// or discard ordinary usage still awaiting its batch flush.
+			return
+		}
 		if invalidateErr := invalidateUserCache(id); invalidateErr != nil {
 			common.SysError("durable task user quota cache invalidation failed: " + invalidateErr.Error())
 		}

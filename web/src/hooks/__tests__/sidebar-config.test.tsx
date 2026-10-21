@@ -27,11 +27,64 @@ import {
   serializeSidebarModulesAdmin,
 } from '@/features/system-settings/maintenance/config'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { useSidebarConfig } from '../use-sidebar-config'
 import { useSidebarData } from '../use-sidebar-data'
 
+describe('canvas sidebar visibility', () => {
+  it('keeps the entry hidden until the integration is enabled', () => {
+    const { result } = sidebarFor()
+    expect(
+      result.current
+        .flatMap((group) => group.items)
+        .some((item) => item.url === '/canvas')
+    ).toBe(false)
+  })
+
+  it('shows the enabled canvas with existing sidebar configurations', () => {
+    useSystemConfigStore.getState().setConfig({
+      infiniteCanvas: {
+        enabled: true,
+        url: 'https://canvas.example.com',
+        client_id: 'infinite-canvas',
+      },
+    })
+    const { result } = sidebarFor({ chat: { enabled: true, playground: true } })
+    expect(
+      result.current
+        .flatMap((group) => group.items)
+        .find((item) => item.url === '/canvas')
+    ).toMatchObject({ title: 'AI Infinite Canvas' })
+  })
+
+  it.each([
+    [{ chat: { enabled: true, canvas: false } }, undefined],
+    [undefined, { chat: { enabled: true, canvas: false } }],
+  ])(
+    'respects admin and personal canvas visibility (%j, %j)',
+    (admin, user) => {
+      useSystemConfigStore.getState().setConfig({
+        infiniteCanvas: {
+          enabled: true,
+          url: 'https://canvas.example.com',
+          client_id: 'infinite-canvas',
+        },
+      })
+      const { result } = sidebarFor(admin, user)
+      expect(
+        result.current
+          .flatMap((group) => group.items)
+          .some((item) => item.url === '/canvas')
+      ).toBe(false)
+    }
+  )
+})
+
 beforeEach(() => {
+  useSystemConfigStore
+    .getState()
+    .setConfig({ infiniteCanvas: { enabled: false, url: '', client_id: '' } })
   vi.stubGlobal('localStorage', {
     getItem: () => null,
     setItem: () => undefined,
@@ -83,7 +136,7 @@ describe('security sidebar visibility', () => {
       result.current
         .find((group) => group.id === 'personal')
         ?.items.map((item) => item.title)
-    ).toEqual(['Wallet', 'Profile', 'Security & Access'])
+    ).toEqual(['Wallet', 'Enterprise Invoices', 'Profile', 'Security & Access'])
     expect(
       result.current
         .flatMap((group) => group.items)

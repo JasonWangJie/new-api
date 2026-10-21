@@ -485,6 +485,11 @@ func UploadAsyncImageInput(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "storage_unavailable", "Image signing is unavailable")
 		return
 	}
+	if value, ok := c.Get(service.CanvasGrantContextKey); ok {
+		if grant, ok := value.(*service.CanvasGrantState); ok {
+			link = service.CanvasInputURL(AsyncImageGatewayBase(), input.InputId, grant, cfg.SignedURLExpiry)
+		}
+	}
 	if err := model.ConfirmImageInput(ctx, input, object, service.ImageIdentityHash(link)); err != nil {
 		respondImageUploadError(c, err)
 		return
@@ -525,6 +530,10 @@ func GetImageObjectContent(c *gin.Context) {
 	}
 	var object model.ImageStorageObject
 	if err := model.DB.WithContext(c.Request.Context()).Where("object_id = ? AND status = ? AND (expires_at = 0 OR expires_at > ?)", c.Param("object_id"), "active", time.Now().Unix()).Take(&object).Error; err != nil {
+		c.Status(404)
+		return
+	}
+	if managed, err := service.CanvasImageObjectManaged(c.Request.Context(), object); err != nil || managed {
 		c.Status(404)
 		return
 	}

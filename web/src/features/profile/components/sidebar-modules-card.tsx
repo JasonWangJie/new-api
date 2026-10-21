@@ -68,6 +68,13 @@ export function SidebarModulesCard() {
           description: t('AI model testing environment'),
         },
         {
+          key: 'canvas',
+          title: t('AI Infinite Canvas'),
+          description: t(
+            'Open the independent canvas with your current New API account'
+          ),
+        },
+        {
           key: 'chat',
           title: t('Chat'),
           description: t('Chat session management'),

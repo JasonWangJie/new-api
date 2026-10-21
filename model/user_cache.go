@@ -9,21 +9,23 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const userCacheSchemaVersion = 2
 
 type UserBase struct {
-	Id          int    `json:"id"`
-	Group       string `json:"group"`
-	Email       string `json:"email"`
-	Quota       int    `json:"quota"`
-	Status      int    `json:"status"`
-	Role        int    `json:"role"`
-	Username    string `json:"username"`
-	Setting     string `json:"setting"`
-	AuthVersion int64  `json:"-"`
-	CacheSchema int    `json:"-"`
+	Id            int    `json:"id"`
+	Group         string `json:"group"`
+	Email         string `json:"email"`
+	Quota         int    `json:"quota"`
+	Status        int    `json:"status"`
+	Role          int    `json:"role"`
+	Username      string `json:"username"`
+	Setting       string `json:"setting"`
+	AuthVersion   int64  `json:"-"`
+	CacheSchema   int    `json:"-"`
+	CanvasSubject string `json:"-"`
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -100,16 +102,39 @@ func GetUserCache(userId int) (*UserBase, error) {
 		return nil, err
 	}
 	if common.RedisEnabled {
-		floor, floorErr := getUserAuthVersionFloor(userId)
-		if floorErr == nil && floor > user.AuthVersion {
-			return nil, ErrUserAuthCachePending
-		}
-		if err := populateUserCache(*user); err != nil {
-			if errors.Is(err, ErrUserAuthCachePending) {
-				return nil, err
+		// Managed funding locks this same row before reserving its cache delta.
+		// A cold hash must use a fresh, locked SQL snapshot and stay under that
+		// lock until publication, so it cannot restore a pre-commit balance.
+		// This also covers a reader that started before the first Canvas binding.
+		err = DB.Transaction(func(tx *gorm.DB) error {
+			if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+				// SQLite has no row-level FOR UPDATE. Acquire its writer
+				// reservation before reading the quota snapshot instead.
+				if err := tx.Model(&User{}).Where("id = ?", userId).UpdateColumn("quota", gorm.Expr("quota")).Error; err != nil {
+					return err
+				}
 			}
-			common.SysLog("failed to synchronously populate user cache: " + err.Error())
+			var current User
+			if err := lockForUpdate(tx).First(&current, userId).Error; err != nil {
+				return err
+			}
+			floor, floorErr := getUserAuthVersionFloor(userId)
+			if floorErr == nil && floor > current.AuthVersion {
+				return ErrUserAuthCachePending
+			}
+			if err := populateUserCache(current); err != nil {
+				if errors.Is(err, ErrUserAuthCachePending) {
+					return err
+				}
+				common.SysLog("failed to synchronously populate Canvas user cache: " + err.Error())
+			}
+			user = &current
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
+		return user.ToBaseUser(), nil
 	}
 	return user.ToBaseUser(), nil
 }

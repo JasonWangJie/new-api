@@ -92,6 +92,12 @@ export function SidebarModulesSection({
         title: t('Playground'),
         description: t('Experiment with prompts and models in real time.'),
       },
+      canvas: {
+        title: t('AI Infinite Canvas'),
+        description: t(
+          'Open the independent canvas with your current New API account'
+        ),
+      },
       chat: {
         title: t('Chat'),
         description: t('Access previous conversations and start new ones.'),

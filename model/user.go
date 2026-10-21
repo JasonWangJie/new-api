@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -111,6 +112,7 @@ type User struct {
 	CreatedAt            int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
 	LastLoginAt          int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
 	AuthVersion          int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
+	CanvasSubject        *string                    `json:"-" gorm:"type:varchar(64);uniqueIndex"`
 	AdminPermissions     map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
 }
 
@@ -126,6 +128,9 @@ func (user *User) ToBaseUser() *UserBase {
 		Email:       user.Email,
 		AuthVersion: user.AuthVersion,
 		CacheSchema: userCacheSchemaVersion,
+	}
+	if user.CanvasSubject != nil {
+		cache.CanvasSubject = *user.CanvasSubject
 	}
 	return cache
 }
@@ -1039,13 +1044,30 @@ func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
 	if err := releaseAllExternalIdentitiesWithTx(tx, userId); err != nil {
 		return err
 	}
+	// Application task provenance refers to immutable Token IDs. Retain a
+	// disabled, secret-free anchor so MySQL cannot recycle those IDs after a
+	// restart; delete ordinary credentials with the existing hard-delete policy.
+	var tokens []Token
+	if err := tx.Unscoped().Where("user_id = ?", userId).Find(&tokens).Error; err != nil {
+		return err
+	}
+	for _, token := range tokens {
+		if !IsCanvasTokenKey(token.Key) {
+			continue
+		}
+		if err := tx.Unscoped().Model(&Token{}).Where("id = ? AND user_id = ?", token.Id, userId).Updates(map[string]any{"key": "ic_revoked_" + common.GetUUID(), "status": common.TokenStatusDisabled, "expired_time": time.Now().Unix(), "name": "Revoked Infinite Canvas"}).Error; err != nil {
+			return err
+		}
+	}
+	if err := tx.Scopes(excludeCanvasTokens).Unscoped().Where("user_id = ?", userId).Delete(&Token{}).Error; err != nil {
+		return err
+	}
 	for _, authenticationData := range []any{
 		&TwoFABackupCode{},
 		&TwoFA{},
 		&UserSession{},
 		&AuthFlow{},
 		&PasskeyCredential{},
-		&Token{},
 	} {
 		if err := tx.Unscoped().Where("user_id = ?", userId).Delete(authenticationData).Error; err != nil {
 			return err

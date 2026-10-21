@@ -221,6 +221,9 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if strings.HasPrefix(key, "infinite_canvas.") {
+		return system_setting.ValidateInfiniteCanvasOption(key, value)
+	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}

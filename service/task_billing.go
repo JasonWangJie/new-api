@@ -93,7 +93,9 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 		Other:     other,
 	})
 	if !durableTask {
-		model.UpdateUserUsedQuotaAndRequestCount(info.UserId, info.PriceData.Quota)
+		if err := RecordRelayUsage(c, info, info.PriceData.Quota); err != nil {
+			return err
+		}
 		model.UpdateChannelUsedQuota(info.ChannelId, info.PriceData.Quota)
 	}
 	return nil
@@ -121,8 +123,18 @@ func taskIsSubscription(task *model.Task) bool {
 
 // taskAdjustFunding 调整任务的资金来源（钱包或订阅），delta > 0 表示扣费，delta < 0 表示退还。
 func taskAdjustFunding(task *model.Task, delta int) error {
+	subject, err := model.CanvasBillingSubject(model.DB, task.PrivateData.TokenId, task.UserId)
+	if err != nil {
+		return err
+	}
 	if taskIsSubscription(task) {
+		if subject != "" {
+			return model.PostConsumeCanvasSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta), subject)
+		}
 		return model.PostConsumeUserSubscriptionDelta(task.PrivateData.SubscriptionId, int64(delta))
+	}
+	if subject != "" {
+		return model.AdjustCanvasWallet(task.UserId, subject, -delta, false)
 	}
 	if delta > 0 {
 		return model.DecreaseUserQuota(task.UserId, delta, false)
@@ -383,7 +395,13 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 	taskAdjustTokenQuota(ctx, task, -quota)
 
 	// 3. 回减预扣时累计的用户和渠道用量，请求次数保持不变
-	model.UpdateUserUsedQuota(task.UserId, -quota)
+	if subject, err := model.CanvasBillingSubject(model.DB, task.PrivateData.TokenId, task.UserId); err == nil && subject != "" {
+		if err := model.UpdateCanvasUsage(ctx, task.UserId, subject, -quota, 0); err != nil {
+			logger.LogError(ctx, err.Error())
+		}
+	} else if err == nil {
+		model.UpdateUserUsedQuota(task.UserId, -quota)
+	}
 	model.UpdateChannelUsedQuota(task.ChannelId, -quota)
 
 	// 4. 记录日志
@@ -451,7 +469,13 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	}
 
 	// 提交阶段已经累计过一次请求；结算阶段只调整最终用量。
-	model.UpdateUserUsedQuota(task.UserId, quotaDelta)
+	if subject, err := model.CanvasBillingSubject(model.DB, task.PrivateData.TokenId, task.UserId); err == nil && subject != "" {
+		if err := model.UpdateCanvasUsage(ctx, task.UserId, subject, quotaDelta, 0); err != nil {
+			logger.LogError(ctx, err.Error())
+		}
+	} else if err == nil {
+		model.UpdateUserUsedQuota(task.UserId, quotaDelta)
+	}
 	model.UpdateChannelUsedQuota(task.ChannelId, quotaDelta)
 
 	var logType int

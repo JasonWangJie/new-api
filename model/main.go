@@ -341,6 +341,7 @@ func migrateDB() error {
 		&AsyncMediaJob{}, &MediaArtifactObject{},
 		&Channel{},
 		&Token{},
+		&CanvasGrant{},
 		&User{},
 		&UserSession{},
 		&AuthFlow{},

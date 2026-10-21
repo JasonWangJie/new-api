@@ -37,6 +37,8 @@ import { Route as RankingsIndexRouteImport } from './routes/rankings/index'
 import { Route as SetupIndexRouteImport } from './routes/setup/index'
 import { Route as authUserResetRouteImport } from './routes/(auth)/user/reset'
 import { Route as AuthenticatedAsyncImageTasksIndexRouteImport } from './routes/_authenticated/async-image-tasks/index'
+import { Route as AuthenticatedCanvasIndexRouteImport } from './routes/_authenticated/canvas/index'
+import { Route as AuthenticatedCanvasAuthorizeRouteImport } from './routes/_authenticated/canvas/authorize'
 import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authenticated/channels/index'
 import { Route as AuthenticatedChatChatIdRouteImport } from './routes/_authenticated/chat/$chatId'
 import { Route as AuthenticatedDashboardIndexRouteImport } from './routes/_authenticated/dashboard/index'
@@ -222,6 +224,18 @@ const AuthenticatedAsyncImageTasksIndexRoute =
   AuthenticatedAsyncImageTasksIndexRouteImport.update({
     id: '/async-image-tasks/',
     path: '/async-image-tasks/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedCanvasIndexRoute =
+  AuthenticatedCanvasIndexRouteImport.update({
+    id: '/canvas/',
+    path: '/canvas/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedCanvasAuthorizeRoute =
+  AuthenticatedCanvasAuthorizeRouteImport.update({
+    id: '/canvas/authorize',
+    path: '/canvas/authorize',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedChannelsIndexRoute =
@@ -521,6 +535,7 @@ export interface FileRoutesByFullPath {
   '/rankings/': typeof RankingsIndexRoute
   '/setup/': typeof SetupIndexRoute
   '/user/reset': typeof authUserResetRoute
+  '/canvas/authorize': typeof AuthenticatedCanvasAuthorizeRoute
   '/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/errors/$error': typeof AuthenticatedErrorsErrorRoute
@@ -531,6 +546,7 @@ export interface FileRoutesByFullPath {
   '/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/docs/$space/$': typeof DocsSpaceSplatRoute
   '/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
+  '/canvas/': typeof AuthenticatedCanvasIndexRoute
   '/channels/': typeof AuthenticatedChannelsIndexRoute
   '/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/image-library/': typeof AuthenticatedImageLibraryIndexRoute
@@ -594,6 +610,7 @@ export interface FileRoutesByTo {
   '/rankings': typeof RankingsIndexRoute
   '/setup': typeof SetupIndexRoute
   '/user/reset': typeof authUserResetRoute
+  '/canvas/authorize': typeof AuthenticatedCanvasAuthorizeRoute
   '/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/errors/$error': typeof AuthenticatedErrorsErrorRoute
@@ -604,6 +621,7 @@ export interface FileRoutesByTo {
   '/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/docs/$space/$': typeof DocsSpaceSplatRoute
   '/async-image-tasks': typeof AuthenticatedAsyncImageTasksIndexRoute
+  '/canvas': typeof AuthenticatedCanvasIndexRoute
   '/channels': typeof AuthenticatedChannelsIndexRoute
   '/dashboard': typeof AuthenticatedDashboardIndexRoute
   '/image-library': typeof AuthenticatedImageLibraryIndexRoute
@@ -671,6 +689,7 @@ export interface FileRoutesById {
   '/rankings/': typeof RankingsIndexRoute
   '/setup/': typeof SetupIndexRoute
   '/(auth)/user/reset': typeof authUserResetRoute
+  '/_authenticated/canvas/authorize': typeof AuthenticatedCanvasAuthorizeRoute
   '/_authenticated/chat/$chatId': typeof AuthenticatedChatChatIdRoute
   '/_authenticated/dashboard/$section': typeof AuthenticatedDashboardSectionRoute
   '/_authenticated/errors/$error': typeof AuthenticatedErrorsErrorRoute
@@ -681,6 +700,7 @@ export interface FileRoutesById {
   '/_authenticated/wallet/invoices': typeof AuthenticatedWalletInvoicesRoute
   '/docs/$space/$': typeof DocsSpaceSplatRoute
   '/_authenticated/async-image-tasks/': typeof AuthenticatedAsyncImageTasksIndexRoute
+  '/_authenticated/canvas/': typeof AuthenticatedCanvasIndexRoute
   '/_authenticated/channels/': typeof AuthenticatedChannelsIndexRoute
   '/_authenticated/dashboard/': typeof AuthenticatedDashboardIndexRoute
   '/_authenticated/image-library/': typeof AuthenticatedImageLibraryIndexRoute
@@ -747,6 +767,7 @@ export interface FileRouteTypes {
     | '/rankings/'
     | '/setup/'
     | '/user/reset'
+    | '/canvas/authorize'
     | '/chat/$chatId'
     | '/dashboard/$section'
     | '/errors/$error'
@@ -757,6 +778,7 @@ export interface FileRouteTypes {
     | '/wallet/invoices'
     | '/docs/$space/$'
     | '/async-image-tasks/'
+    | '/canvas/'
     | '/channels/'
     | '/dashboard/'
     | '/image-library/'
@@ -820,6 +842,7 @@ export interface FileRouteTypes {
     | '/rankings'
     | '/setup'
     | '/user/reset'
+    | '/canvas/authorize'
     | '/chat/$chatId'
     | '/dashboard/$section'
     | '/errors/$error'
@@ -830,6 +853,7 @@ export interface FileRouteTypes {
     | '/wallet/invoices'
     | '/docs/$space/$'
     | '/async-image-tasks'
+    | '/canvas'
     | '/channels'
     | '/dashboard'
     | '/image-library'
@@ -896,6 +920,7 @@ export interface FileRouteTypes {
     | '/rankings/'
     | '/setup/'
     | '/(auth)/user/reset'
+    | '/_authenticated/canvas/authorize'
     | '/_authenticated/chat/$chatId'
     | '/_authenticated/dashboard/$section'
     | '/_authenticated/errors/$error'
@@ -906,6 +931,7 @@ export interface FileRouteTypes {
     | '/_authenticated/wallet/invoices'
     | '/docs/$space/$'
     | '/_authenticated/async-image-tasks/'
+    | '/_authenticated/canvas/'
     | '/_authenticated/channels/'
     | '/_authenticated/dashboard/'
     | '/_authenticated/image-library/'
@@ -1164,6 +1190,20 @@ declare module '@tanstack/react-router' {
       path: '/async-image-tasks'
       fullPath: '/async-image-tasks/'
       preLoaderRoute: typeof AuthenticatedAsyncImageTasksIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/canvas/': {
+      id: '/_authenticated/canvas/'
+      path: '/canvas'
+      fullPath: '/canvas/'
+      preLoaderRoute: typeof AuthenticatedCanvasIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/canvas/authorize': {
+      id: '/_authenticated/canvas/authorize'
+      path: '/canvas/authorize'
+      fullPath: '/canvas/authorize'
+      preLoaderRoute: typeof AuthenticatedCanvasAuthorizeRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/channels/': {
@@ -1577,6 +1617,7 @@ const AuthenticatedSystemSettingsRouteRouteWithChildren =
 interface AuthenticatedRouteRouteChildren {
   AuthenticatedSystemSettingsRouteRoute: typeof AuthenticatedSystemSettingsRouteRouteWithChildren
   AuthenticatedChat2linkRoute: typeof AuthenticatedChat2linkRoute
+  AuthenticatedCanvasAuthorizeRoute: typeof AuthenticatedCanvasAuthorizeRoute
   AuthenticatedChatChatIdRoute: typeof AuthenticatedChatChatIdRoute
   AuthenticatedDashboardSectionRoute: typeof AuthenticatedDashboardSectionRoute
   AuthenticatedErrorsErrorRoute: typeof AuthenticatedErrorsErrorRoute
@@ -1586,6 +1627,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedUsageLogsAuditRoute: typeof AuthenticatedUsageLogsAuditRoute
   AuthenticatedWalletInvoicesRoute: typeof AuthenticatedWalletInvoicesRoute
   AuthenticatedAsyncImageTasksIndexRoute: typeof AuthenticatedAsyncImageTasksIndexRoute
+  AuthenticatedCanvasIndexRoute: typeof AuthenticatedCanvasIndexRoute
   AuthenticatedChannelsIndexRoute: typeof AuthenticatedChannelsIndexRoute
   AuthenticatedDashboardIndexRoute: typeof AuthenticatedDashboardIndexRoute
   AuthenticatedImageLibraryIndexRoute: typeof AuthenticatedImageLibraryIndexRoute
@@ -1612,6 +1654,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedSystemSettingsRouteRoute:
     AuthenticatedSystemSettingsRouteRouteWithChildren,
   AuthenticatedChat2linkRoute: AuthenticatedChat2linkRoute,
+  AuthenticatedCanvasAuthorizeRoute: AuthenticatedCanvasAuthorizeRoute,
   AuthenticatedChatChatIdRoute: AuthenticatedChatChatIdRoute,
   AuthenticatedDashboardSectionRoute: AuthenticatedDashboardSectionRoute,
   AuthenticatedErrorsErrorRoute: AuthenticatedErrorsErrorRoute,
@@ -1622,6 +1665,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedWalletInvoicesRoute: AuthenticatedWalletInvoicesRoute,
   AuthenticatedAsyncImageTasksIndexRoute:
     AuthenticatedAsyncImageTasksIndexRoute,
+  AuthenticatedCanvasIndexRoute: AuthenticatedCanvasIndexRoute,
   AuthenticatedChannelsIndexRoute: AuthenticatedChannelsIndexRoute,
   AuthenticatedDashboardIndexRoute: AuthenticatedDashboardIndexRoute,
   AuthenticatedImageLibraryIndexRoute: AuthenticatedImageLibraryIndexRoute,

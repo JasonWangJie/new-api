@@ -220,6 +220,11 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 		if err := lockForUpdate(tx.Unscoped()).Where("id = ? AND user_id = ?", bill.TokenId, bill.UserId).First(&token).Error; err != nil {
 			return err
 		}
+		var ownerErr error
+		cached.subject, ownerErr = ValidateCanvasBillingOwner(tx, token, user)
+		if ownerErr != nil {
+			return ownerErr
+		}
 		amount := bill.Quota
 		fundingDelta, tokenDelta := amount-bill.ReservedQuota, amount-bill.ReservedTokenQuota
 		if !token.UnlimitedQuota && token.RemainQuota < max(0, tokenDelta) {
@@ -324,6 +329,6 @@ func ApplyAsyncImageBill(ctx context.Context, taskId, fingerprint string) error 
 		}
 		return err
 	}
-	syncAsyncImageQuotaCache(userID, tokenID, tokenKey, walletRefund, tokenRefund, tokenUsage)
+	syncAsyncImageQuotaCache(userID, tokenID, tokenKey, walletRefund, tokenRefund, tokenUsage, cached.subject, cached.generation)
 	return nil
 }

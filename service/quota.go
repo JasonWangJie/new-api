@@ -28,6 +28,16 @@ type TokenDetails struct {
 	AudioTokens int
 }
 
+// RecordRelayUsage keeps ordinary accounting unchanged and fences managed
+// application usage against deletion and numeric user-ID reuse.
+func RecordRelayUsage(ctx *gin.Context, info *relaycommon.RelayInfo, quota int) error {
+	if info.CanvasSubject != "" {
+		return model.UpdateCanvasUsage(ctx.Request.Context(), info.UserId, info.CanvasSubject, quota, 1)
+	}
+	model.UpdateUserUsedQuotaAndRequestCount(info.UserId, quota)
+	return nil
+}
+
 type QuotaInfo struct {
 	InputDetails  TokenDetails
 	OutputDetails TokenDetails
@@ -223,12 +233,18 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, "+
 			"tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, modelName, relayInfo.FinalPreConsumedQuota))
 	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
+		if err := RecordRelayUsage(ctx, relayInfo, quota); err != nil {
+			logger.LogError(ctx, err.Error())
+			return
+		}
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
+		if relayInfo.CanvasSubject != "" {
+			return
+		}
 	}
 
 	logModel := modelName
@@ -356,12 +372,18 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, "+
 			"tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, billingModelName, relayInfo.FinalPreConsumedQuota))
 	} else {
-		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, quota)
+		if err := RecordRelayUsage(ctx, relayInfo, quota); err != nil {
+			logger.LogError(ctx, err.Error())
+			return
+		}
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
+		if relayInfo.CanvasSubject != "" {
+			return
+		}
 	}
 
 	logModel := billingModelName
@@ -444,14 +466,22 @@ func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, pre
 		}
 		delta := int64(quota)
 		if delta != 0 {
-			if err := model.PostConsumeUserSubscriptionDelta(relayInfo.SubscriptionId, delta); err != nil {
+			var err error
+			if relayInfo.CanvasSubject != "" {
+				err = model.PostConsumeCanvasSubscriptionDelta(relayInfo.SubscriptionId, delta, relayInfo.CanvasSubject)
+			} else {
+				err = model.PostConsumeUserSubscriptionDelta(relayInfo.SubscriptionId, delta)
+			}
+			if err != nil {
 				return result, err
 			}
 			relayInfo.SubscriptionPostDelta += delta
 		}
 	} else {
 		// Wallet
-		if quota > 0 {
+		if relayInfo.CanvasSubject != "" {
+			err = model.AdjustCanvasWallet(relayInfo.UserId, relayInfo.CanvasSubject, -quota, false)
+		} else if quota > 0 {
 			err = model.DecreaseUserQuota(relayInfo.UserId, quota, false)
 		} else {
 			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)

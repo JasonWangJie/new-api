@@ -285,7 +285,7 @@ func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) e
 		// 全额无条件扣减，余额不足的部分记为欠费（余额可为负），不中断请求，
 		// 保证日志记录的预扣额度与用户余额的实际变动始终对账一致。
 		// DecreaseUserQuota 仅在数据库错误时失败。
-		if err := model.DecreaseUserQuota(funding.userId, delta, false); err != nil {
+		if err := funding.Settle(delta); err != nil {
 			return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 		}
 		funding.consumed += delta
@@ -310,7 +310,9 @@ func (s *BillingSession) rollbackFundingReserve(delta int) {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
 		var err error
-		if s.durable {
+		if funding.subject != "" {
+			err = model.AdjustCanvasWallet(funding.userId, funding.subject, delta, false)
+		} else if s.durable {
 			err = model.AdjustUserQuotaDurable(funding.userId, delta)
 		} else {
 			err = model.IncreaseUserQuota(funding.userId, delta, false)
@@ -431,7 +433,7 @@ func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 
 		session := &BillingSession{
 			relayInfo: relayInfo,
-			funding:   &WalletFunding{userId: relayInfo.UserId, durable: durable},
+			funding:   &WalletFunding{userId: relayInfo.UserId, durable: durable, subject: relayInfo.CanvasSubject},
 			durable:   durable,
 		}
 		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
@@ -449,6 +451,7 @@ func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 			relayInfo: relayInfo,
 			durable:   durable,
 			funding: &SubscriptionFunding{
+				subject:   relayInfo.CanvasSubject,
 				requestId: relayInfo.RequestId,
 				userId:    relayInfo.UserId,
 				modelName: relayInfo.GetBillingModelName(),

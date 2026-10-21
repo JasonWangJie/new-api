@@ -31,11 +31,16 @@ func SetUpLogger(server *gin.Engine) {
 		path := param.Path
 		// OAuth callbacks carry one-time codes and state in the query string.
 		// Redact the log value only; the handler still needs the original query.
-		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
+		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(path, "/api/integrations/canvas/") || strings.HasPrefix(path, "/canvas/") {
 			path, _, _ = strings.Cut(path, "?")
 		}
 		// Stats never accept query credentials; avoid recording rejected keys.
 		requestPath, _, _ := strings.Cut(path, "?")
+		if requestPath == "/v1/models" || strings.HasPrefix(requestPath, "/v1beta/models") || strings.HasPrefix(requestPath, "/v1beta/openai/models") {
+			// These compatibility routes accept ?key= credentials, including
+			// rejected managed keys. Never copy their query into access logs.
+			path = requestPath
+		}
 		switch requestPath {
 		case "/v1/images/tasks_async/stats", "/v1/videos/tasks_async/stats", "/v1/media/tasks_async/stats":
 			path = requestPath

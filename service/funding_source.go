@@ -36,6 +36,7 @@ type WalletFunding struct {
 	userId   int
 	consumed int // 实际预扣的用户额度
 	durable  bool
+	subject  string
 }
 
 func (w *WalletFunding) Source() string { return BillingSourceWallet }
@@ -46,7 +47,13 @@ func (w *WalletFunding) PreConsume(amount int) error {
 	}
 	var reserved bool
 	var err error
-	if w.durable {
+	if w.subject != "" {
+		err = model.AdjustCanvasWallet(w.userId, w.subject, -amount, true)
+		reserved = err == nil
+		if errors.Is(err, model.ErrCanvasWalletInsufficient) {
+			err = nil
+		}
+	} else if w.durable {
 		reserved, err = model.TryReserveUserQuotaDurable(w.userId, amount)
 	} else {
 		reserved, err = model.TryReserveUserQuota(w.userId, amount)
@@ -65,6 +72,9 @@ func (w *WalletFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
+	if w.subject != "" {
+		return model.AdjustCanvasWallet(w.userId, w.subject, -delta, false)
+	}
 	if w.durable {
 		return model.AdjustUserQuotaDurable(w.userId, -delta)
 	}
@@ -77,6 +87,9 @@ func (w *WalletFunding) Settle(delta int) error {
 func (w *WalletFunding) Refund() error {
 	if w.consumed <= 0 {
 		return nil
+	}
+	if w.subject != "" {
+		return model.AdjustCanvasWallet(w.userId, w.subject, w.consumed, false)
 	}
 	// IncreaseUserQuota 是 quota += N 的非幂等操作，不能重试，否则会多退额度。
 	// 订阅的 RefundSubscriptionPreConsume 有 requestId 幂等保护所以可以重试。
@@ -91,6 +104,7 @@ func (w *WalletFunding) Refund() error {
 // ---------------------------------------------------------------------------
 
 type SubscriptionFunding struct {
+	subject        string
 	requestId      string
 	userId         int
 	modelName      string
@@ -110,7 +124,7 @@ func (s *SubscriptionFunding) Source() string { return BillingSourceSubscription
 
 func (s *SubscriptionFunding) PreConsume(_ int) error {
 	// amount 参数被忽略，使用内部 s.amount（已在构造时根据 preConsumedQuota 计算）
-	res, err := model.PreConsumeUserSubscription(s.requestId, s.userId, s.modelName, 0, s.amount)
+	res, err := model.PreConsumeUserSubscription(s.requestId, s.userId, s.modelName, 0, s.amount, s.subject)
 	if err != nil {
 		return err
 	}
@@ -131,6 +145,12 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 	if delta == 0 {
 		return nil
 	}
+	if s.subject != "" {
+		if s.durable {
+			return model.PostConsumeCanvasSubscriptionDelta(s.subscriptionId, int64(delta), s.subject, s.PeriodStart)
+		}
+		return model.PostConsumeCanvasSubscriptionDelta(s.subscriptionId, int64(delta), s.subject)
+	}
 	if s.durable {
 		return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta), s.PeriodStart)
 	}
@@ -140,6 +160,12 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 func (s *SubscriptionFunding) Refund() error {
 	if s.preConsumed <= 0 {
 		return nil
+	}
+	if s.subject != "" {
+		if s.durable {
+			return model.RefundCanvasSubscriptionPreConsume(s.requestId, s.subject, s.PeriodStart)
+		}
+		return model.RefundCanvasSubscriptionPreConsume(s.requestId, s.subject)
 	}
 	return refundWithRetry(func() error {
 		if s.durable {

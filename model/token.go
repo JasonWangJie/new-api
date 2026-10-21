@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Token struct {
@@ -106,8 +107,14 @@ func (token *Token) GetIpLimits() []string {
 func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
 	var tokens []*Token
 	var err error
-	err = DB.Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
+	err = DB.Scopes(excludeCanvasTokens).Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
 	return tokens, err
+}
+
+// Internal application credentials are not manually managed API keys. Keep the
+// same portable namespace predicate in listing, search and creation-limit counts.
+func excludeCanvasTokens(query *gorm.DB) *gorm.DB {
+	return query.Where(clause.Expr{SQL: "LOWER(SUBSTR(?, 1, 3)) <> ?", Vars: []any{clause.Column{Name: "key"}, "ic_"}})
 }
 
 // sanitizeLikePattern 校验并清洗用户输入的 LIKE 搜索模式。
@@ -183,7 +190,7 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		}
 	}
 
-	baseQuery := DB.Model(&Token{}).Where("user_id = ?", userId)
+	baseQuery := DB.Model(&Token{}).Scopes(excludeCanvasTokens).Where("user_id = ?", userId)
 
 	// 非空才加 LIKE 条件，空则跳过（不过滤该字段）
 	if keyword != "" {
@@ -437,7 +444,7 @@ func decreaseTokenQuota(id int, quota int) (err error) {
 // CountUserTokens returns total number of tokens for the given user, used for pagination
 func CountUserTokens(userId int) (int64, error) {
 	var total int64
-	err := DB.Model(&Token{}).Where("user_id = ?", userId).Count(&total).Error
+	err := DB.Model(&Token{}).Scopes(excludeCanvasTokens).Where("user_id = ?", userId).Count(&total).Error
 	return total, err
 }
 

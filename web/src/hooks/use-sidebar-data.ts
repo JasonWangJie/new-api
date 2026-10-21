@@ -24,6 +24,7 @@ import {
   ClipboardList,
   CreditCard,
   FileText,
+  Frame,
   FlaskConical,
   Key,
   LayoutDashboard,
@@ -45,6 +46,7 @@ import type { SidebarData } from '@/components/layout/types'
 import { hasPermission } from '@/lib/admin-permissions'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 /**
  * Root navigation groups for the application sidebar.
@@ -55,6 +57,7 @@ import { useAuthStore } from '@/stores/auth-store'
 export function useSidebarData(): SidebarData {
   const { t } = useTranslation()
   const user = useAuthStore((state) => state.auth.user)
+  const canvas = useSystemConfigStore((state) => state.config.infiniteCanvas)
 
   return {
     navGroups: [
@@ -67,6 +70,9 @@ export function useSidebarData(): SidebarData {
             url: '/playground',
             icon: FlaskConical,
           },
+          ...(canvas?.enabled
+            ? [{ title: t('AI Infinite Canvas'), url: '/canvas', icon: Frame }]
+            : []),
           {
             title: t('Image Workbench'),
             url: '/image-workbench',

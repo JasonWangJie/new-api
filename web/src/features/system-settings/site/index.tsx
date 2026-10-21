@@ -25,6 +25,9 @@ import {
 } from './section-registry.tsx'
 
 const defaultSiteSettings: SiteSettings = {
+  'infinite_canvas.enabled': false,
+  'infinite_canvas.url': '',
+  'infinite_canvas.client_id': 'infinite-canvas',
   Notice: '',
   SystemName: 'New API',
   Logo: '',
