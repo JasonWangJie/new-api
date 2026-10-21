@@ -22,6 +22,9 @@ func TestBuildTaskPluginViewRestoresLegacyDramaFailureReason(t *testing.T) {
 	}{
 		{name: "saved image dimensions", reason: placeholder, data: `{"status":"failed","metadata":{"url":"` + dimensions + `"}}`, want: dimensions},
 		{name: "saved upstream busy", reason: placeholder, data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
+		{name: "saved upstream credits", reason: placeholder, data: `{"status":"failed","metadata":{"url":"HTTP 402 Insufficient credits: need 4.48, have 0.26"}}`, want: "HTTP 402 Insufficient credits: need 4.48, have 0.26"},
+		{name: "saved submission unknown", reason: placeholder, data: `{"status":"failed","metadata":{"url":"upstream submission result is unknown; the submission worker stopped before recording a response"}}`, want: "upstream submission result is unknown; the submission worker stopped before recording a response"},
+		{name: "saved MiniMax quality mismatch", reason: placeholder, data: `{"status":"failed","metadata":{"url":"MiniMax New-API resolution must be 480P, 768P, or 2K"}}`, want: "MiniMax New-API resolution must be 480P, 768P, or 2K"},
 		{name: "empty saved reason", data: `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"}}`, want: "系统繁忙，请稍后重试"},
 		{name: "error string has priority", reason: placeholder, data: `{"status":"failed","error":" primary error ","metadata":{"url":"secondary error"}}`, want: "primary error"},
 		{name: "error message has priority", reason: placeholder, data: `{"status":"failed","error":{"message":" primary message "},"metadata":{"url":"secondary error"}}`, want: "primary message"},
@@ -135,11 +138,19 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 		{name: "image inaccessible", raw: "Image download denied: HTTP 403", summary: "无法获取输入图片", suggestion: "访问"},
 		{name: "image invalid", raw: "Invalid image format", summary: "图片格式", suggestion: "图片"},
 		{name: "unsupported parameter", raw: "Invalid parameter: duration must be 5 or 10", summary: "参数不符合上游要求", suggestion: "参数"},
+		{name: "MiniMax quality mismatch", raw: "MiniMax New-API resolution must be 480P, 768P, or 2K", summary: "画质参数与上游接口不兼容", suggestion: "720p 需按渠道要求适配为 768P"},
+		{name: "MiniMax quality mismatch legacy list", raw: "MiniMax New-API resolution must be 480P, 768P, 2K", summary: "画质参数与上游接口不兼容", suggestion: "720p 需按渠道要求适配为 768P"},
 		{name: "video duration supplied bounds", raw: "Video duration must be between 2s and 15 seconds.", summary: "2–15 秒", suggestion: "2–15 秒"},
+		{name: "upstream credits", raw: "HTTP 402 Insufficient credits: need 4.48, have 0.26", summary: "上游服务账号余额不足", suggestion: "管理员补充上游服务账号余额"},
+		{name: "upstream credits Chinese", raw: "上游余额不足", summary: "上游服务账号余额不足", suggestion: "管理员补充上游服务账号余额"},
+		{name: "local token quota cache unavailable", raw: "video submission failed (HTTP 403, code pre_consume_token_quota_failed): durable task token quota cache is cold during batch updates", summary: "本地令牌额度检查暂不可用", suggestion: "批量更新时的额度同步状态"},
 		{name: "rate limited", raw: "Rate limit exceeded", summary: "请求频率或并发数", suggestion: "并发"},
 		{name: "busy", raw: "系统繁忙，请稍后重试", summary: "服务当前繁忙", suggestion: "稍后"},
 		{name: "server busy", raw: "服务器繁忙，请稍后重试", summary: "服务当前繁忙", suggestion: "稍后"},
 		{name: "submission execution unknown", raw: "Upstream submission could not be confirmed; the video operation will not be repeated", summary: "提交结果尚未确认", suggestion: "不会自动再次提交"},
+		{name: "submission worker stopped", raw: "upstream submission result is unknown; the submission worker stopped before recording a response", summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
+		{name: "submission unknown with pricing diagnostic", raw: "Upstream submission could not be confirmed; the video operation will not be repeated\nvideo submission failed (HTTP 503, code video_pricing_not_configured): video pricing rule is not configured", summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
+		{name: "submission unknown with validation diagnostic", raw: "Upstream submission could not be confirmed; the video operation will not be repeated\n生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。", summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
 		{name: "submission unknown nested response", raw: `{"error":{"code":"task_submission_unknown","message":"task submission state is unknown"},"data":null}`, summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
 		{name: "submission unknown upstream code", raw: "submission_unknown", summary: "提交结果尚未确认", suggestion: "不会自动再次提交"},
 		{name: "submission unknown Chinese upstream message", raw: "任务提交结果未知，请查询原任务，勿重复创建", summary: "提交结果尚未确认", suggestion: "核对上游任务状态和费用"},
@@ -184,6 +195,50 @@ func TestVideoTaskFailureNoticeExplainsProviderReasons(t *testing.T) {
 				assert.NotContains(t, notice.Summary, "审核认为")
 				assert.Contains(t, notice.Detail, "是否侵犯了版权保护")
 			}
+			if strings.HasPrefix(tc.name, "MiniMax quality mismatch") {
+				assert.Contains(t, notice.Summary, "480P、768P 或 2K 档位")
+				assert.NotContains(t, notice.Summary, "像素")
+				assert.NotContains(t, notice.Suggestion, "裁剪")
+			}
+			if strings.HasPrefix(tc.name, "upstream credits") {
+				assert.NotContains(t, notice.Summary+notice.Suggestion, "用户余额")
+				assert.Contains(t, notice.Detail, tc.raw)
+			}
+			if tc.name == "local token quota cache unavailable" {
+				assert.NotContains(t, notice.Summary+notice.Suggestion, "余额不足")
+				assert.NotContains(t, notice.Summary+notice.Suggestion, "鉴权")
+				assert.NotContains(t, notice.Suggestion, "充值")
+			}
+			if strings.HasSuffix(tc.name, "diagnostic") {
+				assert.Equal(t, tc.raw, notice.Detail, "an uncertain execution must retain the concrete diagnostic without losing its uncertainty warning")
+			}
+		})
+	}
+}
+
+func TestVideoTaskFailureNoticeRefreshesOnlySystemGenericExplanation(t *testing.T) {
+	const genericSummary = "视频任务失败，未提供可识别的进一步原因。"
+	const genericSuggestion = "请保留任务号和原始错误，联系管理员核查；当前信息不足以确定具体原因。"
+	const quotaCacheDiagnostic = "video submission failed (HTTP 403, code pre_consume_token_quota_failed): durable task token quota cache is cold during batch updates"
+	for _, tc := range []struct {
+		name, summary, suggestion, detail, wantSummary, wantSuggestion string
+	}{
+		{name: "refresh quota cache fallback", summary: genericSummary, suggestion: genericSuggestion, detail: quotaCacheDiagnostic, wantSummary: "本地令牌额度检查暂不可用，未能完成视频提交。", wantSuggestion: "请联系管理员检查令牌额度缓存，以及批量更新时的额度同步状态。"},
+		{name: "refresh upstream credits fallback", summary: genericSummary, suggestion: genericSuggestion, detail: "HTTP 402 Insufficient credits: need 4.48, have 0.26", wantSummary: "上游服务账号余额不足，未能完成视频任务。", wantSuggestion: "请联系管理员补充上游服务账号余额，并核对该任务状态后再提交。"},
+		{name: "unknown detail retains fallback", summary: genericSummary, suggestion: genericSuggestion, detail: "Unrecognized provider error Q102", wantSummary: genericSummary, wantSuggestion: genericSuggestion},
+		{name: "placeholder detail retains fallback", summary: genericSummary, suggestion: genericSuggestion, detail: "Video generation failed", wantSummary: genericSummary, wantSuggestion: genericSuggestion},
+		{name: "custom suggestion is authoritative", summary: genericSummary, suggestion: "请管理员先核对账单。", detail: quotaCacheDiagnostic, wantSummary: genericSummary, wantSuggestion: "请管理员先核对账单。"},
+		{name: "specific explanation is authoritative", summary: "视频任务费用确认尚未完成，需要核对账单。", suggestion: "请先核对费用。", detail: quotaCacheDiagnostic, wantSummary: "视频任务费用确认尚未完成，需要核对账单。", wantSuggestion: "请先核对费用。"},
+		{name: "execution unknown with pricing stays unknown", summary: "视频提交结果尚未确认，暂时无法判断上游是否已受理或开始生成。", suggestion: "为避免重复生成或重复扣费，系统不会自动再次提交；请保留任务号，联系管理员核对上游任务状态和费用后再处理。", detail: "video submission failed (HTTP 503, code video_pricing_not_configured): video pricing rule is not configured", wantSummary: "视频提交结果尚未确认，暂时无法判断上游是否已受理或开始生成。", wantSuggestion: "为避免重复生成或重复扣费，系统不会自动再次提交；请保留任务号，联系管理员核对上游任务状态和费用后再处理。"},
+		{name: "execution unknown with validation stays unknown", summary: "视频提交结果尚未确认，暂时无法判断上游是否已受理或开始生成。", suggestion: "为避免重复生成或重复扣费，系统不会自动再次提交；请保留任务号，联系管理员核对上游任务状态和费用后再处理。", detail: "生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。", wantSummary: "视频提交结果尚未确认，暂时无法判断上游是否已受理或开始生成。", wantSuggestion: "为避免重复生成或重复扣费，系统不会自动再次提交；请保留任务号，联系管理员核对上游任务状态和费用后再处理。"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rendered := tc.summary + "\n处理建议：" + tc.suggestion + "\n原始错误：" + tc.detail
+			notice := VideoTaskFailureNotice(rendered)
+			assert.Equal(t, tc.wantSummary, notice.Summary)
+			assert.Equal(t, tc.wantSuggestion, notice.Suggestion)
+			assert.Equal(t, tc.detail, notice.Detail)
+			assert.Equal(t, notice, VideoTaskFailureNotice(VideoTaskFailureReason(rendered)), "refreshed and preserved notices must stay stable on repeated queries")
 		})
 	}
 }

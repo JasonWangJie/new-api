@@ -34,21 +34,28 @@ type VideoFailureNotice struct {
 // plain-language explanation. Unknown errors do not imply a content category,
 // a retry policy or a successful refund.
 func VideoTaskFailureNotice(raw string) VideoFailureNotice {
+	const genericSummary = "视频任务失败，未提供可识别的进一步原因。"
+	const genericSuggestion = "请保留任务号和原始错误，联系管理员核查；当前信息不足以确定具体原因。"
+	var restored *VideoFailureNotice
 	// The original diagnostic may have been shortened for public display after
-	// classification. Restore the explanation itself on a second presentation;
-	// classifying its shortened detail could lose the actual cause.
+	// classification. Preserve specific explanations on a second presentation;
+	// only the exact system fallback can gain a newly recognized explanation.
 	if summary, suffix, rendered := strings.Cut(raw, "\n处理建议："); rendered {
 		suggestion, detail, hasDetail := strings.Cut(suffix, "\n原始错误：")
 		if hasDetail || summary == "视频任务失败，未提供具体错误原因。" {
-			return sanitizeVideoFailureNotice(VideoFailureNotice{Summary: summary, Suggestion: suggestion, Detail: detail})
+			restored = &VideoFailureNotice{Summary: summary, Suggestion: suggestion, Detail: detail}
+			if !hasDetail || summary != genericSummary || suggestion != genericSuggestion {
+				return sanitizeVideoFailureNotice(*restored)
+			}
+			raw = detail
 		}
 	}
 	// Classify the complete sanitized diagnostic before bounding the public
 	// detail, so a concrete cause after a long prefix is still explained.
 	raw = sanitizeVideoFailureDiagnostic(raw, -1)
 	notice := VideoFailureNotice{
-		Summary:    "视频任务失败，未提供可识别的进一步原因。",
-		Suggestion: "请保留任务号和原始错误，联系管理员核查；当前信息不足以确定具体原因。",
+		Summary:    genericSummary,
+		Suggestion: genericSuggestion,
 		Detail:     raw,
 	}
 	lower := strings.ToLower(raw)
@@ -70,12 +77,15 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 	case strings.Contains(lower, "terminated by administrator after upstream verification"):
 		notice.Summary = "管理员已结束本地任务处理。"
 		notice.Suggestion = "这不代表上游任务已取消或费用已退回；请联系管理员核对上游任务状态和账单，不要直接重新提交视频生成。"
-	case strings.Contains(lower, "upstream submission could not be confirmed") || strings.Contains(lower, "task submission state is unknown") || strings.Contains(lower, "submission_unknown") || strings.Contains(raw, "任务提交结果未知") || lower == "execution_unknown":
+	case strings.Contains(lower, "upstream submission could not be confirmed") || strings.Contains(lower, "upstream submission result is unknown") || strings.Contains(lower, "task submission state is unknown") || strings.Contains(lower, "submission_unknown") || strings.Contains(raw, "任务提交结果未知") || lower == "execution_unknown":
 		notice.Summary = "视频提交结果尚未确认，暂时无法判断上游是否已受理或开始生成。"
 		notice.Suggestion = "为避免重复生成或重复扣费，系统不会自动再次提交；请保留任务号，联系管理员核对上游任务状态和费用后再处理。"
 	case isMissingVideoFailureReason(raw):
 		notice.Summary = "视频任务失败，未提供具体错误原因。"
 		notice.Suggestion = "请保留任务号并联系管理员检查任务记录；当前没有更多可确认的失败原因。"
+	case strings.Contains(lower, "durable task token quota cache is cold during batch updates"):
+		notice.Summary = "本地令牌额度检查暂不可用，未能完成视频提交。"
+		notice.Suggestion = "请联系管理员检查令牌额度缓存，以及批量更新时的额度同步状态。"
 	case strings.Contains(lower, "generated video could not be saved locally") || lower == "storage_failed":
 		notice.Summary = "视频结果未能保存到本地。"
 		notice.Suggestion = "请联系管理员检查本地存储，并优先恢复现有视频结果的保存；不要重复发起视频生成。"
@@ -88,6 +98,12 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 	case strings.Contains(raw, "上游成功响应缺少有效成片地址"):
 		notice.Summary = "上游返回了成功状态，但没有提供可用的成片地址，当前无法交付视频。"
 		notice.Suggestion = "请联系管理员核对上游任务结果并尝试恢复成片地址；不要重复发起视频生成，以免产生重复任务或费用。"
+	case strings.Contains(lower, "insufficient credits") || strings.Contains(raw, "上游余额不足"):
+		notice.Summary = "上游服务账号余额不足，未能完成视频任务。"
+		notice.Suggestion = "请联系管理员补充上游服务账号余额，并核对该任务状态后再提交。"
+	case strings.Contains(lower, "minimax new-api resolution must be 480p, 768p, or 2k") || strings.Contains(lower, "minimax new-api resolution must be 480p, 768p, 2k"):
+		notice.Summary = "视频画质参数与上游接口不兼容，该接口仅支持 480P、768P 或 2K 档位。"
+		notice.Suggestion = "请联系管理员检查渠道画质映射；720p 需按渠道要求适配为 768P 后再提交。"
 	case strings.Contains(raw, "检查上传素材是否公网可达") && strings.Contains(raw, "是否输入了被允许的参数") && strings.Contains(raw, "是否侵犯了版权保护"):
 		notice.Summary = "上游返回生成失败，并列出素材访问、参数或版权等可能原因，未说明具体触发项。"
 		notice.Suggestion = "请依次检查素材链接是否公网可达、参数是否受支持和素材使用权限；如仍无法定位，请联系管理员核对上游记录。"
@@ -151,6 +167,9 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") || strings.Contains(lower, "deadline exceeded") || strings.Contains(raw, "超时"):
 		notice.Summary = "视频任务处理或等待响应超时，未能完成。"
 		notice.Suggestion = "请保留任务号，联系管理员确认任务状态和上游处理结果后再决定是否重新提交。"
+	}
+	if restored != nil && (notice.Summary == genericSummary || isMissingVideoFailureReason(raw)) {
+		return sanitizeVideoFailureNotice(*restored)
 	}
 	return sanitizeVideoFailureNotice(notice)
 }

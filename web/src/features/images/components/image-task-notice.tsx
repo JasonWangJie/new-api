@@ -35,7 +35,9 @@ export function ImageTaskNotice(props: {
   const issue = imageTaskIssue(props.task)
   if (!issue) return null
   const diagnostic =
-    (props.task.media_type === 'video' || props.task.error_suggestion_key) &&
+    (props.task.media_type === 'video' ||
+      props.task.error_summary_key ||
+      props.task.error_suggestion_key) &&
     typeof props.task.error_detail === 'string'
       ? props.task.error_detail
       : props.task.error_message

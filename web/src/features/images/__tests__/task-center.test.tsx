@@ -31,6 +31,12 @@ import { toast, Toaster } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -954,6 +960,118 @@ test('structured image route incompatibility translates the explanation and show
     })
     i18next.removeResourceBundle('zh', 'translation')
   }
+})
+
+test.each([
+  {
+    language: 'en',
+    resource: en,
+    summary: 'Image width and height must both be multiples of 16',
+  },
+  {
+    language: 'zh',
+    resource: zh,
+    summary: '图片宽度和高度都必须是 16 的整数倍',
+  },
+  {
+    language: 'zh-TW',
+    resource: zhTW,
+    summary: '圖片寬度和高度都必須是 16 的整數倍',
+  },
+  {
+    language: 'fr',
+    resource: fr,
+    summary:
+      'La largeur et la hauteur de l’image doivent être des multiples de 16',
+  },
+  {
+    language: 'ja',
+    resource: ja,
+    summary: '画像の幅と高さは両方とも 16 の倍数である必要があります',
+  },
+  {
+    language: 'ru',
+    resource: ru,
+    summary: 'Ширина и высота изображения должны быть кратны 16',
+  },
+  {
+    language: 'vi',
+    resource: viLocale,
+    summary: 'Chiều rộng và chiều cao ảnh đều phải là bội số của 16',
+  },
+])(
+  'structured image failures use $language keys and preserve the original once',
+  async ({ language, resource, summary }) => {
+    const summaryKey = 'Image width and height must both be multiples of 16'
+    const suggestionKey =
+      'Adjust both image dimensions to multiples of 16 before submitting again.'
+    const original =
+      'The requested image size is invalid. Width and height must both be divisible by 16.'
+    const failedTask = {
+      ...task,
+      media_type: 'image' as const,
+      status: 'failed',
+      error_summary: '图片宽度和高度都必须是 16 的整数倍',
+      error_summary_key: summaryKey,
+      error_suggestion: '请将图片宽度和高度都调整为 16 的整数倍后再提交。',
+      error_suggestion_key: suggestionKey,
+      error_detail: original,
+      error_message: `图片宽度和高度都必须是 16 的整数倍\n处理建议：请将图片宽度和高度都调整为 16 的整数倍后再提交。\n原始错误：${original}`,
+    }
+    const previousResource = i18next.hasResourceBundle(language, 'translation')
+      ? { ...i18next.getResourceBundle(language, 'translation') }
+      : undefined
+    i18next.addResourceBundle(
+      language,
+      'translation',
+      resource.translation,
+      true,
+      true
+    )
+    try {
+      render(<ImageTaskNotice task={failedTask} diagnostics />)
+      await act(async () => {
+        await i18next.changeLanguage(language)
+      })
+      const notice = screen.getByRole('status')
+      expect(within(notice).getByText(summary)).toBeVisible()
+      expect(within(notice).getByText(i18next.t(suggestionKey))).toBeVisible()
+      expect(notice.textContent?.split(summary)).toHaveLength(2)
+      expect(notice.textContent?.split(original)).toHaveLength(2)
+      expect(
+        within(notice).queryByText(failedTask.error_message)
+      ).not.toBeInTheDocument()
+    } finally {
+      await act(async () => {
+        await i18next.changeLanguage('en')
+      })
+      i18next.removeResourceBundle(language, 'translation')
+      if (previousResource) {
+        i18next.addResourceBundle(language, 'translation', previousResource)
+      }
+    }
+  }
+)
+
+test('structured image failures without recovery advice show their original diagnostic once', () => {
+  const original = 'The administrator stopped this task.'
+  const summary = 'The task was manually terminated'
+  const failedTask = {
+    ...task,
+    status: 'failed',
+    error_summary: '任务已被手动终止',
+    error_summary_key: summary,
+    error_suggestion_key: '',
+    error_detail: original,
+    error_message: `任务已被手动终止\n原始错误：${original}`,
+  }
+  render(<ImageTaskNotice task={failedTask} diagnostics />)
+  const notice = screen.getByRole('status')
+  expect(within(notice).getByText(summary)).toBeVisible()
+  expect(within(notice).getByText(original)).toBeVisible()
+  expect(
+    within(notice).queryByText(failedTask.error_message)
+  ).not.toBeInTheDocument()
 })
 
 test('local routing dependency waits show readable decision and stage labels in public details', async () => {
