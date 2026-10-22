@@ -12,7 +12,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/go-redis/redis/v8"
 )
 
@@ -39,6 +41,390 @@ type ImagePoolModelOption struct {
 type ImagePoolSelectionOptions struct {
 	Models   []ImagePoolModelOption   `json:"models"`
 	Channels []ImagePoolChannelOption `json:"channels"`
+}
+
+type MediaRoutingPreviewRequest struct {
+	Group      string `json:"group"`
+	Platform   string `json:"platform"`
+	MediaType  string `json:"media_type"`
+	Model      string `json:"model"`
+	Resolution string `json:"resolution"`
+	Operation  string `json:"operation"`
+	Seconds    *int   `json:"seconds,omitempty"`
+	TokenID    int    `json:"token_id,omitempty"`
+}
+
+type MediaRoutingPreviewChannel struct {
+	ChannelID         int      `json:"channel_id"`
+	Group             string   `json:"group"`
+	BindingKey        string   `json:"binding_key"`
+	BindingFound      bool     `json:"binding_found"`
+	Name              string   `json:"name"`
+	UpstreamModel     string   `json:"upstream_model"`
+	Priority          int64    `json:"priority"`
+	Weight            int      `json:"weight"`
+	AvailableAccounts int      `json:"available_accounts"`
+	Reasons           []string `json:"reasons"`
+}
+
+type MediaRoutingPreview struct {
+	MediaRoutingPreviewRequest
+	BindingKey    string                       `json:"binding_key"`
+	BindingFound  bool                         `json:"binding_found"`
+	PoolMode      string                       `json:"pool_mode"`
+	PolicyEnabled bool                         `json:"policy_enabled"`
+	AsyncEnabled  bool                         `json:"async_enabled"`
+	Eligible      []MediaRoutingPreviewChannel `json:"eligible"`
+	Excluded      []MediaRoutingPreviewChannel `json:"excluded"`
+	Warnings      []string                     `json:"warnings"`
+	Reasons       []string                     `json:"reasons"`
+	RoutingGroups []string                     `json:"routing_groups"`
+}
+
+// PreviewMediaRouting reads configuration only. It deliberately avoids the
+// random picker, quota reservation, circuit probes and concurrency acquisition.
+func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) (MediaRoutingPreview, error) {
+	preview := MediaRoutingPreview{
+		MediaRoutingPreviewRequest: input,
+		Eligible:                   make([]MediaRoutingPreviewChannel, 0), Excluded: make([]MediaRoutingPreviewChannel, 0),
+		Warnings: []string{"configuration_preview_only"},
+	}
+	var policy model.ImageGroupPolicy
+	var catalog []ImageModelCapability
+	policyReasons := make([]string, 0)
+	var routingGroups []string
+	imageRequest := AsyncImageRequest{
+		Provider: input.Platform, Platform: "openai", Dialect: "async", Model: input.Model,
+		Kind: input.Operation, Resolution: input.Resolution,
+		// The unified generation endpoint also accepts provider reference fields.
+		SourcePath: "/v1/images/generations_async",
+	}
+	if input.Platform == "gemini" {
+		imageRequest.Platform = "gemini"
+	}
+	if input.TokenID > 0 {
+		var token model.Token
+		if err := model.DB.WithContext(ctx).First(&token, input.TokenID).Error; err != nil {
+			return preview, err
+		}
+		var owner model.User
+		if err := model.DB.WithContext(ctx).First(&owner, token.UserId).Error; err != nil {
+			return preview, err
+		}
+		var err error
+		if input.MediaType == "image" {
+			policy, catalog, err = ResolveAsyncImagePolicy(ctx, token, imageRequest)
+		} else {
+			policy, catalog, err = ResolveImagePolicy(ctx, token, input.Platform)
+		}
+		if err != nil {
+			return preview, err
+		}
+		preview.Group = policy.Group
+		if token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExpired && token.Status != common.TokenStatusExhausted {
+			policyReasons = append(policyReasons, "token_disabled")
+		}
+		if token.Status == common.TokenStatusExpired || token.ExpiredTime != -1 && token.ExpiredTime <= time.Now().Unix() {
+			policyReasons = append(policyReasons, "token_expired")
+		}
+		if token.Status == common.TokenStatusExhausted || !token.UnlimitedQuota && token.RemainQuota <= 0 {
+			policyReasons = append(policyReasons, "token_exhausted")
+		}
+		if token.ModelLimitsEnabled && !token.GetModelLimitsMap()[input.Model] {
+			policyReasons = append(policyReasons, "token_model_not_allowed")
+		}
+		if owner.Status != common.UserStatusEnabled {
+			policyReasons = append(policyReasons, "user_disabled")
+		}
+		if input.MediaType == "video" && policy.Group == "auto" {
+			// Match SetupContextForToken/GetRequestAutoGroups: an empty stored
+			// list inherits global groups; malformed or revoked lists fail closed.
+			groups, parseErr := token.GetAutoGroups()
+			if parseErr != nil {
+				routingGroups = []string{}
+			} else if len(groups) > 0 {
+				routingGroups = FilterUserTokenAutoGroups(owner.Group, groups)
+			} else {
+				routingGroups = GetUserAutoGroup(owner.Group)
+			}
+			if len(routingGroups) == 0 {
+				policyReasons = append(policyReasons, "token_group_not_allowed")
+			}
+		} else if !GroupInUserUsableGroups(owner.Group, policy.Group) || input.MediaType == "image" && !IsUserSelectableGroup(owner.Group, policy.Group) {
+			policyReasons = append(policyReasons, "token_group_not_allowed")
+		}
+	} else if input.MediaType == "image" {
+		// An explicit group has no owner permission context. Resolve the same
+		// provider/family policies and channel priorities within that group.
+		token := model.Token{Group: input.Group}
+		var err error
+		policy, catalog, err = resolveInheritedImagePolicy(ctx, token, imageRequest)
+		if err != nil {
+			return preview, err
+		}
+		var priority int64
+		found := false
+		for _, family := range []string{"openai", "gemini"} {
+			request := imageRequest
+			request.Platform = family
+			candidatePolicy, candidateCatalog, err := resolveInheritedImagePolicy(ctx, token, request)
+			if err != nil {
+				return preview, err
+			}
+			if !candidatePolicy.Enabled || !candidatePolicy.AsyncEnabled || !slices.ContainsFunc(candidateCatalog, func(capability ImageModelCapability) bool { return capability.MatchesMedia(input.Model, "image") }) {
+				continue
+			}
+			channels, err := ImageCandidateChannels(ctx, candidatePolicy, input.Model, input.Resolution)
+			if err != nil {
+				return preview, err
+			}
+			for _, channel := range channels {
+				capability := ImageChannelCapability(channel, input.Model)
+				if capability.Provider != input.Platform || !ImageCapabilitySupportsRequest(capability, imageRequest) {
+					continue
+				}
+				if !found || channel.GetPriority() > priority {
+					policy, catalog, priority, found = candidatePolicy, candidateCatalog, channel.GetPriority(), true
+				}
+			}
+		}
+	} else {
+		var policies []model.ImageGroupPolicy
+		if err := model.DB.WithContext(ctx).Where("policy_key = ?", ImageIdentityHash(input.Group, input.Platform)).Limit(1).Find(&policies).Error; err != nil {
+			return preview, err
+		}
+		policy = model.ImageGroupPolicy{Group: input.Group, Platform: input.Platform, PoolMode: "resolution"}
+		if len(policies) > 0 {
+			policy = policies[0]
+			if err := common.UnmarshalJsonStr(policy.Models, &catalog); err != nil {
+				return preview, err
+			}
+		}
+	}
+	preview.PoolMode, preview.PolicyEnabled, preview.AsyncEnabled = policy.PoolMode, policy.Enabled, policy.AsyncEnabled
+	if policy.Id == 0 && input.MediaType == "image" {
+		policyReasons = append(policyReasons, "policy_missing")
+	}
+	if policy.Id > 0 {
+		if !policy.Enabled {
+			policyReasons = append(policyReasons, "policy_disabled")
+		}
+		if !policy.AsyncEnabled {
+			policyReasons = append(policyReasons, "async_disabled")
+		}
+	}
+	capabilityIndex := slices.IndexFunc(catalog, func(capability ImageModelCapability) bool {
+		return capability.MatchesMedia(input.Model, input.MediaType)
+	})
+	if policy.Id > 0 && capabilityIndex < 0 {
+		policyReasons = append(policyReasons, "model_not_in_policy")
+	}
+	if input.MediaType == "image" && capabilityIndex >= 0 {
+		capability := catalog[capabilityIndex]
+		if input.Resolution != "AUTO" && len(capability.Resolutions) > 0 && !slices.Contains(capability.Resolutions, input.Resolution) && !(input.Resolution == "0.5K" && capability.AllowHalfK) {
+			policyReasons = append(policyReasons, "resolution_not_in_policy")
+		}
+		if input.Operation == "image_to_image" && capability.MaxReferenceImages == 0 {
+			policyReasons = append(policyReasons, "operation_not_supported")
+		}
+	}
+	if routingGroups == nil {
+		if policy.Group == "auto" && input.TokenID == 0 {
+			routingGroups = []string{}
+			policyReasons = append(policyReasons, "token_required_for_auto_group")
+		} else {
+			routingGroups = []string{policy.Group}
+		}
+	}
+	preview.Reasons, preview.RoutingGroups = policyReasons, routingGroups
+	for _, group := range routingGroups {
+		poolPolicy := policy
+		poolPolicy.Group = group
+		resolution := input.Resolution
+		if input.MediaType == "video" {
+			resolution = VideoPoolResolution(resolution)
+		}
+		bindingKey := ImagePoolBindingKey(poolPolicy, input.Model, resolution)
+		if len(routingGroups) == 1 {
+			preview.BindingKey = bindingKey
+		}
+		var bindings []model.ImageChannelPool
+		if err := model.DB.WithContext(ctx).Where("binding_key = ? AND channel_id >= ?", bindingKey, 0).Find(&bindings).Error; err != nil {
+			return preview, err
+		}
+		preview.BindingFound = preview.BindingFound || len(bindings) > 0
+		var abilities []model.Ability
+		if err := model.DB.WithContext(ctx).Where(map[string]any{"group": group}).Find(&abilities).Error; err != nil {
+			return preview, err
+		}
+		routingModel := ratio_setting.RoutingMatchModelName(input.Model)
+		exactAbility := slices.ContainsFunc(abilities, func(ability model.Ability) bool { return ability.Enabled && ability.Model == input.Model })
+		ids := make([]int, 0, len(abilities)+len(bindings))
+		for _, ability := range abilities {
+			ids = append(ids, ability.ChannelId)
+		}
+		for _, binding := range bindings {
+			if binding.ChannelId > 0 {
+				ids = append(ids, binding.ChannelId)
+			}
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		var channels []model.Channel
+		if err := model.DB.WithContext(ctx).Where("id IN ?", ids).Order("id").Find(&channels).Error; err != nil {
+			return preview, err
+		}
+		imageCandidates := make(map[int]model.Channel)
+		if input.MediaType == "image" {
+			candidates, err := ImageCandidateChannels(ctx, poolPolicy, input.Model, resolution)
+			if err != nil {
+				return preview, err
+			}
+			for _, channel := range candidates {
+				imageCandidates[channel.Id] = channel
+			}
+		}
+		for _, channel := range channels {
+			candidate := MediaRoutingPreviewChannel{ChannelID: channel.Id, Group: group, BindingKey: bindingKey, BindingFound: len(bindings) > 0, Name: channel.Name, UpstreamModel: input.Model, Reasons: slices.Clone(policyReasons)}
+			if channel.Status != common.ChannelStatusEnabled {
+				candidate.Reasons = append(candidate.Reasons, "channel_disabled")
+			}
+			enabled := slices.ContainsFunc(abilities, func(ability model.Ability) bool {
+				return ability.ChannelId == channel.Id && ability.Enabled && (ability.Model == input.Model || ability.Model == routingModel && (input.MediaType == "video" || !exactAbility))
+			})
+			if !enabled {
+				candidate.Reasons = append(candidate.Reasons, "model_not_enabled")
+			}
+			if input.MediaType == "image" {
+				if mapped, found := imageCandidates[channel.Id]; found {
+					channel = mapped
+				} else if policy.AsyncEnabled {
+					mapped, available, err := imageChannelForResolution(channel, input.Model, resolution)
+					if err != nil {
+						return preview, err
+					}
+					if !available {
+						candidate.Reasons = append(candidate.Reasons, "resolution_mapping_missing")
+					}
+					channel = mapped
+				}
+				capability := ImageChannelCapability(channel, input.Model)
+				if capability.Provider != input.Platform || !ImageChannelSupportsPlatform(channel, input.Model, policy.Platform) {
+					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
+				}
+				if !ImageCapabilitySupportsRequest(capability, imageRequest) {
+					candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
+				}
+			} else {
+				if !mediaChannelSupportsVideoPlatform(&channel, input.Model, input.Platform) {
+					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
+				}
+				for _, binding := range mediaVideoCandidates(input.Model) {
+					if binding.Plugin == nil || binding.Plugin.Meta.Key != input.Platform {
+						continue
+					}
+					var overrides VideoModelOverrides
+					if capabilityIndex >= 0 {
+						overrides = catalog[capabilityIndex].VideoOverrides
+					}
+					profile, err := EffectiveVideoProfile(binding, input.Model, overrides)
+					if err != nil {
+						return preview, err
+					}
+					modeIndex := slices.IndexFunc(profile.Modes, func(mode jsplugin.VideoModeProfile) bool { return mode.Name == input.Operation })
+					if modeIndex < 0 {
+						candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
+						break
+					}
+					mode := profile.Modes[modeIndex]
+					// Validate scalar routing dimensions with the same profile validator;
+					// reference material is intentionally outside this configuration view.
+					mode.Inputs = nil
+					profile.Modes = []jsplugin.VideoModeProfile{mode}
+					parameters := map[string]any{"prompt": "routing preview"}
+					if input.Resolution != "" {
+						parameters["resolution"] = input.Resolution
+					}
+					if input.Seconds != nil {
+						parameters["seconds"] = *input.Seconds
+					}
+					if err := ValidateVideoProfileRequest(profile, input.Operation, parameters, nil); err != nil {
+						candidate.Reasons = append(candidate.Reasons, "video_parameters_not_supported")
+					}
+					break
+				}
+			}
+			if len(bindings) > 0 {
+				index := slices.IndexFunc(bindings, func(binding model.ImageChannelPool) bool { return binding.ChannelId == channel.Id })
+				if index < 0 {
+					candidate.Reasons = append(candidate.Reasons, "not_in_pool")
+				} else {
+					ApplyMediaChannelPoolWeight(&channel, bindings[index].Priority)
+				}
+			} else if input.MediaType == "video" {
+				weight := uint(max(1, min(channel.GetWeight(), 1_000_000_000)))
+				channel.Weight = &weight
+			}
+			candidate.Priority, candidate.Weight = channel.GetPriority(), channel.GetWeight()
+			candidate.AvailableAccounts = len(ImageChannelAccounts(channel, ImageAccountRouting{}))
+			if candidate.AvailableAccounts == 0 {
+				candidate.Reasons = append(candidate.Reasons, "no_enabled_account")
+			}
+			if raw := channel.GetModelMapping(); raw != "" {
+				var mapping map[string]string
+				if err := common.UnmarshalJsonStr(raw, &mapping); err != nil {
+					candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
+				} else {
+					seen := make(map[string]bool)
+					for {
+						next, found := mapping[candidate.UpstreamModel]
+						if base := hostreasoning.BaseModelName(candidate.UpstreamModel); (!found || next == "") && base != candidate.UpstreamModel {
+							next, found = mapping[base]
+						}
+						if !found || next == "" || next == candidate.UpstreamModel {
+							break
+						}
+						if seen[candidate.UpstreamModel] {
+							candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
+							break
+						}
+						seen[candidate.UpstreamModel] = true
+						candidate.UpstreamModel = next
+					}
+				}
+			}
+			if len(candidate.Reasons) > 0 {
+				preview.Excluded = append(preview.Excluded, candidate)
+			} else {
+				preview.Eligible = append(preview.Eligible, candidate)
+			}
+		}
+	}
+	if len(preview.Eligible) > 0 {
+		priority := preview.Eligible[0].Priority
+		for _, channel := range preview.Eligible {
+			priority = max(priority, channel.Priority)
+		}
+		positiveWeight := slices.ContainsFunc(preview.Eligible, func(channel MediaRoutingPreviewChannel) bool {
+			return channel.Priority == priority && channel.Weight > 0
+		})
+		eligible := make([]MediaRoutingPreviewChannel, 0, len(preview.Eligible))
+		for _, channel := range preview.Eligible {
+			if channel.Priority < priority {
+				channel.Reasons = append(channel.Reasons, "lower_priority")
+			} else if positiveWeight && channel.Weight == 0 {
+				channel.Reasons = append(channel.Reasons, "zero_weight")
+			}
+			if len(channel.Reasons) > 0 {
+				preview.Excluded = append(preview.Excluded, channel)
+			} else {
+				eligible = append(eligible, channel)
+			}
+		}
+		preview.Eligible = eligible
+	}
+	return preview, nil
 }
 
 // GetImagePoolSelectionOptions returns only executable model/channel choices
@@ -215,7 +601,7 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 		}
 	}
 	var bindings []model.ImageChannelPool
-	if err := model.DB.WithContext(ctx).Where("binding_key = ?", ImagePoolBindingKey(policy, modelName, resolution)).Find(&bindings).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("binding_key = ? AND channel_id >= ?", ImagePoolBindingKey(policy, modelName, resolution), 0).Find(&bindings).Error; err != nil {
 		return nil, err
 	}
 	var channels []model.Channel

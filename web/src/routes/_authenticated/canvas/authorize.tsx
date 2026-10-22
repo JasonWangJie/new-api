@@ -25,6 +25,8 @@ import {
 } from '@/features/infinite-canvas/api'
 
 export const Route = createFileRoute('/_authenticated/canvas/authorize')({
+  // All three views share one import; keep it eager for the pending state.
+  codeSplitGroupings: [],
   loader: async ({ context, location, cause }) => {
     if (cause === 'preload') return
     const config = await loadCanvasIntegration(context.queryClient)

@@ -1106,6 +1106,13 @@ export const protocols = {openai_video:{decodeRequest(ctx){return {kind:"submit"
 	}
 	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
 	require.NoError(t, f.db.First(&job, job.ID).Error)
+	assert.Equal(t, "submitted", job.Status)
+	assert.Equal(t, "ready", job.StorageStatus)
+	claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 30)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, f.db.First(&job, job.ID).Error)
 	assert.Equal(t, "succeeded", job.Status)
 	assert.Equal(t, "settled", job.BillingStatus)
 	for _, dispatched := range []bool{false, true} {

@@ -307,7 +307,7 @@ describe('task matrix recognition rejection matrix', () => {
     )
   })
 
-  test('rejects undeclared usage fields and enum values', () => {
+  test('rejects undeclared usage fields in prices and conditions', () => {
     assert.equal(
       tryParseTaskMatrixConfig(
         'tier("base", u("unknown") * 0.4)',
@@ -317,11 +317,38 @@ describe('task matrix recognition rejection matrix', () => {
     )
     assert.equal(
       tryParseTaskMatrixConfig(
-        'u("mode") == "ultra" ? tier("ultra", u("seconds") * 0.8) : tier("base", u("seconds") * 0.4)',
+        'u("unknown") == "std" ? tier("std", u("seconds") * 0.8) : tier("base", u("seconds") * 0.4)',
         singleEnumSchema
       ),
       null
     )
+  })
+
+  test('projects retired enum branches onto current values without changing charges', () => {
+    const expression =
+      'u("mode") == "ultra" ? tier("ultra", u("seconds") * 0.8) : tier("base", u("seconds") * 0.4)'
+    const matrix = tryParseTaskMatrixConfig(expression, singleEnumSchema)
+    assert.ok(matrix)
+    assert.deepEqual(
+      matrix.rows.map((row) => [row.combination.mode, row.unitPrices.seconds]),
+      [
+        ['std', 0.4],
+        ['pro', 0.4],
+      ]
+    )
+    assert.deepEqual(parseTaskTiersFromExpr(expression, singleEnumSchema), [])
+    const generated = generateTaskExprFromConfig(
+      { tiers: taskMatrixToTiers(matrix, singleEnumSchema) },
+      singleEnumSchema
+    )
+    for (const mode of ['std', 'pro']) {
+      const input = { usage: { mode, seconds: 3 } }
+      const original = evaluateBillingExpression(expression, input)
+      const projected = evaluateBillingExpression(generated, input)
+      assert.ok(original.status === 'success')
+      assert.ok(projected.status === 'success')
+      assert.equal(projected.cost, original.cost)
+    }
   })
 
   test('expands a tier condition that omits an enum field', () => {

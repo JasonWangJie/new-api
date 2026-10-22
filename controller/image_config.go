@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -48,7 +49,7 @@ func GetImageConfiguration(c *gin.Context) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	if err := model.DB.WithContext(ctx).Find(&pools).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("channel_id >= ?", 0).Find(&pools).Error; err != nil {
 		imageManagementError(c, 503, err)
 		return
 	}
@@ -88,6 +89,51 @@ func GetImageChannelPoolOptions(c *gin.Context) {
 		return
 	}
 	imageManagementData(c, options)
+}
+
+func PreviewMediaRouting(c *gin.Context) {
+	var input service.MediaRoutingPreviewRequest
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<16), &input); err != nil {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview request"))
+		return
+	}
+	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)
+	if input.TokenID < 0 || input.TokenID == 0 && input.Group == "" || len(input.Group) > 64 || !service.RegisteredMediaProvider(input.Platform) || service.ValidateImageModelName(input.Model) != nil || input.MediaType != "image" && input.MediaType != "video" {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview request"))
+		return
+	}
+	if input.Seconds != nil && (*input.Seconds < 1 || *input.Seconds > relaycommon.MaxTaskDurationSeconds) {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid video duration"))
+		return
+	}
+	if input.MediaType == "image" {
+		input.Resolution = strings.ToUpper(strings.TrimSpace(input.Resolution))
+		if input.Resolution == "" {
+			input.Resolution = "1K"
+		}
+		if input.Operation == "" {
+			input.Operation = "text_to_image"
+		}
+		if !slices.Contains([]string{"0.5K", "1K", "2K", "4K", "AUTO"}, input.Resolution) || !slices.Contains([]string{"text_to_image", "image_to_image"}, input.Operation) {
+			imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image routing dimensions"))
+			return
+		}
+	} else {
+		input.Resolution = strings.ToLower(strings.TrimSpace(input.Resolution))
+		if input.Operation == "" {
+			input.Operation = "text_to_video"
+		}
+		if len(input.Resolution) > 32 || !slices.Contains([]string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame", "edit_video", "extend_video"}, input.Operation) {
+			imageManagementError(c, http.StatusBadRequest, errors.New("Invalid video routing dimensions"))
+			return
+		}
+	}
+	preview, err := service.PreviewMediaRouting(c.Request.Context(), input)
+	if err != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Routing configuration is unavailable"))
+		return
+	}
+	imageManagementData(c, preview)
 }
 
 func UpdateImageRuntime(c *gin.Context) {
@@ -249,12 +295,13 @@ func DeleteImagePolicy(c *gin.Context) {
 
 func SaveImageChannelPool(c *gin.Context) {
 	var input struct {
-		Group      string `json:"group"`
-		Platform   string `json:"platform"`
-		Mode       string `json:"mode"`
-		Model      string `json:"model"`
-		Resolution string `json:"resolution"`
-		Channels   []struct {
+		Group       string `json:"group"`
+		Platform    string `json:"platform"`
+		Mode        string `json:"mode"`
+		Model       string `json:"model"`
+		Resolution  string `json:"resolution"`
+		ExpectedIDs []int  `json:"expected_ids"`
+		Channels    []struct {
 			Id       int `json:"id"`
 			Priority int `json:"priority"`
 		} `json:"channels"`
@@ -283,6 +330,13 @@ func SaveImageChannelPool(c *gin.Context) {
 	}
 	if input.Mode == "model" {
 		input.Resolution = ""
+	}
+	slices.Sort(input.ExpectedIDs)
+	for i, id := range input.ExpectedIDs {
+		if id < 1 || i > 0 && id == input.ExpectedIDs[i-1] {
+			imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image pool revision"))
+			return
+		}
 	}
 	policy := model.ImageGroupPolicy{Group: input.Group, Platform: input.Platform, PoolMode: input.Mode}
 	key := service.ImagePoolBindingKey(policy, input.Model, input.Resolution)
@@ -336,13 +390,43 @@ func SaveImageChannelPool(c *gin.Context) {
 		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution})
 	}
 	err := model.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error; err != nil {
+		// Reserve the binding's unique key before reading its revision, including
+		// first creation without a parent policy. This temporary row is removed
+		// before commit and its negative channel ID can never be a real member.
+		guard := model.ImageChannelPool{BindingKey: key, ChannelId: -1}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "binding_key"}, {Name: "channel_id"}},
+			DoUpdates: clause.Assignments(map[string]any{"priority": 0}),
+		}).Create(&guard).Error; err != nil {
 			return err
 		}
-		return tx.Create(&rows).Error
+		var currentIDs []int
+		if err := tx.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id >= ?", key, 0).Order("id").Pluck("id", &currentIDs).Error; err != nil {
+			return err
+		}
+		if !slices.Equal(currentIDs, input.ExpectedIDs) {
+			return model.ErrImageConflict
+		}
+		if len(currentIDs) > 0 {
+			deleted := tx.Where("binding_key = ? AND id IN ?", key, currentIDs).Delete(&model.ImageChannelPool{})
+			if deleted.Error != nil {
+				return deleted.Error
+			}
+			if deleted.RowsAffected != int64(len(currentIDs)) {
+				return model.ErrImageConflict
+			}
+		}
+		if err := tx.Create(&rows).Error; err != nil {
+			return err
+		}
+		return tx.Where("binding_key = ? AND channel_id = ?", key, -1).Delete(&model.ImageChannelPool{}).Error
 	})
 	if err != nil {
-		imageManagementError(c, 400, err)
+		status := http.StatusBadRequest
+		if errors.Is(err, model.ErrImageConflict) {
+			status = http.StatusConflict
+		}
+		imageManagementError(c, status, err)
 		return
 	}
 	imageManagementData(c, rows)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -61,45 +62,87 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			if err := CleanupMediaObjects(ctx); err != nil {
 				common.SysError("media cleanup: " + err.Error())
 			}
-			jobs, err := model.GetDueAsyncMediaJobs(ctx, time.Now().Unix(), cfg.DownloadConcurrency)
-			if err != nil {
+			if _, err := DispatchAsyncMediaJobs(ctx, cfg); err != nil {
 				common.SysError("media queue: " + err.Error())
-				continue
-			}
-			for _, job := range jobs {
-				lease := common.GetUUID()
-				// Redis bounds download concurrency across gateway processes.
-				if common.RDB == nil || !common.RedisEnabled {
-					continue
-				}
-				slot, err := imageInvocationAcquire.Run(ctx, common.RDB, []string{ImageRedisKey("video-media-slots")}, time.Now().Unix(), time.Now().Unix()+int64(cfg.DownloadTimeout+120), cfg.DownloadConcurrency, lease, cfg.DownloadTimeout+120).Int()
-				if err != nil || slot != 1 {
-					continue
-				}
-				claimed, err := model.ClaimAsyncMediaJob(ctx, &job, lease, cfg.DownloadTimeout+120)
-				if err != nil || !claimed {
-					_ = common.RDB.ZRem(ctx, ImageRedisKey("video-media-slots"), lease).Err()
-					continue
-				}
-				go func() {
-					defer func() {
-						if recovered := recover(); recovered != nil {
-							common.SysError("media worker panic; lease recovery will reconcile the job")
-						}
-					}()
-					defer common.RDB.ZRem(context.WithoutCancel(ctx), ImageRedisKey("video-media-slots"), lease)
-					if err := ProcessAsyncMediaJob(ctx, job, cfg); err != nil {
-						common.SysError("media task " + job.TaskId + ": " + err.Error())
-					}
-				}()
 			}
 		}
 	}()
 	return cancel
 }
 
+// DispatchAsyncMediaJobs starts one bounded pass over each stage. The returned
+// group allows shutdown callers and regression tests to await this pass.
+func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.WaitGroup, error) {
+	var workers sync.WaitGroup
+	if common.RDB == nil || !common.RedisEnabled {
+		return &workers, nil
+	}
+	cfg = cfg.withWorkerDefaults()
+	pools := []struct {
+		phase       string
+		concurrency int
+		timeout     int
+	}{
+		{phase: "submit", concurrency: cfg.SubmitConcurrency, timeout: cfg.SubmitTimeout},
+		{phase: "status", concurrency: cfg.StatusConcurrency, timeout: 30},
+		{phase: "download", concurrency: cfg.DownloadConcurrency, timeout: cfg.DownloadTimeout},
+	}
+	redis := common.RDB
+	for _, pool := range pools {
+		jobs, err := model.GetDueAsyncMediaJobsForPhase(ctx, time.Now().Unix(), pool.concurrency, pool.phase)
+		if err != nil {
+			return &workers, err
+		}
+		slotKey := ImageRedisKey("video-media-" + pool.phase + "-slots")
+		if pool.phase == "download" {
+			// Preserve the existing download budget during rolling upgrades.
+			slotKey = ImageRedisKey("video-media-slots")
+		}
+		for _, job := range jobs {
+			lease := common.GetUUID()
+			leaseSeconds := pool.timeout + 120
+			slot, err := imageInvocationAcquire.Run(ctx, redis, []string{slotKey}, time.Now().Unix(), time.Now().Unix()+int64(leaseSeconds), pool.concurrency, lease, leaseSeconds).Int()
+			if err != nil {
+				return &workers, err
+			}
+			if slot != 1 {
+				continue
+			}
+			claimed, err := model.ClaimAsyncMediaJob(ctx, &job, lease, leaseSeconds)
+			if err != nil || !claimed {
+				_ = redis.ZRem(ctx, slotKey, lease).Err()
+				if err != nil {
+					return &workers, err
+				}
+				continue
+			}
+			workers.Go(func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						common.SysError("media worker panic; lease recovery will reconcile the job")
+					}
+				}()
+				defer redis.ZRem(context.WithoutCancel(ctx), slotKey, lease)
+				workerCtx, cancel := context.WithTimeout(ctx, time.Duration(pool.timeout)*time.Second)
+				defer cancel()
+				if err := ProcessAsyncMediaJob(workerCtx, job, cfg); err != nil {
+					common.SysError("media task " + job.TaskId + ": " + err.Error())
+				}
+			})
+		}
+	}
+	return &workers, nil
+}
+
 func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg MediaRuntimeConfig) error {
-	ctx, cancel := context.WithTimeout(parent, time.Duration(cfg.DownloadTimeout)*time.Second)
+	cfg = cfg.withWorkerDefaults()
+	timeout := cfg.DownloadTimeout
+	if job.Status == "queued" || job.Status == "submitting" {
+		timeout = cfg.SubmitTimeout
+	} else if job.StorageStatus != "ready" && job.StorageStatus != "saving" && job.StorageStatus != "failed" {
+		timeout = 30
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 	defer cancel()
 	updates := map[string]any{"lease_token": "", "lease_expires_at": 0, "next_attempt_at": time.Now().Unix() + 3}
 	defer func() {
@@ -144,6 +187,11 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		if task.Status != model.TaskStatusSuccess {
 			return nil
 		}
+		if job.Status != "submitted" || (job.StorageStatus != "ready" && job.StorageStatus != "saving" && job.StorageStatus != "failed") {
+			// Release the submit/status lease before entering the download pool.
+			updates["storage_status"], updates["next_attempt_at"] = "ready", 0
+			return nil
+		}
 		if PersistAsyncVideoFunc == nil {
 			return errors.New("media persistence is unavailable")
 		}
@@ -179,7 +227,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		updates["storage_status"], updates["status"], updates["error_message"], updates["next_attempt_at"] = "succeeded", "succeeded", "", 0
 		return nil
 	}
-	if job.DispatchedAt > 0 || job.BillingStatus == "reserving" {
+	if job.Status == "submitted" || job.DispatchedAt > 0 || job.BillingStatus == "reserving" {
 		reason := "Upstream submission could not be confirmed; the video operation will not be repeated"
 		if detail := VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
 			if strings.Contains(detail, reason) {

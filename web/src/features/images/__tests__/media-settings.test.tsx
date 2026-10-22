@@ -37,6 +37,9 @@ const mediaSettings = {
   max_file_bytes: 1_073_741_824,
   download_timeout_seconds: 900,
   download_concurrency: 2,
+  submit_concurrency: 2,
+  status_concurrency: 8,
+  submit_timeout_seconds: 120,
   storage_retry_attempts: 5,
 }
 
@@ -64,13 +67,34 @@ test('shows success feedback after media settings are saved', async () => {
   })
   await user.clear(path)
   await user.type(path, 'data/video')
+  const submitConcurrency = screen.getByRole('spinbutton', {
+    name: 'Video submit concurrency',
+  })
+  const statusConcurrency = screen.getByRole('spinbutton', {
+    name: 'Video status concurrency',
+  })
+  const submitTimeout = screen.getByRole('spinbutton', {
+    name: 'Video submit timeout (seconds)',
+  })
+  await user.clear(submitConcurrency)
+  await user.type(submitConcurrency, '3')
+  await user.clear(statusConcurrency)
+  await user.type(statusConcurrency, '9')
+  await user.clear(submitTimeout)
+  await user.type(submitTimeout, '140')
   await user.click(screen.getByRole('button', { name: 'Save' }))
 
   await waitFor(() =>
     expect(imageRequest).toHaveBeenCalledWith(
       '/api/option/images/media',
       'PUT',
-      { ...mediaSettings, local_path: 'data/video' }
+      {
+        ...mediaSettings,
+        local_path: 'data/video',
+        submit_concurrency: 3,
+        status_concurrency: 9,
+        submit_timeout_seconds: 140,
+      }
     )
   )
   expect(success).toHaveBeenCalledWith('Saved')

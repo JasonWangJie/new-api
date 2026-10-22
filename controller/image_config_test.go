@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,15 +11,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -60,6 +66,11 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 
 			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 			require.NoError(t, err)
+			if engine == "sqlite" {
+				connection, err := db.DB()
+				require.NoError(t, err)
+				connection.SetMaxOpenConns(1)
+			}
 			previousDB := model.DB
 			previousType := common.MainDatabaseType()
 			previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
@@ -151,6 +162,79 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			var saved model.ImageChannelPool
 			require.NoError(t, db.Where("channel_id = ?", 11).Take(&saved).Error)
 			assert.Equal(t, 7, saved.Priority)
+			t.Run("routing preview", func(t *testing.T) { verifyMediaRoutingPreview(t, db, redisServer) })
+
+			t.Run("pool compare and swap covers concurrent creation and editing", func(t *testing.T) {
+				const group = "pool-without-policy"
+				require.NoError(t, db.Create(&model.Ability{Group: group, Model: "image-alpha", ChannelId: 11, Enabled: true}).Error)
+				key := service.ImagePoolBindingKey(model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "resolution"}, "", "4K")
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Ability{}).Error)
+				})
+				for _, phase := range []string{"create", "edit"} {
+					var expectedIDs []int
+					require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", key).Order("id").Pluck("id", &expectedIDs).Error)
+					responses := make([]*httptest.ResponseRecorder, 2)
+					start := make(chan struct{})
+					var workers sync.WaitGroup
+					for index := range 2 {
+						body, err := common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": expectedIDs, "channels": []gin.H{{"id": 11, "priority": index + 1}}})
+						require.NoError(t, err)
+						workers.Go(func() {
+							<-start
+							recorder := httptest.NewRecorder()
+							context, _ := gin.CreateTestContext(recorder)
+							context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+							SaveImageChannelPool(context)
+							responses[index] = recorder
+						})
+					}
+					close(start)
+					workers.Wait()
+					require.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, []int{responses[0].Code, responses[1].Code}, "%s: %s / %s", phase, responses[0].Body.String(), responses[1].Body.String())
+					var rows []model.ImageChannelPool
+					require.NoError(t, db.Where("binding_key = ?", key).Find(&rows).Error)
+					require.Len(t, rows, 1, "only the winning edit is stored, with no guard row")
+					assert.Equal(t, 11, rows[0].ChannelId)
+					assert.NotContains(t, expectedIDs, rows[0].Id, "a replacement gets a fresh revision")
+				}
+				var before []model.ImageChannelPool
+				require.NoError(t, db.Where("binding_key = ?", key).Find(&before).Error)
+				require.Len(t, before, 1)
+				body, err := common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": []int{before[0].Id}, "channels": []gin.H{}})
+				require.NoError(t, err)
+				const callback = "test:pool-replacement-failure"
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+					if rows, ok := tx.Statement.Dest.(*[]model.ImageChannelPool); ok && len(*rows) > 0 {
+						tx.AddError(errors.New("injected pool write failure"))
+					}
+				}))
+				recorder := httptest.NewRecorder()
+				context, _ := gin.CreateTestContext(recorder)
+				context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+				SaveImageChannelPool(context)
+				require.NoError(t, db.Callback().Create().Remove(callback))
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				var after []model.ImageChannelPool
+				require.NoError(t, db.Where("binding_key = ?", key).Find(&after).Error)
+				assert.Equal(t, before, after, "failed replacement rolls back all rows, including its guard")
+				recorder = httptest.NewRecorder()
+				context, _ = gin.CreateTestContext(recorder)
+				context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+				SaveImageChannelPool(context)
+				after = nil
+				require.NoError(t, db.Where("binding_key = ?", key).Find(&after).Error)
+				require.Len(t, after, 1)
+				assert.Zero(t, after[0].ChannelId, "closed bindings retain a real revision")
+				body, err = common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": []int{after[0].Id}, "channels": []gin.H{{"id": 11, "priority": 3}}})
+				require.NoError(t, err)
+				recorder = httptest.NewRecorder()
+				context, _ = gin.CreateTestContext(recorder)
+				context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+				SaveImageChannelPool(context)
+				assert.Equal(t, http.StatusOK, recorder.Code)
+			})
 
 			invalidBody, err := common.Marshal(gin.H{
 				"group": "default", "platform": "openai", "mode": "model", "model": "image-alpha",
@@ -210,9 +294,12 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					{name: "positive excludes zero", weights: []int{0, 9, 0}, selected: []int{21, 21, 21, 21, 21, 21}},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
+						var expectedIDs []int
+						require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", saved.BindingKey).Order("id").Pluck("id", &expectedIDs).Error)
 						body, err := common.Marshal(gin.H{
 							"group": "default", "platform": "openai", "mode": "model", "model": "image-alpha",
-							"channels": []gin.H{{"id": 11, "priority": tc.weights[0]}, {"id": 21, "priority": tc.weights[1]}, {"id": 22, "priority": tc.weights[2]}},
+							"expected_ids": expectedIDs,
+							"channels":     []gin.H{{"id": 11, "priority": tc.weights[0]}, {"id": 21, "priority": tc.weights[1]}, {"id": 22, "priority": tc.weights[2]}},
 						})
 						require.NoError(t, err)
 						recorder := httptest.NewRecorder()
@@ -519,6 +606,207 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, otherKey, pools[0].BindingKey)
 		})
 	}
+}
+
+func verifyMediaRoutingPreview(t *testing.T, db *gorm.DB, redisServer *miniredis.Miniredis) {
+	previousAuto := setting.AutoGroups2JsonString()
+	previousUsable := setting.UserUsableGroups2JSONString()
+	previousRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, setting.UpdateAutoGroupsByJsonString(`["default"]`))
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","preview-image-family":"Image","preview-video-group":"Video","preview-video-secondary":"Video secondary"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"preview-image-family":1,"preview-video-group":1,"preview-video-secondary":1,"preview-video-denied":1}`))
+	t.Cleanup(func() {
+		assert.NoError(t, setting.UpdateAutoGroupsByJsonString(previousAuto))
+		assert.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+		assert.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+	})
+	previousCapability := service.ImageChannelCapabilityFunc
+	service.ImageChannelCapabilityFunc = func(channel model.Channel, name string) dto.ImageCapability {
+		if channel.Type == 3 {
+			return dto.ImageCapability{Provider: "newapi", Protocol: "openai_images", Generate: true}
+		}
+		if channel.Type == 4 {
+			return dto.ImageCapability{Provider: "newapi", Protocol: "gemini_native", Generate: true}
+		}
+		if channel.Type == constant.ChannelTypeVolcEngine {
+			return (&volcengine.Adaptor{}).ImageCapability(name)
+		}
+		return previousCapability(channel, name)
+	}
+	t.Cleanup(func() { service.ImageChannelCapabilityFunc = previousCapability })
+	inheritedChannel := model.Channel{Type: 3, Name: "Inherited image channel", Key: "private-inherited-credential", Status: common.ChannelStatusEnabled, Models: "inherited-image", Group: "preview-image-family"}
+	require.NoError(t, db.Create(&inheritedChannel).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: inheritedChannel.Group, Model: "inherited-image", ChannelId: inheritedChannel.Id, Enabled: true}).Error)
+	otherFamilyChannels := []model.Channel{
+		{Type: 1, Name: "Other provider in family", Key: "private-other-provider", Status: common.ChannelStatusEnabled, Models: "inherited-image", Group: inheritedChannel.Group},
+		{Type: 4, Name: "Provider in unconfigured family", Key: "private-other-family", Status: common.ChannelStatusEnabled, Models: "inherited-image", Group: inheritedChannel.Group},
+		{Type: constant.ChannelTypeVolcEngine, Name: "Seedream reference channel", Key: "private-reference-provider", Status: common.ChannelStatusEnabled, Models: "doubao-seedream-4-5-251128", Group: inheritedChannel.Group},
+	}
+	require.NoError(t, db.Create(&otherFamilyChannels).Error)
+	for _, channel := range otherFamilyChannels {
+		require.NoError(t, db.Create(&model.Ability{Group: channel.Group, Model: channel.Models, ChannelId: channel.Id, Enabled: true}).Error)
+	}
+	inheritedPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash(inheritedChannel.Group, "openai"), Group: inheritedChannel.Group, Platform: "openai", PoolMode: "model", Models: `[{"id":"inherited-image","media_type":"image"},{"id":"doubao-seedream-4-5-251128","media_type":"image","max_reference_images":2}]`, Enabled: true, AsyncEnabled: true}
+	require.NoError(t, db.Create(&inheritedPolicy).Error)
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where("channel_id = ?", inheritedChannel.Id).Delete(&model.Ability{}).Error)
+		assert.NoError(t, db.Delete(&inheritedChannel).Error)
+		assert.NoError(t, db.Delete(&inheritedPolicy).Error)
+		for _, channel := range otherFamilyChannels {
+			assert.NoError(t, db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+			assert.NoError(t, db.Delete(&channel).Error)
+		}
+	})
+	t.Helper()
+	settings := dto.ChannelSettings{ImageResolutionModelMapping: dto.ImageResolutionModelMapping{"image-alpha": {"2K": "upstream-image-2K"}}}
+	settingJSON, err := common.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 11).Update("setting", string(settingJSON)).Error)
+	t.Cleanup(func() { assert.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 11).Update("setting", "").Error) })
+	const pluginKey = "routing-preview-video"
+	_, err = jsplugin.DefaultRegistry.Register(`
+export const meta = {apiVersion: 1, key: "routing-preview-video", name: "Routing preview", version: "1.0.0", author: {name: "Test"}, models: ["preview-video"], fetchMode: "per_task", protocols: ["openai_video"], videoProfiles: [{models: ["preview-video"], modes: [{name: "text_to_video", duration: {min: 1, max: 10, step: 1, default: 5}, resolutions: ["720p"], defaultResolution: "720p"}]}]};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+export const protocols = {openai_video: {decodeRequest() { return {}; }, render() { return {}; }}};
+export function listArtifacts() { return []; }
+export function buildContentRequest() { return {}; }
+`, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+	video := model.Channel{Type: 61, Name: "Preview video channel", Key: "private-video-credential", Status: common.ChannelStatusEnabled, Models: "preview-video", Group: "preview-video-group"}
+	video.SetSetting(dto.ChannelSettings{TaskPluginKey: pluginKey})
+	require.NoError(t, db.Create(&video).Error)
+	for _, group := range []string{video.Group, "preview-video-secondary", "preview-video-denied"} {
+		require.NoError(t, db.Create(&model.Ability{Group: group, Model: "preview-video", ChannelId: video.Id, Enabled: true}).Error)
+	}
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where("channel_id = ?", video.Id).Delete(&model.Ability{}).Error)
+		assert.NoError(t, db.Delete(&video).Error)
+	})
+	owner := model.User{Username: "routing-preview-owner", Group: "default", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&owner).Error)
+	tokens := []model.Token{
+		{UserId: owner.Id, Key: "preview-token-credential", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100},
+		{UserId: owner.Id, Key: "preview-disabled-credential", Group: "default", Status: common.TokenStatusDisabled, ExpiredTime: -1, RemainQuota: 100},
+		{UserId: owner.Id, Key: "preview-limited-credential", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100, ModelLimitsEnabled: true, ModelLimits: "other-image"},
+		{UserId: owner.Id, Key: "preview-inherited-credential", Group: inheritedChannel.Group, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100},
+		{UserId: owner.Id, Key: "preview-auto-credential", Group: "auto", AutoGroups: `["preview-video-denied","preview-video-secondary","preview-video-group"]`, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100},
+		{UserId: owner.Id, Key: "preview-revoked-credential", Group: "auto", AutoGroups: `["preview-video-denied"]`, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100},
+	}
+	require.NoError(t, db.Create(&tokens).Error)
+	t.Cleanup(func() {
+		assert.NoError(t, db.Unscoped().Where("user_id = ?", owner.Id).Delete(&model.Token{}).Error)
+		assert.NoError(t, db.Unscoped().Delete(&owner).Error)
+	})
+	for _, body := range []string{
+		`{"provider":"newapi","model":"inherited-image","prompt":"routing preview","resolution":"auto"}`,
+		`{"provider":"volcengine","model":"doubao-seedream-4-5-251128","prompt":"routing preview","resolution":"1K","image":"https://example.com/reference.png"}`,
+	} {
+		request, err := service.ParseAsyncImageRequest([]byte(body), "application/json", "/v1/images/generations_async", service.DefaultImageRuntimeConfig())
+		require.NoError(t, err)
+		policy, _, err := service.ResolveAsyncImagePolicy(t.Context(), tokens[3], request)
+		require.NoError(t, err)
+		channels, err := service.ImageCandidateChannels(t.Context(), policy, request.Model, service.AsyncImageRoutingResolution(request))
+		require.NoError(t, err)
+		require.True(t, slices.ContainsFunc(channels, func(channel model.Channel) bool {
+			capability := service.ImageChannelCapability(channel, request.Model)
+			return capability.Provider == request.Provider && service.ImageCapabilitySupportsRequest(capability, request)
+		}), "the actual async generation path must support this preview fixture")
+	}
+	const callback = "test:routing-preview-must-not-write"
+	failWrite := func(tx *gorm.DB) { tx.AddError(errors.New("routing preview must be read only")) }
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, failWrite))
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, failWrite))
+	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(callback, failWrite))
+	t.Cleanup(func() {
+		assert.NoError(t, db.Callback().Create().Remove(callback))
+		assert.NoError(t, db.Callback().Update().Remove(callback))
+		assert.NoError(t, db.Callback().Delete().Remove(callback))
+	})
+	redisKeys := redisServer.Keys()
+	for _, test := range []struct {
+		name       string
+		request    service.MediaRoutingPreviewRequest
+		wantID     int
+		wantModel  string
+		wantReason string
+		wantGroups []string
+	}{
+		{"image mapping", service.MediaRoutingPreviewRequest{Group: "default", Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "2K"}, 11, "upstream-image-2K", "", []string{"default"}},
+		{"missing tier", service.MediaRoutingPreviewRequest{Group: "default", Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "4K"}, 0, "", "resolution_mapping_missing", []string{"default"}},
+		{"auto still requires configured channel mapping", service.MediaRoutingPreviewRequest{Group: "default", Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "AUTO"}, 0, "", "resolution_mapping_missing", []string{"default"}},
+		{"token resolves effective group", service.MediaRoutingPreviewRequest{TokenID: tokens[0].Id, Group: "untrusted", Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "2K"}, 11, "upstream-image-2K", "", []string{"default"}},
+		{"disabled token", service.MediaRoutingPreviewRequest{TokenID: tokens[1].Id, Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "2K"}, 0, "", "token_disabled", []string{"default"}},
+		{"token model restriction", service.MediaRoutingPreviewRequest{TokenID: tokens[2].Id, Platform: "openai", MediaType: "image", Model: "image-alpha", Resolution: "2K"}, 0, "", "token_model_not_allowed", []string{"default"}},
+		{"token inherits protocol family policy", service.MediaRoutingPreviewRequest{TokenID: tokens[3].Id, Platform: "newapi", MediaType: "image", Model: "inherited-image", Resolution: "1K"}, inheritedChannel.Id, "inherited-image", "", []string{inheritedChannel.Group}},
+		{"explicit group inherits protocol family policy", service.MediaRoutingPreviewRequest{Group: inheritedChannel.Group, Platform: "newapi", MediaType: "image", Model: "inherited-image", Resolution: "1K"}, inheritedChannel.Id, "inherited-image", "", []string{inheritedChannel.Group}},
+		{"auto inherits protocol family policy", service.MediaRoutingPreviewRequest{TokenID: tokens[3].Id, Platform: "newapi", MediaType: "image", Model: "inherited-image", Resolution: "AUTO"}, inheritedChannel.Id, "inherited-image", "", []string{inheritedChannel.Group}},
+		{"generation reference input", service.MediaRoutingPreviewRequest{TokenID: tokens[3].Id, Platform: "volcengine", MediaType: "image", Model: "doubao-seedream-4-5-251128", Resolution: "1K", Operation: "image_to_image"}, otherFamilyChannels[2].Id, "doubao-seedream-4-5-251128", "", []string{inheritedChannel.Group}},
+		{"explicit group respects provider within family", service.MediaRoutingPreviewRequest{Group: inheritedChannel.Group, Platform: "openai", MediaType: "image", Model: "inherited-image", Resolution: "1K"}, otherFamilyChannels[0].Id, "inherited-image", "", []string{inheritedChannel.Group}},
+		{"video default routing", service.MediaRoutingPreviewRequest{Group: video.Group, Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p"}, video.Id, "preview-video", "", []string{video.Group}},
+		{"video unsupported duration", service.MediaRoutingPreviewRequest{Group: video.Group, Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p", Seconds: common.GetPointer(11)}, 0, "", "video_parameters_not_supported", []string{video.Group}},
+		{"video unsupported operation", service.MediaRoutingPreviewRequest{Group: video.Group, Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p", Operation: "edit_video"}, 0, "", "operation_not_supported", []string{video.Group}},
+		{"video auto custom groups", service.MediaRoutingPreviewRequest{TokenID: tokens[4].Id, Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p"}, video.Id, "preview-video", "", []string{"preview-video-secondary", video.Group}},
+		{"video auto revoked groups", service.MediaRoutingPreviewRequest{TokenID: tokens[5].Id, Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p"}, 0, "", "token_group_not_allowed", []string{}},
+		{"auto group requires token context", service.MediaRoutingPreviewRequest{Group: "auto", Platform: pluginKey, MediaType: "video", Model: "preview-video", Resolution: "720p"}, 0, "", "token_required_for_auto_group", []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := common.Marshal(test.request)
+			require.NoError(t, err)
+			router := gin.New()
+			router.Use(func(c *gin.Context) { c.Set("id", 730001); c.Set("role", common.RoleRootUser) })
+			router.POST("/preview", middleware.RequirePermission(authz.ImageConfigRead), PreviewMediaRouting)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/preview", bytes.NewReader(encoded)))
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			var response struct {
+				Data service.MediaRoutingPreview `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.Equal(t, []string{"configuration_preview_only"}, response.Data.Warnings)
+			assert.Equal(t, test.wantGroups, response.Data.RoutingGroups)
+			if test.wantID > 0 {
+				require.Len(t, response.Data.Eligible, len(test.wantGroups))
+				for index, candidate := range response.Data.Eligible {
+					assert.Equal(t, test.wantID, candidate.ChannelID)
+					assert.Equal(t, test.wantModel, candidate.UpstreamModel)
+					assert.Equal(t, test.wantGroups[index], candidate.Group)
+				}
+			} else {
+				assert.Empty(t, response.Data.Eligible)
+				assert.True(t, slices.Contains(response.Data.Reasons, test.wantReason) || slices.ContainsFunc(response.Data.Excluded, func(channel service.MediaRoutingPreviewChannel) bool {
+					return slices.Contains(channel.Reasons, test.wantReason)
+				}))
+			}
+			for _, secret := range []string{"openai-secret", "gemini-secret", "disabled-secret", "private-video-credential", "preview-token-credential", "preview-disabled-credential", "preview-limited-credential"} {
+				assert.NotContains(t, recorder.Body.String(), secret)
+			}
+		})
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("id", 730002); c.Set("role", common.RoleCommonUser) })
+	router.POST("/preview", middleware.RequirePermission(authz.ImageConfigRead), PreviewMediaRouting)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/preview", strings.NewReader(`{}`)))
+	assert.Equal(t, http.StatusForbidden, recorder.Code, "ordinary users cannot inspect administrator routing")
+	for _, body := range []string{
+		`{"group":"default","platform":"openai","media_type":"image","model":"image-alpha","token_id":-1}`,
+		`{"platform":"openai","media_type":"image","model":"image-alpha"}`,
+		`{"group":"default","platform":"openai","media_type":"image","model":"image-alpha","resolution":"8K"}`,
+		`{"group":"default","platform":"openai","media_type":"image","model":"image-alpha","seconds":0}`,
+		`{"group":"default","platform":"openai","media_type":"image","model":"image-alpha","operation":"edit_video"}`,
+	} {
+		router := gin.New()
+		router.Use(func(c *gin.Context) { c.Set("id", 730001); c.Set("role", common.RoleRootUser) })
+		router.POST("/preview", middleware.RequirePermission(authz.ImageConfigRead), PreviewMediaRouting)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/preview", strings.NewReader(body)))
+		assert.Equal(t, http.StatusBadRequest, recorder.Code, body)
+	}
+	assert.Equal(t, redisKeys, redisServer.Keys(), "preview must not reserve concurrency slots or mutate health state")
 }
 
 func TestSaveMediaPolicyAcceptsImageVideoCatalogAndRejectsCapabilityExpansion(t *testing.T) {

@@ -36,6 +36,7 @@ func SetApiRouter(router *gin.Engine) {
 	imageOptions := apiRouter.Group("/option/images", middleware.RootAuth(), middleware.DisableCache())
 	imageOptions.GET("", middleware.RequirePermission(authz.ImageConfigRead), controller.GetImageConfiguration)
 	imageOptions.GET("/pool/options", middleware.RequirePermission(authz.ImageConfigRead), controller.GetImageChannelPoolOptions)
+	imageOptions.POST("/routing/preview", middleware.RequirePermission(authz.ImageConfigRead), controller.PreviewMediaRouting)
 	imageOptions.GET("/media", middleware.RequirePermission(authz.ImageConfigRead), controller.GetMediaConfiguration)
 	imageOptions.PUT("/media", middleware.RequirePermission(authz.ImageConfigManage), controller.UpdateMediaConfiguration)
 	imageOptions.PUT("/runtime", middleware.RequirePermission(authz.ImageConfigManage), controller.UpdateImageRuntime)

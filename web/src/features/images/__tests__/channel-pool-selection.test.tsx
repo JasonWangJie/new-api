@@ -48,6 +48,7 @@ const geminiOptions = {
   channels: [{ id: 22, name: 'Gemini account' }],
 }
 const savedBinding = {
+  id: 22,
   binding_key: 'saved-pool',
   group: 'premium',
   platform: 'gemini',
@@ -60,6 +61,7 @@ const savedBinding = {
 
 function renderPool(
   pools: Array<{
+    id?: number
     binding_key: string
     group: string
     platform: string
@@ -408,6 +410,7 @@ test.each([7, -3])(
     const user = userEvent.setup()
     const { onSuccess } = renderPool([
       {
+        id: 22,
         binding_key: 'saved-pool',
         group: 'premium',
         platform: 'gemini',
@@ -452,6 +455,7 @@ test.each([7, -3])(
         '/api/option/images/pool',
         'PUT',
         {
+          expected_ids: [22],
           group: 'premium',
           platform: 'gemini',
           mode: 'model',
@@ -575,7 +579,7 @@ test('a pending pool save blocks dismissal and duplicate submissions until it su
   expect(onSuccess).toHaveBeenCalledOnce()
 })
 
-test('selecting another group replaces model and channel choices and clears saved weights', async () => {
+test('copying a binding into another group replaces choices and preserves the source', async () => {
   vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
     if (method === 'GET' && url.includes('group=default')) return openAIOptions
     if (method === 'GET' && url.includes('group=premium')) return geminiOptions
@@ -594,6 +598,15 @@ test('selecting another group replaces model and channel choices and clears save
     )
   )
   const group = screen.getByRole('combobox', { name: 'Group' })
+  expect(group).toBeDisabled()
+  expect(screen.getByRole('combobox', { name: 'Platform' })).toBeDisabled()
+  expect(screen.getByRole('combobox', { name: 'Pool binding' })).toBeDisabled()
+  expect(screen.getByRole('combobox', { name: 'Model' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Copy binding' }))
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'A binding already exists for this target. Edit that binding instead.'
+  )
   await user.click(group)
   await user.clear(group)
   await user.type(group, 'default')
@@ -626,6 +639,7 @@ test('selecting another group replaces model and channel choices and clears save
       '/api/option/images/pool',
       'PUT',
       {
+        expected_ids: [],
         group: 'default',
         platform: 'gemini',
         mode: 'model',
@@ -633,6 +647,34 @@ test('selecting another group replaces model and channel choices and clears save
         resolution: '',
         channels: [{ id: 11, priority: 0 }],
       }
+    )
+  )
+})
+
+test('reopening a closed binding submits the original placeholder row ID for concurrency protection', async () => {
+  const user = userEvent.setup()
+  renderPool([{ ...savedBinding, id: 50, channel_id: 0 }])
+  await user.click(
+    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
+  )
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  expect(screen.getByRole('status')).toHaveTextContent(
+    'Saving an empty channel list closes this binding to new requests.'
+  )
+  const channels = screen.getByRole('combobox', { name: 'Channels' })
+  await waitFor(() => expect(channels).toBeEnabled())
+  await user.click(channels)
+  await user.click(screen.getByRole('option', { name: '#22 · Gemini account' }))
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      expect.objectContaining({
+        expected_ids: [50],
+        channels: [{ id: 22, priority: 0 }],
+      })
     )
   )
 })

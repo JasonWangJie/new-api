@@ -24,6 +24,7 @@ import { toast } from 'sonner'
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { MultiSelect } from '@/components/multi-select'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Combobox } from '@/components/ui/combobox'
 import { Field, FieldDescription, FieldGroup } from '@/components/ui/field'
@@ -43,6 +44,7 @@ import { ImageSelect } from './image-select'
 
 export type ImagePoolBinding = ImageChannelPool & {
   channels: ImageChannelPool[]
+  rowIds: (number | undefined)[]
 }
 
 type ImagePoolEditorProps = {
@@ -58,6 +60,8 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
   const queryClient = useQueryClient()
   const formId = useId()
   const weightDescriptionId = useId()
+  const [copying, setCopying] = useState(false)
+  const editing = !!props.binding && !copying
   const [group, setGroup] = useState(props.binding?.group || 'default')
   const [platform, setPlatform] = useState(props.binding?.platform || 'openai')
   const [mode, setMode] = useState(props.binding?.mode || 'resolution')
@@ -76,6 +80,15 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       ]) || []
     )
   )
+  const targetBindings = (props.config?.pools || []).filter(
+    (binding) =>
+      binding.group === group.trim() &&
+      binding.platform === platform &&
+      binding.mode === mode &&
+      binding.model === (mode === 'resolution' ? '' : model) &&
+      binding.resolution === (mode === 'model' ? '' : resolution)
+  )
+  const targetConflict = !editing && targetBindings.length > 0
   const poolOptions = useQuery({
     queryKey: ['image-pool-options', group, platform],
     queryFn: ({ signal }) => {
@@ -139,6 +152,18 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
   }, [availableChannelIds, channelIds, poolOptions.data?.channels, t])
   const save = useMutation({
     mutationFn: async () => {
+      if (targetConflict) {
+        throw new Error(
+          t(
+            'A binding already exists for this target. Edit that binding instead.'
+          )
+        )
+      }
+      if (editing && props.binding?.rowIds.some((id) => !id)) {
+        throw new Error(
+          t('The binding has changed. Reload the configuration before saving.')
+        )
+      }
       if (mode !== 'resolution' && !model) {
         throw new Error(t('Model name is required'))
       }
@@ -151,7 +176,8 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         throw new Error(t('Invalid channel IDs'))
       }
       await imageRequest('/api/option/images/pool', 'PUT', {
-        group,
+        expected_ids: editing ? props.binding?.rowIds : [],
+        group: group.trim(),
         platform,
         mode,
         model: mode === 'resolution' ? '' : model,
@@ -185,9 +211,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         props.onClose()
       }}
       title={
-        props.binding
-          ? t('Edit channel pool binding')
-          : t('Add channel pool binding')
+        editing ? t('Edit channel pool binding') : t('Add channel pool binding')
       }
       description={t(
         'Choose channels already enabled for this group and model. An empty list explicitly closes this binding.'
@@ -196,6 +220,16 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       showCloseButton={!busy}
       footer={
         <>
+          {editing && props.canManage && (
+            <Button
+              type='button'
+              variant='outline'
+              disabled={busy}
+              onClick={() => setCopying(true)}
+            >
+              {t('Copy binding')}
+            </Button>
+          )}
           <Button
             type='button'
             variant='outline'
@@ -213,6 +247,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
               !props.canManage ||
               poolOptions.isLoading ||
               poolOptions.isError ||
+              targetConflict ||
               !group.trim()
             }
           >
@@ -225,7 +260,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         id={formId}
         onSubmit={(event) => {
           event.preventDefault()
-          if (!busy && props.canManage) save.mutate()
+          if (!busy && props.canManage && !targetConflict) save.mutate()
         }}
       >
         <fieldset disabled={busy || !props.canManage} className='min-w-0'>
@@ -239,10 +274,10 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 setChannelIds([])
                 setWeights({})
               }}
-              disabled={busy || !props.canManage}
+              disabled={busy || !props.canManage || editing}
             />
             <ImageSelect
-              disabled={busy || !props.canManage}
+              disabled={busy || !props.canManage || editing}
               label={t('Platform')}
               value={platform}
               options={(
@@ -260,7 +295,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
               }}
             />
             <ImageSelect
-              disabled={busy || !props.canManage}
+              disabled={busy || !props.canManage || editing}
               label={t('Pool binding')}
               value={mode}
               options={['resolution', 'model', 'model_resolution'].map(
@@ -295,6 +330,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                   disabled={
                     busy ||
                     !props.canManage ||
+                    editing ||
                     poolOptions.isLoading ||
                     poolOptions.isError
                   }
@@ -304,7 +340,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
             )}
             {mode !== 'model' && (
               <ImageSelect
-                disabled={busy || !props.canManage}
+                disabled={busy || !props.canManage || editing}
                 label={t('Resolution')}
                 value={resolution}
                 options={['1K', '2K', '4K'].map((value) => ({
@@ -385,6 +421,52 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
               </FieldDescription>
             </div>
           </FieldGroup>
+          <Alert
+            className='mt-4'
+            role={targetConflict ? 'alert' : 'status'}
+            variant={targetConflict ? 'destructive' : 'default'}
+          >
+            <AlertTitle>{t('Binding impact')}</AlertTitle>
+            <AlertDescription>
+              <p className='break-words'>
+                {group} / {platform} / {t(imageLabel(mode))} /{' '}
+                {model || t('All Models')} /{' '}
+                {mode === 'model' ? t('All resolutions') : resolution}
+              </p>
+              <p>
+                {t('Channels: {{before}} → {{after}}', {
+                  before: targetBindings.filter(
+                    (binding) => binding.channel_id > 0
+                  ).length,
+                  after: channelIds.length,
+                })}
+              </p>
+              {editing && (
+                <p>
+                  {t(
+                    'The binding target is fixed while editing. Copy the binding to use another target.'
+                  )}
+                </p>
+              )}
+              {copying && (
+                <p>{t('The original binding will remain unchanged.')}</p>
+              )}
+              {targetConflict && (
+                <p>
+                  {t(
+                    'A binding already exists for this target. Edit that binding instead.'
+                  )}
+                </p>
+              )}
+              {channelIds.length === 0 && (
+                <p>
+                  {t(
+                    'Saving an empty channel list closes this binding to new requests.'
+                  )}
+                </p>
+              )}
+            </AlertDescription>
+          </Alert>
         </fieldset>
       </form>
       {save.isError && (

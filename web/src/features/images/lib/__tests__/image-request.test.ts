@@ -23,6 +23,7 @@ import { ASYNC_IMAGE_ENDPOINTS, asyncImageGuide } from '../guide-content'
 import {
   buildImageRequest,
   extractImageResponse,
+  imageRequestDimensions,
   terminalImageStatus,
 } from '../image-request'
 
@@ -47,6 +48,31 @@ const options = {
   background: 'opaque',
 }
 describe('capability-driven image request contracts', () => {
+  it('reports exact submitted dimensions and marks approximate aspect ratios', () => {
+    const current: ImageModel = { ...model, mode: 'realtime' }
+    const dimensions = imageRequestDimensions(current, '1K', '16:9')
+    expect(dimensions).toEqual({ size: '1536x1024', approximate: true })
+    expect(
+      JSON.parse(
+        buildImageRequest({ ...options, model: current, ratio: '16:9' }).body
+      ).size
+    ).toBe(dimensions?.size)
+    expect(imageRequestDimensions(current, '2K', '16:9')).toEqual({
+      size: '2048x1152',
+      approximate: false,
+    })
+    expect(
+      imageRequestDimensions(
+        {
+          ...model,
+          provider: 'newapi',
+          supported_parameters: ['output_resolution'],
+        },
+        '1K',
+        '16:9'
+      )
+    ).toBeUndefined()
+  })
   it('documents every asynchronous media path with valid standalone examples', () => {
     for (const chinese of [true, false]) {
       const examples = asyncImageGuide(

@@ -364,6 +364,9 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 			c.Abort()
 			return
 		}
+		if !authorizeTokenIP(c, token) {
+			return
+		}
 
 		userCache, err := model.GetUserCache(token.UserId)
 		if err != nil {
@@ -507,7 +510,7 @@ func CanvasAsyncMediaWorkerAuth(tokenID, userID int) gin.HandlerFunc {
 	}
 }
 
-func authorizeRelayToken(c *gin.Context, token *model.Token, user *model.UserBase, parts ...string) bool {
+func authorizeTokenIP(c *gin.Context, token *model.Token) bool {
 	allowIps := token.GetIpLimits()
 	if len(allowIps) > 0 {
 		clientIp := c.ClientIP()
@@ -522,6 +525,13 @@ func authorizeRelayToken(c *gin.Context, token *model.Token, user *model.UserBas
 			return false
 		}
 		logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
+	}
+	return true
+}
+
+func authorizeRelayToken(c *gin.Context, token *model.Token, user *model.UserBase, parts ...string) bool {
+	if !authorizeTokenIP(c, token) {
+		return false
 	}
 	if user == nil {
 		var err error

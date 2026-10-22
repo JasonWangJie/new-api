@@ -1230,6 +1230,86 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 	}
 }
 
+func TestPendingTaskAtFullProgressRemainsPollableAndTimesOutOnce(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID = 680, 680, 680
+	seedUser(t, userID, 10000)
+	seedToken(t, tokenID, userID, "full-progress-token", 7000)
+	seedTaskPollingChannel(t, channelID, true)
+	task := makeTask(userID, channelID, 4000, tokenID, BillingSourceWallet, 0)
+	task.TaskID, task.Progress = "task_full_progress", "100%"
+	task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+	require.NoError(t, model.DB.Create(task).Error)
+	assert.True(t, model.HasUnfinishedSyncTasks())
+	require.Len(t, model.GetAllUnFinishSyncTasks(10), 1)
+	require.Len(t, model.GetTimedOutUnfinishedTasks(time.Now().Add(-time.Minute).Unix(), 10), 1)
+	page, err := model.GetUnfinishedSyncTaskPage(t.Context(), 0, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	ch, err := model.GetChannelById(channelID, true)
+	require.NoError(t, err)
+	adaptor := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "100%"}}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, ch, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+	var pending model.Task
+	require.NoError(t, model.DB.First(&pending, task.ID).Error)
+	assert.Equal(t, "99%", pending.Progress)
+	previousTimeout, previousCursor := constant.TaskTimeoutMinutes, taskTimeoutCursor.Swap(0)
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout; taskTimeoutCursor.Store(previousCursor) })
+	for range 2 {
+		sweepTimedOutTasks(t.Context())
+	}
+	var finished model.Task
+	require.NoError(t, model.DB.First(&finished, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, finished.Status)
+	assert.Zero(t, finished.Quota)
+	assert.Equal(t, 14000, getUserQuota(t, userID))
+	assert.Equal(t, 11000, getTokenRemainQuota(t, tokenID))
+	assert.False(t, model.HasUnfinishedSyncTasks())
+}
+
+func TestBatchMissingTaskUsesFailureBudgetWithoutAffectingOtherTasks(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const userID, tokenID, channelID = 681, 681, 681
+	seedUser(t, userID, 10000)
+	seedToken(t, tokenID, userID, "batch-missing-token", 7000)
+	seedTaskPollingChannel(t, channelID, true)
+	previousLimit := constant.TaskPollMaxFailures
+	constant.TaskPollMaxFailures = 2
+	t.Cleanup(func() { constant.TaskPollMaxFailures = previousLimit })
+	missing := makeTask(userID, channelID, 4000, tokenID, BillingSourceWallet, 0)
+	missing.TaskID, missing.PrivateData.UpstreamTaskID = "task_missing", "upstream_missing"
+	require.NoError(t, model.DB.Create(missing).Error)
+	present := seedPollingTask(t, channelID, "task_present", "upstream_present")
+	present.PrivateData.PollFailures = 1
+	require.NoError(t, present.Update())
+	adaptor := &scriptedBatchPollingAdaptor{results: map[string]*BatchTaskResult{
+		present.GetUpstreamTaskID(): {TaskInfo: relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Progress: "100%"}},
+	}}
+	ch, err := model.GetChannelById(channelID, true)
+	require.NoError(t, err)
+	require.NoError(t, updateBatchTaskGroup(t.Context(), adaptor, ch, ch.Key, []*model.Task{missing, present}))
+	assert.Equal(t, 1, missing.PrivateData.PollFailures)
+	assert.EqualValues(t, model.TaskStatusInProgress, missing.Status)
+	assert.Zero(t, present.PrivateData.PollFailures)
+	assert.Equal(t, "99%", present.Progress)
+	stale := *missing
+	require.NoError(t, updateBatchTaskGroup(t.Context(), adaptor, ch, ch.Key, []*model.Task{missing, present}))
+	// A poll started from the same pre-terminal row cannot issue a second refund.
+	require.NoError(t, updateBatchTaskGroup(t.Context(), adaptor, ch, ch.Key, []*model.Task{&stale}))
+	var finished model.Task
+	require.NoError(t, model.DB.First(&finished, missing.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, finished.Status)
+	assert.Equal(t, 2, finished.PrivateData.PollFailures)
+	assert.Contains(t, finished.FailReason, "batch response omitted the requested task")
+	assert.Zero(t, finished.Quota)
+	assert.Equal(t, 14000, getUserQuota(t, userID))
+	assert.Equal(t, 11000, getTokenRemainQuota(t, tokenID))
+	require.NoError(t, model.DB.First(present, present.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, present.Status)
+	assert.Zero(t, present.PrivateData.PollFailures)
+}
+
 func upstreamAsyncTestProfile(t *testing.T, mediaType string) *dto.UpstreamAsyncProfile {
 	t.Helper()
 	configJSON := fmt.Sprintf(`{"profiles":[{"id":"dynamic","media_type":%q,"models":["mapped"],"operations":["generate"],"submit":{"task_id_path":"job.identifier"},"poll":{"request":{"method":"POST","path":"/tasks/{task_id}","query":{"model":"{upstream_model}"},"headers":{"Authorization":"Bearer {api_key}"},"body":{"task":"{task_id}","model":"{model}"}},"response":{"status_path":"job.status","status_values":{"queued":["queued",1],"in_progress":["running"],"succeeded":["done",true],"failed":["failed",false]},"progress_path":"job.progress","failure_reason_path":"job.error.message","result_path":"job.output","usage_paths":{"prompt_tokens":"usage.input","completion_tokens":"usage.output","total_tokens":"usage.total"},"download_headers":{"Authorization":"Bearer {api_key}"}}}}]}`, mediaType)

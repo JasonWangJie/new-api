@@ -23,6 +23,8 @@ import { loadCanvasIntegration } from '@/features/infinite-canvas/api'
 import { isSidebarModuleEnabled } from '@/lib/nav-modules'
 
 export const Route = createFileRoute('/_authenticated/canvas/')({
+  // All three views share one import; keep it eager for the pending state.
+  codeSplitGroupings: [],
   loader: async ({ context, cause }) => {
     if (cause === 'preload') return
     if (!isSidebarModuleEnabled('chat', 'canvas')) {

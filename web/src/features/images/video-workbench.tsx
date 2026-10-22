@@ -17,10 +17,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { isAxiosError } from 'axios'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import { SectionPageLayout } from '@/components/layout'
+import { SectionPageLayout } from '@/components/layout/components/section-page-layout'
 import { Badge } from '@/components/ui/badge'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
 
@@ -32,6 +33,12 @@ import {
 } from './components/video-capability-form'
 import { VideoResults } from './components/video-results'
 import { imageLabel } from './lib/image-labels'
+import { terminalImageStatus } from './lib/image-request'
+import {
+  readWorkbenchTask,
+  rememberWorkbenchTask,
+  workbenchSubmissionKey,
+} from './lib/workbench-session'
 
 function pricingStatusLabel(status: string): string {
   if (status === 'configured') return 'Pricing configured'
@@ -45,10 +52,9 @@ export function VideoWorkbench(props: { userId: number }) {
   const { t } = useTranslation()
   const [tokenId, setTokenId] = useState('')
   const [modelId, setModelId] = useState('')
-  const [taskId, setTaskId] = useState(
-    () => sessionStorage.getItem(`new-api:video-task:${props.userId}`) || ''
+  const [taskId, setTaskId] = useState(() =>
+    readWorkbenchTask(props.userId, 'video')
   )
-  const [submissionKey, setSubmissionKey] = useState(() => crypto.randomUUID())
   const keys = useQuery({
     queryKey: ['image-keys', props.userId],
     queryFn: () => getApiKeys({ p: 1, size: 100 }),
@@ -67,19 +73,18 @@ export function VideoWorkbench(props: { userId: number }) {
     queryFn: ({ signal }) => getImageTask(false, taskId, signal),
     enabled: !!taskId,
     refetchInterval: (query) => {
-      const status = query.state.data?.task.status
-      return status &&
-        [
-          'succeeded',
-          'failed',
-          'expired',
-          'execution_unknown',
-          'storage_failed',
-        ].includes(status)
+      const current = query.state.data?.task
+      return current &&
+        terminalImageStatus(current.status, current.next_attempt_at)
         ? false
-        : 3000
+        : Math.min(30000, 3000 * 2 ** query.state.fetchFailureCount)
     },
   })
+  useEffect(() => {
+    if (!isAxiosError(task.error) || task.error.response?.status !== 404) return
+    rememberWorkbenchTask(props.userId, 'video', '')
+    setTaskId('')
+  }, [task.error, props.userId])
   const submit = useMutation({
     mutationFn: async (submission: VideoFormSubmission) => {
       if (!selectedModel?.available) {
@@ -113,7 +118,13 @@ export function VideoWorkbench(props: { userId: number }) {
         endpoint,
         key,
         body,
-        submissionKey
+        await workbenchSubmissionKey(
+          props.userId,
+          'video',
+          Number(tokenId),
+          endpoint,
+          body
+        )
       )
       if (typeof response.task_id !== 'string') {
         throw new Error(t('Video task was not returned'))
@@ -122,11 +133,10 @@ export function VideoWorkbench(props: { userId: number }) {
     },
     onSuccess: (id) => {
       setTaskId(id)
-      sessionStorage.setItem(`new-api:video-task:${props.userId}`, id)
-      setSubmissionKey(crypto.randomUUID())
+      rememberWorkbenchTask(props.userId, 'video', id)
     },
   })
-  const changed = () => setSubmissionKey(crypto.randomUUID())
+  const changed = () => submit.reset()
 
   return (
     <SectionPageLayout>

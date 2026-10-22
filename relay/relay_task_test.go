@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,47 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestLegacyVideoFetchOnlyReadsPersistedTask(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Task{}))
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+	for _, channelType := range []int{constant.ChannelTypeGemini, constant.ChannelTypeVertexAi} {
+		t.Run(fmt.Sprint(channelType), func(t *testing.T) {
+			ch := &model.Channel{Name: "persisted-query", Type: channelType, Key: "test-key", BaseURL: &upstream.URL}
+			require.NoError(t, database.Create(ch).Error)
+			task := &model.Task{TaskID: fmt.Sprintf("task-query-%d", channelType), UserId: 1, ChannelId: ch.Id, Status: model.TaskStatusInProgress, Progress: "80%", Quota: 4000}
+			require.NoError(t, database.Create(task).Error)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/video/query/"+task.TaskID, nil)
+			c.Set("task_id", task.TaskID)
+			c.Set("id", task.UserId)
+			body, taskErr := videoFetchByIDRespBodyBuilder(c)
+			require.Nil(t, taskErr)
+			var response struct {
+				Data struct {
+					Status string `json:"status"`
+					TaskID string `json:"task_id"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(body, &response))
+			assert.Equal(t, "processing", response.Data.Status)
+			assert.Equal(t, task.TaskID, response.Data.TaskID)
+			var persisted model.Task
+			require.NoError(t, database.First(&persisted, task.ID).Error)
+			assert.Equal(t, task.Status, persisted.Status)
+			assert.Equal(t, task.Quota, persisted.Quota)
+			assert.Zero(t, persisted.PrivateData.PollFailures)
+		})
+	}
+	assert.Zero(t, requests.Load(), "retrieval must not run a second upstream polling and settlement path")
+}
 
 func setupRelayChannelDB(t *testing.T) *gorm.DB {
 	t.Helper()

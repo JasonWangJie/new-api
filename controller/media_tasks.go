@@ -92,7 +92,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		status = "invoking"
 		progress = 10
 	}
-	if job.StorageStatus == "saving" {
+	if job.StorageStatus == "ready" || job.StorageStatus == "saving" {
 		status = "uploading"
 		progress = 80
 	}
@@ -626,7 +626,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded'
 		WHEN status = 'succeeded' THEN 'succeeded'
 		WHEN storage_status = 'failed' THEN 'storage_failed'
-		WHEN storage_status = 'saving' THEN 'uploading'
+		WHEN storage_status IN ('ready','saving') THEN 'uploading'
 		WHEN status IN ('submitting','submitted') AND storage_status = 'pending'
 			AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
 				AND tasks.user_id = async_media_jobs.user_id
@@ -639,7 +639,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		case "invoking":
 			legacyStatus = model.DB.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted"}, "pending")
 		case "uploading":
-			legacyStatus = model.DB.Where("storage_status = ?", "saving")
+			legacyStatus = model.DB.Where("storage_status IN ?", []string{"ready", "saving"})
 		case "storage_failed":
 			legacyStatus = model.DB.Where("storage_status = ?", "failed")
 		}
@@ -700,7 +700,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		case "generating":
 			legacyStage = model.DB.Where("status IN ? AND storage_status = ? AND NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status IN ?)", []string{"submitting", "submitted"}, "pending", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure})
 		case "saving":
-			legacyStage = model.DB.Where("storage_status IN ? OR (storage_status = ? AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", []string{"saving", "failed"}, "pending", model.TaskStatusSuccess)
+			legacyStage = model.DB.Where("storage_status IN ? OR (storage_status = ? AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", []string{"ready", "saving", "failed"}, "pending", model.TaskStatusSuccess)
 		case "completed":
 			legacyStage = model.DB.Where("status = ?", "succeeded")
 		case "failed":
@@ -709,7 +709,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		videos = videos.Where(model.DB.Where("provider = ? AND (?) IN ?", "drama", dramaStatus, selected).
 			Or(model.DB.Where("provider IS NULL OR provider <> ?", "drama").Where(legacyStage)))
 	}
-	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status = 'saving' THEN 'uploading' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
+	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status IN ('ready','saving') THEN 'uploading' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
 	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, dramaStatus))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
 	var total int64

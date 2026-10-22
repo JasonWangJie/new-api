@@ -17,13 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
+import { isAxiosError } from 'axios'
 import { ArrowDown, ArrowUp, Plus, Sparkles, Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
-import { SectionPageLayout } from '@/components/layout'
+import { SectionPageLayout } from '@/components/layout/components/section-page-layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -47,9 +48,15 @@ import {
   buildImageRequest,
   extractImageResponse,
   IMAGE_RATIOS,
+  imageRequestDimensions,
   terminalImageStatus,
 } from './lib/image-request'
 import { imageChecksum, saveLocalImage } from './lib/local-images'
+import {
+  readWorkbenchTask,
+  rememberWorkbenchTask,
+  workbenchSubmissionKey,
+} from './lib/workbench-session'
 import type { ImageMetadata } from './types'
 import { VideoWorkbench } from './video-workbench'
 
@@ -102,7 +109,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const [background, setBackground] = useState('')
   const [count, setCount] = useState(1)
   const [busy, setBusy] = useState(false)
-  const [taskId, setTaskId] = useState('')
+  const [taskId, setTaskId] = useState(() => readWorkbenchTask(userId, 'image'))
   const [results, setResults] = useState<{ id: string; url: string }[]>([])
   const [submissionError, setSubmissionError] = useState('')
   const [saveError, setSaveError] = useState('')
@@ -149,6 +156,11 @@ function WorkbenchSession({ userId }: { userId: number }) {
         : Math.min(30000, 3000 * 2 ** query.state.fetchFailureCount),
     retry: false,
   })
+  useEffect(() => {
+    if (!isAxiosError(task.error) || task.error.response?.status !== 404) return
+    rememberWorkbenchTask(userId, 'image', '')
+    setTaskId('')
+  }, [task.error, userId])
   const taskImages = useQuery({
     queryKey: [
       'workbench-image-results',
@@ -280,13 +292,23 @@ function WorkbenchSession({ userId }: { userId: number }) {
         })
         accepted = {
           ...request,
-          key: crypto.randomUUID(),
+          key:
+            currentModel.mode === 'async'
+              ? await workbenchSubmissionKey(
+                  userId,
+                  'image',
+                  selectedId,
+                  request.url,
+                  request.body
+                )
+              : crypto.randomUUID(),
           tokenId: selectedId,
           version: fresh.capability_version,
         }
         snapshot.current = currentModel.mode === 'async' ? accepted : null
         setResults([])
         setTaskId('')
+        rememberWorkbenchTask(userId, 'image', '')
       }
       if (!accepted) return
       const key = await fetchTokenKey(selectedId)
@@ -312,6 +334,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
       }
       if (id) {
         setTaskId(id)
+        rememberWorkbenchTask(userId, 'image', id)
         snapshot.current = null
         return
       }
@@ -375,6 +398,9 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const options = (values: string[]) =>
     values.map((value) => ({ value, label: value }))
   const shownImages = taskId ? taskImages.data || [] : results
+  const dimensions = model
+    ? imageRequestDimensions(model, resolution, ratio)
+    : undefined
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Image Workbench')}</SectionPageLayout.Title>
@@ -469,6 +495,22 @@ function WorkbenchSession({ userId }: { userId: number }) {
                 disabled={busy || activeTask}
               />
             </div>
+            {dimensions && (
+              <p role='status' className='text-muted-foreground text-sm'>
+                {t('Submitted size: {{size}}', {
+                  size:
+                    dimensions.size === 'auto' ? t('Auto') : dimensions.size,
+                })}
+                {dimensions.approximate && (
+                  <>
+                    {' '}
+                    {t(
+                      'The selected aspect ratio is approximated by this size.'
+                    )}
+                  </>
+                )}
+              </p>
+            )}
             {model?.capability.qualities?.length ? (
               <ImageSelect
                 label={t('Quality')}

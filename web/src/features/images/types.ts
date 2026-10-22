@@ -364,6 +364,7 @@ export type ImageStorageProfile = {
   path_style: boolean
 }
 export type ImageChannelPool = {
+  id?: number
   binding_key: string
   group: string
   platform: string

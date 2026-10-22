@@ -16,9 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Blob } from 'node:buffer'
+import { webcrypto } from 'node:crypto'
+
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { AxiosError, AxiosHeaders } from 'axios'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { useAuthStore } from '@/stores/auth-store'
@@ -47,6 +51,8 @@ vi.mock('../api', () => imageApiMocks)
 let client: QueryClient
 
 beforeEach(() => {
+  vi.stubGlobal('Blob', Blob)
+  vi.stubGlobal('crypto', webcrypto)
   client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -65,8 +71,130 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
   client.clear()
   useAuthStore.getState().auth.reset()
+})
+
+test('resumes an image task after reopening the workbench for its owner', async () => {
+  sessionStorage.setItem('new-api:image-task:101', 'image_in_progress')
+  imageApiMocks.getImageTask.mockResolvedValue({
+    task: { status: 'queued', progress: 0, cost: 0 },
+    results: [],
+    events: [],
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText('image_in_progress')).toBeVisible()
+  expect(screen.getByRole('combobox', { name: 'API Key' })).toBeDisabled()
+})
+
+test.each(['image', 'video'] as const)(
+  'a missing restored %s task is forgotten so the workbench can start a new request',
+  async (media) => {
+    sessionStorage.setItem(`new-api:${media}-task:101`, 'removed_task')
+    imageApiMocks.getImageTask.mockRejectedValue(
+      new AxiosError(
+        'Task not found',
+        'ERR_BAD_REQUEST',
+        undefined,
+        undefined,
+        {
+          status: 404,
+          statusText: 'Not Found',
+          data: { success: false, message: 'Task not found' },
+          headers: {},
+          config: { headers: new AxiosHeaders() },
+        }
+      )
+    )
+    render(
+      <QueryClientProvider client={client}>
+        {media === 'image' ? (
+          <ImageWorkbench />
+        ) : (
+          <VideoWorkbench userId={101} />
+        )}
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(sessionStorage.getItem(`new-api:${media}-task:101`)).toBe('')
+    )
+    expect(screen.getByRole('combobox', { name: 'API Key' })).toBeEnabled()
+  }
+)
+
+test.each(['image', 'video'] as const)(
+  'a temporary query failure preserves the restored %s task for later polling',
+  async (media) => {
+    sessionStorage.setItem(`new-api:${media}-task:101`, 'pending_task')
+    imageApiMocks.getImageTask.mockRejectedValue(
+      new AxiosError(
+        'Service unavailable',
+        'ERR_BAD_RESPONSE',
+        undefined,
+        undefined,
+        {
+          status: 503,
+          statusText: 'Service Unavailable',
+          data: {},
+          headers: {},
+          config: { headers: new AxiosHeaders() },
+        }
+      )
+    )
+    render(
+      <QueryClientProvider client={client}>
+        {media === 'image' ? (
+          <ImageWorkbench />
+        ) : (
+          <VideoWorkbench userId={101} />
+        )}
+      </QueryClientProvider>
+    )
+    expect(await screen.findByRole('alert')).toBeVisible()
+    expect(sessionStorage.getItem(`new-api:${media}-task:101`)).toBe(
+      'pending_task'
+    )
+    if (media === 'image') {
+      expect(screen.getByRole('combobox', { name: 'API Key' })).toBeDisabled()
+    }
+  }
+)
+
+test('continues video polling while a failed save has a scheduled retry', async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  sessionStorage.setItem('new-api:video-task:101', 'video_saving')
+  imageApiMocks.getImageTask
+    .mockResolvedValueOnce({
+      task: {
+        status: 'storage_failed',
+        progress: 90,
+        cost: 2,
+        next_attempt_at: 1234,
+      },
+      results: [],
+      events: [],
+    })
+    .mockResolvedValue({
+      task: { status: 'succeeded', progress: 100, cost: 2, next_attempt_at: 0 },
+      results: [],
+      events: [],
+    })
+  render(
+    <QueryClientProvider client={client}>
+      <VideoWorkbench userId={101} />
+    </QueryClientProvider>
+  )
+  expect(await screen.findByText(/Storage failed/)).toBeVisible()
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(3100)
+  })
+  expect(await screen.findByText(/Succeeded/)).toBeVisible()
 })
 
 test('keeps the model-dependent form inside the remaining scrollable page height', () => {

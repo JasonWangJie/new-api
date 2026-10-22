@@ -13,14 +13,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -130,6 +133,7 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 		_, err := store.Resolve(task, "video")
 		return err
 	}
+	require.NoError(t, db.Model(&job).Update("storage_status", "ready").Error)
 	for attempt := range 2 {
 		require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
 		require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
@@ -153,10 +157,13 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 	assert.Equal(t, 120, job.Quota)
 	assert.Zero(t, submissions, "storage recovery must not generate or pre-consume again")
 	assert.Equal(t, 2, saves)
-	for _, billing := range []string{"pending", "reserving"} {
+	for _, billing := range []string{"pending", "reserving", "reserved"} {
 		uncertain := model.AsyncMediaJob{TaskId: "uncertain-" + billing, IdentityHash: "uncertain-" + billing, UserId: 1, Status: "submitting", BillingStatus: billing, ExpiresAt: time.Now().Unix() + 3600}
 		if billing == "pending" {
 			uncertain.DispatchedAt = time.Now().Unix()
+		}
+		if billing == "reserved" {
+			uncertain.Status = "submitted"
 		}
 		require.NoError(t, db.Create(&uncertain).Error)
 		claimed, err := model.ClaimAsyncMediaJob(t.Context(), &uncertain, common.GetUUID(), 30)
@@ -175,6 +182,114 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 	ref, err = store.Resolve(task, "video")
 	require.NoError(t, err)
 	assert.Nil(t, ref)
+}
+
+func TestAsyncMediaPoolsKeepSubmissionAndStatusAvailableDuringDownload(t *testing.T) {
+	setupTaskPollingDatabase(t)
+	asyncImageKeyFixture(t)
+	entities := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+	for range 2 {
+		require.NoError(t, model.DB.AutoMigrate(entities...))
+	}
+	t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(entities...)) })
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = previousRedis, previousRedisEnabled
+		assert.NoError(t, client.Close())
+	})
+	cfg := DefaultMediaRuntimeConfig()
+	cfg.SubmitConcurrency, cfg.StatusConcurrency, cfg.DownloadConcurrency = 1, 1, 1
+	cfg.DownloadTimeout = 60
+	require.NoError(t, SaveMediaRuntimeConfig(t.Context(), cfg))
+	previousSubmit, previousPersist := SubmitAsyncVideoFunc, PersistAsyncVideoFunc
+	t.Cleanup(func() { SubmitAsyncVideoFunc, PersistAsyncVideoFunc = previousSubmit, previousPersist })
+	downloadStarted, releaseDownload := make(chan struct{}), make(chan struct{})
+	var submissions, downloads atomic.Int32
+	PersistAsyncVideoFunc = func(ctx context.Context, _ model.AsyncMediaJob, _ *model.Task) error {
+		downloads.Add(1)
+		close(downloadStarted)
+		select {
+		case <-releaseDownload:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	SubmitAsyncVideoFunc = func(ctx context.Context, job model.AsyncMediaJob, _ AsyncVideoRequest) error {
+		submissions.Add(1)
+		return model.DB.WithContext(ctx).Create(&model.Task{TaskID: job.TaskId, UserId: job.UserId, Status: model.TaskStatusInProgress}).Error
+	}
+	now := time.Now().Unix()
+	slow := model.AsyncMediaJob{TaskId: "slow-download", IdentityHash: "slow-download", UserId: 1, Status: "submitted", StorageStatus: "ready", ExpiresAt: now + 3600}
+	require.NoError(t, model.DB.Create(&slow).Error)
+	require.NoError(t, model.DB.Create(&model.Task{TaskID: slow.TaskId, UserId: 1, Status: model.TaskStatusSuccess}).Error)
+	first, err := DispatchAsyncMediaJobs(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		select {
+		case <-releaseDownload:
+		default:
+			close(releaseDownload)
+		}
+		first.Wait()
+	})
+	select {
+	case <-downloadStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("download worker did not start")
+	}
+	// Even an older completed result cannot consume the next submission slot.
+	backlog := model.AsyncMediaJob{TaskId: "download-backlog", IdentityHash: "download-backlog", UserId: 1, Status: "submitted", StorageStatus: "ready", ExpiresAt: now + 3600}
+	require.NoError(t, model.DB.Create(&backlog).Error)
+	require.NoError(t, model.DB.Create(&model.Task{TaskID: backlog.TaskId, UserId: 1, Status: model.TaskStatusSuccess}).Error)
+	queued := model.AsyncMediaJob{TaskId: "queued-video", IdentityHash: "queued-video", UserId: 1, Status: "queued", StorageStatus: "pending", ExpiresAt: now + 3600}
+	queued.RequestCipher, err = EncryptImagePayload([]byte(`{}`), "media-request:"+queued.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Create(&queued).Error)
+	status := model.AsyncMediaJob{TaskId: "status-video", IdentityHash: "status-video", UserId: 1, Status: "submitted", StorageStatus: "pending", ExpiresAt: now + 3600}
+	require.NoError(t, model.DB.Create(&status).Error)
+	require.NoError(t, model.DB.Create(&model.Task{TaskID: status.TaskId, UserId: 1, Status: model.TaskStatusSuccess}).Error)
+	second, err := DispatchAsyncMediaJobs(t.Context(), cfg)
+	require.NoError(t, err)
+	second.Wait()
+	assert.EqualValues(t, 1, submissions.Load())
+	assert.EqualValues(t, 1, downloads.Load())
+	require.NoError(t, model.DB.First(&queued, queued.ID).Error)
+	assert.Equal(t, "submitted", queued.Status)
+	require.NoError(t, model.DB.First(&status, status.ID).Error)
+	assert.Equal(t, "ready", status.StorageStatus, "status workers hand completed results to the download pool")
+	stale := status
+	stale.StorageStatus = "pending"
+	claimed, err := model.ClaimAsyncMediaJob(t.Context(), &stale, "stale-phase", 30)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a stale status candidate cannot claim a download job")
+	duplicate := slow
+	claimed, err = model.ClaimAsyncMediaJob(t.Context(), &duplicate, "duplicate-download", 30)
+	require.NoError(t, err)
+	assert.False(t, claimed, "each task retains one exclusive lease across pools")
+	legacy := cfg
+	legacy.SubmitConcurrency, legacy.StatusConcurrency, legacy.SubmitTimeout = 0, 0, 0
+	require.NoError(t, SaveMediaRuntimeConfig(t.Context(), legacy))
+	loaded, err := GetMediaRuntimeConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, cfg.DownloadConcurrency, loaded.SubmitConcurrency)
+	assert.Equal(t, DefaultMediaRuntimeConfig().StatusConcurrency, loaded.StatusConcurrency)
+	assert.Equal(t, cfg.DownloadTimeout, loaded.SubmitTimeout)
+	assert.Equal(t, cfg.DownloadConcurrency, loaded.DownloadConcurrency)
+	// A persisted pre-upgrade JSON object has no new worker properties at all.
+	require.NoError(t, model.DB.Model(&model.Option{}).Where(map[string]any{"key": "media_runtime_config"}).Update("value", `{"local_path":"data/media","retention_days":90,"signed_url_expiry_seconds":3600,"max_file_bytes":1073741824,"download_timeout_seconds":900,"download_concurrency":7,"storage_retry_attempts":5}`).Error)
+	loaded, err = GetMediaRuntimeConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 7, loaded.SubmitConcurrency)
+	assert.Equal(t, 900, loaded.SubmitTimeout)
+	assert.Equal(t, 8, loaded.StatusConcurrency)
+	close(releaseDownload)
+	first.Wait()
+	require.NoError(t, model.DB.First(&slow, slow.ID).Error)
+	assert.Equal(t, "succeeded", slow.Status)
 }
 
 func mediaTestMP4() []byte {

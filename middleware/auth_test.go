@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,10 +26,15 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	previousDB := model.DB
 	previousLogDB := model.LOG_DB
 	previousType := common.MainDatabaseType()
+	previousLogType := common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousSecret := common.SessionSecret
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	previousMaster, previousSQLite := common.IsMasterNode, common.SQLitePath
+	common.IsMasterNode, common.SQLitePath = false, filepath.Join(t.TempDir(), "auth.db")
+	t.Setenv("SQL_DSN", "")
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitDB())
+	db := model.DB
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.AuditLog{}))
 	model.DB = db
 	model.LOG_DB = db
@@ -39,9 +44,14 @@ func setupDashboardAuthMiddlewareTest(t *testing.T) {
 	t.Cleanup(func() {
 		model.DB = previousDB
 		model.LOG_DB = previousLogDB
-		common.SetMainDatabaseType(previousType)
+		common.SetDatabaseTypes(previousType, previousLogType)
 		common.RedisEnabled = previousRedis
 		common.SessionSecret = previousSecret
+		common.IsMasterNode, common.SQLitePath = previousMaster, previousSQLite
+		connection, err := db.DB()
+		if err == nil {
+			_ = connection.Close()
+		}
 	})
 }
 
@@ -85,6 +95,70 @@ func createMiddlewarePATUser(t *testing.T, username, token string) *model.User {
 	}
 	require.NoError(t, model.DB.Create(user).Error)
 	return user
+}
+
+func TestTokenAuthReadOnlyEnforcesTokenSecurityPolicy(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+	user := createMiddlewarePATUser(t, "readonly-policy", "unused-dashboard-token")
+	router := gin.New()
+	require.NoError(t, router.SetTrustedProxies(nil))
+	router.GET("/readonly", TokenAuthReadOnly(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id"), "token_id": c.GetInt("token_id")})
+	})
+	router.GET("/relay", TokenAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
+	for index, test := range []struct {
+		name        string
+		allowIPs    string
+		clientAddr  string
+		tokenState  int
+		userState   int
+		readStatus  int
+		relayStatus int
+	}{
+		{"allowed IPv4", "192.0.2.0/24", "192.0.2.10:443", common.TokenStatusEnabled, common.UserStatusEnabled, 200, 200},
+		{"blocked IPv4", "192.0.2.0/24", "198.51.100.10:443", common.TokenStatusEnabled, common.UserStatusEnabled, 403, 403},
+		{"allowed IPv6", "2001:db8::/32", "[2001:db8::1]:443", common.TokenStatusEnabled, common.UserStatusEnabled, 200, 200},
+		{"blocked IPv6", "2001:db8::/32", "[2001:db9::1]:443", common.TokenStatusEnabled, common.UserStatusEnabled, 403, 403},
+		{"invalid client IP", "192.0.2.0/24", "invalid", common.TokenStatusEnabled, common.UserStatusEnabled, 403, 403},
+		{"no IP restriction", "", "198.51.100.10:443", common.TokenStatusEnabled, common.UserStatusEnabled, 200, 200},
+		{"disabled token", "192.0.2.0/24", "192.0.2.10:443", common.TokenStatusDisabled, common.UserStatusEnabled, 401, 401},
+		{"disabled user", "192.0.2.0/24", "192.0.2.10:443", common.TokenStatusEnabled, common.UserStatusDisabled, 403, 403},
+		{"expired read access", "192.0.2.0/24", "192.0.2.10:443", common.TokenStatusExpired, common.UserStatusEnabled, 200, 401},
+		{"expired blocked IP", "192.0.2.0/24", "198.51.100.10:443", common.TokenStatusExpired, common.UserStatusEnabled, 403, 401},
+		{"exhausted read access", "192.0.2.0/24", "192.0.2.10:443", common.TokenStatusExhausted, common.UserStatusEnabled, 200, 401},
+		{"exhausted blocked IP", "192.0.2.0/24", "198.51.100.10:443", common.TokenStatusExhausted, common.UserStatusEnabled, 403, 401},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.NoError(t, model.DB.Model(user).Update("status", test.userState).Error)
+			token := &model.Token{UserId: user.Id, Key: fmt.Sprintf("readonlypolicy%d", index), Status: test.tokenState, AllowIps: &test.allowIPs, ExpiredTime: -1, RemainQuota: 100}
+			if test.tokenState == common.TokenStatusExpired {
+				token.ExpiredTime = time.Now().Add(-time.Hour).Unix()
+			}
+			if test.tokenState == common.TokenStatusExhausted {
+				token.RemainQuota = 0
+			}
+			require.NoError(t, model.DB.Create(token).Error)
+			for path, wantStatus := range map[string]int{"/readonly": test.readStatus, "/relay": test.relayStatus} {
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.RemoteAddr = test.clientAddr
+				request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+				request.Header.Set("X-Forwarded-For", "192.0.2.10")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				assert.Equal(t, wantStatus, response.Code, path)
+				if path == "/readonly" && wantStatus == http.StatusOK {
+					var body struct {
+						ID      int `json:"id"`
+						TokenID int `json:"token_id"`
+					}
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+					assert.Equal(t, user.Id, body.ID)
+					assert.Equal(t, token.Id, body.TokenID)
+				}
+			}
+		})
+	}
 }
 
 func TestUserAuthAllowsOpaqueDottedPAT(t *testing.T) {

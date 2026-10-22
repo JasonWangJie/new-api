@@ -181,7 +181,10 @@ func SubmitAsyncImage(c *gin.Context) {
 	}
 	task, reused, err := model.AcceptAsyncImageTask(ctx, task, key, inputIds)
 	if err != nil {
-		if errors.Is(err, model.ErrImageConflict) {
+		if errors.Is(err, model.ErrAsyncQueueFull) {
+			c.Header("Retry-After", "5")
+			AsyncImagePublicError(c, 429, "async_queue_full", "Asynchronous image queue limit reached; retry after existing tasks finish")
+		} else if errors.Is(err, model.ErrImageConflict) {
 			AsyncImagePublicError(c, 409, "async_image_idempotency_conflict", err.Error())
 		} else {
 			AsyncImagePublicError(c, 503, "database_unavailable", "Image admission could not be persisted")

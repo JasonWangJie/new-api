@@ -25,7 +25,7 @@ func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
 	return errors.Join(taskError, retentionError)
 }
 
-// AcceptAsyncImageTask serializes admission on its Token and commits the task,
+// AcceptAsyncImageTask serializes admission on its user and Token and commits the task,
 // idempotency binding, input references, event and queue command together.
 func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash string, inputIds []string) (AsyncImageTask, bool, error) {
 	if keyHash != "" {
@@ -49,9 +49,31 @@ func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash stri
 	task.CreatedAt = now
 	task.UpdatedAt = now
 	task.NextAttemptAt = now
+	reused := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", task.UserId).Take(&user).Error; err != nil {
+			return err
+		}
 		var token Token
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
+			return err
+		}
+		if keyHash != "" {
+			var prior AsyncImageIdempotency
+			err := tx.Where("token_id = ? AND key_hash = ?", task.TokenId, keyHash).Take(&prior).Error
+			if err == nil {
+				if prior.RequestHash != task.RequestHash {
+					return ErrImageConflict
+				}
+				reused = true
+				return tx.Where("task_id = ?", prior.TaskId).Take(&task).Error
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
+		if err := enforceAsyncAdmission(tx, &AsyncImageTask{}, task.UserId, task.TokenId, len(task.RequestCipher)); err != nil {
 			return err
 		}
 		if keyHash != "" {
@@ -87,7 +109,7 @@ func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash stri
 			return task, true, lookupErr
 		}
 	}
-	return task, false, err
+	return task, reused, err
 }
 
 func ClaimAsyncImageTask(ctx context.Context, id, lease string, seconds int) (AsyncImageTask, error) {

@@ -535,7 +535,10 @@ func AcceptAsyncVideo(c *gin.Context) {
 	}
 	job, reused, err := model.AcceptAsyncMediaJob(ctx, job)
 	if err != nil {
-		if errors.Is(err, model.ErrImageConflict) {
+		if errors.Is(err, model.ErrAsyncQueueFull) {
+			c.Header("Retry-After", "5")
+			AsyncImagePublicError(c, 429, "async_queue_full", "Asynchronous video queue limit reached; retry after existing tasks finish")
+		} else if errors.Is(err, model.ErrImageConflict) {
 			AsyncImagePublicError(c, 409, "idempotency_conflict", "Idempotency-Key was used for a different video request")
 		} else {
 			AsyncImagePublicError(c, 503, "database_unavailable", "Video admission could not be persisted")

@@ -462,6 +462,9 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		}
 		responseItem := responseItems[task.GetUpstreamTaskID()]
 		if responseItem == nil {
+			if err := recordPollFailure(ctx, adaptor, task, task.Status, pollClassUnrecognized, resp.StatusCode, "batch response omitted the requested task"); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("record missing batch task %s: %v", task.TaskID, err))
+			}
 			continue
 		}
 		snap := task.Snapshot()
@@ -500,6 +503,9 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		}
 		if responseItem.TaskInfo.Status == model.TaskStatusSuccess {
 			task.Progress = "100%"
+		}
+		if isNonTerminalPollStatus(task.Status) && task.Progress == taskcommon.ProgressComplete {
+			task.Progress = "99%"
 		}
 		if responseItem.Data != nil {
 			task.SetData(responseItem.Data)
@@ -929,6 +935,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 	if taskResult.Progress != "" {
 		task.Progress = taskResult.Progress
+	}
+	if isNonTerminalPollStatus(task.Status) && task.Progress == taskcommon.ProgressComplete {
+		task.Progress = "99%"
 	}
 	if task.Status == model.TaskStatusSuccess {
 		captured, captureErr := CaptureAsyncMediaOutput(ctx, task)

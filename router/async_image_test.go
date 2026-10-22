@@ -1133,6 +1133,10 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	})
 
 	t.Run("async-video-local-recovery-and-range", func(t *testing.T) {
+		service.InitHttpClient()
+		require.NoError(t, model.AdjustUserQuotaDurable(user.Id, 1000000))
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
+		require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota", 1000000).Err())
 		require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
 		previousSubmit, previousPersist, previousAdaptor := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc
 		service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = controller.ExecuteAsyncVideo, controller.PersistAsyncVideo
@@ -1343,6 +1347,10 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&wallet).Error)
 		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&chargedToken).Error)
 		quota, remaining := wallet.Quota, chargedToken.RemainQuota
+		require.NoError(t, run())
+		assert.Zero(t, downloads.Load(), "status processing releases its lease before downloading")
+		ready := request("GET", "/v1/media/tasks_async/"+accepted.TaskId, "", "", token.Key)
+		assert.Contains(t, ready.Body.String(), `"storage_status":"ready"`)
 		require.Error(t, run(), "damaged content must not be published")
 		pending := request("GET", "/v1/media/tasks_async/"+accepted.TaskId, "", "", token.Key)
 		assert.Contains(t, pending.Body.String(), `"storage_status":"failed"`)

@@ -37,6 +37,9 @@ type MediaSettings = {
   max_file_bytes: number
   download_timeout_seconds: number
   download_concurrency: number
+  submit_concurrency: number
+  status_concurrency: number
+  submit_timeout_seconds: number
   storage_retry_attempts: number
 }
 
@@ -71,7 +74,12 @@ function MediaSettingsForm(props: {
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const [values, setValues] = useState(props.initial)
+  const [values, setValues] = useState(() => ({
+    ...props.initial,
+    submit_concurrency: props.initial.submit_concurrency || 2,
+    status_concurrency: props.initial.status_concurrency || 8,
+    submit_timeout_seconds: props.initial.submit_timeout_seconds || 120,
+  }))
   const save = useMutation({
     mutationFn: () => imageRequest('/api/option/images/media', 'PUT', values),
     onSuccess: async () => {
@@ -83,6 +91,7 @@ function MediaSettingsForm(props: {
   const fields: {
     key: keyof Omit<MediaSettings, 'video_async_enabled' | 'local_path'>
     label: string
+    max?: number
   }[] = [
     { key: 'retention_days', label: 'Video retention (days)' },
     { key: 'signed_url_expiry_seconds', label: 'Link validity (seconds)' },
@@ -91,7 +100,18 @@ function MediaSettingsForm(props: {
       key: 'download_timeout_seconds',
       label: 'Video download timeout (seconds)',
     },
-    { key: 'download_concurrency', label: 'Video download concurrency' },
+    {
+      key: 'download_concurrency',
+      label: 'Video download concurrency',
+      max: 32,
+    },
+    { key: 'submit_concurrency', label: 'Video submit concurrency', max: 32 },
+    { key: 'status_concurrency', label: 'Video status concurrency', max: 64 },
+    {
+      key: 'submit_timeout_seconds',
+      label: 'Video submit timeout (seconds)',
+      max: 86400,
+    },
     { key: 'storage_retry_attempts', label: 'Storage retries' },
   ]
   return (
@@ -144,6 +164,7 @@ function MediaSettingsForm(props: {
                 id={`video-${field.key}`}
                 type='number'
                 min={field.key === 'storage_retry_attempts' ? 0 : 1}
+                max={field.max}
                 value={values[field.key]}
                 onChange={(event) =>
                   setValues((previous) => ({

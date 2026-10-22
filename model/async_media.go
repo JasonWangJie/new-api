@@ -62,8 +62,26 @@ type MediaArtifactObject struct {
 // long-running upstream job must not monopolize every worker slot while newer
 // submissions or completed results wait behind it.
 func GetDueAsyncMediaJobs(ctx context.Context, now int64, limit int) ([]AsyncMediaJob, error) {
+	return GetDueAsyncMediaJobsForPhase(ctx, now, limit, "")
+}
+
+// GetDueAsyncMediaJobsForPhase gives each independently bounded worker pool
+// its own queue, so a blocked download cannot hide later submissions.
+func GetDueAsyncMediaJobsForPhase(ctx context.Context, now int64, limit int, phase string) ([]AsyncMediaJob, error) {
 	var jobs []AsyncMediaJob
-	err := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, now, now).
+	query := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, now, now)
+	switch phase {
+	case "submit":
+		query = query.Where("status IN ?", []string{"queued", "submitting"})
+	case "status":
+		query = query.Where("status = ? AND storage_status NOT IN ?", "submitted", []string{"ready", "saving", "failed"})
+	case "download":
+		query = query.Where("status = ? AND storage_status IN ?", "submitted", []string{"ready", "saving", "failed"})
+	case "":
+	default:
+		return nil, errors.New("invalid async media worker phase")
+	}
+	err := query.
 		Order("CASE WHEN next_attempt_at = 0 THEN created_at ELSE next_attempt_at END").Order("created_at").Order("id").Limit(limit).Find(&jobs).Error
 	return jobs, err
 }
@@ -71,6 +89,10 @@ func GetDueAsyncMediaJobs(ctx context.Context, now int64, limit int) ([]AsyncMed
 func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, bool, error) {
 	reused := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id").Where("id = ?", job.UserId).Take(&user).Error; err != nil {
+			return err
+		}
 		var token Token
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
 			return err
@@ -87,6 +109,9 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		if err := enforceAsyncAdmission(tx, &AsyncMediaJob{}, job.UserId, job.TokenId, len(job.RequestCipher)); err != nil {
+			return err
+		}
 		job.Status, job.StorageStatus, job.BillingStatus = "queued", "pending", "pending"
 		job.CreatedAt = time.Now().Unix()
 		return tx.Create(&job).Error
@@ -96,7 +121,9 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 
 func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int) (bool, error) {
 	now := time.Now().Unix()
-	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted"}).Updates(map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds)})
+	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted"}).
+		Where("status = ? AND storage_status = ?", job.Status, job.StorageStatus).
+		Updates(map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds)})
 	if result.Error != nil || result.RowsAffected == 0 {
 		return false, result.Error
 	}

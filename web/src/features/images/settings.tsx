@@ -60,6 +60,7 @@ import {
   ImagePoolEditor,
   type ImagePoolBinding,
 } from './components/image-pool-editor'
+import { ImageRoutingPreview } from './components/image-routing-preview'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
 import type { ImageAdminConfiguration, ImageStorageProfile } from './types'
@@ -440,6 +441,7 @@ export function ImageSettings() {
             { id: 'policy', label: 'Image policies' },
             { id: 'video', label: 'Video configuration' },
             { id: 'pool', label: 'Channel pools' },
+            { id: 'routing', label: 'Routing preview' },
           ].map((item) => (
             <TabsTrigger key={item.id} value={item.id}>
               {t(item.label)}
@@ -478,6 +480,7 @@ export function ImageSettings() {
           onSuccess={() => configuration.refetch()}
         />
       )}
+      {tab === 'routing' && <ImageRoutingPreview config={config} />}
     </div>
   )
 }
@@ -1184,7 +1187,11 @@ export function ImagePoolForm({
       const first = rows[0]
       if (!first) return []
       return [
-        { ...first, channels: rows.filter((pool) => pool.channel_id > 0) },
+        {
+          ...first,
+          channels: rows.filter((pool) => pool.channel_id > 0),
+          rowIds: rows.map((pool) => pool.id),
+        },
       ]
     })
     const collator = new Intl.Collator('en', { numeric: true })

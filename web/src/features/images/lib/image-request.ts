@@ -64,6 +64,35 @@ export type ImageRequestOptions = {
   background: string
 }
 
+export function imageRequestDimensions(
+  model: ImageModel,
+  resolution: string,
+  ratio: string
+): { size: string; approximate: boolean } | undefined {
+  if (
+    model.protocol === 'gemini_native' ||
+    (!model.provider && model.platform === 'gemini') ||
+    (model.mode === 'async' &&
+      (!model.provider ||
+        (model.provider === 'newapi' &&
+          model.supported_parameters?.includes('output_resolution'))))
+  ) {
+    return undefined
+  }
+  const size =
+    ratio === 'auto'
+      ? 'auto'
+      : OPENAI_SIZES[ratio]?.[['1K', '2K', '4K'].indexOf(resolution)]
+  if (!size) return undefined
+  const [width, height] = size.split('x').map(Number)
+  const [ratioWidth, ratioHeight] = ratio.split(':').map(Number)
+  return {
+    size,
+    approximate:
+      ratio !== 'auto' && width * ratioHeight !== height * ratioWidth,
+  }
+}
+
 export function imageFileExtension(mime: string): string {
   return (
     (
@@ -118,10 +147,7 @@ export function buildImageRequest(options: ImageRequestOptions): {
     ) {
       throw new Error('Invalid image request')
     }
-    const size =
-      ratio === 'auto'
-        ? 'auto'
-        : OPENAI_SIZES[ratio]?.[['1K', '2K', '4K'].indexOf(resolution)]
+    const size = imageRequestDimensions(model, resolution, ratio)?.size
     return {
       url:
         references.length && !model.supports_reference_generation
@@ -254,10 +280,7 @@ export function buildImageRequest(options: ImageRequestOptions): {
       }),
     }
   }
-  const size =
-    ratio === 'auto'
-      ? 'auto'
-      : OPENAI_SIZES[ratio]?.[['1K', '2K', '4K'].indexOf(resolution)]
+  const size = imageRequestDimensions(model, resolution, ratio)?.size
   if (!size) throw new Error('Unsupported image dimensions')
   return {
     url: references.length ? '/v1/images/edits' : '/v1/images/generations',

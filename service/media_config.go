@@ -22,6 +22,9 @@ type MediaRuntimeConfig struct {
 	MaxFileBytes        int64  `json:"max_file_bytes"`
 	DownloadTimeout     int    `json:"download_timeout_seconds"`
 	DownloadConcurrency int    `json:"download_concurrency"`
+	SubmitConcurrency   int    `json:"submit_concurrency"`
+	StatusConcurrency   int    `json:"status_concurrency"`
+	SubmitTimeout       int    `json:"submit_timeout_seconds"`
 	StorageRetries      int    `json:"storage_retry_attempts"`
 }
 
@@ -37,10 +40,36 @@ type VideoReadiness struct {
 }
 
 func DefaultMediaRuntimeConfig() MediaRuntimeConfig {
-	return MediaRuntimeConfig{LocalPath: "data/media", RetentionDays: 90, SignedURLExpiry: 3600, MaxFileBytes: 1 << 30, DownloadTimeout: 900, DownloadConcurrency: 2, StorageRetries: 5}
+	return MediaRuntimeConfig{LocalPath: "data/media", RetentionDays: 90, SignedURLExpiry: 3600, MaxFileBytes: 1 << 30, DownloadTimeout: 900, DownloadConcurrency: 2, SubmitConcurrency: 2, StatusConcurrency: 8, SubmitTimeout: 120, StorageRetries: 5}
+}
+
+// Older configuration clients omit the added worker settings. Preserve their
+// former submission limits while separating the download budget.
+func (cfg MediaRuntimeConfig) withWorkerDefaults() MediaRuntimeConfig {
+	defaults := DefaultMediaRuntimeConfig()
+	if cfg.SubmitConcurrency == 0 {
+		cfg.SubmitConcurrency = cfg.DownloadConcurrency
+		if cfg.SubmitConcurrency == 0 {
+			cfg.SubmitConcurrency = defaults.SubmitConcurrency
+		}
+	}
+	if cfg.StatusConcurrency == 0 {
+		cfg.StatusConcurrency = defaults.StatusConcurrency
+	}
+	if cfg.SubmitTimeout == 0 {
+		cfg.SubmitTimeout = cfg.DownloadTimeout
+		if cfg.SubmitTimeout == 0 {
+			cfg.SubmitTimeout = defaults.SubmitTimeout
+		}
+	}
+	return cfg
 }
 
 func (cfg MediaRuntimeConfig) Validate() error {
+	cfg = cfg.withWorkerDefaults()
+	if cfg.SubmitConcurrency < 1 || cfg.SubmitConcurrency > 32 || cfg.StatusConcurrency < 1 || cfg.StatusConcurrency > 64 || cfg.SubmitTimeout < 1 || cfg.SubmitTimeout > 86400 {
+		return errors.New("invalid media worker limits")
+	}
 	if cfg.LocalPath == "" || cfg.RetentionDays < 1 || cfg.RetentionDays > 36500 || cfg.SignedURLExpiry < 1 || cfg.SignedURLExpiry > 604800 || cfg.MaxFileBytes < 1 || cfg.MaxFileBytes > 16<<30 || cfg.DownloadTimeout < 1 || cfg.DownloadTimeout > 86400 || cfg.DownloadConcurrency < 1 || cfg.DownloadConcurrency > 32 || cfg.StorageRetries < 0 || cfg.StorageRetries > 100 {
 		return errors.New("invalid media storage limits")
 	}
@@ -58,13 +87,18 @@ func GetMediaRuntimeConfig(ctx context.Context) (MediaRuntimeConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
+	// Existing saved configs used the download limits for submission as well.
+	// New installations keep the independently chosen defaults above.
+	cfg.SubmitConcurrency, cfg.SubmitTimeout = 0, 0
 	if err := common.UnmarshalJsonStr(option.Value, &cfg); err != nil {
 		return cfg, err
 	}
+	cfg = cfg.withWorkerDefaults()
 	return cfg, cfg.Validate()
 }
 
 func SaveMediaRuntimeConfig(ctx context.Context, cfg MediaRuntimeConfig) error {
+	cfg = cfg.withWorkerDefaults()
 	if err := cfg.Validate(); err != nil {
 		return err
 	}

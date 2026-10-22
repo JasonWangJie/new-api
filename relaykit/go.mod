@@ -2,7 +2,7 @@ module github.com/QuantumNous/new-api/relaykit
 
 go 1.25.1
 
-toolchain go1.26.8
+toolchain go1.26.10
 
 require (
 	github.com/google/uuid v1.6.0

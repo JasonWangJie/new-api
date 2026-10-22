@@ -51,7 +51,9 @@ func imageTestDatabase(t *testing.T, name string) *gorm.DB {
 	}
 	dsn := os.Getenv("ASYNC_IMAGE_TEST_PG_DSN")
 	if dsn == "" {
-		db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), name+".db")), &gorm.Config{})
+		// Match production SQLite transaction/locking settings so concurrent
+		// admission is tested across connections, rather than serialized by Go.
+		db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), name+".db")+"?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"), &gorm.Config{})
 		require.NoError(t, err)
 		t.Cleanup(func() { connection, _ := db.DB(); _ = connection.Close() })
 		return db
@@ -135,6 +137,92 @@ func stageImageBillFixture(t *testing.T, db *gorm.DB, task AsyncImageTask, bill 
 	require.NoError(t, StageAsyncImageOutput(context.Background(), task, []AsyncImageStagingObject{{Data: []byte("image"), Checksum: "checksum", Width: 1024, Height: 1024, ContentType: "image/png"}}, bill))
 	require.NoError(t, db.Create(&AsyncImageResult{TaskId: task.TaskId, ObjectId: "object", ImageIndex: 0}).Error)
 	require.NoError(t, db.Model(&AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"status": ImageTaskBillingPending, "result_count": 1}).Error)
+}
+
+func TestAsyncMediaAdmissionBudgets(t *testing.T) {
+	for _, kind := range []string{"image", "video"} {
+		t.Run(kind, func(t *testing.T) {
+			db, task, _ := imageDatabaseFixture(t)
+			require.NoError(t, db.Model(&task).Update("status", ImageTaskSucceeded).Error)
+			require.NoError(t, db.AutoMigrate(&AsyncMediaJob{}))
+			if db.Dialector.Name() == "sqlite" {
+				conn, err := db.DB()
+				require.NoError(t, err)
+				conn.SetMaxOpenConns(4)
+			}
+			t.Setenv("ASYNC_MEDIA_TOKEN_ACTIVE_TASK_LIMIT", "1")
+			t.Setenv("ASYNC_MEDIA_USER_ACTIVE_TASK_LIMIT", "2")
+			t.Setenv("ASYNC_MEDIA_TOKEN_PENDING_BYTES", "20")
+			t.Setenv("ASYNC_MEDIA_USER_PENDING_BYTES", "30")
+			secondToken := Token{UserId: task.UserId, Key: "admission-second", RemainQuota: 1000}
+			thirdToken := Token{UserId: task.UserId, Key: "admission-third", RemainQuota: 1000}
+			require.NoError(t, db.Create(&secondToken).Error)
+			require.NoError(t, db.Create(&thirdToken).Error)
+			accept := func(id string, tokenID int, payload string) (bool, error) {
+				if kind == "image" {
+					_, reused, err := AcceptAsyncImageTask(t.Context(), AsyncImageTask{TaskId: id, UserId: task.UserId, TokenId: tokenID, RequestHash: payload, RequestCipher: []byte(payload)}, id, nil)
+					return reused, err
+				}
+				_, reused, err := AcceptAsyncMediaJob(t.Context(), AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: task.UserId, TokenId: tokenID, RequestHash: payload, RequestCipher: []byte(payload)})
+				return reused, err
+			}
+			var entity any = &AsyncImageTask{}
+			if kind == "video" {
+				entity = &AsyncMediaJob{}
+			}
+			reused, err := accept("admission-first", task.TokenId, "first")
+			require.NoError(t, err)
+			assert.False(t, reused)
+			_, err = accept("admission-token-full", task.TokenId, "second")
+			assert.ErrorIs(t, err, ErrAsyncQueueFull)
+			reused, err = accept("admission-first", task.TokenId, "first")
+			require.NoError(t, err)
+			assert.True(t, reused, "idempotent reads remain available at the limit")
+			_, err = accept("admission-first", task.TokenId, "changed")
+			assert.ErrorIs(t, err, ErrImageConflict)
+			_, err = accept("admission-second", secondToken.Id, "second")
+			require.NoError(t, err)
+			_, err = accept("admission-user-full", thirdToken.Id, "third")
+			assert.ErrorIs(t, err, ErrAsyncQueueFull, "creating more API keys must not bypass the user budget")
+			require.NoError(t, db.Model(entity).Where("user_id = ?", task.UserId).Update("status", ImageTaskSucceeded).Error)
+			_, err = accept("admission-token-full", task.TokenId, "second")
+			require.NoError(t, err, "rejected admissions must not reserve their idempotency key")
+			t.Setenv("ASYNC_MEDIA_TOKEN_ACTIVE_TASK_LIMIT", "10")
+			t.Setenv("ASYNC_MEDIA_USER_ACTIVE_TASK_LIMIT", "10")
+			_, err = accept("admission-token-bytes", task.TokenId, strings.Repeat("x", 15))
+			assert.ErrorIs(t, err, ErrAsyncQueueFull)
+			_, err = accept("admission-user-bytes-one", secondToken.Id, strings.Repeat("x", 20))
+			require.NoError(t, err)
+			_, err = accept("admission-user-bytes-two", thirdToken.Id, strings.Repeat("x", 5))
+			assert.ErrorIs(t, err, ErrAsyncQueueFull)
+			require.NoError(t, db.Model(entity).Where("user_id = ?", task.UserId).Update("status", ImageTaskSucceeded).Error)
+			t.Setenv("ASYNC_MEDIA_USER_ACTIVE_TASK_LIMIT", "1")
+			start, results := make(chan struct{}), make(chan error, 2)
+			for i, tokenID := range []int{task.TokenId, secondToken.Id} {
+				go func() {
+					<-start
+					_, err := accept(fmt.Sprintf("admission-concurrent-%d", i), tokenID, "x")
+					results <- err
+				}()
+			}
+			close(start)
+			accepted, rejected := 0, 0
+			for range 2 {
+				err := <-results
+				if err == nil {
+					accepted++
+				} else {
+					require.ErrorIs(t, err, ErrAsyncQueueFull)
+					rejected++
+				}
+			}
+			assert.Equal(t, 1, accepted)
+			assert.Equal(t, 1, rejected)
+			var user User
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			assert.Equal(t, 1000, user.Quota, "admission must not charge the wallet")
+		})
+	}
 }
 
 func TestAsyncImageBillAtomicSettlementAndLogRetry(t *testing.T) {

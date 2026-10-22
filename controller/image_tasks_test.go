@@ -1121,6 +1121,34 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Delete(&arrival).Error)
 			require.NoError(t, db.Where("id IN ?", []int{waiting[0].ID, waiting[1].ID, waiting[2].ID}).Delete(&model.AsyncMediaJob{}).Error)
 			require.NoError(t, db.Model(&video).Update("next_attempt_at", 0).Error)
+			t.Run("ready video remains in saving filters and statistics", func(t *testing.T) {
+				completed := model.Task{TaskID: video.TaskId, UserId: video.UserId, Status: model.TaskStatusSuccess}
+				require.NoError(t, db.Create(&completed).Error)
+				for _, provider := range []string{"sora", "drama"} {
+					require.NoError(t, db.Model(&video).Updates(map[string]any{"provider": provider, "storage_status": "ready"}).Error)
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", video.UserId)
+					c.Request = httptest.NewRequest(http.MethodGet, "/?media_type=video&stage=saving&status=uploading", nil)
+					ListMediaTasks(c, false)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Items []gin.H
+							Total int
+							Stats map[string]float64
+						}
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					require.Len(t, response.Data.Items, 1, provider)
+					assert.Equal(t, "uploading", response.Data.Items[0]["status"])
+					assert.Equal(t, "saving", response.Data.Items[0]["stage"])
+					assert.Equal(t, "ready", response.Data.Items[0]["storage_status"])
+					assert.Equal(t, float64(1), response.Data.Stats["processing"])
+				}
+				require.NoError(t, db.Delete(&completed).Error)
+				require.NoError(t, db.Model(&video).Updates(map[string]any{"provider": "sora", "storage_status": "failed"}).Error)
+			})
 			for _, owner := range []int{101, 102} {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
@@ -1302,9 +1330,15 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
 				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
 				require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Updates(map[string]any{"status": model.TaskStatusSuccess, "finish_time": now}).Error)
-				service.PersistAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, *model.Task) error { return nil }
+				saves := 0
+				service.PersistAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, *model.Task) error { saves++; return nil }
 				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
 				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				assert.Equal(t, "ready", job.StorageStatus)
+				assert.Zero(t, saves, "status confirmation hands the result to a separate download worker")
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
+				assert.Equal(t, 1, saves)
 				assert.Equal(t, "succeeded", job.Status)
 				assert.NotEmpty(t, job.RequestCipher)
 				// An upstream result avoids requiring a local artifact for this
