@@ -145,6 +145,24 @@ func ImageNativeTier(width, height int, platform string) string {
 	return "4K"
 }
 
+// AsyncImageRoutingResolution derives a pool and model-mapping tier without
+// changing native request fields or the explicit dimensions used for billing.
+func AsyncImageRoutingResolution(request AsyncImageRequest) string {
+	if resolution := strings.ToUpper(strings.TrimSpace(request.Resolution)); resolution != "" {
+		return resolution
+	}
+	size := strings.ToUpper(strings.TrimSpace(request.Size))
+	if slices.Contains([]string{"0.5K", "1K", "2K", "4K"}, size) {
+		return size
+	}
+	if width, height, ok := imageDimensions(request.Size); ok {
+		// Native pixel sizes use the OpenAI input convention. A unified request
+		// can select a Gemini transport later; that must not change its pool.
+		return ImageNativeTier(width, height, "openai")
+	}
+	return ""
+}
+
 func imageDimensions(value string) (int, int, bool) {
 	value = strings.NewReplacer("X", "x", "*", "x", "×", "x").Replace(strings.TrimSpace(value))
 	left, right, ok := strings.Cut(value, "x")

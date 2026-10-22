@@ -156,15 +156,15 @@ function WorkbenchSession({ userId }: { userId: number }) {
       taskId,
       (task.data?.results || [])
         .map(
-          (result) => `${result.image_index}:${result.url || result.view_url}`
+          (result) =>
+            `${result.image_index}:${result.url || result.view_url}:${!!result.authenticated}`
         )
         .join('|'),
     ],
     queryFn: async ({ signal }) =>
       Promise.all(
-        (task.data?.results || []).map(async (result) => ({
-          id: String(result.image_index),
-          url:
+        (task.data?.results || []).map(async (result) => {
+          const url =
             result.url ||
             (
               await imageRequest<{ url: string }>(
@@ -173,8 +173,15 @@ function WorkbenchSession({ userId }: { userId: number }) {
                 undefined,
                 signal
               )
-            ).url,
-        }))
+            ).url
+          return {
+            id: String(result.image_index),
+            url,
+            blob: result.authenticated
+              ? await imageBlob(url, signal, true)
+              : undefined,
+          }
+        })
       ),
     enabled: !!task.data?.results.length,
     staleTime: 60_000,

@@ -30,6 +30,8 @@ const safeArtifactKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/
 const taskArtifactContentPathPattern =
   /\/v1\/tasks\/[^/]+\/artifacts\/[^/]+\/content$/
 const taskArtifactAccessTokenPattern = /^[A-Za-z0-9_-]{43}$/
+const authenticatedContentPathPattern =
+  /^\/api\/(user|admin)\/(async-image-tasks|media-tasks)\/[A-Za-z0-9._~-]+\/results\/[A-Za-z0-9._~-]+\/view$/
 const maxTaskArtifacts = 64
 export type TaskPreviewMode = 'plugin' | 'legacy-suno' | 'legacy-video' | 'none'
 
@@ -47,7 +49,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-function parseContentUrl(value: unknown): string {
+function parseContentUrl(value: unknown, authenticated = false): string {
   if (typeof value !== 'string') {
     throw new TaskArtifactApiError('invalid_content_url')
   }
@@ -56,9 +58,17 @@ function parseContentUrl(value: unknown): string {
   if (
     contentUrl.length === 0 ||
     contentUrl !== value ||
-    contentUrl.includes('#') ||
-    !/^https?:\/\//i.test(contentUrl)
+    contentUrl.includes('#')
   ) {
+    throw new TaskArtifactApiError('invalid_content_url')
+  }
+  if (authenticated) {
+    if (!authenticatedContentPathPattern.test(contentUrl)) {
+      throw new TaskArtifactApiError('invalid_content_url')
+    }
+    return contentUrl
+  }
+  if (!/^https?:\/\//i.test(contentUrl)) {
     throw new TaskArtifactApiError('invalid_content_url')
   }
   for (const character of contentUrl) {
@@ -112,7 +122,8 @@ function parseTaskArtifact(value: unknown): TaskArtifact {
   if (
     key !== key.trim() ||
     !safeArtifactKeyPattern.test(key) ||
-    !taskArtifactTypes.has(type)
+    !taskArtifactTypes.has(type) ||
+    (value.authenticated != null && typeof value.authenticated !== 'boolean')
   ) {
     throw new TaskArtifactApiError('invalid_artifact')
   }
@@ -120,8 +131,12 @@ function parseTaskArtifact(value: unknown): TaskArtifact {
   const artifact: TaskArtifact = {
     key,
     type: type as TaskArtifact['type'],
-    content_url: parseContentUrl(value.content_url),
+    content_url: parseContentUrl(
+      value.content_url,
+      value.authenticated === true
+    ),
   }
+  if (value.authenticated === true) artifact.authenticated = true
   if (typeof value.mime_type === 'string' && value.mime_type.trim()) {
     const mimeType = value.mime_type.trim()
     if (mimeType.length > 255 || /[\r\n]/.test(mimeType)) {

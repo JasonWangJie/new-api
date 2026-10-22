@@ -26,8 +26,9 @@ import {
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { toast } from 'sonner'
-import { afterEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
+import { getGroups } from '@/features/users/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from '../api'
@@ -35,6 +36,7 @@ import { ImageSettings } from '../settings'
 import type { ImageAdminConfiguration } from '../types'
 
 vi.mock('../api', () => ({ imageRequest: vi.fn() }))
+vi.mock('@/features/users/api', () => ({ getGroups: vi.fn() }))
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
 const clients: QueryClient[] = []
@@ -52,7 +54,11 @@ const cases = [
   },
 ]
 
-function renderSettings(manage = true, deletion?: () => Promise<unknown>) {
+function renderSettings(
+  manage = true,
+  deletion?: () => Promise<unknown>,
+  groups?: { policy: string; pool: string }
+) {
   useAuthStore.getState().auth.setUser({
     id: 1,
     username: 'configuration-admin',
@@ -84,7 +90,7 @@ function renderSettings(manage = true, deletion?: () => Promise<unknown>) {
     storage_providers: [],
     policies: [
       {
-        group: 'default',
+        group: groups?.policy ?? 'default',
         platform: 'gemini',
         pool_mode: 'model_resolution',
         enabled: true,
@@ -95,7 +101,7 @@ function renderSettings(manage = true, deletion?: () => Promise<unknown>) {
     ],
     pools: [11, 12].map((channelId) => ({
       binding_key: bindingKey,
-      group: 'default',
+      group: groups?.pool ?? 'default',
       platform: 'gemini',
       mode: 'model_resolution',
       model: 'gemini-image',
@@ -109,6 +115,7 @@ function renderSettings(manage = true, deletion?: () => Promise<unknown>) {
     if (url.startsWith('/api/option/images/pool/options?')) {
       return { models: [], channels: [] }
     }
+    if (url === '/api/option/images/policy' && method === 'PUT') return null
     if (method === 'DELETE') {
       await deletion?.()
       config = url.endsWith('/policy')
@@ -129,6 +136,13 @@ function renderSettings(manage = true, deletion?: () => Promise<unknown>) {
   )
 }
 
+beforeEach(() => {
+  vi.mocked(getGroups).mockResolvedValue({
+    success: true,
+    data: ['default', 'premium'],
+  })
+})
+
 afterEach(() => {
   cleanup()
   for (const client of clients) client.clear()
@@ -143,6 +157,11 @@ test.each(cases)(
     const user = userEvent.setup()
     renderSettings()
     await user.click(await screen.findByRole('tab', { name: tab }))
+    if (tab === 'Channel pools') {
+      await user.click(
+        screen.getByRole('button', { name: /default.*gemini.*1K/ })
+      )
+    }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
     expect(dialog).toHaveTextContent('default / gemini')
@@ -155,9 +174,58 @@ test.each(cases)(
       'DELETE',
       expect.anything()
     )
-    expect(screen.getByRole('row', { name: /default gemini/ })).toBeVisible()
+    expect(
+      screen.getByRole('row', {
+        name: tab === 'Image policies' ? /default gemini/ : /gemini-image/,
+      })
+    ).toBeVisible()
   }
 )
+
+test('policy group selection accepts a system group with the keyboard and saves that group', async () => {
+  const user = userEvent.setup()
+  renderSettings()
+  await user.click(await screen.findByRole('tab', { name: 'Image policies' }))
+  const group = screen.getByRole('combobox', { name: 'Group' })
+  await user.click(group)
+  await user.type(group, 'premium')
+  expect(await screen.findByRole('option', { name: 'premium' })).toBeVisible()
+  await user.keyboard('{ArrowDown}{Enter}')
+  expect(group).toHaveValue('premium')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/policy',
+      'PUT',
+      expect.objectContaining({ group: 'premium' })
+    )
+  )
+})
+
+test('a failed group catalog keeps saved policy and pool groups selectable', async () => {
+  vi.mocked(getGroups).mockResolvedValue({
+    success: false,
+    message: 'Group catalog unavailable',
+    data: [],
+  })
+  const user = userEvent.setup()
+  renderSettings(true, undefined, {
+    policy: 'retired-policy',
+    pool: 'retired-pool',
+  })
+  await user.click(await screen.findByRole('tab', { name: 'Image policies' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Group catalog unavailable'
+  )
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const group = screen.getByRole('combobox', { name: 'Group' })
+  expect(group).toHaveValue('retired-policy')
+  await user.click(group)
+  expect(screen.getByRole('option', { name: 'retired-policy' })).toBeVisible()
+  expect(screen.getByRole('option', { name: 'default' })).toBeVisible()
+  await user.click(screen.getByRole('option', { name: 'retired-pool' }))
+  expect(group).toHaveValue('retired-pool')
+})
 
 test.each(cases)(
   'confirming deletion in $tab blocks duplicate requests and refreshes the list',
@@ -169,6 +237,11 @@ test.each(cases)(
     })
     renderSettings(true, () => pending)
     await user.click(await screen.findByRole('tab', { name: tab }))
+    if (tab === 'Channel pools') {
+      await user.click(
+        screen.getByRole('button', { name: /default.*gemini.*1K/ })
+      )
+    }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
     const confirm = within(dialog).getByRole('button', { name: 'Delete' })
@@ -192,7 +265,9 @@ test.each(cases)(
       expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
     )
     expect(
-      screen.queryByRole('row', { name: /default gemini/ })
+      screen.queryByRole('row', {
+        name: tab === 'Image policies' ? /default gemini/ : /gemini-image/,
+      })
     ).not.toBeInTheDocument()
     expect(toast.success).toHaveBeenCalledWith('Deleted')
   }
@@ -206,6 +281,11 @@ test.each(cases)(
       throw new Error('Configuration changed; reload and retry')
     })
     await user.click(await screen.findByRole('tab', { name: tab }))
+    if (tab === 'Channel pools') {
+      await user.click(
+        screen.getByRole('button', { name: /default.*gemini.*1K/ })
+      )
+    }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
     await user.click(within(dialog).getByRole('button', { name: 'Delete' }))
@@ -218,7 +298,11 @@ test.each(cases)(
     expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeEnabled()
     expect(toast.success).not.toHaveBeenCalled()
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
-    expect(screen.getByRole('row', { name: /default gemini/ })).toBeVisible()
+    expect(
+      screen.getByRole('row', {
+        name: tab === 'Image policies' ? /default gemini/ : /gemini-image/,
+      })
+    ).toBeVisible()
   }
 )
 
@@ -228,6 +312,11 @@ test.each(cases)(
     const user = userEvent.setup()
     renderSettings(false)
     await user.click(await screen.findByRole('tab', { name: tab }))
+    if (tab === 'Channel pools') {
+      await user.click(
+        screen.getByRole('button', { name: /default.*gemini.*1K/ })
+      )
+    }
     const remove = screen.getByRole('button', { name: 'Delete' })
     expect(remove).toBeDisabled()
     await user.click(remove)

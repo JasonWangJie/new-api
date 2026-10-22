@@ -27,10 +27,11 @@ import {
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
+import { LoadingState } from '@/components/loading-state'
 import {
   Alert,
   AlertAction,
@@ -55,8 +56,10 @@ import {
 } from '@/components/ui/empty'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { authenticatedMediaBlob, imageBlob } from '@/features/images/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getTaskArtifacts } from '../api'
 import {
@@ -214,8 +217,35 @@ function MediaFailure(props: { onRetry: () => void }) {
 
 function TaskArtifactCard(props: { artifact: TaskArtifact }) {
   const { t } = useTranslation()
+  const userId = useAuthStore((state) => state.auth.user?.id)
   const [mediaFailed, setMediaFailed] = useState(false)
   const [mediaRevision, setMediaRevision] = useState(0)
+  const path = props.artifact.content_url
+  const type = props.artifact.type
+  const media = useQuery({
+    queryKey: ['authenticated-task-artifact', userId, path, type],
+    queryFn: ({ signal }) => {
+      if (type === 'image') return imageBlob(path, signal, true)
+      return authenticatedMediaBlob(path, signal)
+    },
+    enabled: props.artifact.authenticated === true && userId !== undefined,
+    retry: false,
+    gcTime: 0,
+    staleTime: Infinity,
+    meta: { errorToast: false },
+  })
+  const [preview, setPreview] = useState<{ blob: Blob; url: string }>()
+  useEffect(() => {
+    if (!media.data) return
+    const url = URL.createObjectURL(media.data)
+    setPreview({ blob: media.data, url })
+    return () => URL.revokeObjectURL(url)
+  }, [media.data])
+  let mediaUrl: string | undefined = path
+  if (props.artifact.authenticated) {
+    mediaUrl = undefined
+    if (preview?.blob === media.data) mediaUrl = preview?.url
+  }
   const icon = artifactIcon(props.artifact.type)
   const isVisualArtifact =
     props.artifact.type === 'image' || props.artifact.type === 'video'
@@ -230,21 +260,24 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
       <HugeiconsIcon icon={icon} className='size-6' strokeWidth={1.5} />
     </div>
   )
-  if (mediaFailed) {
+  if (mediaFailed || (props.artifact.authenticated && media.isError)) {
     cardContent = (
       <MediaFailure
         onRetry={() => {
           setMediaFailed(false)
           setMediaRevision((revision) => revision + 1)
+          if (props.artifact.authenticated) void media.refetch()
         }}
       />
     )
+  } else if (mediaUrl === undefined) {
+    cardContent = <LoadingState />
   } else if (props.artifact.type !== 'file') {
     cardContent = (
       <ArtifactMedia
         key={mediaRevision}
         artifact={props.artifact}
-        mediaUrl={props.artifact.content_url}
+        mediaUrl={mediaUrl}
         onError={() => setMediaFailed(true)}
       />
     )
@@ -280,10 +313,11 @@ function TaskArtifactCard(props: { artifact: TaskArtifact }) {
         <Button
           variant='outline'
           size='sm'
+          disabled={mediaUrl === undefined}
           nativeButton={false}
           render={
             <a
-              href={props.artifact.content_url}
+              href={mediaUrl}
               download={props.artifact.key}
               target='_blank'
               rel='noopener noreferrer'

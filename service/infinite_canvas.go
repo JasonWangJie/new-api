@@ -81,7 +81,8 @@ func canvasDigest(value string) string {
 }
 
 func canvasConfigHash(settings system_setting.InfiniteCanvasSettings) string {
-	return canvasDigest(settings.ClientID + "\x00" + settings.URL + "\x00" + system_setting.CanvasClientSecret())
+	origin, _ := system_setting.CanvasOrigin(settings.URL)
+	return canvasDigest(settings.ClientID + "\x00" + origin + "\x00" + system_setting.CanvasClientSecret())
 }
 
 func canvasReady() (system_setting.InfiniteCanvasSettings, error) {
@@ -426,18 +427,38 @@ func ValidateCanvasCredential(ctx context.Context, key, proof, method, path stri
 	if subtle.ConstantTimeCompare([]byte(token.Key), []byte(key)) != 1 || token.Status != common.TokenStatusEnabled || token.ExpiredTime <= time.Now().Unix() {
 		return nil, nil, nil, ErrCanvasAuthorization
 	}
+	return validateCanvasToken(ctx, &token, method == http.MethodPost)
+}
+
+// ValidateCanvasWorkerCredential restores an accepted job's authorization from
+// its durable owner binding. It is not an alternative public credential flow.
+func ValidateCanvasWorkerCredential(ctx context.Context, tokenID, userID int) (*model.Token, *model.UserBase, *CanvasGrantState, error) {
+	if tokenID <= 0 || userID <= 0 {
+		return nil, nil, nil, ErrCanvasAuthorization
+	}
+	var token model.Token
+	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", tokenID, userID).Take(&token).Error; err != nil || !model.IsCanvasTokenKey(token.Key) {
+		return nil, nil, nil, ErrCanvasAuthorization
+	}
+	return validateCanvasToken(ctx, &token, false)
+}
+
+func validateCanvasToken(ctx context.Context, token *model.Token, activity bool) (*model.Token, *model.UserBase, *CanvasGrantState, error) {
+	if token.Status != common.TokenStatusEnabled || token.ExpiredTime <= time.Now().Unix() {
+		return nil, nil, nil, ErrCanvasAuthorization
+	}
 	var record model.CanvasGrant
 	if err := model.DB.WithContext(ctx).Where("token_id = ? AND user_id = ?", token.Id, token.UserId).Take(&record).Error; err != nil {
 		return nil, nil, nil, ErrCanvasAuthorization
 	}
-	grant, user, err := GetCanvasGrant(ctx, record.ID, method == http.MethodPost)
+	grant, user, err := GetCanvasGrant(ctx, record.ID, activity)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if grant.KeyHash != canvasDigest(key) || grant.TokenID != token.Id || grant.Identity.UserID != token.UserId {
+	if grant.KeyHash != canvasDigest(token.Key) || grant.TokenID != token.Id || grant.Identity.UserID != token.UserId {
 		return nil, nil, nil, ErrCanvasAuthorization
 	}
-	return &token, user.ToBaseUser(), grant, nil
+	return token, user.ToBaseUser(), grant, nil
 }
 
 // CanvasImageObjectManaged follows durable provenance rather than assuming an
@@ -452,6 +473,35 @@ func CanvasImageObjectManaged(ctx context.Context, object model.ImageStorageObje
 	}
 	err := model.DB.WithContext(ctx).Table("async_image_results").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_results.task_id").Joins("JOIN canvas_grants ON canvas_grants.token_id = async_image_tasks.token_id").Where("async_image_results.object_id = ?", object.ObjectId).Count(&count).Error
 	return count > 0, err
+}
+
+// CanvasImageTaskManaged checks durable provenance against the current account
+// incarnation. Dashboard access does not depend on a live Canvas grant.
+func CanvasImageTaskManaged(ctx context.Context, task model.AsyncImageTask) (bool, error) {
+	return CanvasTaskOwnerManaged(ctx, task.TokenId, task.UserId)
+}
+
+// CanvasTaskOwnerManaged binds generated media to the current account subject,
+// including historical tasks whose issuing grant is no longer active.
+func CanvasTaskOwnerManaged(ctx context.Context, tokenID, userID int) (bool, error) {
+	var grant model.CanvasGrant
+	err := model.DB.WithContext(ctx).Where("token_id = ?", tokenID).Take(&grant).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		_, err = model.CanvasBillingSubject(model.DB.WithContext(ctx), tokenID, userID)
+		return false, err
+	}
+	if err != nil {
+		return false, err
+	}
+	var owner model.User
+	if grant.UserID != userID || grant.Subject == "" {
+		return true, ErrCanvasAuthorization
+	}
+	err = model.DB.WithContext(ctx).Where("id = ? AND canvas_subject = ?", userID, grant.Subject).Take(&owner).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return true, ErrCanvasAuthorization
+	}
+	return true, err
 }
 
 func CanvasContentPath(kind, taskID, artifact string) string {

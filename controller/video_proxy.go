@@ -93,7 +93,20 @@ func VideoProxy(c *gin.Context) {
 			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
 			return
 		}
+		managed, err := service.CanvasTaskOwnerManaged(c.Request.Context(), mediaJob.TokenId, mediaJob.UserId)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+				status = http.StatusNotFound
+			}
+			videoProxyError(c, status, "artifact_not_found", "Video is unavailable")
+			return
+		}
 		if link := upstreamVideoArtifactURL(task, mediaJob); link != "" {
+			if managed {
+				serveAuthorizedMediaTaskResult(c, mediaJob, "video")
+				return
+			}
 			c.Header("Cache-Control", "private, no-store")
 			c.Redirect(http.StatusTemporaryRedirect, link)
 			return
@@ -105,6 +118,10 @@ func VideoProxy(c *gin.Context) {
 		var objects []model.MediaArtifactObject
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND status = ? AND expires_at > ?", task.TaskID, "active", time.Now().Unix()).Order("artifact_key").Limit(1).Find(&objects).Error; err != nil || len(objects) == 0 {
 			videoProxyError(c, 404, "artifact_not_found", "Video is not available locally")
+			return
+		}
+		if managed {
+			serveAuthorizedMediaTaskResult(c, mediaJob, objects[0].ArtifactKey)
 			return
 		}
 		store := service.GetTaskArtifactStore()

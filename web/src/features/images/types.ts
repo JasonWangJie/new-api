@@ -268,6 +268,8 @@ export type ImageResult = {
   view_url: string
   /** Signed object URL when the detail API could mint one. */
   url?: string
+  /** Result bytes require the dashboard session client. */
+  authenticated?: boolean
   source?: 'upstream'
   expires_at: number
 }

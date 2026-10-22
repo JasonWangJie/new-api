@@ -247,6 +247,9 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
+	if key == "infinite_canvas.url" && value != "" {
+		value, _ = system_setting.CanvasOrigin(value)
+	}
 	// Save to database first
 	option := Option{
 		Key: key,
@@ -281,6 +284,10 @@ func UpdateOptionsBulk(values map[string]string) error {
 		if err := validateOptionValue(key, value); err != nil {
 			return err
 		}
+	}
+	if value := values["infinite_canvas.url"]; value != "" {
+		values = maps.Clone(values)
+		values["infinite_canvas.url"], _ = system_setting.CanvasOrigin(value)
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {

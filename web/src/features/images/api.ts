@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { t } from 'i18next'
+
 import { api } from '@/lib/api'
 
 import type {
@@ -133,34 +135,72 @@ export async function imageRelayRequest(
 
 export async function imageBlob(
   url: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  authenticated = false
 ): Promise<Blob> {
-  // Gateway view paths need a signed URL; browsers can load them via <img>,
-  // but download fetch must use the resolved object URL without session cookies.
   let target = url
-  if (url.startsWith('/') || url.startsWith(`${window.location.origin}/`)) {
+  if (
+    !authenticated &&
+    (url.startsWith('/') || url.startsWith(`${window.location.origin}/`))
+  ) {
     const resolved = new URL(url, window.location.origin)
-    target = (
-      await imageRequest<{ url: string }>(
-        `${resolved.pathname}${resolved.search}`,
-        'GET',
-        undefined,
-        signal
-      )
-    ).url
+    const link = await imageRequest<{ url: string; authenticated?: boolean }>(
+      `${resolved.pathname}${resolved.search}`,
+      'GET',
+      undefined,
+      signal
+    )
+    target = link.url
+    authenticated = link.authenticated === true
   }
-  const response = await fetch(target, {
-    signal,
-    credentials: 'omit',
-    cache: 'no-store',
-  })
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  const blob = await response.blob()
+  let blob: Blob
+  if (authenticated) {
+    blob = await authenticatedMediaBlob(target, signal, 'image/*')
+  } else {
+    const response = await fetch(target, {
+      signal,
+      credentials: 'omit',
+      cache: 'no-store',
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    blob = await response.blob()
+  }
   if (
     !['image/png', 'image/jpeg', 'image/webp'].includes(blob.type) ||
     !blob.size
   ) {
-    throw new Error('Unsupported image format')
+    throw new Error(t('Unsupported image format'))
   }
   return blob
+}
+
+export async function authenticatedMediaBlob(
+  url: string,
+  signal?: AbortSignal,
+  accept = 'video/*'
+): Promise<Blob> {
+  const resolved = new URL(url, window.location.origin)
+  if (
+    resolved.origin !== window.location.origin ||
+    !/^\/api\/(user|admin)\/(async-image-tasks|media-tasks)\/[^/]+\/results\/[^/]+\/view$/.test(
+      resolved.pathname
+    )
+  ) {
+    throw new Error(t('Media preview failed. Please try again.'))
+  }
+  const response = await api.request<Blob>({
+    url: `${resolved.pathname}${resolved.search}`,
+    method: 'GET',
+    responseType: 'blob',
+    headers: { Accept: accept },
+    disableDuplicate: true,
+    signal,
+  })
+  if (
+    !response.data.size ||
+    (accept === 'video/*' && !response.data.type.startsWith('video/'))
+  ) {
+    throw new Error(t('Media preview failed. Please try again.'))
+  }
+  return response.data
 }

@@ -131,8 +131,27 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				}
 			}
 			resolutions := make([]string, 0, len(capability.Resolutions))
+			var channels []model.Channel
 			for _, resolution := range capability.Resolutions {
-				channels, err := service.ImageCandidateChannels(ctx, policy, capability.Id, resolution)
+				candidates, err := service.ImageCandidateChannels(ctx, policy, capability.Id, resolution)
+				if err != nil {
+					imageManagementError(c, 503, err)
+					return
+				}
+				candidates = slices.DeleteFunc(candidates, func(channel model.Channel) bool {
+					return service.ImageChannelCapability(channel, capability.Id).Provider != platform
+				})
+				if len(candidates) > 0 {
+					resolutions = append(resolutions, resolution)
+					channels = append(channels, candidates...)
+				}
+			}
+			capability.Resolutions = resolutions
+			if len(resolutions) == 0 {
+				continue
+			}
+			if !policy.AsyncEnabled {
+				channels, err = service.ImageCandidateChannels(ctx, policy, capability.Id, "")
 				if err != nil {
 					imageManagementError(c, 503, err)
 					return
@@ -140,22 +159,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
 					return service.ImageChannelCapability(channel, capability.Id).Provider != platform
 				})
-				if len(channels) > 0 {
-					resolutions = append(resolutions, resolution)
-				}
 			}
-			capability.Resolutions = resolutions
-			if len(resolutions) == 0 {
-				continue
-			}
-			channels, err := service.ImageCandidateChannels(ctx, policy, capability.Id, "")
-			if err != nil {
-				imageManagementError(c, 503, err)
-				return
-			}
-			channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
-				return service.ImageChannelCapability(channel, capability.Id).Provider != platform
-			})
 			if len(channels) == 0 {
 				continue
 			}

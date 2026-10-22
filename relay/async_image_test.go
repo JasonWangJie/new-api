@@ -26,6 +26,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -194,11 +195,19 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 	var pngImage bytes.Buffer
 	require.NoError(t, png.Encode(&pngImage, image.NewRGBA(image.Rect(0, 0, 2, 3))))
 	imageData := base64.StdEncoding.EncodeToString(pngImage.Bytes())
-	for _, platform := range []string{"openai", "gemini"} {
-		t.Run(platform, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, platform    string
+		resolutionMapping bool
+	}{
+		{name: "openai", platform: "openai"},
+		{name: "gemini", platform: "gemini"},
+		{name: "openai_resolution_mapping", platform: "openai", resolutionMapping: true},
+		{name: "gemini_resolution_mapping", platform: "gemini", resolutionMapping: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			var response any = dto.ImageResponse{Data: []dto.ImageData{{B64Json: imageData}}}
 			channelType := constant.ChannelTypeOpenAI
-			if platform == "gemini" {
+			if tc.platform == "gemini" {
 				channelType = constant.ChannelTypeGemini
 				response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}}}}}}}
 			}
@@ -209,7 +218,7 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 				Billing: service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
 			}
 			request := service.AsyncImageRequest{
-				Platform: platform, Model: "accepted-image", Count: 1, Kind: "image_to_image", Completion: completion,
+				Platform: tc.platform, Model: "accepted-image", Count: 1, Kind: "image_to_image", Completion: completion,
 				Parts:       []service.AsyncImageInputPart{{Type: "image_url", URL: "https://expired.invalid/reference.png"}},
 				Native:      map[string]common.RawMessage{"ignored_after_completion": common.RawMessage(`invalid JSON`)},
 				Billing:     &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 999}},
@@ -218,7 +227,11 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			invalidMapping := "invalid mapping"
 			unreachableURL := "http://127.0.0.1:1"
 			channel := &model.Channel{Id: 14, Type: channelType, Key: "frozen-key", BaseURL: &unreachableURL, Status: common.ChannelStatusManuallyDisabled, ModelMapping: &invalidMapping}
-			task := model.AsyncImageTask{TaskId: "completion-" + platform, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", UpstreamSucceededAt: time.Now().Unix()}
+			if tc.resolutionMapping {
+				channel.SetSetting(dto.ChannelSettings{ImageResolutionModelMapping: dto.ImageResolutionModelMapping{"accepted-image": {"1K": "changed-1k-upstream", "2K": "changed-2k-upstream"}}})
+				completion.BillingModel = request.Model
+			}
+			task := model.AsyncImageTask{TaskId: "completion-" + tc.name, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", UpstreamSucceededAt: time.Now().Unix()}
 			attemptContext, cancel := context.WithCancel(t.Context())
 			cancel()
 			dispatches := 0
@@ -234,7 +247,10 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			assert.Equal(t, 5000, bill.Quota, "recovery must use the accepted price, even if current pricing changed")
 			var log model.Log
 			require.NoError(t, common.UnmarshalJsonStr(bill.LogPayload, &log))
-			assert.Equal(t, "frozen-billing", log.ModelName)
+			assert.Equal(t, completion.BillingModel, log.ModelName)
+			if tc.resolutionMapping {
+				assert.Equal(t, request.Model, log.ModelName, "resolution aliases must not replace the public billing model")
+			}
 			assert.Zero(t, dispatches, "accepted output must never generate or poll again")
 		})
 	}
@@ -258,9 +274,9 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			response["metadata"] = strings.Repeat("x", (32<<20)+1-len(encoded))
 			encoded, err = common.Marshal(response)
 			require.NoError(t, err)
-			upstreamRequests := make(chan struct{}, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				upstreamRequests <- struct{}{}
+			upstreamRequests := make(chan string, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamRequests <- r.URL.Path
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write(encoded)
 			}))
@@ -270,11 +286,13 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			freshToken := model.Token{UserId: freshUser.Id, Key: tc.name, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
 			require.NoError(t, db.Create(&freshToken).Error)
 			request := service.AsyncImageRequest{
-				Platform: "gemini", Dialect: "async", Model: "gemini-image-test", Prompt: "draw", Count: 1,
+				Platform: "gemini", Dialect: "async", Model: "gemini-image-test", Resolution: "2K", Prompt: "draw", Count: 1,
 				Parts:   []service.AsyncImageInputPart{{Type: "text", Text: "draw"}},
 				Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
 			}
 			channel := &model.Channel{Id: 14, Type: constant.ChannelTypeGemini, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled}
+			channel.SetSetting(dto.ChannelSettings{ImageResolutionModelMapping: dto.ImageResolutionModelMapping{"gemini-image-test": {"1K": "gemini-image-test-1k", "2K": "gemini-image-test-2k"}}})
+			channel.ModelMapping = common.GetPointer(`{"gemini-image-test":"gemini-image-test-2k","gemini-image-test-2k":"gemini-image-test-2k"}`)
 			task := model.AsyncImageTask{TaskId: tc.name, UserId: freshUser.Id, TokenId: freshToken.Id, ChannelId: channel.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "oversized-worker", LeaseExpiresAt: time.Now().Unix() + 120}
 			requestBytes, err := common.Marshal(request)
 			require.NoError(t, err)
@@ -294,6 +312,12 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 				require.Len(t, output.Images, 1)
 				assert.Equal(t, 2, output.Images[0].Width)
 				assert.Equal(t, 5000, bill.Quota, "large metadata must not prevent a valid current invocation from finishing")
+				var log model.Log
+				require.NoError(t, common.UnmarshalJsonStr(bill.LogPayload, &log))
+				assert.Equal(t, request.Model, log.ModelName, "the resolution-specific upstream name must not change the public billing model")
+				var other map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+				assert.Equal(t, "gemini-image-test-2k", other["upstream_model_name"])
 			} else {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
@@ -301,7 +325,7 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 				assert.Equal(t, 608, failure.Code)
 				assert.Nil(t, output)
 			}
-			<-upstreamRequests
+			assert.Contains(t, <-upstreamRequests, "/models/gemini-image-test-2k:")
 			assert.Empty(t, upstreamRequests)
 			var stored model.AsyncImageTask
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
@@ -349,7 +373,22 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		fileFormat                 string
 		passThrough                bool
 		xai                        bool
+		resolutionMapping          bool
+		resolution                 string
+		parameterOverride          string
+		modelConflict              bool
+		templateBody               map[string]any
+		expectedTemplate           string
 	}{
+		{name: "resolution_mapping_json", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true},
+		{name: "resolution_mapping_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, passThrough: true},
+		{name: "resolution_mapping_2k_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, resolution: "2K", passThrough: true},
+		{name: "resolution_mapping_multipart_passthrough", path: "/v1/images/edits_async", fileFormat: "jpeg", resolutionMapping: true, passThrough: true},
+		{name: "resolution_mapping_rejects_model_override", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, parameterOverride: `{"model":"other-model"}`, modelConflict: true},
+		{name: "resolution_mapping_rejects_model_deletion", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, parameterOverride: `{"operations":[{"path":"model","mode":"delete"}]}`, modelConflict: true},
+		{name: "resolution_mapping_rejects_template_alias", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, templateBody: map[string]any{"model": "{request.model}", "n": "{request.n}"}, modelConflict: true},
+		{name: "resolution_mapping_template_model", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
+		{name: "resolution_mapping_template_custom_field", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, templateBody: map[string]any{"provider_model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"provider_model":"gpt-image-2","n":1}`},
 		{name: "xai_normalized_geometry", path: "/v1/images/generations_async", referenceField: "images", xai: true},
 		{name: "xai_provider_diagnostic", path: "/v1/images/generations_async", referenceField: "images", xai: true, status: http.StatusBadRequest, failureCode: 610, responseMessage: "unknown provider for model grok-imagine-image-2.0"},
 		{name: "edits_oa", path: "/v1/images/edits_oa", referenceField: "image_urls"},
@@ -429,6 +468,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			defer upstream.Close()
 			mapping := `{"image-alias":"gpt-image-2"}`
 			parameters := `{"quality":"low","vendor_override":true}`
+			if tc.parameterOverride != "" {
+				parameters = tc.parameterOverride
+			}
 			headers := `{"X-Image-Probe":"synthetic"}`
 			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
 			if tc.xai {
@@ -438,16 +480,33 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			channel.StatusCodeMapping = &tc.statusMapping
 			channelSettings := dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough}
+			if tc.resolutionMapping {
+				channelSettings.ImageResolutionModelMapping = dto.ImageResolutionModelMapping{"image-alias": {"1K": "gpt-image-2", "2K": "gpt-image-2-2k"}}
+				mapping = `{"image-alias":"gpt-image-2","gpt-image-2":"gpt-image-2"}`
+				if tc.resolution == "2K" {
+					mapping = `{"image-alias":"gpt-image-2-2k","gpt-image-2-2k":"gpt-image-2-2k"}`
+				}
+			}
 			if tc.channelReferenceLimit > 0 {
 				channelSettings.ImageMaxReferenceBytes = &tc.channelReferenceLimit
 			}
 			channel.SetSetting(channelSettings)
+			if tc.templateBody != nil {
+				var config dto.UpstreamAsyncConfig
+				require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"resolution-template","media_type":"image","models":["gpt-image-2"],"operations":["edit"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/v1/images/edits","headers":{"Authorization":"Bearer {api_key}"}}},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"urls"}}}]}`, &config))
+				config.Profiles[0].Submit.Request.Body = tc.templateBody
+				require.NoError(t, config.Validate())
+				channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &config})
+			}
 			body := map[string]any{
 				"model": "image-alias", "prompt": "draw a river", "n": 1,
 				"size": "1024x1024", "quality": "high", "response_format": "b64_json",
 				"mask":      map[string]string{"image_url": maskURL},
 				"watermark": false, "seed": 0, "custom_toggle": false,
 				"vendor_options": map[string]any{"strength": 0, "enabled": false},
+			}
+			if tc.resolution == "2K" {
+				body["size"] = "2048x2048"
 			}
 			if tc.xai {
 				delete(body, "mask")
@@ -511,6 +570,15 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
 			})
 			require.Error(t, err)
+			if tc.modelConflict {
+				assert.ErrorContains(t, err, "outbound image model conflicts")
+				assert.Zero(t, dispatches, "model conflicts must fail before quota reservation or dispatch")
+				assert.Empty(t, received)
+				var reservations int64
+				require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&reservations).Error)
+				assert.Zero(t, reservations)
+				return
+			}
 			if tc.localReferenceRejected {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
@@ -570,6 +638,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			assert.Equal(t, http.MethodPost, record.method)
 			assert.Equal(t, "/v1/images/edits", record.path)
 			assert.Equal(t, "Bearer synthetic-upstream-key", record.authorization)
+			if tc.expectedTemplate != "" {
+				assert.JSONEq(t, tc.expectedTemplate, string(record.body))
+				return
+			}
 			assert.Equal(t, "synthetic", record.marker)
 			if tc.xai {
 				assert.JSONEq(t, `{"model":"grok-imagine-image-quality","prompt":"draw a river","n":1,"resolution":"2k","aspect_ratio":"16:9","response_format":"b64_json","image":{"url":"`+referenceURL+`","type":"image_url"}}`, string(record.body))
@@ -584,6 +656,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				imageField, expectedModel := "image", "gpt-image-2"
 				if tc.passThrough {
 					imageField, expectedModel = "image[]", "image-alias"
+				}
+				if tc.resolutionMapping {
+					expectedModel = "gpt-image-2"
 				}
 				assert.Equal(t, expectedModel, replayed.PostForm.Get("model"))
 				assert.Equal(t, "draw a river", replayed.PostForm.Get("prompt"))
@@ -620,6 +695,12 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			} else {
 				assert.JSONEq(t, "true", string(outbound["vendor_override"]))
 			}
+			if tc.resolutionMapping {
+				expectedModel = `"gpt-image-2"`
+				if tc.resolution == "2K" {
+					expectedModel = `"gpt-image-2-2k"`
+				}
+			}
 			assert.JSONEq(t, expectedModel, string(outbound["model"]))
 			assert.JSONEq(t, expectedQuality, string(outbound["quality"]))
 			for _, key := range []string{"prompt", "n", "size", "response_format", "watermark", "seed", "custom_toggle", "vendor_options", "mask"} {
@@ -635,6 +716,186 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			assert.Equal(t, referenceURL, images[0].URL, "external signed URL bytes must be preserved")
 			assert.NotContains(t, outbound, "image")
 			assert.NotContains(t, outbound, "image_urls")
+		})
+	}
+}
+
+func TestTianyueAsyncImageOutbound(t *testing.T) {
+	previousDB, previousCount, previousRedis, previousAddress := model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "tianyue-outbound.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress = db, false, false, "https://gateway.example"
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress = previousDB, previousCount, previousRedis, previousAddress
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tianyue:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tianyue")
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	user := model.User{Username: "tianyue-user", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "tianyue-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	service.InitHttpClient()
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	for _, tc := range []struct {
+		name                           string
+		reference, multipart, yb, mask bool
+		disabled, badOverride          bool
+		badTemplate, customProfile     bool
+	}{
+		{name: "synchronous_text"},
+		{name: "uploaded_reference", reference: true},
+		{name: "multipart_reference", reference: true, multipart: true},
+		{name: "asynchronous_receipt_and_poll", reference: true, yb: true},
+		{name: "mask_is_rejected", reference: true, mask: true},
+		{name: "unsafe_override_is_rejected", badOverride: true},
+		{name: "unsafe_async_template_is_rejected", yb: true, badTemplate: true},
+		{name: "custom_profile_with_builtin_id_is_preserved", yb: true, customProfile: true},
+		{name: "ordinary_newapi_edits_are_preserved", reference: true, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			type receivedRequest struct {
+				path string
+				body map[string]common.RawMessage
+			}
+			received := make(chan receivedRequest, 3)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]common.RawMessage
+				if r.Method == http.MethodPost {
+					assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+					assert.NoError(t, common.DecodeJson(r.Body, &body))
+				}
+				assert.Equal(t, "Bearer tianyue-upstream-key", r.Header.Get("Authorization"))
+				received <- receivedRequest{r.URL.Path, body}
+				w.Header().Set("Content-Type", "application/json")
+				if tc.yb {
+					if tc.customProfile {
+						if r.Method == http.MethodPost {
+							w.WriteHeader(http.StatusAccepted)
+							_, _ = w.Write([]byte(`{"job":{"identifier":"custom-job","state":"queued"}}`))
+						} else {
+							_, _ = w.Write([]byte(`{"job":{"identifier":"custom-job","state":"running","progress":30}}`))
+						}
+						return
+					}
+					if r.Method == http.MethodPost {
+						w.WriteHeader(http.StatusAccepted)
+						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"IN_PROGRESS"}}`))
+					} else {
+						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"IN_PROGRESS","progress":"30%"}}`))
+					}
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"synthetic capture completed"}}`))
+			}))
+			t.Cleanup(upstream.Close)
+			mapped := "seedream-5-pro-1K"
+			if tc.yb {
+				mapped = "gpt-image-2-yb"
+			}
+			mapping, err := common.Marshal(map[string]string{"image-alias": mapped})
+			require.NoError(t, err)
+			mappingText := string(mapping)
+			channel := &model.Channel{Id: 30, Type: constant.ChannelTypeNewAPI, Key: "tianyue-upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mappingText}
+			channel.SetSetting(dto.ChannelSettings{TianyueMediaCompatibility: !tc.disabled})
+			if tc.badOverride {
+				override := `{"duration":2}`
+				channel.ParamOverride = &override
+			}
+			if tc.badTemplate || tc.customProfile {
+				var custom dto.UpstreamAsyncConfig
+				require.NoError(t, common.Unmarshal([]byte(`{"profiles":[{"id":"tianyue-image","media_type":"image","models":["gpt-image-2-yb"],"operations":["generate"],"submit":{"task_id_path":"job.identifier","request":{"method":"POST","path":"/custom/images/jobs","headers":{"Authorization":"Bearer {api_key}"}}},"poll":{"request":{"method":"GET","path":"/custom/images/jobs/{task_id}","headers":{"Authorization":"Bearer {api_key}"}},"response":{"status_path":"job.state","progress_path":"job.progress","status_values":{"queued":["queued"],"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"result_path":"job.output"}}}]}`), &custom))
+				if tc.badTemplate {
+					custom.Profiles[0].Submit.Request.Body = map[string]any{"model": "{upstream_model}", "prompt": "{request.prompt}", "duration": float64(2)}
+				}
+				require.NoError(t, custom.Validate())
+				channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &custom})
+			}
+			request := service.AsyncImageRequest{Platform: "openai", Provider: "newapi", Dialect: "async", Model: "image-alias", Prompt: "test picture", Count: 1, Kind: "text_to_image", Size: "1024x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async", Native: map[string]common.RawMessage{"model": common.RawMessage(`"image-alias"`), "prompt": common.RawMessage(`"test picture"`), "n": common.RawMessage(`1`), "size": common.RawMessage(`"1024x1024"`)}}
+			if tc.reference {
+				request.Kind, request.SourcePath = "image_to_image", "/v1/images/edits_async"
+				request.Parts = []service.AsyncImageInputPart{{Type: "image_url", URL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(bitmap.Bytes())}}
+			}
+			if tc.multipart {
+				request.InputFormat = "multipart"
+			}
+			if tc.mask {
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "mask", URL: request.Parts[0].URL})
+			}
+			request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			task := model.AsyncImageTask{TaskId: "tianyue-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120, StartedAt: time.Now().Unix()}
+			payload, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = service.EncryptImagePayload(payload, "task:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			beforeInvoke := func() error {
+				dispatches++
+				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			}
+			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+			require.Error(t, err)
+			if tc.mask || tc.badOverride || tc.badTemplate {
+				assert.Zero(t, dispatches)
+				assert.Empty(t, received)
+				if tc.badTemplate {
+					assert.ErrorContains(t, err, "duration=1")
+				}
+				return
+			}
+			require.Len(t, received, 1)
+			sent := <-received
+			assert.Equal(t, 1, dispatches)
+			if tc.disabled {
+				assert.Equal(t, "/v1/images/edits", sent.path)
+				var references []map[string]string
+				require.NoError(t, common.Unmarshal(sent.body["images"], &references))
+				require.Len(t, references, 1)
+				assert.True(t, strings.HasPrefix(references[0]["image_url"], "data:"))
+				return
+			}
+			expectedPath := "/v1/images/generations"
+			if tc.yb {
+				expectedPath = "/v1/video/generations"
+			}
+			if tc.customProfile {
+				expectedPath = "/custom/images/jobs"
+			}
+			assert.Equal(t, expectedPath, sent.path)
+			assert.JSONEq(t, `"`+mapped+`"`, string(sent.body["model"]))
+			assert.JSONEq(t, `1`, string(sent.body["duration"]))
+			assert.JSONEq(t, `"1:1"`, string(sent.body["aspect_ratio"]))
+			assert.JSONEq(t, `"1K"`, string(sent.body["output_resolution"]))
+			assert.NotContains(t, sent.body, "size")
+			if tc.reference {
+				var references []string
+				require.NoError(t, common.Unmarshal(sent.body["images"], &references))
+				require.Len(t, references, 1)
+				assert.True(t, strings.HasPrefix(references[0], "https://gateway.example/api/image-task-references/"))
+				assert.Contains(t, references[0], "signature=")
+				assert.NotContains(t, references[0], "data:")
+			}
+			if tc.yb {
+				var pending *service.AsyncImagePending
+				require.ErrorAs(t, err, &pending)
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				expectedTaskID, expectedPollPath := "tianyue-job", "/v1/video/generations/tianyue-job"
+				if tc.customProfile {
+					expectedTaskID, expectedPollPath = "custom-job", "/custom/images/jobs/custom-job"
+				}
+				assert.Equal(t, expectedTaskID, task.UpstreamTaskId)
+				_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+				require.ErrorAs(t, err, &pending)
+				require.Len(t, received, 1)
+				assert.Equal(t, expectedPollPath, (<-received).path)
+				assert.Equal(t, 1, dispatches, "polling a known task must never submit again")
+			}
 		})
 	}
 }
@@ -662,15 +923,22 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 	canonicalReference := "data:image/png;base64," + referenceBase64
 	sourceReference := "data:image/png;base64," + referenceBase64[:32] + "\n" + referenceBase64[32:]
 	for _, tc := range []struct {
-		name      string
-		body      map[string]any
-		reference bool
-		invalid   bool
+		name              string
+		body              map[string]any
+		reference         bool
+		invalid           bool
+		resolutionMapping bool
+		parameterOverride string
+		expectedBody      string
 	}{
 		{name: "template", body: map[string]any{"prompt": "{request.prompt}", "n": "{request.n}"}},
 		{name: "native_body"},
 		{name: "converted_reference_template", body: map[string]any{"image_urls": "{request.image_urls}", "n": "{request.n}"}, reference: true},
 		{name: "conflicting_count", body: map[string]any{"n": float64(2)}, invalid: true},
+		{name: "resolution_mapping_native_body", resolutionMapping: true},
+		{name: "resolution_mapping_custom_field", resolutionMapping: true, body: map[string]any{"provider_model": "{upstream_model}", "n": "{request.n}"}, expectedBody: `{"provider_model":"gemini-image-test","n":1}`},
+		{name: "resolution_mapping_conflicting_template", resolutionMapping: true, body: map[string]any{"model": "{request.model}"}, invalid: true},
+		{name: "resolution_mapping_conflicting_override", resolutionMapping: true, parameterOverride: `{"model":"other-model"}`, invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			type recordedRequest struct{ method, path, auth, query, body string }
@@ -697,6 +965,14 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 			channel := &model.Channel{Id: 1, Key: "upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeGemini, Status: common.ChannelStatusEnabled, Models: "gemini-image-test", Group: "default"}
 			channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &config})
 			request := service.AsyncImageRequest{Platform: "gemini", Model: "gemini-image-test", Prompt: "draw", Count: 1, Parts: []service.AsyncImageInputPart{{Type: "text", Text: "draw"}}, Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+			if tc.resolutionMapping {
+				request.Model, request.Resolution = "gemini-alias", "1K"
+				channel.ModelMapping = common.GetPointer(`{"gemini-alias":"gemini-image-test","gemini-image-test":"gemini-image-test"}`)
+				channel.SetSetting(dto.ChannelSettings{ImageResolutionModelMapping: dto.ImageResolutionModelMapping{"gemini-alias": {"1K": "gemini-image-test"}}})
+			}
+			if tc.parameterOverride != "" {
+				channel.ParamOverride = &tc.parameterOverride
+			}
 			if tc.reference {
 				channel.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: "local"})
 				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: sourceReference})
@@ -723,8 +999,10 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 			assert.Equal(t, http.MethodPost, record.method)
 			assert.Equal(t, "/custom/jobs", record.path)
 			assert.Equal(t, "upstream-key", record.auth)
-			assert.Equal(t, request.Model, record.query)
-			if tc.reference {
+			assert.Equal(t, "gemini-image-test", record.query)
+			if tc.expectedBody != "" {
+				assert.JSONEq(t, tc.expectedBody, record.body)
+			} else if tc.reference {
 				expected, err := common.Marshal(map[string]any{"image_urls": []string{canonicalReference}, "n": 1})
 				require.NoError(t, err)
 				assert.JSONEq(t, string(expected), record.body, "custom templates must receive the validated and converted reference")
@@ -732,6 +1010,7 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 				assert.JSONEq(t, `{"prompt":"draw","n":1}`, record.body)
 			} else {
 				assert.Contains(t, record.body, `"contents"`)
+				assert.NotContains(t, record.body, `"model"`, "Gemini uses the URL model without an injected JSON field")
 			}
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			assert.Equal(t, "vendor-job", task.UpstreamTaskId)

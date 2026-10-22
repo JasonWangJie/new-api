@@ -17,8 +17,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
-import { describe, test } from 'vitest'
 
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { createElement } from 'react'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+
+import { api } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth-store'
+
+import { TaskArtifactsCell } from '../components/task-artifacts'
 import {
   getSafePluginAuthorUrl,
   parseTaskArtifactsResponse,
@@ -29,6 +38,14 @@ import {
 import type { TaskLog } from '../types'
 
 const artifactAccessToken = `${'A'.repeat(41)}-_`
+
+vi.mock('@/lib/api', () => ({ api: { get: vi.fn(), request: vi.fn() } }))
+
+afterEach(() => {
+  vi.resetAllMocks()
+  vi.unstubAllGlobals()
+  useAuthStore.getState().auth.reset()
+})
 
 function artifactContentUrl(
   artifactKey: string,
@@ -84,6 +101,46 @@ describe('task artifact projection', () => {
       }),
       { artifacts: [] }
     )
+  })
+
+  test('preserves authentication on same-origin protected media results', () => {
+    const artifact = {
+      key: 'video',
+      type: 'video',
+      mime_type: 'video/mp4',
+      authenticated: true,
+      content_url: '/api/user/media-tasks/task-public/results/video/view',
+    }
+    expect(
+      parseTaskArtifactsResponse({
+        success: true,
+        data: { artifacts: [artifact] },
+      })
+    ).toEqual({ artifacts: [artifact] })
+  })
+
+  test.each([
+    'https://attacker.example/api/user/media-tasks/task-public/results/video/view',
+    '//attacker.example/api/user/media-tasks/task-public/results/video/view',
+    '/api/user/self',
+    '/api/user/media-tasks/task-public/results/video/view?token=secret',
+    '/api/user/media-tasks/task-public/results/video/view#fragment',
+  ])('rejects authenticated media outside the protected route: %s', (url) => {
+    expect(() =>
+      parseTaskArtifactsResponse({
+        success: true,
+        data: {
+          artifacts: [
+            {
+              key: 'video',
+              type: 'video',
+              authenticated: true,
+              content_url: url,
+            },
+          ],
+        },
+      })
+    ).toThrow(TaskArtifactApiError)
   })
 
   test('keeps stable absolute cross-origin content URLs', () => {
@@ -334,6 +391,169 @@ describe('legacy task preview compatibility', () => {
       ),
       'plugin'
     )
+  })
+})
+
+describe('protected task artifact viewer', () => {
+  test('loads private video bytes with the session and releases the preview URL', async () => {
+    const contentUrl = '/api/user/media-tasks/task-public/results/video/view'
+    const blob = new Blob(['private generated video'], { type: 'video/mp4' })
+    const createObjectURL = vi.fn(() => 'blob:private-task-artifact')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal(
+      'URL',
+      class extends URL {
+        static createObjectURL = createObjectURL
+        static revokeObjectURL = revokeObjectURL
+      }
+    )
+    useAuthStore.getState().auth.setUser({ id: 7, username: 'owner', role: 1 })
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          artifacts: [
+            {
+              key: 'video',
+              type: 'video',
+              authenticated: true,
+              content_url: contentUrl,
+            },
+          ],
+        },
+      },
+    })
+    vi.mocked(api.request).mockResolvedValue({ data: blob })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(TaskArtifactsCell, { log: taskFixture() })
+      )
+    )
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: 'Artifacts' }))
+    const download = (await screen.findByText('Download')).closest('a')
+    await waitFor(() =>
+      expect(download).toHaveAttribute('href', 'blob:private-task-artifact')
+    )
+    expect(document.querySelector('video')).toHaveAttribute(
+      'src',
+      'blob:private-task-artifact'
+    )
+    expect(api.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: contentUrl,
+        responseType: 'blob',
+        headers: { Accept: 'video/*' },
+      })
+    )
+    expect(createObjectURL).toHaveBeenCalledWith(blob)
+    view.unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:private-task-artifact')
+    client.clear()
+  })
+
+  test('keeps ordinary signed artifact previews and downloads anonymous', async () => {
+    const contentUrl = artifactContentUrl('video')
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          artifacts: [{ key: 'video', type: 'video', content_url: contentUrl }],
+        },
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(TaskArtifactsCell, { log: taskFixture() })
+      )
+    )
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: 'Artifacts' }))
+    expect((await screen.findByText('Download')).closest('a')).toHaveAttribute(
+      'href',
+      contentUrl
+    )
+    expect(document.querySelector('video')).toHaveAttribute('src', contentUrl)
+    expect(api.request).not.toHaveBeenCalled()
+    view.unmount()
+    client.clear()
+  })
+
+  test('shows a private transfer failure and retries without exposing a raw download', async () => {
+    const contentUrl = '/api/admin/media-tasks/task-public/results/video/view'
+    const blob = new Blob(['retried private video'], { type: 'video/mp4' })
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal(
+      'URL',
+      class extends URL {
+        static createObjectURL = vi.fn(() => 'blob:retried-task-artifact')
+        static revokeObjectURL = revokeObjectURL
+      }
+    )
+    useAuthStore.getState().auth.setUser({ id: 9, username: 'admin', role: 10 })
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          artifacts: [
+            {
+              key: 'video',
+              type: 'video',
+              authenticated: true,
+              content_url: contentUrl,
+            },
+          ],
+        },
+      },
+    })
+    vi.mocked(api.request)
+      .mockRejectedValueOnce(new Error('private transfer unavailable'))
+      .mockResolvedValueOnce({ data: blob })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(TaskArtifactsCell, { log: taskFixture() })
+      )
+    )
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Artifacts' }))
+    expect(
+      await screen.findByText('Media preview failed. Please try again.')
+    ).toBeVisible()
+    expect(screen.getByText('Download').closest('a')).not.toHaveAttribute(
+      'href'
+    )
+    expect(document.querySelector('video')).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      expect(document.querySelector('video')).toHaveAttribute(
+        'src',
+        'blob:retried-task-artifact'
+      )
+    )
+    expect(screen.getByText('Download').closest('a')).toHaveAttribute(
+      'href',
+      'blob:retried-task-artifact'
+    )
+    view.unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:retried-task-artifact')
+    client.clear()
   })
 })
 

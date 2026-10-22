@@ -46,8 +46,11 @@ import {
   getImageRetainedRequest,
   getImageTasks,
   getMediaTaskPlatforms,
+  imageBlob,
+  authenticatedMediaBlob,
   imageRequest,
 } from '../api'
+import { ImageResults } from '../components/image-results'
 import { ImageTaskDetails } from '../components/image-task-details'
 import { ImageTaskNotice } from '../components/image-task-notice'
 import {
@@ -69,6 +72,7 @@ vi.mock('../api', () => ({
   imageTasksPath: (admin: boolean) =>
     `/api/${admin ? 'admin' : 'user'}/async-image-tasks`,
   imageBlob: vi.fn(),
+  authenticatedMediaBlob: vi.fn(),
   getImageTasks: vi.fn(),
   getMediaTaskPlatforms: vi.fn(),
   getImageTask: vi.fn(),
@@ -287,7 +291,9 @@ function mount(content: React.ReactNode) {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   clients.push(client)
-  render(<QueryClientProvider client={client}>{content}</QueryClientProvider>)
+  return render(
+    <QueryClientProvider client={client}>{content}</QueryClientProvider>
+  )
 }
 function setMobileViewport() {
   const matchMedia = window.matchMedia.bind(window)
@@ -437,6 +443,51 @@ test.each([
     ).toBe(expected)
   }
 )
+
+test('replacing a protected image releases the previous preview URL', async () => {
+  const first = new Blob(['first'], { type: 'image/png' })
+  const second = new Blob(['second'], { type: 'image/png' })
+  const revokeObjectURL = vi.fn()
+  vi.stubGlobal(
+    'URL',
+    class extends URL {
+      static createObjectURL = vi
+        .fn()
+        .mockReturnValueOnce('blob:first')
+        .mockReturnValueOnce('blob:second')
+      static revokeObjectURL = revokeObjectURL
+    }
+  )
+  try {
+    const view = render(
+      <ImageResults
+        images={[{ id: 'private', url: '/private', blob: first }]}
+      />
+    )
+    await waitFor(() =>
+      expect(screen.getByAltText('Generated image')).toHaveAttribute(
+        'src',
+        'blob:first'
+      )
+    )
+    view.rerender(
+      <ImageResults
+        images={[{ id: 'private', url: '/private', blob: second }]}
+      />
+    )
+    await waitFor(() =>
+      expect(screen.getByAltText('Generated image')).toHaveAttribute(
+        'src',
+        'blob:second'
+      )
+    )
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:first')
+    view.unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:second')
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
 
 test.each([false, true])(
   'administrator successful task cost uses all filtered results after average duration (mobile=%s)',
@@ -2615,6 +2666,64 @@ test('existing standard image previews retain their image URL and copy action', 
   )
 })
 
+test('protected video details load bytes with the session and release the preview URL', async () => {
+  const blob = new Blob(['private video'], { type: 'video/mp4' })
+  const revokeObjectURL = vi.fn()
+  vi.stubGlobal(
+    'URL',
+    class extends URL {
+      static createObjectURL = vi.fn(() => 'blob:private-canvas-video')
+      static revokeObjectURL = revokeObjectURL
+    }
+  )
+  try {
+    const link = '/api/user/media-tasks/private-video/results/video/view'
+    vi.mocked(authenticatedMediaBlob).mockResolvedValue(blob)
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: { ...task, media_type: 'video', status: 'succeeded' },
+      results: [
+        {
+          ...detail.results[0],
+          url: link,
+          view_url: link,
+          authenticated: true,
+          content_type: 'video/mp4',
+        },
+      ],
+    })
+    const view = mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={false}
+        userId={101}
+        onClose={vi.fn()}
+        canManage={false}
+        onManage={vi.fn()}
+      />
+    )
+    await waitFor(() =>
+      expect(document.querySelector('video')).toHaveAttribute(
+        'src',
+        'blob:private-canvas-video'
+      )
+    )
+    expect(authenticatedMediaBlob).toHaveBeenCalledWith(
+      link,
+      expect.any(AbortSignal)
+    )
+    expect(screen.getByText('Download').closest('a')).toHaveAttribute(
+      'href',
+      'blob:private-canvas-video'
+    )
+    expect(screen.queryByText('Copy link')).toBeNull()
+    view.unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:private-canvas-video')
+  } finally {
+    vi.unstubAllGlobals()
+  }
+})
+
 test('video task details play local results and refresh an expired link', async () => {
   const user = userEvent.setup()
   const link = '/v1/media/objects/local-video?expires=1789690000&access=example'
@@ -2657,6 +2766,74 @@ test('video task details play local results and refresh an expired link', async 
   )
   expect(document.body).not.toHaveTextContent('secret-fingerprint-canary')
 })
+
+test.each([false, true])(
+  'authenticated image results preview and download through the session client (admin=%s)',
+  async (admin) => {
+    const blob = new Blob(['private image'], { type: 'image/png' })
+    const createObjectURL = vi.fn(() => 'blob:private-canvas-image')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal(
+      'URL',
+      class extends URL {
+        static createObjectURL = createObjectURL
+        static revokeObjectURL = revokeObjectURL
+      }
+    )
+    try {
+      const link = `/api/${admin ? 'admin' : 'user'}/async-image-tasks/${task.id}/results/0/view`
+      vi.mocked(imageBlob).mockResolvedValue(blob)
+      vi.mocked(getImageTask).mockResolvedValue({
+        ...detail,
+        task: { ...task, status: 'succeeded' },
+        results: [
+          {
+            ...detail.results[0],
+            url: link,
+            view_url: link,
+            source: 'upstream',
+            authenticated: true,
+          },
+        ],
+      } as ImageTaskDetail)
+      const view = mount(
+        <ImageTaskDetails
+          id={task.id}
+          admin={admin}
+          userId={101}
+          canManage={admin}
+          onClose={vi.fn()}
+          onManage={vi.fn()}
+        />
+      )
+      await waitFor(() =>
+        expect(screen.getByAltText('Generated image')).toHaveAttribute(
+          'src',
+          'blob:private-canvas-image'
+        )
+      )
+      expect(imageBlob).toHaveBeenCalledWith(
+        link,
+        expect.any(AbortSignal),
+        true
+      )
+      expect(screen.queryByRole('button', { name: 'Copy link' })).toBeNull()
+      const download = vi
+        .spyOn(HTMLAnchorElement.prototype, 'click')
+        .mockImplementation(() => {})
+      await userEvent
+        .setup()
+        .click(screen.getByRole('button', { name: 'Download image' }))
+      expect(download).toHaveBeenCalledOnce()
+      expect(createObjectURL).toHaveBeenCalledWith(blob)
+      download.mockRestore()
+      view.unmount()
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:private-canvas-image')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  }
+)
 
 test('failed image downloads show the upstream link without a local archive action', async () => {
   const user = userEvent.setup()

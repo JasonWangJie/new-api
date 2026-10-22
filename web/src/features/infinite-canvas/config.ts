@@ -23,9 +23,23 @@ export interface CanvasIntegration {
 }
 
 export function canvasOrigin(value: string): string | null {
+  // Reject inputs that URL would silently rewrite into an origin.
+  const origin = /^https?:\/\/(\[[^\]]+\]|[^/:]+)(?::\d*)?\/?$/i.exec(value)
+  if (/[\s\\?#@]/.test(value) || !origin) {
+    return null
+  }
   try {
     const url = new URL(value)
-    const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    if (
+      /^\d+\.\d+\.\d+\.\d+$/.test(url.hostname) &&
+      origin[1] !== url.hostname
+    ) {
+      return null
+    }
+    const local =
+      ['localhost', '[::1]'].includes(url.hostname) ||
+      /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(url.hostname) ||
+      /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(url.hostname)
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && local)) {
       return null
     }

@@ -47,6 +47,54 @@ func TestChannelImageExecutionSettings(t *testing.T) {
 	}
 }
 
+func TestChannelImageResolutionModelMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mapping     string
+		decodeError bool
+		invalid     bool
+	}{
+		{name: "disabled", mapping: `null`},
+		{name: "empty", mapping: `{}`},
+		{name: "multiple models", mapping: `{"seedream-5-pro":{"1K":"seedream-5-pro-1K","2K":"seedream-5-pro-2K"},"custom.image":{"4K":"vendor/image-hd"}}`},
+		{name: "duplicate source", mapping: `{"image":{"1K":"first"},"image":{"2K":"second"}}`, decodeError: true},
+		{name: "duplicate tier", mapping: `{"image":{"1K":"first","1K":"second"}}`, decodeError: true},
+		{name: "empty model", mapping: `{"":{"1K":"target"}}`, invalid: true},
+		{name: "source whitespace", mapping: `{" image":{"1K":"target"}}`, invalid: true},
+		{name: "wildcard", mapping: `{"image*":{"1K":"target"}}`, invalid: true},
+		{name: "empty target", mapping: `{"image":{"1K":""}}`, invalid: true},
+		{name: "target whitespace", mapping: `{"image":{"1K":"target "}}`, invalid: true},
+		{name: "control character", mapping: `{"image":{"1K":"target\nname"}}`, invalid: true},
+		{name: "oversized UTF8 name", mapping: `{"image":{"1K":"` + strings.Repeat("图", 86) + `"}}`, invalid: true},
+		{name: "unknown tier", mapping: `{"image":{"8K":"target"}}`, invalid: true},
+		{name: "noncanonical tier", mapping: `{"image":{"2k":"target"}}`, invalid: true},
+		{name: "no targets", mapping: `{"image":{}}`, invalid: true},
+		{name: "null targets", mapping: `{"image":null}`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var settings ChannelSettings
+			err := kitutil.Unmarshal([]byte(`{"image_resolution_model_mapping":`+tc.mapping+`}`), &settings)
+			if tc.decodeError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if tc.invalid {
+				require.Error(t, settings.ValidateImageGeneration())
+				return
+			}
+			require.NoError(t, settings.ValidateImageGeneration())
+			encoded, err := kitutil.Marshal(settings)
+			require.NoError(t, err)
+			if tc.name == "multiple models" {
+				assert.JSONEq(t, tc.mapping, gjson.GetBytes(encoded, "image_resolution_model_mapping").Raw)
+			} else {
+				assert.False(t, gjson.GetBytes(encoded, "image_resolution_model_mapping").Exists())
+			}
+		})
+	}
+}
+
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

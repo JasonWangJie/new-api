@@ -64,6 +64,10 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 		}
 	}
 	capability := provider.ImageCapability(modelName)
+	if ch.Type == constant.ChannelTypeNewAPI && ch.GetSetting().TianyueMediaCompatibility {
+		capability.ReferenceField = "images"
+		capability.Parameters = append(slices.Clone(capability.Parameters), "aspect_ratio", "output_resolution")
+	}
 	if modelName != "" && capability.Provider != "openai" && capability.Provider != "newapi" && capability.Provider != "moonshot" && capability.Provider != "advanced_custom" && !capability.DeclaresModel(modelName) {
 		capability.Generate = false
 		capability.Edit = false

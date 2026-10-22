@@ -22,19 +22,20 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { StaticDataTable } from '@/components/data-table'
+import {
+  StaticDataTable,
+  type StaticDataTableColumn,
+} from '@/components/data-table'
 import { JsonCodeEditor } from '@/components/json-code-editor'
-import { MultiSelect } from '@/components/multi-select'
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from '@/components/ui/accordion'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Combobox } from '@/components/ui/combobox'
-import { FieldDescription } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -53,14 +54,15 @@ import { handleServerError } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
+import { ImageGroupSelect } from './components/image-group-select'
 import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
+import {
+  ImagePoolEditor,
+  type ImagePoolBinding,
+} from './components/image-pool-editor'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
-import type {
-  ImageAdminConfiguration,
-  ImagePoolSelectionOptions,
-  ImageStorageProfile,
-} from './types'
+import type { ImageAdminConfiguration, ImageStorageProfile } from './types'
 import { VideoConfiguration } from './video-settings'
 
 type ImageConfiguration = ImageAdminConfiguration
@@ -996,14 +998,12 @@ function ImagePolicyForm({
         }}
       >
         <div className='grid gap-3 sm:grid-cols-3'>
-          <div className='space-y-2'>
-            <Label htmlFor='image-policy-group'>{t('Group')}</Label>
-            <Input
-              id='image-policy-group'
-              value={group}
-              onChange={(event) => setGroup(event.target.value)}
-            />
-          </div>
+          <ImageGroupSelect
+            config={config}
+            value={group}
+            onChange={setGroup}
+            disabled={busy || deletion.isPending}
+          />
           <ImageSelect
             label={t('Platform')}
             value={platform}
@@ -1156,14 +1156,8 @@ export function ImagePoolForm({
   const [deleting, setDeleting] = useState<
     ImageConfiguration['pools'][number] | null
   >(null)
-  const [group, setGroup] = useState('default')
-  const [platform, setPlatform] = useState('openai')
-  const [mode, setMode] = useState('resolution')
-  const [model, setModel] = useState('')
-  const [resolution, setResolution] = useState('1K')
-  const [channelIds, setChannelIds] = useState<number[]>([])
-  const [weights, setWeights] = useState<Record<number, number>>({})
-  const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState<ImagePoolBinding | null>()
+  const [expanded, setExpanded] = useState<string[]>([])
   const deletion = useMutation({
     mutationFn: (binding: ImageConfiguration['pools'][number]) =>
       imageRequest(
@@ -1181,67 +1175,6 @@ export function ImagePoolForm({
     },
     onError: (error) => handleServerError(error, t('Image request failed')),
   })
-  const poolOptions = useQuery({
-    queryKey: ['image-pool-options', group, platform],
-    queryFn: ({ signal }) => {
-      const params = new URLSearchParams({ group, platform })
-      return imageRequest<ImagePoolSelectionOptions>(
-        `/api/option/images/pool/options?${params}`,
-        'GET',
-        undefined,
-        signal
-      )
-    },
-    enabled: group.trim().length > 0 && platform.length > 0,
-  })
-  const modelOptions = useMemo(() => {
-    const options = (poolOptions.data?.models || []).map((item) => ({
-      value: item.id,
-      label:
-        item.media_types && item.media_types.length > 0
-          ? `${item.label} · ${item.media_types.map((media) => t(media === 'video' ? 'Video' : 'Images')).join(' + ')}`
-          : item.label,
-    }))
-    if (model && !options.some((option) => option.value === model)) {
-      options.push({ value: model, label: `${model} · ${t('Unavailable')}` })
-    }
-    return options
-  }, [model, poolOptions.data?.models, t])
-  const availableModelIdSet = useMemo(
-    () => new Set((poolOptions.data?.models || []).map((item) => item.id)),
-    [poolOptions.data?.models]
-  )
-  const availableChannelIds = useMemo(() => {
-    if (mode === 'resolution') {
-      return (poolOptions.data?.channels || []).map((channel) => channel.id)
-    }
-    return (
-      poolOptions.data?.models.find((item) => item.id === model)?.channel_ids ||
-      []
-    )
-  }, [mode, model, poolOptions.data])
-  const availableChannelIdSet = useMemo(
-    () => new Set(availableChannelIds),
-    [availableChannelIds]
-  )
-  const channelOptions = useMemo(() => {
-    const channelsById = new Map(
-      (poolOptions.data?.channels || []).map((channel) => [channel.id, channel])
-    )
-    const ids = new Set(availableChannelIds)
-    for (const channelId of channelIds) {
-      ids.add(channelId)
-    }
-    return [...ids].map((channelId) => {
-      const channel = channelsById.get(channelId)
-      return {
-        value: String(channelId),
-        label: channel
-          ? `#${channelId} · ${channel.name}`
-          : `#${channelId} · ${t('Unavailable')}`,
-      }
-    })
-  }, [availableChannelIds, channelIds, poolOptions.data?.channels, t])
   const bindings = useMemo(() => {
     const rowsByBinding = [
       ...new Set(config?.pools.map((pool) => pool.binding_key) || []),
@@ -1261,41 +1194,94 @@ export function ImagePoolForm({
         collator.compare(a.resolution, b.resolution)
     )
   }, [config?.pools])
-  const save = async () => {
-    setBusy(true)
-    try {
-      if (mode !== 'resolution' && !model) {
-        throw new Error(t('Model name is required'))
+  const sections = useMemo(() => {
+    const grouped = new Map<
+      string,
+      {
+        key: string
+        group: string
+        platform: string
+        resolution: string
+        bindings: ImagePoolBinding[]
       }
-      if (mode !== 'resolution' && !availableModelIdSet.has(model)) {
-        throw new Error(
-          t('A selected model no longer exists. Reload the model list.')
-        )
+    >()
+    for (const binding of bindings) {
+      const key = JSON.stringify([
+        binding.group,
+        binding.platform,
+        binding.resolution,
+      ])
+      const section = grouped.get(key)
+      if (section) {
+        section.bindings.push(binding)
+      } else {
+        grouped.set(key, {
+          key,
+          group: binding.group,
+          platform: binding.platform,
+          resolution: binding.resolution,
+          bindings: [binding],
+        })
       }
-      if (channelIds.some((id) => !availableChannelIdSet.has(id))) {
-        throw new Error(t('Invalid channel IDs'))
-      }
-      await imageRequest('/api/option/images/pool', 'PUT', {
-        group,
-        platform,
-        mode,
-        model: mode === 'resolution' ? '' : model,
-        resolution: mode === 'model' ? '' : resolution,
-        channels: channelIds.map((id) => ({
-          id,
-          priority: weights[id] ?? 0,
-        })),
-      })
-      await onSuccess()
-      toast.success(t('Saved'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    } finally {
-      setBusy(false)
     }
-  }
+    const collator = new Intl.Collator('en', { numeric: true })
+    return [...grouped.values()].sort(
+      (a, b) =>
+        collator.compare(a.group, b.group) ||
+        collator.compare(a.platform, b.platform) ||
+        collator.compare(a.resolution, b.resolution)
+    )
+  }, [bindings])
+  const expandedKeys = new Set(expanded)
+  const allExpanded =
+    sections.length > 0 &&
+    sections.every((section) => expandedKeys.has(section.key))
+  const columns: StaticDataTableColumn<ImagePoolBinding>[] = [
+    {
+      id: 'mode',
+      header: t('Pool binding'),
+      cell: (binding) => t(imageLabel(binding.mode)),
+    },
+    {
+      id: 'model',
+      header: t('Model'),
+      cell: (binding) => binding.model || '—',
+    },
+    {
+      id: 'channels',
+      header: t('Channel'),
+      cell: (binding) =>
+        binding.channels
+          .map((row) => `${row.channel_id} (${Math.max(0, row.priority)})`)
+          .join(', ') || t('Disabled'),
+    },
+    {
+      id: 'edit',
+      header: t('Actions'),
+      cell: (binding) => (
+        <div className='flex flex-wrap gap-2'>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={deletion.isPending}
+            onClick={() => setEditing(binding)}
+          >
+            {t('Edit')}
+          </Button>
+          <Button
+            type='button'
+            size='sm'
+            variant='destructive'
+            disabled={!canManage || deletion.isPending}
+            onClick={() => setDeleting(binding)}
+          >
+            {t('Delete')}
+          </Button>
+        </div>
+      ),
+    },
+  ]
   return (
     <SettingsCard
       title={t('Channel pools')}
@@ -1303,245 +1289,96 @@ export function ImagePoolForm({
         'Choose channels already enabled for this group and model. An empty list explicitly closes this binding.'
       )}
     >
-      <form
-        className='grid gap-4 sm:grid-cols-2'
-        onSubmit={(event) => {
-          event.preventDefault()
-          void save()
-        }}
-      >
-        <div className='space-y-2'>
-          <Label htmlFor='pool-group'>{t('Group')}</Label>
-          <Input
-            id='pool-group'
-            value={group}
-            onChange={(event) => {
-              setGroup(event.target.value)
-              setModel('')
-              setChannelIds([])
-              setWeights({})
-            }}
-          />
-        </div>
-        <ImageSelect
-          label={t('Platform')}
-          value={platform}
-          options={(
-            config?.media_providers ||
-            config?.image_providers || ['openai', 'gemini']
-          ).map((value) => ({
-            value,
-            label: value,
-          }))}
-          onChange={(value) => {
-            setPlatform(value)
-            setModel('')
-            setChannelIds([])
-            setWeights({})
-          }}
-        />
-        <ImageSelect
-          label={t('Pool binding')}
-          value={mode}
-          options={['resolution', 'model', 'model_resolution'].map((value) => ({
-            value,
-            label: t(imageLabel(value)),
-          }))}
-          onChange={(value) => {
-            setMode(value)
-            if (value === 'resolution') setModel('')
-            setChannelIds([])
-            setWeights({})
-          }}
-        />
-        {mode !== 'resolution' && (
-          <div className='space-y-2'>
-            <Label htmlFor='pool-model'>{t('Model')}</Label>
-            <Combobox
-              id='pool-model'
-              options={modelOptions}
-              value={model || null}
-              onValueChange={(value) => {
-                setModel(value || '')
-                setChannelIds([])
-                setWeights({})
-              }}
-              placeholder={
-                poolOptions.isLoading ? t('Loading...') : t('Select model')
-              }
-              emptyText={t('No available models')}
-              disabled={poolOptions.isLoading || poolOptions.isError}
-              className='w-full'
-            />
-          </div>
-        )}
-        {mode !== 'model' && (
-          <ImageSelect
-            label={t('Resolution')}
-            value={resolution}
-            options={['1K', '2K', '4K'].map((value) => ({
-              value,
-              label: value,
-            }))}
-            onChange={setResolution}
-          />
-        )}
-        <div className='space-y-2'>
-          <Label htmlFor='pool-channels'>{t('Channels')}</Label>
-          <MultiSelect
-            id='pool-channels'
-            options={channelOptions}
-            selected={channelIds.map(String)}
-            onChange={(values) => {
-              const ids = values.map(Number)
-              setChannelIds(ids)
-              setWeights((previous) =>
-                Object.fromEntries(ids.map((id) => [id, previous[id] ?? 0]))
-              )
-            }}
-            placeholder={
-              poolOptions.isLoading ? t('Loading...') : t('Channels')
-            }
-            emptyText={t('No available channels')}
-            disabled={
-              poolOptions.isLoading ||
-              poolOptions.isError ||
-              (mode !== 'resolution' && !model)
-            }
-          />
-        </div>
-        {poolOptions.isError && (
-          <p className='text-destructive text-sm sm:col-span-2' role='alert'>
-            {poolOptions.error.message}
-          </p>
-        )}
-        <div className='sm:col-span-2'>
-          {channelIds.length > 0 && (
-            <StaticDataTable
-              data={[...new Set(channelIds)]}
-              getRowKey={(id) => String(id)}
-              columns={[
-                { id: 'channel', header: t('Channel'), cell: (id) => id },
-                {
-                  id: 'weight',
-                  header: t('Weight'),
-                  cell: (id) => (
-                    <Input
-                      aria-label={`${t('Weight')} ${id}`}
-                      aria-describedby='pool-weight-description'
-                      type='number'
-                      min={0}
-                      max={1000000}
-                      value={weights[id] ?? 0}
-                      onChange={(event) =>
-                        setWeights((previous) => ({
-                          ...previous,
-                          [id]: Number(event.target.value),
-                        }))
-                      }
-                    />
-                  ),
-                },
-              ]}
-            />
-          )}
-          <FieldDescription id='pool-weight-description' className='mb-3'>
-            {t(
-              'Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.'
-            )}
-          </FieldDescription>
+      <div className='mb-4 flex flex-wrap items-center justify-between gap-3'>
+        <span className='text-muted-foreground flex items-center gap-2 text-sm'>
+          {t('Pool binding')}
+          <Badge variant='secondary'>{bindings.length}</Badge>
+        </span>
+        <div className='flex flex-wrap items-center gap-2'>
           <Button
-            disabled={
-              busy ||
-              deletion.isPending ||
-              poolOptions.isLoading ||
-              poolOptions.isError ||
-              !group.trim()
+            type='button'
+            variant='outline'
+            disabled={sections.length === 0}
+            onClick={() =>
+              setExpanded(
+                allExpanded ? [] : sections.map((section) => section.key)
+              )
             }
-            type='submit'
           >
-            {t('Save')}
+            {allExpanded ? t('Collapse all') : t('Expand all')}
+          </Button>
+          <Button
+            type='button'
+            disabled={!canManage || deletion.isPending}
+            onClick={() => setEditing(null)}
+          >
+            {t('Add channel pool binding')}
           </Button>
         </div>
-      </form>
-      <StaticDataTable
-        data={bindings}
-        getRowKey={(binding) => binding.binding_key}
-        columns={[
-          { id: 'group', header: t('Group'), cell: (binding) => binding.group },
-          {
-            id: 'platform',
-            header: t('Platform'),
-            cell: (binding) => binding.platform,
-          },
-          {
-            id: 'mode',
-            header: t('Pool binding'),
-            cell: (binding) => t(imageLabel(binding.mode)),
-          },
-          {
-            id: 'model',
-            header: t('Model'),
-            cell: (binding) => binding.model || '—',
-          },
-          {
-            id: 'resolution',
-            header: t('Resolution'),
-            cell: (binding) => binding.resolution || '—',
-          },
-          {
-            id: 'channels',
-            header: t('Channel'),
-            cell: (binding) =>
-              binding.channels
-                .map(
-                  (row) => `${row.channel_id} (${Math.max(0, row.priority)})`
-                )
-                .join(', ') || t('Disabled'),
-          },
-          {
-            id: 'edit',
-            header: t('Actions'),
-            cell: (binding) => (
-              <div className='flex flex-wrap gap-2'>
-                <Button
-                  type='button'
-                  size='sm'
-                  variant='outline'
-                  disabled={busy || deletion.isPending}
-                  onClick={() => {
-                    setGroup(binding.group)
-                    setPlatform(binding.platform)
-                    setMode(binding.mode)
-                    setModel(binding.model)
-                    setResolution(binding.resolution || '1K')
-                    setChannelIds(binding.channels.map((row) => row.channel_id))
-                    setWeights(
-                      Object.fromEntries(
-                        binding.channels.map((row) => [
-                          row.channel_id,
-                          Math.max(0, row.priority),
-                        ])
-                      )
-                    )
+      </div>
+      {editing !== undefined && (
+        <ImagePoolEditor
+          config={config}
+          binding={editing}
+          canManage={canManage}
+          onSuccess={onSuccess}
+          onClose={() => setEditing(undefined)}
+        />
+      )}
+      {sections.length === 0 ? (
+        <StaticDataTable data={[]} columns={columns} />
+      ) : (
+        <Accordion
+          multiple
+          value={expanded}
+          onValueChange={setExpanded}
+          className='gap-3'
+        >
+          {sections.map((section) => (
+            <AccordionItem
+              key={section.key}
+              value={section.key}
+              className='rounded-lg border last:border-b'
+            >
+              <AccordionTrigger className='items-center gap-3 px-4 py-3 hover:no-underline'>
+                <span className='flex min-w-0 flex-1 flex-wrap items-center gap-2'>
+                  <span className='min-w-0 font-semibold break-all'>
+                    {section.group}
+                  </span>
+                  <Badge
+                    variant='outline'
+                    className='h-auto min-h-5 max-w-full break-all whitespace-normal'
+                  >
+                    {section.platform}
+                  </Badge>
+                  <Badge
+                    variant='secondary'
+                    className='h-auto min-h-5 max-w-full whitespace-normal'
+                  >
+                    {section.resolution || t('All resolutions')}
+                  </Badge>
+                </span>
+                <Badge
+                  variant='secondary'
+                  aria-label={`${t('Pool binding')}: ${section.bindings.length}`}
+                >
+                  {section.bindings.length}
+                </Badge>
+              </AccordionTrigger>
+              <AccordionContent className='px-3 pb-3'>
+                <StaticDataTable
+                  data={section.bindings}
+                  getRowKey={(binding) => binding.binding_key}
+                  tableProps={{
+                    'aria-label': `${section.group} / ${section.platform} / ${section.resolution || t('All resolutions')}`,
                   }}
-                >
-                  {t('Edit')}
-                </Button>
-                <Button
-                  type='button'
-                  size='sm'
-                  variant='destructive'
-                  disabled={!canManage || busy || deletion.isPending}
-                  onClick={() => setDeleting(binding)}
-                >
-                  {t('Delete')}
-                </Button>
-              </div>
-            ),
-          },
-        ]}
-      />
+                  columns={columns}
+                />
+              </AccordionContent>
+            </AccordionItem>
+          ))}
+        </Accordion>
+      )}
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => {
@@ -1563,12 +1400,12 @@ export function ImagePoolForm({
             </p>
           </div>
         }
-        disabled={!canManage || busy}
+        disabled={!canManage}
         confirmText={t('Delete')}
         destructive
         isLoading={deletion.isPending}
         handleConfirm={() => {
-          if (deleting && canManage && !busy && !deletion.isPending) {
+          if (deleting && canManage && !deletion.isPending) {
             deletion.mutate(deleting)
           }
         }}

@@ -55,7 +55,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 		require.NoError(t, database.Raw(query).Scan(&databaseName).Error)
 		require.True(t, strings.HasPrefix(databaseName, "new_api_controller_test"), "media tests require an isolated new_api_controller_test database")
 	}
-	rows := []any{&model.Task{}, &model.Channel{}, &model.User{}, &model.Token{}, &model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+	rows := []any{&model.Task{}, &model.Channel{}, &model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
 	for range 2 {
 		require.NoError(t, database.AutoMigrate(rows...))
 	}

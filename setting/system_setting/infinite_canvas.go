@@ -2,13 +2,18 @@ package system_setting
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/config"
+	"golang.org/x/net/idna"
 )
 
 type InfiniteCanvasSettings struct {
@@ -29,21 +34,76 @@ func InfiniteCanvasSettingsSnapshot() InfiniteCanvasSettings {
 	return infiniteCanvasSettings
 }
 
-// CanvasCallbackURL accepts a fixed deployment base, never a caller-selected redirect.
-func CanvasCallbackURL(settings InfiniteCanvasSettings) (string, error) {
-	u, err := url.Parse(settings.URL)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "" && u.Path != "/" || strings.ContainsAny(settings.URL, "\\\r\n\t #") {
+// CanvasOrigin is the single representation used for configured redirects and
+// grant fingerprints. It accepts an origin, never a caller-selected path.
+func CanvasOrigin(value string) (string, error) {
+	u, err := url.Parse(value)
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "" && u.Path != "/" || strings.ContainsAny(value, "\\#") || strings.ContainsFunc(value, unicode.IsSpace) {
 		return "", errors.New("invalid Infinite Canvas URL")
 	}
+	hostname := strings.ToLower(u.Hostname())
+	loopback := false
+	if ip, err := netip.ParseAddr(hostname); err == nil {
+		if ip.Zone() != "" {
+			return "", errors.New("invalid Infinite Canvas URL")
+		}
+		loopback = ip.Unmap().IsLoopback()
+		hostname = ip.String()
+		if ip.Is4In6() {
+			// Browser URL origins render mapped IPv4 addresses in hexadecimal.
+			bytes := ip.As16()
+			hostname = fmt.Sprintf("::ffff:%x:%x", uint16(bytes[12])<<8|uint16(bytes[13]), uint16(bytes[14])<<8|uint16(bytes[15]))
+		}
+	} else {
+		hostname, err = idna.Lookup.ToASCII(hostname)
+		if err != nil || hostname == "" || strings.HasPrefix(u.Host, "[") || strings.ContainsAny(hostname, "%[]:") {
+			return "", errors.New("invalid Infinite Canvas URL")
+		}
+		lastLabel := strings.TrimSuffix(hostname, ".")
+		if index := strings.LastIndexByte(lastLabel, '.'); index >= 0 {
+			lastLabel = lastLabel[index+1:]
+		}
+		hexLabel, hexadecimal := strings.CutPrefix(lastLabel, "0x")
+		if strings.Trim(lastLabel, "0123456789") == "" || hexadecimal && hexLabel != "" && strings.Trim(hexLabel, "0123456789abcdef") == "" {
+			// Reject abbreviated/hexadecimal IPs that browsers reinterpret.
+			return "", errors.New("invalid Infinite Canvas URL")
+		}
+	}
 	if u.Scheme != "https" {
-		ip := net.ParseIP(u.Hostname())
-		if u.Scheme != "http" || u.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		if u.Scheme != "http" || hostname != "localhost" && !loopback {
 			return "", errors.New("Infinite Canvas requires HTTPS, except loopback development")
 		}
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/auth/callback"
+	port := u.Port()
+	if port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 0 || number > 65535 {
+			return "", errors.New("invalid Infinite Canvas URL")
+		}
+		port = strconv.Itoa(number)
+		if u.Scheme == "https" && port == "443" || u.Scheme == "http" && port == "80" {
+			port = ""
+		}
+	}
+	u.Host = hostname
+	if strings.Contains(hostname, ":") {
+		u.Host = "[" + hostname + "]"
+	}
+	if port != "" {
+		u.Host = net.JoinHostPort(hostname, port)
+	}
+	u.Path = ""
 	u.RawPath = ""
 	return u.String(), nil
+}
+
+// CanvasCallbackURL accepts a fixed deployment base, never a caller-selected redirect.
+func CanvasCallbackURL(settings InfiniteCanvasSettings) (string, error) {
+	origin, err := CanvasOrigin(settings.URL)
+	if err != nil {
+		return "", err
+	}
+	return origin + "/auth/callback", nil
 }
 
 func CanvasClientSecret() string { return os.Getenv("INFINITE_CANVAS_CLIENT_SECRET") }

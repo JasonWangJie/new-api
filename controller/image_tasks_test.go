@@ -57,7 +57,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			previousDB, previousType := model.DB, common.MainDatabaseType()
 			model.DB = db
 			common.SetMainDatabaseType(common.DatabaseType(engine))
-			entities := []any{&model.User{}, &model.Token{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
 				common.SetMainDatabaseType(previousType)

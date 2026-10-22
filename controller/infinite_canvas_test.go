@@ -5,12 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"maps"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +26,14 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	gatewaytypes "github.com/QuantumNous/new-api/types"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -68,27 +75,40 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 	t.Helper()
 	previousDB, previousLogDB, previousRedis, previousRDB, previousSecret := model.DB, model.LOG_DB, common.RedisEnabled, common.RDB, common.SessionSecret
 	previousSettings := system_setting.InfiniteCanvasSettingsSnapshot()
-	previousType := common.MainDatabaseType()
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
 	f := &canvasFixture{}
-	var err error
-	f.db, err = gorm.Open(sqlite.Open("file:"+common.GetUUID()+"?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	require.NoError(t, err)
+	dialect := os.Getenv("TEST_CANVAS_DIALECT")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	require.Contains(t, []string{"sqlite", "mysql", "postgres"}, dialect)
+	f.db, _ = newAuditTestDatabase(t, dialect, os.Getenv("TEST_"+strings.ToUpper(dialect)+"_DSN"))
+	f.db.Logger = logger.Default.LogMode(logger.Silent)
 	sqlDB, err := f.db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}))
+	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}, &model.ImageStorageProfile{}, &model.AsyncImageEvent{}, &model.Option{}))
 	f.redis = miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: f.redis.Addr()})
 	model.DB, model.LOG_DB, common.RedisEnabled, common.RDB, common.SessionSecret = f.db, f.db, true, client, "canvas-fixture-signing-secret"
 	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	if dialect == "mysql" {
+		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+	} else if dialect == "postgres" {
+		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+	}
+	t.Setenv("LOG_SQL_DSN", "")
+	previousMaster := common.IsMasterNode
+	common.IsMasterNode = false
+	require.NoError(t, model.InitLogDB()) // Initialize dialect-specific quoted columns for ordinary TokenAuth.
+	common.IsMasterNode = previousMaster
 	t.Setenv("INFINITE_CANVAS_CLIENT_SECRET", strings.Repeat("secret", 8))
 	require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"enabled": "true", "url": "https://canvas.example.test", "client_id": "infinite-canvas"}))
 	t.Cleanup(func() {
 		require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"enabled": fmt.Sprint(previousSettings.Enabled), "url": previousSettings.URL, "client_id": previousSettings.ClientID}))
 		model.DB, model.LOG_DB, common.RedisEnabled, common.RDB, common.SessionSecret = previousDB, previousLogDB, previousRedis, previousRDB, previousSecret
-		common.SetMainDatabaseType(previousType)
+		common.SetDatabaseTypes(previousType, previousLogType)
 		_ = client.Close()
-		_ = sqlDB.Close()
 	})
 	f.user = model.User{Username: "canvas-user", DisplayName: "Canvas User", AffCode: "canvas-owner", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", AuthVersion: 1, Quota: 1000000}
 	require.NoError(t, f.db.Create(&f.user).Error)
@@ -107,6 +127,19 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 	api.GET("/integrations/canvas/history/:kind/:task_id/content/:artifact", CanvasHistoryContent)
 	api.HEAD("/integrations/canvas/history/:kind/:task_id/content/:artifact", CanvasHistoryContent)
 	api.GET("/integrations/canvas/inputs/:input_id/content", CanvasInputContent)
+	api.GET("/user/async-image-tasks", middleware.UserAuth(), func(c *gin.Context) { ListImageTasks(c, false) })
+	api.GET("/image-objects/:object_id/content", GetImageObjectContent)
+	api.GET("/user/async-image-tasks/:task_id", middleware.UserAuth(), func(c *gin.Context) { GetImageTask(c, false) })
+	api.GET("/user/async-image-tasks/:task_id/results/:image_index/view", middleware.UserAuth(), func(c *gin.Context) { ViewImageTaskResult(c, false) })
+	api.GET("/admin/async-image-tasks/:task_id", middleware.AdminAuth(), func(c *gin.Context) { GetImageTask(c, true) })
+	api.GET("/admin/async-image-tasks/:task_id/results/:image_index/view", middleware.AdminAuth(), func(c *gin.Context) { ViewImageTaskResult(c, true) })
+	api.GET("/user/media-tasks", middleware.UserAuth(), func(c *gin.Context) { ListMediaTasks(c, false) })
+	api.GET("/user/media-tasks/:task_id", middleware.UserAuth(), func(c *gin.Context) { GetMediaTask(c, false) })
+	api.GET("/admin/media-tasks/:task_id", middleware.AdminAuth(), func(c *gin.Context) { GetMediaTask(c, true) })
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		api.Handle(method, "/user/media-tasks/:task_id/results/:artifact_key/view", middleware.UserAuth(), func(c *gin.Context) { ViewMediaTaskResult(c, false) })
+		api.Handle(method, "/admin/media-tasks/:task_id/results/:artifact_key/view", middleware.AdminAuth(), func(c *gin.Context) { ViewMediaTaskResult(c, true) })
+	}
 	api.POST("/token/:id/key", func(c *gin.Context) { c.Set("id", f.user.Id) }, GetTokenKey)
 	api.POST("/token/batch/keys", func(c *gin.Context) { c.Set("id", f.user.Id) }, GetTokenKeysBatch)
 	api.PUT("/token/", func(c *gin.Context) { c.Set("id", f.user.Id) }, UpdateToken)
@@ -120,6 +153,9 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 		})
 	}
 	f.router.POST("/v1/images/generations", middleware.TokenAuth(), func(c *gin.Context) { c.JSON(200, gin.H{"id": c.GetInt("id")}) })
+	f.router.GET("/v1/images/tasks_async/:task_id", middleware.TokenAuth(), QueryAsyncImage)
+	f.router.GET("/v1/media/tasks_async/:task_id", middleware.TokenAuth(), QueryAsyncMedia)
+	f.router.GET("/v1/media/objects/:object_id", MediaObjectContent)
 	f.router.GET("/api/log/token", middleware.TokenAuthReadOnly(), func(c *gin.Context) { c.Status(200) })
 	f.router.GET("/v1/images/tasks_async/stats", middleware.AsyncTaskStatsAuth(), func(c *gin.Context) { c.Status(200) })
 	return f
@@ -245,8 +281,64 @@ func TestCanvasAuthorizeRequiresBrowserSessionAndRegisteredCallback(t *testing.T
 	}
 }
 
+func TestCanvasOriginNormalizationPreservesOnlyEquivalentAuthorizations(t *testing.T) {
+	for _, raw := range []string{"https://CANVAS.EXAMPLE.TEST", "https://canvas.example.test:443", "https://CANVAS.EXAMPLE.TEST:443/"} {
+		t.Run(raw, func(t *testing.T) {
+			f := newCanvasFixture(t)
+			require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"url": raw}))
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequest("GET", "/api/status", nil)
+			GetStatus(c)
+			require.Equal(t, 200, response.Code, response.Body.String())
+			var status struct {
+				Data struct {
+					Canvas system_setting.InfiniteCanvasSettings `json:"infinite_canvas"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &status))
+			assert.True(t, status.Data.Canvas.Enabled)
+			assert.Equal(t, "https://canvas.example.test", status.Data.Canvas.URL)
+			grant := f.grant(t) // Both authorization and exchange use the canonical fixed callback.
+			assert.Equal(t, 200, f.request("GET", "/v1/models", "", "Bearer "+grant.APIKey, f.proof, "").Code)
+			common.OptionMapRWMutex.Lock()
+			previousOptions := maps.Clone(common.OptionMap)
+			if common.OptionMap == nil {
+				common.OptionMap = make(map[string]string)
+			}
+			common.OptionMapRWMutex.Unlock()
+			t.Cleanup(func() {
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap = previousOptions
+				common.OptionMapRWMutex.Unlock()
+			})
+			require.NoError(t, model.UpdateOption("infinite_canvas.url", raw))
+			assert.Equal(t, "https://canvas.example.test", system_setting.InfiniteCanvasSettingsSnapshot().URL)
+			assert.Equal(t, 200, f.request("GET", "/v1/models", "", "Bearer "+grant.APIKey, f.proof, "").Code)
+			var payload service.CanvasGrantState
+			key := "canvas:grant:" + grant.GrantID
+			require.NoError(t, common.UnmarshalJsonStr(f.redis.HGet(key, "payload"), &payload))
+			payload.ConfigHash = common.GenerateHMACWithKey([]byte("infinite-canvas-v1:"+common.SessionSecret), "infinite-canvas\x00"+raw+"\x00"+system_setting.CanvasClientSecret())
+			encoded, err := common.Marshal(payload)
+			require.NoError(t, err)
+			f.redis.HSet(key, "payload", string(encoded))
+			assert.Equal(t, 401, f.request("GET", "/v1/models", "", "Bearer "+grant.APIKey, f.proof, "").Code, "legacy raw fingerprints require reauthorization")
+			current := f.grant(t)
+			for settingKey, value := range map[string]string{"url": "https://other.example.test", "client_id": "other-client"} {
+				require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{settingKey: value}))
+				_, _, err := service.GetCanvasGrant(t.Context(), current.GrantID, false)
+				require.Error(t, err)
+				require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"url": "https://canvas.example.test", "client_id": "infinite-canvas"}))
+			}
+			t.Setenv("INFINITE_CANVAS_CLIENT_SECRET", strings.Repeat("changed", 8))
+			_, _, err = service.GetCanvasGrant(t.Context(), current.GrantID, false)
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestCanvasCredentialAndRevocationBoundaries(t *testing.T) {
-	for _, scenario := range []string{"missing application proof", "wrong application proof", "parent logout", "disabled user", "password version", "session version", "token disabled", "token deleted", "application disabled", "Redis loss", "idle timeout"} {
+	for _, scenario := range []string{"missing application proof", "wrong application proof", "parent logout", "disabled user", "password version", "session version", "session expired", "token disabled", "token deleted", "token expired", "grant revoked", "subject replaced", "client replaced", "application disabled", "Redis loss", "idle timeout", "IP permission changed", "group permission changed"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newCanvasFixture(t)
 			grant := f.grant(t)
@@ -264,19 +356,44 @@ func TestCanvasCredentialAndRevocationBoundaries(t *testing.T) {
 				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("auth_version", 2).Error)
 			case "session version":
 				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.identity.SessionID).Update("version", 2).Error)
+			case "session expired":
+				require.NoError(t, f.db.Model(&model.UserSession{}).Where("sid = ?", f.identity.SessionID).Update("expires_at", time.Now().Unix()-1).Error)
 			case "token disabled":
 				require.NoError(t, f.db.Model(&model.Token{}).Where("user_id = ?", f.user.Id).Update("status", common.TokenStatusDisabled).Error)
 			case "token deleted":
 				require.NoError(t, f.db.Where("user_id = ?", f.user.Id).Delete(&model.Token{}).Error)
+			case "token expired":
+				require.NoError(t, f.db.Model(&model.Token{}).Where("user_id = ?", f.user.Id).Update("expired_time", time.Now().Unix()-1).Error)
+			case "grant revoked":
+				require.NoError(t, service.RevokeCanvasGrant(t.Context(), grant.GrantID))
+			case "subject replaced":
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("canvas_subject", "ics_"+common.GetUUID()).Error)
+			case "client replaced":
+				require.NoError(t, f.db.Model(&model.CanvasGrant{}).Where("id = ?", grant.GrantID).Update("client_id", "another-app").Error)
 			case "application disabled":
 				require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("infinite_canvas"), map[string]string{"enabled": "false"}))
 			case "Redis loss":
 				f.redis.FlushAll()
 			case "idle timeout":
 				f.redis.HSet("canvas:grant:"+grant.GrantID, "last_active", fmt.Sprint(time.Now().Add(-service.CanvasIdleTTL).Unix()))
+			case "IP permission changed":
+				require.NoError(t, f.db.Model(&model.Token{}).Where("user_id = ?", f.user.Id).Update("allow_ips", "198.51.100.0/24").Error)
+			case "group permission changed":
+				require.NoError(t, f.db.Model(&model.Token{}).Where("user_id = ?", f.user.Id).Update("group", "canvas-worker-forbidden-group").Error)
 			}
 			response := f.request("GET", "/v1/models", "", "Bearer "+grant.APIKey, proof, "")
 			assert.NotEqual(t, 200, response.Code, response.Body.String())
+			if !strings.Contains(scenario, "application proof") {
+				var record model.CanvasGrant
+				require.NoError(t, f.db.First(&record, "id = ?", grant.GrantID).Error)
+				internal := gin.New()
+				internal.POST("/v1/videos", middleware.CanvasAsyncMediaWorkerAuth(record.TokenID, f.user.Id), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+				request := httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+				request.RemoteAddr = "192.0.2.1:0"
+				workerResponse := httptest.NewRecorder()
+				internal.ServeHTTP(workerResponse, request)
+				assert.NotEqual(t, http.StatusNoContent, workerResponse.Code, "worker must reject "+scenario)
+			}
 		})
 	}
 	t.Run("owner context and stripped proof; scopes never expose logs or stats", func(t *testing.T) {
@@ -417,6 +534,18 @@ func TestCanvasUpstreamImageManifestUsesPrivateContentBridge(t *testing.T) {
 	assert.Contains(t, response.Body.String(), contentPath)
 	assert.NotContains(t, response.Body.String(), providerURL)
 	assert.NotContains(t, response.Body.String(), "provider-result-canary")
+	for _, prefix := range []string{"/v1/images/tasks_async/", "/v1/media/tasks_async/"} {
+		response = f.request("GET", prefix+task.TaskId, "", "Bearer "+grant.APIKey, f.proof, "")
+		require.Equal(t, 200, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), contentPath)
+		assert.NotContains(t, response.Body.String(), "provider-result-canary")
+	}
+	jwt, _, err := service.IssueAccessToken(f.identity)
+	require.NoError(t, err)
+	response = f.request("GET", "/api/user/async-image-tasks/"+task.TaskId, "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"authenticated":true`)
+	assert.NotContains(t, response.Body.String(), "provider-result-canary")
 	assert.Equal(t, 404, f.request("GET", service.CanvasContentPath("images", task.TaskId, "1"), "", f.proof, "", grant.GrantID).Code)
 	// Both the public-manifest gate and the existing HTTPS downloader must
 	// reject unsafe persisted inputs before any outbound network access.
@@ -438,6 +567,185 @@ func TestCanvasUpstreamImageManifestUsesPrivateContentBridge(t *testing.T) {
 	replacement := f.grant(t)
 	assert.Equal(t, 404, f.request("GET", path, "", f.proof, "", replacement.GrantID).Code)
 	assert.Equal(t, 404, f.request("GET", contentPath, "", f.proof, "", replacement.GrantID).Code)
+}
+
+func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T) {
+	f := newCanvasFixture(t)
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	grant := f.grant(t)
+	var record model.CanvasGrant
+	require.NoError(t, f.db.First(&record, "id = ?", grant.GrantID).Error)
+	profile := model.ImageStorageProfile{ProfileId: "canvas-results", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}
+	require.NoError(t, f.db.Create(&profile).Error)
+	content := []byte("private-canvas-image-content")
+	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, "result.png"), content, 0600))
+	object := model.ImageStorageObject{ObjectId: "canvas-result", ProfileId: profile.ProfileId, ObjectKey: "result.png", ContentType: "image/png", ByteSize: int64(len(content)), Status: "active", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	require.NoError(t, f.db.Create(&object).Error)
+	task := model.AsyncImageTask{TaskId: "asyncimg_canvas_content", UserId: f.user.Id, TokenId: record.TokenID, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ResultCount: 1, ExpiresAt: object.ExpiresAt}
+	require.NoError(t, f.db.Create(&task).Error)
+	require.NoError(t, f.db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: object.ObjectId}).Error)
+	queryPath := "/v1/images/tasks_async/" + task.TaskId
+	response := f.request("GET", queryPath, "", "Bearer "+grant.APIKey, f.proof, "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var manifest struct {
+		Status string `json:"status"`
+		Data   []struct {
+			URL string `json:"url"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &manifest))
+	require.Equal(t, "succeeded", manifest.Status)
+	require.Len(t, manifest.Data, 1)
+	contentPath := manifest.Data[0].URL
+	assert.Equal(t, service.CanvasContentPath("images", task.TaskId, "0"), contentPath)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		response = f.request(method, contentPath, "", f.proof, "", grant.GrantID)
+		require.Equal(t, 200, response.Code, response.Body.String())
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		assert.Equal(t, "image/png", response.Header().Get("Content-Type"))
+		if method == http.MethodGet {
+			assert.Equal(t, content, response.Body.Bytes())
+		} else {
+			assert.Empty(t, response.Body.Bytes())
+		}
+	}
+	assert.Equal(t, 401, f.request("GET", contentPath, "", "", "", grant.GrantID).Code)
+	signed, err := service.ImageObjectURL(t.Context(), object, "", 3600)
+	require.NoError(t, err)
+	assert.Equal(t, 404, f.request("GET", signed, "", "", "", "").Code)
+	jwt, _, err := service.IssueAccessToken(f.identity)
+	require.NoError(t, err)
+	viewPath := "/api/user/async-image-tasks/" + task.TaskId + "/results/0/view"
+	response = f.request("GET", viewPath, "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, content, response.Body.Bytes())
+	assert.Empty(t, response.Header().Get("Location"))
+	// Local uploads may legitimately exceed the independently configured remote
+	// download limit. They remain readable by upstreams and the owner's dashboard.
+	input := model.ImageInputObject{InputId: "sci_canvas_content", TokenId: record.TokenID, ObjectId: object.ObjectId, IntentKey: "canvas-content-input", Status: "active", ExpiresAt: object.ExpiresAt}
+	require.NoError(t, f.db.Create(&input).Error)
+	require.NoError(t, f.db.Create(&model.ImageUploadIntent{IntentKey: input.IntentKey, TokenId: record.TokenID, UserId: f.user.Id, ProfileId: object.ProfileId, ObjectKey: object.ObjectKey}).Error)
+	grantState, _, err := service.GetCanvasGrant(t.Context(), grant.GrantID, false)
+	require.NoError(t, err)
+	inputPath := service.CanvasInputURL("", input.InputId, grantState, 3600)
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.DownloadMaxBytes = 1
+	require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+	response = f.request("GET", inputPath, "", "", "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, content, response.Body.Bytes())
+	response = f.request("GET", viewPath, "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, content, response.Body.Bytes())
+	require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), service.DefaultImageRuntimeConfig()))
+	jsonRequest := httptest.NewRequest("GET", viewPath, nil)
+	jsonRequest.Header.Set("Authorization", "Bearer "+jwt)
+	jsonRequest.Header.Set("Accept", "application/json")
+	response = httptest.NewRecorder()
+	f.router.ServeHTTP(response, jsonRequest)
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"url":"`+viewPath+`"`)
+	assert.Contains(t, response.Body.String(), `"authenticated":true`)
+	assert.NotContains(t, response.Body.String(), "signature=")
+	response = f.request("GET", "/api/user/async-image-tasks/"+task.TaskId, "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"authenticated":true`)
+	assert.NotContains(t, response.Body.String(), "signature=")
+	// S3 results use the same private projection; signing must never escape in
+	// either the public poll response or the dashboard result manifest.
+	credential, err := common.Marshal(service.ImageStorageCredentials{AccessKey: "canvas-s3-test", SecretKey: "canvas-s3-test-secret"})
+	require.NoError(t, err)
+	cipher, err := service.EncryptImagePayload(credential, "storage:"+profile.ProfileId)
+	require.NoError(t, err)
+	require.NoError(t, f.db.Model(&profile).Updates(map[string]any{"backend": "s3", "bucket": "canvas-private", "region": "us-east-1", "credential_cipher": cipher}).Error)
+	s3Signed, err := service.ImageObjectURL(t.Context(), object, "", 3600)
+	require.NoError(t, err)
+	assert.Contains(t, s3Signed, "X-Amz-Signature=")
+	for _, path := range []string{queryPath, "/api/user/async-image-tasks/" + task.TaskId} {
+		authorization, proof := "Bearer "+grant.APIKey, f.proof
+		if strings.HasPrefix(path, "/api/") {
+			authorization, proof = "Bearer "+jwt, ""
+		}
+		response = f.request("GET", path, "", authorization, proof, "")
+		require.Equal(t, 200, response.Code, response.Body.String())
+		assert.NotContains(t, response.Body.String(), "X-Amz-")
+		assert.NotContains(t, response.Body.String(), "amazonaws.com")
+	}
+	require.NoError(t, f.db.Model(&profile).Update("backend", "local").Error)
+	admin := model.User{Username: "canvas-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1}
+	require.NoError(t, f.db.Create(&admin).Error)
+	adminIdentity := service.AuthIdentity{UserID: admin.Id, SessionID: "canvas-admin-parent", UserAuthVersion: 1, SessionVersion: 1}
+	require.NoError(t, f.db.Create(&model.UserSession{SID: adminIdentity.SessionID, UserID: admin.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "admin-refresh-hash", ExpiresAt: object.ExpiresAt}).Error)
+	adminJWT, _, err := service.IssueAccessToken(adminIdentity)
+	require.NoError(t, err)
+	adminView := "/api/admin/async-image-tasks/" + task.TaskId + "/results/0/view"
+	response = f.request("GET", adminView, "", "Bearer "+adminJWT, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, content, response.Body.Bytes())
+	assert.Equal(t, 404, f.request("GET", viewPath, "", "Bearer "+adminJWT, "", "").Code)
+	assert.Equal(t, 401, f.request("GET", viewPath, "", "", "", "").Code)
+	require.NoError(t, service.RevokeCanvasGrant(t.Context(), grant.GrantID))
+	assert.Equal(t, 401, f.request("GET", contentPath, "", f.proof, "", grant.GrantID).Code)
+	assert.Equal(t, 200, f.request("GET", viewPath, "", "Bearer "+jwt, "", "").Code, "Canvas revocation preserves the owner's dashboard access")
+	current := f.grant(t)
+	assert.Equal(t, 200, f.request("GET", queryPath, "", "Bearer "+current.APIKey, f.proof, "").Code)
+	assert.Equal(t, 200, f.request("GET", contentPath, "", f.proof, "", current.GrantID).Code)
+
+	ordinary := model.Token{UserId: f.user.Id, Key: "ordinary" + common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true, Group: "default"}
+	require.NoError(t, f.db.Create(&ordinary).Error)
+	ordinaryObject := object
+	ordinaryObject.Id, ordinaryObject.ObjectId, ordinaryObject.IdentityHash, ordinaryObject.ObjectKey = 0, "ordinary-result", "ordinary-result-identity", "ordinary.png"
+	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, ordinaryObject.ObjectKey), content, 0600))
+	require.NoError(t, f.db.Create(&ordinaryObject).Error)
+	ordinaryTask := task
+	ordinaryTask.Id, ordinaryTask.TaskId, ordinaryTask.TokenId = 0, "asyncimg_ordinary_content", ordinary.Id
+	require.NoError(t, f.db.Create(&ordinaryTask).Error)
+	require.NoError(t, f.db.Create(&model.AsyncImageResult{TaskId: ordinaryTask.TaskId, ImageIndex: 0, ObjectId: ordinaryObject.ObjectId}).Error)
+	response = f.request("GET", "/v1/images/tasks_async/"+ordinaryTask.TaskId, "", "Bearer "+ordinary.Key, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &manifest))
+	require.Len(t, manifest.Data, 1)
+	assert.Contains(t, manifest.Data[0].URL, "/api/image-objects/ordinary-result/content?")
+	response = f.request("GET", manifest.Data[0].URL, "", "", "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Equal(t, content, response.Body.Bytes())
+	assert.Equal(t, 307, f.request("GET", "/api/user/async-image-tasks/"+ordinaryTask.TaskId+"/results/0/view", "", "Bearer "+jwt, "", "").Code)
+	assert.Equal(t, 404, f.request("GET", "/v1/images/tasks_async/"+ordinaryTask.TaskId, "", "Bearer "+current.APIKey, f.proof, "").Code)
+	assert.Equal(t, 404, f.request("GET", queryPath, "", "Bearer "+ordinary.Key, "", "").Code)
+
+	listPath := "/api/user/async-image-tasks?start_date=2000-01-01&end_date=2100-01-01"
+	response = f.request("GET", listPath, "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	var listing struct {
+		Data struct {
+			Total int `json:"total"`
+			Items []struct {
+				TaskID string `json:"task_id"`
+			} `json:"items"`
+			Stats struct {
+				Total int `json:"total"`
+			} `json:"stats"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &listing))
+	assert.Equal(t, 2, listing.Data.Total)
+	assert.Equal(t, 2, listing.Data.Stats.Total)
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("canvas_subject", "ics_"+common.GetUUID()).Error)
+	replacement := f.grant(t)
+	assert.Equal(t, 404, f.request("GET", queryPath, "", "Bearer "+replacement.APIKey, f.proof, "").Code)
+	assert.Equal(t, 404, f.request("GET", contentPath, "", f.proof, "", replacement.GrantID).Code)
+	assert.Equal(t, 404, f.request("GET", viewPath, "", "Bearer "+jwt, "", "").Code)
+	assert.Equal(t, 404, f.request("GET", adminView, "", "Bearer "+adminJWT, "", "").Code)
+	for _, subject := range []any{replacement.User.Subject, nil} {
+		require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("canvas_subject", subject).Error)
+		response = f.request("GET", listPath, "", "Bearer "+jwt, "", "")
+		require.Equal(t, 200, response.Code, response.Body.String())
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &listing))
+		assert.Equal(t, 1, listing.Data.Total)
+		assert.Equal(t, 1, listing.Data.Stats.Total)
+		require.Len(t, listing.Data.Items, 1)
+		assert.Equal(t, ordinaryTask.TaskId, listing.Data.Items[0].TaskID)
+	}
 }
 
 func TestCanvasInternalCredentialsDoNotConsumeManualKeySlots(t *testing.T) {
@@ -663,6 +971,305 @@ func TestCanvasHardDeleteRetainsOnlyManagedTokenAnchors(t *testing.T) {
 	assert.Equal(t, grant.User.Subject, subject)
 }
 
+func TestCanvasAsyncVideoWorkerLifecycle(t *testing.T) {
+	f := newCanvasFixture(t)
+	f.router.GET("/api/task/:task_id/artifacts", middleware.UserAuth(), GetDashboardTaskArtifacts)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		f.router.Handle(method, "/v1/videos/:task_id/content", middleware.TokenAuth(), VideoProxy)
+		f.router.Handle(method, "/v1/tasks/:key/artifacts/:artifact_key/content", middleware.TokenAuth(), TaskArtifactContent)
+	}
+	previousSubmit, previousPersist := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc
+	previousBatch, previousLogs, previousMemory := common.BatchUpdateEnabled, common.LogConsumeEnabled, common.MemoryCacheEnabled
+	common.BatchUpdateEnabled, common.LogConsumeEnabled, common.MemoryCacheEnabled = false, false, false
+	t.Cleanup(func() {
+		service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = previousSubmit, previousPersist
+		common.BatchUpdateEnabled, common.LogConsumeEnabled, common.MemoryCacheEnabled = previousBatch, previousLogs, previousMemory
+	})
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+	require.NoError(t, f.db.AutoMigrate(&model.Task{}, &model.Channel{}, &model.Ability{}, &model.TokenImagePlatformMapping{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.Log{}))
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("setting", `{"billing_preference":"wallet_only"}`).Error)
+	grant := f.grant(t)
+	var record model.CanvasGrant
+	require.NoError(t, f.db.First(&record, "id = ?", grant.GrantID).Error)
+	lastActive := fmt.Sprint(time.Now().Add(-time.Minute).Unix())
+	f.redis.HSet("canvas:grant:"+grant.GrantID, "last_active", lastActive)
+	internal := gin.New()
+	for _, path := range []string{"/v1/videos", "/v1/videos/edits", "/v1/videos/extensions"} {
+		internal.POST(path, middleware.CanvasAsyncMediaWorkerAuth(record.TokenID, f.user.Id), func(c *gin.Context) {
+			assert.Equal(t, f.user.Id, c.GetInt("id"))
+			assert.Equal(t, record.TokenID, c.GetInt("token_id"))
+			assert.Equal(t, grant.User.Subject, c.GetString("canvas_subject"))
+			assert.Equal(t, "default", common.GetContextKeyString(c, constant.ContextKeyUsingGroup))
+			state, exists := c.Get(service.CanvasGrantContextKey)
+			require.True(t, exists)
+			assert.Equal(t, grant.GrantID, state.(*service.CanvasGrantState).ID)
+			assert.Empty(t, c.GetHeader(service.CanvasClientProofHeader))
+			c.Status(http.StatusNoContent)
+		})
+		response := httptest.NewRecorder()
+		internal.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		require.Equal(t, http.StatusNoContent, response.Code, response.Body.String())
+	}
+	assert.Equal(t, lastActive, f.redis.HGet("canvas:grant:"+grant.GrantID, "last_active"), "background work must not prolong user activity")
+	_, _, _, err := service.ValidateCanvasWorkerCredential(t.Context(), record.TokenID, f.user.Id+1)
+	require.ErrorIs(t, err, service.ErrCanvasAuthorization)
+	var token model.Token
+	require.NoError(t, f.db.First(&token, record.TokenID).Error)
+	require.Error(t, validateMediaToken(t.Context(), token, "192.0.2.1"), "the anonymous media guard must still reject managed credentials")
+	assert.Equal(t, http.StatusUnauthorized, f.request("GET", "/v1/models", "", "Bearer "+grant.APIKey, "", "").Code)
+
+	const source = `
+export const meta = {apiVersion:1,key:"canvas-worker-video",name:"Canvas worker video",version:"1.0.0",author:{name:"Test"},models:["canvas-worker-video"],fetchMode:"per_task",protocols:["openai_video"]};
+export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit",method:"POST",headers:{Authorization:"Bearer "+ctx.apiKey},body:ctx.requestBody}; }
+export function parseSubmitResponse(ctx,response) { return {taskId:response.body.id}; }
+export function buildQueryRequest(ctx) { return {url:ctx.baseUrl+"/query"}; }
+export function parseTaskResult() { return {status:"IN_PROGRESS"}; }
+export function listArtifacts() { return []; }
+export function buildContentRequest() { throw new Error("artifact_not_found"); }
+export const protocols = {openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};`
+	plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(plugin.Meta.Key)) })
+	box := func(kind string, payload []byte) []byte {
+		result := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(result, uint32(len(result)))
+		copy(result[4:8], kind)
+		copy(result[8:], payload)
+		return result
+	}
+	videoHandler := make([]byte, 25)
+	copy(videoHandler[8:12], "vide")
+	video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
+	video = append(video, box("moov", box("trak", box("mdia", box("hdlr", videoHandler))))...)
+	video = append(video, box("mdat", []byte("generated-canvas-video"))...)
+	var submissions atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/generated.mp4" {
+			assert.Empty(t, r.Header.Get("Authorization"))
+			assert.Empty(t, r.Header.Get(service.CanvasClientProofHeader))
+			assert.Empty(t, r.Header.Get(service.CanvasGrantHeader))
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Set-Cookie", "private-upstream-cookie")
+			http.ServeContent(w, r, "generated.mp4", time.Time{}, bytes.NewReader(video))
+			return
+		}
+		submissions.Add(1)
+		assert.Equal(t, "/submit", r.URL.Path)
+		assert.Equal(t, "Bearer canvas-upstream-secret", r.Header.Get("Authorization"))
+		assert.Empty(t, r.Header.Get(service.CanvasClientProofHeader))
+		assert.Empty(t, r.Header.Get(service.CanvasGrantHeader))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"upstream-canvas-video"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	service.InitHttpClient()
+	channelSetting := `{"task_plugin_key":"canvas-worker-video"}`
+	channel := model.Channel{Name: "canvas-worker-video", Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "canvas-upstream-secret", BaseURL: &upstream.URL, Setting: &channelSetting, Models: "canvas-worker-video", Group: "default"}
+	require.NoError(t, f.db.Create(&channel).Error)
+	require.NoError(t, f.db.Create(&model.Ability{ChannelId: channel.Id, Model: "canvas-worker-video", Group: "default", Enabled: true}).Error)
+	request := service.AsyncVideoRequest{Body: []byte(`{"model":"canvas-worker-video","prompt":"draw a landscape"}`), ContentType: "application/json", ClientIP: "192.0.2.1", Channel: channel, PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key, Version: plugin.Meta.Version}}, Billing: service.MediaBillingSnapshot{Price: gatewaytypes.PriceData{Quota: 100, QuotaToPreConsume: 100, UsePrice: true, GroupRatioInfo: gatewaytypes.GroupRatioInfo{GroupRatio: 1}}}}
+	encoded, err := common.Marshal(request)
+	require.NoError(t, err)
+	job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: f.user.Id, TokenId: record.TokenID, ChannelId: channel.Id, Provider: plugin.Meta.Key, Model: "canvas-worker-video", Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: "canvas-worker-lease", LeaseExpiresAt: time.Now().Unix() + 120, ExpiresAt: time.Now().Unix() + 3600}
+	job.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	require.NoError(t, err)
+	channelBytes, err := common.Marshal(channel)
+	require.NoError(t, err)
+	job.ChannelCipher, err = service.EncryptImagePayload(channelBytes, "media-channel:"+job.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, f.db.Create(&job).Error)
+	service.SubmitAsyncVideoFunc = ExecuteAsyncVideo
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, f.db.First(&job, job.ID).Error)
+	assert.Equal(t, "submitted", job.Status)
+	assert.Positive(t, job.DispatchedAt)
+	var accepted model.Task
+	require.NoError(t, f.db.Where("task_id = ?", job.TaskId).Take(&accepted).Error)
+	assert.Equal(t, record.TokenID, accepted.PrivateData.TokenId)
+	assert.Equal(t, 100, accepted.Quota)
+	var owner model.User
+	require.NoError(t, f.db.First(&owner, f.user.Id).Error)
+	assert.Equal(t, 999900, owner.Quota)
+	assert.EqualValues(t, 1, submissions.Load())
+	assert.Equal(t, lastActive, f.redis.HGet("canvas:grant:"+grant.GrantID, "last_active"))
+	require.NoError(t, service.RevokeCanvasGrant(t.Context(), grant.GrantID))
+	// Accepted work keeps its settlement/storage path after revocation.
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, f.db.Model(&accepted).Update("status", model.TaskStatusSuccess).Error)
+	service.PersistAsyncVideoFunc = func(ctx context.Context, _ model.AsyncMediaJob, task *model.Task) error {
+		_, err := service.GetTaskArtifactStore().Persist(ctx, task, gatewaytypes.TaskArtifact{Key: "video", Type: "video", MimeType: "video/mp4"}, bytes.NewReader(video))
+		return err
+	}
+	require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+	require.NoError(t, f.db.First(&job, job.ID).Error)
+	assert.Equal(t, "succeeded", job.Status)
+	assert.Equal(t, "settled", job.BillingStatus)
+	for _, dispatched := range []bool{false, true} {
+		queued := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: f.user.Id, TokenId: record.TokenID, ChannelId: channel.Id, Provider: plugin.Meta.Key, Model: job.Model, Group: "default", Status: "queued", BillingStatus: "pending", LeaseToken: "next-canvas-lease", ExpiresAt: time.Now().Unix() + 3600}
+		queued.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+queued.TaskId)
+		require.NoError(t, err)
+		if dispatched {
+			queued.DispatchedAt, queued.BillingStatus = time.Now().Unix(), "reserved"
+		}
+		require.NoError(t, f.db.Create(&queued).Error)
+		processErr := service.ProcessAsyncMediaJob(t.Context(), queued, cfg)
+		require.NoError(t, f.db.First(&queued, queued.ID).Error)
+		if dispatched {
+			require.NoError(t, processErr)
+			assert.Equal(t, "execution_unknown", queued.Status)
+			assert.Equal(t, "unknown", queued.BillingStatus)
+		} else {
+			require.Error(t, processErr)
+			assert.Equal(t, "failed", queued.Status)
+			assert.Zero(t, queued.DispatchedAt)
+		}
+	}
+	assert.EqualValues(t, 1, submissions.Load(), "revoked queued and uncertain jobs must never submit again")
+	require.NoError(t, f.db.First(&owner, f.user.Id).Error)
+	assert.Equal(t, 999900, owner.Quota, "revocation/uncertainty cannot duplicate a charge or refund accepted work")
+	current := f.grant(t)
+	jwt, _, err := service.IssueAccessToken(f.identity)
+	require.NoError(t, err)
+	admin := model.User{Username: "canvas-video-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1}
+	require.NoError(t, f.db.Create(&admin).Error)
+	adminIdentity := service.AuthIdentity{UserID: admin.Id, SessionID: "canvas-video-admin-parent", UserAuthVersion: 1, SessionVersion: 1}
+	require.NoError(t, f.db.Create(&model.UserSession{SID: adminIdentity.SessionID, UserID: admin.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "admin-refresh-hash", ExpiresAt: job.ExpiresAt}).Error)
+	adminJWT, _, err := service.IssueAccessToken(adminIdentity)
+	require.NoError(t, err)
+	ordinary := model.Token{UserId: f.user.Id, Key: "ordinaryvideo" + common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, f.db.Create(&ordinary).Error)
+	contentPath := service.CanvasContentPath("media", job.TaskId, "video")
+	userView := mediaTaskResultPath(job.TaskId, "video", false)
+	adminView := mediaTaskResultPath(job.TaskId, "video", true)
+	legacyVideo := "/v1/videos/" + job.TaskId + "/content"
+	legacyArtifact := "/v1/tasks/" + job.TaskId + "/artifacts/video/content"
+	legacyManifest := "/api/task/" + job.TaskId + "/artifacts"
+	assert.Equal(t, 401, f.request("GET", contentPath, "", f.proof, "", grant.GrantID).Code)
+	assert.Equal(t, 401, f.request("GET", userView, "", "", "", "").Code)
+	assert.Equal(t, 404, f.request("GET", userView, "", "Bearer "+adminJWT, "", "").Code)
+	var object model.MediaArtifactObject
+	require.NoError(t, f.db.Where("task_id = ?", job.TaskId).Take(&object).Error)
+	signed, err := service.MediaObjectURL(object, "", 3600)
+	require.NoError(t, err)
+	assert.Equal(t, 404, f.request("GET", signed, "", "", "", "").Code)
+	// Keep the URL public while pinning all test transfer connections to the
+	// local stub. The normal proxy still performs URL and header checks.
+	proxyClient := service.GetSSRFProtectedHTTPClient()
+	previousTransport := proxyClient.Transport
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", upstream.Listener.Addr().String())
+	}}
+	proxyClient.Transport = transport
+	t.Cleanup(func() { proxyClient.Transport = previousTransport; transport.CloseIdleConnections() })
+	for _, source := range []string{"local", "upstream"} {
+		t.Run(source+" generated result access", func(t *testing.T) {
+			if source == "upstream" {
+				accepted.PrivateData.UpstreamAsync = &relaydto.UpstreamAsyncProfile{}
+				accepted.PrivateData.ResultURL = "http://8.8.8.8/generated.mp4?signature=canvas-private-video"
+				require.NoError(t, f.db.Model(&accepted).Update("private_data", accepted.PrivateData).Error)
+				require.NoError(t, f.db.Model(&job).Update("storage_status", "upstream").Error)
+			}
+			for _, endpoint := range []struct{ path, auth, proof, grant string }{
+				{"/v1/media/tasks_async/" + job.TaskId, "Bearer " + current.APIKey, f.proof, ""},
+				{"/api/integrations/canvas/history/media/" + job.TaskId, f.proof, "", current.GrantID},
+				{"/api/user/media-tasks/" + job.TaskId, "Bearer " + jwt, "", ""},
+				{"/api/admin/media-tasks/" + job.TaskId, "Bearer " + adminJWT, "", ""},
+				{legacyManifest, "Bearer " + jwt, "", ""},
+				{legacyManifest, "Bearer " + adminJWT, "", ""},
+			} {
+				response := f.request("GET", endpoint.path, "", endpoint.auth, endpoint.proof, endpoint.grant)
+				require.Equal(t, 200, response.Code, response.Body.String())
+				if strings.Contains(endpoint.path, "/api/user/") || strings.Contains(endpoint.path, "/api/admin/") || endpoint.path == legacyManifest {
+					assert.Contains(t, response.Body.String(), "/results/video/view")
+					assert.Contains(t, response.Body.String(), `"authenticated":true`)
+				} else {
+					assert.Contains(t, response.Body.String(), "/content/video")
+				}
+				assert.NotContains(t, response.Body.String(), "access=")
+				assert.NotContains(t, response.Body.String(), "canvas-private-video")
+				assert.NotContains(t, response.Body.String(), "/v1/media/objects/")
+			}
+			for _, endpoint := range []struct{ path, auth, grant, proof string }{
+				{contentPath, f.proof, current.GrantID, ""}, {userView, "Bearer " + jwt, "", ""}, {adminView, "Bearer " + adminJWT, "", ""},
+				{legacyVideo, "Bearer " + current.APIKey, "", f.proof},
+				{legacyArtifact, "Bearer " + ordinary.Key, "", ""},
+			} {
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					request := httptest.NewRequest(method, endpoint.path, nil)
+					request.Header.Set("Authorization", endpoint.auth)
+					request.Header.Set(service.CanvasGrantHeader, endpoint.grant)
+					if endpoint.proof != "" {
+						request.Header.Set(service.CanvasClientProofHeader, endpoint.proof)
+					}
+					request.Header.Set("Range", "bytes=0-3")
+					response := httptest.NewRecorder()
+					f.router.ServeHTTP(response, request)
+					require.Equal(t, http.StatusPartialContent, response.Code, response.Body.String())
+					assert.Equal(t, "bytes 0-3/"+strconv.Itoa(len(video)), response.Header().Get("Content-Range"))
+					assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+					assert.Equal(t, "video/mp4", response.Header().Get("Content-Type"))
+					assert.Empty(t, response.Header().Get("Set-Cookie"))
+					assert.Empty(t, response.Header().Get("Location"))
+					if method == http.MethodGet {
+						assert.Equal(t, video[:4], response.Body.Bytes())
+					} else {
+						assert.Empty(t, response.Body.Bytes())
+					}
+				}
+			}
+			if source == "local" {
+				require.NoError(t, f.db.Delete(&accepted).Error)
+				for _, endpoint := range []struct{ path, auth, grant string }{
+					{contentPath, f.proof, current.GrantID}, {userView, "Bearer " + jwt, ""},
+				} {
+					response := f.request("GET", endpoint.path, "", endpoint.auth, "", endpoint.grant)
+					require.Equal(t, 200, response.Code, response.Body.String())
+					assert.Equal(t, video, response.Body.Bytes(), "local artifacts outlive the separately retained task row")
+				}
+				require.NoError(t, f.db.Create(&accepted).Error)
+			}
+		})
+	}
+	require.NoError(t, service.RevokeCanvasGrant(t.Context(), current.GrantID))
+	assert.Equal(t, 401, f.request("GET", contentPath, "", f.proof, "", current.GrantID).Code)
+	assert.Equal(t, 401, f.request("GET", legacyVideo, "", "Bearer "+current.APIKey, f.proof, "").Code)
+	assert.Equal(t, 200, f.request("GET", legacyManifest, "", "Bearer "+jwt, "", "").Code)
+	assert.Equal(t, 200, f.request("GET", userView, "", "Bearer "+jwt, "", "").Code, "grant revocation preserves dashboard access")
+	replacement := f.grant(t)
+	assert.Equal(t, 200, f.request("GET", contentPath, "", f.proof, "", replacement.GrantID).Code)
+	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("canvas_subject", "ics_"+common.GetUUID()).Error)
+	assert.Equal(t, 404, f.request("GET", userView, "", "Bearer "+jwt, "", "").Code)
+	assert.Equal(t, 404, f.request("GET", adminView, "", "Bearer "+adminJWT, "", "").Code)
+	assert.Equal(t, 404, f.request("GET", legacyArtifact, "", "Bearer "+ordinary.Key, "", "").Code)
+	assert.Equal(t, 404, f.request("GET", legacyManifest, "", "Bearer "+adminJWT, "", "").Code)
+	response := f.request("GET", "/api/user/media-tasks?media_type=video", "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.NotContains(t, response.Body.String(), job.TaskId)
+	ordinaryJob := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: f.user.Id, TokenId: ordinary.Id, Status: "succeeded", StorageStatus: "upstream", BillingStatus: "settled", ExpiresAt: job.ExpiresAt}
+	require.NoError(t, f.db.Create(&ordinaryJob).Error)
+	ordinaryTask := accepted
+	ordinaryTask.ID, ordinaryTask.TaskID, ordinaryTask.PrivateData.TokenId = 0, ordinaryJob.TaskId, ordinary.Id
+	require.NoError(t, f.db.Create(&ordinaryTask).Error)
+	ordinaryContent := "/v1/videos/" + ordinaryTask.TaskID + "/content"
+	response = f.request("GET", ordinaryContent, "", "Bearer "+ordinary.Key, "", "")
+	require.Equal(t, http.StatusTemporaryRedirect, response.Code, response.Body.String())
+	assert.Equal(t, ordinaryTask.PrivateData.ResultURL, response.Header().Get("Location"), "ordinary tasks retain the existing upstream redirect")
+	response = f.request("GET", "/api/task/"+ordinaryTask.TaskID+"/artifacts", "", "Bearer "+jwt, "", "")
+	require.Equal(t, 200, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), ordinaryTask.PrivateData.ResultURL)
+	assert.NotContains(t, response.Body.String(), `"authenticated":true`)
+	ordinaryView := mediaTaskResultPath(ordinaryJob.TaskId, "video", false)
+	assert.Equal(t, 404, f.request("GET", ordinaryView, "", "Bearer "+jwt, "", "").Code)
+	ordinary.Status = common.TokenStatusDisabled
+	require.NoError(t, ordinary.Update())
+	assert.Equal(t, 401, f.request("GET", ordinaryContent, "", "Bearer "+ordinary.Key, "", "").Code, "the public route retains token revocation enforcement")
+	assert.Equal(t, 404, f.request("GET", ordinaryView, "", "Bearer "+jwt, "", "").Code, "the managed content route cannot bypass ordinary token revocation")
+}
+
 func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 	f := newCanvasFixture(t)
 	previousBatch, previousLogs, previousCount, previousQuota, previousMemory := common.BatchUpdateEnabled, common.LogConsumeEnabled, constant.CountToken, common.QuotaPerUnit, common.MemoryCacheEnabled
@@ -775,6 +1382,77 @@ func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 
 // External DSNs must name disposable databases. Prefixing this matrix leaves
 // unrelated tables intact and lets repeated runs prove migration idempotency.
+func TestCanvasManagementAccountIncarnationBoundaries(t *testing.T) {
+	f := newCanvasFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.Task{}, &model.AsyncImageBill{}, &model.ImageOutbox{}))
+	grant := f.grant(t)
+	var record model.CanvasGrant
+	require.NoError(t, f.db.First(&record, "id = ?", grant.GrantID).Error)
+	jwt, _, err := service.IssueAccessToken(f.identity)
+	require.NoError(t, err)
+	for _, action := range []string{"resume", "terminate"} {
+		f.router.POST("/api/user/media-tasks/:task_id/"+action, middleware.UserAuth(), func(c *gin.Context) {
+			ManageMediaTask(c, false, action)
+		})
+	}
+	ordinary := model.Token{UserId: f.user.Id, Key: "ordinary-management-" + common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, f.db.Create(&ordinary).Error)
+	for _, scenario := range []struct {
+		name    string
+		tokenID int
+		want    int
+	}{
+		{"same subject", record.TokenID, http.StatusOK},
+		{"revoked grant preserves dashboard ownership", record.TokenID, http.StatusOK},
+		{"reused account denies old tasks", record.TokenID, http.StatusNotFound},
+		{"ordinary tasks preserve numeric ownership", ordinary.Id, http.StatusOK},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			if scenario.name == "revoked grant preserves dashboard ownership" {
+				require.NoError(t, service.RevokeCanvasGrant(t.Context(), grant.GrantID))
+			}
+			if scenario.name == "reused account denies old tasks" {
+				require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("canvas_subject", "ics_"+common.GetUUID()).Error)
+			}
+			for _, action := range []string{"resume", "terminate"} {
+				status, storage := "queued", "pending"
+				if action == "resume" {
+					status, storage = "succeeded", "upstream"
+				}
+				job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: f.user.Id, TokenId: scenario.tokenID, Status: status, StorageStatus: storage, BillingStatus: "pending", ExpiresAt: time.Now().Unix() + 3600}
+				require.NoError(t, f.db.Create(&job).Error)
+				if action == "resume" {
+					require.NoError(t, f.db.Create(&model.Task{TaskID: job.TaskId, UserId: job.UserId, Status: model.TaskStatusSuccess}).Error)
+				}
+				response := f.request("POST", "/api/user/media-tasks/"+job.TaskId+"/"+action, "{}", "Bearer "+jwt, "", "")
+				require.Equal(t, scenario.want, response.Code, response.Body.String())
+				var stored model.AsyncMediaJob
+				require.NoError(t, f.db.First(&stored, job.ID).Error)
+				if scenario.want == http.StatusNotFound {
+					assert.Equal(t, job, stored, "denied operations must preserve billing and execution state")
+				} else if action == "resume" {
+					assert.Equal(t, "submitted", stored.Status)
+				} else {
+					assert.Equal(t, "failed", stored.Status)
+					assert.Equal(t, "not_billable", stored.BillingStatus)
+				}
+			}
+			image := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: f.user.Id, TokenId: scenario.tokenID, Status: model.ImageTaskStorageFailed, ImageCount: 1}
+			require.NoError(t, f.db.Create(&image).Error)
+			require.NoError(t, f.db.Create(&model.AsyncImageBill{TaskId: image.TaskId, BillingRequestId: common.GetUUID(), UserId: image.UserId, TokenId: image.TokenId}).Error)
+			response := f.request("POST", "/api/user/media-tasks/"+image.TaskId+"/resume", "{}", "Bearer "+jwt, "", "")
+			require.Equal(t, scenario.want, response.Code, response.Body.String())
+			var stored model.AsyncImageTask
+			require.NoError(t, f.db.Where("task_id = ?", image.TaskId).Take(&stored).Error)
+			if scenario.want == http.StatusNotFound {
+				assert.Equal(t, image, stored)
+			} else {
+				assert.Equal(t, model.ImageTaskUpstreamSucceeded, stored.Status)
+			}
+		})
+	}
+}
+
 func TestCanvasDatabaseCompatibility(t *testing.T) {
 	engines := []struct {
 		name, dsn string

@@ -281,6 +281,7 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 	referenceCount := request.ReferenceImageCount()
 	bestSupportsReferenceCount := false
 	found := false
+	resolution := AsyncImageRoutingResolution(request)
 	for _, provider := range providers {
 		for _, family := range []string{"openai", "gemini"} {
 			candidate := request
@@ -298,7 +299,7 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 			if !slices.ContainsFunc(catalog, func(capability ImageModelCapability) bool { return capability.MatchesMedia(request.Model, "image") }) {
 				continue
 			}
-			channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
+			channels, err := ImageCandidateChannels(ctx, policy, request.Model, resolution)
 			if err != nil {
 				return policy, nil, err
 			}

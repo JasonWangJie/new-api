@@ -998,6 +998,116 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.NotContains(t, recorder.Body.String(), "secret")
 }
 
+func TestTaskPluginCanvasTaskIsolation(t *testing.T) {
+	setupOriginTaskDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.CanvasGrant{}, &model.Token{}, &model.User{}))
+	subject := "canvas-current-account"
+	require.NoError(t, model.DB.Create(&model.User{Id: 7, Username: "canvas-owner", AffCode: "canvas-test", CanvasSubject: &subject}).Error)
+	channel := insertOriginTaskChannel(t, common.ChannelStatusEnabled)
+	for _, fixture := range []struct {
+		taskID, clientID, subject, key string
+		tokenID                        int
+	}{
+		{taskID: "ordinary-task", key: "ordinary-key", tokenID: 101},
+		{taskID: "managed-task", clientID: "canvas-app", subject: subject, key: "ic_managed", tokenID: 102},
+		{taskID: "other-client-task", clientID: "other-app", subject: subject, key: "ic_other_client", tokenID: 103},
+		{taskID: "old-account-task", clientID: "canvas-app", subject: "canvas-deleted-account", key: "ic_old_account", tokenID: 104},
+	} {
+		require.NoError(t, model.DB.Create(&model.Token{Id: fixture.tokenID, UserId: 7, Key: fixture.key}).Error)
+		if fixture.clientID != "" {
+			require.NoError(t, model.DB.Create(&model.CanvasGrant{ID: fixture.taskID + "-grant", TokenID: fixture.tokenID, UserID: 7, ClientID: fixture.clientID, Subject: fixture.subject}).Error)
+		}
+		task := insertOriginOwnedTask(t, fixture.taskID, 7, channel.Id, "canvas-isolation")
+		task.PrivateData.TokenId = fixture.tokenID
+		require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	}
+	plugin := compileTaskRoutePlugin(t, `
+export const meta = {
+  apiVersion: 1, key: "canvas-isolation", name: "Canvas isolation", version: "1.0.0",
+  author: {name: "Test"}, models: ["canvas-model"], fetchMode: "per_task",
+  routes: [
+    {method: "POST", path: "/vendor/jobs", type: "submit", decode: "submit", render: "created"},
+    {method: "POST", path: "/vendor/query", type: "dynamic", decode: "query", render: "show"},
+  ],
+};
+export const native = {
+  submit: function(ctx) {return {kind: "submit", model: "canvas-model", originTaskIds: ctx.body.value.ids};},
+  created: function(ctx, task) {return task;},
+  query: function(ctx) {return {kind: "query", taskIds: ctx.body.value.ids};},
+  show: function(ctx, tasks) {return {ids: tasks.map(function(task) {return task.task_id;})};},
+};
+export function buildSubmitRequest() {return {url: "https://example.com"};}
+export function parseSubmitResponse() {return {taskId: "one"};}
+export function buildQueryRequest() {return {url: "https://example.com"};}
+export function parseTaskResult() {return {status: "SUCCESS"};}
+`)
+	for _, testCase := range []struct {
+		name    string
+		managed bool
+		ids     []string
+		allowed bool
+	}{
+		{name: "new grant can reuse historical task from the same client and account", managed: true, ids: []string{"managed-task"}, allowed: true},
+		{name: "canvas cannot access personal token task", managed: true, ids: []string{"ordinary-task"}},
+		{name: "canvas cannot access another application task", managed: true, ids: []string{"other-client-task"}},
+		{name: "canvas cannot access a deleted account task after user id reuse", managed: true, ids: []string{"old-account-task"}},
+		{name: "mixed authorized and personal tasks reject the entire request", managed: true, ids: []string{"managed-task", "ordinary-task"}},
+		{name: "ordinary credentials retain personal task access", ids: []string{"ordinary-task"}, allowed: true},
+		{name: "account owner retains managed task access", ids: []string{"managed-task"}, allowed: true},
+		{name: "ordinary credentials cannot access the previous account subject", ids: []string{"old-account-task"}},
+	} {
+		for _, operation := range []struct {
+			name, path   string
+			routeIndex   int
+			rejectStatus int
+		}{
+			{name: "origin references", path: "/vendor/jobs", routeIndex: 0, rejectStatus: http.StatusBadRequest},
+			{name: "batch query", path: "/vendor/query", routeIndex: 1, rejectStatus: http.StatusNotFound},
+		} {
+			t.Run(testCase.name+"/"+operation.name, func(t *testing.T) {
+				router := gin.New()
+				reachedSubmit := false
+				router.POST(operation.path, pinTaskPluginRoute(plugin, operation.routeIndex), func(c *gin.Context) {
+					common.SetContextKey(c, constant.ContextKeyUserId, 7)
+					if testCase.managed {
+						c.Set(service.CanvasGrantContextKey, &service.CanvasGrantState{ID: "new-grant", Identity: service.AuthIdentity{UserID: 7}, ClientID: "canvas-app", Subject: subject})
+					}
+					c.Next()
+					if !testCase.allowed {
+						_, pinned := resolvedOriginPin(c)
+						assert.False(t, pinned)
+						_, hasOrigins := c.Get(string(constant.ContextKeyOriginTasks))
+						assert.False(t, hasOrigins)
+					}
+				}, PrepareTaskPluginRoute(), func(c *gin.Context) {
+					reachedSubmit = true
+					c.Status(http.StatusNoContent)
+				})
+				body, err := common.Marshal(map[string]any{"ids": testCase.ids})
+				require.NoError(t, err)
+				request := httptest.NewRequest(http.MethodPost, operation.path, bytes.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, request)
+				if !testCase.allowed {
+					assert.Equal(t, operation.rejectStatus, recorder.Code)
+					assert.False(t, reachedSubmit)
+					assert.NotContains(t, recorder.Body.String(), `"ids"`)
+					return
+				}
+				if operation.routeIndex == 0 {
+					assert.Equal(t, http.StatusNoContent, recorder.Code)
+					assert.True(t, reachedSubmit)
+				} else {
+					assert.Equal(t, http.StatusOK, recorder.Code)
+					assert.False(t, reachedSubmit)
+					assert.JSONEq(t, `{"ids":["`+testCase.ids[0]+`"]}`, recorder.Body.String())
+				}
+			})
+		}
+	}
+}
+
 func TestPrepareTaskPluginDynamicDecoderRejectsRendererField(t *testing.T) {
 	plugin := compileTaskRoutePlugin(t, `
 export const meta = {apiVersion:1,key:"dynamic-renderer",name:"Dynamic",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task",routes:[{method:"POST",path:"/vendor/query",type:"dynamic",decode:"decode",render:"show"}]};

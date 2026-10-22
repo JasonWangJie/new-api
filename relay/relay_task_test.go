@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -159,6 +160,54 @@ func TestTaskModel2DtoNormalizesLegacyAction(t *testing.T) {
 
 	assert.Equal(t, constant.TaskActionFirstTailToVideo, dtoTask.Action)
 	assert.Equal(t, "firstTailGenerate", task.Action)
+}
+
+func TestCanvasVideoRetrieveHidesProviderExtensions(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Task{}, &model.User{}, &model.Token{}, &model.CanvasGrant{}))
+	subject := "canvas-video-account"
+	owner := model.User{Username: "canvas-video-owner", AffCode: "canvas-video", CanvasSubject: &subject}
+	require.NoError(t, database.Create(&owner).Error)
+	token := model.Token{UserId: owner.Id, Key: "ic_video_retrieve"}
+	require.NoError(t, database.Create(&token).Error)
+	require.NoError(t, database.Create(&model.CanvasGrant{ID: "historical-video-grant", TokenID: token.Id, UserID: owner.Id, ClientID: "infinite-canvas", Subject: subject}).Error)
+	channel := model.Channel{Name: "canvas-video-channel", Type: constant.ChannelTypeTaskPlugin, Key: "upstream-only-key"}
+	require.NoError(t, database.Create(&channel).Error)
+	task := model.Task{
+		TaskID: "task_canvas_video_public", UserId: owner.Id, ChannelId: channel.Id, Platform: "xai",
+		Status: model.TaskStatusSuccess, Progress: "100%", CreatedAt: 123, FinishTime: 456,
+		Properties:  model.Properties{OriginModelName: "grok-imagine-video"},
+		PrivateData: model.TaskPrivateData{TokenId: token.Id, UpstreamTaskID: "private-upstream-task"},
+		Data:        []byte(`{"status":"done","video":{"url":"https://cdn.example/generated.mp4?signature=provider-canary"},"provider_extension":"preserve-for-ordinary"}`),
+	}
+	require.NoError(t, database.Create(&task).Error)
+	require.NotNil(t, GetTaskAdaptor("xai"), "use the real embedded xAI renderer")
+	for _, managed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("canvas=%t", managed), func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID, nil)
+			c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+			c.Set("id", owner.Id)
+			if managed {
+				c.Set(service.CanvasGrantContextKey, &service.CanvasGrantState{ID: "new-grant", Identity: service.AuthIdentity{UserID: owner.Id}, ClientID: "infinite-canvas", Subject: subject})
+			}
+			body, taskErr := videoFetchByIDRespBodyBuilder(c)
+			require.Nil(t, taskErr)
+			var response map[string]any
+			require.NoError(t, common.Unmarshal(body, &response))
+			assert.Equal(t, task.TaskID, response["id"])
+			assert.Equal(t, "completed", response["status"])
+			if managed {
+				assert.JSONEq(t, `{"id":"task_canvas_video_public","object":"video","model":"grok-imagine-video","status":"completed","progress":100,"created_at":123,"completed_at":456}`, string(body))
+				assert.NotContains(t, string(body), "cdn.example")
+				assert.NotContains(t, string(body), "provider-canary")
+				assert.NotContains(t, string(body), "private-upstream-task")
+				return
+			}
+			assert.Equal(t, "preserve-for-ordinary", response["provider_extension"])
+			assert.Contains(t, string(body), "https://cdn.example/generated.mp4?signature=provider-canary")
+		})
+	}
 }
 
 const mappingOrderSubmitPlugin = `

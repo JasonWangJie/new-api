@@ -87,11 +87,16 @@ export interface ChannelSettings {
   image_max_reference_bytes?: number
   image_attempt_timeout_seconds?: number
   image_concurrency_limit?: number
+  tianyue_media_compatibility?: boolean
   image_reference_transport_mode?:
     | ''
     | 'passthrough'
     | 'local'
     | 'passthrough_fallback_local'
+  image_resolution_model_mapping?: Record<
+    string,
+    Partial<Record<'1K' | '2K' | '4K', string>>
+  >
   proxy?: string
   pass_through_body_enabled?: boolean
   responses_websocket_enabled?: boolean

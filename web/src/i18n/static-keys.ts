@@ -112,6 +112,8 @@ export const STATIC_I18N_KEYS = [
   'Blank inherits the global timeout. Maximum 86400 seconds; the task deadline still applies.',
   'Blank inherits the global concurrency limit. Maximum 10000 active image requests per channel.',
   'Image limit must be a positive whole number within the allowed range',
+  'Model names must be 1–255 UTF-8 bytes without control characters or wildcards',
+  'Configure at least one resolution or delete this mapping',
   'Manual backend',
   'Retry confirmation',
   'Confirm the received amount and quota preview before adding quota.',

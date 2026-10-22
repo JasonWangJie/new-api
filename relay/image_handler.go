@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -63,6 +64,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	adaptor.Init(info)
 	imageOperation := upstreamAsyncImageOperation(c)
 	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, imageOperation)
+	if !hasAsyncProfile && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+		asyncProfile = service.TianyueAsyncImageProfile(info.UpstreamModelName)
+		hasAsyncProfile = asyncProfile != nil
+		c.Set(contextKeyTianyueImageProfile, hasAsyncProfile)
+	}
 	if hasAsyncProfile && !c.GetBool("async_image_execution") {
 		return nil, types.NewErrorWithStatusCode(fmt.Errorf("channel model requires the asynchronous image endpoint"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -86,6 +92,12 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			jsonData, err = storage.Bytes()
 			if err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			if mapped := c.GetString(asyncImageResolutionModelContextKey); mapped != "" {
+				jsonData, err = sjson.SetBytes(jsonData, "model", mapped)
+				if err != nil {
+					return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+				}
 			}
 		}
 	} else {
@@ -125,11 +137,15 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			}
 
 			// apply param override
+			requiresModel := gjson.GetBytes(jsonData, "model").Exists()
 			if len(info.ParamOverride) > 0 {
 				jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 				if err != nil {
 					return nil, newAPIErrorFromParamOverride(err)
 				}
+			}
+			if err := validateAsyncImageResolutionModel(c, jsonData, requiresModel); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
 
 		}
@@ -201,6 +217,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 			}
 		}
+		if c.GetBool("async_image_execution") && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+			if err := service.ValidateTianyueImageSubmission(jsonData, imageCount); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
 		if reserve {
 			logger.LogDebug(c, "image request body: %s", jsonData)
 		}
@@ -233,6 +254,28 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeConvertRequestFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		if asyncProfile.Submit.Request.Body != nil {
+			if info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+				if submitRequest.GetBody == nil {
+					return nil, types.NewErrorWithStatusCode(fmt.Errorf("TianYue image submit body is unavailable"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				reader, readErr := submitRequest.GetBody()
+				if readErr != nil {
+					return nil, types.NewError(readErr, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+				}
+				encoded, readErr := io.ReadAll(io.LimitReader(reader, (64<<20)+1))
+				_ = reader.Close()
+				if readErr == nil && len(encoded) <= 64<<20 {
+					readErr = service.ValidateTianyueImageSubmission(encoded, imageCount)
+				} else if readErr == nil {
+					readErr = fmt.Errorf("TianYue image submit body exceeds the byte limit")
+				}
+				if readErr != nil {
+					return nil, types.NewErrorWithStatusCode(readErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+			}
+			if err := validateAsyncImageResolutionSubmitModel(c, submitRequest); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
 			if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, imageCount); err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
@@ -333,6 +376,44 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		_ = service.RecordImageCircuit(c.Request.Context(), "sync", info.ChannelId, true, circuit)
 	}
 	return &ImageExecutionResult{Request: request, Usage: imageUsage}, nil
+}
+
+// Resolution mappings are routing decisions, so later administrator overrides
+// cannot silently send a different model than the selected profile and audit.
+func validateAsyncImageResolutionModel(c *gin.Context, body []byte, required bool) error {
+	expected := c.GetString(asyncImageResolutionModelContextKey)
+	if expected == "" {
+		return nil
+	}
+	actual := gjson.GetBytes(body, "model")
+	if !actual.Exists() && !required {
+		return nil
+	}
+	if actual.Type != gjson.String || actual.String() != expected {
+		return fmt.Errorf("outbound image model conflicts with the asynchronous resolution model mapping")
+	}
+	return nil
+}
+
+// Custom protocols may use another field or the URL for their model. Validate
+// an explicit model without adding a field to an administrator's template.
+func validateAsyncImageResolutionSubmitModel(c *gin.Context, request *http.Request) error {
+	if c.GetString(asyncImageResolutionModelContextKey) == "" {
+		return nil
+	}
+	if request.GetBody == nil {
+		return fmt.Errorf("upstream async submit body is unavailable")
+	}
+	body, err := request.GetBody()
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	encoded, err := io.ReadAll(io.LimitReader(body, (64<<20)+1))
+	if err != nil || len(encoded) > 64<<20 {
+		return fmt.Errorf("upstream async submit body exceeds the byte limit")
+	}
+	return validateAsyncImageResolutionModel(c, encoded, false)
 }
 
 type ImageExecutionResult struct {

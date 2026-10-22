@@ -19,6 +19,7 @@ const (
 	contextKeyUpstreamAsyncImageURLs    = "upstream_async_image_urls"
 	contextKeyUpstreamAsyncOperation    = "upstream_async_operation"
 	contextKeyUpstreamAsyncSubmitSource = "upstream_async_submit_source"
+	contextKeyTianyueImageProfile       = "tianyue_builtin_image_profile"
 )
 
 func upstreamAsyncImageOperation(c *gin.Context) string {
@@ -38,6 +39,9 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 	defer service.CloseResponseBodyGracefully(response)
 	resumeTaskID := c.GetString("async_image_resume_task")
 	body, err := service.ReadUpstreamAsyncResponse(response, c.GetInt64("async_image_response_limit"))
+	if err == nil && c.GetBool(contextKeyTianyueImageProfile) {
+		body, err = service.NormalizeTianyueImageTask(body, info.ChannelBaseUrl)
+	}
 	if err != nil {
 		if resumeTaskID == "" {
 			// A successful submission response does not prove that generation

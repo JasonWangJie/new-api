@@ -124,32 +124,47 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 	for _, modelName := range configuredModels {
 		ids := slices.Clone(abilityChannels[modelName])
 		routingModel := ratio_setting.RoutingMatchModelName(modelName)
-		if MediaPlatformSupportsVideoModel(modelName, platform) {
+		videoModel := MediaPlatformSupportsVideoModel(modelName, platform)
+		if videoModel {
 			ids = append(ids, abilityChannels[routingModel]...)
 		} else if len(ids) == 0 {
 			ids = abilityChannels[routingModel]
 		}
 		modelChannels := make([]int, 0, len(ids))
+		hasImageChannel := false
 		seen := make(map[int]bool)
 		for _, channelId := range ids {
 			channel := channelsById[channelId]
-			if seen[channelId] || !MediaChannelSupportsPlatform(channel, modelName, platform) {
+			if seen[channelId] || channel == nil {
+				continue
+			}
+			imageSupported := ImageChannelSupportsPlatform(*channel, modelName, platform)
+			if (len(policies) == 0 || policies[0].AsyncEnabled) && len(channel.GetSetting().ImageResolutionModelMapping[modelName]) > 0 {
+				imageSupported = false
+				for _, resolution := range []string{"1K", "2K", "4K"} {
+					candidate, available, err := imageChannelForResolution(*channel, modelName, resolution)
+					if err != nil {
+						return options, err
+					}
+					if available && ImageChannelSupportsPlatform(candidate, modelName, platform) {
+						imageSupported = true
+						break
+					}
+				}
+			}
+			if !imageSupported && !mediaChannelSupportsVideoPlatform(channel, modelName, platform) {
 				continue
 			}
 			seen[channelId] = true
 			selectedChannels[channelId] = true
 			modelChannels = append(modelChannels, channelId)
+			hasImageChannel = hasImageChannel || imageSupported
 		}
 		if len(modelChannels) == 0 {
 			continue
 		}
-		if len(policies) == 0 && !slices.Contains(mediaTypes[modelName], "image") {
-			for _, channelId := range ids {
-				if channel := channelsById[channelId]; channel != nil && ImageChannelSupportsPlatform(*channel, modelName, platform) {
-					mediaTypes[modelName] = append(mediaTypes[modelName], "image")
-					break
-				}
-			}
+		if len(policies) == 0 && hasImageChannel && !slices.Contains(mediaTypes[modelName], "image") {
+			mediaTypes[modelName] = append(mediaTypes[modelName], "image")
 		}
 		slices.Sort(modelChannels)
 		label := labels[modelName]
@@ -178,6 +193,9 @@ func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution st
 }
 
 func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, modelName, resolution string) ([]model.Channel, error) {
+	if policy.AsyncEnabled {
+		resolution = strings.ToUpper(strings.TrimSpace(resolution))
+	}
 	var abilities []model.Ability
 	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": policy.Group, "enabled": true}).Find(&abilities).Error; err != nil {
 		return nil, err
@@ -209,6 +227,17 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 	}
 	eligible := make([]model.Channel, 0, len(channels))
 	for _, channel := range channels {
+		if policy.AsyncEnabled {
+			var available bool
+			var err error
+			channel, available, err = imageChannelForResolution(channel, modelName, resolution)
+			if err != nil {
+				return nil, err
+			}
+			if !available {
+				continue
+			}
+		}
 		capability := ImageChannelCapability(channel, modelName)
 		if !capability.Generate || !ImageChannelSupportsPlatform(channel, modelName, policy.Platform) {
 			continue
@@ -223,6 +252,28 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 		eligible = append(eligible, channel)
 	}
 	return eligible, nil
+}
+
+// imageChannelForResolution creates a request-local mapping that is also kept
+// in the frozen channel snapshot after the upstream accepts an image task.
+func imageChannelForResolution(channel model.Channel, modelName, resolution string) (model.Channel, bool, error) {
+	rules := channel.GetSetting().ImageResolutionModelMapping[modelName]
+	if len(rules) == 0 {
+		return channel, true, nil
+	}
+	target := rules[resolution]
+	if target == "" {
+		return channel, false, nil
+	}
+	// Targets are final upstream names, not another link in the ordinary
+	// mapping chain. Keep this override isolated from the stored channel.
+	mapping := map[string]string{modelName: target, target: target}
+	encoded, err := common.Marshal(mapping)
+	if err != nil {
+		return channel, false, err
+	}
+	channel.ModelMapping = common.GetPointer(string(encoded))
+	return channel, true, nil
 }
 
 // ApplyMediaChannelPoolWeight uses the legacy pool priority field as a relative
@@ -323,7 +374,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	if request.Provider == "" {
 		request.Provider = policy.AsyncProvider
 	}
-	channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
+	channels, err := ImageCandidateChannels(ctx, policy, request.Model, AsyncImageRoutingResolution(request))
 	if err != nil {
 		return nil, ImageAccount{}, err
 	}
@@ -754,10 +805,11 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	invalid := func(message string) (model.ImageGroupPolicy, model.ImageFundingSelection, error) {
 		return policy, model.ImageFundingSelection{}, &AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: message, HTTPStatus: 400}
 	}
-	if request.Resolution == "0.5K" && !capability.AllowHalfK {
+	resolution := AsyncImageRoutingResolution(request)
+	if resolution == "0.5K" && !capability.AllowHalfK {
 		return invalid("unsupported_image_dimensions: model does not support 0.5K")
 	}
-	if request.Resolution != "" && request.Resolution != "AUTO" && !slices.Contains(capability.Resolutions, request.Resolution) && !(request.Resolution == "0.5K" && capability.AllowHalfK) {
+	if resolution != "" && resolution != "AUTO" && !slices.Contains(capability.Resolutions, resolution) && !(resolution == "0.5K" && capability.AllowHalfK) {
 		return invalid("unsupported_image_dimensions: resolution is not supported by this model")
 	}
 	if capability.MaxOutputImages > 0 && request.Count > capability.MaxOutputImages {
@@ -778,7 +830,7 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	if references > capability.MaxReferenceImages {
 		return invalid("too_many_reference_images_for_model")
 	}
-	channels, err := ImageCandidateChannels(ctx, policy, request.Model, request.Resolution)
+	channels, err := ImageCandidateChannels(ctx, policy, request.Model, resolution)
 	if err != nil {
 		return policy, model.ImageFundingSelection{}, err
 	}

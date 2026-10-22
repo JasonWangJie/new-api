@@ -137,6 +137,7 @@ import {
   ADD_MODE_OPTIONS,
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_STATUS_LABELS,
+  CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
@@ -210,6 +211,7 @@ import {
 import { ParamOverrideEditorDialog } from '../dialogs/param-override-editor-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
 import { UpstreamAsyncEditorDialog } from '../dialogs/upstream-async-editor-dialog'
+import { ImageResolutionModelMapping } from '../image-resolution-model-mapping'
 import { ModelMappingEditor } from '../model-mapping-editor'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
@@ -280,6 +282,8 @@ const SENSITIVE_FORM_FIELDS = [
   'http2_connection_shards',
   'image_max_reference_images',
   'image_reference_transport_mode',
+  'tianyue_media_compatibility',
+  'image_resolution_model_mapping',
   'image_max_reference_bytes',
   'image_attempt_timeout_seconds',
   'image_concurrency_limit',
@@ -1926,6 +1930,36 @@ export function ChannelMutateDrawer({
           )}
         />
 
+        <ImageResolutionModelMapping
+          form={form}
+          models={currentModelsArray}
+          disabled={sensitiveLocked || isSubmitting}
+        />
+        {currentType === CHANNEL_TYPE_NEW_API && (
+          <FormField
+            control={form.control}
+            name='tianyue_media_compatibility'
+            render={({ field }) => (
+              <FormItem className='flex items-center justify-between gap-4 sm:col-span-2'>
+                <div className='space-y-0.5'>
+                  <FormLabel>{t('TianYue image compatibility')}</FormLabel>
+                  <FormDescription>
+                    {t(
+                      'Send reference images as HTTPS URLs through the TianYue image generation API. Async tasks keep downloading results to local storage.'
+                    )}
+                  </FormDescription>
+                </div>
+                <FormControl>
+                  <Switch
+                    checked={field.value === true}
+                    onCheckedChange={field.onChange}
+                    disabled={sensitiveLocked || isSubmitting}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+        )}
         <FormField
           control={form.control}
           name='image_max_reference_images'

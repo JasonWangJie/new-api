@@ -23,11 +23,12 @@ import (
 )
 
 type taskArtifactResponse struct {
-	Key        string `json:"key"`
-	Type       string `json:"type"`
-	MimeType   string `json:"mime_type,omitempty"`
-	ContentURL string `json:"content_url"`
-	Source     string `json:"source,omitempty"`
+	Key           string `json:"key"`
+	Type          string `json:"type"`
+	MimeType      string `json:"mime_type,omitempty"`
+	ContentURL    string `json:"content_url"`
+	Source        string `json:"source,omitempty"`
+	Authenticated bool   `json:"authenticated,omitempty"`
 }
 
 func upstreamVideoArtifactURL(task *model.Task, job model.AsyncMediaJob) string {
@@ -112,6 +113,15 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
+		managed, err := service.CanvasTaskOwnerManaged(c.Request.Context(), mediaJob.TokenId, mediaJob.UserId)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+				status = http.StatusNotFound
+			}
+			writeTaskArtifactError(c, status, "artifact_not_found", "Media is unavailable")
+			return
+		}
 		items := make([]taskArtifactResponse, 0)
 		if mediaJob.StorageStatus == "succeeded" {
 			cfg, err := service.GetMediaRuntimeConfig(c.Request.Context())
@@ -125,15 +135,29 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 				return
 			}
 			for _, object := range objects {
-				link, err := service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
-				if err != nil {
-					writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
-					return
+				var link string
+				if managed {
+					link = service.CanvasContentPath("media", task.TaskID, object.ArtifactKey)
+					if dashboard {
+						link = mediaTaskResultPath(task.TaskID, object.ArtifactKey, c.GetInt("role") >= common.RoleAdminUser)
+					}
+				} else {
+					link, err = service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+					if err != nil {
+						writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
+						return
+					}
 				}
-				items = append(items, taskArtifactResponse{Key: object.ArtifactKey, Type: "video", MimeType: object.MimeType, ContentURL: link})
+				items = append(items, taskArtifactResponse{Key: object.ArtifactKey, Type: "video", MimeType: object.MimeType, ContentURL: link, Authenticated: managed && dashboard})
 			}
 		} else if link := upstreamVideoArtifactURL(task, mediaJob); link != "" {
-			items = append(items, taskArtifactResponse{Key: "video", Type: "video", MimeType: "video/mp4", ContentURL: link, Source: "upstream"})
+			if managed {
+				link = service.CanvasContentPath("media", task.TaskID, "video")
+				if dashboard {
+					link = mediaTaskResultPath(task.TaskID, "video", c.GetInt("role") >= common.RoleAdminUser)
+				}
+			}
+			items = append(items, taskArtifactResponse{Key: "video", Type: "video", MimeType: "video/mp4", ContentURL: link, Source: "upstream", Authenticated: managed && dashboard})
 		}
 		response := gin.H{"task_id": task.TaskID, "artifacts": items}
 		if dashboard {
@@ -371,6 +395,19 @@ func TaskArtifactContent(c *gin.Context) {
 		}
 		if middleware.IsTaskArtifactAccess(c) {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		managed, err := service.CanvasTaskOwnerManaged(c.Request.Context(), mediaJob.TokenId, mediaJob.UserId)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+				status = http.StatusNotFound
+			}
+			writeTaskArtifactError(c, status, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if managed {
+			serveAuthorizedMediaTaskResult(c, mediaJob, artifactKey)
 			return
 		}
 		if artifactKey == "video" {

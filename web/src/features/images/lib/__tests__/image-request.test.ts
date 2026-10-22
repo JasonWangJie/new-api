@@ -204,6 +204,59 @@ describe('capability-driven image request contracts', () => {
     expect(realtime.url).toBe('/v1/images/generations')
     expect(JSON.parse(realtime.body).size).toBe('2384x1024')
   })
+  it.each([
+    { resolution: '1K', ratio: '16:9' },
+    { resolution: '1K', ratio: '4:3' },
+    { resolution: '2K', ratio: '4:3' },
+    { resolution: '2K', ratio: 'auto' },
+  ])(
+    'preserves $resolution and $ratio for New API models declaring output_resolution',
+    ({ resolution, ratio }) => {
+      const request = buildImageRequest({
+        ...options,
+        resolution,
+        ratio,
+        model: {
+          ...model,
+          provider: 'newapi',
+          supported_parameters: ['output_resolution', 'aspect_ratio'],
+          supports_reference_generation: true,
+        },
+        parts: [
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,aW1hZ2U=' },
+          },
+        ],
+      })
+      const body = JSON.parse(request.body)
+      expect(request.url).toBe('/v1/images/generations_async')
+      expect(body).toMatchObject({
+        resolution,
+        images: [{ image_url: 'data:image/png;base64,aW1hZ2U=' }],
+      })
+      expect(body).not.toHaveProperty('size')
+      if (ratio === 'auto') expect(body).not.toHaveProperty('aspect_ratio')
+      else expect(body.aspect_ratio).toBe(ratio)
+    }
+  )
+  it.each([
+    { provider: 'newapi', supported_parameters: undefined },
+    { provider: 'openai', supported_parameters: ['output_resolution'] },
+  ])(
+    'keeps pixel sizes for $provider without the New API output_resolution capability',
+    ({ provider, supported_parameters }) => {
+      const request = buildImageRequest({
+        ...options,
+        ratio: '16:9',
+        model: { ...model, provider, supported_parameters },
+      })
+      const body = JSON.parse(request.body)
+      expect(body.size).toBe('1536x1024')
+      expect(body).not.toHaveProperty('resolution')
+      expect(body).not.toHaveProperty('aspect_ratio')
+    }
+  )
   it('rejects unavailable capabilities, zero or excessive counts and excessive reference images', () => {
     for (const count of [0, 129, Number.NaN]) {
       expect(() => buildImageRequest({ ...options, count })).toThrow()

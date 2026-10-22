@@ -69,6 +69,62 @@ function imageChannelLimitSchema(maximum: number) {
     .optional()
 }
 
+const imageResolutionMappingSchema = z
+  .array(
+    z.object({
+      model: z.string(),
+      resolution_1k: z.string(),
+      resolution_2k: z.string(),
+      resolution_4k: z.string(),
+    })
+  )
+  .superRefine((rows, ctx) => {
+    const sources = new Set<string>()
+    for (const [index, row] of rows.entries()) {
+      for (const field of [
+        'model',
+        'resolution_1k',
+        'resolution_2k',
+        'resolution_4k',
+      ] as const) {
+        const value = row[field].trim()
+        if (field !== 'model' && !value) continue
+        if (
+          !value ||
+          new TextEncoder().encode(value).length > 255 ||
+          /[\p{Cc}*]/u.test(value)
+        ) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [index, field],
+            message:
+              'Model names must be 1–255 UTF-8 bytes without control characters or wildcards',
+          })
+        }
+      }
+      const source = row.model.trim()
+      if (sources.has(source)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [index, 'model'],
+          message: 'Duplicate source model mappings are not allowed',
+        })
+      }
+      sources.add(source)
+      if (
+        !row.resolution_1k.trim() &&
+        !row.resolution_2k.trim() &&
+        !row.resolution_4k.trim()
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [index, 'resolution_1k'],
+          message: 'Configure at least one resolution or delete this mapping',
+        })
+      }
+    }
+  })
+
 function isOptionalProxyURL(value: string | undefined): boolean {
   const trimmedValue = value?.trim() || ''
   if (!trimmedValue) return true
@@ -308,6 +364,8 @@ export const channelFormSchema = z
     image_reference_transport_mode: z
       .enum(['', 'passthrough', 'local', 'passthrough_fallback_local'])
       .optional(),
+    tianyue_media_compatibility: z.boolean().optional(),
+    image_resolution_model_mapping: imageResolutionMappingSchema.optional(),
     image_max_reference_bytes: imageChannelLimitSchema(
       IMAGE_CHANNEL_EXECUTION_LIMITS.image_max_reference_bytes
     ),
@@ -509,6 +567,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   http2_connection_shards: 1,
   image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   image_reference_transport_mode: '',
+  tianyue_media_compatibility: false,
+  image_resolution_model_mapping: [],
   image_max_reference_bytes: undefined,
   image_attempt_timeout_seconds: undefined,
   image_concurrency_limit: undefined,
@@ -559,6 +619,10 @@ export function transformChannelToFormDefaults(
     image_reference_transport_mode: '' as NonNullable<
       ChannelFormValues['image_reference_transport_mode']
     >,
+    tianyue_media_compatibility: false,
+    image_resolution_model_mapping: [] as NonNullable<
+      ChannelFormValues['image_resolution_model_mapping']
+    >,
     image_max_reference_bytes:
       CHANNEL_FORM_DEFAULT_VALUES.image_max_reference_bytes,
     image_attempt_timeout_seconds:
@@ -588,6 +652,9 @@ export function transformChannelToFormDefaults(
         image_max_reference_images: normalizeImageMaxReferenceImages(
           parsed.image_max_reference_images
         ),
+        tianyue_media_compatibility:
+          channel.type === CHANNEL_TYPE_NEW_API &&
+          parsed.tianyue_media_compatibility === true,
         image_reference_transport_mode: [
           'passthrough',
           'local',
@@ -595,6 +662,17 @@ export function transformChannelToFormDefaults(
         ].includes(parsed.image_reference_transport_mode)
           ? parsed.image_reference_transport_mode
           : '',
+        image_resolution_model_mapping: Object.entries(
+          (parsed.image_resolution_model_mapping || {}) as Record<
+            string,
+            Partial<Record<'1K' | '2K' | '4K', string>>
+          >
+        ).map(([model, resolutions]) => ({
+          model,
+          resolution_1k: resolutions['1K'] || '',
+          resolution_2k: resolutions['2K'] || '',
+          resolution_4k: resolutions['4K'] || '',
+        })),
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         image_max_reference_bytes:
           typeof parsed.image_max_reference_bytes === 'number'
@@ -764,6 +842,26 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   if (formData.image_reference_transport_mode) {
     settingObj.image_reference_transport_mode =
       formData.image_reference_transport_mode
+  }
+  if (
+    formData.type === CHANNEL_TYPE_NEW_API &&
+    formData.tianyue_media_compatibility === true
+  ) {
+    settingObj.tianyue_media_compatibility = true
+  }
+  if (formData.image_resolution_model_mapping?.length) {
+    settingObj.image_resolution_model_mapping = Object.fromEntries(
+      formData.image_resolution_model_mapping.map((row) => [
+        row.model.trim(),
+        Object.fromEntries(
+          [
+            ['1K', row.resolution_1k.trim()],
+            ['2K', row.resolution_2k.trim()],
+            ['4K', row.resolution_4k.trim()],
+          ].filter(([, target]) => target)
+        ),
+      ])
+    )
   }
   for (const field of Object.keys(
     IMAGE_CHANNEL_EXECUTION_LIMITS

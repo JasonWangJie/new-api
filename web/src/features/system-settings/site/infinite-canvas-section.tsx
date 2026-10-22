@@ -96,7 +96,10 @@ export function InfiniteCanvasSection(props: { settings: SiteSettings }) {
           if (typeof changedFields[key] === 'string') {
             await updateOption.mutateAsync({
               key,
-              value: String(changedFields[key]).trim().replace(/\/$/, ''),
+              value:
+                key === 'infinite_canvas.url'
+                  ? (canvasOrigin(String(changedFields[key])) ?? '')
+                  : String(changedFields[key]).trim(),
             })
           }
         }

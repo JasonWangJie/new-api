@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { FieldErrors, FieldPath } from 'react-hook-form'
 
 import {
+  CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   MODEL_FETCHABLE_TYPES,
@@ -56,6 +57,8 @@ const CONFIGURATION_BLOCKS = {
       'weight',
       'image_max_reference_images',
       'image_reference_transport_mode',
+      'tianyue_media_compatibility',
+      'image_resolution_model_mapping',
       'image_max_reference_bytes',
       'image_attempt_timeout_seconds',
       'image_concurrency_limit',
@@ -153,7 +156,10 @@ export function getChannelConfigurationState(
   const configured: Record<ChannelConfigurationBlock, boolean> = {
     modelMapping: hasConfiguredJson(values.model_mapping),
     routingStrategy: Boolean(
+      (values.type === CHANNEL_TYPE_NEW_API &&
+        values.tianyue_media_compatibility) ||
       values.image_reference_transport_mode ||
+      values.image_resolution_model_mapping?.length ||
       values.image_max_reference_bytes ||
       values.image_attempt_timeout_seconds ||
       values.image_concurrency_limit ||

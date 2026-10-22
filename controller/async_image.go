@@ -213,8 +213,13 @@ func respondAsyncImageAccepted(c *gin.Context, task model.AsyncImageTask, reused
 
 func QueryAsyncImage(c *gin.Context) {
 	ctx := c.Request.Context()
+	query := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", c.Param("task_id"), c.GetInt("id"))
+	grantValue, canvas := c.Get(service.CanvasGrantContextKey)
+	if !canvas {
+		query = query.Where("token_id = ?", c.GetInt("token_id"))
+	}
 	var task model.AsyncImageTask
-	err := model.DB.WithContext(ctx).Where("task_id = ? AND token_id = ? AND user_id = ?", c.Param("task_id"), c.GetInt("token_id"), c.GetInt("id")).Take(&task).Error
+	err := query.Take(&task).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		AsyncImagePublicError(c, 404, "task_not_found", "Image task was not found")
 		return
@@ -222,6 +227,13 @@ func QueryAsyncImage(c *gin.Context) {
 	if err != nil {
 		AsyncImagePublicError(c, 503, "database_unavailable", "Image task lookup is unavailable")
 		return
+	}
+	if canvas {
+		grant, ok := grantValue.(*service.CanvasGrantState)
+		if !ok || grant == nil || !canvasHistoricalOwner(c, grant, task.TokenId, task.UserId) {
+			AsyncImagePublicError(c, 404, "task_not_found", "Image task was not found")
+			return
+		}
 	}
 	if task.Terminal() && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() {
 		AsyncImagePublicError(c, 404, "task_not_found", "Image task was not found")
@@ -254,6 +266,21 @@ func QueryAsyncImage(c *gin.Context) {
 		}
 	}
 	if task.ResultsAvailable() {
+		if canvas {
+			data := make([]gin.H, 0, task.ResultCount)
+			for index := range task.ResultCount {
+				data = append(data, gin.H{"url": service.CanvasContentPath("images", task.TaskId, strconv.Itoa(index))})
+			}
+			response["status"], response["data"] = "succeeded", data
+			if task.ResultSource == model.ImageResultSourceUpstream {
+				response["result_source"] = model.ImageResultSourceUpstream
+				if strings.Contains(c.Request.URL.Path, "/media/") {
+					response["storage_status"] = "upstream"
+				}
+			}
+			c.JSON(http.StatusOK, response)
+			return
+		}
 		if task.ResultSource == model.ImageResultSourceUpstream {
 			urls, err := service.AsyncImageUpstreamResultURLs(ctx, task)
 			if err != nil {

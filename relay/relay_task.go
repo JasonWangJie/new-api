@@ -702,6 +702,22 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 
 	// OpenAI Video API 格式: 走各 adaptor 的 ConvertToOpenAIVideo
 	if isOpenAIVideoAPI {
+		if _, canvas := c.Get(service.CanvasGrantContextKey); canvas {
+			// Match the host-owned submission receipt. Provider extensions may
+			// contain reusable CDN capabilities that outlive this authorization.
+			video := originTask.ToOpenAIVideo()
+			if originTask.Status == model.TaskStatusFailure {
+				video.Error = &kitdto.OpenAIVideoError{
+					Code:    "video_generation_failed",
+					Message: service.VideoTaskFailureReason(service.PublicTaskFailureReason(originTask)),
+				}
+			}
+			respBody, err = common.Marshal(video)
+			if err != nil {
+				taskResp = service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
+			}
+			return
+		}
 		adaptor := GetTaskAdaptor(originTask.Platform)
 		if adaptor == nil {
 			taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("invalid channel id: %d", originTask.ChannelId), "invalid_channel_id", http.StatusBadRequest)

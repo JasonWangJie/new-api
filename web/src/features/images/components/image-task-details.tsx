@@ -36,7 +36,12 @@ import {
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-import { getImageTask, getImageRetainedRequest, imageRequest } from '../api'
+import {
+  getImageTask,
+  getImageRetainedRequest,
+  imageBlob,
+  imageRequest,
+} from '../api'
 import {
   imageLabel,
   imageTimelineDotClass,
@@ -260,7 +265,8 @@ export function ImageTaskDetails(props: {
       props.id,
       results
         .map(
-          (result) => `${result.image_index}:${result.url || result.view_url}`
+          (result) =>
+            `${result.image_index}:${result.url || result.view_url}:${!!result.authenticated}`
         )
         .join('|'),
     ],
@@ -280,7 +286,10 @@ export function ImageTaskDetails(props: {
           return {
             id: String(result.image_index),
             url,
-            direct: result.source === 'upstream',
+            blob: result.authenticated
+              ? await imageBlob(url, signal, true)
+              : undefined,
+            direct: result.source === 'upstream' && !result.authenticated,
             description:
               result.source === 'upstream'
                 ? t('Upstream link')

@@ -37,10 +37,18 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import type { TaskPluginOption } from '../../api'
 import {
+  CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
   CHANNEL_TYPE_SGLANG,
   CHANNEL_TYPE_VLLM,
 } from '../../constants'
+import {
+  CHANNEL_FORM_DEFAULT_VALUES,
+  channelFormSchema,
+  transformChannelToFormDefaults,
+  transformFormDataToCreatePayload,
+  transformFormDataToUpdatePayload,
+} from '../../lib/channel-form'
 import { channelSchema, type Channel } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelsProvider } from '../channels-provider'
@@ -1296,6 +1304,208 @@ test('restoring routing defaults clears the configured indicator for both the bl
   expect(within(block).getByRole('img', { name: 'Configured' })).toBeVisible()
 })
 
+test('restores image resolution mappings and saves independent models and unsupported tiers', async () => {
+  editingChannel = {
+    ...editingChannel,
+    models: 'seedream.5-pro,other-image',
+    model_mapping: '{"seedream.5-pro":"legacy-model"}',
+    setting: JSON.stringify({
+      image_resolution_model_mapping: {
+        'seedream.5-pro': { '1K': 'upstream-1K', '2K': 'upstream-2K' },
+        'other-image': { '4K': 'other-4K' },
+      },
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution mapping source 1' })
+  ).toHaveValue('seedream.5-pro')
+  expect(
+    screen.getByRole('textbox', { name: 'Upstream model 2K row 1' })
+  ).toHaveValue('upstream-2K')
+  expect(
+    screen.getByRole('textbox', { name: 'Upstream model 4K row 1' })
+  ).toHaveValue('')
+  fireEvent.change(
+    screen.getByRole('textbox', { name: 'Upstream model 1K row 1' }),
+    {
+      target: { value: ' updated-1K ' },
+    }
+  )
+  await user.clear(
+    screen.getByRole('textbox', { name: 'Upstream model 2K row 1' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  const payload = put.mock.calls[0][1] as {
+    setting: string
+    model_mapping: string
+  }
+  expect(JSON.parse(payload.setting).image_resolution_model_mapping).toEqual({
+    'seedream.5-pro': { '1K': 'updated-1K' },
+    'other-image': { '4K': 'other-4K' },
+  })
+  expect(payload.model_mapping).toBe(editingChannel.model_mapping)
+})
+
+test('adds a resolution mapping from declared models and requires at least one target', async () => {
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  await user.click(
+    screen.getByRole('button', { name: 'Add resolution mapping' })
+  )
+  const source = screen.getByRole('combobox', {
+    name: 'Resolution mapping source 1',
+  })
+  expect(source).toHaveValue('custom-model')
+  await user.click(source)
+  expect(screen.getByRole('option', { name: 'custom-model' })).toBeVisible()
+  expect(
+    screen.queryByRole('option', { name: 'upstream-model' })
+  ).not.toBeInTheDocument()
+  await user.keyboard('{Escape}')
+  expect(
+    screen.getByRole('button', { name: 'Add resolution mapping' })
+  ).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  expect(
+    await screen.findByText(
+      'Configure at least one resolution or delete this mapping'
+    )
+  ).toBeVisible()
+  expect(put).not.toHaveBeenCalled()
+  await user.type(
+    screen.getByRole('textbox', { name: 'Upstream model 2K row 1' }),
+    'custom-2K'
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(
+    JSON.parse((put.mock.calls[0][1] as { setting: string }).setting)
+      .image_resolution_model_mapping
+  ).toEqual({ 'custom-model': { '2K': 'custom-2K' } })
+})
+
+test('retains an unavailable resolution mapping until it is explicitly deleted', async () => {
+  editingChannel = {
+    ...editingChannel,
+    setting: JSON.stringify({
+      image_resolution_model_mapping: {
+        'removed-model': { '1K': 'old-upstream' },
+      },
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution mapping source 1' })
+  ).toHaveValue('removed-model · Unavailable')
+  await user.click(
+    screen.getByRole('button', { name: 'Delete resolution mapping 1' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  expect(
+    JSON.parse((put.mock.calls[0][1] as { setting: string }).setting)
+  ).not.toHaveProperty('image_resolution_model_mapping')
+})
+
+test.each(['single', 'batch', 'multi_to_single'] as const)(
+  'preserves resolution mappings through ordinary edits and %s creation',
+  (mode) => {
+    const mapping = { 'custom-model': { '1K': 'one', '4K': 'four' } }
+    const values = transformChannelToFormDefaults({
+      ...editingChannel,
+      setting: JSON.stringify({ image_resolution_model_mapping: mapping }),
+    })
+    values.name = 'Renamed channel'
+    values.multi_key_mode = mode
+    const created = transformFormDataToCreatePayload(values)
+    expect(created.mode).toBe(mode)
+    expect(
+      JSON.parse(created.channel.setting || '{}').image_resolution_model_mapping
+    ).toEqual(mapping)
+    expect(
+      JSON.parse(transformFormDataToUpdatePayload(values, 42).setting || '{}')
+        .image_resolution_model_mapping
+    ).toEqual(mapping)
+  }
+)
+
+test.each([
+  {
+    model: 'custom-model',
+    resolution_1k: '*',
+    resolution_2k: '',
+    resolution_4k: '',
+  },
+  {
+    model: 'custom-model',
+    resolution_1k: 'a\u0000b',
+    resolution_2k: '',
+    resolution_4k: '',
+  },
+  {
+    model: 'custom-model',
+    resolution_1k: '图'.repeat(86),
+    resolution_2k: '',
+    resolution_4k: '',
+  },
+  { model: '*', resolution_1k: 'one', resolution_2k: '', resolution_4k: '' },
+])('rejects invalid resolution model names: $model / $resolution_1k', (row) => {
+  const result = channelFormSchema.safeParse({
+    ...CHANNEL_FORM_DEFAULT_VALUES,
+    name: 'image channel',
+    models: 'custom-model',
+    image_resolution_model_mapping: [row],
+  })
+  expect(result.success).toBe(false)
+  if (!result.success) {
+    expect(
+      result.error.issues.some(
+        (issue) => issue.path[0] === 'image_resolution_model_mapping'
+      )
+    ).toBe(true)
+  }
+})
+
+test('rejects duplicate resolution source models after trimming', () => {
+  const row = {
+    model: 'custom-model',
+    resolution_1k: 'one',
+    resolution_2k: '',
+    resolution_4k: '',
+  }
+  const result = channelFormSchema.safeParse({
+    ...CHANNEL_FORM_DEFAULT_VALUES,
+    name: 'image channel',
+    models: 'custom-model',
+    image_resolution_model_mapping: [row, { ...row, model: ' custom-model ' }],
+  })
+  expect(result.success).toBe(false)
+  if (!result.success) {
+    expect(result.error.issues.map((issue) => issue.message)).toContain(
+      'Duplicate source model mappings are not allowed'
+    )
+  }
+})
+
 test('edits and saves the image channel reference capacity from routing settings', async () => {
   editingChannel = {
     ...editingChannel,
@@ -1349,6 +1559,69 @@ test('restores a channel reference transport override and saves global inheritan
   expect(
     JSON.parse((put.mock.calls[0][1] as { setting: string }).setting)
   ).not.toHaveProperty('image_reference_transport_mode')
+})
+
+test('a New API channel saves, restores and disables TianYue image compatibility', async () => {
+  editingChannel = { ...editingChannel, type: CHANNEL_TYPE_NEW_API }
+  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, data) => {
+    const payload = data as { setting: string }
+    editingChannel = { ...editingChannel, setting: payload.setting }
+    return { data: { success: true } }
+  })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const toggle = screen.getByRole('switch', {
+    name: 'TianYue image compatibility',
+  })
+  expect(toggle).not.toBeChecked()
+  await user.click(toggle)
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+  expect(JSON.parse(editingChannel.setting || '{}')).toHaveProperty(
+    'tianyue_media_compatibility',
+    true
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Open channel' }))
+  await screen.findByDisplayValue('Existing channel')
+  const routingTab = screen.getByRole('tab', { name: /Routing & Mapping/ })
+  expect(routingTab).toHaveAccessibleName(/Configured/)
+  await user.click(routingTab)
+  const restoredToggle = screen.getByRole('switch', {
+    name: 'TianYue image compatibility',
+  })
+  expect(restoredToggle).toBeChecked()
+  restoredToggle.focus()
+  await user.keyboard(' ')
+  expect(restoredToggle).not.toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
+  expect(JSON.parse(editingChannel.setting || '{}')).not.toHaveProperty(
+    'tianyue_media_compatibility'
+  )
+})
+
+test('other providers hide TianYue image compatibility and omit it when saved', async () => {
+  editingChannel.setting = '{"tianyue_media_compatibility":true}'
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.queryByRole('switch', { name: 'TianYue image compatibility' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  expect(
+    JSON.parse((put.mock.calls[0][1] as { setting: string }).setting)
+  ).not.toHaveProperty('tianyue_media_compatibility')
 })
 
 test('channel image execution limits restore, update and clear to inherited defaults', async () => {
@@ -2030,6 +2303,9 @@ test('advanced custom edits preview draft connection settings with the saved key
 })
 
 test('an operator without sensitive write permission can discover saved models and update routing', async () => {
+  editingChannel.setting = JSON.stringify({
+    image_resolution_model_mapping: { 'custom-model': { '1K': 'custom-1K' } },
+  })
   useAuthStore.setState({
     auth: {
       ...originalAuth,
@@ -2067,6 +2343,15 @@ test('an operator without sensitive write permission can discover saved models a
   await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
   expect(
     screen.getByRole('spinbutton', { name: 'Maximum reference images' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('textbox', { name: 'Upstream model 1K row 1' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution mapping source 1' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('button', { name: 'Delete resolution mapping 1' })
   ).toBeDisabled()
   fireEvent.change(screen.getByLabelText('Priority'), {
     target: { value: '8' },

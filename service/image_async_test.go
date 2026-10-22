@@ -193,10 +193,11 @@ func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
 }
 
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
-	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection"} {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection", "resolution mapping changed before retry"} {
 		t.Run(condition, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			wantChannelID, wantKey := alternate.Id, alternate.Key
+			wantUpstreamModel := ""
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
 			attempts := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, Code: 606}}
 			switch condition {
@@ -238,6 +239,17 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				attempts[0].FinishedAt = time.Now().Unix()
 				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
 				wantChannelID, wantKey = task.ChannelId, "upstream-key-a"
+			case "resolution mapping changed before retry":
+				attempts[0].FinishedAt = time.Now().Unix()
+				wantUpstreamModel = "image-model-2K-current"
+				alternate.SetSetting(dto.ChannelSettings{ImageResolutionModelMapping: map[string]map[string]string{"image-model": {"2K": wantUpstreamModel}}})
+				require.NoError(t, db.Model(&alternate).Updates(map[string]any{"setting": alternate.Setting, "model_mapping": `{"image-model":"legacy-model","image-model-2K-current":"wrong-chain-target"}`}).Error)
+				request.Size = "2048x2048"
+				data, err := common.Marshal(request)
+				require.NoError(t, err)
+				task.RequestCipher, err = EncryptImagePayload(data, "task:"+task.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("request_cipher", task.RequestCipher).Error)
 			}
 			encoded, err := common.Marshal(attempts)
 			require.NoError(t, err)
@@ -247,6 +259,8 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
 				selected = *channel
 				assert.Equal(t, request.Billing, outbound.Billing, "retry must preserve the admitted price")
+				assert.Equal(t, request.Size, outbound.Size)
+				assert.Equal(t, request.Resolution, outbound.Resolution)
 				require.NoError(t, beforeInvoke())
 				require.NoError(t, db.WithContext(ctx).Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("upstream_task_id", "accepted-alternate-job").Error)
 				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
@@ -263,6 +277,12 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 			require.NoError(t, common.Unmarshal(data, &frozen))
 			assert.Equal(t, wantChannelID, frozen.Id, "subsequent polls must use the accepted retry account")
 			assert.Equal(t, wantKey, frozen.Key)
+			if wantUpstreamModel != "" {
+				var mapping map[string]string
+				require.NoError(t, common.UnmarshalJsonStr(frozen.GetModelMapping(), &mapping))
+				assert.Equal(t, wantUpstreamModel, mapping[request.Model])
+				assert.Equal(t, wantUpstreamModel, mapping[wantUpstreamModel], "frozen final target must stop ordinary mapping chains")
+			}
 		})
 	}
 }
@@ -315,13 +335,20 @@ func TestAsyncImageWorkerPolicyChangeOnlyRejectsNewSubmissions(t *testing.T) {
 			db, task, request, cfg, _ := asyncImageWorkerFixture(t)
 			if accepted {
 				task.UpstreamTaskId, task.DispatchedAt = "accepted-original-job", time.Now().Unix()-1
-				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+				var acceptedChannel model.Channel
+				require.NoError(t, db.First(&acceptedChannel, task.ChannelId).Error)
+				acceptedChannel.ModelMapping = common.GetPointer(`{"image-model":"image-model-2K-accepted","image-model-2K-accepted":"image-model-2K-accepted"}`)
+				data, err := common.Marshal(acceptedChannel)
+				require.NoError(t, err)
+				task.SelectedChannelCipher, err = EncryptImagePayload(data, "image-channel:"+task.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt, "selected_channel_cipher": task.SelectedChannelCipher}).Error)
 			}
 			require.NoError(t, db.Model(&model.User{}).Where("id = ?", task.UserId).Update("quota", 900).Error)
 			require.NoError(t, db.Model(&model.Token{}).Where("id = ?", task.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: task.TaskId, BillingRequestId: "async-image:" + task.TaskId, UserId: task.UserId, TokenId: task.TokenId, FundingSource: "wallet", ReservedAt: time.Now().Unix(), ReservedQuota: 100, ReservedTokenQuota: 100, Status: "reserved"}).Error)
 			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where(map[string]any{"group": "default"}).Updates(map[string]any{"async_enabled": false, "models": "[]"}).Error)
-			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"status": common.ChannelStatusManuallyDisabled, "key": "replacement-key"}).Error)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"status": common.ChannelStatusManuallyDisabled, "key": "replacement-key", "model_mapping": `{"image-model":"image-model-2K-replacement"}`, "setting": `{"image_resolution_model_mapping":{"image-model":{"2K":"image-model-2K-replacement"}}}`}).Error)
 			cfg.AsyncEnabled = false
 			calls := 0
 			ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, _ func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
@@ -329,6 +356,9 @@ func TestAsyncImageWorkerPolicyChangeOnlyRejectsNewSubmissions(t *testing.T) {
 				assert.Equal(t, task.UpstreamTaskId, current.UpstreamTaskId)
 				assert.Equal(t, task.ChannelId, channel.Id)
 				assert.Equal(t, "upstream-key-a", channel.Key, "polling must keep the account that accepted the job")
+				var mapping map[string]string
+				require.NoError(t, common.UnmarshalJsonStr(channel.GetModelMapping(), &mapping))
+				assert.Equal(t, "image-model-2K-accepted", mapping[request.Model], "polling must keep the upstream model that accepted the job")
 				assert.Equal(t, request.Billing, outbound.Billing)
 				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
 			}
@@ -2710,6 +2740,35 @@ func TestAsyncImageReferenceDNSRedirectAndConnectedPeer(t *testing.T) {
 			require.NoError(t, err)
 			assert.NoError(t, client.CheckRedirect(&http.Request{URL: parsed}, []*http.Request{{}}))
 			assert.Error(t, client.CheckRedirect(&http.Request{URL: parsed}, make([]*http.Request, cfg.DownloadRedirects+1)))
+		})
+	}
+}
+
+func TestAsyncImageRoutingResolutionPreservesNativeDimensions(t *testing.T) {
+	for _, tc := range []struct {
+		name, fields, resolution string
+	}{
+		{name: "explicit tier takes precedence", fields: `"resolution":" 1k ","size":"4096x4096"`, resolution: "1K"},
+		{name: "native tier", fields: `"size":"2k"`, resolution: "2K"},
+		{name: "native square dimensions", fields: `"size":"2048x2048"`, resolution: "2K"},
+		{name: "native wide dimensions use maximum edge", fields: `"size":"2384x1024"`, resolution: "4K"},
+		{name: "automatic size", fields: `"size":"auto"`},
+		{name: "explicit automatic tier", fields: `"resolution":"auto","size":"2048x2048"`, resolution: "AUTO"},
+		{name: "provider-specific size", fields: `"size":"wide"`},
+		{name: "no dimensions", fields: `"n":1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"image-model","prompt":"draw",` + tc.fields + `}`)
+			request, err := ParseAsyncImageRequest(body, "application/json", "/v1/images/generations_async", DefaultImageRuntimeConfig())
+			require.NoError(t, err)
+			before, err := common.Marshal(request)
+			require.NoError(t, err)
+			assert.Equal(t, tc.resolution, AsyncImageRoutingResolution(request))
+			after, err := common.Marshal(request)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after), "routing must preserve upstream dimensions and billing facts")
+			request.Platform = "gemini"
+			assert.Equal(t, tc.resolution, AsyncImageRoutingResolution(request), "selecting a transport must not change the routing tier")
 		})
 	}
 }

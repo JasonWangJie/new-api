@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -48,9 +50,21 @@ func QueryAsyncMedia(c *gin.Context) {
 		return
 	}
 	var job model.AsyncMediaJob
-	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND token_id = ?", c.Param("task_id"), c.GetInt("id"), c.GetInt("token_id")).Take(&job).Error; err != nil {
+	query := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", c.Param("task_id"), c.GetInt("id"))
+	grantValue, canvas := c.Get(service.CanvasGrantContextKey)
+	if !canvas {
+		query = query.Where("token_id = ?", c.GetInt("token_id"))
+	}
+	if err := query.Take(&job).Error; err != nil {
 		AsyncImagePublicError(c, 404, "task_not_found", "Media task was not found")
 		return
+	}
+	if canvas {
+		grant, ok := grantValue.(*service.CanvasGrantState)
+		if !ok || grant == nil || !canvasHistoricalOwner(c, grant, job.TokenId, job.UserId) {
+			AsyncImagePublicError(c, 404, "task_not_found", "Media task was not found")
+			return
+		}
 	}
 	view, results, err := videoJobView(c, job, false)
 	if err != nil {
@@ -67,6 +81,11 @@ func QueryAsyncMedia(c *gin.Context) {
 }
 
 func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, []gin.H, error) {
+	managed, ownerErr := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId)
+	if ownerErr != nil && !errors.Is(ownerErr, service.ErrCanvasAuthorization) && !errors.Is(ownerErr, model.ErrCanvasBillingOwner) {
+		return nil, nil, ownerErr
+	}
+	_, canvas := c.Get(service.CanvasGrantContextKey)
 	now := time.Now().Unix()
 	status, progress := job.Status, 0
 	if status == "submitting" || status == "submitted" {
@@ -178,9 +197,20 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		}
 	}
 	results := make([]gin.H, 0)
+	if ownerErr != nil {
+		return view, results, nil
+	}
 	if job.StorageStatus == "upstream" && job.ExpiresAt > time.Now().Unix() {
 		if link := service.PublicUpstreamAsyncVideoResultURL(&task); link != "" {
-			results = append(results, gin.H{"id": job.ID, "image_index": 0, "key": "video", "url": link, "view_url": link, "source": "upstream", "content_type": "video/mp4", "width": 0, "height": 0, "byte_size": 0, "checksum": "", "expires_at": job.ExpiresAt})
+			item := gin.H{"id": job.ID, "image_index": 0, "key": "video", "url": link, "view_url": link, "source": "upstream", "content_type": "video/mp4", "width": 0, "height": 0, "byte_size": 0, "checksum": "", "expires_at": job.ExpiresAt}
+			if managed {
+				link = mediaTaskResultPath(job.TaskId, "video", admin)
+				if canvas {
+					link = service.CanvasContentPath("media", job.TaskId, "video")
+				}
+				item["url"], item["view_url"], item["authenticated"] = link, link, true
+			}
+			results = append(results, item)
 			view["result_count"] = 1
 		}
 		return view, results, nil
@@ -198,17 +228,98 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		return nil, nil, err
 	}
 	for i, object := range objects {
-		link, err := service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
-		if err != nil {
-			return nil, nil, err
+		link := ""
+		if managed {
+			link = mediaTaskResultPath(job.TaskId, object.ArtifactKey, admin)
+			if canvas {
+				link = service.CanvasContentPath("media", job.TaskId, object.ArtifactKey)
+			}
+		} else {
+			link, err = service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
-		results = append(results, gin.H{"id": object.ID, "image_index": i, "key": object.ArtifactKey, "url": link, "view_url": link, "content_type": object.MimeType, "width": 0, "height": 0, "byte_size": object.ByteSize, "checksum": object.Checksum, "expires_at": min(object.ExpiresAt, time.Now().Unix()+int64(cfg.SignedURLExpiry))})
+		item := gin.H{"id": object.ID, "image_index": i, "key": object.ArtifactKey, "url": link, "view_url": link, "content_type": object.MimeType, "width": 0, "height": 0, "byte_size": object.ByteSize, "checksum": object.Checksum, "expires_at": min(object.ExpiresAt, time.Now().Unix()+int64(cfg.SignedURLExpiry))}
+		if managed {
+			item["authenticated"] = true
+		}
+		results = append(results, item)
 	}
 	view["result_count"] = len(results)
 	if len(results) == 0 {
 		view["status"], view["stage"], view["storage_status"] = "expired", "failed", "expired"
 	}
 	return view, results, nil
+}
+
+func mediaTaskResultPath(taskID, artifact string, admin bool) string {
+	base := "/api/user/media-tasks/"
+	if admin {
+		base = "/api/admin/media-tasks/"
+	}
+	return base + url.PathEscape(taskID) + "/results/" + url.PathEscape(artifact) + "/view"
+}
+
+// ViewMediaTaskResult serves dashboard results under the current user session.
+// Managed outputs use this route instead of anonymous storage capabilities.
+func ViewMediaTaskResult(c *gin.Context, admin bool) {
+	query := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id"))
+	if !admin {
+		query = query.Where("user_id = ?", c.GetInt("id"))
+	}
+	var job model.AsyncMediaJob
+	if err := query.Take(&job).Error; err != nil {
+		imageManagementError(c, http.StatusNotFound, errors.New("Media task result was not found"))
+		return
+	}
+	if managed, err := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId); err != nil || !managed {
+		imageManagementError(c, http.StatusNotFound, errors.New("Media task result was not found"))
+		return
+	}
+	serveAuthorizedMediaTaskResult(c, job, c.Param("artifact_key"))
+}
+
+// serveAuthorizedMediaTaskResult is shared by Canvas and dashboard reads.
+// Callers establish grant or dashboard ownership before entering this function.
+func serveAuthorizedMediaTaskResult(c *gin.Context, job model.AsyncMediaJob, artifact string) {
+	canvasResponseHeaders(c)
+	if job.Status != "succeeded" || job.ExpiresAt <= time.Now().Unix() || job.BillingStatus == "failed" || !taskArtifactKeyPattern.MatchString(artifact) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	task := &model.Task{TaskID: job.TaskId, UserId: job.UserId}
+	if job.StorageStatus == "upstream" && artifact == "video" {
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND status = ?", job.TaskId, job.UserId, model.TaskStatusSuccess).Take(task).Error; err != nil {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		if link := service.PublicUpstreamAsyncVideoResultURL(task); link != "" {
+			descriptor := &relaychannel.TaskContentRequest{URL: link, Method: c.Request.Method, Credentialless: true}
+			if err := proxyTaskMedia(c, task, descriptor); err != nil && !c.Writer.Written() {
+				writeTaskMediaProxyError(c, err)
+			}
+			return
+		}
+	}
+	if job.StorageStatus != "succeeded" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	var object model.MediaArtifactObject
+	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND artifact_key = ? AND user_id = ? AND token_id = ? AND status = ? AND expires_at > ?", job.TaskId, artifact, job.UserId, job.TokenId, "active", time.Now().Unix()).Take(&object).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	store := service.GetTaskArtifactStore()
+	ref, err := store.Resolve(task, artifact)
+	if err != nil || ref == nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	if err := store.Serve(c, task, ref); err != nil && !c.Writer.Written() {
+		c.Status(http.StatusNotFound)
+	}
 }
 
 func MediaObjectContent(c *gin.Context) {
@@ -276,6 +387,14 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 404, errors.New("Media task was not found"))
 		return
 	}
+	if _, err := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId); err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+			status = http.StatusNotFound
+		}
+		imageManagementError(c, status, errors.New("Media task is unavailable"))
+		return
+	}
 	view, results, err := videoJobView(c, job, admin)
 	if err != nil {
 		imageManagementError(c, 503, err)
@@ -319,6 +438,14 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			imageManagementError(c, 404, errors.New("Image task was not found"))
 			return
 		}
+		if _, err := service.CanvasImageTaskManaged(c.Request.Context(), task); err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+				status = http.StatusNotFound
+			}
+			imageManagementError(c, status, errors.New("Image task is unavailable"))
+			return
+		}
 		if task.ErrorCode == "billing_quota_uncertain" {
 			imageManagementError(c, http.StatusConflict, errors.New("Quota reservation reconciliation by an administrator is required before resuming billing"))
 			return
@@ -337,6 +464,23 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ? AND lease_expires_at <= ? AND expires_at > ?", c.Param("task_id"), time.Now().Unix(), time.Now().Unix())
 	if !admin {
 		query = query.Where("user_id = ?", c.GetInt("id"))
+		var job model.AsyncMediaJob
+		if err := query.Session(&gorm.Session{}).Take(&job).Error; err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				status = http.StatusConflict
+			}
+			imageManagementError(c, status, errors.New("Media task cannot be changed in its current phase"))
+			return
+		}
+		if _, err := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId); err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+				status = http.StatusNotFound
+			}
+			imageManagementError(c, status, errors.New("Media task is unavailable"))
+			return
+		}
 	}
 	updates := map[string]any{}
 	switch action {
@@ -419,7 +563,13 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	}
 	videos := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{})
 	if !admin {
-		videos = videos.Where("user_id = ?", c.GetInt("id"))
+		userID := c.GetInt("id")
+		videos = videos.Where("user_id = ?", userID)
+		ownerSubject := model.DB.WithContext(c.Request.Context()).Model(&model.User{}).
+			Select("COALESCE(canvas_subject, '')").Where("id = ?", userID)
+		previousAccounts := model.DB.WithContext(c.Request.Context()).Model(&model.CanvasGrant{}).
+			Select("token_id").Where("user_id = ?", userID).Where("subject NOT IN (?)", ownerSubject)
+		videos = videos.Where("token_id NOT IN (?)", previousAccounts)
 	}
 	mediaType := c.Query("media_type")
 	if mediaType != "" && mediaType != "image" && mediaType != "video" {

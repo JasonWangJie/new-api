@@ -561,7 +561,10 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
 		return err
 	}
-	if err := validateMediaToken(ctx, token, request.ClientIP); err != nil {
+	authenticate := middleware.TokenAuth()
+	if model.IsCanvasTokenKey(token.Key) {
+		authenticate = middleware.CanvasAsyncMediaWorkerAuth(job.TokenId, job.UserId)
+	} else if err := validateMediaToken(ctx, token, request.ClientIP); err != nil {
 		return err
 	}
 	engine := gin.New()
@@ -572,7 +575,7 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 	if !validOperation {
 		return errors.New("encrypted video operation is invalid")
 	}
-	handler := []gin.HandlerFunc{middleware.BodyStorageCleanup(), middleware.TokenAuth(), middleware.PinTaskPluginEndpoint(), func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	handler := []gin.HandlerFunc{middleware.BodyStorageCleanup(), authenticate, middleware.PinTaskPluginEndpoint(), func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		value, _ := c.Get(pluginruntime.ContextKeyPinnedPlugin)
 		pinned, ok := value.(pluginruntime.PinnedPlugin)
 		endpointValue, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
@@ -679,7 +682,9 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 	}
 	req.RemoteAddr = net.JoinHostPort(request.ClientIP, "0")
 	req.Header.Set("Content-Type", request.ContentType)
-	req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+	if !model.IsCanvasTokenKey(token.Key) {
+		req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+	}
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, req)
 	if executionErr != nil {

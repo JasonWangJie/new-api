@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -41,6 +42,7 @@ type asyncImageResponseWriter struct {
 const (
 	asyncImageUpstreamRequestIDContextKey = "async_image_upstream_request_id"
 	asyncImageUpstreamStatusContextKey    = "async_image_upstream_status"
+	asyncImageResolutionModelContextKey   = "async_image_resolution_model"
 )
 
 func (writer *asyncImageResponseWriter) Header() http.Header { return writer.Headers }
@@ -220,7 +222,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		request.Platform = "gemini"
 	}
 	upstreamPath := "/v1/images/generations"
-	if request.Kind == "image_to_image" && !(service.ImageChannelCapability(*channel, request.Model).ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async")) {
+	tianyue := channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility
+	if tianyue {
+		c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
+	}
+	if request.Kind == "image_to_image" && !tianyue && !(service.ImageChannelCapability(*channel, request.Model).ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async")) {
 		upstreamPath = "/v1/images/edits"
 	}
 	if request.Platform == "gemini" {
@@ -266,6 +272,13 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		funding := model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}
 		return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, *completion, cfg, funding)
 	}
+	if len(channel.GetSetting().ImageResolutionModelMapping[request.Model]) > 0 {
+		mapped := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model}}
+		if err := helper.ModelMappedHelper(c, mapped, nil); err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
+		c.Set(asyncImageResolutionModelContextKey, mapped.UpstreamModelName)
+	}
 	var parsed dto.Request
 	var nativeBody []byte
 	var submitImageURLs []string
@@ -279,7 +292,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		var images []map[string]string
 		mode := service.ImageChannelReferenceTransport(*channel, request.Platform, task.ReferenceRetryCount, cfg)
 		referenceIndex := 0
-		for _, part := range request.Parts {
+		for partIndex, part := range request.Parts {
 			if accepted {
 				break
 			}
@@ -287,6 +300,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				continue
 			}
 			referenceIndex++
+			if tianyue && part.Type == "mask" {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: "TianYue image generation does not support masks", HTTPStatus: http.StatusBadRequest}
+			}
 			reference := part.URL
 			bound, err := service.IsBoundImageReference(ctx, task.TokenId, reference)
 			if err != nil {
@@ -298,6 +314,12 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 					return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 				}
 				reference = image.DataURL()
+				if tianyue {
+					reference, err = service.TianyueImageReferenceURL(task, partIndex, cfg)
+					if err != nil {
+						return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
+					}
+				}
 				localReferences = true
 			} else {
 				remoteReferences = true
@@ -315,7 +337,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		if len(images) > 0 {
 			capability := service.ImageChannelCapability(*channel, request.Model)
-			if capability.ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async") {
+			if tianyue || capability.ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async") {
 				urls := make([]string, 0, len(images))
 				for _, image := range images {
 					urls = append(urls, image["image_url"])
@@ -324,14 +346,25 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				if err != nil {
 					return nil, model.AsyncImageBill{}, err
 				}
-				request.Native[capability.ReferenceField] = data
 				delete(request.Native, "images")
+				field := capability.ReferenceField
+				if tianyue {
+					field = "images"
+				}
+				request.Native[field] = data
 			} else {
 				data, err := common.Marshal(images)
 				if err != nil {
 					return nil, model.AsyncImageBill{}, err
 				}
 				request.Native["images"] = data
+			}
+		}
+		if tianyue {
+			var err error
+			request.Native, err = service.TianyueImageRequest(request, submitImageURLs)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
 			}
 		}
 		var err error
@@ -431,7 +464,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		// multipart edits but do not implement JSON image references.
 		editFormat = request.InputFormat
 	}
-	if request.Platform == "openai" && request.Kind == "image_to_image" && editFormat == "multipart" && !accepted {
+	if request.Platform == "openai" && request.Kind == "image_to_image" && editFormat == "multipart" && !tianyue && !accepted {
 		var encoded bytes.Buffer
 		form := multipart.NewWriter(&encoded)
 		for key, raw := range request.Native {
@@ -441,6 +474,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			var value string
 			if common.Unmarshal(raw, &value) != nil {
 				value = string(raw)
+			}
+			if key == "model" && c.GetString(asyncImageResolutionModelContextKey) != "" {
+				value = c.GetString(asyncImageResolutionModelContextKey)
 			}
 			if err := form.WriteField(key, value); err != nil {
 				return nil, model.AsyncImageBill{}, err
@@ -640,6 +676,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				return nil, model.AsyncImageBill{}, err
 			}
 		}
+		if err := validateAsyncImageResolutionModel(c, body, false); err != nil {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
@@ -650,6 +689,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
 			}
 			if asyncProfile.Submit.Request.Body != nil {
+				if err := validateAsyncImageResolutionSubmitModel(c, submitRequest); err != nil {
+					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+				}
 				if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, request.Count); err != nil {
 					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
 				}
@@ -730,6 +772,37 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		Billing:     service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup},
 		BillingBody: nativeBody, UpstreamModel: info.UpstreamModelName, BillingModel: info.GetBillingModelName(),
 	}
+	if tianyue {
+		if _, dynamic := c.Get(contextKeyUpstreamAsyncImageURLs); !dynamic {
+			var response struct {
+				Data []struct {
+					URL string `json:"url"`
+				} `json:"data"`
+			}
+			if common.Unmarshal(completion.Body, &response) == nil && len(response.Data) > 0 {
+				urls := make([]string, 0, len(response.Data))
+				for _, item := range response.Data {
+					if item.URL == "" {
+						urls = nil
+						break
+					}
+					resultURL := item.URL
+					if strings.HasPrefix(resultURL, "/") && !strings.HasPrefix(resultURL, "//") {
+						base, baseErr := url.Parse(strings.TrimRight(info.ChannelBaseUrl, "/") + "/")
+						parsed, parseErr := url.Parse(resultURL)
+						if baseErr == nil && parseErr == nil {
+							resultURL = base.ResolveReference(parsed).String()
+						}
+					}
+					urls = append(urls, resultURL)
+				}
+				if len(urls) > 0 {
+					c.Set(contextKeyUpstreamAsyncImageURLs, urls)
+					c.Set(contextKeyUpstreamAsyncImageProfile, &dto.UpstreamAsyncProfile{ID: "tianyue-sync-image", MediaType: dto.UpstreamAsyncMediaImage, Poll: dto.UpstreamAsyncPoll{Response: dto.UpstreamAsyncPollResponse{DownloadHeaders: map[string]string{"Authorization": "Bearer {api_key}"}}}})
+				}
+			}
+		}
+	}
 	if task.UpstreamSucceededAt > 0 {
 		completion.EvaluatedAt = time.Unix(task.UpstreamSucceededAt, 0)
 	}
@@ -784,7 +857,11 @@ func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task mode
 		if err := model.RecordAsyncImageUpstreamResult(ctx, task, publicURLs); err != nil {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_record_failed", Message: "Upstream image result could not be recorded"}
 		}
-		images, err = service.DownloadUpstreamAsyncImages(ctx, urls, profile, info.ChannelBaseUrl, info.ChannelSetting.Proxy, service.UpstreamAsyncTemplateContext{
+		download := service.DownloadUpstreamAsyncImages
+		if info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+			download = service.DownloadTianyueImages
+		}
+		images, err = download(ctx, urls, profile, info.ChannelBaseUrl, info.ChannelSetting.Proxy, service.UpstreamAsyncTemplateContext{
 			TaskID:        task.UpstreamTaskId,
 			Model:         info.OriginModelName,
 			UpstreamModel: info.UpstreamModelName,

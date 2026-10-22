@@ -1075,7 +1075,7 @@ func applyOriginTaskIntent(c *gin.Context, intent map[string]any, meta pluginrun
 		if err != nil {
 			return &originTaskIntentError{Code: "origin_task_not_found", Message: "origin task not found or not owned by you", StatusCode: http.StatusInternalServerError}
 		}
-		if !exist || task == nil {
+		if !exist || !service.CanvasTaskAccess(c, task) {
 			return &originTaskIntentError{Code: "origin_task_not_found", Message: "origin task not found or not owned by you", StatusCode: http.StatusBadRequest}
 		}
 		if _, allowed := allowedPlatform[task.Platform]; !allowed {
@@ -1169,7 +1169,7 @@ func renderTaskPluginQuery(
 	views := make([]map[string]any, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
 		task := tasksByID[taskID]
-		if task == nil {
+		if !service.CanvasTaskAccess(c, task) {
 			logger.LogDebug(
 				c,
 				"task_plugin subsystem=query event=lookup_failed generation=%d plugin=%q reason=task_not_found requested=%d found=%d",

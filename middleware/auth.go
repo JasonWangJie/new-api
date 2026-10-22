@@ -474,65 +474,83 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 
-		allowIps := token.GetIpLimits()
-		if len(allowIps) > 0 {
-			clientIp := c.ClientIP()
-			logger.LogDebug(c, "Token has IP restrictions, checking client IP %s", clientIp)
-			ip := net.ParseIP(clientIp)
-			if ip == nil {
-				abortWithOpenAiMessage(c, http.StatusForbidden, "无法解析客户端 IP 地址")
-				return
-			}
-			if common.IsIpInCIDRList(ip, allowIps) == false {
-				abortWithOpenAiMessage(c, http.StatusForbidden, "您的 IP 不在令牌允许访问的列表中", types.ErrorCodeAccessDenied)
-				return
-			}
-			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
-		}
-
-		userCache := canvasUser
-		if userCache == nil {
-			userCache, err = model.GetUserCache(token.UserId)
-		}
-		if err != nil {
-			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
-			abortWithOpenAiMessage(c, http.StatusInternalServerError,
-				common.TranslateMessage(c, i18n.MsgDatabaseError))
-			return
-		}
-		userEnabled := userCache.Status == common.UserStatusEnabled
-		if !userEnabled {
-			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
-			return
-		}
-
-		userCache.WriteContext(c)
-
-		userGroup := userCache.Group
-		tokenGroup := token.Group
-		if tokenGroup != "" {
-			// check common.UserUsableGroups[userGroup]
-			if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
-				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("无权访问 %s 分组", tokenGroup))
-				return
-			}
-			// check group in common.GroupRatio
-			if !ratio_setting.ContainsGroupRatio(tokenGroup) {
-				if tokenGroup != "auto" {
-					abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("分组 %s 已被弃用", tokenGroup))
-					return
-				}
-			}
-			userGroup = tokenGroup
-		}
-		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
-
-		err = SetupContextForToken(c, token, parts...)
-		if err != nil {
+		if !authorizeRelayToken(c, token, canvasUser, parts...) {
 			return
 		}
 		c.Next()
 	}
+}
+
+// CanvasAsyncMediaWorkerAuth is restricted to ExecuteAsyncVideo's private
+// engine. Public relay routes must continue to use TokenAuth and client proof.
+func CanvasAsyncMediaWorkerAuth(tokenID, userID int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost || (c.Request.URL.Path != "/v1/videos" && c.Request.URL.Path != "/v1/videos/edits" && c.Request.URL.Path != "/v1/videos/extensions") {
+			abortWithOpenAiMessage(c, http.StatusUnauthorized, service.ErrCanvasAuthorization.Error())
+			return
+		}
+		token, user, grant, err := service.ValidateCanvasWorkerCredential(c.Request.Context(), tokenID, userID)
+		if err != nil {
+			status := http.StatusUnauthorized
+			if errors.Is(err, service.ErrCanvasUnavailable) {
+				status = http.StatusServiceUnavailable
+			}
+			abortWithOpenAiMessage(c, status, err.Error())
+			return
+		}
+		c.Set(service.CanvasGrantContextKey, grant)
+		c.Set("canvas_subject", grant.Subject)
+		if !authorizeRelayToken(c, token, user) {
+			return
+		}
+		c.Next()
+	}
+}
+
+func authorizeRelayToken(c *gin.Context, token *model.Token, user *model.UserBase, parts ...string) bool {
+	allowIps := token.GetIpLimits()
+	if len(allowIps) > 0 {
+		clientIp := c.ClientIP()
+		logger.LogDebug(c, "Token has IP restrictions, checking client IP %s", clientIp)
+		ip := net.ParseIP(clientIp)
+		if ip == nil {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "无法解析客户端 IP 地址")
+			return false
+		}
+		if !common.IsIpInCIDRList(ip, allowIps) {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "您的 IP 不在令牌允许访问的列表中", types.ErrorCodeAccessDenied)
+			return false
+		}
+		logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
+	}
+	if user == nil {
+		var err error
+		user, err = model.GetUserCache(token.UserId)
+		if err != nil {
+			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, common.TranslateMessage(c, i18n.MsgDatabaseError))
+			return false
+		}
+	}
+	if user.Status != common.UserStatusEnabled {
+		abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
+		return false
+	}
+	user.WriteContext(c)
+	userGroup := user.Group
+	if tokenGroup := token.Group; tokenGroup != "" {
+		if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
+			abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("无权访问 %s 分组", tokenGroup))
+			return false
+		}
+		if !ratio_setting.ContainsGroupRatio(tokenGroup) && tokenGroup != "auto" {
+			abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("分组 %s 已被弃用", tokenGroup))
+			return false
+		}
+		userGroup = tokenGroup
+	}
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
+	return SetupContextForToken(c, token, parts...) == nil
 }
 
 func authenticateCanvasRelay(c *gin.Context, key, proof string) (*model.Token, *model.UserBase, error) {

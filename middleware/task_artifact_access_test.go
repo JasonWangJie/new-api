@@ -150,6 +150,20 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), request)
 
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
+	router.GET("/api/image-task-references/:task_id/:index/content", func(c *gin.Context) {
+		assert.Equal(t, "1893456789", c.Query("expires"))
+		assert.Equal(t, "reference-key-never-log", c.Query("key"))
+		assert.Equal(t, "reference-signature-never-log", c.Query("signature"))
+		c.Status(http.StatusNoContent)
+	})
+	reference := httptest.NewRequest(http.MethodGet, "/api/image-task-references/task-1/0/content?expires=1893456789&key=reference-key-never-log&signature=reference-signature-never-log", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, reference)
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+	assert.Contains(t, output.String(), "/api/image-task-references/task-1/0/content")
+	for _, secret := range []string{"1893456789", "reference-key-never-log", "reference-signature-never-log"} {
+		assert.NotContains(t, output.String(), secret)
+	}
 }
 
 func urlQueryEscape(value string) string {

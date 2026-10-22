@@ -132,6 +132,13 @@ func MediaChannelSupportsPlatform(channel *model.Channel, modelName, platform st
 	if ImageChannelSupportsPlatform(*channel, modelName, platform) {
 		return true
 	}
+	return mediaChannelSupportsVideoPlatform(channel, modelName, platform)
+}
+
+func mediaChannelSupportsVideoPlatform(channel *model.Channel, modelName, platform string) bool {
+	if channel == nil {
+		return false
+	}
 	for _, candidate := range mediaVideoCandidates(modelName) {
 		if candidate.Plugin == nil || candidate.Protocol != "openai_video" || candidate.Plugin.Meta.Key != platform {
 			continue

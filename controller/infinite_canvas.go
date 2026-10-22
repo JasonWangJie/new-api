@@ -198,14 +198,11 @@ func CanvasHistoryTask(c *gin.Context) {
 			c.Status(404)
 			return
 		}
-		var objects []model.MediaArtifactObject
-		if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ? AND token_id = ? AND status = ? AND expires_at > ?", job.TaskId, job.UserId, job.TokenId, "active", time.Now().Unix()).Find(&objects).Error; err != nil {
+		c.Set(service.CanvasGrantContextKey, grant)
+		_, data, err := videoJobView(c, job, false)
+		if err != nil {
 			c.Status(503)
 			return
-		}
-		data := make([]gin.H, 0, len(objects))
-		for _, object := range objects {
-			data = append(data, gin.H{"key": object.ArtifactKey, "url": service.CanvasContentPath("media", job.TaskId, object.ArtifactKey), "content_type": object.MimeType})
 		}
 		c.JSON(200, gin.H{"task_id": job.TaskId, "status": job.Status, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "data": data})
 	default:
@@ -236,6 +233,14 @@ func CanvasInputContent(c *gin.Context) {
 		c.Status(404)
 		return
 	}
+	serveAuthorizedImageObject(c, object)
+}
+
+// serveAuthorizedImageObject is shared by Canvas and dashboard content routes.
+// Callers must establish ownership before passing an object to this function.
+func serveAuthorizedImageObject(c *gin.Context, object model.ImageStorageObject) {
+	canvasResponseHeaders(c)
+	ctx := c.Request.Context()
 	store, err := service.GetImageObjectStorage(ctx, object)
 	if err != nil {
 		c.Status(503)
@@ -274,6 +279,55 @@ func CanvasInputContent(c *gin.Context) {
 	c.Data(200, object.ContentType, data)
 }
 
+// serveAuthorizedImageTaskResult never returns a storage or provider capability.
+// Both confidential-client and dashboard routes recheck access before reading.
+func serveAuthorizedImageTaskResult(c *gin.Context, task model.AsyncImageTask, index int) {
+	canvasResponseHeaders(c)
+	ctx := c.Request.Context()
+	if !task.ResultsAvailable() || task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() || index < 0 || index >= task.ResultCount {
+		c.Status(404)
+		return
+	}
+	if task.ResultSource == model.ImageResultSourceUpstream {
+		urls, err := service.AsyncImageUpstreamResultURLs(ctx, task)
+		if err != nil || index >= len(urls) {
+			c.Status(503)
+			return
+		}
+		cfg, err := service.GetImageRuntimeConfig(ctx)
+		if err != nil {
+			c.Status(503)
+			return
+		}
+		// Preserve DNS, connected-peer, redirect, byte and pixel restrictions.
+		// Application credentials never enter the reference downloader.
+		image, err := service.DownloadImageReference(ctx, urls[index], cfg)
+		if err != nil {
+			c.Status(503)
+			return
+		}
+		c.Header("Content-Type", image.ContentType)
+		c.Header("Content-Length", strconv.Itoa(len(image.Data)))
+		if c.Request.Method == http.MethodHead {
+			c.Status(200)
+			return
+		}
+		c.Data(200, image.ContentType, image.Data)
+		return
+	}
+	var result model.AsyncImageResult
+	if err := model.DB.WithContext(ctx).Where("task_id = ? AND image_index = ?", task.TaskId, index).Take(&result).Error; err != nil {
+		c.Status(404)
+		return
+	}
+	var object model.ImageStorageObject
+	if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ? AND (expires_at = 0 OR expires_at > ?)", result.ObjectId, "active", time.Now().Unix()).Take(&object).Error; err != nil {
+		c.Status(404)
+		return
+	}
+	serveAuthorizedImageObject(c, object)
+}
+
 func CanvasHistoryContent(c *gin.Context) {
 	grant, ok := canvasHistoryIdentity(c)
 	if !ok {
@@ -290,107 +344,22 @@ func CanvasHistoryContent(c *gin.Context) {
 		if !canvasHistoricalOwner(c, grant, task.TokenId, task.UserId) {
 			return
 		}
-		if !task.ResultsAvailable() || task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() {
-			c.Status(404)
-			return
-		}
 		index, err := strconv.Atoi(c.Param("artifact"))
-		if err != nil || index < 0 || index >= task.ResultCount {
+		if err != nil {
 			c.Status(404)
 			return
 		}
-		if task.ResultSource == model.ImageResultSourceUpstream {
-			urls, err := service.AsyncImageUpstreamResultURLs(ctx, task)
-			if err != nil || index >= len(urls) {
-				c.Status(503)
-				return
-			}
-			cfg, err := service.GetImageRuntimeConfig(ctx)
-			if err != nil {
-				c.Status(503)
-				return
-			}
-			// Reuse the reference downloader's DNS, connected-peer, redirect,
-			// byte and pixel limits. Application credentials never enter it.
-			image, err := service.DownloadImageReference(ctx, urls[index], cfg)
-			if err != nil {
-				c.Status(503)
-				return
-			}
-			c.Header("Content-Type", image.ContentType)
-			c.Header("Content-Length", strconv.Itoa(len(image.Data)))
-			if c.Request.Method == http.MethodHead {
-				c.Status(200)
-				return
-			}
-			c.Data(200, image.ContentType, image.Data)
-			return
-		}
-		var result model.AsyncImageResult
-		if err := model.DB.WithContext(ctx).Where("task_id = ? AND image_index = ?", task.TaskId, index).Take(&result).Error; err != nil {
-			c.Status(404)
-			return
-		}
-		var object model.ImageStorageObject
-		if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ? AND (expires_at = 0 OR expires_at > ?)", result.ObjectId, "active", time.Now().Unix()).Take(&object).Error; err != nil {
-			c.Status(404)
-			return
-		}
-		store, err := service.GetImageObjectStorage(ctx, object)
-		if err != nil {
-			c.Status(503)
-			return
-		}
-		if store.Profile.Backend == "local" {
-			filename, err := store.LocalPath(object.ObjectKey, false)
-			if err != nil {
-				c.Status(404)
-				return
-			}
-			c.Header("Content-Type", object.ContentType)
-			c.File(filename)
-			return
-		}
-		cfg, err := service.GetImageRuntimeConfig(ctx)
-		if err != nil {
-			c.Status(503)
-			return
-		}
-		if object.ByteSize > cfg.DownloadMaxBytes {
-			c.Status(413)
-			return
-		}
-		if c.Request.Method == http.MethodHead {
-			c.Header("Content-Type", object.ContentType)
-			c.Header("Content-Length", strconv.FormatInt(object.ByteSize, 10))
-			c.Status(200)
-			return
-		}
-		data, err := store.Read(ctx, object.ObjectKey, cfg.DownloadMaxBytes)
-		if err != nil {
-			c.Status(503)
-			return
-		}
-		c.Data(200, object.ContentType, data)
+		serveAuthorizedImageTaskResult(c, task, index)
 	case "media":
-		var object model.MediaArtifactObject
-		if err := model.DB.WithContext(ctx).Where("task_id = ? AND artifact_key = ? AND user_id = ? AND status = ? AND expires_at > ?", c.Param("task_id"), c.Param("artifact"), grant.Identity.UserID, "active", time.Now().Unix()).Take(&object).Error; err != nil {
+		var job model.AsyncMediaJob
+		if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", c.Param("task_id"), grant.Identity.UserID).Take(&job).Error; err != nil {
 			c.Status(404)
 			return
 		}
-		if !canvasHistoricalOwner(c, grant, object.TokenId, object.UserId) {
+		if !canvasHistoricalOwner(c, grant, job.TokenId, job.UserId) {
 			return
 		}
-		store := service.GetTaskArtifactStore()
-		task := &model.Task{TaskID: object.TaskId, UserId: object.UserId}
-		ref, err := store.Resolve(task, object.ArtifactKey)
-		if err != nil || ref == nil {
-			c.Status(404)
-			return
-		}
-		if err := store.Serve(c, task, ref); err != nil && !c.Writer.Written() {
-			c.Status(404)
-		}
+		serveAuthorizedMediaTaskResult(c, job, c.Param("artifact"))
 	default:
 		c.Status(404)
 	}

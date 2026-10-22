@@ -6,8 +6,12 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/tidwall/gjson"
 )
 
 type ChannelSettings struct {
@@ -19,11 +23,15 @@ type ChannelSettings struct {
 	ImageAttemptTimeoutSeconds  *int   `json:"image_attempt_timeout_seconds,omitempty"`
 	ImageConcurrencyLimit       *int   `json:"image_concurrency_limit,omitempty"`
 	ImageReferenceTransportMode string `json:"image_reference_transport_mode,omitempty"`
-	Proxy                       string `json:"proxy"`
-	PassThroughBodyEnabled      bool   `json:"pass_through_body_enabled,omitempty"`
-	ResponsesWebSocketEnabled   bool   `json:"responses_websocket_enabled,omitempty"`
-	SystemPrompt                string `json:"system_prompt,omitempty"`
-	SystemPromptOverride        bool   `json:"system_prompt_override,omitempty"`
+	TianyueMediaCompatibility   bool   `json:"tianyue_media_compatibility,omitempty"`
+	// ImageResolutionModelMapping selects final upstream names for asynchronous
+	// images only. A configured model cannot use a tier absent from its map.
+	ImageResolutionModelMapping ImageResolutionModelMapping `json:"image_resolution_model_mapping,omitempty"`
+	Proxy                       string                      `json:"proxy"`
+	PassThroughBodyEnabled      bool                        `json:"pass_through_body_enabled,omitempty"`
+	ResponsesWebSocketEnabled   bool                        `json:"responses_websocket_enabled,omitempty"`
+	SystemPrompt                string                      `json:"system_prompt,omitempty"`
+	SystemPromptOverride        bool                        `json:"system_prompt_override,omitempty"`
 	// HTTPProtocol controls outbound HTTP version negotiation for this channel.
 	// Accepted values: "", "auto" (default), "http1".
 	HTTPProtocol string `json:"http_protocol,omitempty"`
@@ -32,10 +40,66 @@ type ChannelSettings struct {
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
 }
 
+type ImageResolutionModelMapping map[string]map[string]string
+
+// UnmarshalJSON rejects ambiguous duplicate rules instead of accepting the
+// last JSON object member silently. Decoding still uses the module's codec.
+func (mapping *ImageResolutionModelMapping) UnmarshalJSON(data []byte) error {
+	var decoded map[string]map[string]string
+	if err := kitutil.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(decoded))
+	var duplicateErr error
+	gjson.ParseBytes(data).ForEach(func(source, targets gjson.Result) bool {
+		modelName := source.String()
+		if seen[modelName] {
+			duplicateErr = fmt.Errorf("duplicate image resolution mapping model: %s", modelName)
+			return false
+		}
+		seen[modelName] = true
+		resolutions := make(map[string]bool)
+		targets.ForEach(func(tier, _ gjson.Result) bool {
+			resolution := tier.String()
+			if resolutions[resolution] {
+				duplicateErr = fmt.Errorf("duplicate image resolution mapping tier for %s: %s", modelName, resolution)
+				return false
+			}
+			resolutions[resolution] = true
+			return true
+		})
+		return duplicateErr == nil
+	})
+	if duplicateErr != nil {
+		return duplicateErr
+	}
+	*mapping = decoded
+	return nil
+}
+
 // ValidateImageGeneration validates save-time image generation channel settings.
 func (s *ChannelSettings) ValidateImageGeneration() error {
 	if s == nil {
 		return nil
+	}
+	for source, targets := range s.ImageResolutionModelMapping {
+		if len(targets) == 0 {
+			return fmt.Errorf("image resolution mapping requires at least one tier for %s", source)
+		}
+		names := []string{source}
+		for resolution, target := range targets {
+			switch resolution {
+			case "1K", "2K", "4K":
+			default:
+				return fmt.Errorf("invalid image resolution mapping tier: %s", resolution)
+			}
+			names = append(names, target)
+		}
+		for _, name := range names {
+			if name == "" || name != strings.TrimSpace(name) || len(name) > 255 || !utf8.ValidString(name) || strings.Contains(name, "*") || strings.ContainsFunc(name, unicode.IsControl) {
+				return fmt.Errorf("invalid model name in image resolution mapping")
+			}
+		}
 	}
 	if s.ImageMaxReferenceImages != nil && (*s.ImageMaxReferenceImages < 0 || *s.ImageMaxReferenceImages > MaxImageN) {
 		return fmt.Errorf("invalid image_max_reference_images: %d", *s.ImageMaxReferenceImages)

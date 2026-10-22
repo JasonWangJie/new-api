@@ -46,6 +46,12 @@ func GetStatus(c *gin.Context) {
 	cs := console_setting.GetConsoleSetting()
 	passkeySetting := system_setting.PasskeySettingsSnapshot()
 	canvasSetting := system_setting.InfiniteCanvasSettingsSnapshot()
+	if origin, err := system_setting.CanvasOrigin(canvasSetting.URL); err == nil {
+		canvasSetting.URL = origin
+	} else {
+		canvasSetting.Enabled = false
+		canvasSetting.URL = ""
+	}
 	common.OptionMapRWMutex.RLock()
 	defer common.OptionMapRWMutex.RUnlock()
 

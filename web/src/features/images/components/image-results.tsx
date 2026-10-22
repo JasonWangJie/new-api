@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Download, Expand, ImageIcon } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -40,6 +40,7 @@ export function ImageResults({
     title?: string
     description?: string
     direct?: boolean
+    blob?: Blob
   }[]
   actions?: (id: string) => ReactNode
   empty?: string
@@ -47,6 +48,25 @@ export function ImageResults({
 }) {
   const { t } = useTranslation()
   const [preview, setPreview] = useState<number | null>(null)
+  const [blobUrls, setBlobUrls] = useState<Map<Blob, string>>(() => new Map())
+  useEffect(() => {
+    const next = new Map<Blob, string>()
+    for (const image of images) {
+      if (image.blob && !next.has(image.blob)) {
+        next.set(image.blob, URL.createObjectURL(image.blob))
+      }
+    }
+    setBlobUrls((previous) =>
+      previous.size === 0 && next.size === 0 ? previous : next
+    )
+    return () => {
+      for (const url of next.values()) URL.revokeObjectURL(url)
+    }
+  }, [images])
+  const displayedImages = images.map((image) => ({
+    ...image,
+    url: image.blob ? blobUrls.get(image.blob) || '' : image.url,
+  }))
   const download = async (index: number) => {
     try {
       const image = images[index]
@@ -54,7 +74,7 @@ export function ImageResults({
         window.open(image.url, '_blank', 'noopener,noreferrer')
         return
       }
-      const blob = await imageBlob(image.url)
+      const blob = image.blob || (await imageBlob(image.url))
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
@@ -83,7 +103,7 @@ export function ImageResults({
   return (
     <>
       <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3'>
-        {images.map((image, index) => (
+        {displayedImages.map((image, index) => (
           <article
             key={image.id}
             className='bg-card overflow-hidden rounded-xl border'
@@ -93,9 +113,10 @@ export function ImageResults({
               className='bg-muted/30 group focus-visible:ring-ring relative block aspect-square w-full focus-visible:ring-2'
               aria-label={`${t('Image Preview')}: ${image.title || index + 1}`}
               onClick={() => setPreview(index)}
+              disabled={!image.url}
             >
               <img
-                src={image.url}
+                src={image.url || undefined}
                 alt={image.title || t('Generated image')}
                 className='h-full w-full object-contain'
                 loading='lazy'
@@ -134,7 +155,7 @@ export function ImageResults({
       {preview !== null && images.length > 0 && (
         <ImageDialog
           key={images[preview]?.id}
-          images={images.map((image) => image.url)}
+          images={displayedImages.map((image) => image.url)}
           initialIndex={preview}
           open
           presentation={previewMode}

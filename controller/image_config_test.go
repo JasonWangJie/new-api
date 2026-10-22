@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -271,6 +272,151 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 				selected, _, err = service.PickImageChannel(t.Context(), policy, request, service.ImageAccountRouting{})
 				require.NoError(t, err)
 				assert.Equal(t, 11, selected.Id, "missing binding preserves global priority routing")
+			})
+
+			t.Run("resolution mappings survive storage edits and channel copies", func(t *testing.T) {
+				group := "resolution-mapping-test"
+				ordinaryMapping := `{"seedream-5-pro":"legacy-image","seedream-5-pro-2K":"wrong-chain-target"}`
+				channel := model.Channel{Type: 1, Name: "One upstream", Key: "mapping-test-key", Status: common.ChannelStatusEnabled, Models: "seedream-5-pro,other-image", Group: group, ModelMapping: &ordinaryMapping}
+				settings := dto.ChannelSettings{ImageResolutionModelMapping: dto.ImageResolutionModelMapping{
+					"seedream-5-pro": {"1K": "seedream-5-pro-1K", "2K": "seedream-5-pro-2K"},
+				}}
+				channel.SetSetting(settings)
+				require.NoError(t, channel.ValidateSettings())
+				require.NoError(t, channel.Insert())
+				defer func() {
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Ability{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Channel{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.ImageChannelPool{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.ImageGroupPolicy{}).Error)
+				}()
+				loaded, err := model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, settings.ImageResolutionModelMapping, loaded.GetSetting().ImageResolutionModelMapping)
+
+				policy := model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "model_resolution", AsyncEnabled: true}
+				for _, resolution := range []string{"1K", "2K"} {
+					require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(policy, "seedream-5-pro", resolution), Group: group, Platform: "openai", Mode: "model_resolution", Model: "seedream-5-pro", Resolution: resolution, ChannelId: channel.Id, Priority: 7}).Error)
+					candidates, err := service.ImageCandidateChannels(t.Context(), policy, "seedream-5-pro", resolution)
+					require.NoError(t, err)
+					require.Len(t, candidates, 1)
+					var mapping map[string]string
+					require.NoError(t, common.UnmarshalJsonStr(candidates[0].GetModelMapping(), &mapping))
+					assert.Equal(t, "seedream-5-pro-"+resolution, mapping["seedream-5-pro"])
+					assert.Equal(t, 7, candidates[0].GetWeight())
+				}
+				for _, resolution := range []string{"4K", "", "AUTO"} {
+					candidates, err := service.ImageCandidateChannels(t.Context(), policy, "seedream-5-pro", resolution)
+					require.NoError(t, err)
+					assert.Empty(t, candidates, "unconfigured tier %q must not use the ordinary mapping", resolution)
+				}
+				candidates, err := service.ImageCandidateChannels(t.Context(), policy, "other-image", "4K")
+				require.NoError(t, err)
+				require.Len(t, candidates, 1, "rules for one model must not restrict another model")
+				assert.Equal(t, ordinaryMapping, candidates[0].GetModelMapping())
+				policy.AsyncEnabled = false
+				candidates, err = service.ImageCandidateChannels(t.Context(), policy, "seedream-5-pro", "4K")
+				require.NoError(t, err)
+				require.Len(t, candidates, 1, "synchronous routing retains the ordinary mapping")
+				assert.Equal(t, ordinaryMapping, candidates[0].GetModelMapping())
+
+				t.Run("variant-only aliases stay visible only for asynchronous policies", func(t *testing.T) {
+					originalCapability := service.ImageChannelCapabilityFunc
+					service.ImageChannelCapabilityFunc = func(channel model.Channel, modelName string) dto.ImageCapability {
+						capability := originalCapability(channel, modelName)
+						if modelName == "seedream-5-pro" {
+							var mapping map[string]string
+							if common.UnmarshalJsonStr(channel.GetModelMapping(), &mapping) != nil {
+								capability.Generate = false
+							} else {
+								capability.Generate = mapping[modelName] == "seedream-5-pro-1K" || mapping[modelName] == "seedream-5-pro-2K"
+							}
+						}
+						return capability
+					}
+					defer func() { service.ImageChannelCapabilityFunc = originalCapability }()
+					options, err := service.GetImagePoolSelectionOptions(t.Context(), group, "openai")
+					require.NoError(t, err)
+					assert.True(t, slices.ContainsFunc(options.Models, func(option service.ImagePoolModelOption) bool {
+						return option.Id == "seedream-5-pro" && slices.Contains(option.ChannelIds, channel.Id) && slices.Contains(option.MediaTypes, "image")
+					}), "a variant-only alias must be selectable before its policy is created")
+					catalog, err := common.Marshal([]service.ImageModelCapability{{Id: "seedream-5-pro", Resolutions: []string{"1K", "2K", "4K"}, MaxOutputImages: 1}})
+					require.NoError(t, err)
+					configuredPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash(group, "openai"), Group: group, Platform: "openai", PoolMode: "model_resolution", Models: string(catalog), Enabled: true, AsyncEnabled: true}
+					require.NoError(t, db.Create(&configuredPolicy).Error)
+					defer func() { assert.NoError(t, db.Delete(&configuredPolicy).Error) }()
+					user := model.User{Username: "resolution-capability-user", AffCode: "imgres", Group: "default", Status: common.UserStatusEnabled}
+					require.NoError(t, db.Create(&user).Error)
+					token := model.Token{UserId: user.Id, Key: "resolution-capability-token", Group: group, Status: common.TokenStatusEnabled, ExpiredTime: -1}
+					require.NoError(t, db.Create(&token).Error)
+					for _, async := range []bool{true, false} {
+						require.NoError(t, db.Model(&configuredPolicy).Update("async_enabled", async).Error)
+						options, err = service.GetImagePoolSelectionOptions(t.Context(), group, "openai")
+						require.NoError(t, err)
+						if async {
+							require.Len(t, options.Models, 1)
+							assert.Equal(t, []int{channel.Id}, options.Models[0].ChannelIds)
+						} else {
+							assert.Empty(t, options.Models, "synchronous policies must not gain support from asynchronous mappings")
+						}
+						recorder := httptest.NewRecorder()
+						ctx, _ := gin.CreateTestContext(recorder)
+						ctx.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+						ctx.Params = gin.Params{{Key: "token_id", Value: strconv.Itoa(token.Id)}}
+						ctx.Set("id", user.Id)
+						GetImageWorkbenchCapabilities(ctx)
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						var response struct {
+							Data struct {
+								Models []struct {
+									Id         string                       `json:"id"`
+									Capability service.ImageModelCapability `json:"capability"`
+								} `json:"models"`
+							} `json:"data"`
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						if async {
+							require.Len(t, response.Data.Models, 1, "enumeration must not require an unspecified-resolution route")
+							assert.Equal(t, "seedream-5-pro", response.Data.Models[0].Id)
+							assert.Equal(t, []string{"1K", "2K"}, response.Data.Models[0].Capability.Resolutions)
+						} else {
+							assert.Empty(t, response.Data.Models, "synchronous discovery must continue using the ordinary mapping")
+						}
+					}
+				})
+
+				loaded, err = model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, ordinaryMapping, loaded.GetModelMapping(), "routing must not persist its effective mapping")
+				loaded.Name = "Renamed upstream"
+				require.NoError(t, loaded.Update())
+				loaded, err = model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, settings.ImageResolutionModelMapping, loaded.GetSetting().ImageResolutionModelMapping)
+				clone := *loaded
+				clone.Id, clone.Name = 0, "Copied upstream"
+				require.NoError(t, clone.ValidateSettings())
+				require.NoError(t, clone.Insert())
+				copied, err := model.GetChannelById(clone.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, settings.ImageResolutionModelMapping, copied.GetSetting().ImageResolutionModelMapping)
+				updated := loaded.GetSetting()
+				updated.ImageResolutionModelMapping["seedream-5-pro"]["2K"] = "replacement-image-2K"
+				loaded.SetSetting(updated)
+				require.NoError(t, loaded.ValidateSettings())
+				require.NoError(t, loaded.Update())
+				loaded, err = model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, "replacement-image-2K", loaded.GetSetting().ImageResolutionModelMapping["seedream-5-pro"]["2K"])
+				copied, err = model.GetChannelById(clone.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, "seedream-5-pro-2K", copied.GetSetting().ImageResolutionModelMapping["seedream-5-pro"]["2K"])
+				updated.ImageResolutionModelMapping = nil
+				loaded.SetSetting(updated)
+				require.NoError(t, loaded.Update())
+				loaded, err = model.GetChannelById(channel.Id, true)
+				require.NoError(t, err)
+				assert.Empty(t, loaded.GetSetting().ImageResolutionModelMapping)
 			})
 
 			invalidModelBody, err := common.Marshal(gin.H{

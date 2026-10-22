@@ -21,7 +21,13 @@ import (
 func imageTaskListQuery(c *gin.Context, admin bool) (*gorm.DB, error) {
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncImageTask{})
 	if !admin {
-		query = query.Where("user_id = ?", c.GetInt("id"))
+		userID := c.GetInt("id")
+		query = query.Where("user_id = ?", userID)
+		ownerSubject := model.DB.WithContext(c.Request.Context()).Model(&model.User{}).
+			Select("COALESCE(canvas_subject, '')").Where("id = ?", userID)
+		previousAccounts := model.DB.WithContext(c.Request.Context()).Model(&model.CanvasGrant{}).
+			Select("token_id").Where("user_id = ?", userID).Where("subject NOT IN (?)", ownerSubject)
+		query = query.Where("token_id NOT IN (?)", previousAccounts)
 		for _, key := range []string{"channel_id", "account_id", "user_id"} {
 			if _, present := c.GetQuery(key); present {
 				return nil, errors.New("User image task filters cannot include another user or channel")
@@ -429,6 +435,15 @@ func GetImageTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 404, errors.New("Image task was not found"))
 		return
 	}
+	managed, err := service.CanvasImageTaskManaged(c.Request.Context(), task)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+			status = http.StatusNotFound
+		}
+		imageManagementError(c, status, errors.New("Image task is unavailable"))
+		return
+	}
 	var events []model.AsyncImageEvent
 	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", task.TaskId).Order("id").Find(&events).Error; err != nil {
 		imageManagementError(c, 503, err)
@@ -491,7 +506,9 @@ func GetImageTask(c *gin.Context, admin bool) {
 			}
 			view := base + task.TaskId + "/results/" + strconv.Itoa(result.ImageIndex) + "/view"
 			item := gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt}
-			if cfgErr == nil {
+			if managed {
+				item["url"], item["authenticated"] = view, true
+			} else if cfgErr == nil {
 				if link, signErr := service.ImageObjectURL(c.Request.Context(), object, AsyncImageGatewayBase(), cfg.SignedURLExpiry); signErr == nil {
 					item["url"] = link
 				}
@@ -506,7 +523,16 @@ func GetImageTask(c *gin.Context, admin bool) {
 			return
 		}
 		for i, resultURL := range urls {
-			results = append(results, gin.H{"id": i, "image_index": i, "url": resultURL, "view_url": resultURL, "source": "upstream", "content_type": "", "byte_size": 0, "checksum": "", "width": 0, "height": 0, "created_at": task.UpstreamSucceededAt, "expires_at": task.ExpiresAt})
+			item := gin.H{"id": i, "image_index": i, "url": resultURL, "view_url": resultURL, "source": "upstream", "content_type": "", "byte_size": 0, "checksum": "", "width": 0, "height": 0, "created_at": task.UpstreamSucceededAt, "expires_at": task.ExpiresAt}
+			if managed {
+				base := "/api/user/async-image-tasks/"
+				if admin {
+					base = "/api/admin/async-image-tasks/"
+				}
+				view := base + task.TaskId + "/results/" + strconv.Itoa(i) + "/view"
+				item["url"], item["view_url"], item["authenticated"] = view, view, true
+			}
+			results = append(results, item)
 		}
 	}
 	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)
@@ -531,6 +557,28 @@ func ViewImageTaskResult(c *gin.Context, admin bool) {
 	index, err := strconv.Atoi(c.Param("image_index"))
 	if err != nil || index < 0 {
 		imageManagementError(c, 400, errors.New("Invalid image index"))
+		return
+	}
+	managed, err := service.CanvasImageTaskManaged(ctx, task)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, service.ErrCanvasAuthorization) || errors.Is(err, model.ErrCanvasBillingOwner) {
+			status = http.StatusNotFound
+		}
+		imageManagementError(c, status, errors.New("Image task result is unavailable"))
+		return
+	}
+	if managed {
+		canvasResponseHeaders(c)
+		if index >= task.ResultCount || task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() {
+			imageManagementError(c, http.StatusNotFound, errors.New("Image task result was not found"))
+			return
+		}
+		if strings.Contains(c.GetHeader("Accept"), "application/json") {
+			imageManagementData(c, gin.H{"url": c.Request.URL.Path, "expires_at": task.ExpiresAt, "authenticated": true})
+			return
+		}
+		serveAuthorizedImageTaskResult(c, task, index)
 		return
 	}
 	if task.ResultSource == model.ImageResultSourceUpstream {

@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"image"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
@@ -74,7 +78,7 @@ func TestAsyncImageCompletionRecovery(t *testing.T) {
 			common.IsMasterNode = previousMaster
 			require.NoError(t, err)
 			model.LOG_DB = imageLogs
-			require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}))
+			require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}))
 			require.NoError(t, model.MigrateImageModels(model.DB))
 			require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 			require.NoError(t, model.MigrateImageLogs(model.LOG_DB))
@@ -271,7 +275,7 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 				pricing.BillingMode = map[string]string{"image-fallback-model": billing_setting.BillingModeTieredExpr}
 				pricing.BillingExpr = map[string]string{"image-fallback-model": tc.expression}
 			}
-			require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}))
+			require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}))
 			require.NoError(t, model.MigrateImageModels(model.DB))
 			require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 			require.NoError(t, model.MigrateImageLogs(model.LOG_DB))
@@ -663,4 +667,263 @@ func TestAsyncImageUpstreamFallbackTaskMigration(t *testing.T) {
 	duplicate := legacy
 	duplicate.Id = 0
 	assert.Error(t, db.Create(&duplicate).Error, "migration must preserve the unique task identity")
+}
+
+func TestTianyueImageContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, size, resolution, aspectRatio, wantRatio, wantResolution string
+	}{
+		{name: "square", size: "1024x1024", wantRatio: "1:1", wantResolution: "1K"},
+		{name: "native landscape", size: "1536x1024", wantRatio: "3:2", wantResolution: "2K"},
+		{name: "explicit routing tier", size: "1536x1024", resolution: "1K", wantRatio: "3:2", wantResolution: "1K"},
+		{name: "explicit aspect ratio", size: "1536x1024", resolution: "2K", aspectRatio: "16:9", wantRatio: "16:9", wantResolution: "2K"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := service.AsyncImageRequest{Model: "seedream-5-pro", Prompt: "Preserve the reference scene", Count: 1, Size: tc.size, Resolution: tc.resolution, AspectRatio: tc.aspectRatio, Native: map[string]common.RawMessage{
+				"duration": common.RawMessage(`18446744073709551615`), "n": common.RawMessage(`128`), "quality": common.RawMessage(`"high"`), "detail_level": common.RawMessage(`"standard"`),
+			}}
+			references := []string{"https://gateway.example/reference.png?signature=example"}
+			native, err := service.TianyueImageRequest(request, references)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(native)
+			require.NoError(t, err)
+			var outbound map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &outbound))
+			assert.Equal(t, map[string]any{"model": request.Model, "prompt": request.Prompt, "duration": float64(1), "aspect_ratio": tc.wantRatio, "output_resolution": tc.wantResolution, "detail_level": "standard", "images": []any{references[0]}}, outbound)
+			assert.NoError(t, service.ValidateTianyueImageSubmission(encoded, 1))
+		})
+	}
+	for _, count := range []int{0, 2} {
+		_, err := service.TianyueImageRequest(service.AsyncImageRequest{Count: count}, nil)
+		assert.Error(t, err, "multiple images must be rejected rather than silently changing the requested quantity")
+	}
+	for _, tc := range []struct {
+		name, body string
+		count      int
+	}{
+		{name: "oversized duration after override", body: `{"duration":18446744073709551615}`, count: 1},
+		{name: "negative duration after override", body: `{"duration":-1}`, count: 1},
+		{name: "missing fixed duration", body: `{}`, count: 1},
+		{name: "multiple images after override", body: `{"duration":1}`, count: 2},
+		{name: "reference object", body: `{"duration":1,"images":[{"image_url":"https://example.com/image.png"}]}`, count: 1},
+		{name: "reference data URI", body: `{"duration":1,"images":["data:image/png;base64,aGVsbG8="]}`, count: 1},
+		{name: "private reference", body: `{"duration":1,"images":["https://127.0.0.1/image.png"]}`, count: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Error(t, service.ValidateTianyueImageSubmission([]byte(tc.body), tc.count))
+		})
+	}
+	assert.Nil(t, service.TianyueAsyncImageProfile("seedream-5-pro-1K"), "synchronous model responses must never be interpreted as task receipts")
+	profile := service.TianyueAsyncImageProfile("gpt-image-2-yb")
+	require.NotNil(t, profile)
+	normalized, err := service.NormalizeTianyueImageTask([]byte(`{"code":200,"data":{"task_id":"vendor-image-123","status":"queued"}}`), "https://upstream.example")
+	require.NoError(t, err)
+	taskID, err := service.ParseUpstreamAsyncTaskID(profile, normalized)
+	require.NoError(t, err)
+	assert.Equal(t, "vendor-image-123", taskID)
+	for _, tc := range []struct {
+		name, body string
+		status     model.TaskStatus
+		urls       []string
+		reason     string
+	}{
+		{name: "wrapped running", body: `{"data":{"task_id":"vendor-image-123","status":"running","progress":40}}`, status: model.TaskStatusInProgress},
+		{name: "wrapped completed", body: `{"data":{"status":"completed","data":{"content_url":"/v1/video/generations/vendor-image-123/content"}}}`, status: model.TaskStatusSuccess, urls: []string{"https://upstream.example/v1/video/generations/vendor-image-123/content"}},
+		{name: "wrapped failure", body: `{"data":{"status":"FAILED","fail_reason":"Reference URL expired"}}`, status: model.TaskStatusFailure, reason: "Reference URL expired"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			normalized, err := service.NormalizeTianyueImageTask([]byte(tc.body), "https://upstream.example")
+			require.NoError(t, err)
+			result, err := service.ParseUpstreamAsyncPollResponse(profile, normalized)
+			require.NoError(t, err)
+			assert.Equal(t, tc.status, result.Status)
+			assert.Equal(t, tc.urls, result.URLs)
+			assert.Equal(t, tc.reason, result.Reason)
+		})
+	}
+	_, err = service.NormalizeTianyueImageTask([]byte(`{"data":`), "https://upstream.example")
+	assert.Error(t, err)
+	for _, tc := range []struct {
+		name, resultURL string
+		credentialless  bool
+	}{
+		{name: "same origin content", resultURL: "https://upstream.example/v1/videos/job/content"},
+		{name: "same origin explicit default port", resultURL: "https://upstream.example:443/result.png"},
+		{name: "public HTTPS CDN", resultURL: "https://cdn.example/result.png", credentialless: true},
+		{name: "public HTTP image server", resultURL: "http://216.36.118.192:15000/generated/result.png", credentialless: true},
+		{name: "different scheme", resultURL: "http://upstream.example/result.png", credentialless: true},
+		{name: "different port", resultURL: "https://upstream.example:8443/result.png", credentialless: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scoped, err := service.TianyueImageResultProfile(profile, tc.resultURL, "https://upstream.example")
+			require.NoError(t, err)
+			headers, credentialless, err := service.BuildUpstreamAsyncDownloadHeaders(scoped, tc.resultURL, "https://upstream.example", service.UpstreamAsyncTemplateContext{APIKey: "private-channel-key"})
+			require.NoError(t, err)
+			assert.Equal(t, tc.credentialless, credentialless)
+			if tc.credentialless {
+				assert.Empty(t, headers, "public result servers must never receive the channel key")
+			} else {
+				assert.Equal(t, "Bearer private-channel-key", headers["Authorization"])
+			}
+			assert.Equal(t, map[string]string{"Authorization": "Bearer {api_key}"}, profile.Poll.Response.DownloadHeaders, "scoping one result must preserve the frozen profile for subsequent same-origin results")
+		})
+	}
+}
+
+func TestTianyueImageReferenceAccess(t *testing.T) {
+	db := imageRouterDatabase(t, "tianyue-references")
+	previousDB, previousAddress := model.DB, system_setting.ServerAddress
+	previousType := common.MainDatabaseType()
+	model.DB, system_setting.ServerAddress = db, "https://gateway.example/v1"
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() {
+		model.DB, system_setting.ServerAddress = previousDB, previousAddress
+		common.SetMainDatabaseType(previousType)
+	})
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tianyue-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{23}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tianyue-test")
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.AsyncImageTask{}, &model.ImageInputAlias{}, &model.Option{}, &model.CanvasGrant{}, &model.UserSession{}))
+	now := time.Now().Unix()
+	user := model.User{Username: "tianyue-reference-owner", Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "tianyue-reference-token", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, db.Create(&token).Error)
+	var encodedImage bytes.Buffer
+	require.NoError(t, png.Encode(&encodedImage, image.NewRGBA(image.Rect(0, 0, 3, 2))))
+	request := service.AsyncImageRequest{Count: 1, Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(encodedImage.Bytes())}, {Type: "text", Text: "private reference prompt"}}}
+	payload, err := common.Marshal(request)
+	require.NoError(t, err)
+	task := model.AsyncImageTask{TaskId: "asyncimg_tianyue_reference", UserId: user.Id, TokenId: token.Id, Status: model.ImageTaskInvoking, CreatedAt: now, StartedAt: now, ExpiresAt: now + 3600}
+	task.RequestCipher, err = service.EncryptImagePayload(payload, "task:"+task.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&task).Error)
+	cfg := service.DefaultImageRuntimeConfig()
+	link, err := service.TianyueImageReferenceURL(task, 0, cfg)
+	require.NoError(t, err)
+	parsed, err := url.Parse(link)
+	require.NoError(t, err)
+	routes := gin.New()
+	routes.GET("/api/image-task-references/:task_id/:index/content", controller.TianyueImageReferenceContent)
+	response := httptest.NewRecorder()
+	routes.ServeHTTP(response, httptest.NewRequest(http.MethodGet, link, nil))
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, encodedImage.Bytes(), response.Body.Bytes(), "the anonymous signed GET must serve the actual validated reference")
+	assert.Equal(t, "image/png", response.Header().Get("Content-Type"))
+	assert.Equal(t, "private, no-store", response.Header().Get("Cache-Control"))
+	assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+	for _, tc := range []struct {
+		name, queryKey, queryValue string
+		path                       string
+	}{
+		{name: "different task", path: strings.Replace(parsed.Path, task.TaskId, "asyncimg_another_owner", 1)},
+		{name: "different reference", path: strings.Replace(parsed.Path, "/0/content", "/1/content", 1)},
+		{name: "extended expiry", queryKey: "expires", queryValue: strconv.FormatInt(now+86400, 10)},
+		{name: "expired signature", queryKey: "expires", queryValue: strconv.FormatInt(now-1, 10)},
+		{name: "missing signature", queryKey: "signature"},
+		{name: "invalid signature", queryKey: "signature", queryValue: "invalid"},
+		{name: "unknown signing key", queryKey: "key", queryValue: "unknown-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			modified := *parsed
+			if tc.path != "" {
+				modified.Path = tc.path
+			}
+			if tc.queryKey != "" {
+				query := modified.Query()
+				query.Set(tc.queryKey, tc.queryValue)
+				modified.RawQuery = query.Encode()
+			}
+			recorder := httptest.NewRecorder()
+			routes.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, modified.String(), nil))
+			assert.Equal(t, http.StatusNotFound, recorder.Code)
+			assert.Empty(t, recorder.Body.String(), "authorization failures must not expose task or image details")
+		})
+	}
+	textLink, err := service.TianyueImageReferenceURL(task, 1, cfg)
+	require.NoError(t, err)
+	for _, target := range []string{parsed.Scheme + "://" + parsed.Host + parsed.Path, textLink} {
+		recorder := httptest.NewRecorder()
+		routes.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		assert.Equal(t, http.StatusNotFound, recorder.Code)
+	}
+	for _, tc := range []struct {
+		name, column string
+		entity       any
+		value, reset any
+	}{
+		{name: "disabled token", entity: &token, column: "status", value: common.TokenStatusDisabled, reset: token.Status},
+		{name: "expired token", entity: &token, column: "expired_time", value: now - 1, reset: token.ExpiredTime},
+		{name: "disabled owner", entity: &user, column: "status", value: common.UserStatusDisabled, reset: user.Status},
+		{name: "terminal task", entity: &task, column: "status", value: model.ImageTaskSucceeded, reset: task.Status},
+		{name: "expired task", entity: &task, column: "expires_at", value: now - 1, reset: task.ExpiresAt},
+		{name: "owner binding changed", entity: &task, column: "user_id", value: user.Id + 1000, reset: user.Id},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, db.Model(tc.entity).Update(tc.column, tc.value).Error)
+			t.Cleanup(func() { require.NoError(t, db.Model(tc.entity).Update(tc.column, tc.reset).Error) })
+			recorder := httptest.NewRecorder()
+			routes.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, link, nil))
+			assert.Equal(t, http.StatusNotFound, recorder.Code)
+			assert.Empty(t, recorder.Body.String())
+		})
+	}
+	// A Canvas token must not fall back to ordinary-token access when its grant
+	// is missing, even if the signed image capability is still valid.
+	require.NoError(t, db.Model(&token).Update("key", "ic_tianyue-revoked-grant").Error)
+	recorder := httptest.NewRecorder()
+	routes.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, link, nil))
+	assert.Equal(t, http.StatusNotFound, recorder.Code)
+	t.Run("canvas grant and parent revocation", func(t *testing.T) {
+		previousRedis, previousEnabled, previousMemory, previousSecret := common.RDB, common.RedisEnabled, common.MemoryCacheEnabled, common.SessionSecret
+		settings := config.GlobalConfig.Get("infinite_canvas").(*system_setting.InfiniteCanvasSettings)
+		previousSettings := *settings
+		redisServer := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+		common.RDB, common.RedisEnabled, common.MemoryCacheEnabled, common.SessionSecret = client, true, false, "tianyue-canvas-fixture-secret"
+		t.Cleanup(func() {
+			*settings = previousSettings
+			common.RDB, common.RedisEnabled, common.MemoryCacheEnabled, common.SessionSecret = previousRedis, previousEnabled, previousMemory, previousSecret
+			assert.NoError(t, client.Close())
+		})
+		t.Setenv("INFINITE_CANVAS_CLIENT_SECRET", strings.Repeat("tianyue-test", 4))
+		require.NoError(t, config.UpdateConfigFromMap(settings, map[string]string{"enabled": "true", "url": "https://canvas.example", "client_id": "tianyue-test"}))
+		identity := service.AuthIdentity{UserID: user.Id, SessionID: "tianyue-canvas-parent", UserAuthVersion: 1, SessionVersion: 1}
+		session := model.UserSession{SID: identity.SessionID, UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: strings.Repeat("0", 64), ExpiresAt: now + 3600}
+		require.NoError(t, db.Create(&session).Error)
+		verifier := strings.Repeat("tianyue-pkce", 6)
+		digest := sha256.Sum256([]byte(verifier))
+		redirect, err := service.AuthorizeCanvas(t.Context(), identity, "tianyue-test", "https://canvas.example/auth/callback", strings.Repeat("state", 8), base64.RawURLEncoding.EncodeToString(digest[:]), "S256")
+		require.NoError(t, err)
+		callback, err := url.Parse(redirect)
+		require.NoError(t, err)
+		grant, err := service.ExchangeCanvasCode(t.Context(), callback.Query().Get("code"), "https://canvas.example/auth/callback", verifier)
+		require.NoError(t, err)
+		var record model.CanvasGrant
+		require.NoError(t, db.Where("id = ?", grant.GrantID).Take(&record).Error)
+		require.NoError(t, db.Model(&task).Update("token_id", record.TokenID).Error)
+		valid := httptest.NewRecorder()
+		routes.ServeHTTP(valid, httptest.NewRequest(http.MethodGet, link, nil))
+		require.Equal(t, http.StatusOK, valid.Code, "a live Canvas parent grant permits only the signed task reference")
+		assert.Equal(t, encodedImage.Bytes(), valid.Body.Bytes())
+		for _, tc := range []struct {
+			name, column string
+			entity       any
+			value, reset any
+		}{
+			{name: "grant revoked", entity: &record, column: "revoked_at", value: now, reset: int64(0)},
+			{name: "parent session revoked", entity: &session, column: "status", value: model.UserSessionStatusRevoked, reset: model.UserSessionStatusActive},
+			{name: "parent session expired", entity: &session, column: "expires_at", value: now - 1, reset: session.ExpiresAt},
+			{name: "parent security changed", entity: &user, column: "auth_version", value: 2, reset: int64(1)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.NoError(t, db.Model(tc.entity).Update(tc.column, tc.value).Error)
+				t.Cleanup(func() { require.NoError(t, db.Model(tc.entity).Update(tc.column, tc.reset).Error) })
+				denied := httptest.NewRecorder()
+				routes.ServeHTTP(denied, httptest.NewRequest(http.MethodGet, link, nil))
+				assert.Equal(t, http.StatusNotFound, denied.Code)
+				assert.Empty(t, denied.Body.String())
+			})
+		}
+	})
 }

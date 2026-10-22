@@ -52,6 +52,16 @@ describe('canvas application authorization', () => {
     'https://canvas.example.com?apiKey=secret',
     'https://canvas.example.com/#key',
     'http://canvas.example.com',
+    'https://canvas.example.com?',
+    'https://canvas.example.com#',
+    'https://canvas.example.com/./',
+    'https://canvas.example.com/other/../',
+    'https://canvas.example.com\\',
+    ' https://canvas.example.com',
+    'https://canvas.example.com\n',
+    'https://@canvas.example.com',
+    'https://127.1',
+    'https://0x7f000001',
   ])('rejects untrusted canvas origins: %s', (url) => {
     expect(canvasOrigin(url)).toBeNull()
     expect(
@@ -68,6 +78,22 @@ describe('canvas application authorization', () => {
         infinite_canvas: { enabled: 'true', url: config.url },
       }).enabled
     ).toBe(false)
+  })
+
+  it.each([
+    ['https://CANVAS.Example.COM:443/', 'https://canvas.example.com'],
+    ['https://CANVAS.Example.COM:8443/', 'https://canvas.example.com:8443'],
+    ['http://LOCALHOST:80/', 'http://localhost'],
+    ['http://127.0.0.2:3000/', 'http://127.0.0.2:3000'],
+    ['http://[::1]:80/', 'http://[::1]'],
+    ['http://[0:0:0:0:0:0:0:1]:80/', 'http://[::1]'],
+    ['http://[::ffff:127.0.0.1]:80/', 'http://[::ffff:7f00:1]'],
+    ['https://例子.测试/', 'https://xn--fsqu00a.xn--0zwm56d'],
+  ])('normalizes the configured origin %s to %s', (url, expected) => {
+    expect(canvasOrigin(url)).toBe(expected)
+    expect(
+      canvasIntegration({ infinite_canvas: { enabled: true, url } }).url
+    ).toBe(expected)
   })
 
   it.each([

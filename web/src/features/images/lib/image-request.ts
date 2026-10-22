@@ -137,7 +137,9 @@ export function buildImageRequest(options: ImageRequestOptions): {
             .map((part) => part.text),
         ].join('\n'),
         n: count,
-        ...(model.protocol === 'gemini_native'
+        ...(model.protocol === 'gemini_native' ||
+        (model.provider === 'newapi' &&
+          model.supported_parameters?.includes('output_resolution'))
           ? { resolution, ...(ratio === 'auto' ? {} : { aspect_ratio: ratio }) }
           : { size }),
         ...(quality ? { quality } : {}),
