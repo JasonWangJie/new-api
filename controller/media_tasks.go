@@ -71,10 +71,6 @@ func QueryAsyncMedia(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "storage_unavailable", "Media results are unavailable")
 		return
 	}
-	if view["status"] == "execution_unknown" {
-		view["status"], view["stage"] = "failed", "failed"
-		view["error_code"], view["error_retryable"] = "execution_unknown", false
-	}
 	c.Header("Cache-Control", "no-store")
 	view["data"] = results
 	c.JSON(http.StatusOK, view)
@@ -88,6 +84,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	_, canvas := c.Get(service.CanvasGrantContextKey)
 	now := time.Now().Unix()
 	status, progress := job.Status, 0
+	if status == "execution_unknown" {
+		status = "failed"
+	}
 	if status == "submitting" || status == "submitted" {
 		status = "invoking"
 		progress = 10
@@ -175,7 +174,10 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		if task.Status == model.TaskStatusFailure {
 			view["status"], view["stage"], view["error_message"] = "failed", "failed", service.PublicTaskFailureReason(&task)
 			if job.BillingStatus != "failed" {
-				view["billing_status"] = "refunded"
+				view["billing_status"] = "failed"
+				if task.Quota == 0 {
+					view["billing_status"] = "refunded"
+				}
 			}
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -184,9 +186,12 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.Provider == "drama" && job.ExpiresAt <= now {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
+	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && view["status"] == "failed" && errors.Is(err, gorm.ErrRecordNotFound) {
+		view["error_code"], view["error_retryable"] = "execution_unknown", false
+	}
 	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" {
 		reason, _ := view["error_message"].(string)
-		if status == "execution_unknown" && strings.TrimSpace(reason) == "" {
+		if job.Status == "execution_unknown" && strings.TrimSpace(reason) == "" {
 			reason = "execution_unknown"
 		}
 		if reason != "" || status == "failed" {
@@ -625,6 +630,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
 			AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded'
 		WHEN status = 'succeeded' THEN 'succeeded'
+		WHEN status = 'execution_unknown' THEN 'failed'
 		WHEN storage_status = 'failed' THEN 'storage_failed'
 		WHEN storage_status IN ('ready','saving') THEN 'uploading'
 		WHEN status IN ('submitting','submitted') AND storage_status = 'pending'
@@ -636,6 +642,8 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	if status := c.Query("status"); status != "" {
 		legacyStatus := model.DB.Where("status = ?", status)
 		switch status {
+		case "failed":
+			legacyStatus = model.DB.Where("status IN ? OR EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?)", []string{"failed", "execution_unknown"}, model.TaskStatusFailure)
 		case "invoking":
 			legacyStatus = model.DB.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted"}, "pending")
 		case "uploading":
@@ -709,7 +717,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		videos = videos.Where(model.DB.Where("provider = ? AND (?) IN ?", "drama", dramaStatus, selected).
 			Or(model.DB.Where("provider IS NULL OR provider <> ?", "drama").Where(legacyStage)))
 	}
-	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status IN ('ready','saving') THEN 'uploading' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
+	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status IN ('ready','saving') THEN 'uploading' WHEN status = 'execution_unknown' THEN 'failed' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
 	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, dramaStatus))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
 	var total int64

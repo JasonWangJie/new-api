@@ -2,42 +2,47 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"maps"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
 )
 
 // AsyncMediaJob owns submission and storage leases. Upstream task accounting
 // remains in Task; retrying storage never enters the submission path.
 type AsyncMediaJob struct {
-	ID              int    `json:"-"`
-	TaskId          string `json:"task_id" gorm:"size:64;uniqueIndex"`
-	IdentityHash    string `json:"-" gorm:"size:64;uniqueIndex"`
-	RequestHash     string `json:"-" gorm:"size:64"`
-	UserId          int    `json:"user_id" gorm:"index"`
-	TokenId         int    `json:"api_key_id" gorm:"index"`
-	ChannelId       int    `json:"-"`
-	Provider        string `json:"provider" gorm:"size:32"`
-	Model           string `json:"model" gorm:"size:255"`
-	Group           string `json:"group" gorm:"size:64"`
-	RequestCipher   []byte `json:"-"`
-	ChannelCipher   []byte `json:"-"`
-	OutputRootPath  string `json:"-" gorm:"type:text"`
-	OutputObjectKey string `json:"-" gorm:"size:128"`
-	ArtifactKeys    string `json:"-" gorm:"type:text"`
-	Status          string `json:"status" gorm:"size:32;index"`
-	StorageStatus   string `json:"storage_status" gorm:"size:32"`
-	BillingStatus   string `json:"billing_status" gorm:"size:32"`
-	Quota           int    `json:"quota"`
-	DispatchedAt    int64  `json:"-"`
-	LeaseToken      string `json:"-" gorm:"size:64"`
-	LeaseExpiresAt  int64  `json:"-"`
-	NextAttemptAt   int64  `json:"-" gorm:"index"`
-	StorageRetries  int    `json:"storage_retry_count"`
-	ErrorMessage    string `json:"error_message,omitempty" gorm:"type:text"`
-	CreatedAt       int64  `json:"created_at" gorm:"index"`
-	ExpiresAt       int64  `json:"expires_at"`
+	ID               int    `json:"-"`
+	TaskId           string `json:"task_id" gorm:"size:64;uniqueIndex"`
+	IdentityHash     string `json:"-" gorm:"size:64;uniqueIndex"`
+	RequestHash      string `json:"-" gorm:"size:64"`
+	UserId           int    `json:"user_id" gorm:"index"`
+	TokenId          int    `json:"api_key_id" gorm:"index"`
+	ChannelId        int    `json:"-"`
+	Provider         string `json:"provider" gorm:"size:32"`
+	Model            string `json:"model" gorm:"size:255"`
+	Group            string `json:"group" gorm:"size:64"`
+	RequestCipher    []byte `json:"-"`
+	ChannelCipher    []byte `json:"-"`
+	OutputRootPath   string `json:"-" gorm:"type:text"`
+	OutputObjectKey  string `json:"-" gorm:"size:128"`
+	ArtifactKeys     string `json:"-" gorm:"type:text"`
+	Status           string `json:"status" gorm:"size:32;index"`
+	StorageStatus    string `json:"storage_status" gorm:"size:32"`
+	BillingStatus    string `json:"billing_status" gorm:"size:32"`
+	RefundLogPayload string `json:"-" gorm:"type:text"`
+	Quota            int    `json:"quota"`
+	DispatchedAt     int64  `json:"-"`
+	LeaseToken       string `json:"-" gorm:"size:64"`
+	LeaseExpiresAt   int64  `json:"-"`
+	NextAttemptAt    int64  `json:"-" gorm:"index"`
+	StorageRetries   int    `json:"storage_retry_count"`
+	ErrorMessage     string `json:"error_message,omitempty" gorm:"type:text"`
+	CreatedAt        int64  `json:"created_at" gorm:"index"`
+	ExpiresAt        int64  `json:"expires_at"`
 }
 
 type MediaArtifactObject struct {
@@ -140,4 +145,109 @@ func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[str
 		return ErrImageConflict
 	}
 	return nil
+}
+
+// SaveAsyncMediaSubmissionRefund persists the confirmed rollback and its log
+// command together. Retrying log delivery must never repeat the refund itself.
+func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID int, updates map[string]any, refund *RecordTaskBillingLogParams) error {
+	var payload string
+	if refund != nil {
+		if refund.LogType != LogTypeRefund || refund.UserId != userID || refund.TokenId <= 0 || refund.Quota <= 0 || updates["billing_status"] != "refunded" {
+			return ErrImageConflict
+		}
+		log := newTaskBillingLog(*refund)
+		ensureLogRequestId(log)
+		data, err := common.Marshal(log)
+		if err != nil {
+			return err
+		}
+		payload = string(data)
+	}
+	if err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job AsyncMediaJob
+		if err := lockForUpdate(tx).Select("id", "token_id", "billing_status", "refund_log_payload").
+			Where("task_id = ? AND user_id = ?", taskID, userID).Take(&job).Error; err != nil {
+			return err
+		}
+		changes := maps.Clone(updates)
+		if changes == nil {
+			changes = make(map[string]any)
+		}
+		delete(changes, "refund_log_payload")
+		if refund != nil {
+			if refund.TokenId != job.TokenId {
+				return ErrImageConflict
+			}
+			if job.RefundLogPayload != "" {
+				var existing Log
+				if err := common.UnmarshalJsonStr(job.RefundLogPayload, &existing); err != nil {
+					return err
+				}
+				if existing.Type != refund.LogType || existing.UserId != refund.UserId || existing.TokenId != refund.TokenId || existing.ChannelId != refund.ChannelId || existing.ModelName != refund.ModelName || existing.Quota != refund.Quota {
+					return ErrImageConflict
+				}
+			} else if job.BillingStatus != "refunded" {
+				changes["refund_log_payload"] = payload
+			}
+		}
+		// The locked read proves ownership even when an identical MySQL update
+		// reports zero changed rows. Keep an already-pending log immutable.
+		return tx.Model(&AsyncMediaJob{}).Where("id = ? AND task_id = ? AND user_id = ?", job.ID, taskID, userID).Updates(changes).Error
+	}); err != nil {
+		return err
+	}
+	if refund != nil {
+		return ConfirmAsyncMediaRefundLog(ctx, taskID)
+	}
+	return nil
+}
+
+// ConfirmAsyncMediaRefundLog delivers a persisted refund event without changing
+// wallet, subscription, or token balances. The payload survives log-store errors.
+func ConfirmAsyncMediaRefundLog(ctx context.Context, taskID string) error {
+	var job AsyncMediaJob
+	if err := DB.WithContext(ctx).Select("id", "task_id", "user_id", "token_id", "refund_log_payload").Where("task_id = ?", taskID).Take(&job).Error; err != nil {
+		return err
+	}
+	if job.RefundLogPayload == "" {
+		return nil
+	}
+	var log Log
+	if err := common.UnmarshalJsonStr(job.RefundLogPayload, &log); err != nil {
+		return err
+	}
+	if log.Type != LogTypeRefund || log.UserId != job.UserId || log.TokenId != job.TokenId || log.Quota <= 0 || log.RequestId == "" || log.Id != 0 {
+		return ErrImageConflict
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(job.RefundLogPayload)))
+	if err := recordTaskBillingLogOnce(ctx, &log, "video-refund:"+job.TaskId, fingerprint); err != nil {
+		return err
+	}
+	// Another delivery may already have acknowledged this exact payload. A
+	// compare-and-set avoids clearing a different command written concurrently.
+	return DB.WithContext(ctx).Model(&AsyncMediaJob{}).
+		Where("id = ? AND user_id = ? AND refund_log_payload = ?", job.ID, job.UserId, job.RefundLogPayload).
+		Update("refund_log_payload", "").Error
+}
+
+// ReplayAsyncMediaRefundLogs repairs missing usage logs, including terminal and
+// expired tasks. It never resumes generation or performs financial adjustments.
+func ReplayAsyncMediaRefundLogs(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return nil
+	}
+	var jobs []AsyncMediaJob
+	if err := DB.WithContext(ctx).Select("task_id").Where("COALESCE(refund_log_payload, '') <> ''").Order("id").Limit(limit).Find(&jobs).Error; err != nil {
+		return err
+	}
+	var replayErrors []error
+	for _, job := range jobs {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(replayErrors, err)...)
+		}
+		if err := ConfirmAsyncMediaRefundLog(ctx, job.TaskId); err != nil {
+			replayErrors = append(replayErrors, fmt.Errorf("media refund log %s: %w", job.TaskId, err))
+		}
+	}
+	return errors.Join(replayErrors...)
 }

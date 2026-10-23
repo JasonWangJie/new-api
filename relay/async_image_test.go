@@ -746,8 +746,16 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		reference, multipart, yb, mask bool
 		disabled, badOverride          bool
 		badTemplate, customProfile     bool
+		providerErrorCode              string
+		disconnect                     bool
 	}{
 		{name: "synchronous_text"},
+		{name: "provider_request_failure", providerErrorCode: "do_request_failed"},
+		{name: "provider_response_read_failure", providerErrorCode: "read_response_body_failed"},
+		{name: "provider_bad_response", providerErrorCode: "bad_response"},
+		{name: "provider_bad_response_body", providerErrorCode: "bad_response_body"},
+		{name: "provider_empty_response", providerErrorCode: "empty_response"},
+		{name: "transport_eof", disconnect: true},
 		{name: "uploaded_reference", reference: true},
 		{name: "multipart_reference", reference: true, multipart: true},
 		{name: "asynchronous_receipt_and_poll", reference: true, yb: true},
@@ -771,7 +779,23 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				}
 				assert.Equal(t, "Bearer tianyue-upstream-key", r.Header.Get("Authorization"))
 				received <- receivedRequest{r.URL.Path, body}
+				if tc.disconnect {
+					connection, _, err := w.(http.Hijacker).Hijack()
+					if assert.NoError(t, err) {
+						assert.NoError(t, connection.Close())
+					}
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
+				if tc.providerErrorCode != "" {
+					w.Header().Set(common.RequestIdKey, "tianyue-provider-request-id")
+					w.WriteHeader(http.StatusInternalServerError)
+					encoded, err := common.Marshal(map[string]any{"error": map[string]string{"message": "TianYue could not confirm image generation; Authorization: Bearer private-provider-key", "type": "new_api_error", "code": tc.providerErrorCode}})
+					if assert.NoError(t, err) {
+						_, _ = w.Write(encoded)
+					}
+					return
+				}
 				if tc.yb {
 					if tc.customProfile {
 						if r.Method == http.MethodPost {
@@ -873,6 +897,27 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			assert.JSONEq(t, `"1:1"`, string(sent.body["aspect_ratio"]))
 			assert.JSONEq(t, `"1K"`, string(sent.body["output_resolution"]))
 			assert.NotContains(t, sent.body, "size")
+			if tc.providerErrorCode != "" || tc.disconnect {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, 608, failure.Code)
+				assert.True(t, failure.ExecutionUnknown, "an unconfirmed dispatched generation must retain its reservation for reconciliation")
+				assert.False(t, failure.UpstreamTerminal)
+				if tc.disconnect {
+					assert.Equal(t, "upstream_transport_disconnected", failure.InternalCode)
+					assert.Contains(t, failure.Message, "(EOF)")
+					assert.Zero(t, failure.HTTPStatus)
+					assert.Empty(t, failure.UpstreamRequestID)
+					assert.Empty(t, failure.ProviderCode)
+				} else {
+					assert.Equal(t, "execution_unknown", failure.InternalCode)
+					assert.Contains(t, failure.Message, "TianYue could not confirm image generation")
+					assert.NotContains(t, failure.Message, "private-provider-key")
+					assert.Equal(t, http.StatusInternalServerError, failure.HTTPStatus)
+					assert.Equal(t, "tianyue-provider-request-id", failure.UpstreamRequestID)
+					assert.Equal(t, tc.providerErrorCode, failure.ProviderCode)
+				}
+			}
 			if tc.reference {
 				var references []string
 				require.NoError(t, common.Unmarshal(sent.body["images"], &references))
@@ -1337,6 +1382,116 @@ func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
 		assert.Zero(t, stored.UpstreamSucceededAt)
 		assert.EqualValues(t, 1, stored.Version)
 	})
+}
+
+func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
+	previousDB, previousType, previousCount, previousRedis := model.DB, common.MainDatabaseType(), constant.CountToken, common.RedisEnabled
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "tianyue-sync-completion.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test", "use a dedicated disposable database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_job_test") || strings.Contains(dsn, "/new_api_image_job_test"), "use a dedicated disposable database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled = db, false, false
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.RedisEnabled = previousDB, previousCount, previousRedis
+		common.SetMainDatabaseType(previousType)
+		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}, &model.UserSubscription{}, &model.Token{}, &model.User{}))
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tianyue-sync:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tianyue-sync")
+	user := model.User{Username: "tianyue-sync-user", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "tianyue-sync-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	service.InitHttpClient()
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	received := make(chan string, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Method + " " + r.URL.Path
+		assert.Equal(t, "Bearer tianyue-upstream-key", r.Header.Get("Authorization"))
+		switch r.URL.Path {
+		case "/v1/images/generations":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"created":1,"data":[{"url":"/image.png"}]}`))
+		case "/image.png":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(bitmap.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	channel := &model.Channel{Id: 34, Type: constant.ChannelTypeNewAPI, Key: "tianyue-upstream-key", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled}
+	channel.SetSetting(dto.ChannelSettings{TianyueMediaCompatibility: true})
+	request := service.AsyncImageRequest{
+		Platform: "openai", Provider: "newapi", Dialect: "async", Model: "seedream-5-pro", Prompt: "test picture", Count: 1,
+		Kind: "text_to_image", Size: "1024x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async",
+		Native:  map[string]common.RawMessage{"model": common.RawMessage(`"seedream-5-pro"`), "prompt": common.RawMessage(`"test picture"`), "n": common.RawMessage(`1`)},
+		Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
+	}
+	task := model.AsyncImageTask{TaskId: "tianyue-sync-completion", UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+	payload, err := common.Marshal(request)
+	require.NoError(t, err)
+	task.RequestCipher, err = service.EncryptImagePayload(payload, "task:"+task.TaskId)
+	require.NoError(t, err)
+	channelPayload, err := common.Marshal(channel)
+	require.NoError(t, err)
+	task.SelectedChannelCipher, err = service.EncryptImagePayload(channelPayload, "image-channel:"+task.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&task).Error)
+	dispatches := 0
+	output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
+		dispatches++
+		return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+	})
+	require.NoError(t, err, "a synchronous provider response must finish without a provider job ID")
+	require.NotNil(t, output)
+	require.Len(t, output.Images, 1)
+	assert.Equal(t, 2, output.Images[0].Width)
+	assert.Equal(t, 3, output.Images[0].Height)
+	assert.Equal(t, 5000, bill.Quota)
+	require.Len(t, received, 2)
+	assert.Equal(t, "POST /v1/images/generations", <-received)
+	assert.Equal(t, "GET /image.png", <-received)
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Empty(t, task.UpstreamTaskId, "synchronous completion must not invent a provider job")
+	assert.Positive(t, task.UpstreamSucceededAt)
+	payload, err = service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+	require.NoError(t, err)
+	var recovered service.AsyncImageRequest
+	require.NoError(t, common.Unmarshal(payload, &recovered))
+	require.NotNil(t, recovered.Completion)
+	require.NotNil(t, recovered.Completion.Profile)
+	assert.Equal(t, []string{upstream.URL + "/image.png"}, recovered.Completion.URLs)
+	recoveredOutput, recoveredBill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), func() error {
+		dispatches++
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, recoveredOutput)
+	require.Len(t, recoveredOutput.Images, 1)
+	assert.Equal(t, output.Images[0].Data, recoveredOutput.Images[0].Data)
+	assert.Equal(t, bill.Quota, recoveredBill.Quota)
+	require.Len(t, received, 1)
+	assert.Equal(t, "GET /image.png", <-received)
+	assert.Empty(t, received, "checkpoint recovery must only download the accepted image")
+	assert.Equal(t, 1, dispatches, "checkpoint recovery must not repeat submission")
+	require.NoError(t, db.Take(&user, user.Id).Error)
+	assert.Equal(t, 995000, user.Quota, "checkpoint recovery must reuse the existing reservation")
+	var reservations int64
+	require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&reservations).Error)
+	assert.EqualValues(t, 1, reservations)
 }
 
 func TestBuildGeminiAsyncImagePartsReferenceTransport(t *testing.T) {

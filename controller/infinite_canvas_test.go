@@ -1127,7 +1127,7 @@ export const protocols = {openai_video:{decodeRequest(ctx){return {kind:"submit"
 		require.NoError(t, f.db.First(&queued, queued.ID).Error)
 		if dispatched {
 			require.NoError(t, processErr)
-			assert.Equal(t, "execution_unknown", queued.Status)
+			assert.Equal(t, "failed", queued.Status)
 			assert.Equal(t, "unknown", queued.BillingStatus)
 		} else {
 			require.Error(t, processErr)

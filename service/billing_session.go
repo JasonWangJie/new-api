@@ -86,11 +86,19 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	return tokenErr
 }
 
-// Refund 退还所有预扣费，幂等安全，异步执行。
+// Refund 退还所有预扣费。异步视频提交等待退款结果落账，其余请求异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
+	asyncMedia := c.GetBool("async_media_execution")
 	s.mu.Lock()
-	if s.settled || s.refunded || !s.needsRefundLocked() {
+	if s.settled || s.refunded || s.fundingSettled {
 		s.mu.Unlock()
+		return
+	}
+	if !s.needsRefundLocked() {
+		s.mu.Unlock()
+		if asyncMedia {
+			recordAsyncVideoSubmissionRefund(c, s.relayInfo, 0, nil)
+		}
 		return
 	}
 	s.refunded = true
@@ -111,14 +119,17 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	subscriptionId := s.relayInfo.SubscriptionId
 	funding := s.funding
 
-	gopool.Go(func() {
+	refund := func() {
+		var refundErr error
 		// 1) 退还资金来源
 		if err := funding.Refund(); err != nil {
 			common.SysLog("error refunding billing source: " + err.Error())
+			refundErr = errors.Join(refundErr, err)
 		}
 		if extraReserved > 0 && funding.Source() == BillingSourceSubscription && subscriptionId > 0 {
 			if err := funding.Settle(-extraReserved); err != nil {
 				common.SysLog("error refunding subscription extra reserved quota: " + err.Error())
+				refundErr = errors.Join(refundErr, err)
 			}
 		}
 		// 2) 退还令牌额度
@@ -131,9 +142,18 @@ func (s *BillingSession) Refund(c *gin.Context) {
 			}
 			if err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
+				refundErr = errors.Join(refundErr, err)
 			}
 		}
-	})
+		if asyncMedia {
+			recordAsyncVideoSubmissionRefund(c, s.relayInfo, s.preConsumedQuota, refundErr)
+		}
+	}
+	if asyncMedia {
+		refund()
+		return
+	}
+	gopool.Go(refund)
 }
 
 // NeedsRefund 返回是否存在需要退还的预扣状态。

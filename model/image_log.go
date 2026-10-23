@@ -51,42 +51,51 @@ func ConfirmAsyncImageLog(ctx context.Context, taskId string) error {
 	if log.RequestId != bill.BillingRequestId || log.UserId != bill.UserId || log.TokenId != bill.TokenId || log.Quota != bill.Quota {
 		return ErrImageConflict
 	}
+	if err := recordTaskBillingLogOnce(ctx, &log, bill.BillingRequestId, bill.Fingerprint); err != nil {
+		return err
+	}
+	return DB.WithContext(ctx).Model(&AsyncImageBill{}).Where("id = ? AND status = ? AND fingerprint = ?", bill.Id, "applied", bill.Fingerprint).Update("log_status", "done").Error
+}
+
+// recordTaskBillingLogOnce deduplicates durable billing events in the log store.
+// It never performs financial writes or acknowledges the main-DB command.
+func recordTaskBillingLogOnce(ctx context.Context, log *Log, eventID, fingerprint string) error {
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		row := struct {
 			Log
 			EventId     string `gorm:"column:event_id"`
 			Fingerprint string
-		}{Log: log, EventId: bill.BillingRequestId, Fingerprint: bill.Fingerprint}
+		}{Log: *log, EventId: eventID, Fingerprint: fingerprint}
 		if err := LOG_DB.WithContext(ctx).Table("async_image_consume_logs").Create(&row).Error; err != nil {
 			return err
 		}
 		var actual struct{ Fingerprint string }
-		if err := LOG_DB.WithContext(ctx).Table("async_image_consume_logs FINAL").Select("fingerprint").Where("created_at = ? AND event_id = ?", log.CreatedAt, bill.BillingRequestId).Take(&actual).Error; err != nil {
+		if err := LOG_DB.WithContext(ctx).Table("async_image_consume_logs FINAL").Select("fingerprint").Where("created_at = ? AND event_id = ?", log.CreatedAt, eventID).Take(&actual).Error; err != nil {
 			return err
 		}
-		if actual.Fingerprint != bill.Fingerprint {
+		if actual.Fingerprint != fingerprint {
 			return ErrImageConflict
 		}
 	} else {
 		if err := LOG_DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			receipt := AsyncImageLogReceipt{EventId: bill.BillingRequestId, Fingerprint: bill.Fingerprint}
+			receipt := AsyncImageLogReceipt{EventId: eventID, Fingerprint: fingerprint}
 			if err := tx.Create(&receipt).Error; err != nil {
 				return err
 			}
-			return tx.Create(&log).Error
+			return tx.Create(log).Error
 		}); err != nil {
 			// A receipt exists only if its log committed in the same transaction.
 			// Do not infer duplicate insertion from dialect-specific RowsAffected.
 			var existing AsyncImageLogReceipt
-			if lookupErr := LOG_DB.WithContext(ctx).Where("event_id = ?", bill.BillingRequestId).Take(&existing).Error; lookupErr != nil {
+			if lookupErr := LOG_DB.WithContext(ctx).Where("event_id = ?", eventID).Take(&existing).Error; lookupErr != nil {
 				return err
 			}
-			if existing.Fingerprint != bill.Fingerprint {
+			if existing.Fingerprint != fingerprint {
 				return ErrImageConflict
 			}
 		}
 	}
-	return DB.WithContext(ctx).Model(&AsyncImageBill{}).Where("id = ? AND status = ? AND fingerprint = ?", bill.Id, "applied", bill.Fingerprint).Update("log_status", "done").Error
+	return nil
 }
 
 func RefreshAsyncImageBillingCache(ctx context.Context, taskId string) error {

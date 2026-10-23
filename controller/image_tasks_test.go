@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -54,21 +55,61 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			}
 			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 			require.NoError(t, err)
-			previousDB, previousType := model.DB, common.MainDatabaseType()
-			model.DB = db
+			logDialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "refund-logs.db")))
+			logEngine := "sqlite"
+			if engine == "mysql" && os.Getenv("IMAGE_TASK_TEST_LOG_MYSQL_DSN") != "" {
+				dsn := os.Getenv("IMAGE_TASK_TEST_LOG_MYSQL_DSN")
+				require.Contains(t, dsn, "/new_api_refund_test_logs", "Use the dedicated disposable refund log database")
+				logDialector, logEngine = mysql.Open(dsn), engine
+			}
+			if engine == "postgres" && os.Getenv("IMAGE_TASK_TEST_LOG_PG_DSN") != "" {
+				dsn := os.Getenv("IMAGE_TASK_TEST_LOG_PG_DSN")
+				require.Contains(t, dsn, "dbname=new_api_refund_test_logs", "Use the dedicated disposable refund log database")
+				logDialector, logEngine = postgres.Open(dsn), engine
+			}
+			logDB, err := gorm.Open(logDialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			previousDB, previousLogDB, previousType := model.DB, model.LOG_DB, common.MainDatabaseType()
+			previousLogType := common.LogDatabaseType()
+			model.DB, model.LOG_DB = db, logDB
 			common.SetMainDatabaseType(common.DatabaseType(engine))
+			common.SetLogDatabaseType(common.DatabaseType(logEngine))
 			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
-				model.DB = previousDB
+				model.DB, model.LOG_DB = previousDB, previousLogDB
 				common.SetMainDatabaseType(previousType)
+				common.SetLogDatabaseType(previousLogType)
 				assert.NoError(t, db.Migrator().DropTable(entities...))
+				assert.NoError(t, logDB.Migrator().DropTable(&model.Log{}, &model.AsyncImageLogReceipt{}))
+				logConnection, logCloseErr := logDB.DB()
+				if assert.NoError(t, logCloseErr) {
+					assert.NoError(t, logConnection.Close())
+				}
 				connection, closeErr := db.DB()
 				if assert.NoError(t, closeErr) {
 					assert.NoError(t, connection.Close())
 				}
 			})
-			require.NoError(t, db.AutoMigrate(entities...))
-			require.NoError(t, db.AutoMigrate(entities...))
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}))
+			}
+			// Rebuild the released table shape, then exercise the same startup
+			// migration against both existing data and its unique task identifier.
+			require.NoError(t, db.Migrator().DropColumn(&model.AsyncMediaJob{}, "RefundLogPayload"))
+			legacy := model.AsyncMediaJob{TaskId: "legacy-video-refund-upgrade", IdentityHash: "legacy-video-refund-identity", UserId: 90101, TokenId: 90201, Provider: "drama", Model: "legacy-video-model", Group: "refund-upgrade", Status: "execution_unknown", StorageStatus: "pending", BillingStatus: "unknown", Quota: 120, ErrorMessage: "historical video submission diagnostic", CreatedAt: 1700000000, ExpiresAt: 1800000000}
+			require.NoError(t, db.Omit("RefundLogPayload").Create(&legacy).Error)
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(entities...))
+				require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AsyncImageLogReceipt{}))
+			}
+			var upgraded model.AsyncMediaJob
+			require.NoError(t, db.Take(&upgraded, legacy.ID).Error)
+			assert.Equal(t, legacy, upgraded, "adding the refund log outbox must preserve historical task and accounting data")
+			assert.Empty(t, upgraded.RefundLogPayload)
+			duplicateLegacy := legacy
+			duplicateLegacy.ID, duplicateLegacy.IdentityHash = 0, "legacy-video-refund-duplicate"
+			require.Error(t, db.Create(&duplicateLegacy).Error, "upgrading must preserve task_id uniqueness")
+			require.NoError(t, db.Delete(&legacy).Error)
 			var version string
 			versionQuery := "SELECT VERSION()"
 			if engine == "sqlite" {
@@ -76,6 +117,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			}
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("Database version: %s", version)
+			logVersionQuery := "SELECT VERSION()"
+			if logEngine == "sqlite" {
+				logVersionQuery = "SELECT sqlite_version()"
+			}
+			var logVersion string
+			require.NoError(t, logDB.Raw(logVersionQuery).Scan(&logVersion).Error)
+			t.Logf("Separate log database (%s) version: %s", logEngine, logVersion)
 			now := time.Now().Unix()
 			require.NoError(t, db.Create(&model.User{Id: 101, Username: "creator", DisplayName: "Creative account", Password: "password-secret-canary", AffCode: "creator"}).Error)
 			require.NoError(t, db.Create(&model.User{Id: 102, Username: "other", AffCode: "other"}).Error)
@@ -799,6 +847,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					name, jobStatus, storage, provider, data, taskProgress, status, stage string
 					taskStatus                                                            model.TaskStatus
 					progress                                                              int
+					taskQuota                                                             int
+					jobBilling, billing                                                   string
 					upstreamProgress                                                      any
 					expired                                                               bool
 					noTask, terminable                                                    bool
@@ -824,12 +874,17 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
 					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
 					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
+					{name: "failed task refund remains unconfirmed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", taskQuota: 120, billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
+					{name: "zero task quota cannot clear known billing failure", taskStatus: model.TaskStatusFailure, taskProgress: "100%", jobBilling: "failed", billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "expiry takes precedence", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "expired", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(0)},
 					{name: "other providers retain their status", taskStatus: model.TaskStatusQueued, provider: "sora", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "invoking", stage: "generating", progress: 14},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
 						job.Status, job.StorageStatus, job.Provider, job.ExpiresAt, job.DispatchedAt = "submitted", "pending", "drama", now+3600, now-5
 						job.BillingStatus, job.Quota, job.ErrorMessage = "reserved", 0, ""
+						if tc.jobBilling != "" {
+							job.BillingStatus = tc.jobBilling
+						}
 						if tc.jobStatus != "" {
 							job.Status = tc.jobStatus
 						}
@@ -851,6 +906,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						}
 						upstream.Platform = constant.TaskPlatform(job.Provider)
 						upstream.Status, upstream.Progress, upstream.Data = tc.taskStatus, tc.taskProgress, []byte(tc.data)
+						upstream.Quota = tc.taskQuota
 						require.NoError(t, db.Save(&job).Error)
 						if tc.noTask {
 							require.NoError(t, db.Delete(&upstream).Error)
@@ -888,25 +944,26 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							expectedStatus := tc.status
 							expectedTerminable := tc.terminable
 							if tc.status == "execution_unknown" {
+								expectedStatus = "failed"
 								assert.Equal(t, "unknown", view["billing_status"], surface)
 								assert.Equal(t, float64(job.Quota), view["quota"], surface)
 								assert.Equal(t, 4.5, view["cost"], surface)
 								assert.Zero(t, view["finished_at"], surface)
 								assert.False(t, view["can_resume"].(bool), surface)
 								if surface == "public" {
-									expectedStatus = "failed"
 									assert.Equal(t, "execution_unknown", view["error_code"])
 									assert.Equal(t, false, view["error_retryable"])
 								} else {
 									expectedTerminable = surface == "administrator"
-									assert.Empty(t, view["error_code"], surface)
-									assert.NotContains(t, view, "error_retryable", surface)
 								}
 							} else {
 								assert.NotEqual(t, "execution_unknown", view["error_code"], surface)
 								assert.NotContains(t, view, "error_retryable", surface)
 							}
 							assert.Equal(t, expectedStatus, view["status"], surface)
+							if tc.billing != "" {
+								assert.Equal(t, tc.billing, view["billing_status"], surface)
+							}
 							assert.Equal(t, tc.stage, view["stage"], surface)
 							assert.Equal(t, float64(tc.progress), view["progress"], surface)
 							if tc.upstreamProgress == nil {
@@ -919,8 +976,12 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						var persisted model.AsyncMediaJob
 						require.NoError(t, db.Where("id = ?", job.ID).Take(&persisted).Error)
 						assert.Equal(t, job, persisted, "queries must preserve the job, quotation, billing and scheduling state")
+						filterStatus := tc.status
+						if filterStatus == "execution_unknown" {
+							filterStatus = "failed"
+						}
 						for _, admin := range []bool{false, true} {
-							for _, filter := range []string{"", "&status=" + tc.status, "&stage=" + tc.stage, "&status=queued&stage=generating"} {
+							for _, filter := range []string{"", "&status=" + filterStatus, "&stage=" + tc.stage, "&status=queued&stage=generating"} {
 								recorder := httptest.NewRecorder()
 								c, _ := gin.CreateTestContext(recorder)
 								c.Set("id", 101)
@@ -942,7 +1003,14 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								}
 								require.Len(t, response.Data.Items, 1, filter)
 								assert.Equal(t, 1, response.Data.Total, filter)
-								assert.Equal(t, tc.status, response.Data.Items[0]["status"], filter)
+								expectedStatus := tc.status
+								if expectedStatus == "execution_unknown" {
+									expectedStatus = "failed"
+								}
+								assert.Equal(t, expectedStatus, response.Data.Items[0]["status"], filter)
+								if tc.billing != "" {
+									assert.Equal(t, tc.billing, response.Data.Items[0]["billing_status"], filter)
+								}
 								stat := "processing"
 								if tc.status == "queued" || tc.status == "succeeded" {
 									stat = tc.status
@@ -1479,10 +1547,12 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								view = body["data"].(map[string]any)["task"].(map[string]any)
 							}
 							expectedStatus := item.status
-							if endpoint == "public" && item.status == "execution_unknown" {
+							if item.status == "execution_unknown" {
 								expectedStatus = "failed"
-								assert.Equal(t, "execution_unknown", view["error_code"])
-								assert.Equal(t, false, view["error_retryable"])
+								if endpoint == "public" {
+									assert.Equal(t, "execution_unknown", view["error_code"])
+									assert.Equal(t, false, view["error_retryable"])
+								}
 							}
 							assert.Equal(t, expectedStatus, view["status"], endpoint)
 							assert.Equal(t, item.billing, view["billing_status"], endpoint)
@@ -1508,16 +1578,203 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 
+			t.Run("video submission refunds preserve accounting and terminal state", func(t *testing.T) {
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+				previousSubmit, previousRedis := service.SubmitAsyncVideoFunc, common.RedisEnabled
+				common.RedisEnabled = false
+				t.Cleanup(func() {
+					service.SubmitAsyncVideoFunc, common.RedisEnabled = previousSubmit, previousRedis
+				})
+				const initialQuota, reservedQuota = 1000, 120
+				for index, item := range []struct {
+					name, failedTable, billing                string
+					reserve, recovery, lateRefund             bool
+					logFailure, ackFailure, disableConsumeLog bool
+					wallet, token, quota, logs                int
+				}{
+					{name: "refunded", reserve: true, disableConsumeLog: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "funding failure", reserve: true, failedTable: "users", billing: "failed", wallet: initialQuota - reservedQuota, token: initialQuota, quota: reservedQuota},
+					{name: "token failure", reserve: true, failedTable: "tokens", billing: "failed", wallet: initialQuota, token: initialQuota - reservedQuota, quota: reservedQuota},
+					{name: "not reserved", billing: "not_billable", wallet: initialQuota, token: initialQuota},
+					{name: "reservation recovered after interruption", reserve: true, recovery: true, billing: "unknown", wallet: initialQuota - reservedQuota, token: initialQuota - reservedQuota, quota: reservedQuota},
+					{name: "late refund survives stale recovery update", reserve: true, recovery: true, lateRefund: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "refund log database unavailable", reserve: true, logFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "refund log written before acknowledgement failure", reserve: true, ackFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						if item.disableConsumeLog {
+							previousConsumeLog := common.LogConsumeEnabled
+							common.LogConsumeEnabled = false
+							t.Cleanup(func() { common.LogConsumeEnabled = previousConsumeLog })
+						}
+						user := model.User{Id: 1101 + index, Username: "video-refund-" + strings.ReplaceAll(item.name, " ", "-"), AffCode: "video-refund-" + string(rune('a'+index)), Quota: initialQuota, UsedQuota: 37}
+						token := model.Token{Id: 1201 + index, UserId: user.Id, Name: "Refund key", Key: "video-refund-key-" + string(rune('a'+index)), RemainQuota: initialQuota, UsedQuota: 23}
+						require.NoError(t, db.Create(&user).Error)
+						require.NoError(t, db.Create(&token).Error)
+						job := model.AsyncMediaJob{TaskId: "video-refund-" + string(rune('a'+index)), IdentityHash: "video-refund-" + string(rune('a'+index)), UserId: user.Id, TokenId: token.Id, ChannelId: 301, Provider: "drama", Model: "video-refund-model", Group: "default", Status: "queued", StorageStatus: "pending", BillingStatus: "pending", CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "refund-lease", LeaseExpiresAt: now + 120}
+						var err error
+						job.RequestCipher, err = service.EncryptImagePayload([]byte(`{}`), "media-request:"+job.TaskId)
+						require.NoError(t, err)
+						require.NoError(t, db.Create(&job).Error)
+						c, _ := gin.CreateTestContext(httptest.NewRecorder())
+						c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+						c.Set("async_media_execution", true)
+						info := &relaycommon.RelayInfo{
+							UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: job.Model, UsingGroup: job.Group,
+							UserSetting:   dto.UserSetting{BillingPreference: "wallet_only"},
+							ChannelMeta:   &relaycommon.ChannelMeta{ChannelId: job.ChannelId},
+							TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: job.TaskId},
+						}
+						if item.recovery {
+							require.Nil(t, service.PreConsumeDurableTaskBilling(c, reservedQuota, info))
+							require.NoError(t, db.Model(&job).Updates(map[string]any{"status": "submitting", "billing_status": "reserved", "quota": reservedQuota, "dispatched_at": now}).Error)
+							require.NoError(t, db.Take(&job, job.ID).Error)
+						}
+						if item.lateRefund {
+							refundPending := true
+							require.NoError(t, db.Callback().Update().Before("gorm:begin_transaction").Register("video-refund-before-recovery", func(tx *gorm.DB) {
+								updates, ok := tx.Statement.Dest.(map[string]any)
+								if refundPending && ok && tx.Statement.Table == "async_media_jobs" && updates["status"] == "failed" {
+									refundPending = false
+									info.Billing.Refund(c)
+								}
+							}))
+							t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("video-refund-before-recovery")) })
+						}
+						var submissions int
+						submitErr := errors.New("video submission failed (HTTP 429, code fail_to_fetch_task): upstream capacity exhausted")
+						service.SubmitAsyncVideoFunc = func(ctx context.Context, current model.AsyncMediaJob, _ service.AsyncVideoRequest) error {
+							submissions++
+							require.False(t, item.recovery, "lease recovery must not repeat an upstream submission")
+							if !item.reserve {
+								return submitErr
+							}
+							require.Nil(t, service.PreConsumeDurableTaskBilling(c, reservedQuota, info))
+							require.NoError(t, model.UpdateAsyncMediaJob(ctx, current, map[string]any{"billing_status": "reserved", "quota": reservedQuota, "dispatched_at": now}))
+							var reservedUser model.User
+							var reservedToken model.Token
+							require.NoError(t, db.Take(&reservedUser, user.Id).Error)
+							require.NoError(t, db.Take(&reservedToken, token.Id).Error)
+							assert.Equal(t, initialQuota-reservedQuota, reservedUser.Quota)
+							assert.Equal(t, initialQuota-reservedQuota, reservedToken.RemainQuota)
+							if item.failedTable != "" {
+								require.NoError(t, db.Callback().Update().Before("gorm:update").Register("video-refund-failure", func(tx *gorm.DB) {
+									if tx.Statement.Table == item.failedTable {
+										tx.AddError(errors.New("injected refund write failure"))
+									}
+								}))
+								t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("video-refund-failure")) })
+							}
+							if item.logFailure {
+								require.NoError(t, logDB.Callback().Create().Before("gorm:create").Register("video-refund-log-failure", func(tx *gorm.DB) {
+									if tx.Statement.Table == "logs" {
+										tx.AddError(errors.New("injected refund log database failure"))
+									}
+								}))
+								t.Cleanup(func() { assert.NoError(t, logDB.Callback().Create().Remove("video-refund-log-failure")) })
+							}
+							if item.ackFailure {
+								require.NoError(t, db.Callback().Update().Before("gorm:update").Register("video-refund-log-ack-failure", func(tx *gorm.DB) {
+									updates, ok := tx.Statement.Dest.(map[string]any)
+									if ok && tx.Statement.Table == "async_media_jobs" && updates["refund_log_payload"] == "" {
+										tx.AddError(errors.New("injected refund log acknowledgement failure"))
+									}
+								}))
+								t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("video-refund-log-ack-failure")) })
+							}
+							// Refund must survive cancellation of the upstream submission context.
+							cancelled, cancel := context.WithCancel(c.Request.Context())
+							cancel()
+							c.Request = c.Request.WithContext(cancelled)
+							info.Billing.Refund(c)
+							if item.failedTable != "" {
+								require.NoError(t, db.Callback().Update().Remove("video-refund-failure"))
+							}
+							info.Billing.Refund(c)
+							return submitErr
+						}
+						processErr := service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig())
+						if item.recovery {
+							require.NoError(t, processErr)
+						} else {
+							require.ErrorIs(t, processErr, submitErr)
+						}
+						require.NoError(t, db.Take(&job, job.ID).Error)
+						assert.Equal(t, "failed", job.Status)
+						assert.Equal(t, item.billing, job.BillingStatus)
+						assert.Equal(t, item.quota, job.Quota)
+						assert.Empty(t, job.LeaseToken)
+						assert.Zero(t, job.NextAttemptAt)
+						if item.logFailure || item.ackFailure {
+							assert.NotEmpty(t, job.RefundLogPayload, "refund log stays pending until its persistence can be acknowledged")
+							var count int64
+							require.NoError(t, logDB.Model(&model.Log{}).Where("token_id = ?", token.Id).Count(&count).Error)
+							if item.ackFailure {
+								assert.EqualValues(t, 1, count, "the log was committed before the acknowledgement failed")
+							} else {
+								assert.Zero(t, count)
+							}
+							require.NoError(t, db.Take(&user, user.Id).Error)
+							require.NoError(t, db.Take(&token, token.Id).Error)
+							assert.Equal(t, initialQuota, user.Quota, "log failure must not undo the completed wallet refund")
+							assert.Equal(t, initialQuota, token.RemainQuota)
+							if item.logFailure {
+								require.NoError(t, logDB.Callback().Create().Remove("video-refund-log-failure"))
+							} else {
+								require.NoError(t, db.Callback().Update().Remove("video-refund-log-ack-failure"))
+							}
+							for range 2 {
+								require.NoError(t, model.ReplayAsyncMediaRefundLogs(t.Context(), 10))
+							}
+							require.NoError(t, db.Take(&job, job.ID).Error)
+							assert.Empty(t, job.RefundLogPayload)
+						}
+						require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
+						require.NoError(t, db.Take(&job, job.ID).Error)
+						assert.Equal(t, "failed", job.Status)
+						assert.Equal(t, item.billing, job.BillingStatus, "worker recovery must preserve the confirmed refund result")
+						assert.Equal(t, item.quota, job.Quota)
+						expectedSubmissions := 1
+						if item.recovery {
+							expectedSubmissions = 0
+						}
+						assert.Equal(t, expectedSubmissions, submissions)
+						require.NoError(t, db.Take(&user, user.Id).Error)
+						require.NoError(t, db.Take(&token, token.Id).Error)
+						assert.Equal(t, item.wallet, user.Quota)
+						assert.Equal(t, item.token, token.RemainQuota)
+						assert.Equal(t, 23+initialQuota-item.token, token.UsedQuota)
+						assert.Equal(t, 37, user.UsedQuota, "submission rollback must not reverse consumption that was never recorded")
+						var logs []model.Log
+						require.NoError(t, logDB.Where("token_id = ?", token.Id).Find(&logs).Error)
+						require.Len(t, logs, item.logs, "only completed refunds produce a usage-log entry; failed submission needs no consume log")
+						if item.logs > 0 {
+							assert.Equal(t, model.LogTypeRefund, logs[0].Type)
+							assert.Equal(t, reservedQuota, logs[0].Quota)
+							assert.Equal(t, job.Model, logs[0].ModelName)
+							assert.Equal(t, job.Group, logs[0].Group)
+							assert.Equal(t, job.ChannelId, logs[0].ChannelId)
+							var other map[string]any
+							require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+							assert.Equal(t, true, other["is_task"])
+							assert.Equal(t, job.TaskId, other["task_id"])
+							assert.Equal(t, service.BillingSourceWallet, other["billing_source"])
+							assert.NotEmpty(t, other["reason"])
+						}
+					})
+				}
+			})
 			t.Run("video submission errors retain diagnostics without replay", func(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
 				previousSubmit := service.SubmitAsyncVideoFunc
 				t.Cleanup(func() { service.SubmitAsyncVideoFunc = previousSubmit })
 				for _, dispatched := range []bool{true, false} {
-					name, status, billing, summary := "before-dispatch", "failed", "refunded", "视频生成参数不符合上游要求"
+					name, status, billing, summary := "before-dispatch", "failed", "not_billable", "视频生成参数不符合上游要求"
 					diagnostic := "Invalid parameter: duration; Authorization: Basic cHJpdmF0ZS1jcmVkZW50aWFs; api_key=private-api-canary"
 					if dispatched {
-						name, status, billing, summary = "after-dispatch", "execution_unknown", "unknown", "视频提交结果尚未确认"
+						name, status, billing, summary = "after-dispatch", "failed", "unknown", "视频提交结果尚未确认"
 						diagnostic = `video submission failed (HTTP 502, code fail_to_fetch_task): {"code":"task_submission_unknown","message":"task submission state is unknown","data":null,"request":{"prompt":"private-request-canary","api_key":"private-api-canary"}}`
 					}
 					t.Run(name, func(t *testing.T) {
@@ -1556,7 +1813,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
 							require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
 							assert.Equal(t, originalReason, job.ErrorMessage, "lease recovery must retain the original sanitized submission diagnostic")
-							assert.Equal(t, "execution_unknown", job.Status)
+							assert.Equal(t, "failed", job.Status)
 							assert.Equal(t, "unknown", job.BillingStatus)
 							assert.Zero(t, job.NextAttemptAt)
 							assert.Equal(t, originalCipher, job.RequestCipher)
@@ -1575,13 +1832,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 						var view map[string]any
 						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
-						expectedPublicStatus := status
-						if dispatched {
-							expectedPublicStatus = "failed"
-							assert.Equal(t, "execution_unknown", view["error_code"])
-							assert.Equal(t, false, view["error_retryable"])
-						}
-						assert.Equal(t, expectedPublicStatus, view["status"])
+						assert.Equal(t, status, view["status"])
 						assert.Equal(t, billing, view["billing_status"])
 						assert.Contains(t, view["error_summary"], summary)
 						assert.NotEmpty(t, view["error_suggestion"])

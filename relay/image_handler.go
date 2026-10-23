@@ -339,8 +339,18 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				if !reserve {
 					c.Set("async_image_retry_after", httpResp.Header.Get("Retry-After"))
 				}
-				if !reserve && c.GetBool("async_image_execution") && (info.ApiType == constant.APITypeOpenAI || info.ApiType == constant.APITypeXai) {
+				if !reserve && c.GetBool("async_image_execution") && (info.ApiType == constant.APITypeOpenAI || info.ApiType == constant.APITypeXai || info.ApiType == constant.APITypeNewAPI) {
 					failure := service.ClassifyOpenAIAsyncImageHTTPFailure(c.Request.Context(), httpResp, statusCodeMappingStr)
+					if info.ApiType == constant.APITypeNewAPI && c.GetString("async_image_resume_task") == "" {
+						// A gateway's error codes describe its own upstream call, not
+						// this connection. Keep ambiguous submissions reserved while
+						// retaining the provider's HTTP response for reconciliation.
+						switch types.ErrorCode(failure.ProviderCode) {
+						case types.ErrorCodeDoRequestFailed, types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponse, types.ErrorCodeBadResponseBody, types.ErrorCodeEmptyResponse:
+							failure.Code, failure.InternalCode = 608, "execution_unknown"
+							failure.ExecutionUnknown = true
+						}
+					}
 					return nil, types.NewErrorWithStatusCode(failure, types.ErrorCodeBadResponseStatusCode, failure.HTTPStatus)
 				}
 				if reserve && (httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500) {

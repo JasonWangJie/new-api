@@ -854,8 +854,12 @@ func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task mode
 				publicURLs = append(publicURLs, resultURL)
 			}
 		}
-		if err := model.RecordAsyncImageUpstreamResult(ctx, task, publicURLs); err != nil {
-			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_record_failed", Message: "Upstream image result could not be recorded"}
+		// A download profile can accompany a synchronous response. Provider job
+		// milestones apply only when the provider returned a job ID.
+		if task.UpstreamTaskId != "" {
+			if err := model.RecordAsyncImageUpstreamResult(ctx, task, publicURLs); err != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_record_failed", Message: "Upstream image result could not be recorded"}
+			}
 		}
 		download := service.DownloadUpstreamAsyncImages
 		if info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {

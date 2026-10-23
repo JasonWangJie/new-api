@@ -410,12 +410,10 @@ type RecordTaskBillingLogParams struct {
 	Group     string
 	Other     *LogOther
 	NodeName  string // 任务发起节点；为空时回退当前节点
+	RequestId string
 }
 
-func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
-	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
-		return
-	}
+func newTaskBillingLog(params RecordTaskBillingLogParams) *Log {
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
 	if params.TokenId > 0 {
@@ -423,11 +421,10 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 			tokenName = token.Name
 		}
 	}
-	createdAt := common.GetTimestamp()
-	log := &Log{
+	return &Log{
 		UserId:    params.UserId,
 		Username:  username,
-		CreatedAt: createdAt,
+		CreatedAt: common.GetTimestamp(),
 		Type:      params.LogType,
 		Content:   params.Content,
 		TokenName: tokenName,
@@ -437,7 +434,15 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		TokenId:   params.TokenId,
 		Group:     params.Group,
 		Other:     params.Other.JSONString(),
+		RequestId: params.RequestId,
 	}
+}
+
+func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
+	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		return
+	}
+	log := newTaskBillingLog(params)
 	err := createLog(log)
 	if err != nil {
 		common.SysLog("failed to record task billing log: " + err.Error())
@@ -449,10 +454,10 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		}
 		LogQuotaData(QuotaDataLogParams{
 			UserID:    params.UserId,
-			Username:  username,
+			Username:  log.Username,
 			ModelName: params.ModelName,
 			Quota:     params.Quota,
-			CreatedAt: createdAt,
+			CreatedAt: log.CreatedAt,
 			UseGroup:  params.Group,
 			TokenID:   params.TokenId,
 			ChannelID: params.ChannelId,

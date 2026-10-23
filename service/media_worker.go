@@ -9,9 +9,12 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
@@ -38,6 +41,42 @@ type AsyncVideoRequest struct {
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
 var PersistAsyncVideoFunc func(context.Context, model.AsyncMediaJob, *model.Task) error
 
+// recordAsyncVideoSubmissionRefund records only confirmed reservation rollbacks.
+// Submit failures have not accumulated usage, so RefundTaskQuota cannot be used.
+func recordAsyncVideoSubmissionRefund(c *gin.Context, info *relaycommon.RelayInfo, quota int, refundErr error) {
+	if info.TaskRelayInfo == nil || info.TaskRelayInfo.PublicTaskID == "" {
+		return
+	}
+	taskID := info.TaskRelayInfo.PublicTaskID
+	updates := map[string]any{"billing_status": "refunded", "quota": 0}
+	var refund *model.RecordTaskBillingLogParams
+	if refundErr != nil {
+		updates = map[string]any{"billing_status": "failed"}
+	} else if quota == 0 {
+		updates["billing_status"] = "not_billable"
+	} else {
+		other := model.NewLogOther()
+		other.SetPublic("is_task", true)
+		other.SetPublic("task_id", taskID)
+		other.SetPublic("reason", "Task submission failed; reserved quota returned")
+		other.SetPublic("billing_source", info.BillingSource)
+		other.SetPublic("request_path", c.Request.URL.Path)
+		if info.SubscriptionId > 0 {
+			other.SetPublic("subscription_id", info.SubscriptionId)
+		}
+		attachQuotaSaturation(c, info, other)
+		refund = &model.RecordTaskBillingLogParams{
+			UserId: info.UserId, LogType: model.LogTypeRefund, ChannelId: info.ChannelId,
+			ModelName: info.OriginModelName, Quota: quota, TokenId: info.TokenId,
+			Group: info.UsingGroup, Other: other, RequestId: c.GetString(common.RequestIdKey),
+		}
+	}
+	ctx := context.WithoutCancel(c.Request.Context())
+	if err := model.SaveAsyncMediaSubmissionRefund(ctx, taskID, info.UserId, updates, refund); err != nil {
+		logger.LogError(c, "video submission refund audit "+taskID+": "+err.Error())
+	}
+}
+
 // ErrAsyncMediaDownloadTransport marks download failures for which the owner's
 // browser may still reach the public result. Invalid media and rejected URLs
 // must never use this fallback.
@@ -53,6 +92,12 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
+			}
+			refundLogCtx, refundLogCancel := context.WithTimeout(ctx, 2*time.Second)
+			refundLogErr := model.ReplayAsyncMediaRefundLogs(refundLogCtx, 100)
+			refundLogCancel()
+			if refundLogErr != nil {
+				common.SysError("media refund log delivery: " + refundLogErr.Error())
 			}
 			cfg, err := GetMediaRuntimeConfig(ctx)
 			if err != nil {
@@ -135,6 +180,12 @@ func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.
 }
 
 func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg MediaRuntimeConfig) error {
+	if job.Status == "failed" || job.Status == "expired" || job.Status == "execution_unknown" {
+		if job.Status == "execution_unknown" {
+			return model.UpdateAsyncMediaJob(parent, job, map[string]any{"status": "failed", "next_attempt_at": 0})
+		}
+		return nil
+	}
 	cfg = cfg.withWorkerDefaults()
 	timeout := cfg.DownloadTimeout
 	if job.Status == "queued" || job.Status == "submitting" {
@@ -146,6 +197,11 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 	defer cancel()
 	updates := map[string]any{"lease_token": "", "lease_expires_at": 0, "next_attempt_at": time.Now().Unix() + 3}
 	defer func() {
+		if updates["billing_status"] == "unknown" {
+			// A previous lease holder may confirm its refund after this worker's
+			// read. Preserve that evidence atomically when releasing this lease.
+			updates["billing_status"] = gorm.Expr("CASE WHEN billing_status IN ('refunded','not_billable','failed') THEN billing_status ELSE ? END", "unknown")
+		}
 		if err := model.UpdateAsyncMediaJob(context.WithoutCancel(parent), job, updates); err != nil {
 			common.SysError("media lease confirmation: " + err.Error())
 		} else if updates["status"] == "succeeded" || updates["status"] == "expired" {
@@ -176,11 +232,14 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			if task.Status == model.TaskStatusSuccess {
 				updates["billing_status"] = "settled"
 			}
-			if task.Status == model.TaskStatusFailure {
-				updates["billing_status"] = "refunded"
-			}
 		}
 		if task.Status == model.TaskStatusFailure {
+			if job.BillingStatus != "failed" {
+				updates["billing_status"] = "failed"
+				if task.Quota == 0 {
+					updates["billing_status"] = "refunded"
+				}
+			}
 			updates["status"], updates["error_message"], updates["next_attempt_at"] = "failed", task.FailReason, 0
 			return nil
 		}
@@ -227,7 +286,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		updates["storage_status"], updates["status"], updates["error_message"], updates["next_attempt_at"] = "succeeded", "succeeded", "", 0
 		return nil
 	}
-	if job.Status == "submitted" || job.DispatchedAt > 0 || job.BillingStatus == "reserving" {
+	if job.Status == "submitted" || job.DispatchedAt > 0 || job.BillingStatus == "reserving" || job.BillingStatus == "reserved" {
 		reason := "Upstream submission could not be confirmed; the video operation will not be repeated"
 		if detail := VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
 			if strings.Contains(detail, reason) {
@@ -236,7 +295,11 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 				reason += "\n" + detail
 			}
 		}
-		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "execution_unknown", "unknown", VideoTaskFailureReason(reason), 0
+		billingStatus := job.BillingStatus
+		if billingStatus != "refunded" && billingStatus != "not_billable" && billingStatus != "failed" {
+			billingStatus = "unknown"
+		}
+		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "failed", billingStatus, VideoTaskFailureReason(reason), 0
 		return nil
 	}
 	if SubmitAsyncVideoFunc == nil {
@@ -272,9 +335,14 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return err
 	}
 	reason := submitErr.Error()
-	updates["status"], updates["billing_status"], updates["next_attempt_at"] = "failed", "refunded", 0
-	if current.DispatchedAt > 0 {
-		updates["status"], updates["billing_status"] = "execution_unknown", "unknown"
+	updates["status"], updates["billing_status"], updates["next_attempt_at"] = "failed", current.BillingStatus, 0
+	if current.BillingStatus != "refunded" && current.BillingStatus != "not_billable" && current.BillingStatus != "failed" {
+		updates["billing_status"] = "not_billable"
+		if current.DispatchedAt > 0 || current.BillingStatus == "reserving" || current.BillingStatus == "reserved" {
+			updates["billing_status"] = "unknown"
+		}
+	}
+	if current.DispatchedAt > 0 && updates["billing_status"] == "unknown" {
 		reason = "Upstream submission could not be confirmed; the video operation will not be repeated\n" + reason
 	}
 	updates["error_message"] = VideoTaskFailureReason(reason)

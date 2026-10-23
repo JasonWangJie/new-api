@@ -171,7 +171,8 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 		require.True(t, claimed)
 		require.NoError(t, ProcessAsyncMediaJob(t.Context(), uncertain, cfg))
 		require.NoError(t, db.Where("id = ?", uncertain.ID).Take(&uncertain).Error)
-		assert.Equal(t, "execution_unknown", uncertain.Status)
+		assert.Equal(t, "failed", uncertain.Status)
+		assert.Equal(t, "unknown", uncertain.BillingStatus)
 	}
 	assert.Zero(t, submissions)
 	require.NoError(t, db.Model(&object).Update("expires_at", 1).Error)
