@@ -31,7 +31,11 @@ import { Label } from '@/components/ui/label'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
 
 import { imageRequest } from '../api'
-import { imageLabel } from '../lib/image-labels'
+import {
+  imageLabel,
+  imagePlatformLabel,
+  imageRoutingPlatforms,
+} from '../lib/image-labels'
 import type { ImageAdminConfiguration } from '../types'
 import { ImageGroupSelect } from './image-group-select'
 import { ImageSelect } from './image-select'
@@ -43,6 +47,8 @@ type RouteCandidate = {
   channel_id: number
   name: string
   upstream_model: string
+  provider?: string
+  protocol?: string
   priority: number
   weight: number
   available_accounts: number
@@ -142,16 +148,31 @@ export function ImageRoutingPreview(props: {
             label={t('Platform')}
             value={values.platform}
             disabled={preview.isPending}
-            options={(
-              props.config.media_providers ||
-              props.config.image_providers || ['openai', 'gemini']
-            ).map((value) => ({ value, label: value }))}
-            onChange={(value) => change('platform', value)}
+            options={imageRoutingPlatforms(
+              props.config.routing_platforms ||
+                props.config.media_providers ||
+                props.config.image_providers
+            ).map((value) => ({ value, label: t(imagePlatformLabel(value)) }))}
+            onChange={(value) => {
+              setValues((previous) => ({
+                ...previous,
+                platform: value,
+                ...(value === 'mixed'
+                  ? {
+                      media_type: 'image',
+                      operation: 'text_to_image',
+                      resolution: '1K',
+                      seconds: '',
+                    }
+                  : {}),
+              }))
+              preview.reset()
+            }}
           />
           <ImageSelect
             label={t('Media type')}
             value={values.media_type}
-            disabled={preview.isPending}
+            disabled={preview.isPending || values.platform === 'mixed'}
             options={[
               { value: 'image', label: t('Image') },
               { value: 'video', label: t('Video') },
@@ -288,6 +309,16 @@ export function ImageRoutingPreview(props: {
                 header: t('Channel'),
                 cell: (candidate) =>
                   `#${candidate.channel_id} · ${candidate.name}`,
+              },
+              {
+                id: 'provider',
+                header: t('Provider'),
+                cell: (candidate) => candidate.provider || '—',
+              },
+              {
+                id: 'protocol',
+                header: t('Protocol'),
+                cell: (candidate) => candidate.protocol || '—',
               },
               {
                 id: 'model',

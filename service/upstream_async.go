@@ -39,6 +39,7 @@ type UpstreamAsyncPollResult struct {
 	URLs          []string
 	ActualSeconds *float64
 	Usage         *relaydto.Usage
+	UsageFields   map[string]bool
 }
 
 // BuildUpstreamAsyncSubmitRequest replaces only the outbound HTTP request.
@@ -151,6 +152,19 @@ func expandUpstreamAsyncSubmitJSON(value any, values UpstreamAsyncTemplateContex
 }
 
 func ValidateUpstreamAsyncImageSubmitCount(request *http.Request, expected int) error {
+	return validateImageSubmitCount(request, expected, false)
+}
+
+// ValidateMixedImageSubmitCount also requires an explicit quantity for batches;
+// a single-output converter cannot silently accept a multi-output mixed task.
+func ValidateMixedImageSubmitCount(request *http.Request, expected int) error {
+	return validateImageSubmitCount(request, expected, true)
+}
+
+func validateImageSubmitCount(request *http.Request, expected int, requireBatchCount bool) error {
+	if expected < 1 || expected > relaydto.MaxImageN {
+		return errors.New("upstream async image count is outside the allowed range")
+	}
 	if request == nil || request.GetBody == nil {
 		return errors.New("upstream async submit body is unavailable")
 	}
@@ -163,15 +177,20 @@ func ValidateUpstreamAsyncImageSubmitCount(request *http.Request, expected int) 
 	if err != nil || len(encoded) > 64<<20 {
 		return errors.New("upstream async submit body exceeds the byte limit")
 	}
-	for _, path := range []string{"n", "create_count", "batch_size", "num_outputs", "input.num_outputs", "parameters.n", "sequential_image_generation_options.max_images"} {
+	found := false
+	for _, path := range []string{"n", "create_count", "batch_size", "num_outputs", "input.num_outputs", "parameters.n", "parameters.sampleCount", "sequential_image_generation_options.max_images"} {
 		value := gjson.GetBytes(encoded, path)
 		if !value.Exists() {
 			continue
 		}
+		found = true
 		count, err := strconv.ParseUint(value.Raw, 10, 64)
 		if err != nil || count != uint64(expected) {
 			return fmt.Errorf("upstream async submit %s conflicts with the validated image count", path)
 		}
+	}
+	if requireBatchCount && expected > 1 && !found {
+		return errors.New("image adaptor does not declare the requested batch count")
 	}
 	return nil
 }
@@ -407,6 +426,12 @@ func ParseUpstreamAsyncPollResponse(profile *relaydto.UpstreamAsyncProfile, body
 		return nil, err
 	}
 	result.Usage = usage
+	if len(profile.Poll.Response.UsagePaths) > 0 {
+		result.UsageFields = make(map[string]bool, len(profile.Poll.Response.UsagePaths))
+		for target, path := range profile.Poll.Response.UsagePaths {
+			result.UsageFields[target] = gjson.GetBytes(body, path).Exists()
+		}
+	}
 	return result, nil
 }
 
@@ -589,6 +614,22 @@ func parseUpstreamAsyncUsage(body []byte, paths map[string]string) (*relaydto.Us
 			return nil, fmt.Errorf("%w: %s exceeds the billing limit", ErrUpstreamAsyncBillingUsage, target)
 		}
 		setUpstreamAsyncUsage(usage, target, int(integer))
+		// Responses-style names are accepted configuration targets. Preserve
+		// explicit Chat-style mappings, including zero, when both are supplied.
+		canonical := target
+		switch {
+		case target == "input_tokens":
+			canonical = "prompt_tokens"
+		case target == "output_tokens":
+			canonical = "completion_tokens"
+		case strings.HasPrefix(target, "input_tokens_details."):
+			canonical = "prompt_tokens_details." + strings.TrimPrefix(target, "input_tokens_details.")
+		case strings.HasPrefix(target, "output_tokens_details."):
+			canonical = "completion_tokens_details." + strings.TrimPrefix(target, "output_tokens_details.")
+		}
+		if canonical != target && (paths[canonical] == "" || !gjson.GetBytes(body, paths[canonical]).Exists()) {
+			setUpstreamAsyncUsage(usage, canonical, int(integer))
+		}
 		found = true
 	}
 	if !found {

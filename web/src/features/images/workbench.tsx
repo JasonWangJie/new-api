@@ -18,17 +18,25 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { isAxiosError } from 'axios'
-import { ArrowDown, ArrowUp, Plus, Sparkles, Trash2 } from 'lucide-react'
+import {
+  Film,
+  ImageIcon,
+  Loader2,
+  SlidersHorizontal,
+  Sparkles,
+} from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
+import { EmptyState } from '@/components/empty-state'
 import { SectionPageLayout } from '@/components/layout/components/section-page-layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
@@ -41,15 +49,20 @@ import {
   imageRelayRequest,
   imageRequest,
 } from './api'
+import {
+  ImageReferenceInput,
+  type ReferencePart,
+} from './components/image-reference-input'
 import { ImageResults } from './components/image-results'
 import { ImageSelect } from './components/image-select'
-import { imageLabel } from './lib/image-labels'
+import { imageLabel, imagePlatformLabel } from './lib/image-labels'
 import {
   buildImageRequest,
   extractImageResponse,
   IMAGE_RATIOS,
   imageRequestDimensions,
   terminalImageStatus,
+  type ImageRequestPart,
 } from './lib/image-request'
 import { imageChecksum, saveLocalImage } from './lib/local-images'
 import {
@@ -60,7 +73,6 @@ import {
 import type { ImageMetadata } from './types'
 import { VideoWorkbench } from './video-workbench'
 
-type ReferencePart = { id: string; type: 'text' | 'image'; value: string }
 type SubmissionSnapshot = {
   url: string
   body: string
@@ -74,15 +86,24 @@ export function ImageWorkbench() {
   const { t } = useTranslation()
   const [media, setMedia] = useState('image')
   return userId ? (
-    <div className='flex min-h-0 flex-1 flex-col gap-4 overflow-hidden'>
+    <div className='flex min-h-0 flex-1 flex-col overflow-hidden'>
       <Tabs
-        className='shrink-0'
+        className='shrink-0 border-b px-3 py-3 sm:px-4'
         value={media}
         onValueChange={(value) => setMedia(String(value))}
       >
-        <TabsList>
-          <TabsTrigger value='image'>{t('Image')}</TabsTrigger>
-          <TabsTrigger value='video'>{t('Video')}</TabsTrigger>
+        <TabsList
+          aria-label={t('Media type')}
+          className='w-full rounded-xl p-1 group-data-horizontal/tabs:h-11 sm:w-fit sm:min-w-72'
+        >
+          <TabsTrigger value='image' className='gap-2 rounded-lg px-6'>
+            <ImageIcon className='size-4' aria-hidden='true' />
+            {t('Image')}
+          </TabsTrigger>
+          <TabsTrigger value='video' className='gap-2 rounded-lg px-6'>
+            <Film className='size-4' aria-hidden='true' />
+            {t('Video')}
+          </TabsTrigger>
         </TabsList>
       </Tabs>
       {media === 'image' ? (
@@ -101,13 +122,16 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const [prompt, setPrompt] = useState(
     () => sessionStorage.getItem(`new-api:image-prompt:${userId}`) || ''
   )
-  const [parts, setParts] = useState<ReferencePart[]>([])
+  const [parts, setParts] = useState<ReferencePart[]>([
+    { id: 'reference-urls', type: 'image_urls', value: '' },
+  ])
   const [resolution, setResolution] = useState('1K')
   const [ratio, setRatio] = useState('1:1')
   const [quality, setQuality] = useState('')
   const [format, setFormat] = useState('')
   const [background, setBackground] = useState('')
   const [count, setCount] = useState(1)
+  const [loadingReferences, setLoadingReferences] = useState(false)
   const [busy, setBusy] = useState(false)
   const [taskId, setTaskId] = useState(() => readWorkbenchTask(userId, 'image'))
   const [results, setResults] = useState<{ id: string; url: string }[]>([])
@@ -206,45 +230,63 @@ function WorkbenchSession({ userId }: { userId: number }) {
         task.data.task.next_attempt_at
       ))
   const chooseModel = (value: string) => {
+    const selectedModel = models.find(
+      (candidate) => `${candidate.platform}:${candidate.id}` === value
+    )
     setModelId(value)
     setQuality('')
     setFormat('')
     setBackground('')
     setCount(1)
-    setResolution('1K')
+    setResolution(selectedModel?.capability.resolutions?.[0] || '1K')
   }
-  const movePart = (index: number, offset: number) => {
-    setParts((previous) => {
-      const next = [...previous]
-      ;[next[index], next[index + offset]] = [next[index + offset], next[index]]
-      return next
-    })
-  }
-  const loadReference = async (file: File) => {
+  const loadReferences = async (files: File[]) => {
     if (
-      !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) ||
-      file.size > 32 * 1024 * 1024
+      files.some(
+        (file) =>
+          !['image/png', 'image/jpeg', 'image/webp'].includes(file.type) ||
+          file.size > 32 * 1024 * 1024
+      )
     ) {
       toast.error(t('Unsupported image format'))
       return
     }
-    const reader = new FileReader()
-    reader.addEventListener('load', () => {
+    setLoadingReferences(true)
+    try {
+      const uploadedParts = await Promise.all(
+        files.map(
+          (file) =>
+            new Promise<ReferencePart>((resolve, reject) => {
+              const reader = new FileReader()
+              reader.addEventListener('load', () =>
+                resolve({
+                  id: crypto.randomUUID(),
+                  type: 'image',
+                  value: String(reader.result),
+                })
+              )
+              reader.addEventListener('error', () =>
+                reject(new Error(t('Failed to load image')))
+              )
+              reader.readAsDataURL(file)
+            })
+        )
+      )
       if (currentOwner()) {
-        setParts((previous) => [
-          ...previous,
-          {
-            id: crypto.randomUUID(),
-            type: 'image',
-            value: String(reader.result),
-          },
-        ])
+        setParts((previous) => [...previous, ...uploadedParts])
       }
-    })
-    reader.readAsDataURL(file)
+    } catch (error) {
+      if (currentOwner()) {
+        toast.error(
+          error instanceof Error ? error.message : t('Failed to load image')
+        )
+      }
+    } finally {
+      if (currentOwner()) setLoadingReferences(false)
+    }
   }
   const submit = async (retry = false) => {
-    if (!model && !retry) return
+    if (loadingReferences || (!model && !retry)) return
     setBusy(true)
     setSubmissionError('')
     setSaveError('')
@@ -278,15 +320,23 @@ function WorkbenchSession({ userId }: { userId: number }) {
         const request = buildImageRequest({
           model: currentModel,
           prompt,
-          parts: parts.map((part) =>
-            part.type === 'text'
-              ? { type: 'text', text: part.value }
-              : { type: 'image_url', image_url: { url: part.value } }
-          ),
+          parts: parts.flatMap((part): ImageRequestPart[] => {
+            if (part.type === 'text') {
+              return [{ type: 'text', text: part.value }]
+            }
+            if (part.type === 'image') {
+              return [{ type: 'image_url', image_url: { url: part.value } }]
+            }
+            return part.value
+              .split(/\r?\n/)
+              .map((url) => url.trim())
+              .filter(Boolean)
+              .map((url) => ({ type: 'image_url', image_url: { url } }))
+          }),
           resolution,
           ratio,
           quality,
-          count: currentModel.platform === 'gemini' ? 1 : count,
+          count,
           format,
           background,
         })
@@ -405,63 +455,79 @@ function WorkbenchSession({ userId }: { userId: number }) {
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Image Workbench')}</SectionPageLayout.Title>
       <SectionPageLayout.Actions>
-        <a
-          className='text-muted-foreground text-sm underline underline-offset-4'
-          href='/guide/async-image-api'
+        <Button
+          variant='outline'
+          size='sm'
+          render={<a href='/guide/async-image-api' />}
         >
           {t('Async Image API Guide')}
-        </a>
+        </Button>
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
-        <div className='grid min-h-full gap-6 lg:grid-cols-[minmax(280px,360px)_1fr]'>
+        <div className='grid min-h-full items-start gap-5 xl:grid-cols-[minmax(360px,440px)_minmax(0,1fr)]'>
           <form
-            className='bg-card space-y-5 rounded-xl border p-5'
+            aria-label={t('Image generation settings')}
+            className='bg-card min-w-0 overflow-hidden rounded-2xl border shadow-sm [&_[data-slot=select-trigger]]:min-h-11 [&_input:not([type=file])]:min-h-11'
             onSubmit={(event) => {
               event.preventDefault()
               void submit()
             }}
           >
-            <div>
-              <p className='text-muted-foreground mb-1 text-xs font-semibold tracking-widest'>
-                {t('CREATE')}
-              </p>
-              <h3 className='font-serif text-2xl'>
-                {t('A place for your next image')}
-              </h3>
+            <div className='from-primary/5 flex items-center gap-4 border-b bg-linear-to-br to-transparent p-5 sm:p-6'>
+              <div className='bg-primary/10 text-primary flex size-11 shrink-0 items-center justify-center rounded-xl'>
+                <ImageIcon className='size-5' aria-hidden='true' />
+              </div>
+              <div className='min-w-0'>
+                <p className='text-muted-foreground mb-1 text-[10px] font-semibold tracking-[0.2em]'>
+                  {t('CREATE')}
+                </p>
+                <h3 className='font-serif text-xl leading-snug'>
+                  {t('A place for your next image')}
+                </h3>
+              </div>
             </div>
-            <ImageSelect
-              label={t('API Key')}
-              value={tokenId}
-              options={(keys.data?.data?.items || [])
-                .filter((key) => key.status === 1)
-                .map((key) => ({ value: String(key.id), label: key.name }))}
-              onChange={(value) => {
-                setTokenId(value)
-                chooseModel('')
-              }}
-              disabled={busy || activeTask}
-            />
-            <ImageSelect
-              label={t('Model')}
-              value={modelId}
-              options={models.map((candidate) => ({
-                value: `${candidate.platform}:${candidate.id}`,
-                label: `${candidate.label || candidate.id} · ${candidate.platform} · ${t(candidate.mode === 'async' ? 'Asynchronous' : 'Realtime')}`,
-              }))}
-              onChange={chooseModel}
-              disabled={busy || activeTask || !tokenId}
-            />
-            {capabilities.isError && (
-              <p role='alert' className='text-destructive text-sm'>
-                {capabilities.error.message}
-              </p>
-            )}
-            {capabilities.data && !models.length && (
-              <p role='status' className='text-muted-foreground text-sm'>
-                {t('No executable image model is available')}
-              </p>
-            )}
-            <div className='space-y-2'>
+            <div className='space-y-4 border-b p-5 sm:p-6'>
+              <ImageSelect
+                label={t('API Key')}
+                value={tokenId}
+                options={(keys.data?.data?.items || [])
+                  .filter((key) => key.status === 1)
+                  .map((key) => ({ value: String(key.id), label: key.name }))}
+                onChange={(value) => {
+                  setTokenId(value)
+                  chooseModel('')
+                }}
+                disabled={busy || activeTask}
+              />
+              <ImageSelect
+                label={t('Model')}
+                value={modelId}
+                options={models.map((candidate) => ({
+                  value: `${candidate.platform}:${candidate.id}`,
+                  label: `${candidate.label || candidate.id} · ${t(imagePlatformLabel(candidate.platform))} · ${t(candidate.mode === 'async' ? 'Asynchronous' : 'Realtime')}`,
+                }))}
+                onChange={chooseModel}
+                disabled={busy || activeTask || !tokenId}
+              />
+              {model?.platform === 'mixed' && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t(
+                    'Mixed scheduling accepts asynchronous image requests without provider. Explicit provider requests keep their platform routing.'
+                  )}
+                </p>
+              )}
+              {capabilities.isError && (
+                <p role='alert' className='text-destructive text-sm'>
+                  {capabilities.error.message}
+                </p>
+              )}
+              {capabilities.data && !models.length && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t('No executable image model is available')}
+                </p>
+              )}
+            </div>
+            <div className='space-y-3 border-b p-5 sm:p-6'>
               <Label htmlFor='image-prompt'>{t('Prompt')}</Label>
               <Textarea
                 id='image-prompt'
@@ -470,303 +536,249 @@ function WorkbenchSession({ userId }: { userId: number }) {
                 placeholder={t(
                   'Describe your image, its light, materials and composition'
                 )}
-                className='min-h-36'
+                className='bg-background/60 min-h-36 resize-y text-sm leading-relaxed'
                 required
                 disabled={busy || activeTask}
               />
             </div>
-            <div className='grid grid-cols-2 gap-3'>
-              <ImageSelect
-                label={t('Resolution')}
-                value={resolution}
-                options={options(
-                  model?.capability.resolutions?.length
-                    ? model.capability.resolutions
-                    : ['1K', '2K', '4K']
-                )}
-                onChange={setResolution}
-                disabled={busy || activeTask}
-              />
-              <ImageSelect
-                label={t('Aspect Ratio')}
-                value={ratio}
-                options={options(IMAGE_RATIOS)}
-                onChange={setRatio}
-                disabled={busy || activeTask}
-              />
-            </div>
-            {dimensions && (
-              <p role='status' className='text-muted-foreground text-sm'>
-                {t('Submitted size: {{size}}', {
-                  size:
-                    dimensions.size === 'auto' ? t('Auto') : dimensions.size,
-                })}
-                {dimensions.approximate && (
-                  <>
-                    {' '}
-                    {t(
-                      'The selected aspect ratio is approximated by this size.'
-                    )}
-                  </>
-                )}
-              </p>
-            )}
-            {model?.capability.qualities?.length ? (
-              <ImageSelect
-                label={t('Quality')}
-                value={quality}
-                options={[
-                  { value: '', label: t('Default') },
-                  ...options(model.capability.qualities),
-                ]}
-                onChange={setQuality}
-                disabled={busy || activeTask}
-              />
-            ) : null}
-            {model?.capability.formats?.length ? (
-              <ImageSelect
-                label={t('Output format')}
-                value={format}
-                options={[
-                  { value: '', label: t('Default') },
-                  ...options(model.capability.formats),
-                ]}
-                onChange={setFormat}
-                disabled={busy || activeTask}
-              />
-            ) : null}
-            {model?.capability.backgrounds?.length ? (
-              <ImageSelect
-                label={t('Background')}
-                value={background}
-                options={[
-                  { value: '', label: t('Default') },
-                  ...options(model.capability.backgrounds),
-                ]}
-                onChange={setBackground}
-                disabled={busy || activeTask}
-              />
-            ) : null}
-            {model?.platform === 'openai' && (
-              <div className='space-y-2'>
-                <Label htmlFor='image-count'>{t('Image count')}</Label>
-                <Input
-                  id='image-count'
-                  type='number'
-                  min={1}
-                  max={Math.min(128, model.capability.max_output_images)}
-                  value={count}
-                  onChange={(event) => setCount(event.target.valueAsNumber)}
+            <ImageReferenceInput
+              parts={parts}
+              onChange={setParts}
+              onUpload={loadReferences}
+              disabled={busy || activeTask || loadingReferences}
+            />
+            <div className='space-y-4 border-b p-5 sm:p-6'>
+              <h4 className='flex items-center gap-2 text-sm font-medium'>
+                <SlidersHorizontal
+                  className='text-muted-foreground size-4'
+                  aria-hidden='true'
+                />
+                {t('Generation settings')}
+              </h4>
+              <div className='grid grid-cols-2 gap-3'>
+                <ImageSelect
+                  label={t('Resolution')}
+                  value={resolution}
+                  options={options(
+                    model?.capability.resolutions?.length
+                      ? model.capability.resolutions
+                      : ['1K', '2K', '4K']
+                  )}
+                  onChange={setResolution}
+                  disabled={busy || activeTask}
+                />
+                <ImageSelect
+                  label={t('Aspect Ratio')}
+                  value={ratio}
+                  options={options(IMAGE_RATIOS)}
+                  onChange={setRatio}
                   disabled={busy || activeTask}
                 />
               </div>
-            )}
-            <fieldset className='space-y-3' disabled={busy || activeTask}>
-              <legend className='mb-2 text-sm font-medium'>
-                {t('Reference images and text parts')}
-              </legend>
-              {parts.map((part, index) => (
-                <div
-                  key={part.id}
-                  className='bg-muted/30 space-y-2 rounded-lg border p-2'
-                >
-                  {part.type === 'image' && part.value.startsWith('data:') ? (
-                    <img
-                      className='h-20 w-full object-contain'
-                      src={part.value}
-                      alt={t('Reference image')}
-                    />
-                  ) : (
-                    <Input
-                      value={part.value}
-                      onChange={(event) =>
-                        setParts((previous) =>
-                          previous.map((candidate) =>
-                            candidate.id === part.id
-                              ? { ...candidate, value: event.target.value }
-                              : candidate
-                          )
-                        )
-                      }
-                      aria-label={t(
-                        part.type === 'text'
-                          ? 'Text part'
-                          : 'Reference image URL'
+              {dimensions && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t('Submitted size: {{size}}', {
+                    size:
+                      dimensions.size === 'auto' ? t('Auto') : dimensions.size,
+                  })}
+                  {dimensions.approximate && (
+                    <>
+                      {' '}
+                      {t(
+                        'The selected aspect ratio is approximated by this size.'
                       )}
-                      placeholder={
-                        part.type === 'image' ? 'https://…' : t('Text part')
-                      }
-                    />
+                    </>
                   )}
-                  <div className='flex justify-end gap-1'>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      size='icon'
-                      aria-label={t('Move up')}
-                      disabled={!index}
-                      onClick={() => movePart(index, -1)}
-                    >
-                      <ArrowUp className='size-4' />
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      size='icon'
-                      aria-label={t('Move down')}
-                      disabled={index === parts.length - 1}
-                      onClick={() => movePart(index, 1)}
-                    >
-                      <ArrowDown className='size-4' />
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      size='icon'
-                      aria-label={t('Remove')}
-                      onClick={() =>
-                        setParts((previous) =>
-                          previous.filter(
-                            (candidate) => candidate.id !== part.id
-                          )
-                        )
-                      }
-                    >
-                      <Trash2 className='size-4' />
-                    </Button>
-                  </div>
-                </div>
-              ))}
-              <div className='flex flex-wrap gap-2'>
-                <Button
-                  type='button'
-                  variant='outline'
-                  size='sm'
-                  onClick={() =>
-                    setParts((previous) => [
-                      ...previous,
-                      { id: crypto.randomUUID(), type: 'image', value: '' },
-                    ])
-                  }
-                >
-                  <Plus className='size-3' />
-                  {t('Image URL')}
-                </Button>
-                <Button
-                  type='button'
-                  variant='outline'
-                  size='sm'
-                  onClick={() =>
-                    setParts((previous) => [
-                      ...previous,
-                      { id: crypto.randomUUID(), type: 'text', value: '' },
-                    ])
-                  }
-                >
-                  {t('Add text part')}
-                </Button>
-                <Label
-                  htmlFor='image-reference-file'
-                  className='text-muted-foreground cursor-pointer text-xs underline'
-                >
-                  {t('Upload reference image')}
-                </Label>
-                <Input
-                  id='image-reference-file'
-                  type='file'
-                  accept='image/png,image/jpeg,image/webp'
-                  className='text-xs'
-                  onChange={(event) => {
-                    const file = event.target.files?.[0]
-                    if (file) void loadReference(file)
-                    event.target.value = ''
-                  }}
-                />
-              </div>
-            </fieldset>
-            <Button
-              type='submit'
-              className='w-full'
-              disabled={!model || busy || activeTask}
-            >
-              <Sparkles className='size-4' aria-hidden='true' />
-              {busy && t('Submitting')}
-              {!busy && activeTask && t('Processing')}
-              {!busy && !activeTask && t('Generate image')}
-            </Button>
-            {submissionError && (
-              <div role='alert' className='text-destructive text-sm'>
-                {submissionError}
-                {snapshot.current && (
-                  <Button
-                    type='button'
-                    variant='outline'
-                    className='mt-2 w-full'
-                    disabled={busy}
-                    onClick={() => void submit(true)}
-                  >
-                    {t('Retry the same submission')}
-                  </Button>
-                )}
-              </div>
-            )}
-            <p className='text-muted-foreground text-xs leading-relaxed'>
-              {t(
-                'Realtime images are saved on this device. Async images remain in your task center.'
+                </p>
               )}
-            </p>
+              {model?.capability.qualities?.length ? (
+                <ImageSelect
+                  label={t('Quality')}
+                  value={quality}
+                  options={[
+                    { value: '', label: t('Default') },
+                    ...options(model.capability.qualities),
+                  ]}
+                  onChange={setQuality}
+                  disabled={busy || activeTask}
+                />
+              ) : null}
+              {model?.capability.formats?.length ? (
+                <ImageSelect
+                  label={t('Output format')}
+                  value={format}
+                  options={[
+                    { value: '', label: t('Default') },
+                    ...options(model.capability.formats),
+                  ]}
+                  onChange={setFormat}
+                  disabled={busy || activeTask}
+                />
+              ) : null}
+              {model?.capability.backgrounds?.length ? (
+                <ImageSelect
+                  label={t('Background')}
+                  value={background}
+                  options={[
+                    { value: '', label: t('Default') },
+                    ...options(model.capability.backgrounds),
+                  ]}
+                  onChange={setBackground}
+                  disabled={busy || activeTask}
+                />
+              ) : null}
+              {model &&
+                model.capability.max_output_images > 1 &&
+                model.protocol !== 'gemini_native' &&
+                (model.provider || model.platform !== 'gemini') && (
+                  <div className='space-y-2'>
+                    <Label htmlFor='image-count'>{t('Image count')}</Label>
+                    <Input
+                      id='image-count'
+                      type='number'
+                      min={1}
+                      max={Math.min(128, model.capability.max_output_images)}
+                      value={count}
+                      onChange={(event) => setCount(event.target.valueAsNumber)}
+                      disabled={busy || activeTask}
+                    />
+                  </div>
+                )}
+            </div>
+            <div className='bg-muted/15 space-y-3 p-5 sm:p-6'>
+              <Button
+                type='submit'
+                className='h-11 w-full gap-2 rounded-xl shadow-sm'
+                disabled={!model || busy || activeTask || loadingReferences}
+              >
+                {busy || activeTask || loadingReferences ? (
+                  <Loader2
+                    className='size-4 animate-spin motion-reduce:animate-none'
+                    aria-hidden='true'
+                  />
+                ) : (
+                  <Sparkles className='size-4' aria-hidden='true' />
+                )}
+                {busy && t('Submitting')}
+                {!busy && activeTask && t('Processing')}
+                {!busy && !activeTask && loadingReferences && t('Loading...')}
+                {!busy &&
+                  !activeTask &&
+                  !loadingReferences &&
+                  t('Generate image')}
+              </Button>
+              {submissionError && (
+                <div role='alert' className='text-destructive text-sm'>
+                  {submissionError}
+                  {snapshot.current && (
+                    <Button
+                      type='button'
+                      variant='outline'
+                      className='mt-2 w-full'
+                      disabled={busy}
+                      onClick={() => void submit(true)}
+                    >
+                      {t('Retry the same submission')}
+                    </Button>
+                  )}
+                </div>
+              )}
+              <p className='text-muted-foreground text-xs leading-relaxed'>
+                {t(
+                  'Realtime images are saved on this device. Async images remain in your task center.'
+                )}
+              </p>
+            </div>
           </form>
-          <section className='min-w-0 space-y-4'>
-            <div className='flex flex-wrap items-center justify-between gap-2 border-b pb-3'>
-              <h3 className='text-sm font-semibold'>{t('Results')}</h3>
+          <section
+            aria-label={t('Results')}
+            className='bg-card min-w-0 overflow-hidden rounded-2xl border shadow-sm xl:sticky xl:top-0'
+          >
+            <div className='flex flex-wrap items-center justify-between gap-3 border-b px-5 py-4 sm:px-6'>
+              <div className='flex items-center gap-3'>
+                <div className='bg-muted text-muted-foreground flex size-9 items-center justify-center rounded-lg'>
+                  <ImageIcon className='size-4' aria-hidden='true' />
+                </div>
+                <div>
+                  <h3 className='text-sm font-semibold'>
+                    {t('Image preview')}
+                  </h3>
+                  <p className='text-muted-foreground mt-0.5 text-xs'>
+                    {t('Results')}
+                  </p>
+                </div>
+              </div>
               {(taskId || results.length > 0) && (
                 <Badge variant='outline'>
                   {t(taskId ? 'Asynchronous' : 'Realtime')}
                 </Badge>
               )}
             </div>
-            {taskId && (
-              <div
-                aria-live='polite'
-                className='bg-muted/30 space-y-2 rounded-xl border p-4'
-              >
-                <div className='flex flex-wrap items-center justify-between gap-2'>
-                  <Badge variant='outline'>
-                    {t(imageLabel(task.data?.task.status || 'queued'))}
-                  </Badge>
-                  <CopyButton value={taskId} size='sm'>
-                    {taskId}
-                  </CopyButton>
+            <div className='space-y-4 p-4 sm:p-5'>
+              {taskId && (
+                <div
+                  aria-live='polite'
+                  className='bg-muted/30 min-w-0 space-y-3 rounded-xl border p-4'
+                >
+                  <div className='flex flex-wrap items-center justify-between gap-2'>
+                    <Badge variant='outline'>
+                      {t(imageLabel(task.data?.task.status || 'queued'))}
+                    </Badge>
+                    <CopyButton
+                      value={taskId}
+                      size='sm'
+                      className='max-w-full min-w-0'
+                    >
+                      <span className='truncate'>{taskId}</span>
+                    </CopyButton>
+                  </div>
+                  <Progress
+                    value={task.data?.task.progress || 0}
+                    aria-label={t('Processing')}
+                  />
+                  <p className='text-muted-foreground text-sm'>
+                    {task.data?.task.progress || 0}% · {t('Task center')}:{' '}
+                    <a href='/async-image-tasks' className='underline'>
+                      {t('View tasks')}
+                    </a>
+                  </p>
+                  {task.data?.task.error_message && (
+                    <p className='text-destructive text-sm'>
+                      {task.data.task.error_message}
+                    </p>
+                  )}
+                  {task.isError && (
+                    <p role='alert' className='text-muted-foreground text-sm'>
+                      {t(
+                        'Task query is temporarily unavailable. Polling will resume.'
+                      )}
+                    </p>
+                  )}
                 </div>
-                <p className='text-muted-foreground text-sm'>
-                  {task.data?.task.progress || 0}% · {t('Task center')}:{' '}
-                  <a href='/async-image-tasks' className='underline'>
-                    {t('View tasks')}
-                  </a>
+              )}
+              {saveError && (
+                <p role='alert' className='text-destructive text-sm'>
+                  {t(
+                    'Generation succeeded, but local saving failed. Download the image before leaving.'
+                  )}{' '}
+                  {saveError}
                 </p>
-                {task.data?.task.error_message && (
-                  <p className='text-destructive text-sm'>
-                    {task.data.task.error_message}
-                  </p>
-                )}
-                {task.isError && (
-                  <p role='alert' className='text-muted-foreground text-sm'>
-                    {t(
-                      'Task query is temporarily unavailable. Polling will resume.'
+              )}
+              {shownImages.length > 0 ? (
+                <ImageResults images={shownImages} />
+              ) : (
+                <div className='bg-muted/20 flex min-h-80 items-center justify-center rounded-xl border border-dashed [background-image:radial-gradient(var(--border)_1px,transparent_1px)] [background-size:20px_20px] sm:min-h-[420px]'>
+                  <EmptyState
+                    icon={ImageIcon}
+                    title={t('Your images will appear here')}
+                    description={t(
+                      'Describe your image, its light, materials and composition'
                     )}
-                  </p>
-                )}
-              </div>
-            )}
-            {saveError && (
-              <p role='alert' className='text-destructive text-sm'>
-                {t(
-                  'Generation succeeded, but local saving failed. Download the image before leaving.'
-                )}{' '}
-                {saveError}
-              </p>
-            )}
-            <ImageResults images={shownImages} />
+                    className='bg-card/85 m-4 min-h-0 max-w-sm rounded-2xl border p-6 shadow-sm sm:p-8'
+                  />
+                </div>
+              )}
+            </div>
           </section>
         </div>
       </SectionPageLayout.Content>

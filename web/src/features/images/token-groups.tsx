@@ -30,8 +30,13 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
 import { ImageSelect } from './components/image-select'
+import { imageLabel } from './lib/image-labels'
 
-type ImageGroups = { openai: string | null; gemini: string | null }
+type ImageGroups = {
+  openai: string | null
+  gemini: string | null
+  mixed?: string | null
+}
 
 export function TokenImageGroups({
   tokenId,
@@ -91,10 +96,12 @@ export function TokenImageGroups({
       )}
       {value && (
         <div className='grid gap-3'>
-          {(['openai', 'gemini'] as const).map((platform) => (
+          {(['openai', 'gemini', 'mixed'] as const).map((platform) => (
             <ImageSelect
               key={platform}
-              label={platform === 'openai' ? 'OpenAI' : 'Gemini'}
+              label={t(
+                platform === 'mixed' ? 'Mixed scheduling' : imageLabel(platform)
+              )}
               value={value[platform] || '__primary__'}
               disabled={busy}
               options={[

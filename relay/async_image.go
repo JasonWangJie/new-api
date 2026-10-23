@@ -68,6 +68,14 @@ func FreezeAsyncImageBilling(ctx context.Context, token model.Token, request ser
 	if request.Count < 1 || request.Count > dto.MaxImageN {
 		return service.MediaBillingSnapshot{}, errors.New("invalid image count")
 	}
+	if request.MixedRouting != nil {
+		// A mixed pool has one customer-facing price. Channel mappings and
+		// self-use fallback must not make a random first selection set the bill.
+		if !helper.HasPriceOrRatioEntry(request.Model) {
+			return service.MediaBillingSnapshot{}, fmt.Errorf("mixed image model %s requires an explicit billing configuration", request.Model)
+		}
+		selected = nil
+	}
 	var user model.User
 	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", token.UserId, common.UserStatusEnabled).Take(&user).Error; err != nil {
 		return service.MediaBillingSnapshot{}, err
@@ -120,6 +128,7 @@ func FreezeAsyncImageBilling(ctx context.Context, token model.Token, request ser
 		info = relaycommon.GenRelayInfoGemini(c, parsed)
 	}
 	info.ChannelMeta = &relaycommon.ChannelMeta{}
+	info.ImageMixedBilling = request.MixedRouting != nil
 	if selected != nil {
 		if setupErr := middleware.SetupContextForSelectedChannel(c, selected, request.Model); setupErr != nil {
 			return service.MediaBillingSnapshot{}, setupErr
@@ -178,6 +187,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	// A known upstream job has already consumed provider resources. Revoking
 	// submission permissions must not cancel its internal polling or accounting.
 	accepted := task.UpstreamTaskId != "" || request.Completion != nil
+	if request.MixedRouting != nil && !accepted {
+		if err := validateMixedImageChannelRequest(*channel, request); err != nil {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+		}
+	}
 	tokenQuery := model.DB.WithContext(ctx)
 	if accepted {
 		tokenQuery = tokenQuery.Unscoped()
@@ -226,7 +240,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if tianyue {
 		c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
 	}
-	if request.Kind == "image_to_image" && !tianyue && !(service.ImageChannelCapability(*channel, request.Model).ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async")) {
+	if request.Kind == "image_to_image" && !tianyue && !(service.ImageChannelCapability(*channel, request.Model).ReferenceField != "" && request.Dialect == "async") {
 		upstreamPath = "/v1/images/edits"
 	}
 	if request.Platform == "gemini" {
@@ -253,6 +267,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			info = relaycommon.GenRelayInfoGemini(c, nil)
 		}
 		info.InitChannelMeta(c)
+		info.ImageMixedBilling = request.MixedRouting != nil
 		info.UpstreamModelName, info.BillingModelName = completion.UpstreamModel, completion.BillingModel
 		info.PriceData = completion.Billing.Price
 		for key, ratio := range completion.Billing.Ratios {
@@ -272,7 +287,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		funding := model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}
 		return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, *completion, cfg, funding)
 	}
-	if len(channel.GetSetting().ImageResolutionModelMapping[request.Model]) > 0 {
+	if request.MixedRouting != nil || len(channel.GetSetting().ImageResolutionModelMapping[request.Model]) > 0 {
 		mapped := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model}}
 		if err := helper.ModelMappedHelper(c, mapped, nil); err != nil {
 			return nil, model.AsyncImageBill{}, err
@@ -337,7 +352,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		if len(images) > 0 {
 			capability := service.ImageChannelCapability(*channel, request.Model)
-			if tianyue || capability.ReferenceField != "" && strings.HasSuffix(request.SourcePath, "generations_async") {
+			if tianyue || capability.ReferenceField != "" && request.Dialect == "async" {
 				urls := make([]string, 0, len(images))
 				for _, image := range images {
 					urls = append(urls, image["image_url"])
@@ -424,12 +439,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, err
 		}
 	}
-	var submitSource map[string]any
-	if err := common.Unmarshal(nativeBody, &submitSource); err != nil {
+	submitSource, err := asyncImageSubmitSource(request, nativeBody, submitImageURLs)
+	if err != nil {
 		return nil, model.AsyncImageBill{}, err
-	}
-	if submitSource == nil {
-		submitSource = make(map[string]any)
 	}
 	if request.ReferenceTransportUsed != nil {
 		switch {
@@ -440,21 +452,6 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		case localReferences:
 			*request.ReferenceTransportUsed = "local"
 		}
-	}
-	submitSource["model"] = request.Model
-	submitSource["prompt"] = request.Prompt
-	if len(submitImageURLs) > 0 {
-		submitSource["image_urls"] = submitImageURLs
-	}
-	submitSource["n"] = request.Count
-	if _, exists := submitSource["create_count"]; !exists {
-		submitSource["create_count"] = request.Count
-	}
-	if request.AspectRatio != "" {
-		submitSource["aspect_ratio"] = request.AspectRatio
-	}
-	if request.Resolution != "" {
-		submitSource["resolution"] = request.Resolution
 	}
 	c.Set(contextKeyUpstreamAsyncSubmitSource, submitSource)
 	contentType := "application/json"
@@ -533,6 +530,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		info = relaycommon.GenRelayInfoGemini(c, parsed)
 	}
 	info.InitChannelMeta(c)
+	info.ImageMixedBilling = request.MixedRouting != nil
 	facts := service.ImageBillingSpecifications(request, []service.ImageBytes{{Width: 1024, Height: 1024}})[0]
 	encodedFacts, err := common.Marshal(facts)
 	if err != nil {
@@ -772,6 +770,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		Billing:     service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup},
 		BillingBody: nativeBody, UpstreamModel: info.UpstreamModelName, BillingModel: info.GetBillingModelName(),
 	}
+	if fields, exists := c.Get(contextKeyUpstreamAsyncUsageFields); exists {
+		completion.UsageFields, _ = fields.(map[string]bool)
+	}
 	if tianyue {
 		if _, dynamic := c.Get(contextKeyUpstreamAsyncImageURLs); !dynamic {
 			var response struct {
@@ -837,6 +838,21 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 // crosses the submission barrier, including after a worker restart.
 func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task model.AsyncImageTask, info *relaycommon.RelayInfo, request service.AsyncImageRequest, completion service.AsyncImageCompletion, cfg service.ImageRuntimeConfig, funding model.ImageFundingSelection) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 	c.Request = c.Request.WithContext(ctx)
+	if request.MixedRouting != nil && completion.Profile != nil && completion.UsageFields != nil {
+		// Validate only the captured price's required fields. Optional cache
+		// breakdowns may be absent; known historical checkpoints have no such
+		// presence evidence and retain their existing recovery behavior.
+		profile := *completion.Profile
+		profile.Poll.Response.UsagePaths = make(map[string]string)
+		for target, reported := range completion.UsageFields {
+			if reported {
+				profile.Poll.Response.UsagePaths[target] = "reported"
+			}
+		}
+		if err := validateMixedImageTokenUsage(&completion.Billing, dto.ImageCapability{}, &profile); err != nil {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing", Message: err.Error()}
+		}
+	}
 	var images []service.ImageBytes
 	var upstreamURLs []string
 	var err error
@@ -1027,4 +1043,30 @@ func decodeAsyncImagePrefix(value string) []byte {
 	}
 	decoded, _ := base64.StdEncoding.DecodeString(value)
 	return decoded
+}
+
+// asyncImageSubmitSource is the pure normalized view used by custom submit
+// templates during both candidate admission and actual dispatch.
+func asyncImageSubmitSource(request service.AsyncImageRequest, nativeBody []byte, references []string) (map[string]any, error) {
+	var source map[string]any
+	if err := common.Unmarshal(nativeBody, &source); err != nil {
+		return nil, err
+	}
+	if source == nil {
+		source = make(map[string]any)
+	}
+	source["model"], source["prompt"], source["n"] = request.Model, request.Prompt, request.Count
+	if len(references) > 0 {
+		source["image_urls"] = references
+	}
+	if _, exists := source["create_count"]; !exists {
+		source["create_count"] = request.Count
+	}
+	if request.AspectRatio != "" {
+		source["aspect_ratio"] = request.AspectRatio
+	}
+	if request.Resolution != "" {
+		source["resolution"] = request.Resolution
+	}
+	return source, nil
 }

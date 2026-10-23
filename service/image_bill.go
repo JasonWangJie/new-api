@@ -22,7 +22,8 @@ func FixAsyncImageBill(c *gin.Context, task model.AsyncImageTask, info *relaycom
 		return model.AsyncImageBill{}, errors.New("invalid deferred image billing context")
 	}
 	// Outbound billing preparation has already captured the effective prompt
-	// extension flag, including frozen channel overrides. Refresh only quantity.
+	// extension flag, including frozen channel overrides. Refresh only quantity;
+	// mixed routing continues using its public price rather than provider surcharges.
 	promptExtend := info.PriceData.OtherRatios()["prompt_extend"] == common.ZImagePromptExtendMultiplier
 	if err := EstimateImageBillingForRequest(info, count, promptExtend); err != nil {
 		return model.AsyncImageBill{}, err

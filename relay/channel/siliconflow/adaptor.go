@@ -130,5 +130,5 @@ func (a *Adaptor) GetChannelName() string {
 }
 
 func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
-	return dto.ImageCapability{Models: []string{"black-forest-labs/FLUX*", "stabilityai/stable-diffusion*", "Kwai-Kolors/Kolors*", "Qwen/Qwen-Image*", "Tongyi-MAI/Z-Image*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "siliconflow", Protocol: "openai_images", Generate: true, Edit: false}
+	return dto.ImageCapability{Models: []string{"black-forest-labs/FLUX*", "stabilityai/stable-diffusion*", "Kwai-Kolors/Kolors*", "Qwen/Qwen-Image*", "Tongyi-MAI/Z-Image*"}, Parameters: []string{"model", "prompt", "n", "size", "quality", "response_format", "provider_extensions"}, Provider: "siliconflow", Protocol: "openai_images", Generate: true, Edit: false, TokenUsage: true}
 }

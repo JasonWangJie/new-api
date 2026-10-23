@@ -20,8 +20,10 @@ function seedanceMode(name, duration, resolutions, inputs, options) {
 const DURATION_1X = { values: [5, 10], default: 5 };
 const DURATION_20 = { min: 4, max: 15, step: 1, default: 5 };
 const DURATION_25 = { min: 4, max: 30, step: 1, default: 5 };
+const SEEDANCE_25_MODELS = ["doubao-seedance-2-5", "doubao-seedance-2-5-260628"];
 const RESOLUTIONS_1X = ["480p", "720p", "1080p"];
 const RESOLUTIONS_2X = ["480p", "720p"];
+const RESOLUTIONS_25 = ["480p", "720p", "1080p"];
 const VIDEO_OPTIONS = { generateAudio: true, watermark: true, returnLastFrame: true };
 const FIRST_FRAME_INPUT = [{ name: "image", kind: "image", sources: SEEDANCE_PROFILE_SOURCES, maxItems: 1, required: true }];
 const FRAME_PAIR_INPUTS = [
@@ -69,7 +71,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.3.0",
+  version: "1.3.1",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -80,7 +82,7 @@ export const meta = {
     "doubao-seedance-2-0-260128",
     "doubao-seedance-2-0-fast-260128",
     "doubao-seedance-2-0-mini-260615",
-    "doubao-seedance-2-5-260628",
+    ...SEEDANCE_25_MODELS,
   ],
   fetchMode: "per_task",
   usageSchema: {
@@ -178,14 +180,14 @@ export const meta = {
       ],
     },
     {
-      models: ["doubao-seedance-2-5-260628"],
+      models: SEEDANCE_25_MODELS,
       modes: [
-        seedanceMode("text_to_video", DURATION_25, RESOLUTIONS_2X, [], VIDEO_OPTIONS),
-        seedanceMode("image_to_video", DURATION_25, RESOLUTIONS_2X, FIRST_FRAME_INPUT, VIDEO_OPTIONS),
-        seedanceMode("reference_to_video", DURATION_25, RESOLUTIONS_2X, referenceInputs(30, 10, 10), VIDEO_OPTIONS),
-        seedanceMode("first_last_frame", DURATION_25, RESOLUTIONS_2X, FRAME_PAIR_INPUTS, VIDEO_OPTIONS),
-        seedanceOperationMode("edit_video", null, RESOLUTIONS_2X, 30, 10, 10),
-        seedanceOperationMode("extend_video", DURATION_25, RESOLUTIONS_2X, 30, 10, 10),
+        seedanceMode("text_to_video", DURATION_25, RESOLUTIONS_25, [], VIDEO_OPTIONS),
+        { ...seedanceMode("image_to_video", DURATION_25, RESOLUTIONS_25, FIRST_FRAME_INPUT, VIDEO_OPTIONS), aspectRatios: ["adaptive"], defaultAspectRatio: "adaptive" },
+        seedanceMode("reference_to_video", DURATION_25, RESOLUTIONS_25, referenceInputs(30, 10, 10), VIDEO_OPTIONS),
+        { ...seedanceMode("first_last_frame", DURATION_25, RESOLUTIONS_25, FRAME_PAIR_INPUTS, VIDEO_OPTIONS), aspectRatios: ["adaptive"], defaultAspectRatio: "adaptive" },
+        seedanceOperationMode("edit_video", null, RESOLUTIONS_25, 30, 10, 10),
+        seedanceOperationMode("extend_video", DURATION_25, RESOLUTIONS_25, 30, 10, 10),
       ],
     },
   ],
@@ -288,6 +290,17 @@ function seedanceContent(req, action, extensionDirection) {
     throw new Error("metadata must be an object");
   }
   const metadata = req.metadata || {};
+  if (req.content !== undefined) {
+    if (!Array.isArray(req.content)) throw new Error("content must be an array");
+    if (req.content.length === 0) throw new Error("content is required");
+    const texts = [];
+    for (const item of req.content) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("content entries must be objects");
+      if (item.type === "text" && typeof item.text === "string") texts.push(item.text);
+      if (item.type === "video_url" || item.video_url !== undefined) seedanceMediaURL(item.video_url === undefined ? item.url : item.video_url, "content video");
+    }
+    return { metadata, content: req.content, userPrompt: texts.join("\n") };
+  }
   const content = [];
   if (req.video !== undefined && req.video !== null && req.video !== "") {
     content.push(seedanceMediaItem("video_url", "reference_video", seedanceMediaURL(req.video, "video")));
@@ -393,6 +406,7 @@ function validateSeedanceDuration(duration, profile) {
 }
 
 function validateSeedanceRequest(model, body, action, facts) {
+  const isSeedance25 = SEEDANCE_25_MODELS.includes(model);
   const profile = seedanceModeProfile(model, action);
   if (profile === null) throw new Error(`${action} is not supported by ${model}`);
   if (profile === undefined) {
@@ -418,6 +432,9 @@ function validateSeedanceRequest(model, body, action, facts) {
     delete body.aspect_ratio;
     if (!profile.aspectRatios.includes(body.ratio)) throw new Error("ratio is not supported by Seedance");
   } else if (action === "edit_video" || action === "extend_video") {
+    if (isSeedance25 && ((body.ratio !== undefined && body.ratio !== "adaptive") || (body.aspect_ratio !== undefined && body.aspect_ratio !== "adaptive"))) {
+      throw new Error("Seedance 2.5 video editing and extension require adaptive ratio");
+    }
     body.ratio = "adaptive";
     delete body.aspect_ratio;
   }
@@ -425,6 +442,7 @@ function validateSeedanceRequest(model, body, action, facts) {
   if (facts.lastFrames > 1) throw new Error("only one last_frame is supported");
   if (action === "first_last_frame" && facts.firstFrames !== 1) throw new Error("first_last_frame requires one first_frame");
   const primaryVideos = action === "edit_video" || action === "extend_video" ? 1 : 0;
+  if (primaryVideos && facts.referenceVideos < 1) throw new Error("video is required for Seedance video editing and extension");
   const counts = {
     video: primaryVideos,
     image: facts.firstFrames,
@@ -453,7 +471,7 @@ function validateSeedanceRequest(model, body, action, facts) {
   if (model.indexOf("seedance-2-0-") >= 0 && facts.referenceAudios > 0 && facts.firstFrames + facts.referenceImages + facts.referenceVideos === 0) {
     throw new Error("Seedance 2.0 reference audio requires an image or video reference");
   }
-  if ((action === "edit_video" || action === "extend_video") && facts.referenceImages > 0 && !["480p", "720p"].includes(body.resolution)) {
+  if (!isSeedance25 && (action === "edit_video" || action === "extend_video") && facts.referenceImages > 0 && !["480p", "720p"].includes(body.resolution)) {
     throw new Error("Seedance operations with reference images support at most 720p");
   }
   for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
@@ -465,18 +483,28 @@ function validateSeedanceRequest(model, body, action, facts) {
       throw new Error(name + " is not supported by this Seedance model and mode");
     }
   }
+  if (isSeedance25) {
+    if (body.output_format !== undefined && !["mp4", "mov"].includes(body.output_format)) throw new Error("output_format must be mp4 or mov");
+    for (const name of ["camera_fixed", "web_search"]) {
+      if (body[name] !== undefined && typeof body[name] !== "boolean") throw new Error(`${name} must be a boolean`);
+    }
+  }
 }
 
 function prepareSeedanceBody(req, model, originTasks, forcedAction) {
   const operation = forcedAction === "edit_video" || forcedAction === "extend_video" ? forcedAction : "";
+  const structuredOperation = req.content === undefined ? operation : "";
   const metadata = req.metadata && typeof req.metadata === "object" && !Array.isArray(req.metadata) ? req.metadata : {};
+  if (SEEDANCE_25_MODELS.includes(model) && [req.seconds, req.duration, metadata.duration].some((value) => value !== undefined && Number(value) === -1)) {
+    throw new Error("Automatic duration -1 is not supported by this gateway; use an explicit duration between 4 and 30 seconds");
+  }
   const hasField = function (...names) {
     return names.some(function (name) {
       return Object.hasOwn(req, name) || Object.hasOwn(metadata, name);
     });
   };
   if (!operation && Object.hasOwn(req, "video")) throw new Error("video is only supported by Seedance edit and extension endpoints");
-  if (operation) {
+  if (structuredOperation) {
     if (!trimmed(req.prompt)) throw new Error("prompt is required for Seedance video editing and extension");
     if (!Object.hasOwn(req, "video") || req.video === null || (typeof req.video === "string" && !trimmed(req.video))) {
       throw new Error("video is required for Seedance video editing and extension");
@@ -491,11 +519,11 @@ function prepareSeedanceBody(req, model, originTasks, forcedAction) {
       if (Object.hasOwn(metadata, name)) throw new Error("metadata." + name + " cannot override a structured Seedance video field");
     }
   }
-  if (operation === "extend_video" && hasField("duration") && hasField("seconds")) {
+  if (structuredOperation === "extend_video" && hasField("duration") && hasField("seconds")) {
     throw new Error("duration and seconds cannot both be provided");
   }
-  const direction = operation === "extend_video" ? trimmed(req.extension_direction) || "backward" : "";
-  if (operation === "extend_video" && direction !== "forward" && direction !== "backward") {
+  const direction = structuredOperation === "extend_video" ? trimmed(req.extension_direction) || "backward" : "";
+  if (structuredOperation === "extend_video" && direction !== "forward" && direction !== "backward") {
     throw new Error("extension_direction must be forward or backward");
   }
   if (operation !== "extend_video" && hasField("extension_direction")) {
@@ -513,13 +541,20 @@ function prepareSeedanceBody(req, model, originTasks, forcedAction) {
   }
   if (req.ratio !== undefined) body.ratio = req.ratio;
   else if (req.aspect_ratio !== undefined) body.ratio = req.aspect_ratio;
-  for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
+  for (const name of ["generate_audio", "watermark", "return_last_frame", "camera_fixed", "web_search", "seed", "output_format", "omni_reference_task_type"]) {
     if (req[name] !== undefined) body[name] = req[name];
   }
   const facts = seedanceContentFacts(body.content);
-  const action = operation || seedanceAction(facts);
+  const taskType = body.omni_reference_task_type;
+  if (SEEDANCE_25_MODELS.includes(model) && taskType !== undefined && !["auto", "edit", "extend"].includes(taskType)) throw new Error("omni_reference_task_type must be auto, edit or extend");
+  const nativeOperation = SEEDANCE_25_MODELS.includes(model) && (taskType === "edit" || taskType === "extend") ? `${taskType}_video` : "";
+  if (operation && nativeOperation && operation !== nativeOperation) throw new Error("omni_reference_task_type cannot override the Seedance video operation");
+  const action = operation || nativeOperation || seedanceAction(facts);
   validateSeedanceRequest(model, body, action, facts);
-  if (action === "edit_video" && model === "doubao-seedance-2-5-260628") body.duration = -1;
+  if (SEEDANCE_25_MODELS.includes(model) && (action === "edit_video" || action === "extend_video")) {
+    body.omni_reference_task_type = action === "edit_video" ? "edit" : "extend";
+    if (action === "edit_video") body.duration = -1;
+  }
   delete body.seconds;
   delete body.size;
   delete body.video;
@@ -548,7 +583,7 @@ function estimateTokens(seconds, resolution) {
 function videoInputRatio(model, resolution, content) {
   const video = hasVideo(content);
   const res = trimmed(resolution).toLowerCase();
-  if (model === "doubao-seedance-2-5-260628") {
+  if (SEEDANCE_25_MODELS.includes(model)) {
     if (res === "1080p") return video ? 7.0 / 10.7 : 11.7 / 10.7;
     return video ? 42 / 70 : 1;
   }
@@ -633,11 +668,13 @@ export const native = {
           return trimmed(text);
         })
         .join("\n"),
+      content,
       metadata: body,
     };
     const seconds = Number(body.duration);
     if (Number.isFinite(seconds) && seconds > 0) requestBody.seconds = seconds;
-    const intent = { kind: "submit", model: model, action: hasReference ? "image_to_video" : "text_to_video", requestBody: requestBody };
+    const prepared = prepareSeedanceBody(requestBody, model);
+    const intent = { kind: "submit", model: model, action: prepared.action, requestBody: requestBody };
     const originTaskIds = draftTaskIds(content);
     if (originTaskIds.length) intent.originTaskIds = originTaskIds;
     return intent;
@@ -698,10 +735,11 @@ export function extractUsage(ctx) {
     outputSeconds = Math.min(frames / 24, 3600);
   }
   if (ctx.action === "edit_video" || ctx.action === "extend_video") {
-    const inputSeconds = (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628" ? 30 : 15;
-    const tokenOutputSeconds = ctx.action === "edit_video" && (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628" ? 30 : seconds;
+    const isSeedance25 = SEEDANCE_25_MODELS.includes(ctx.upstreamModel || ctx.model);
+    const inputSeconds = isSeedance25 ? 30 : 15;
+    const tokenOutputSeconds = ctx.action === "edit_video" && isSeedance25 ? 30 : seconds;
     seconds = inputSeconds + tokenOutputSeconds;
-    if (ctx.action === "edit_video" && (ctx.upstreamModel || ctx.model) === "doubao-seedance-2-5-260628") outputSeconds = 30;
+    if (ctx.action === "edit_video" && isSeedance25) outputSeconds = 30;
   }
   const rawResolution = req.resolution || metadata.resolution || req.size;
   const raw = trimmed(rawResolution).toLowerCase();
@@ -912,7 +950,7 @@ protocols.openai_video = {
           throw new Error(name + " must be valid JSON");
         }
       }
-      for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
+      for (const name of ["generate_audio", "watermark", "return_last_frame", "camera_fixed", "web_search"]) {
         if (req[name] === undefined) continue;
         if (req[name] !== "true" && req[name] !== "false") throw new Error(name + " must be true or false");
         req[name] = req[name] === "true";

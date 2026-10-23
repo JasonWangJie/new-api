@@ -713,8 +713,7 @@ func TestTianyueImageContract(t *testing.T) {
 			assert.Error(t, service.ValidateTianyueImageSubmission([]byte(tc.body), tc.count))
 		})
 	}
-	assert.Nil(t, service.TianyueAsyncImageProfile("seedream-5-pro-1K"), "synchronous model responses must never be interpreted as task receipts")
-	profile := service.TianyueAsyncImageProfile("gpt-image-2-yb")
+	profile := service.TianyueAsyncImageProfile("seedream-5-pro-1K")
 	require.NotNil(t, profile)
 	normalized, err := service.NormalizeTianyueImageTask([]byte(`{"code":200,"data":{"task_id":"vendor-image-123","status":"queued"}}`), "https://upstream.example")
 	require.NoError(t, err)

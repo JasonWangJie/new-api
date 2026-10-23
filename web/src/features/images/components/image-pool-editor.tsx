@@ -33,7 +33,11 @@ import { Label } from '@/components/ui/label'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { imageRequest } from '../api'
-import { imageLabel } from '../lib/image-labels'
+import {
+  imageLabel,
+  imagePlatformLabel,
+  imageRoutingPlatforms,
+} from '../lib/image-labels'
 import type {
   ImageAdminConfiguration,
   ImageChannelPool,
@@ -280,20 +284,29 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
               disabled={busy || !props.canManage || editing}
               label={t('Platform')}
               value={platform}
-              options={(
-                props.config?.media_providers ||
-                props.config?.image_providers || ['openai', 'gemini']
+              options={imageRoutingPlatforms(
+                props.config?.routing_platforms ||
+                  props.config?.media_providers ||
+                  props.config?.image_providers
               ).map((value) => ({
                 value,
-                label: value,
+                label: t(imagePlatformLabel(value)),
               }))}
               onChange={(value) => {
                 setPlatform(value)
+                if (copying) return
                 setModel('')
                 setChannelIds([])
                 setWeights({})
               }}
             />
+            {platform === 'mixed' && (
+              <FieldDescription className='sm:col-span-2'>
+                {t(
+                  'Mixed scheduling accepts asynchronous image requests without provider. Explicit provider requests keep their platform routing.'
+                )}
+              </FieldDescription>
+            )}
             <ImageSelect
               disabled={busy || !props.canManage || editing}
               label={t('Pool binding')}

@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
+import { Loader2, Settings2, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { type FieldErrors, type Resolver, useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -396,7 +397,7 @@ export function VideoCapabilityForm(props: {
 
   return (
     <form
-      className='space-y-4'
+      className='space-y-5 border-t p-5 sm:p-6 [&_[data-slot=select-trigger]]:min-h-11 [&_input:not([type=file])]:min-h-11'
       onSubmit={form.handleSubmit(submit, (errors) =>
         setLocalError(firstError(errors, t('Invalid video request')))
       )}
@@ -412,10 +413,20 @@ export function VideoCapabilityForm(props: {
         onChange={changeMode}
         disabled={props.busy}
       />
-      <div className='space-y-2'>
-        <Label htmlFor='video-prompt'>{t('Prompt')}</Label>
+      <div className='space-y-3'>
+        <Label htmlFor='video-prompt' className='flex items-center gap-2'>
+          <Sparkles
+            className='text-muted-foreground size-3.5'
+            aria-hidden='true'
+          />
+          {t('Prompt')}
+        </Label>
         <Textarea
           id='video-prompt'
+          className='min-h-36 resize-y rounded-xl text-sm leading-relaxed'
+          placeholder={t(
+            'Describe the scene, motion, and visual style you have in mind.'
+          )}
           {...form.register('prompt')}
           required={['text_to_video', 'edit_video', 'extend_video'].includes(
             mode.name
@@ -423,90 +434,106 @@ export function VideoCapabilityForm(props: {
           disabled={props.busy}
         />
       </div>
-      <div className='grid gap-3 sm:grid-cols-2'>
-        {mode.duration?.values && (
-          <ImageSelect
-            label={t('Duration (seconds)')}
-            value={form.watch('seconds')}
-            options={mode.duration.values.map((value) => ({
-              value: String(value),
-              label: String(value),
-            }))}
-            onChange={(value) => {
-              form.setValue('seconds', value, { shouldDirty: true })
-              props.onChanged()
-            }}
-            disabled={props.busy}
+      <section
+        aria-label={t('Generation settings')}
+        className='space-y-4 border-t pt-5'
+      >
+        <h4 className='flex items-center gap-2 text-sm font-medium'>
+          <Settings2
+            className='text-muted-foreground size-3.5'
+            aria-hidden='true'
           />
-        )}
-        {mode.duration && !mode.duration.values && (
-          <div className='space-y-2'>
-            <Label htmlFor='video-seconds'>{t('Duration (seconds)')}</Label>
-            <Input
-              id='video-seconds'
-              type='number'
-              min={mode.duration.min}
-              max={mode.duration.max}
-              step={mode.duration.step}
-              {...form.register('seconds')}
+          {t('Generation settings')}
+        </h4>
+        <div className='grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-2'>
+          {mode.duration?.values && (
+            <ImageSelect
+              label={t('Duration (seconds)')}
+              value={form.watch('seconds')}
+              options={mode.duration.values.map((value) => ({
+                value: String(value),
+                label: String(value),
+              }))}
+              onChange={(value) => {
+                form.setValue('seconds', value, { shouldDirty: true })
+                props.onChanged()
+              }}
               disabled={props.busy}
             />
-          </div>
-        )}
-        {!!mode.resolutions?.length && (
-          <ImageSelect
-            label={t('Resolution')}
-            value={form.watch('resolution')}
-            options={mode.resolutions.map((value) => ({ value, label: value }))}
-            onChange={(value) => {
-              form.setValue('resolution', value, { shouldDirty: true })
-              props.onChanged()
-            }}
-            disabled={props.busy}
-          />
-        )}
-        {!!mode.aspectRatios?.length && (
-          <ImageSelect
-            label={t('Aspect ratio')}
-            value={form.watch('aspectRatio')}
-            options={mode.aspectRatios.map((value) => ({
-              value,
-              label: value,
-            }))}
-            onChange={(value) => {
-              form.setValue('aspectRatio', value, { shouldDirty: true })
-              props.onChanged()
-            }}
-            disabled={props.busy}
-          />
-        )}
-        {mode.name === 'extend_video' && !!mode.extensionDirections?.length && (
-          <ImageSelect
-            label={t('Extension direction')}
-            value={form.watch('extensionDirection')}
-            options={mode.extensionDirections.map((value) => ({
-              value,
-              label: t(value === 'forward' ? 'Forward' : 'Backward'),
-            }))}
-            onChange={(value) => {
-              form.setValue('extensionDirection', value, {
-                shouldDirty: true,
-              })
-              props.onChanged()
-            }}
-            disabled={props.busy}
-          />
-        )}
-      </div>
-      {(!mode.duration ||
-        !mode.resolutions?.length ||
-        !mode.aspectRatios?.length) && (
-        <p className='text-muted-foreground text-xs'>
-          {t(
-            'Fields hidden for this mode are inherited from the source video or fixed by the provider.'
           )}
-        </p>
-      )}
+          {mode.duration && !mode.duration.values && (
+            <div className='space-y-2'>
+              <Label htmlFor='video-seconds'>{t('Duration (seconds)')}</Label>
+              <Input
+                id='video-seconds'
+                type='number'
+                min={mode.duration.min}
+                max={mode.duration.max}
+                step={mode.duration.step}
+                {...form.register('seconds')}
+                disabled={props.busy}
+              />
+            </div>
+          )}
+          {!!mode.resolutions?.length && (
+            <ImageSelect
+              label={t('Resolution')}
+              value={form.watch('resolution')}
+              options={mode.resolutions.map((value) => ({
+                value,
+                label: value,
+              }))}
+              onChange={(value) => {
+                form.setValue('resolution', value, { shouldDirty: true })
+                props.onChanged()
+              }}
+              disabled={props.busy}
+            />
+          )}
+          {!!mode.aspectRatios?.length && (
+            <ImageSelect
+              label={t('Aspect ratio')}
+              value={form.watch('aspectRatio')}
+              options={mode.aspectRatios.map((value) => ({
+                value,
+                label: value,
+              }))}
+              onChange={(value) => {
+                form.setValue('aspectRatio', value, { shouldDirty: true })
+                props.onChanged()
+              }}
+              disabled={props.busy}
+            />
+          )}
+          {mode.name === 'extend_video' &&
+            !!mode.extensionDirections?.length && (
+              <ImageSelect
+                label={t('Extension direction')}
+                value={form.watch('extensionDirection')}
+                options={mode.extensionDirections.map((value) => ({
+                  value,
+                  label: t(value === 'forward' ? 'Forward' : 'Backward'),
+                }))}
+                onChange={(value) => {
+                  form.setValue('extensionDirection', value, {
+                    shouldDirty: true,
+                  })
+                  props.onChanged()
+                }}
+                disabled={props.busy}
+              />
+            )}
+        </div>
+        {(!mode.duration ||
+          !mode.resolutions?.length ||
+          !mode.aspectRatios?.length) && (
+          <p className='text-muted-foreground text-xs leading-relaxed'>
+            {t(
+              'Fields hidden for this mode are inherited from the source video or fixed by the provider.'
+            )}
+          </p>
+        )}
+      </section>
       {(mode.inputs || []).map((input) => {
         const supportsUpload = input.sources.includes('upload')
         const visibleSources =
@@ -517,7 +544,10 @@ export function VideoCapabilityForm(props: {
             : input.sources
         const multiple = input.maxItems > 1
         return (
-          <div key={input.name} className='space-y-2'>
+          <div
+            key={input.name}
+            className='bg-muted/20 min-w-0 space-y-3 rounded-xl border p-4'
+          >
             <Label htmlFor={`video-${input.name}`}>
               {t(inputLabel(input.name))}
               {input.required ? ' *' : ''}
@@ -525,6 +555,8 @@ export function VideoCapabilityForm(props: {
             {multiple ? (
               <Textarea
                 id={`video-${input.name}`}
+                className='bg-background min-h-28 resize-y font-mono text-xs leading-relaxed'
+                aria-describedby={`video-${input.name}-help`}
                 value={inputValues[input.name] || ''}
                 placeholder={t(
                   'Enter one URL, asset ID, file ID object, or voice ID per line'
@@ -544,6 +576,8 @@ export function VideoCapabilityForm(props: {
             ) : (
               <Input
                 id={`video-${input.name}`}
+                className='bg-background'
+                aria-describedby={`video-${input.name}-help`}
                 value={inputValues[input.name] || ''}
                 placeholder={t('URL, asset ID, or file ID object')}
                 onChange={(event) =>
@@ -559,7 +593,10 @@ export function VideoCapabilityForm(props: {
                 disabled={props.busy}
               />
             )}
-            <p className='text-muted-foreground text-xs'>
+            <p
+              id={`video-${input.name}-help`}
+              className='text-muted-foreground text-xs leading-relaxed wrap-anywhere'
+            >
               {t('Allowed sources: {{sources}}. Maximum: {{count}}.', {
                 sources: visibleSources.join(', '),
                 count: input.maxItems,
@@ -571,6 +608,7 @@ export function VideoCapabilityForm(props: {
                   input: t(inputLabel(input.name)),
                 })}
                 type='file'
+                className='bg-background h-auto min-h-11 min-w-0 cursor-pointer py-2 file:cursor-pointer'
                 accept={inputAccept(input.kind)}
                 multiple={multiple}
                 disabled={props.busy}
@@ -583,7 +621,7 @@ export function VideoCapabilityForm(props: {
                 }}
               />
             ) : (
-              <p className='text-muted-foreground text-xs'>
+              <p className='text-muted-foreground text-xs leading-relaxed'>
                 {t(
                   props.model.provider === 'doubao'
                     ? 'This provider does not accept browser file uploads here. Use a public URL or asset:// ID.'
@@ -597,7 +635,7 @@ export function VideoCapabilityForm(props: {
       {(mode.options?.generateAudio ||
         mode.options?.watermark ||
         mode.options?.returnLastFrame) && (
-        <div className='flex flex-wrap gap-4'>
+        <div className='grid gap-2'>
           {[
             [
               'generate_audio',
@@ -612,7 +650,10 @@ export function VideoCapabilityForm(props: {
             ],
           ].map(([name, label, visible]) =>
             visible ? (
-              <div key={String(name)} className='flex items-center gap-2'>
+              <div
+                key={String(name)}
+                className='bg-muted/30 flex min-h-11 items-center gap-3 rounded-lg border px-3 py-2.5'
+              >
                 <Checkbox
                   id={`video-${name}`}
                   checked={options[String(name)] === true}
@@ -629,31 +670,52 @@ export function VideoCapabilityForm(props: {
                   }}
                   disabled={props.busy}
                 />
-                <Label htmlFor={`video-${name}`}>{t(String(label))}</Label>
+                <Label
+                  htmlFor={`video-${name}`}
+                  className='flex-1 cursor-pointer text-xs leading-relaxed'
+                >
+                  {t(String(label))}
+                </Label>
               </div>
             ) : null
           )}
         </div>
       )}
-      <div className='space-y-2'>
+      <div className='space-y-3 border-t pt-5'>
         <Label htmlFor='video-additional'>{t('Additional parameters')}</Label>
         <Textarea
           id='video-additional'
-          className='min-h-28 font-mono text-xs'
+          className='bg-muted/20 min-h-28 resize-y rounded-xl font-mono text-xs leading-relaxed'
+          aria-describedby='video-additional-help'
           {...form.register('additional')}
           disabled={props.busy}
         />
-        <p className='text-muted-foreground text-xs'>
+        <p
+          id='video-additional-help'
+          className='text-muted-foreground text-xs leading-relaxed'
+        >
           {t(
             'Additional JSON may include provider-native content, but cannot override the selected operation or structured video fields.'
           )}
         </p>
       </div>
-      <Button type='submit' disabled={!props.model.available || props.busy}>
+      <Button
+        className='min-h-11 w-full rounded-xl shadow-sm'
+        type='submit'
+        disabled={!props.model.available || props.busy}
+      >
+        {props.busy ? (
+          <Loader2 className='size-4 animate-spin' aria-hidden='true' />
+        ) : (
+          <Sparkles className='size-4' aria-hidden='true' />
+        )}
         {t(props.busy ? 'Submitting...' : submitLabel)}
       </Button>
       {(localError || props.error) && (
-        <p role='alert' className='text-destructive text-sm'>
+        <p
+          role='alert'
+          className='text-destructive bg-destructive/5 border-destructive/20 rounded-lg border p-3 text-xs leading-relaxed wrap-anywhere'
+        >
           {localError || props.error}
         </p>
       )}

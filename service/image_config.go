@@ -260,6 +260,20 @@ func ResolveImagePolicy(ctx context.Context, token model.Token, platform string)
 }
 
 func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request AsyncImageRequest) (model.ImageGroupPolicy, []ImageModelCapability, error) {
+	if request.MixedRouting != nil {
+		if request.Provider != "" || request.Dialect != "async" || request.Platform != "openai" {
+			return model.ImageGroupPolicy{}, nil, errors.New("invalid mixed image routing state")
+		}
+		policy, catalog, err := ResolveImagePolicy(ctx, token, "mixed")
+		if err != nil {
+			return policy, nil, err
+		}
+		identity := request.MixedRouting
+		if policy.Group != identity.Group || policy.PoolMode != identity.PoolMode || ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(request)) != identity.BindingKey {
+			return policy, nil, errors.New("mixed image routing identity changed before execution")
+		}
+		return policy, catalog, nil
+	}
 	if request.PolicyPlatform != "" {
 		request.Platform = request.PolicyPlatform
 		return resolveInheritedImagePolicy(ctx, token, request)
@@ -323,6 +337,39 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 		return best, bestCatalog, nil
 	}
 	return resolveInheritedImagePolicy(ctx, token, request)
+}
+
+// PrepareMixedImageAdmission is intentionally called only for new submissions.
+// Recovery of historical tasks cannot opt into a newly enabled mixed pool.
+func PrepareMixedImageAdmission(ctx context.Context, token model.Token, request *AsyncImageRequest) error {
+	if request.Dialect != "async" || request.Provider != "" || request.Platform != "openai" {
+		return nil
+	}
+	policy, catalog, err := ResolveImagePolicy(ctx, token, "mixed")
+	if err != nil {
+		return err
+	}
+	if !policy.Enabled || !policy.AsyncEnabled || !slices.ContainsFunc(catalog, func(capability ImageModelCapability) bool { return capability.MatchesMedia(request.Model, "image") }) {
+		return nil
+	}
+	var owner model.User
+	if err := model.DB.WithContext(ctx).Where("id = ?", token.UserId).Take(&owner).Error; err != nil {
+		return err
+	}
+	if !IsUserSelectableGroup(owner.Group, policy.Group) {
+		return errors.New("mixed image group is outside user permissions")
+	}
+	key := ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(*request))
+	var bindingCount int64
+	if err := model.DB.WithContext(ctx).Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id >= ?", key, 0).Count(&bindingCount).Error; err != nil {
+		return err
+	}
+	if bindingCount == 0 {
+		return nil
+	}
+	request.MixedRouting = &ImageMixedRouting{Group: policy.Group, BindingKey: key, PoolMode: policy.PoolMode}
+	request.PolicyPlatform = "mixed"
+	return nil
 }
 
 func resolveInheritedImagePolicy(ctx context.Context, token model.Token, request AsyncImageRequest) (model.ImageGroupPolicy, []ImageModelCapability, error) {

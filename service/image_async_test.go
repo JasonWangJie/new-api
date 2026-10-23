@@ -192,8 +192,251 @@ func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
 	}
 }
 
+func TestMixedImageAdmissionAndPoolIsolation(t *testing.T) {
+	for _, mode := range []string{"resolution", "model", "model_resolution"} {
+		t.Run(mode, func(t *testing.T) {
+			db, task, request, _, alternate := asyncImageWorkerFixture(t)
+			require.NoError(t, db.Model(&alternate).Update("type", constant.ChannelTypeNewAPI).Error)
+			_, parseErr := ParseAsyncImageRequest([]byte(`{"model":"image-model","prompt":"test","mixed_routing":{"group":"forged"}}`), "application/json", "/v1/images/generations_async", DefaultImageRuntimeConfig())
+			require.ErrorContains(t, parseErr, "reserved for server")
+			var token model.Token
+			var original model.ImageGroupPolicy
+			require.NoError(t, db.First(&token, task.TokenId).Error)
+			require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&original).Error)
+			policy := model.ImageGroupPolicy{PolicyKey: ImageIdentityHash(task.Group, "mixed"), Group: task.Group, Platform: "mixed", PoolMode: mode, Enabled: true, AsyncEnabled: true, Models: original.Models}
+			require.NoError(t, db.Create(&policy).Error)
+			require.NoError(t, db.Create(&model.TokenImagePlatformMapping{TokenId: token.Id, Platform: "newapi", Group: "provider-specific-group"}).Error)
+			independent, _, err := ResolveImagePolicy(t.Context(), token, "mixed")
+			require.NoError(t, err)
+			assert.Equal(t, task.Group, independent.Group, "mixed routing does not inherit another provider's Token group")
+			request.Provider, request.PolicyPlatform, request.Resolution = "", "", "1K"
+			legacyPolicy, _, err := ResolveAsyncImagePolicy(t.Context(), token, request)
+			require.NoError(t, err)
+			assert.Equal(t, "openai", legacyPolicy.Platform, "historical envelopes do not opt into new mixed policies")
+			require.NoError(t, PrepareMixedImageAdmission(t.Context(), token, &request))
+			assert.Nil(t, request.MixedRouting, "an unbound model/resolution keeps the old route")
+			bindingKey := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+			binding := model.ImageChannelPool{BindingKey: bindingKey, Group: task.Group, Platform: "mixed", Mode: mode, Model: request.Model, Resolution: request.Resolution, ChannelId: alternate.Id, Priority: 7}
+			require.NoError(t, db.Create(&binding).Error)
+			explicit := request
+			explicit.Provider = "openai"
+			require.NoError(t, PrepareMixedImageAdmission(t.Context(), token, &explicit))
+			assert.Nil(t, explicit.MixedRouting, "an explicit provider always retains its platform")
+			require.NoError(t, PrepareMixedImageAdmission(t.Context(), token, &request))
+			require.NotNil(t, request.MixedRouting)
+			assert.Equal(t, bindingKey, request.MixedRouting.BindingKey)
+			resolved, _, err := ResolveAsyncImagePolicy(t.Context(), token, request)
+			require.NoError(t, err)
+			assert.Equal(t, "mixed", resolved.Platform)
+			require.NoError(t, db.Model(&policy).Update("async_enabled", false).Error)
+			disabled, _, err := ResolveAsyncImagePolicy(t.Context(), token, request)
+			require.NoError(t, err)
+			assert.False(t, disabled.AsyncEnabled)
+			assert.Equal(t, "mixed", disabled.Platform, "disabling a mixed policy cannot move accepted tasks into an old pool")
+			require.NoError(t, db.Model(&policy).Update("async_enabled", true).Error)
+			candidates, err := ImageCandidateChannels(t.Context(), resolved, request.Model, request.Resolution)
+			require.NoError(t, err)
+			require.Len(t, candidates, 1)
+			assert.Equal(t, alternate.Id, candidates[0].Id)
+			assert.Equal(t, 7, candidates[0].GetWeight())
+			assert.Zero(t, candidates[0].GetPriority(), "pool weights remove global channel priority")
+			require.NoError(t, db.Model(&binding).Update("channel_id", 0).Error)
+			candidates, err = ImageCandidateChannels(t.Context(), resolved, request.Model, request.Resolution)
+			require.NoError(t, err)
+			assert.Empty(t, candidates, "an explicit empty mixed binding stays closed")
+			fresh := request
+			fresh.MixedRouting, fresh.PolicyPlatform = nil, ""
+			require.NoError(t, PrepareMixedImageAdmission(t.Context(), token, &fresh))
+			require.NotNil(t, fresh.MixedRouting, "empty binding identity must not authorize legacy fallback")
+			require.NoError(t, db.Delete(&binding).Error)
+			candidates, err = ImageCandidateChannels(t.Context(), resolved, request.Model, request.Resolution)
+			require.NoError(t, err)
+			assert.Empty(t, candidates, "a removed mixed binding cannot broaden an accepted task")
+			require.NoError(t, db.Model(&policy).Update("pool_mode", "changed").Error)
+			_, _, err = ResolveAsyncImagePolicy(t.Context(), token, request)
+			require.ErrorContains(t, err, "identity changed")
+		})
+	}
+}
+
+func TestMixedImageProviderCapabilitiesAndDuplicateAccounts(t *testing.T) {
+	db, task, request, _, alternate := asyncImageWorkerFixture(t)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("type", constant.ChannelTypeVolcEngine).Error)
+	require.NoError(t, db.Model(&alternate).Update("type", constant.ChannelTypeNewAPI).Error)
+	previousValidation := ValidateMixedImageChannelRequestFunc
+	t.Cleanup(func() { ValidateMixedImageChannelRequestFunc = previousValidation })
+	ImageChannelCapabilityFunc = func(channel model.Channel, _ string) dto.ImageCapability {
+		capability := dto.ImageCapability{Protocol: "openai_images", Generate: true, Edit: true}
+		switch channel.Type {
+		case constant.ChannelTypeVolcEngine:
+			capability.Provider = "volcengine"
+		case constant.ChannelTypeNewAPI:
+			capability.Provider = "newapi"
+		case constant.ChannelTypeOpenAI:
+			capability.Provider = "openai"
+		case constant.ChannelTypeAzure:
+			capability.Provider = "azure"
+		case constant.ChannelTypeAli:
+			capability.Provider = "ali"
+		case constant.ChannelTypeGemini:
+			capability.Provider, capability.Protocol = "gemini", "gemini_native"
+		case constant.ChannelTypeTaskPlugin:
+			capability.Provider, capability.Protocol = "task-plugin", "openai_video"
+		case constant.ChannelTypeAnthropic:
+			capability.Provider, capability.Generate = "anthropic", false
+		case 28:
+			capability.Provider = "fallback-openai"
+		default:
+			return dto.ImageCapability{}
+		}
+		return capability
+	}
+	request.Provider, request.PolicyPlatform, request.Resolution = "", "mixed", "1K"
+	catalog, err := common.Marshal([]ImageModelCapability{{Id: request.Model, MaxOutputImages: 2, MaxReferenceImages: 1}})
+	require.NoError(t, err)
+	policy := model.ImageGroupPolicy{PolicyKey: ImageIdentityHash(task.Group, "mixed"), Group: task.Group, Platform: "mixed", PoolMode: "model_resolution", Enabled: true, AsyncEnabled: true, Models: string(catalog)}
+	require.NoError(t, db.Create(&policy).Error)
+	key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+	request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: key, PoolMode: policy.PoolMode}
+	openAI := model.Channel{Key: "other-openai-protocol-key", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Group: task.Group, Models: request.Model, ModelMapping: common.GetPointer(`{"image-model":"openai-upstream-model"}`)}
+	ali := model.Channel{Key: "ali-image-key", Type: constant.ChannelTypeAli, Status: common.ChannelStatusEnabled, Group: task.Group, Models: request.Model}
+	require.NoError(t, db.Create(&openAI).Error)
+	require.NoError(t, db.Create(&ali).Error)
+	require.NoError(t, db.Create(&[]model.Ability{{Group: task.Group, Model: request.Model, ChannelId: openAI.Id, Enabled: true}, {Group: task.Group, Model: request.Model, ChannelId: ali.Id, Enabled: true}}).Error)
+	require.NoError(t, db.Create(&[]model.ImageChannelPool{{BindingKey: key, ChannelId: task.ChannelId, Priority: 100}, {BindingKey: key, ChannelId: alternate.Id, Priority: 1}, {BindingKey: key, ChannelId: openAI.Id, Priority: 13}, {BindingKey: key, ChannelId: ali.Id, Priority: 1}}).Error)
+	assert.True(t, ImageChannelSupportsPlatform(openAI, request.Model, "openai"), "ordinary OpenAI protocol routing remains available")
+	assert.True(t, ImageChannelSupportsPlatform(openAI, request.Model, "mixed"), "mixed routing uses adaptor capability rather than channel type")
+	assert.True(t, MixedImageChannelRequestSupported(openAI, request))
+	assert.True(t, ImageChannelSupportsPlatform(model.Channel{Type: constant.ChannelTypeAzure}, request.Model, "mixed"), "registered OpenAI-compatible legacy transports remain eligible")
+	assert.True(t, ImageChannelSupportsPlatform(model.Channel{Type: 28}, request.Model, "openai"), "mixed admission does not change legacy unknown-type fallback")
+	excludedIDs := make([]int, 0)
+	for _, channelType := range []int{constant.ChannelTypeGemini, constant.ChannelTypeTaskPlugin, constant.ChannelTypeUnknown, constant.ChannelTypeAnthropic, 28} {
+		channel := model.Channel{Key: "non-image-protocol-key", Type: channelType, Status: common.ChannelStatusEnabled, Group: task.Group, Models: request.Model}
+		require.NoError(t, db.Create(&channel).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: task.Group, Model: request.Model, ChannelId: channel.Id, Enabled: true}).Error)
+		require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: key, ChannelId: channel.Id, Priority: 1000000}).Error)
+		assert.False(t, ImageChannelSupportsPlatform(channel, request.Model, "mixed"), "same model cannot admit a non-image adaptor or incompatible protocol")
+		assert.False(t, MixedImageChannelRequestSupported(channel, request))
+		excludedIDs = append(excludedIDs, channel.Id)
+	}
+	options, err := GetImagePoolSelectionOptions(t.Context(), task.Group, "mixed")
+	require.NoError(t, err)
+	require.Len(t, options.Channels, 4)
+	for _, option := range options.Channels {
+		assert.NotContains(t, excludedIDs, option.Id)
+	}
+	candidates, err := ImageCandidateChannels(t.Context(), policy, request.Model, request.Resolution)
+	require.NoError(t, err)
+	require.Len(t, candidates, 4)
+	for _, candidate := range candidates {
+		assert.NotContains(t, excludedIDs, candidate.Id)
+		if candidate.Id == openAI.Id {
+			assert.Equal(t, 13, candidate.GetWeight(), "newly admitted providers retain pool weights")
+			assert.Zero(t, candidate.GetPriority())
+		}
+	}
+	preview, err := PreviewMediaRouting(t.Context(), MediaRoutingPreviewRequest{Group: task.Group, Platform: "mixed", MediaType: "image", Model: request.Model, Resolution: request.Resolution, Operation: request.Kind})
+	require.NoError(t, err)
+	require.Len(t, preview.Eligible, 4)
+	for _, candidate := range preview.Eligible {
+		assert.NotContains(t, excludedIDs, candidate.ChannelID)
+		if candidate.ChannelID == openAI.Id {
+			assert.Equal(t, "openai", candidate.Provider)
+			assert.Equal(t, "openai-upstream-model", candidate.UpstreamModel)
+			assert.Equal(t, 13, candidate.Weight)
+		}
+	}
+	for _, candidate := range preview.Excluded {
+		assert.Contains(t, excludedIDs, candidate.ChannelID)
+		assert.Contains(t, candidate.Reasons, "platform_mismatch")
+	}
+	ValidateMixedImageChannelRequestFunc = func(channel model.Channel, request AsyncImageRequest) error {
+		if channel.Id != alternate.Id && request.Count > 1 {
+			return errors.New("provider model supports one output")
+		}
+		return nil
+	}
+	request.Count = 2
+	selected, _, err := PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, alternate.Id, selected.Id, "incompatible output counts are excluded before weighting")
+	maxReferences := 0
+	var first model.Channel
+	require.NoError(t, db.First(&first, task.ChannelId).Error)
+	first.SetSetting(dto.ChannelSettings{ImageMaxReferenceImages: &maxReferences})
+	require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{first.Id, openAI.Id, ali.Id}).Update("setting", first.Setting).Error)
+	request.Count, request.Kind = 1, "image_to_image"
+	request.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://reference.example/image.png"}}
+	selected, _, err = PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
+	require.NoError(t, err)
+	assert.Equal(t, alternate.Id, selected.Id, "configured reference zero is a strict mixed-pool limit")
+	base := "https://supplier.example/v1"
+	require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{first.Id, alternate.Id}).Update("base_url", base).Error)
+	require.NoError(t, ValidateMixedImagePoolMembers(t.Context(), []int{first.Id, alternate.Id}))
+	require.NoError(t, db.Model(&alternate).Updates(map[string]any{"key": first.Key, "base_url": "https://SUPPLIER.example:443/api"}).Error)
+	err = ValidateMixedImagePoolMembers(t.Context(), []int{first.Id, alternate.Id})
+	require.ErrorContains(t, err, "duplicate upstream origin and credential")
+	assert.NotContains(t, err.Error(), first.Key)
+}
+
+func TestMixedImageFailurePreservesAcceptanceBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failure    AsyncImageFailure
+		acceptedID string
+		wantStatus string
+	}{
+		{name: "unknown transport timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout", ExecutionUnknown: true}, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "unconfirmed server error", failure: AsyncImageFailure{Code: 606, HTTPStatus: 503}, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "crash recovery never resubmits", wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "explicit rate rejection can retry", failure: AsyncImageFailure{Code: 605, HTTPStatus: 429}, wantStatus: model.ImageTaskQueued},
+		{name: "accepted job polling stays fixed", failure: AsyncImageFailure{Code: 606}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskInvoking},
+		{name: "accepted terminal job cannot resubmit", failure: AsyncImageFailure{Code: 606, UpstreamTerminal: true}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, request, cfg, _ := asyncImageWorkerFixture(t)
+			request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: "frozen-mixed-binding", PoolMode: "resolution"}
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = EncryptImagePayload(encoded, "task:"+task.TaskId)
+			require.NoError(t, err)
+			task.DispatchedAt, task.UpstreamTaskId = time.Now().Unix(), tc.acceptedID
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "dispatched_at": task.DispatchedAt, "upstream_task_id": task.UpstreamTaskId}).Error)
+			require.NoError(t, db.Model(&model.User{}).Where("id = ?", task.UserId).Update("quota", 900).Error)
+			require.NoError(t, db.Model(&model.Token{}).Where("id = ?", task.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+			bill := model.AsyncImageBill{TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ReservedAt: time.Now().Unix(), ReservedQuota: 100, ReservedTokenQuota: 100, FundingSource: "wallet", Status: "reserved"}
+			require.NoError(t, db.Create(&bill).Error)
+			if tc.name == "crash recovery never resubmits" {
+				ExecuteAsyncImageFunc = func(context.Context, model.AsyncImageTask, AsyncImageRequest, *model.Channel, ImageRuntimeConfig, func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+					t.Fatal("an interrupted mixed dispatch must not submit again")
+					return nil, model.AsyncImageBill{}, errors.New("unexpected submission")
+				}
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			} else {
+				require.NoError(t, failAsyncImageInvocation(t.Context(), task, &tc.failure, cfg))
+			}
+			var saved model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, tc.wantStatus, saved.Status)
+			if tc.wantStatus == model.ImageTaskFailed {
+				assert.Equal(t, "refunded", bill.Status)
+			} else {
+				assert.Equal(t, "reserved", bill.Status)
+			}
+			if tc.wantStatus == model.ImageTaskExecutionUnknown {
+				assert.Zero(t, saved.NextAttemptAt)
+				assert.Zero(t, saved.RetryCount)
+				assert.Equal(t, task.RequestCipher, saved.RequestCipher)
+				_, err := model.ClaimAsyncImageTask(t.Context(), saved.TaskId, "cannot-resubmit", cfg.WorkerLease)
+				assert.ErrorIs(t, err, model.ErrImageConflict)
+			}
+		})
+	}
+}
+
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
-	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection", "resolution mapping changed before retry"} {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "mixed completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection", "resolution mapping changed before retry"} {
 		t.Run(condition, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			wantChannelID, wantKey := alternate.Id, alternate.Key
@@ -228,6 +471,30 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("channel_info", channelInfo).Error)
 			case "completed upstream rate limit":
 				attempts[0].Code, attempts[0].FinishedAt = 605, time.Now().Unix()
+			case "mixed completed upstream rate limit":
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("type", constant.ChannelTypeVolcEngine).Error)
+				require.NoError(t, db.Model(&alternate).Update("type", constant.ChannelTypeNewAPI).Error)
+				attempts[0].Code, attempts[0].HTTPStatus, attempts[0].FinishedAt = 605, http.StatusTooManyRequests, time.Now().Unix()
+				var policy model.ImageGroupPolicy
+				require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&policy).Error)
+				policy.Id, policy.Platform, policy.PolicyKey = 0, "mixed", ImageIdentityHash(task.Group, "mixed")
+				require.NoError(t, db.Create(&policy).Error)
+				request.Provider, request.PolicyPlatform, request.Resolution = "", "mixed", "1K"
+				key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+				request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: key, PoolMode: policy.PoolMode}
+				require.NoError(t, db.Create(&[]model.ImageChannelPool{{BindingKey: key, ChannelId: task.ChannelId, Priority: 100}, {BindingKey: key, ChannelId: alternate.Id, Priority: 1}}).Error)
+				ImageChannelCapabilityFunc = func(channel model.Channel, _ string) dto.ImageCapability {
+					provider := "volcengine"
+					if channel.Id == alternate.Id {
+						provider = "newapi"
+					}
+					return dto.ImageCapability{Provider: provider, Protocol: "openai_images", Generate: true, Edit: true}
+				}
+				data, err := common.Marshal(request)
+				require.NoError(t, err)
+				task.RequestCipher, err = EncryptImagePayload(data, "task:"+task.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
 			case "HTTP 429 capacity rejection":
 				attempts[0].Code, attempts[0].HTTPStatus, attempts[0].FinishedAt = 603, 429, time.Now().Unix()
 			case "completed upstream transient rejection":
@@ -271,6 +538,16 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 			var saved model.AsyncImageTask
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
 			assert.Equal(t, wantChannelID, saved.ChannelId)
+			if condition == "mixed completed upstream rate limit" {
+				assert.Equal(t, "newapi", saved.Provider)
+				var history []ImageChannelAttempt
+				require.NoError(t, common.UnmarshalJsonStr(saved.Attempts, &history))
+				require.Len(t, history, 2)
+				assert.Equal(t, "newapi", history[1].Provider)
+				assert.Equal(t, "openai_images", history[1].Protocol)
+				assert.Equal(t, request.Model, history[1].UpstreamModel)
+				assert.False(t, history[1].RetryOnTimeout)
+			}
 			data, err := DecryptImagePayload(saved.SelectedChannelCipher, "image-channel:"+task.TaskId)
 			require.NoError(t, err)
 			var frozen model.Channel

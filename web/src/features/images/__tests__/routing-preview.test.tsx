@@ -144,6 +144,46 @@ test('video preview uses provider defaults and shows policy errors even when no 
   )
 })
 
+test('mixed preview explains missing bindings and incompatible image parameters in readable language', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({
+    binding_found: false,
+    binding_key: '',
+    routing_groups: ['default'],
+    eligible: [],
+    excluded: [
+      {
+        group: 'default',
+        channel_id: 45,
+        name: 'Ark',
+        upstream_model: 'seedream',
+        provider: 'volcengine',
+        protocol: 'openai_images',
+        priority: 0,
+        weight: 1,
+        available_accounts: 1,
+        reasons: ['image_parameters_not_supported'],
+      },
+    ],
+    reasons: ['mixed_pool_missing'],
+    warnings: [],
+  })
+  const user = userEvent.setup()
+  renderPreview()
+  await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+  await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+  await user.type(screen.getByRole('textbox', { name: 'Model' }), 'seedream')
+  await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'No mixed channel pool binding is configured'
+  )
+  expect(
+    screen.getByRole('cell', {
+      name: 'Image parameters are not supported',
+    })
+  ).toBeVisible()
+})
+
 test('failed route preview exposes retry and does not retain previous candidates', async () => {
   vi.mocked(imageRequest)
     .mockRejectedValueOnce(new Error('Preview unavailable'))
@@ -164,6 +204,59 @@ test('failed route preview exposes retry and does not retain previous candidates
     expect(screen.queryByText('Preview unavailable')).not.toBeInTheDocument()
   )
   expect(await screen.findByRole('table')).toBeVisible()
+})
+
+test('mixed preview limits media to images and displays the actual provider and protocol', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({
+    binding_found: true,
+    binding_key: 'mixed-pool',
+    eligible: [
+      {
+        channel_id: 45,
+        name: 'Ark native',
+        group: 'default',
+        binding_key: 'mixed-pool',
+        binding_found: true,
+        upstream_model: 'doubao-seedream-5-0-pro-260628',
+        provider: 'volcengine',
+        protocol: 'openai_images',
+        priority: 0,
+        weight: 5,
+        available_accounts: 1,
+        reasons: [],
+      },
+    ],
+    excluded: [],
+    reasons: [],
+    warnings: [],
+  })
+  const user = userEvent.setup()
+  renderPreview()
+  await user.click(screen.getByRole('combobox', { name: 'Media type' }))
+  await user.click(screen.getByRole('option', { name: 'Video' }))
+  await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+  await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+  expect(screen.getByRole('combobox', { name: 'Media type' })).toBeDisabled()
+  expect(
+    screen.getByRole('combobox', { name: 'Media type' })
+  ).toHaveTextContent('Image')
+  await user.type(
+    screen.getByRole('textbox', { name: 'Model' }),
+    'seedream-5-pro'
+  )
+  await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+  expect(await screen.findByRole('cell', { name: 'volcengine' })).toBeVisible()
+  expect(screen.getByRole('cell', { name: 'openai_images' })).toBeVisible()
+  expect(imageRequest).toHaveBeenCalledWith(
+    '/api/option/images/routing/preview',
+    'POST',
+    expect.objectContaining({
+      platform: 'mixed',
+      media_type: 'image',
+      resolution: '1K',
+      operation: 'text_to_image',
+    })
+  )
 })
 
 test('automatic routing keeps the same channel distinct across actual groups and pool bindings', async () => {

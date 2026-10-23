@@ -5,16 +5,19 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -23,9 +26,15 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -37,6 +46,529 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestMixedImageBillingUsesPublicAlias(t *testing.T) {
+	previousDB, previousCount, previousQuotaUnit := model.DB, constant.CountToken, common.QuotaPerUnit
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "mixed-image-pricing.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.QuotaPerUnit = db, false, 500000
+	t.Cleanup(func() {
+		model.DB, constant.CountToken, common.QuotaPerUnit = previousDB, previousCount, previousQuotaUnit
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices))
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	user := model.User{Username: "mixed-price-user", Group: "default", Status: common.UserStatusEnabled, Quota: 1000000}
+	require.NoError(t, db.Create(&user).Error)
+	prices := ratio_setting.GetModelPriceCopy()
+	prices["mixed-image-alias"], prices["mixed-vendor-model"] = 0.04, 99
+	encoded, err := common.Marshal(prices)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+	request := service.AsyncImageRequest{Platform: "openai", Dialect: "async", Model: "mixed-image-alias", Count: 2, Prompt: "draw", Size: "1024x1024", Native: map[string]common.RawMessage{}, MixedRouting: &service.ImageMixedRouting{Group: "default"}}
+	for _, channelType := range []int{constant.ChannelTypeVolcEngine, constant.ChannelTypeNewAPI, constant.ChannelTypeAli, constant.ChannelTypeOpenAI} {
+		t.Run(strconv.Itoa(channelType), func(t *testing.T) {
+			mapping := `{"mixed-image-alias":"mixed-vendor-model"}`
+			selected := &model.Channel{Type: channelType, Key: "local-test-only", ModelMapping: &mapping}
+			billing, err := FreezeAsyncImageBilling(t.Context(), model.Token{UserId: user.Id}, request, "default", selected)
+			require.NoError(t, err)
+			assert.Equal(t, 0.04, billing.Price.ModelPrice)
+			assert.Equal(t, 40000, billing.Price.QuotaToPreConsume)
+			assert.Equal(t, float64(2), billing.Price.OtherRatios()["n"])
+		})
+	}
+	request.Model = "unpriced-mixed-alias"
+	mapping := `{"unpriced-mixed-alias":"mixed-vendor-model"}`
+	_, err = FreezeAsyncImageBilling(t.Context(), model.Token{UserId: user.Id}, request, "default", &model.Channel{Type: constant.ChannelTypeNewAPI, ModelMapping: &mapping})
+	require.ErrorContains(t, err, "requires an explicit billing configuration")
+}
+
+func TestMixedImageBillingExecutionAndRecovery(t *testing.T) {
+	previousDB, previousCount, previousRedis, previousQuotaUnit := model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit
+	previousType := common.MainDatabaseType()
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	billingSettings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousModes, previousExpressions := maps.Clone(billingSettings.BillingMode), maps.Clone(billingSettings.BillingExpr)
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "mixed-execution-billing.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test", "use a dedicated disposable database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_job_test") || strings.Contains(dsn, "/new_api_image_job_test"), "use a dedicated disposable database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = db, false, false, 500000
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() {
+		common.SetMainDatabaseType(previousType)
+		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}, &model.ImageInputAlias{}, &model.UserSubscription{}, &model.Token{}, &model.User{}))
+		model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = previousDB, previousCount, previousRedis, previousQuotaUnit
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices))
+		billingSettings.BillingMode, billingSettings.BillingExpr = previousModes, previousExpressions
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-billing:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-billing")
+	prices := ratio_setting.GetModelPriceCopy()
+	prices["mixed-billing-image"], prices["z-image-mixed-billing"] = 0.04, 0.04
+	encoded, err := common.Marshal(prices)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+	billingSettings.BillingMode["mixed-expression-image"] = billing_setting.BillingModeTieredExpr
+	billingSettings.BillingExpr["mixed-expression-image"] = `tier("image", fixed(0.03)) * image_count`
+	service.InitHttpClient()
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	for _, tc := range []struct {
+		name, alias string
+		mixed       bool
+		reserved    int
+		actual      int
+	}{
+		{name: "mixed_unit_price", alias: "mixed-billing-image", mixed: true, reserved: 40000, actual: 20000},
+		{name: "mixed_expression", alias: "mixed-expression-image", mixed: true, reserved: 30000, actual: 15000},
+		{name: "legacy_ali_surcharge", alias: "mixed-billing-image", reserved: 80000, actual: 40000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: tc.name, AffCode: tc.name[:min(len(tc.name), 32)], Group: "default", Status: common.UserStatusEnabled, Quota: 1000000}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: tc.name, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&token).Error)
+			received := make(chan []byte, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				received <- body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"output":{"results":[{"b64_image":%q}]},"usage":{"image_count":1}}`, base64.StdEncoding.EncodeToString(bitmap.Bytes()))
+			}))
+			defer upstream.Close()
+			mapping, err := common.Marshal(map[string]string{tc.alias: "z-image-mixed-billing"})
+			require.NoError(t, err)
+			channel := &model.Channel{Id: 45, Type: constant.ChannelTypeAli, Key: "local-mixed-billing", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, ModelMapping: common.GetPointer(string(mapping)), ParamOverride: common.GetPointer(`{"operations":[{"path":"parameters.prompt_extend","mode":"set","value":true}]}`)}
+			request, err := service.ParseAsyncImageRequest([]byte(fmt.Sprintf(`{"model":%q,"prompt":"draw","n":2,"size":"1024x1024","parameters":{"prompt_extend":false}}`, tc.alias)), "application/json", "/v1/images/generations_async", service.DefaultImageRuntimeConfig())
+			require.NoError(t, err)
+			if tc.mixed {
+				request.MixedRouting = &service.ImageMixedRouting{Group: "default"}
+			}
+			billing, err := FreezeAsyncImageBilling(t.Context(), token, request, "default", channel)
+			require.NoError(t, err)
+			request.Billing = &billing
+			task := model.AsyncImageTask{TaskId: tc.name, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			channelPayload, err := common.Marshal(channel)
+			require.NoError(t, err)
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelPayload, "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
+				dispatches++
+				reservation, err := model.GetAsyncImageReservation(t.Context(), task)
+				require.NoError(t, err)
+				require.NotNil(t, reservation)
+				assert.Equal(t, tc.reserved, reservation.ReservedQuota, "reserve the complete public bill before sending")
+				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			})
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			require.Len(t, output.Images, 1)
+			assert.Equal(t, tc.actual, bill.Quota)
+			body := <-received
+			var sent struct {
+				Parameters struct {
+					N            int  `json:"n"`
+					PromptExtend bool `json:"prompt_extend"`
+				} `json:"parameters"`
+			}
+			require.NoError(t, common.Unmarshal(body, &sent))
+			assert.Equal(t, 2, sent.Parameters.N)
+			assert.True(t, sent.Parameters.PromptExtend, "the channel override is sent without changing the mixed price")
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			payload, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			var recovered service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(payload, &recovered))
+			require.NotNil(t, recovered.Completion)
+			if tc.mixed {
+				require.NotNil(t, recovered.MixedRouting)
+			}
+			_, recoveredBill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), func() error { dispatches++; return nil })
+			require.NoError(t, err)
+			assert.Equal(t, bill.Quota, recoveredBill.Quota)
+			assert.Equal(t, 1, dispatches)
+			assert.Empty(t, received, "completion recovery must not submit again")
+			var log model.Log
+			require.NoError(t, common.UnmarshalJsonStr(recoveredBill.LogPayload, &log))
+			assert.Equal(t, tc.alias, log.ModelName)
+		})
+	}
+	for _, tc := range []struct {
+		name, upstream, wantError string
+		channelType               int
+		mask, tokenPrice          bool
+		passThrough               bool
+	}{
+		{name: "ali_token_not_dispatched", upstream: "z-image", channelType: constant.ChannelTypeAli, tokenPrice: true, wantError: "token usage"},
+		{name: "ali_mask_not_dispatched", upstream: "qwen-image-edit-plus", channelType: constant.ChannelTypeAli, mask: true, wantError: "mask"},
+		{name: "ali_edit_preserves_size", upstream: "qwen-image-edit-plus", channelType: constant.ChannelTypeAli},
+		{name: "openai_mask_preserved", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, mask: true},
+		{name: "openai_multipart_passthrough", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, mask: true, passThrough: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: tc.name, AffCode: tc.name[:min(len(tc.name), 32)], Status: common.UserStatusEnabled, Quota: 1000000}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: tc.name, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&token).Error)
+			received := make(chan []byte, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body []byte
+				var readErr error
+				if tc.passThrough {
+					if !assert.NoError(t, r.ParseMultipartForm(1<<20)) {
+						return
+					}
+					defer r.MultipartForm.RemoveAll()
+					assert.Len(t, r.MultipartForm.File["mask"], 1)
+					assert.Len(t, r.MultipartForm.File["image[]"], 1)
+					body, readErr = common.Marshal(map[string]any{"model": r.FormValue("model"), "size": r.FormValue("size"), "mask": len(r.MultipartForm.File["mask"])})
+				} else {
+					body, readErr = io.ReadAll(r.Body)
+				}
+				assert.NoError(t, readErr)
+				received <- body
+				w.Header().Set("Content-Type", "application/json")
+				if tc.channelType == constant.ChannelTypeAli {
+					_, _ = fmt.Fprintf(w, `{"output":{"results":[{"b64_image":%q}]},"usage":{"image_count":1}}`, base64.StdEncoding.EncodeToString(bitmap.Bytes()))
+				} else {
+					_, _ = fmt.Fprintf(w, `{"data":[{"b64_json":%q}]}`, base64.StdEncoding.EncodeToString(bitmap.Bytes()))
+				}
+			}))
+			defer upstream.Close()
+			channel := &model.Channel{Id: 51, Type: tc.channelType, Key: "local", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, ModelMapping: common.GetPointer(fmt.Sprintf(`{"mixed-billing-image":%q}`, tc.upstream))}
+			channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(bitmap.Bytes())
+			body := map[string]any{"model": "mixed-billing-image", "prompt": "draw", "n": 1, "size": "1024x1024", "images": []map[string]string{{"image_url": dataURL}}}
+			if tc.mask {
+				body["mask"] = dataURL
+			}
+			encoded, err := common.Marshal(body)
+			require.NoError(t, err)
+			request, err := service.ParseAsyncImageRequest(encoded, "application/json", "/v1/images/edits_async", service.DefaultImageRuntimeConfig())
+			require.NoError(t, err)
+			if tc.passThrough {
+				request.InputFormat = "multipart"
+			}
+			request.MixedRouting = &service.ImageMixedRouting{Group: "default"}
+			billing, err := FreezeAsyncImageBilling(t.Context(), token, request, "default", channel)
+			require.NoError(t, err)
+			if tc.tokenPrice {
+				billing.Price.UsePrice = false
+				billing.Tiered = &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: `tier("tokens", p * 2 + c * 8)`, GroupRatio: 1}
+			}
+			request.Billing = &billing
+			task := model.AsyncImageTask{TaskId: tc.name, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			channelBytes, err := common.Marshal(channel)
+			require.NoError(t, err)
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelBytes, "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error { dispatches++; return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id) })
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				assert.Zero(t, dispatches)
+				assert.Empty(t, received)
+				reservation, reserveErr := model.GetAsyncImageReservation(t.Context(), task)
+				require.NoError(t, reserveErr)
+				assert.Nil(t, reservation, "incompatible candidates must not reserve funds")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			assert.Equal(t, 20000, bill.Quota)
+			assert.Equal(t, 1, dispatches)
+			var sent map[string]any
+			require.NoError(t, common.Unmarshal(<-received, &sent))
+			assert.Equal(t, tc.upstream, sent["model"], "the recorded upstream model must match JSON and multipart dispatch")
+			if tc.channelType == constant.ChannelTypeAli {
+				assert.Equal(t, "1024*1024", sent["parameters"].(map[string]any)["size"])
+				assert.NotNil(t, sent["input"])
+			} else {
+				assert.NotNil(t, sent["mask"])
+				assert.Equal(t, "1024x1024", sent["size"])
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, body, expression string
+		mixed, historical      bool
+		quota                  int
+		missing                bool
+		canonicalInput         bool
+	}{
+		{name: "required_usage_missing", body: `{"input":10}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, missing: true},
+		{name: "unused_usage_missing", body: `{"output":20}`, expression: `tier("tokens", c * 8)`, mixed: true, quota: 80},
+		{name: "real_mapped_usage", body: `{"input":10,"output":20}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, quota: 90},
+		{name: "missing_canonical_uses_alias", body: `{"input":10,"output":20}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, canonicalInput: true, quota: 90},
+		{name: "explicit_canonical_zero_preserved", body: `{"input":10,"prompt":0,"output":20}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, canonicalInput: true, quota: 80},
+		{name: "missing_alias_uses_canonical", body: `{"prompt":10,"output":20}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, canonicalInput: true, quota: 90},
+		{name: "conflicting_alias_keeps_canonical", body: `{"input":20,"prompt":10,"output":20}`, expression: `tier("tokens", p * 2 + c * 8)`, mixed: true, canonicalInput: true, quota: 90},
+		{name: "fixed_provider_partial_usage", body: `{"input":10}`, expression: `tier("tokens", p * 2 + c * 8)`, quota: 10},
+		{name: "historical_completion_without_presence", body: `{"output":20}`, expression: `tier("tokens", c * 8)`, mixed: true, historical: true, quota: 80},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: tc.name, AffCode: tc.name[:min(len(tc.name), 32)], Status: common.UserStatusEnabled, Quota: 1000000}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: tc.name, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&token).Error)
+			downloads := make(chan string, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				downloads <- r.URL.Path
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write(bitmap.Bytes())
+			}))
+			defer upstream.Close()
+			profile := service.TianyueAsyncImageProfile("frozen-upstream")
+			profile.Poll.Response.UsagePaths = map[string]string{"input_tokens": "usage.input", "output_tokens": "usage.output", "input_tokens_details.cached_tokens": "usage.cache"}
+			if tc.canonicalInput {
+				profile.Poll.Response.UsagePaths["prompt_tokens"] = "usage.prompt"
+			}
+			parsed, err := service.ParseUpstreamAsyncPollResponse(profile, []byte(fmt.Sprintf(`{"status":"SUCCESS","url":%q,"usage":%s}`, upstream.URL+"/image.png", tc.body)))
+			require.NoError(t, err)
+			billing := service.MediaBillingSnapshot{Price: types.PriceData{QuotaToPreConsume: 1000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}, Tiered: &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: 1}, ImageQuotaBeforeGroup: 1000}
+			completion := service.AsyncImageCompletion{EvaluatedAt: time.Now(), Body: []byte(`{"data":[]}`), Usage: parsed.Usage, UsageFields: parsed.UsageFields, Profile: profile, URLs: parsed.URLs, Billing: billing, BillingBody: []byte(`{"n":1}`), UpstreamModel: "frozen-upstream", BillingModel: "frozen-alias"}
+			if tc.historical {
+				completion.UsageFields = nil
+			}
+			request := service.AsyncImageRequest{Platform: "openai", Model: "frozen-alias", Count: 1, Kind: "text_to_image", Billing: &billing}
+			if tc.mixed {
+				request.MixedRouting = &service.ImageMixedRouting{Group: "default"}
+			}
+			task := model.AsyncImageTask{TaskId: tc.name, UserId: user.Id, TokenId: token.Id, ChannelId: 51, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			task.SelectedChannelCipher, err = service.EncryptImagePayload([]byte(`{"id":51,"key":"local"}`), "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 1000, model.ImageFundingSelection{Source: "wallet"}))
+			require.NoError(t, service.PersistAsyncImageCompletion(t.Context(), &task, request, completion))
+			payload, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			var recovered service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(payload, &recovered))
+			require.NotNil(t, recovered.Completion)
+			assert.Equal(t, completion.UsageFields, recovered.Completion.UsageFields)
+			channel := &model.Channel{Id: 51, Type: constant.ChannelTypeAli, Key: "local", BaseURL: &upstream.URL, Status: common.ChannelStatusManuallyDisabled}
+			dispatches := 0
+			_, bill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), func() error { dispatches++; return nil })
+			assert.Zero(t, dispatches, "accepted completion recovery never submits again")
+			if tc.missing {
+				require.ErrorContains(t, err, "token usage")
+				assert.Empty(t, downloads)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.quota, bill.Quota)
+				assert.Equal(t, "/image.png", <-downloads)
+			}
+			reservation, reserveErr := model.GetAsyncImageReservation(t.Context(), task)
+			require.NoError(t, reserveErr)
+			require.NotNil(t, reservation)
+			assert.Equal(t, "reserved", reservation.Status)
+			assert.Equal(t, 1000, reservation.ReservedQuota)
+		})
+	}
+
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("token_ratio_mixed_%t", mixed), func(t *testing.T) {
+			info := &relaycommon.RelayInfo{ImageMixedBilling: mixed, ImageQuotaBeforeGroup: 1000, ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeAli, UpstreamModelName: "z-image"}, PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			require.Nil(t, service.EstimateImageBillingForRequest(info, 3, true))
+			want, n, extension := 6000, 3.0, 2.0
+			if mixed {
+				want, n, extension = 1000, 1, 1
+			}
+			assert.Equal(t, want, info.PriceData.QuotaToPreConsume)
+			assert.Equal(t, n, info.PriceData.OtherRatios()["n"])
+			assert.Equal(t, extension, info.PriceData.OtherRatios()["prompt_extend"])
+		})
+	}
+	// Quantity limits apply before either legacy or frozen expression arithmetic.
+	for _, expression := range []bool{false, true} {
+		info := &relaycommon.RelayInfo{ImageMixedBilling: true}
+		if expression {
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr}
+		}
+		require.NotNil(t, service.EstimateImageBillingForRequest(info, dto.MaxImageN+1, true))
+	}
+}
+
+func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, upstream    string
+		count, references int
+		channelType       int
+		override          string
+		native            map[string]common.RawMessage
+		wantError         string
+		undeclaredModel   bool
+		tokenPrice        bool
+		mask              bool
+		passThrough       bool
+		tianyue           bool
+		usagePaths        map[string]string
+		customProfile     bool
+	}{
+		{name: "pro_single", upstream: "doubao-seedream-5-0-pro-260628", count: 1},
+		{name: "ark_explicit_nonstreaming", upstream: "doubao-seedream-5-0-pro-260628", count: 1, native: map[string]common.RawMessage{"stream": common.RawMessage(`false`)}},
+		{name: "newapi_explicit_nonstreaming", upstream: "image-model", channelType: constant.ChannelTypeNewAPI, count: 1, native: map[string]common.RawMessage{"stream": common.RawMessage(`false`)}},
+		{name: "pro_group_rejected", upstream: "doubao-seedream-5-0-pro-260628", count: 2, wantError: "between 1 and 1"},
+		{name: "lite_total_limit", upstream: "doubao-seedream-5-0-260128", count: 2, references: 14, wantError: "15"},
+		{name: "unsupported_quality", upstream: "doubao-seedream-5-0-pro-260628", count: 1, native: map[string]common.RawMessage{"quality": common.RawMessage(`"hd"`)}, wantError: "parameter quality"},
+		{name: "openai_public_parameters", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 2, native: map[string]common.RawMessage{"quality": common.RawMessage(`"high"`)}},
+		{name: "openai_rejects_ali_container", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 2, native: map[string]common.RawMessage{"parameters": common.RawMessage(`{"n":2}`)}, wantError: "parameter parameters"},
+		{name: "ali_native_parameters", upstream: "z-image", channelType: constant.ChannelTypeAli, count: 2, native: map[string]common.RawMessage{"parameters": common.RawMessage(`{"n":2,"prompt_extend":true}`)}},
+		{name: "ali_native_input", upstream: "z-image", channelType: constant.ChannelTypeAli, count: 2, native: map[string]common.RawMessage{"input": common.RawMessage(`{"prompt":"draw"}`)}},
+		{name: "ali_token_price_rejected", upstream: "z-image", channelType: constant.ChannelTypeAli, count: 1, tokenPrice: true, wantError: "token usage"},
+		{name: "openai_token_price_supported", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true},
+		{name: "ali_mask_rejected", upstream: "qwen-image-edit-plus", channelType: constant.ChannelTypeAli, count: 1, references: 1, mask: true, wantError: "mask"},
+		{name: "openai_mask_supported", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, references: 1, mask: true},
+		{name: "openai_empty_mask_override_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, references: 1, mask: true, override: `{"operations":[{"path":"mask","mode":"set","value":""}]}`, wantError: "mask"},
+		{name: "openai_passthrough_skips_override", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, passThrough: true, override: `{"operations":[{"path":"n","mode":"set","value":2}]}`},
+		{name: "tianyue_mask_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, mask: true, tianyue: true, wantError: "mask"},
+		{name: "tianyue_builtin_token_usage_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, tokenPrice: true, tianyue: true, wantError: "token usage"},
+		{name: "custom_profile_without_usage_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, wantError: "token usage"},
+		{name: "custom_profile_total_only_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, usagePaths: map[string]string{"total_tokens": "usage.total"}, wantError: "token usage"},
+		{name: "custom_profile_input_only_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, usagePaths: map[string]string{"input_tokens": "usage.input"}, wantError: "token usage"},
+		{name: "custom_profile_real_usage_supported", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, usagePaths: map[string]string{"input_tokens": "usage.input", "output_tokens": "usage.output"}},
+		{name: "custom_profile_fixed_price_without_usage_supported", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, customProfile: true},
+		{name: "tianyue_explicit_profile_usage_precedes_builtin", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, tokenPrice: true, customProfile: true, tianyue: true, usagePaths: map[string]string{"prompt_tokens": "usage.input", "completion_tokens": "usage.output"}},
+		{name: "siliconflow_passthrough_requires_conversion", upstream: "Qwen/Qwen-Image", channelType: constant.ChannelTypeSiliconFlow, count: 1, passThrough: true, wantError: "pass-through"},
+		{name: "ali_passthrough_requires_native_body", upstream: "z-image", channelType: constant.ChannelTypeAli, count: 1, passThrough: true, wantError: "pass-through"},
+		{name: "ali_quantity_conflict", upstream: "z-image", channelType: constant.ChannelTypeAli, count: 2, native: map[string]common.RawMessage{"parameters": common.RawMessage(`{"n":3}`)}, wantError: "count conflicts"},
+		{name: "xai_output_limit", upstream: "grok-imagine-image", channelType: constant.ChannelTypeXai, count: 11, wantError: "10 output images"},
+		{name: "xai_reference_limit", upstream: "grok-imagine-image", channelType: constant.ChannelTypeXai, count: 1, references: 4, wantError: "3 reference images"},
+		{name: "imagen_native_count", upstream: "imagen-4.0-generate-001", channelType: constant.ChannelTypeGemini, count: 2},
+		{name: "imagen_override_count", upstream: "imagen-4.0-generate-001", channelType: constant.ChannelTypeGemini, count: 2, override: `{"operations":[{"path":"parameters.sampleCount","mode":"set","value":3}]}`, wantError: "sampleCount conflicts"},
+		{name: "jimeng_single", upstream: "jimeng_high_aes_general_v21_L", channelType: constant.ChannelTypeJimeng, count: 1},
+		{name: "jimeng_cannot_represent_batch", upstream: "jimeng_high_aes_general_v21_L", channelType: constant.ChannelTypeJimeng, count: 2, wantError: "batch count"},
+		{name: "undeclared_parameter", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, native: map[string]common.RawMessage{"undeclared_option": common.RawMessage(`true`)}, wantError: "parameter undeclared_option"},
+		{name: "undeclared_ali_model", upstream: "undeclared-image-model", channelType: constant.ChannelTypeAli, count: 1, undeclaredModel: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mapping, err := common.Marshal(map[string]string{"public-alias": tc.upstream})
+			require.NoError(t, err)
+			channelType := tc.channelType
+			if channelType == 0 {
+				channelType = constant.ChannelTypeVolcEngine
+			}
+			ch := model.Channel{Type: channelType, ModelMapping: common.GetPointer(string(mapping))}
+			if tc.override != "" {
+				ch.ParamOverride = &tc.override
+			}
+			ch.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough, TianyueMediaCompatibility: tc.tianyue})
+			if tc.customProfile {
+				profile := service.TianyueAsyncImageProfile(tc.upstream)
+				profile.Poll.Response.UsagePaths = tc.usagePaths
+				ch.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &dto.UpstreamAsyncConfig{Profiles: []dto.UpstreamAsyncProfile{*profile}}})
+			}
+			request := service.AsyncImageRequest{Model: "public-alias", Count: tc.count, Prompt: "draw", Size: "1024x1024", Native: tc.native}
+			if tc.tokenPrice {
+				request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{QuotaToPreConsume: 1000}, Tiered: &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ExprString: `tier("tokens", p * 2 + c * 8)`}}
+			}
+			for i := range tc.references {
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: fmt.Sprintf("https://example.com/%d.png", i)})
+			}
+			if tc.mask {
+				request.Kind, request.Dialect = "image_to_image", "async"
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "mask", URL: "https://example.com/mask.png"})
+			}
+			if tc.undeclaredModel {
+				assert.False(t, service.MixedImageChannelRequestSupported(ch, request), "an adaptor must declare the mapped model before mixed admission")
+				return
+			}
+			err = validateMixedImageChannelRequest(ch, request)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestMixedImageFinalNativeCountGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		count      int
+		wantError  string
+	}{
+		{name: "imagen_count", body: `{"parameters":{"sampleCount":2}}`, count: 2},
+		{name: "imagen_override", body: `{"parameters":{"sampleCount":3}}`, count: 2, wantError: "sampleCount conflicts"},
+		{name: "unsigned_overflow", body: `{"parameters":{"sampleCount":18446744073709551615}}`, count: 2, wantError: "sampleCount conflicts"},
+		{name: "missing_batch", body: `{"prompt":"draw"}`, count: 2, wantError: "batch count"},
+		{name: "single_without_quantity", body: `{"prompt":"draw"}`, count: 1},
+		{name: "unbounded_expected", body: `{"n":129}`, count: 129, wantError: "outside the allowed range"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			// Match the replayable JSON bodies prepared by the relay.
+			request.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(tc.body)), nil }
+			err := service.ValidateMixedImageSubmitCount(request, tc.count)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+	t.Run("imagen_override_stops_before_dispatch", func(t *testing.T) {
+		previousPassThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled
+		model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
+		t.Cleanup(func() { model_setting.GetGlobalSettings().PassThroughRequestEnabled = previousPassThrough })
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"imagen-4.0-generate-001","prompt":"draw","n":2}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Set("async_image_execution", true)
+		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeGemini)
+		common.SetContextKey(c, constant.ContextKeyOriginalModel, "imagen-4.0-generate-001")
+		var overrides map[string]any
+		require.NoError(t, common.UnmarshalJsonStr(`{"operations":[{"path":"parameters.sampleCount","mode":"set","value":3}]}`, &overrides))
+		common.SetContextKey(c, constant.ContextKeyChannelParamOverride, overrides)
+		request := &dto.ImageRequest{Model: "imagen-4.0-generate-001", Prompt: "draw", N: common.GetPointer(uint(2)), Size: "1024x1024"}
+		info := &relaycommon.RelayInfo{OriginModelName: request.Model, Request: request, RelayMode: relayconstant.RelayModeImagesGenerations, ImageMixedBilling: true, PriceData: types.PriceData{UsePrice: true, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+		dispatches := 0
+		_, apiErr := ExecuteImageRequest(c, info, false, func() error { dispatches++; return errors.New("unexpected dispatch") })
+		require.NotNil(t, apiErr)
+		assert.Contains(t, apiErr.Error(), "sampleCount conflicts")
+		assert.Zero(t, dispatches, "reject native quantity changes before reserving or sending")
+	})
+	// Corrupt configuration must fail locally without invoking repair-on-read getters.
+	for _, field := range []string{"setting", "other_settings", "param_override"} {
+		t.Run(field, func(t *testing.T) {
+			previousDB := model.DB
+			model.DB = nil
+			t.Cleanup(func() { model.DB = previousDB })
+			invalid := "{broken"
+			channel := model.Channel{Type: constant.ChannelTypeNewAPI}
+			switch field {
+			case "setting":
+				channel.Setting = &invalid
+			case "other_settings":
+				channel.OtherSettings = invalid
+			case "param_override":
+				channel.ParamOverride = &invalid
+			}
+			err := validateMixedImageChannelRequest(channel, service.AsyncImageRequest{Model: "gpt-image-1", Count: 1})
+			require.ErrorContains(t, err, "invalid image channel")
+			assert.Equal(t, "{broken", invalid)
+		})
+	}
+}
 
 func TestAsyncImageUnreadableReceiptDoesNotRepeatSubmission(t *testing.T) {
 	for _, tc := range []struct {
@@ -372,6 +904,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		statusMapping              string
 		fileFormat                 string
 		passThrough                bool
+		volcengine                 bool
 		xai                        bool
 		resolutionMapping          bool
 		resolution                 string
@@ -380,6 +913,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		templateBody               map[string]any
 		expectedTemplate           string
 	}{
+		{name: "volcengine_edits_json", path: "/v1/images/edits_async", referenceField: "image", volcengine: true},
+		{name: "volcengine_edits_json_passthrough", path: "/v1/images/edits_async", referenceField: "image", volcengine: true, passThrough: true},
+		{name: "volcengine_edits_uploaded_reference", path: "/v1/images/edits_async", fileFormat: "png", volcengine: true},
+		{name: "volcengine_generations_reference", path: "/v1/images/generations_async", referenceField: "image_urls", volcengine: true},
 		{name: "resolution_mapping_json", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true},
 		{name: "resolution_mapping_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, passThrough: true},
 		{name: "resolution_mapping_2k_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", resolutionMapping: true, resolution: "2K", passThrough: true},
@@ -478,6 +1015,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				mapping = `{"image-alias":"grok-imagine-image-quality"}`
 				channel.ParamOverride = nil
 			}
+			if tc.volcengine {
+				channel.Type = constant.ChannelTypeVolcEngine
+				mapping = `{"image-alias":"doubao-seedream-5-0-pro-260628"}`
+			}
 			channel.StatusCodeMapping = &tc.statusMapping
 			channelSettings := dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough}
 			if tc.resolutionMapping {
@@ -512,6 +1053,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				delete(body, "mask")
 				body["resolution"], body["aspect_ratio"], body["size"] = "2K", "16:9", "2048x1152"
 			}
+			if tc.volcengine {
+				delete(body, "mask")
+				body["size"] = "1.5K"
+			}
 			if tc.referenceField == "images" {
 				body[tc.referenceField] = []map[string]string{{"image_url": referenceURL}}
 			} else if tc.referenceField != "" {
@@ -543,10 +1088,12 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				require.NoError(t, err)
 				_, err = part.Write(imageBytes)
 				require.NoError(t, err)
-				part, err = form.CreateFormFile("mask", "mask.png")
-				require.NoError(t, err)
-				_, err = part.Write(pngImage.Bytes())
-				require.NoError(t, err)
+				if !tc.volcengine {
+					part, err = form.CreateFormFile("mask", "mask.png")
+					require.NoError(t, err)
+					_, err = part.Write(pngImage.Bytes())
+					require.NoError(t, err)
+				}
 				require.NoError(t, form.Close())
 				raw, contentType = formBody.Bytes(), form.FormDataContentType()
 			}
@@ -636,13 +1183,42 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			require.Len(t, received, 1)
 			record := <-received
 			assert.Equal(t, http.MethodPost, record.method)
-			assert.Equal(t, "/v1/images/edits", record.path)
+			if tc.volcengine {
+				assert.Equal(t, "/api/v3/images/generations", record.path)
+			} else {
+				assert.Equal(t, "/v1/images/edits", record.path)
+			}
 			assert.Equal(t, "Bearer synthetic-upstream-key", record.authorization)
 			if tc.expectedTemplate != "" {
 				assert.JSONEq(t, tc.expectedTemplate, string(record.body))
 				return
 			}
 			assert.Equal(t, "synthetic", record.marker)
+			if tc.volcengine {
+				assert.Equal(t, "application/json", record.contentType)
+				var outbound struct {
+					Model     string   `json:"model"`
+					Image     []string `json:"image"`
+					Size      string   `json:"size"`
+					Seed      *int     `json:"seed"`
+					Watermark *bool    `json:"watermark"`
+				}
+				require.NoError(t, common.Unmarshal(record.body, &outbound))
+				assert.Equal(t, "doubao-seedream-5-0-pro-260628", outbound.Model)
+				assert.Equal(t, "1.5K", outbound.Size)
+				require.Len(t, outbound.Image, 1)
+				if tc.fileFormat == "" {
+					assert.Equal(t, referenceURL, outbound.Image[0])
+				} else {
+					assert.Equal(t, "data:image/png;base64,"+base64.StdEncoding.EncodeToString(imageBytes), outbound.Image[0])
+				}
+				require.NotNil(t, outbound.Seed)
+				require.NotNil(t, outbound.Watermark)
+				assert.Zero(t, *outbound.Seed)
+				assert.False(t, *outbound.Watermark)
+				assert.NotContains(t, string(record.body), "sequential_image_generation")
+				return
+			}
 			if tc.xai {
 				assert.JSONEq(t, `{"model":"grok-imagine-image-quality","prompt":"draw a river","n":1,"resolution":"2k","aspect_ratio":"16:9","response_format":"b64_json","image":{"url":"`+referenceURL+`","type":"image_url"}}`, string(record.body))
 				return
@@ -720,13 +1296,170 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 	}
 }
 
+func TestSeedreamFinalImageSubmission(t *testing.T) {
+	service.InitHttpClient()
+	const pro = "doubao-seedream-5-0-pro-260628"
+	const flash = "doubao-seedream-5-0-flash-260915"
+	const lite = "doubao-seedream-5-0-260128"
+	for _, tc := range []struct {
+		name, model, size, failure string
+		count, references          int
+		asynchronous, passThrough  bool
+		fields, override           map[string]any
+		template                   map[string]any
+	}{
+		{name: "sync_pro_preserves_native_options", model: pro, references: 3, size: "1.5K"},
+		{name: "async_flash_ten_references", model: flash, references: 10, asynchronous: true},
+		{name: "lite_group", model: lite, count: 3, size: "3K", asynchronous: true},
+		{name: "lite_native_group", model: lite, count: 3, asynchronous: true, fields: map[string]any{"sequential_image_generation": "auto", "sequential_image_generation_options": map[string]any{"max_images": 3}}},
+		{name: "lite_maximum_group", model: lite, count: 15, asynchronous: true},
+		{name: "lite_reference_group_boundary", model: lite, count: 14, references: 1, asynchronous: true},
+		{name: "lite_reference_output_total_limit", model: lite, count: 15, references: 1, asynchronous: true, failure: "must total at most 15"},
+		{name: "legacy_45_group", model: "doubao-seedream-4-5-251128", count: 2, asynchronous: true},
+		{name: "single_image_passthrough_mapping", model: pro, references: 3, asynchronous: true, passThrough: true},
+		{name: "pro_rejects_group", model: pro, count: 2, failure: "supports between 1 and 1"},
+		{name: "flash_rejects_disabled_sequential", model: flash, fields: map[string]any{"sequential_image_generation": "disabled"}, failure: "does not support sequential"},
+		{name: "pro_rejects_options", model: pro, fields: map[string]any{"sequential_image_generation_options": map[string]any{"max_images": 1}}, failure: "does not support sequential"},
+		{name: "pro_rejects_web_search", model: pro, fields: map[string]any{"web_search": true}, failure: "web_search is not supported"},
+		{name: "pro_rejects_stream", model: pro, fields: map[string]any{"stream": true}, failure: "stream is not supported"},
+		{name: "async_stream_override", model: lite, asynchronous: true, override: map[string]any{"stream": true}, failure: "stream is not supported"},
+		{name: "pro_reference_limit", model: pro, references: 11, failure: "at most 10 reference"},
+		{name: "lite_reference_limit", model: lite, references: 15, failure: "at most 14 reference"},
+		{name: "lite_rejects_sixteen", model: lite, count: 16, failure: "supports between 1 and 15"},
+		{name: "negative_count_override", model: lite, override: map[string]any{"n": -1}, failure: "invalid image billing parameters"},
+		{name: "huge_count_override", model: lite, override: map[string]any{"n": uint64(18446744073686646784)}, failure: "n must be an integer"},
+		{name: "negative_native_quantity", model: lite, fields: map[string]any{"sequential_image_generation_options": map[string]any{"max_images": -1}}, failure: "max_images conflicts"},
+		{name: "huge_native_quantity", model: lite, fields: map[string]any{"sequential_image_generation_options": map[string]any{"max_images": uint64(18446744073686646784)}}, failure: "max_images conflicts"},
+		{name: "native_quantity_conflict", model: lite, count: 3, fields: map[string]any{"sequential_image_generation_options": map[string]any{"max_images": 4}}, failure: "max_images conflicts"},
+		{name: "disabled_group_conflict", model: lite, count: 3, fields: map[string]any{"sequential_image_generation": "disabled"}, failure: "disabled conflicts"},
+		{name: "model_override_cannot_bypass_pro", model: pro, override: map[string]any{"model": lite}, failure: "model conflicts"},
+		{name: "group_override_cannot_bypass_pro", model: pro, override: map[string]any{"n": 2}, failure: "supports between 1 and 1"},
+		{name: "native_options_override_cannot_bypass_pro", model: pro, override: map[string]any{"sequential_image_generation_options": map[string]any{"max_images": 1}}, failure: "does not support sequential"},
+		{name: "provider_quantity_conflict", model: pro, fields: map[string]any{"parameters": map[string]any{"n": 2}}, failure: "parameters.n conflicts"},
+		{name: "async_layers_are_unsupported", model: pro, asynchronous: true, fields: map[string]any{"layer_decomposition": true}, failure: "layer_decomposition is not supported"},
+		{name: "mask_is_unsupported", model: pro, fields: map[string]any{"mask": "https://example.com/mask.png"}, failure: "does not support mask"},
+		{name: "passthrough_sequential_is_checked", model: pro, asynchronous: true, passThrough: true, fields: map[string]any{"sequential_image_generation": "disabled"}, failure: "does not support sequential"},
+		{name: "submit_template_cannot_add_pro_group_options", model: pro, asynchronous: true, template: map[string]any{"model": pro, "n": 1, "sequential_image_generation_options": map[string]any{"max_images": 1}}, failure: "does not support sequential"},
+		{name: "submit_template_cannot_change_model", model: pro, asynchronous: true, template: map[string]any{"model": lite, "n": 1}, failure: "model conflicts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			count := max(1, tc.count)
+			size := tc.size
+			if size == "" {
+				size = "2K"
+			}
+			body := map[string]any{"model": "image-alias", "prompt": "draw a river", "n": count, "size": size, "seed": 0, "watermark": false, "vendor_options": map[string]any{"strength": 0, "enabled": false}}
+			references := make([]string, tc.references)
+			for index := range references {
+				references[index] = "https://example.com/reference-" + string(rune('a'+index)) + ".png"
+			}
+			if len(references) > 0 {
+				body["image"] = references
+			}
+			for name, value := range tc.fields {
+				body[name] = value
+			}
+			encoded, err := common.Marshal(body)
+			require.NoError(t, err)
+			var request dto.ImageRequest
+			require.NoError(t, common.Unmarshal(encoded, &request))
+			var outbound map[string]common.RawMessage
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				assert.Equal(t, "/api/v3/images/generations", r.URL.Path)
+				assert.Equal(t, "Bearer synthetic-seedream-key", r.Header.Get("Authorization"))
+				assert.NoError(t, common.DecodeJson(r.Body, &outbound))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"synthetic request capture complete","type":"invalid_request_error"}}`)
+			}))
+			t.Cleanup(upstream.Close)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(encoded))
+			c.Request.Header.Set("Content-Type", "application/json")
+			storage, err := common.CreateBodyStorage(encoded)
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, storage.Close()) })
+			c.Set(common.KeyBodyStorage, storage)
+			mapping, err := common.Marshal(map[string]string{"image-alias": "mapped-image", "mapped-image": tc.model})
+			require.NoError(t, err)
+			c.Set("model_mapping", string(mapping))
+			c.Set("async_image_execution", tc.asynchronous)
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "synthetic-seedream-key")
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "image-alias")
+			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			if tc.template != nil {
+				var config dto.UpstreamAsyncConfig
+				require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"seedream-template","media_type":"image","operations":["generate"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/api/v3/images/generations"}},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"urls"}}}]}`, &config))
+				config.Profiles[0].Models = []string{tc.model}
+				template, err := common.Marshal(tc.template)
+				require.NoError(t, err)
+				require.NoError(t, common.Unmarshal(template, &config.Profiles[0].Submit.Request.Body))
+				require.NoError(t, config.Validate())
+				common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, dto.ChannelOtherSettings{UpstreamAsync: &config})
+			}
+			if tc.override != nil {
+				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, tc.override)
+			}
+			info := &relaycommon.RelayInfo{Request: &request, OriginModelName: "image-alias", RelayMode: relayconstant.RelayModeImagesGenerations, PriceData: types.PriceData{UsePrice: true, ModelPrice: 0.01, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			dispatches := 0
+			_, apiErr := ExecuteImageRequest(c, info, false, func() error { dispatches++; return nil })
+			require.NotNil(t, apiErr)
+			if tc.failure != "" {
+				assert.ErrorContains(t, apiErr, tc.failure)
+				assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				assert.Zero(t, calls)
+				assert.Zero(t, dispatches, "invalid provider parameters must fail before quota reservation or dispatch")
+				return
+			}
+			assert.Equal(t, 1, calls)
+			assert.Equal(t, 1, dispatches)
+			assert.Equal(t, count, info.ImageRequestCount)
+			assert.Equal(t, common.QuotaRound(0.01*common.QuotaPerUnit*float64(count)), info.PriceData.QuotaToPreConsume)
+			assert.JSONEq(t, `"`+tc.model+`"`, string(outbound["model"]))
+			assert.JSONEq(t, `"`+size+`"`, string(outbound["size"]))
+			assert.JSONEq(t, `0`, string(outbound["seed"]))
+			assert.JSONEq(t, `false`, string(outbound["watermark"]))
+			assert.JSONEq(t, `{"strength":0,"enabled":false}`, string(outbound["vendor_options"]))
+			if count > 1 {
+				assert.JSONEq(t, `"auto"`, string(outbound["sequential_image_generation"]))
+				options, err := common.Marshal(map[string]int{"max_images": count})
+				require.NoError(t, err)
+				assert.JSONEq(t, string(options), string(outbound["sequential_image_generation_options"]))
+			} else {
+				assert.NotContains(t, outbound, "sequential_image_generation")
+				assert.NotContains(t, outbound, "sequential_image_generation_options")
+			}
+			if len(references) > 0 {
+				var actual []string
+				require.NoError(t, common.Unmarshal(outbound["image"], &actual))
+				assert.Equal(t, references, actual)
+			}
+		})
+	}
+}
+
 func TestTianyueAsyncImageOutbound(t *testing.T) {
-	previousDB, previousCount, previousRedis, previousAddress := model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "tianyue-outbound.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	previousDB, previousType, previousCount, previousRedis, previousAddress := model.DB, common.MainDatabaseType(), constant.CountToken, common.RedisEnabled, system_setting.ServerAddress
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "tianyue-outbound.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test", "use a dedicated disposable database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_job_test") || strings.Contains(dsn, "/new_api_image_job_test"), "use a dedicated disposable database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
 	model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress = db, false, false, "https://gateway.example"
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
 	t.Cleanup(func() {
 		model.DB, constant.CountToken, common.RedisEnabled, system_setting.ServerAddress = previousDB, previousCount, previousRedis, previousAddress
+		common.SetMainDatabaseType(previousType)
+		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}, &model.ImageInputAlias{}, &model.UserSubscription{}, &model.Token{}, &model.User{}))
 		connection, err := db.DB()
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
@@ -742,14 +1475,16 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 	var bitmap bytes.Buffer
 	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
 	for _, tc := range []struct {
-		name                           string
-		reference, multipart, yb, mask bool
-		disabled, badOverride          bool
-		badTemplate, customProfile     bool
-		providerErrorCode              string
-		disconnect                     bool
+		name                       string
+		model, resolution          string
+		reference, multipart, mask bool
+		disabled, badOverride      bool
+		badTemplate, customProfile bool
+		providerErrorCode          string
+		disconnect, failed         bool
 	}{
-		{name: "synchronous_text"},
+		{name: "asynchronous_text_1k"},
+		{name: "asynchronous_text_2k", model: "seedream-5-pro-2K", resolution: "2K"},
 		{name: "provider_request_failure", providerErrorCode: "do_request_failed"},
 		{name: "provider_response_read_failure", providerErrorCode: "read_response_body_failed"},
 		{name: "provider_bad_response", providerErrorCode: "bad_response"},
@@ -757,20 +1492,22 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		{name: "provider_empty_response", providerErrorCode: "empty_response"},
 		{name: "transport_eof", disconnect: true},
 		{name: "uploaded_reference", reference: true},
-		{name: "multipart_reference", reference: true, multipart: true},
-		{name: "asynchronous_receipt_and_poll", reference: true, yb: true},
+		{name: "multipart_reference_2k", reference: true, multipart: true, model: "seedream-5-pro-2K", resolution: "2K"},
+		{name: "asynchronous_yb_receipt_and_poll", reference: true, model: "gpt-image-2-yb"},
+		{name: "asynchronous_failure", failed: true},
 		{name: "mask_is_rejected", reference: true, mask: true},
 		{name: "unsafe_override_is_rejected", badOverride: true},
-		{name: "unsafe_async_template_is_rejected", yb: true, badTemplate: true},
-		{name: "custom_profile_with_builtin_id_is_preserved", yb: true, customProfile: true},
+		{name: "unsafe_async_template_is_rejected", badTemplate: true},
+		{name: "custom_profile_with_builtin_id_is_preserved", customProfile: true},
 		{name: "ordinary_newapi_edits_are_preserved", reference: true, disabled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			type receivedRequest struct {
-				path string
-				body map[string]common.RawMessage
+				method, path string
+				body         map[string]common.RawMessage
 			}
 			received := make(chan receivedRequest, 3)
+			polls := 0
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var body map[string]common.RawMessage
 				if r.Method == http.MethodPost {
@@ -778,7 +1515,12 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 					assert.NoError(t, common.DecodeJson(r.Body, &body))
 				}
 				assert.Equal(t, "Bearer tianyue-upstream-key", r.Header.Get("Authorization"))
-				received <- receivedRequest{r.URL.Path, body}
+				received <- receivedRequest{r.Method, r.URL.Path, body}
+				if r.URL.Path == "/image.png" {
+					w.Header().Set("Content-Type", "image/png")
+					_, _ = w.Write(bitmap.Bytes())
+					return
+				}
 				if tc.disconnect {
 					connection, _, err := w.(http.Hijacker).Hijack()
 					if assert.NoError(t, err) {
@@ -796,21 +1538,30 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 					}
 					return
 				}
-				if tc.yb {
+				if !tc.disabled {
+					if r.Method == http.MethodGet {
+						polls++
+					}
 					if tc.customProfile {
 						if r.Method == http.MethodPost {
 							w.WriteHeader(http.StatusAccepted)
 							_, _ = w.Write([]byte(`{"job":{"identifier":"custom-job","state":"queued"}}`))
-						} else {
+						} else if polls == 1 {
 							_, _ = w.Write([]byte(`{"job":{"identifier":"custom-job","state":"running","progress":30}}`))
+						} else {
+							_, _ = w.Write([]byte(`{"job":{"identifier":"custom-job","state":"done","output":"http://` + r.Host + `/image.png"}}`))
 						}
 						return
 					}
 					if r.Method == http.MethodPost {
 						w.WriteHeader(http.StatusAccepted)
 						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"IN_PROGRESS"}}`))
-					} else {
+					} else if polls == 1 {
 						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"IN_PROGRESS","progress":"30%"}}`))
+					} else if tc.failed {
+						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"FAILURE","fail_reason":"Image generation rejected"}}`))
+					} else {
+						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"SUCCESS","data":{"content_url":"/image.png"}}}`))
 					}
 					return
 				}
@@ -819,8 +1570,8 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 			mapped := "seedream-5-pro-1K"
-			if tc.yb {
-				mapped = "gpt-image-2-yb"
+			if tc.model != "" {
+				mapped = tc.model
 			}
 			mapping, err := common.Marshal(map[string]string{"image-alias": mapped})
 			require.NoError(t, err)
@@ -833,7 +1584,7 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			}
 			if tc.badTemplate || tc.customProfile {
 				var custom dto.UpstreamAsyncConfig
-				require.NoError(t, common.Unmarshal([]byte(`{"profiles":[{"id":"tianyue-image","media_type":"image","models":["gpt-image-2-yb"],"operations":["generate"],"submit":{"task_id_path":"job.identifier","request":{"method":"POST","path":"/custom/images/jobs","headers":{"Authorization":"Bearer {api_key}"}}},"poll":{"request":{"method":"GET","path":"/custom/images/jobs/{task_id}","headers":{"Authorization":"Bearer {api_key}"}},"response":{"status_path":"job.state","progress_path":"job.progress","status_values":{"queued":["queued"],"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"result_path":"job.output"}}}]}`), &custom))
+				require.NoError(t, common.Unmarshal([]byte(`{"profiles":[{"id":"tianyue-image","media_type":"image","models":["seedream-5-pro-1K"],"operations":["generate"],"submit":{"task_id_path":"job.identifier","request":{"method":"POST","path":"/custom/images/jobs","headers":{"Authorization":"Bearer {api_key}"}}},"poll":{"request":{"method":"GET","path":"/custom/images/jobs/{task_id}","headers":{"Authorization":"Bearer {api_key}"}},"response":{"status_path":"job.state","progress_path":"job.progress","status_values":{"queued":["queued"],"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"result_path":"job.output","download_headers":{"Authorization":"Bearer {api_key}"}}}}]}`), &custom))
 				if tc.badTemplate {
 					custom.Profiles[0].Submit.Request.Body = map[string]any{"model": "{upstream_model}", "prompt": "{request.prompt}", "duration": float64(2)}
 				}
@@ -841,6 +1592,9 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &custom})
 			}
 			request := service.AsyncImageRequest{Platform: "openai", Provider: "newapi", Dialect: "async", Model: "image-alias", Prompt: "test picture", Count: 1, Kind: "text_to_image", Size: "1024x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async", Native: map[string]common.RawMessage{"model": common.RawMessage(`"image-alias"`), "prompt": common.RawMessage(`"test picture"`), "n": common.RawMessage(`1`), "size": common.RawMessage(`"1024x1024"`)}}
+			if tc.resolution != "" {
+				request.Resolution = tc.resolution
+			}
 			if tc.reference {
 				request.Kind, request.SourcePath = "image_to_image", "/v1/images/edits_async"
 				request.Parts = []service.AsyncImageInputPart{{Type: "image_url", URL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(bitmap.Bytes())}}
@@ -856,6 +1610,10 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			payload, err := common.Marshal(request)
 			require.NoError(t, err)
 			task.RequestCipher, err = service.EncryptImagePayload(payload, "task:"+task.TaskId)
+			require.NoError(t, err)
+			channelPayload, err := common.Marshal(channel)
+			require.NoError(t, err)
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelPayload, "image-channel:"+task.TaskId)
 			require.NoError(t, err)
 			require.NoError(t, db.Create(&task).Error)
 			dispatches := 0
@@ -884,18 +1642,16 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				assert.True(t, strings.HasPrefix(references[0]["image_url"], "data:"))
 				return
 			}
-			expectedPath := "/v1/images/generations"
-			if tc.yb {
-				expectedPath = "/v1/video/generations"
-			}
+			expectedPath := "/v1/video/generations"
 			if tc.customProfile {
 				expectedPath = "/custom/images/jobs"
 			}
 			assert.Equal(t, expectedPath, sent.path)
+			assert.Equal(t, http.MethodPost, sent.method)
 			assert.JSONEq(t, `"`+mapped+`"`, string(sent.body["model"]))
 			assert.JSONEq(t, `1`, string(sent.body["duration"]))
 			assert.JSONEq(t, `"1:1"`, string(sent.body["aspect_ratio"]))
-			assert.JSONEq(t, `"1K"`, string(sent.body["output_resolution"]))
+			assert.JSONEq(t, `"`+request.Resolution+`"`, string(sent.body["output_resolution"]))
 			assert.NotContains(t, sent.body, "size")
 			if tc.providerErrorCode != "" || tc.disconnect {
 				var failure *service.AsyncImageFailure
@@ -905,7 +1661,7 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				assert.False(t, failure.UpstreamTerminal)
 				if tc.disconnect {
 					assert.Equal(t, "upstream_transport_disconnected", failure.InternalCode)
-					assert.Contains(t, failure.Message, "(EOF)")
+					assert.NotEmpty(t, failure.Message, "the OS-specific disconnect text must not change the safe failure contract")
 					assert.Zero(t, failure.HTTPStatus)
 					assert.Empty(t, failure.UpstreamRequestID)
 					assert.Empty(t, failure.ProviderCode)
@@ -917,6 +1673,7 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 					assert.Equal(t, "tianyue-provider-request-id", failure.UpstreamRequestID)
 					assert.Equal(t, tc.providerErrorCode, failure.ProviderCode)
 				}
+				return
 			}
 			if tc.reference {
 				var references []string
@@ -926,21 +1683,57 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				assert.Contains(t, references[0], "signature=")
 				assert.NotContains(t, references[0], "data:")
 			}
-			if tc.yb {
-				var pending *service.AsyncImagePending
-				require.ErrorAs(t, err, &pending)
-				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
-				expectedTaskID, expectedPollPath := "tianyue-job", "/v1/video/generations/tianyue-job"
-				if tc.customProfile {
-					expectedTaskID, expectedPollPath = "custom-job", "/custom/images/jobs/custom-job"
-				}
-				assert.Equal(t, expectedTaskID, task.UpstreamTaskId)
-				_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
-				require.ErrorAs(t, err, &pending)
+			var pending *service.AsyncImagePending
+			require.ErrorAs(t, err, &pending)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			expectedTaskID, expectedPollPath := "tianyue-job", "/v1/video/generations/tianyue-job"
+			if tc.customProfile {
+				expectedTaskID, expectedPollPath = "custom-job", "/custom/images/jobs/custom-job"
+			}
+			assert.Equal(t, expectedTaskID, task.UpstreamTaskId)
+			payload, err = service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			var recovered service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(payload, &recovered))
+			_, _, err = ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+			require.ErrorAs(t, err, &pending)
+			require.Len(t, received, 1)
+			polled := <-received
+			assert.Equal(t, expectedPollPath, polled.path)
+			assert.Equal(t, http.MethodGet, polled.method)
+			assert.Equal(t, 1, dispatches, "polling a known task must never submit again")
+			output, bill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+			if tc.failed {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.True(t, failure.UpstreamTerminal)
+				assert.Equal(t, "upstream_job_failed", failure.InternalCode)
+				assert.Equal(t, "Image generation rejected", failure.Message)
 				require.Len(t, received, 1)
 				assert.Equal(t, expectedPollPath, (<-received).path)
-				assert.Equal(t, 1, dispatches, "polling a known task must never submit again")
+				assert.Equal(t, 1, dispatches, "a failed upstream job must not be submitted again")
+				return
 			}
+			require.NoError(t, err)
+			require.NotNil(t, output)
+			require.Len(t, output.Images, 1)
+			assert.Equal(t, bitmap.Bytes(), output.Images[0].Data)
+			assert.Equal(t, 5000, bill.Quota)
+			require.Len(t, received, 2)
+			assert.Equal(t, expectedPollPath, (<-received).path)
+			assert.Equal(t, "/image.png", (<-received).path)
+			assert.Equal(t, 1, dispatches, "completed polling and downloading must not repeat submission")
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			payload, err = service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(payload, &recovered))
+			require.NotNil(t, recovered.Completion)
+			_, recoveredBill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+			require.NoError(t, err)
+			assert.Equal(t, bill.Quota, recoveredBill.Quota)
+			require.Len(t, received, 1)
+			assert.Equal(t, "/image.png", (<-received).path)
+			assert.Equal(t, 1, dispatches, "completion recovery must only download the saved result")
 		})
 	}
 }
@@ -1421,13 +2214,11 @@ func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
 		received <- r.Method + " " + r.URL.Path
 		assert.Equal(t, "Bearer tianyue-upstream-key", r.Header.Get("Authorization"))
 		switch r.URL.Path {
-		case "/v1/images/generations":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"created":1,"data":[{"url":"/image.png"}]}`))
 		case "/image.png":
 			w.Header().Set("Content-Type", "image/png")
 			_, _ = w.Write(bitmap.Bytes())
 		default:
+			t.Errorf("historical completion recovery sent an unexpected request: %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
@@ -1450,19 +2241,32 @@ func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
 	task.SelectedChannelCipher, err = service.EncryptImagePayload(channelPayload, "image-channel:"+task.TaskId)
 	require.NoError(t, err)
 	require.NoError(t, db.Create(&task).Error)
+	// Simulate a pre-upgrade synchronous response that was durably accepted
+	// before the worker stopped. New submissions use the asynchronous endpoint.
+	require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 5000, model.ImageFundingSelection{Source: "wallet"}))
+	require.NoError(t, model.MarkAsyncImageDispatched(t.Context(), task, channel.Id))
+	completion := service.AsyncImageCompletion{
+		EvaluatedAt: time.Now(), Body: []byte(`{"created":1,"data":[{"url":"/image.png"}]}`), Usage: &dto.Usage{},
+		Billing: *request.Billing, UpstreamModel: request.Model, BillingModel: request.Model,
+		URLs:    []string{upstream.URL + "/image.png"},
+		Profile: &dto.UpstreamAsyncProfile{ID: "tianyue-sync-image", MediaType: dto.UpstreamAsyncMediaImage, Poll: dto.UpstreamAsyncPoll{Response: dto.UpstreamAsyncPollResponse{DownloadHeaders: map[string]string{"Authorization": "Bearer {api_key}"}}}},
+	}
+	require.NoError(t, service.PersistAsyncImageCompletion(t.Context(), &task, request, completion))
+	payload, err = service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(payload, &request))
 	dispatches := 0
 	output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), func() error {
 		dispatches++
 		return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
 	})
-	require.NoError(t, err, "a synchronous provider response must finish without a provider job ID")
+	require.NoError(t, err, "a historical synchronous completion must finish without a provider job ID")
 	require.NotNil(t, output)
 	require.Len(t, output.Images, 1)
 	assert.Equal(t, 2, output.Images[0].Width)
 	assert.Equal(t, 3, output.Images[0].Height)
 	assert.Equal(t, 5000, bill.Quota)
-	require.Len(t, received, 2)
-	assert.Equal(t, "POST /v1/images/generations", <-received)
+	require.Len(t, received, 1)
 	assert.Equal(t, "GET /image.png", <-received)
 	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 	assert.Empty(t, task.UpstreamTaskId, "synchronous completion must not invent a provider job")
@@ -1486,7 +2290,7 @@ func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
 	require.Len(t, received, 1)
 	assert.Equal(t, "GET /image.png", <-received)
 	assert.Empty(t, received, "checkpoint recovery must only download the accepted image")
-	assert.Equal(t, 1, dispatches, "checkpoint recovery must not repeat submission")
+	assert.Zero(t, dispatches, "historical completion recovery must not submit a new generation")
 	require.NoError(t, db.Take(&user, user.Id).Error)
 	assert.Equal(t, 995000, user.Quota, "checkpoint recovery must reuse the existing reservation")
 	var reservations int64

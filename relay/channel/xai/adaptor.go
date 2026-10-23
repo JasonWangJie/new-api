@@ -150,5 +150,5 @@ func (a *Adaptor) GetChannelName() string {
 
 func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
 	modern := strings.HasPrefix(model, "grok-imagine-image") || model == "grok-imagine"
-	return dto.ImageCapability{Models: []string{"grok-2-image*", "grok-imagine-image*", "grok-imagine"}, Parameters: []string{"model", "prompt", "n", "size", "resolution", "aspect_ratio", "quality", "response_format", "provider_extensions"}, Provider: "xai", Protocol: "openai_images", Generate: true, Edit: modern, EditFormat: "json"}
+	return dto.ImageCapability{Models: []string{"grok-2-image*", "grok-imagine-image*", "grok-imagine"}, Parameters: []string{"model", "prompt", "n", "size", "resolution", "aspect_ratio", "quality", "response_format", "provider_extensions"}, Provider: "xai", Protocol: "openai_images", Generate: true, Edit: modern, EditFormat: "json", TokenUsage: true}
 }

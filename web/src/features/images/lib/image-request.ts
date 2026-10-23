@@ -128,6 +128,8 @@ export function buildImageRequest(options: ImageRequestOptions): {
     count < 1 ||
     count > Math.min(128, model.capability.max_output_images) ||
     references.length > model.capability.max_reference_images ||
+    (model.capability.resolutions?.length &&
+      !model.capability.resolutions.includes(resolution)) ||
     !IMAGE_RATIOS.includes(ratio)
   ) {
     throw new Error('Invalid image request')
@@ -139,7 +141,10 @@ export function buildImageRequest(options: ImageRequestOptions): {
   ) {
     throw new Error('Gemini accepts one request at a time')
   }
-  if (model.provider && model.mode === 'async') {
+  if (
+    (model.provider || model.platform === 'mixed') &&
+    model.mode === 'async'
+  ) {
     if (
       references.length &&
       model.supports_edit === false &&
@@ -155,7 +160,9 @@ export function buildImageRequest(options: ImageRequestOptions): {
           : '/v1/images/generations_async',
       body: JSON.stringify({
         model: model.id,
-        provider: model.provider,
+        ...(model.platform !== 'mixed' && model.provider
+          ? { provider: model.provider }
+          : {}),
         prompt: [
           prompt.trim(),
           ...parts
@@ -163,7 +170,8 @@ export function buildImageRequest(options: ImageRequestOptions): {
             .map((part) => part.text),
         ].join('\n'),
         n: count,
-        ...(model.protocol === 'gemini_native' ||
+        ...(model.platform === 'mixed' ||
+        model.protocol === 'gemini_native' ||
         (model.provider === 'newapi' &&
           model.supported_parameters?.includes('output_resolution'))
           ? { resolution, ...(ratio === 'auto' ? {} : { aspect_ratio: ratio }) }

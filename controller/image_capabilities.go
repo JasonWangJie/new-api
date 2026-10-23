@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -46,7 +47,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 		return
 	}
 	usableGroups := service.GetUserUsableGroups(owner.Group)
-	for _, platform := range service.RegisteredImageProviders() {
+	for _, platform := range append(service.RegisteredImageProviders(), "mixed") {
 		type scopedCapability struct {
 			policy     model.ImageGroupPolicy
 			capability service.ImageModelCapability
@@ -57,10 +58,20 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 		}
 		scoped := make([]scopedCapability, 0)
 		for _, family := range families {
-			policy, catalog, err := service.ResolveAsyncImagePolicy(ctx, token, service.AsyncImageRequest{Provider: platform, Platform: family})
+			var policy model.ImageGroupPolicy
+			var catalog []service.ImageModelCapability
+			var err error
+			if platform == "mixed" {
+				policy, catalog, err = service.ResolveImagePolicy(ctx, token, "mixed")
+			} else {
+				policy, catalog, err = service.ResolveAsyncImagePolicy(ctx, token, service.AsyncImageRequest{Provider: platform, Platform: family})
+			}
 			if err != nil {
 				imageManagementError(c, 503, err)
 				return
+			}
+			if platform == "mixed" && (policy.Id == 0 || !policy.Enabled || !policy.AsyncEnabled) {
+				continue
 			}
 			// Missing provider policies retain the executable synchronous catalog.
 			// The adaptor declaration and configured abilities determine membership.
@@ -100,6 +111,9 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			versionFacts = append(versionFacts, policy)
 		}
+		if platform == "mixed" && len(scoped) == 0 {
+			continue
+		}
 
 		eligibleCount := 0
 		providerAvailable := false
@@ -116,6 +130,10 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				mode = "async"
 			}
 			available := valid && policy.Enabled
+			if platform == "mixed" && !helper.HasPriceOrRatioEntry(capability.Id) {
+				available = false
+				providerReason = "Image model price is not configured"
+			}
 			if _, allowed := usableGroups[policy.Group]; !allowed {
 				available = false
 			}
@@ -132,6 +150,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			resolutions := make([]string, 0, len(capability.Resolutions))
 			var channels []model.Channel
+			mixedMaxOutput := min(capability.MaxOutputImages, dto.MaxImageN)
 			for _, resolution := range capability.Resolutions {
 				candidates, err := service.ImageCandidateChannels(ctx, policy, capability.Id, resolution)
 				if err != nil {
@@ -139,6 +158,28 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 					return
 				}
 				candidates = slices.DeleteFunc(candidates, func(channel model.Channel) bool {
+					if platform == "mixed" {
+						size, err := service.MapOpenAIImageDimensions(resolution, "")
+						if err != nil {
+							return true
+						}
+						probe := service.AsyncImageRequest{Platform: "openai", Dialect: "async", SourcePath: "/v1/images/generations_async", Model: capability.Id, Kind: "text_to_image", Count: 1, Resolution: resolution, Size: size, ExplicitTier: true}
+						if !service.MixedImageChannelRequestSupported(channel, probe) {
+							return true
+						}
+						// The workbench exposes a continuous count range starting
+						// at one. Overrides can make admissible counts non-monotonic,
+						// so only extend the range while every count remains valid.
+						// API requests still select from the full pool for their n.
+						for count := 2; count <= mixedMaxOutput; count++ {
+							probe.Count = count
+							if !service.MixedImageChannelRequestSupported(channel, probe) {
+								mixedMaxOutput = count - 1
+								break
+							}
+						}
+						return false
+					}
 					return service.ImageChannelCapability(channel, capability.Id).Provider != platform
 				})
 				if len(candidates) > 0 {
@@ -165,6 +206,24 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			capability.MaxReferenceImages = min(capability.MaxReferenceImages, cfg.MaxReferences)
 			declared := service.ImageChannelCapability(channels[0], capability.Id)
+			if platform == "mixed" {
+				// Only executable members contribute to the common request surface.
+				// Execution checks concrete inputs again before weighted selection.
+				capability.MaxOutputImages = mixedMaxOutput
+				declared.Edit = true
+				declared.ReferenceField = ""
+				for _, channel := range channels {
+					member := service.ImageChannelCapability(channel, capability.Id)
+					declared.Edit = declared.Edit && (member.Edit || member.ReferenceField != "")
+					declared.Parameters = slices.DeleteFunc(slices.Clone(declared.Parameters), func(parameter string) bool {
+						return !slices.Contains(member.Parameters, parameter)
+					})
+					capability.MaxReferenceImages = min(capability.MaxReferenceImages, channel.GetImageMaxReferenceImages())
+				}
+				if capability.MaxOutputImages == 0 {
+					continue
+				}
+			}
 			if !declared.Edit && declared.ReferenceField == "" {
 				capability.MaxReferenceImages = 0
 			}
@@ -173,9 +232,13 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			seenModels[capability.Id] = true
 			eligibleCount++
-			models = append(models, gin.H{"provider": platform, "media_type": "image", "supports_generation": declared.Generate, "supports_edit": declared.Edit, "supports_reference_generation": declared.ReferenceField != "", "supported_parameters": declared.Parameters, "id": capability.Id, "label": capability.Label, "platform": platform, "mode": mode, "protocol": declared.Protocol, "capability": capability, "available": available})
+			entry := gin.H{"media_type": "image", "supports_generation": declared.Generate, "supports_edit": declared.Edit, "supports_reference_generation": declared.ReferenceField != "", "supported_parameters": declared.Parameters, "id": capability.Id, "label": capability.Label, "platform": platform, "mode": mode, "protocol": declared.Protocol, "capability": capability, "available": available}
+			if platform != "mixed" {
+				entry["provider"] = platform
+			}
+			models = append(models, entry)
 			for _, channel := range channels {
-				versionFacts = append(versionFacts, []any{channel.Id, channel.Status, channel.Models, channel.GetPriority(), channel.GetWeight(), channel.ModelMapping, channel.Setting})
+				versionFacts = append(versionFacts, []any{channel.Id, channel.Status, channel.Models, channel.GetPriority(), channel.GetWeight(), channel.ModelMapping, channel.Setting, channel.ParamOverride})
 			}
 			if providerGroup == "" {
 				providerGroup = policy.Group

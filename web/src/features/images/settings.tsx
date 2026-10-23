@@ -62,7 +62,11 @@ import {
 } from './components/image-pool-editor'
 import { ImageRoutingPreview } from './components/image-routing-preview'
 import { ImageSelect } from './components/image-select'
-import { imageLabel } from './lib/image-labels'
+import {
+  imageLabel,
+  imagePlatformLabel,
+  imageRoutingPlatforms,
+} from './lib/image-labels'
 import type { ImageAdminConfiguration, ImageStorageProfile } from './types'
 import { VideoConfiguration } from './video-settings'
 
@@ -972,7 +976,7 @@ function ImagePolicyForm({
         platform,
         pool_mode: mode,
         enabled,
-        async_enabled: asyncEnabled,
+        async_enabled: platform === 'mixed' || asyncEnabled,
         models,
         version: current?.version || 0,
       })
@@ -1010,12 +1014,13 @@ function ImagePolicyForm({
           <ImageSelect
             label={t('Platform')}
             value={platform}
-            options={(
-              config?.media_providers ||
-              config?.image_providers || ['openai', 'gemini']
+            options={imageRoutingPlatforms(
+              config?.routing_platforms ||
+                config?.media_providers ||
+                config?.image_providers
             ).map((value) => ({
               value,
-              label: value,
+              label: t(imagePlatformLabel(value)),
             }))}
             onChange={setPlatform}
           />
@@ -1028,6 +1033,13 @@ function ImagePolicyForm({
             onChange={setMode}
           />
         </div>
+        {platform === 'mixed' && (
+          <p role='status' className='text-muted-foreground text-sm'>
+            {t(
+              'Mixed scheduling accepts asynchronous image requests without provider. Explicit provider requests keep their platform routing.'
+            )}
+          </p>
+        )}
         <div className='flex flex-wrap gap-4'>
           <div className='flex items-center gap-2'>
             <Checkbox
@@ -1040,7 +1052,8 @@ function ImagePolicyForm({
           <div className='flex items-center gap-2'>
             <Checkbox
               id='policy-async'
-              checked={asyncEnabled}
+              checked={platform === 'mixed' || asyncEnabled}
+              disabled={platform === 'mixed'}
               onCheckedChange={setAsyncEnabled}
             />
             <Label htmlFor='policy-async'>
@@ -1069,7 +1082,7 @@ function ImagePolicyForm({
             {
               id: 'platform',
               header: t('Platform'),
-              cell: (item) => item.platform,
+              cell: (item) => t(imagePlatformLabel(item.platform)),
             },
             {
               id: 'mode',
@@ -1356,7 +1369,7 @@ export function ImagePoolForm({
                     variant='outline'
                     className='h-auto min-h-5 max-w-full break-all whitespace-normal'
                   >
-                    {section.platform}
+                    {t(imagePlatformLabel(section.platform))}
                   </Badge>
                   <Badge
                     variant='secondary'

@@ -72,12 +72,9 @@ func TianyueImageRequest(request AsyncImageRequest, references []string) (map[st
 	return native, err
 }
 
-// TianyueAsyncImageProfile is selected only for the vendor's documented -yb
-// models. Synchronous Seedream models must not be treated as task receipts.
+// TianyueAsyncImageProfile uses the vendor's asynchronous media endpoint for
+// every image model, including models without the optional -yb suffix.
 func TianyueAsyncImageProfile(modelName string) *dto.UpstreamAsyncProfile {
-	if !strings.HasSuffix(strings.ToLower(modelName), "-yb") {
-		return nil
-	}
 	return &dto.UpstreamAsyncProfile{
 		ID: "tianyue-image", MediaType: dto.UpstreamAsyncMediaImage,
 		Models: []string{modelName}, Operations: []string{dto.UpstreamAsyncOperationGenerate, dto.UpstreamAsyncOperationEdit},

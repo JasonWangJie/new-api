@@ -20,6 +20,7 @@ const (
 	contextKeyUpstreamAsyncOperation    = "upstream_async_operation"
 	contextKeyUpstreamAsyncSubmitSource = "upstream_async_submit_source"
 	contextKeyTianyueImageProfile       = "tianyue_builtin_image_profile"
+	contextKeyUpstreamAsyncUsageFields  = "upstream_async_usage_fields"
 )
 
 func upstreamAsyncImageOperation(c *gin.Context) string {
@@ -94,6 +95,7 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 		return nil, types.NewError(&service.AsyncImageFailure{Code: 606, InternalCode: "upstream_result_missing", Message: "Upstream image task result URL is missing"}, types.ErrorCodeBadResponse)
 	}
 	c.Set(contextKeyUpstreamAsyncImageProfile, profile)
+	c.Set(contextKeyUpstreamAsyncUsageFields, parsed.UsageFields)
 	c.Set(contextKeyUpstreamAsyncImageURLs, append([]string(nil), parsed.URLs...))
 	responseData := make([]dto.ImageData, len(parsed.URLs))
 	for index, resultURL := range parsed.URLs {

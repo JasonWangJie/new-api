@@ -162,6 +162,30 @@ func getImageBase64sFromForm(c *gin.Context, fieldName string) ([]string, error)
 }
 
 func oaiFormEdit2AliImageEdit(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (*AliImageRequest, error) {
+	imageBase64s, err := getImageBase64sFromForm(c, "image")
+	if err != nil {
+		return nil, fmt.Errorf("get image base64s from form failed: %w", err)
+	}
+	return prepareAliImageEdit(info, request, imageBase64s)
+}
+
+// PrepareImageEditRequest is also used by mixed admission before any reference
+// is fetched. Dispatch substitutes resolved data URLs into the same projection.
+func (a *Adaptor) PrepareImageEditRequest(info *relaycommon.RelayInfo, request dto.ImageRequest, references []string) (any, error) {
+	if isOldWanModel(info.UpstreamModelName) {
+		count, err := request.ImageCount(true)
+		if err != nil {
+			return nil, err
+		}
+		if request.Size != "" && request.Size != "auto" {
+			return nil, fmt.Errorf("legacy Wan image editing cannot preserve the requested size")
+		}
+		return &AliImageRequest{Model: request.Model, ResponseFormat: request.ResponseFormat, Input: WanImageInput{Prompt: request.Prompt, Images: references}, Parameters: AliImageParameters{N: common.GetPointer(uint(count))}}, nil
+	}
+	return prepareAliImageEdit(info, request, references)
+}
+
+func prepareAliImageEdit(info *relaycommon.RelayInfo, request dto.ImageRequest, imageBase64s []string) (*AliImageRequest, error) {
 	count, err := request.ImageCount(true)
 	if err != nil {
 		return nil, err
@@ -170,10 +194,6 @@ func oaiFormEdit2AliImageEdit(c *gin.Context, info *relaycommon.RelayInfo, reque
 	imageRequest.Model = request.Model
 	imageRequest.ResponseFormat = request.ResponseFormat
 
-	imageBase64s, err := getImageBase64sFromForm(c, "image")
-	if err != nil {
-		return nil, fmt.Errorf("get image base64s from form failed: %w", err)
-	}
 	//dto.MediaContent{}
 	mediaContents := make([]AliMediaContent, len(imageBase64s))
 	for i, b64 := range imageBase64s {
@@ -198,6 +218,15 @@ func oaiFormEdit2AliImageEdit(c *gin.Context, info *relaycommon.RelayInfo, reque
 	}
 	if request.BillingParameters != nil {
 		imageRequest.Parameters.PromptExtend = request.BillingParameters.PromptExtend
+	}
+	// The original qwen-image-edit has no size option. Later Qwen edit
+	// families accept native width*height, as does the generation DTO.
+	if request.Size != "" && request.Size != "auto" {
+		if strings.HasPrefix(info.UpstreamModelName, "qwen-image") && info.UpstreamModelName != "qwen-image-edit" {
+			imageRequest.Parameters.Size = strings.ReplaceAll(request.Size, "x", "*")
+		} else if info.ImageMixedBilling {
+			return nil, fmt.Errorf("image editing cannot preserve the requested size for this model")
+		}
 	}
 	return &imageRequest, nil
 }

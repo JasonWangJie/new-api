@@ -37,6 +37,12 @@ type ImageCapabilityProvider interface {
 	ImageCapability(model string) dto.ImageCapability
 }
 
+// ImageEditRequestPreparer projects resolved references and editing scalars
+// without uploading or fetching files, so admission and dispatch share semantics.
+type ImageEditRequestPreparer interface {
+	PrepareImageEditRequest(info *relaycommon.RelayInfo, request dto.ImageRequest, references []string) (any, error)
+}
+
 type AsyncImagePollingProvider interface {
 	PollImage(c *gin.Context, info *relaycommon.RelayInfo, taskId string) (*http.Response, error)
 }

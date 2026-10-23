@@ -48,6 +48,61 @@ const options = {
   background: 'opaque',
 }
 describe('capability-driven image request contracts', () => {
+  it('rejects a resolution outside the selected model capabilities before submission', () => {
+    expect(() =>
+      buildImageRequest({
+        ...options,
+        model: {
+          ...model,
+          platform: 'mixed',
+          protocol: 'openai_images',
+          capability: { ...model.capability, resolutions: ['2K'] },
+        },
+        resolution: '1K',
+      })
+    ).toThrow('Invalid image request')
+  })
+
+  it.each([false, true])(
+    'submits a mixed image request with references=%s without provider or routing parameters',
+    (withReferences) => {
+      const request = buildImageRequest({
+        ...options,
+        model: {
+          ...model,
+          platform: 'mixed',
+          protocol: 'openai_images',
+          supports_edit: true,
+        },
+        parts: withReferences
+          ? [
+              {
+                type: 'image_url',
+                image_url: { url: 'https://example.com/cabinet.png' },
+              },
+            ]
+          : [],
+      })
+      expect(request.url).toBe(
+        withReferences
+          ? '/v1/images/edits_async'
+          : '/v1/images/generations_async'
+      )
+      expect(JSON.parse(request.body)).toEqual({
+        model: model.id,
+        prompt: 'A vase',
+        n: 1,
+        resolution: '1K',
+        aspect_ratio: '21:9',
+        quality: 'high',
+        output_format: 'png',
+        background: 'opaque',
+        ...(withReferences
+          ? { images: [{ image_url: 'https://example.com/cabinet.png' }] }
+          : {}),
+      })
+    }
+  )
   it('reports exact submitted dimensions and marks approximate aspect ratios', () => {
     const current: ImageModel = { ...model, mode: 'realtime' }
     const dimensions = imageRequestDimensions(current, '1K', '16:9')

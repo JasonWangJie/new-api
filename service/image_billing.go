@@ -82,14 +82,14 @@ func EstimateImageBillingForRequest(info *relaycommon.RelayInfo, count int, prom
 		}
 	} else {
 		quantity := 1
-		if info.PriceData.UsePrice || info.ChannelType == constant.ChannelTypeAli {
+		if info.PriceData.UsePrice || !info.ImageMixedBilling && info.ChannelType == constant.ChannelTypeAli {
 			quantity = count
 		}
 		// Overwrite per-attempt ratios so a failed Ali attempt cannot leak its
 		// quantity or prompt-extension surcharge into another channel.
 		info.PriceData.AddOtherRatio("n", float64(quantity))
 		extensionRatio := 1.0
-		if info.ChannelType == constant.ChannelTypeAli && strings.Contains(info.UpstreamModelName, "z-image") && promptExtend {
+		if !info.ImageMixedBilling && info.ChannelType == constant.ChannelTypeAli && strings.Contains(info.UpstreamModelName, "z-image") && promptExtend {
 			extensionRatio = common.ZImagePromptExtendMultiplier
 		}
 		info.PriceData.AddOtherRatio("prompt_extend", extensionRatio)

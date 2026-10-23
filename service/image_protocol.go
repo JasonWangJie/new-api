@@ -27,6 +27,7 @@ type AsyncImageInputPart struct {
 }
 
 type AsyncImageRequest struct {
+	MixedRouting           *ImageMixedRouting           `json:"mixed_routing,omitempty"`
 	ReferenceTransportUsed *string                      `json:"-"`
 	Completion             *AsyncImageCompletion        `json:"completion,omitempty"`
 	PostprocessContext     context.Context              `json:"-"`
@@ -51,6 +52,14 @@ type AsyncImageRequest struct {
 	Native                 map[string]common.RawMessage `json:"native,omitempty"`
 }
 
+// ImageMixedRouting is written only by admission and stored inside the encrypted
+// task envelope. Execution provider selection must never replace this identity.
+type ImageMixedRouting struct {
+	Group      string `json:"group"`
+	BindingKey string `json:"binding_key"`
+	PoolMode   string `json:"pool_mode"`
+}
+
 // AsyncImageCompletion is private, encrypted evidence of an accepted output.
 // Recovery consumes this response and its frozen billing facts, never a second
 // generation. Keeping it in the request envelope needs no schema migration.
@@ -64,6 +73,7 @@ type AsyncImageCompletion struct {
 	BillingModel  string                    `json:"billing_model"`
 	URLs          []string                  `json:"urls,omitempty"`
 	Profile       *dto.UpstreamAsyncProfile `json:"profile,omitempty"`
+	UsageFields   map[string]bool           `json:"usage_fields,omitempty"`
 }
 
 func (request AsyncImageRequest) ReferenceImageCount() int {
@@ -363,6 +373,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 		}
 	}
 	var stream *bool
+	if _, supplied := fields["mixed_routing"]; supplied {
+		return request, errors.New("mixed_routing is reserved for server task state")
+	}
 	if value, ok := fields["provider"]; ok {
 		if common.Unmarshal(value, &request.Provider) != nil || !RegisteredImageProvider(request.Provider) {
 			return request, errors.New("invalid image provider")

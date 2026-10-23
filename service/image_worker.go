@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -312,6 +313,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Persisted request is invalid"}, cfg)
 	}
 	acceptedOutput = acceptedOutput || request.Completion != nil
+	if request.MixedRouting != nil && task.DispatchedAt > 0 && !knownUpstreamTask && !acceptedOutput {
+		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "Mixed image submission was interrupted after dispatch; administrator reconciliation is required", ExecutionUnknown: true}, cfg)
+	}
 	if acceptedOutput && request.Completion == nil && !knownUpstreamTask {
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 607, InternalCode: "completion_checkpoint_invalid", Message: "Accepted image output is missing its durable completion evidence"}, cfg)
 	}
@@ -520,7 +524,11 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if referenceFallback {
 			selection.Action, selection.Reason = "local_reference_fallback", "reference_transport_fallback"
 		}
-		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: true, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
+		upstreamModel, err := ResolveImageChannelUpstreamModel(*channel, request.Model)
+		if err != nil {
+			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "invalid_model_mapping", Message: "Image channel model mapping is invalid"}, cfg)
+		}
+		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
 			return err
@@ -691,6 +699,21 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	if failure.Message == "" {
 		failure.Message = "Upstream image request failed"
 	}
+	mixedRouting := false
+	if len(task.RequestCipher) > 0 {
+		data, err := DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+		if err == nil {
+			var request AsyncImageRequest
+			if common.Unmarshal(data, &request) == nil {
+				mixedRouting = request.MixedRouting != nil
+			}
+		}
+	}
+	if mixedRouting && task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
+		// A transport interruption or server error cannot prove non-acceptance.
+		// Keep the hold and require reconciliation instead of crossing providers.
+		failure.ExecutionUnknown = true
+	}
 	status, kind := model.ImageTaskFailed, ""
 	updates := map[string]any{"public_error_code": failure.Code, "error_code": failure.InternalCode, "error_message": failure.Message, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "finished_at": time.Now().Unix(), "next_attempt_at": 0}
 	submissionTransientRetries := 0
@@ -774,7 +797,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				updates["request_cipher"] = cipher
 			}
 		}
-	} else if timeoutAttempt {
+	} else if timeoutAttempt && !mixedRouting {
 		// Unknown execution belongs to the attempt. The task may continue on
 		// another credential under the administrator's bounded retry policy.
 		updates["public_error_code"] = 606
@@ -824,7 +847,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		resubmit := task.UpstreamTaskId == ""
 		if failure.UpstreamTerminal {
 			resubmit = false
-			if !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
+			if !mixedRouting && !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
 				reservation, err := model.GetAsyncImageReservation(ctx, task)
 				if err != nil {
 					return err

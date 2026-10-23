@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"net"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -22,6 +25,10 @@ func ImageChannelSupportsPlatform(channel model.Channel, modelName, platform str
 	capability := ImageChannelCapability(channel, modelName)
 	if platform == "gemini" {
 		return capability.Generate && capability.Protocol == "gemini_native"
+	}
+	if platform == "mixed" {
+		_, registered := constant.ChannelTypeNames[channel.Type]
+		return registered && channel.Type != constant.ChannelTypeUnknown && capability.Generate && capability.Protocol == "openai_images"
 	}
 	return capability.Generate && (platform == "openai" && capability.Protocol == "openai_images" || capability.Provider == platform)
 }
@@ -55,6 +62,8 @@ type MediaRoutingPreviewRequest struct {
 }
 
 type MediaRoutingPreviewChannel struct {
+	Provider          string   `json:"provider"`
+	Protocol          string   `json:"protocol"`
 	ChannelID         int      `json:"channel_id"`
 	Group             string   `json:"group"`
 	BindingKey        string   `json:"binding_key"`
@@ -95,12 +104,18 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 	var routingGroups []string
 	imageRequest := AsyncImageRequest{
 		Provider: input.Platform, Platform: "openai", Dialect: "async", Model: input.Model,
-		Kind: input.Operation, Resolution: input.Resolution,
+		Kind: input.Operation, Resolution: input.Resolution, Count: 1,
 		// The unified generation endpoint also accepts provider reference fields.
 		SourcePath: "/v1/images/generations_async",
 	}
 	if input.Platform == "gemini" {
 		imageRequest.Platform = "gemini"
+	}
+	if input.Platform == "mixed" {
+		imageRequest.Provider = ""
+	}
+	if input.Operation == "image_to_image" {
+		imageRequest.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://preview.invalid/reference.png"}}
 	}
 	if input.TokenID > 0 {
 		var token model.Token
@@ -112,7 +127,9 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			return preview, err
 		}
 		var err error
-		if input.MediaType == "image" {
+		if input.Platform == "mixed" {
+			policy, catalog, err = ResolveImagePolicy(ctx, token, "mixed")
+		} else if input.MediaType == "image" {
 			policy, catalog, err = ResolveAsyncImagePolicy(ctx, token, imageRequest)
 		} else {
 			policy, catalog, err = ResolveImagePolicy(ctx, token, input.Platform)
@@ -152,6 +169,12 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			}
 		} else if !GroupInUserUsableGroups(owner.Group, policy.Group) || input.MediaType == "image" && !IsUserSelectableGroup(owner.Group, policy.Group) {
 			policyReasons = append(policyReasons, "token_group_not_allowed")
+		}
+	} else if input.Platform == "mixed" {
+		var err error
+		policy, catalog, err = ResolveImagePolicy(ctx, model.Token{Group: input.Group}, "mixed")
+		if err != nil {
+			return preview, err
 		}
 	} else if input.MediaType == "image" {
 		// An explicit group has no owner permission context. Resolve the same
@@ -252,6 +275,10 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		if err := model.DB.WithContext(ctx).Where("binding_key = ? AND channel_id >= ?", bindingKey, 0).Find(&bindings).Error; err != nil {
 			return preview, err
 		}
+		if input.Platform == "mixed" && len(bindings) == 0 {
+			policyReasons = append(policyReasons, "mixed_pool_missing")
+			preview.Reasons = policyReasons
+		}
 		preview.BindingFound = preview.BindingFound || len(bindings) > 0
 		var abilities []model.Ability
 		if err := model.DB.WithContext(ctx).Where(map[string]any{"group": group}).Find(&abilities).Error; err != nil {
@@ -310,11 +337,15 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					channel = mapped
 				}
 				capability := ImageChannelCapability(channel, input.Model)
-				if capability.Provider != input.Platform || !ImageChannelSupportsPlatform(channel, input.Model, policy.Platform) {
+				candidate.Provider, candidate.Protocol = capability.Provider, capability.Protocol
+				if input.Platform != "mixed" && capability.Provider != input.Platform || !ImageChannelSupportsPlatform(channel, input.Model, policy.Platform) {
 					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
 				}
 				if !ImageCapabilitySupportsRequest(capability, imageRequest) {
 					candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
+				}
+				if input.Platform == "mixed" && !MixedImageChannelRequestSupported(channel, imageRequest) {
+					candidate.Reasons = append(candidate.Reasons, "image_parameters_not_supported")
 				}
 			} else {
 				if !mediaChannelSupportsVideoPlatform(&channel, input.Model, input.Platform) {
@@ -371,28 +402,10 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			if candidate.AvailableAccounts == 0 {
 				candidate.Reasons = append(candidate.Reasons, "no_enabled_account")
 			}
-			if raw := channel.GetModelMapping(); raw != "" {
-				var mapping map[string]string
-				if err := common.UnmarshalJsonStr(raw, &mapping); err != nil {
-					candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
-				} else {
-					seen := make(map[string]bool)
-					for {
-						next, found := mapping[candidate.UpstreamModel]
-						if base := hostreasoning.BaseModelName(candidate.UpstreamModel); (!found || next == "") && base != candidate.UpstreamModel {
-							next, found = mapping[base]
-						}
-						if !found || next == "" || next == candidate.UpstreamModel {
-							break
-						}
-						if seen[candidate.UpstreamModel] {
-							candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
-							break
-						}
-						seen[candidate.UpstreamModel] = true
-						candidate.UpstreamModel = next
-					}
-				}
+			var mappingErr error
+			candidate.UpstreamModel, mappingErr = ResolveImageChannelUpstreamModel(channel, input.Model)
+			if mappingErr != nil {
+				candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
 			}
 			if len(candidate.Reasons) > 0 {
 				preview.Excluded = append(preview.Excluded, candidate)
@@ -538,7 +551,7 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 					}
 				}
 			}
-			if !imageSupported && !mediaChannelSupportsVideoPlatform(channel, modelName, platform) {
+			if !imageSupported && (platform == "mixed" || !mediaChannelSupportsVideoPlatform(channel, modelName, platform)) {
 				continue
 			}
 			seen[channelId] = true
@@ -578,6 +591,77 @@ func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution st
 	return ImageIdentityHash(policy.Group, policy.Platform, policy.PoolMode, modelName, resolution)
 }
 
+func ResolveImageChannelUpstreamModel(channel model.Channel, modelName string) (string, error) {
+	if channel.GetModelMapping() == "" {
+		return modelName, nil
+	}
+	var mapping map[string]string
+	if err := common.UnmarshalJsonStr(channel.GetModelMapping(), &mapping); err != nil {
+		return modelName, err
+	}
+	seen := make(map[string]bool)
+	for {
+		next, found := mapping[modelName]
+		if base := hostreasoning.BaseModelName(modelName); (!found || next == "") && base != modelName {
+			next, found = mapping[base]
+		}
+		if !found || next == "" || next == modelName {
+			return modelName, nil
+		}
+		if seen[modelName] {
+			return modelName, errors.New("cyclic image model mapping")
+		}
+		seen[modelName] = true
+		modelName = next
+	}
+}
+
+// ValidateMixedImagePoolMembers prevents duplicate supplier accounts from
+// receiving multiple weights through separate channel/provider declarations.
+func ValidateMixedImagePoolMembers(ctx context.Context, ids []int) error {
+	if len(ids) < 2 {
+		return nil
+	}
+	var channels []model.Channel
+	if err := model.DB.WithContext(ctx).Where("id IN ?", ids).Find(&channels).Error; err != nil {
+		return err
+	}
+	seen := make(map[string]int)
+	for _, channel := range channels {
+		base := channel.GetBaseURL()
+		if base == "" {
+			base = constant.GetChannelBaseURL(channel.Type)
+		}
+		parsed, err := url.Parse(base)
+		if err != nil || parsed.Hostname() == "" {
+			return errors.New("mixed pool channel requires a valid upstream origin")
+		}
+		port := parsed.Port()
+		if port == "" {
+			port = "443"
+			if strings.EqualFold(parsed.Scheme, "http") {
+				port = "80"
+			}
+		}
+		origin := strings.ToLower(parsed.Scheme + "://" + net.JoinHostPort(strings.TrimSuffix(parsed.Hostname(), "."), port))
+		keys := []string{channel.Key}
+		if channel.ChannelInfo.IsMultiKey {
+			keys = channel.GetKeys()
+		}
+		for _, key := range keys {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			identity := ImageIdentityHash("mixed-supplier-account", origin, key)
+			if previous, exists := seen[identity]; exists && previous != channel.Id {
+				return errors.New("mixed pool contains duplicate upstream origin and credential members")
+			}
+			seen[identity] = channel.Id
+		}
+	}
+	return nil
+}
+
 func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, modelName, resolution string) ([]model.Channel, error) {
 	if policy.AsyncEnabled {
 		resolution = strings.ToUpper(strings.TrimSpace(resolution))
@@ -605,6 +689,9 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 		return nil, err
 	}
 	var channels []model.Channel
+	if policy.Platform == "mixed" && len(bindings) == 0 {
+		return channels, nil
+	}
 	if len(ids) == 0 {
 		return channels, nil
 	}
@@ -757,7 +844,13 @@ func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []
 }
 
 func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, request AsyncImageRequest, routing ImageAccountRouting) (*model.Channel, ImageAccount, error) {
-	if request.Provider == "" {
+	if policy.Platform == "mixed" && (request.MixedRouting == nil || request.Provider != "") {
+		return nil, ImageAccount{}, errors.New("mixed image selection requires providerless admitted routing state")
+	}
+	if request.MixedRouting != nil && (policy.Platform != "mixed" || policy.Group != request.MixedRouting.Group || ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(request)) != request.MixedRouting.BindingKey) {
+		return nil, ImageAccount{}, errors.New("mixed image routing identity changed before selection")
+	}
+	if request.Provider == "" && request.MixedRouting == nil {
 		request.Provider = policy.AsyncProvider
 	}
 	channels, err := ImageCandidateChannels(ctx, policy, request.Model, AsyncImageRoutingResolution(request))
@@ -765,6 +858,9 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		return nil, ImageAccount{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
+		if policy.Platform == "mixed" {
+			return !MixedImageChannelRequestSupported(channel, request)
+		}
 		capability := ImageChannelCapability(channel, request.Model)
 		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
 	})
@@ -986,6 +1082,9 @@ func RecordImageCircuit(ctx context.Context, scope string, channelId int, succes
 }
 
 type ImageChannelAttempt struct {
+	Provider              string              `json:"provider,omitempty"`
+	Protocol              string              `json:"protocol,omitempty"`
+	UpstreamModel         string              `json:"upstream_model,omitempty"`
 	AuditVersion          int                 `json:"audit_version,omitempty"`
 	Decision              *ImageRetryDecision `json:"decision,omitempty"`
 	ChannelId             int                 `json:"channel_id"`
@@ -1221,6 +1320,9 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 		return policy, model.ImageFundingSelection{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(ch model.Channel) bool {
+		if policy.Platform == "mixed" {
+			return !MixedImageChannelRequestSupported(ch, request)
+		}
 		capability := ImageChannelCapability(ch, request.Model)
 		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
 	})

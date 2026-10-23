@@ -73,13 +73,13 @@ func GetImageConfiguration(c *gin.Context) {
 		templates = append(templates, gin.H{"provider": meta.Key, "name": meta.Name, "models": slices.Clone(meta.Models), "video_profiles": plugin.Meta.VideoProfiles})
 	}
 	sort.Slice(templates, func(i, j int) bool { return templates[i]["provider"].(string) < templates[j]["provider"].(string) })
-	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates})
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates})
 }
 
 func GetImageChannelPoolOptions(c *gin.Context) {
 	group := c.Query("group")
 	platform := c.Query("platform")
-	if strings.TrimSpace(group) == "" || len(group) > 64 || !service.RegisteredMediaProvider(platform) {
+	if strings.TrimSpace(group) == "" || len(group) > 64 || !service.ImageRoutingPlatform(platform) {
 		imageManagementError(c, 400, errors.New("Invalid image channel pool selection"))
 		return
 	}
@@ -98,12 +98,16 @@ func PreviewMediaRouting(c *gin.Context) {
 		return
 	}
 	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)
-	if input.TokenID < 0 || input.TokenID == 0 && input.Group == "" || len(input.Group) > 64 || !service.RegisteredMediaProvider(input.Platform) || service.ValidateImageModelName(input.Model) != nil || input.MediaType != "image" && input.MediaType != "video" {
+	if input.TokenID < 0 || input.TokenID == 0 && input.Group == "" || len(input.Group) > 64 || !service.ImageRoutingPlatform(input.Platform) || service.ValidateImageModelName(input.Model) != nil || input.MediaType != "image" && input.MediaType != "video" {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview request"))
 		return
 	}
 	if input.Seconds != nil && (*input.Seconds < 1 || *input.Seconds > relaycommon.MaxTaskDurationSeconds) {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid video duration"))
+		return
+	}
+	if input.Platform == "mixed" && input.MediaType != "image" {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Mixed pools support images only"))
 		return
 	}
 	if input.MediaType == "image" {
@@ -156,7 +160,7 @@ func SaveImagePolicy(c *gin.Context) {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if policy.Group == "" || len(policy.Group) > 64 || !service.RegisteredMediaProvider(policy.Platform) || policy.PoolMode != "resolution" && policy.PoolMode != "model" && policy.PoolMode != "model_resolution" {
+	if policy.Group == "" || len(policy.Group) > 64 || !service.ImageRoutingPlatform(policy.Platform) || policy.PoolMode != "resolution" && policy.PoolMode != "model" && policy.PoolMode != "model_resolution" {
 		imageManagementError(c, 400, errors.New("Invalid image platform group or pool mode"))
 		return
 	}
@@ -183,6 +187,10 @@ func SaveImagePolicy(c *gin.Context) {
 			catalog[i].Label = catalog[i].Id
 		}
 		media := catalog[i].MediaType
+		if policy.Platform == "mixed" && media == "video" {
+			imageManagementError(c, 400, errors.New("Mixed pools support images only"))
+			return
+		}
 		if seenMedia[catalog[i].Id] == nil {
 			seenMedia[catalog[i].Id] = make(map[string]bool)
 		}
@@ -310,7 +318,7 @@ func SaveImageChannelPool(c *gin.Context) {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if input.Group == "" || len(input.Group) > 64 || !service.RegisteredMediaProvider(input.Platform) || input.Mode != "resolution" && input.Mode != "model" && input.Mode != "model_resolution" {
+	if input.Group == "" || len(input.Group) > 64 || !service.ImageRoutingPlatform(input.Platform) || input.Mode != "resolution" && input.Mode != "model" && input.Mode != "model_resolution" {
 		imageManagementError(c, 400, errors.New("Invalid image channel pool"))
 		return
 	}
@@ -349,6 +357,16 @@ func SaveImageChannelPool(c *gin.Context) {
 		}
 		seen[channel.Id] = true
 		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution, ChannelId: channel.Id, Priority: channel.Priority})
+	}
+	if input.Platform == "mixed" {
+		ids := make([]int, 0, len(input.Channels))
+		for _, channel := range input.Channels {
+			ids = append(ids, channel.Id)
+		}
+		if err := service.ValidateMixedImagePoolMembers(c.Request.Context(), ids); err != nil {
+			imageManagementError(c, 400, err)
+			return
+		}
 	}
 	if input.Mode != "resolution" || len(input.Channels) > 0 {
 		options, err := service.GetImagePoolSelectionOptions(c.Request.Context(), input.Group, input.Platform)
@@ -524,7 +542,7 @@ func GetTokenImageMappings(c *gin.Context) {
 		imageManagementError(c, 503, errors.New("Image group settings are unavailable"))
 		return
 	}
-	groups := map[string]*string{"openai": nil, "gemini": nil}
+	groups := map[string]*string{"openai": nil, "gemini": nil, "mixed": nil}
 	for _, mapping := range mappings {
 		group := mapping.Group
 		groups[mapping.Platform] = &group
@@ -560,7 +578,7 @@ func UpdateTokenImageMappings(c *gin.Context) {
 	}
 	allowed := service.GetUserUsableGroups(user.Group)
 	for platform, group := range input {
-		if !service.RegisteredMediaProvider(platform) {
+		if !service.ImageRoutingPlatform(platform) {
 			imageManagementError(c, 400, errors.New("Invalid image platform"))
 			return
 		}

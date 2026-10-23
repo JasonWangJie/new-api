@@ -1,15 +1,21 @@
 package plugins_test
 
 import (
+	"io"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -73,6 +79,8 @@ func TestDoubaoVideoUsageBilling(t *testing.T) {
 		{name: "editing excludes input reservation from output seconds", action: "edit_video", request: map[string]any{"duration": 8, "video": "https://cdn.example/input.mp4"}, seconds: 8, tokens: 496800},
 		{name: "extension excludes input reservation from output seconds", action: "extend_video", request: map[string]any{"duration": 5, "video": "https://cdn.example/input.mp4"}, seconds: 5, tokens: 432000},
 		{name: "mapped Seedance 2.5 editing reserves thirty output seconds", model: "doubao-seedance-2-5-260628", action: "edit_video", request: map[string]any{"video": "asset://input-video"}, seconds: 30, tokens: 1296000},
+		{name: "Seedance 2.5 alias editing uses the same reservation", model: "doubao-seedance-2-5", action: "edit_video", request: map[string]any{"video": "asset://input-video"}, seconds: 30, tokens: 1296000},
+		{name: "Seedance 2.5 alias extension reserves thirty input seconds", model: "doubao-seedance-2-5", action: "extend_video", request: map[string]any{"seconds": 30, "video": "asset://input-video"}, seconds: 30, tokens: 1296000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			model := tc.model
@@ -206,6 +214,159 @@ func TestDoubaoVideoReferencesAndProfiles(t *testing.T) {
 		return object(t, value), nil
 	}
 
+	t.Run("Seedance 2.5 alias preserves its upstream model and capability limits", func(t *testing.T) {
+		const model = "doubao-seedance-2-5"
+		for _, path := range []string{"/v1/videos", "/v1/videos/edits", "/v1/videos/extensions", "/v1/responses"} {
+			binding, found := registry.Generation().LookupEndpoint("POST", path, model)
+			require.True(t, found, path)
+			assert.Same(t, plugin, binding.Plugin)
+		}
+		resolved, callErr := decode(t, model, map[string]any{"prompt": "a fox runs", "duration": 30})
+		require.NoError(t, callErr)
+		descriptor, callErr := build(t, model, resolved)
+		require.NoError(t, callErr)
+		body := descriptor["body"].(map[string]any)
+		assert.Equal(t, model, body["model"])
+		assert.Equal(t, float64(30), body["duration"])
+		_, callErr = decode(t, model, map[string]any{"prompt": "too long", "duration": 31})
+		require.ErrorContains(t, callErr, "supported range")
+
+		resolved, callErr = decodeOperation(t, "edit", model, map[string]any{"prompt": "restyle", "video": "asset://main-video"})
+		require.NoError(t, callErr)
+		descriptor, callErr = build(t, model, resolved)
+		require.NoError(t, callErr)
+		assert.Equal(t, model, descriptor["body"].(map[string]any)["model"])
+		assert.Equal(t, float64(-1), descriptor["body"].(map[string]any)["duration"])
+		assert.Equal(t, "edit", descriptor["body"].(map[string]any)["omni_reference_task_type"])
+		assert.Equal(t, "adaptive", descriptor["body"].(map[string]any)["ratio"])
+
+		value, callErr := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{
+			"model": "client-alias", "upstreamModel": model, "usagePurpose": "billing_ratios",
+			"requestBody": map[string]any{"video": "asset://main-video"},
+		})
+		require.NoError(t, callErr)
+		assert.InDelta(t, 42.0/70, object(t, value)["video_input_ratio"], 0.000001)
+	})
+
+	t.Run("channel mapping keeps the client alias and uses the dated upstream model", func(t *testing.T) {
+		const clientModel = "doubao-seedance-2-5"
+		const upstreamModel = "doubao-seedance-2-5-260628"
+		value, callErr := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+			"operation": "edit", "model": clientModel, "upstreamModel": upstreamModel,
+			"body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "restyle", "video": "asset://main-video"}},
+		})
+		require.NoError(t, callErr)
+		resolved := object(t, value)
+		assert.Equal(t, clientModel, resolved["model"])
+		assert.Equal(t, clientModel, resolved["requestBody"].(map[string]any)["model"])
+		ctx := map[string]any{
+			"model": clientModel, "upstreamModel": upstreamModel, "baseUrl": "https://ark.example", "apiKey": "secret",
+			"action": resolved["action"], "requestBody": resolved["requestBody"],
+		}
+		value, callErr = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+		require.NoError(t, callErr)
+		descriptor := object(t, value)
+		assert.Equal(t, upstreamModel, descriptor["body"].(map[string]any)["model"])
+		assert.Equal(t, float64(-1), descriptor["body"].(map[string]any)["duration"])
+		value, callErr = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+		require.NoError(t, callErr)
+		facts := object(t, value)
+		assert.Equal(t, float64(30), facts["seconds"])
+		assert.Equal(t, float64(1296000), facts["tokens"])
+	})
+
+	t.Run("Seedance 2.5 uses adaptive frame ratios and forwards explicit output controls", func(t *testing.T) {
+		for _, model := range []string{"doubao-seedance-2-5", "doubao-seedance-2-5-260628"} {
+			resolved, callErr := decode(t, model, map[string]any{
+				"prompt": "animate", "image": "https://cdn.example/first.png", "last_frame": "https://cdn.example/last.png",
+				"resolution": "1080p", "output_format": "mov", "camera_fixed": false, "web_search": false, "seed": 0,
+			})
+			require.NoError(t, callErr)
+			descriptor, callErr := build(t, model, resolved)
+			require.NoError(t, callErr)
+			body := descriptor["body"].(map[string]any)
+			assert.Equal(t, "adaptive", body["ratio"])
+			assert.Equal(t, "1080p", body["resolution"])
+			assert.Equal(t, "mov", body["output_format"])
+			assert.Equal(t, false, body["camera_fixed"])
+			assert.Equal(t, false, body["web_search"])
+			assert.Equal(t, float64(0), body["seed"])
+			_, callErr = decode(t, model, map[string]any{"image": "https://cdn.example/first.png", "ratio": "16:9"})
+			require.ErrorContains(t, callErr, "ratio")
+			_, callErr = decode(t, model, map[string]any{"prompt": "animate", "output_format": "wmv"})
+			require.ErrorContains(t, callErr, "output_format")
+			_, callErr = decode(t, model, map[string]any{"prompt": "animate", "duration": -1})
+			require.ErrorContains(t, callErr, "Automatic duration -1 is not supported")
+		}
+	})
+
+	t.Run("native Seedance 2.5 content preserves ordering and operation controls", func(t *testing.T) {
+		const model = "doubao-seedance-2-5"
+		content := []any{
+			map[string]any{"type": "text", "text": "first instruction"},
+			map[string]any{"type": "video_url", "role": "reference_video", "video_url": map[string]any{"url": "https://cdn.example/input.mp4"}},
+			map[string]any{"type": "text", "text": "second instruction"},
+		}
+		for _, taskType := range []string{"edit", "extend"} {
+			nativeBody := map[string]any{
+				"model": model, "content": content, "resolution": "1080p", "ratio": "adaptive",
+				"omni_reference_task_type": taskType, "output_format": "mp4", "watermark": false,
+			}
+			expectedDuration := float64(-1)
+			if taskType == "extend" {
+				nativeBody["duration"], expectedDuration = 30, 30
+			}
+			value, callErr := plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, map[string]any{
+				"body": map[string]any{"kind": "json", "value": nativeBody},
+			})
+			require.NoError(t, callErr)
+			resolved := object(t, value)
+			descriptor, callErr := build(t, model, resolved)
+			require.NoError(t, callErr)
+			body := descriptor["body"].(map[string]any)
+			assert.Equal(t, content, body["content"])
+			assert.Equal(t, expectedDuration, body["duration"])
+			assert.Equal(t, taskType, body["omni_reference_task_type"])
+			assert.Equal(t, "adaptive", body["ratio"])
+			assert.Equal(t, false, body["watermark"])
+
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/doubao/api/v3/contents/generations/tasks", nil)
+			c.Set("task_request", resolved["requestBody"])
+			info := &relaycommon.RelayInfo{
+				OriginModelName: model,
+				ChannelMeta:     &relaycommon.ChannelMeta{ChannelBaseUrl: "https://ark.example", UpstreamModelName: model},
+				TaskRelayInfo:   &relaycommon.TaskRelayInfo{Action: resolved["action"].(string)},
+			}
+			adaptor := taskplugin.New(plugin)
+			adaptor.Init(info)
+			require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info), "plugin-derived edit duration must pass host validation")
+			reader, buildErr := adaptor.BuildRequestBody(c, info)
+			require.NoError(t, buildErr)
+			encoded, readErr := io.ReadAll(reader)
+			require.NoError(t, readErr)
+			var upstream map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &upstream))
+			assert.Equal(t, expectedDuration, upstream["duration"])
+			facts, usageErr := adaptor.ExtractUsageFactsValidated(c, info)
+			require.NoError(t, usageErr)
+			assert.Equal(t, float64(30), facts["seconds"])
+			assert.Equal(t, float64(2916000), facts["tokens"])
+		}
+		resolved, callErr := decode(t, model, map[string]any{
+			"prompt": "must not be appended", "images": []any{"https://cdn.example/unused.png"}, "content": content, "duration": 30,
+		})
+		require.NoError(t, callErr)
+		descriptor, callErr := build(t, model, resolved)
+		require.NoError(t, callErr)
+		assert.Equal(t, content, descriptor["body"].(map[string]any)["content"])
+		assert.Equal(t, float64(30), descriptor["body"].(map[string]any)["duration"])
+		_, callErr = plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, map[string]any{
+			"body": map[string]any{"kind": "json", "value": map[string]any{"model": model, "content": content, "duration": -1}},
+		})
+		require.ErrorContains(t, callErr, "Automatic duration -1 is not supported")
+	})
+
 	t.Run("top-level input reference reaches Ark content", func(t *testing.T) {
 		resolved, callErr := decode(t, "doubao-seedance-2-0-260128", map[string]any{
 			"prompt": "animate", "input_reference": "https://cdn.example/first.png", "duration": 5, "resolution": "720p",
@@ -292,6 +453,7 @@ func TestDoubaoVideoReferencesAndProfiles(t *testing.T) {
 		descriptor, callErr = build(t, "doubao-seedance-2-5-260628", resolved)
 		require.NoError(t, callErr)
 		assert.Equal(t, float64(-1), descriptor["body"].(map[string]any)["duration"])
+		assert.Equal(t, "edit", descriptor["body"].(map[string]any)["omni_reference_task_type"])
 
 		resolved, callErr = decodeOperation(t, "extend", "doubao-seedance-2-5-260628", map[string]any{
 			"prompt": "continue walking", "video": "asset://main-video", "duration": 30, "resolution": "720p", "extension_direction": "forward",
@@ -301,6 +463,7 @@ func TestDoubaoVideoReferencesAndProfiles(t *testing.T) {
 		require.NoError(t, callErr)
 		body = descriptor["body"].(map[string]any)
 		assert.NotContains(t, body, "extension_direction")
+		assert.Equal(t, "extend", body["omni_reference_task_type"])
 		assert.Contains(t, body["content"].([]any)[1].(map[string]any)["text"], "向前")
 		resolved, callErr = decodeOperation(t, "extend", "doubao-seedance-2-0-260128", map[string]any{
 			"prompt": "continue walking", "video": "https://cdn.example/main.mp4", "duration": 5, "resolution": "720p",

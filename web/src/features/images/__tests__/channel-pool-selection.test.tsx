@@ -678,3 +678,43 @@ test('reopening a closed binding submits the original placeholder row ID for con
     )
   )
 })
+
+test('copying a pool to mixed scheduling preserves channels and weights without replacing the original binding', async () => {
+  vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
+    if (method === 'GET') return geminiOptions
+    if (method === 'PUT') return data
+    throw new Error(`Unexpected image request: ${method} ${url}`)
+  })
+  const user = userEvent.setup()
+  renderPool([{ ...savedBinding, platform: 'newapi' }])
+  await user.click(
+    screen.getByRole('button', { name: /premium.*newapi.*All resolutions/ })
+  )
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  await user.click(screen.getByRole('button', { name: 'Copy binding' }))
+  await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+  await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  )
+  expect(screen.getByRole('spinbutton', { name: 'Weight 22' })).toHaveValue(7)
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
+    'Image Beta'
+  )
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      {
+        expected_ids: [],
+        group: 'premium',
+        platform: 'mixed',
+        mode: 'model',
+        model: 'image-beta',
+        resolution: '',
+        channels: [{ id: 22, priority: 7 }],
+      }
+    )
+  )
+})

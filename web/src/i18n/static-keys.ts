@@ -1055,6 +1055,7 @@ export const STATIC_I18N_KEYS = [
   'Asynchronous generation is disabled',
   'Model is not in the media policy',
   'Resolution is not in the media policy',
+  'No mixed channel pool binding is configured',
   'API key is disabled',
   'API key has expired',
   'API key quota is exhausted',
@@ -1066,6 +1067,7 @@ export const STATIC_I18N_KEYS = [
   'Channel provider does not match',
   'Resolution mapping is missing',
   'Generation mode is not supported',
+  'Image parameters are not supported',
   'Video parameters are not supported',
   'Channel is outside this pool',
   'No enabled account is available',
@@ -1073,4 +1075,5 @@ export const STATIC_I18N_KEYS = [
   'Channel has zero weight',
   'Model mapping is invalid',
   'Select an API key to preview automatic routing groups',
+  'Mixed scheduling',
 ] as const

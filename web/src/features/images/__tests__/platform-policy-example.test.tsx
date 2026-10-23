@@ -86,3 +86,31 @@ test('uses a copy-ready placeholder for dynamically registered platforms', async
     'custom_media-image-model'
   )
 })
+
+test('mixed scheduling examples use a shared public alias and explain common capabilities and pricing', async () => {
+  const user = userEvent.setup()
+  render(<ImagePolicyExampleDialog platform='mixed' />)
+  await user.click(
+    screen.getByRole('button', {
+      name: /Mixed scheduling.*Configuration example/,
+    })
+  )
+  const dialog = screen.getByRole('dialog')
+  const example = within(dialog).getByRole('region', {
+    name: 'Model capability example for Mixed scheduling',
+  })
+  expect(JSON.parse(example.textContent || '[]')).toEqual([
+    {
+      id: 'seedream-5-pro',
+      label: 'seedream-5-pro',
+      media_type: 'image',
+      resolutions: ['1K', '2K'],
+      max_output_images: 1,
+      max_reference_images: 8,
+      allow_half_k: false,
+    },
+  ])
+  expect(dialog).toHaveTextContent(
+    'Use the public model alias and capabilities shared by all pool members.'
+  )
+})

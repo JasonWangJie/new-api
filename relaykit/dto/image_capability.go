@@ -13,6 +13,10 @@ type ImageCapability struct {
 	EditFormat     string   `json:"edit_format,omitempty"`
 	Edit           bool     `json:"supports_edit"`
 	ReferenceField string   `json:"reference_field,omitempty"`
+	// These adaptor contracts are host-only admission facts, not client options.
+	Mask                    bool `json:"-"`
+	TokenUsage              bool `json:"-"`
+	OpenAICompatibleRequest bool `json:"-"`
 }
 
 // DeclaresModel matches adaptor-declared families for catalog discovery. A

@@ -386,6 +386,7 @@ export type VideoPluginTemplate = {
   video_profiles: VideoCapability[]
 }
 export type ImageAdminConfiguration = {
+  routing_platforms?: string[]
   image_providers?: string[]
   media_providers?: string[]
   runtime: Record<string, string | number | boolean>

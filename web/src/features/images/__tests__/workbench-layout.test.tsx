@@ -20,7 +20,14 @@ import { Blob } from 'node:buffer'
 import { webcrypto } from 'node:crypto'
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosError, AxiosHeaders } from 'axios'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -28,7 +35,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { VideoCapabilityForm } from '../components/video-capability-form'
-import type { VideoModel } from '../types'
+import type { ImageModel, VideoModel } from '../types'
 import { VideoWorkbench } from '../video-workbench'
 import { ImageWorkbench } from '../workbench'
 
@@ -49,6 +56,59 @@ vi.mock('@/features/keys/api', () => keyApiMocks)
 vi.mock('../api', () => imageApiMocks)
 
 let client: QueryClient
+
+const referenceImageModel: ImageModel = {
+  id: 'gemini-image',
+  label: 'Gemini Image',
+  platform: 'gemini',
+  mode: 'async',
+  protocol: 'gemini_bb',
+  available: true,
+  capability: { max_output_images: 1, max_reference_images: 4 },
+}
+
+async function prepareImageSubmission(imageModel = referenceImageModel) {
+  const user = userEvent.setup()
+  keyApiMocks.getApiKeys.mockResolvedValue({
+    data: { items: [{ id: 7, name: 'Primary', status: 1 }] },
+  })
+  keyApiMocks.fetchTokenKey.mockResolvedValue({
+    success: true,
+    data: { key: 'image-key' },
+  })
+  imageApiMocks.getImageCapabilities.mockResolvedValue({
+    api_key_id: 7,
+    capability_version: 'test',
+    gateway_base_url: '',
+    models: [imageModel],
+    platforms: [],
+  })
+  imageApiMocks.imageRelayRequest.mockResolvedValue({ task_id: 'image_queued' })
+  imageApiMocks.getImageTask.mockResolvedValue({
+    task: { status: 'queued', progress: 0, cost: 0 },
+    results: [],
+    events: [],
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+
+  await user.click(await screen.findByRole('combobox', { name: 'API Key' }))
+  await user.click(await screen.findByRole('option', { name: 'Primary' }))
+  await user.click(screen.getByRole('combobox', { name: 'Model' }))
+  await user.click(
+    await screen.findByRole('option', {
+      name: `${imageModel.label} · ${imageModel.platform === 'mixed' ? 'Mixed scheduling' : imageModel.platform} · Asynchronous`,
+    })
+  )
+  await user.type(
+    screen.getByLabelText('Prompt'),
+    'Keep the subject consistent'
+  )
+  return user
+}
 
 beforeEach(() => {
   vi.stubGlobal('Blob', Blob)
@@ -91,6 +151,295 @@ test('resumes an image task after reopening the workbench for its owner', async 
   )
   expect(await screen.findByText('image_in_progress')).toBeVisible()
   expect(screen.getByRole('combobox', { name: 'API Key' })).toBeDisabled()
+  expect(screen.getByLabelText('Reference image URLs')).toBeDisabled()
+})
+
+test('accepts multiple reference URLs in one field and submits trimmed lines in order', async () => {
+  const user = await prepareImageSubmission()
+  const references = screen.getByRole('textbox', {
+    name: 'Reference image URLs',
+  })
+  expect(references.tagName).toBe('TEXTAREA')
+  expect(
+    screen.getAllByRole('textbox', { name: 'Reference image URLs' })
+  ).toHaveLength(1)
+  expect(references).toHaveAccessibleDescription(
+    'Paste one image URL per line. Blank lines are ignored.'
+  )
+  expect(
+    screen.queryByRole('button', { name: /^(?:Add )?Image URL$/ })
+  ).not.toBeInTheDocument()
+
+  await user.click(references)
+  await user.paste(
+    '  https://cdn.example/first.png  \r\n\r\n  \nhttps://cdn.example/second.png\n'
+  )
+  await user.click(screen.getByRole('button', { name: 'Add text part' }))
+  await user.type(screen.getByLabelText('Text part'), 'Use the second palette')
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0]?.[2]))
+      .messages[0].content
+  ).toEqual([
+    { type: 'text', text: 'Keep the subject consistent' },
+    { type: 'image_url', image_url: { url: 'https://cdn.example/first.png' } },
+    { type: 'image_url', image_url: { url: 'https://cdn.example/second.png' } },
+    { type: 'text', text: 'Use the second palette' },
+  ])
+})
+
+test('ignores an empty reference field when generating from text alone', async () => {
+  const user = await prepareImageSubmission()
+  await user.type(screen.getByLabelText('Reference image URLs'), ' \n  \n')
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0]?.[2]))
+      .messages[0].content
+  ).toEqual([{ type: 'text', text: 'Keep the subject consistent' }])
+})
+
+test('mixed image selection shows shared limits and submits references without fixing a provider', async () => {
+  const user = await prepareImageSubmission({
+    ...referenceImageModel,
+    id: 'seedream-5-pro',
+    label: 'Seedream',
+    platform: 'mixed',
+    protocol: 'openai_images',
+    supports_edit: true,
+    capability: {
+      resolutions: ['1K', '2K'],
+      max_output_images: 2,
+      max_reference_images: 3,
+    },
+  })
+  expect(
+    screen.getByRole('spinbutton', { name: 'Image count' })
+  ).toHaveAttribute('max', '2')
+  expect(
+    screen.queryByRole('combobox', { name: 'Quality' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByText(/Mixed scheduling accepts asynchronous image requests/)
+  ).toBeVisible()
+  await user.type(
+    screen.getByLabelText('Reference image URLs'),
+    'https://cdn.example/cabinet.png'
+  )
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  const [endpoint, , body] = imageApiMocks.imageRelayRequest.mock.calls[0]
+  expect(endpoint).toBe('/v1/images/edits_async')
+  expect(JSON.parse(String(body))).toMatchObject({
+    model: 'seedream-5-pro',
+    resolution: '1K',
+    n: 1,
+    images: [{ image_url: 'https://cdn.example/cabinet.png' }],
+  })
+  expect(JSON.parse(String(body))).not.toHaveProperty('provider')
+  expect(JSON.parse(String(body))).not.toHaveProperty('platform')
+})
+
+test('a mixed model limited to 2K selects and submits its supported resolution', async () => {
+  const user = await prepareImageSubmission({
+    ...referenceImageModel,
+    id: 'mixed-2k',
+    label: 'Mixed 2K',
+    platform: 'mixed',
+    protocol: 'openai_images',
+    capability: {
+      max_output_images: 1,
+      max_reference_images: 3,
+      resolutions: ['2K'],
+    },
+  })
+
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution' })
+  ).toHaveTextContent('2K')
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
+  ).toMatchObject({ model: 'mixed-2k', resolution: '2K' })
+})
+
+test.each(['newapi', 'volcengine', 'gemini'])(
+  'an OpenAI images model on %s exposes and submits its supported output count',
+  async (provider) => {
+    const user = await prepareImageSubmission({
+      ...referenceImageModel,
+      id: 'batch-image',
+      label: 'Batch image',
+      platform: provider,
+      provider,
+      protocol: 'openai_images',
+      capability: {
+        max_output_images: 4,
+        max_reference_images: 3,
+        resolutions: ['1K'],
+      },
+    })
+    const count = screen.getByRole('spinbutton', { name: 'Image count' })
+    expect(count).toHaveAttribute('max', '4')
+    await user.clear(count)
+    await user.type(count, '3')
+    await user.click(screen.getByRole('button', { name: 'Generate image' }))
+    await waitFor(() =>
+      expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+    )
+    expect(
+      JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
+    ).toMatchObject({ provider, n: 3 })
+  }
+)
+
+test('Gemini native requests keep a single output even when the catalog limit is larger', async () => {
+  const user = await prepareImageSubmission({
+    ...referenceImageModel,
+    platform: 'vertex',
+    provider: 'vertex',
+    protocol: 'gemini_native',
+    capability: { max_output_images: 4, max_reference_images: 3 },
+  })
+  expect(
+    screen.queryByRole('spinbutton', { name: 'Image count' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
+  ).toMatchObject({ provider: 'vertex', n: 1 })
+})
+
+test('waits for all uploaded references before generating and preserves their selected order', async () => {
+  const user = await prepareImageSubmission()
+  const readers: FileReader[] = []
+  const NativeFileReader = FileReader
+  vi.stubGlobal(
+    'FileReader',
+    class extends NativeFileReader {
+      override readAsDataURL() {
+        readers.push(this)
+      }
+    }
+  )
+  const upload = screen.getByLabelText('Upload reference image')
+  await user.upload(upload, [
+    new File(['first'], 'first.png', { type: 'image/png' }),
+    new File(['second'], 'second.png', { type: 'image/png' }),
+  ])
+
+  expect(readers).toHaveLength(2)
+  const loadingButton = screen.getByRole('button', { name: 'Loading...' })
+  expect(loadingButton).toBeDisabled()
+  expect(upload).toBeDisabled()
+  expect(screen.getByLabelText('Reference image URLs')).toBeDisabled()
+  await user.click(loadingButton)
+  expect(imageApiMocks.imageRelayRequest).not.toHaveBeenCalled()
+
+  await act(async () => {
+    Object.defineProperty(readers[1], 'result', {
+      value: 'data:image/png;base64,c2Vjb25k',
+    })
+    readers[1].dispatchEvent(new ProgressEvent('load'))
+  })
+  expect(screen.getByRole('button', { name: 'Loading...' })).toBeDisabled()
+  expect(screen.getByLabelText('Reference image URLs')).toBeDisabled()
+  expect(imageApiMocks.imageRelayRequest).not.toHaveBeenCalled()
+
+  await act(async () => {
+    Object.defineProperty(readers[0], 'result', {
+      value: 'data:image/png;base64,Zmlyc3Q=',
+    })
+    readers[0].dispatchEvent(new ProgressEvent('load'))
+  })
+
+  expect(screen.getByRole('button', { name: 'Generate image' })).toBeEnabled()
+  expect(upload).toBeEnabled()
+  expect(screen.getByLabelText('Reference image URLs')).toBeEnabled()
+  expect(await screen.findAllByAltText('Reference image')).toHaveLength(2)
+  await user.click(screen.getByRole('button', { name: 'Add text part' }))
+  await user.type(screen.getByLabelText('Text part'), 'Preserve both subjects')
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0]?.[2]))
+      .messages[0].content
+  ).toEqual([
+    { type: 'text', text: 'Keep the subject consistent' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+    { type: 'text', text: 'Preserve both subjects' },
+  ])
+})
+
+test('disables reference editing while an image submission is pending', async () => {
+  const user = await prepareImageSubmission()
+  keyApiMocks.fetchTokenKey.mockReturnValue(new Promise(() => {}))
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  expect(
+    await screen.findByRole('button', { name: 'Submitting' })
+  ).toBeDisabled()
+  expect(screen.getByLabelText('Reference image URLs')).toBeDisabled()
+})
+
+test('switches media with the keyboard and shows a named results area and empty state for each tab', async () => {
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+
+  const tabs = screen.getByRole('tablist', { name: 'Media type' })
+  const imageTab = within(tabs).getByRole('tab', { name: 'Image' })
+  const videoTab = within(tabs).getByRole('tab', { name: 'Video' })
+  expect(imageTab).toHaveAttribute('aria-selected', 'true')
+  expect(
+    screen.getByRole('form', { name: 'Image generation settings' })
+  ).toBeVisible()
+  expect(
+    within(screen.getByRole('region', { name: 'Results' })).getByText(
+      'Your images will appear here'
+    )
+  ).toBeVisible()
+
+  await user.click(imageTab)
+  await user.keyboard('{ArrowRight}')
+
+  expect(videoTab).toHaveFocus()
+  await user.keyboard('{Enter}')
+  expect(videoTab).toHaveAttribute('aria-selected', 'true')
+  expect(imageTab).toHaveAttribute('aria-selected', 'false')
+  expect(
+    within(screen.getByRole('region', { name: 'Results' })).getByText(
+      'Your videos will appear here'
+    )
+  ).toBeVisible()
+
+  await user.keyboard('{ArrowLeft}')
+  expect(imageTab).toHaveFocus()
+  await user.keyboard('{Enter}')
+  expect(imageTab).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByLabelText('Reference image URLs')).toBeVisible()
 })
 
 test.each(['image', 'video'] as const)(
@@ -167,7 +516,7 @@ test.each(['image', 'video'] as const)(
 )
 
 test('continues video polling while a failed save has a scheduled retry', async () => {
-  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
   sessionStorage.setItem('new-api:video-task:101', 'video_saving')
   imageApiMocks.getImageTask
     .mockResolvedValueOnce({
@@ -190,11 +539,13 @@ test('continues video polling while a failed save has a scheduled retry', async 
       <VideoWorkbench userId={101} />
     </QueryClientProvider>
   )
-  expect(await screen.findByText(/Storage failed/)).toBeVisible()
+  expect(await screen.findByRole('status')).toHaveTextContent('Storage failed')
   await act(async () => {
     await vi.advanceTimersByTimeAsync(3100)
   })
-  expect(await screen.findByText(/Succeeded/)).toBeVisible()
+  await waitFor(() =>
+    expect(screen.getByRole('status')).toHaveTextContent('Succeeded')
+  )
 })
 
 test('keeps the model-dependent form inside the remaining scrollable page height', () => {

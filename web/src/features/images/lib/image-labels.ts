@@ -24,6 +24,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   async_disabled: 'Asynchronous generation is disabled',
   model_not_in_policy: 'Model is not in the media policy',
   resolution_not_in_policy: 'Resolution is not in the media policy',
+  mixed_pool_missing: 'No mixed channel pool binding is configured',
   token_disabled: 'API key is disabled',
   token_expired: 'API key has expired',
   token_exhausted: 'API key quota is exhausted',
@@ -35,6 +36,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   platform_mismatch: 'Channel provider does not match',
   resolution_mapping_missing: 'Resolution mapping is missing',
   operation_not_supported: 'Generation mode is not supported',
+  image_parameters_not_supported: 'Image parameters are not supported',
   video_parameters_not_supported: 'Video parameters are not supported',
   not_in_pool: 'Channel is outside this pool',
   no_enabled_account: 'No enabled account is available',
@@ -188,6 +190,14 @@ export const IMAGE_LABELS: Record<string, string> = {
 }
 export function imageLabel(value: string): string {
   return IMAGE_LABELS[value] || value
+}
+
+export function imageRoutingPlatforms(providers?: string[]): string[] {
+  return [...new Set([...(providers || ['openai', 'gemini']), 'mixed'])]
+}
+
+export function imagePlatformLabel(value: string): string {
+  return value === 'mixed' ? 'Mixed scheduling' : value
 }
 export function imageTimelineLabel(event: {
   event_type?: string

@@ -182,6 +182,10 @@ type RelayInfo struct {
 	// ImageQuotaBeforeGroup is the frozen legacy estimate before request ratios.
 	ImageRequestCount     int
 	ImageQuotaBeforeGroup float64
+	// ImageMixedBilling keeps the public image price independent of the
+	// executing provider's legacy quantity and prompt-extension surcharges.
+	// It is reconstructed from the encrypted task routing state, never client JSON.
+	ImageMixedBilling bool
 
 	Request dto.Request
 

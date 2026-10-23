@@ -72,7 +72,11 @@ export function ImagePlatformBadge(props: {
       <span className='flex size-3.5 shrink-0 items-center justify-center'>
         {getLobeIcon(visual.iconKey, 14)}
       </span>
-      {t(imageLabel(props.platform))}
+      {t(
+        props.platform === 'mixed'
+          ? 'Mixed scheduling'
+          : imageLabel(props.platform)
+      )}
     </span>
   )
 }

@@ -137,6 +137,23 @@ function imagePolicyExample(platform: string): string {
   if (normalizedPlatform === 'vertex') {
     return JSON.stringify(VERTEX_MODEL_EXAMPLE, null, 2)
   }
+  if (normalizedPlatform === 'mixed') {
+    return JSON.stringify(
+      [
+        {
+          id: 'seedream-5-pro',
+          label: 'seedream-5-pro',
+          media_type: 'image',
+          resolutions: ['1K', '2K'],
+          max_output_images: 1,
+          max_reference_images: 8,
+          allow_half_k: false,
+        },
+      ],
+      null,
+      2
+    )
+  }
 
   const model =
     PROVIDER_MODEL_EXAMPLES[normalizedPlatform] ||
@@ -160,7 +177,9 @@ function imagePolicyExample(platform: string): string {
 export function ImagePolicyExampleDialog(props: { platform: string }) {
   const { t } = useTranslation()
   const example = imagePolicyExample(props.platform)
-  const platformLabel = t(imageLabel(props.platform))
+  const platformLabel = t(
+    props.platform === 'mixed' ? 'Mixed scheduling' : imageLabel(props.platform)
+  )
   const normalizedPlatform = props.platform.trim().toLowerCase()
   const isGemini = normalizedPlatform === 'gemini'
   const isVertex = normalizedPlatform === 'vertex'
@@ -240,6 +259,13 @@ export function ImagePolicyExampleDialog(props: { platform: string }) {
           <p>
             {t(
               'Gemini-native models generate one image per request. Keep max_output_images at 1; Imagen models do not accept reference images.'
+            )}
+          </p>
+        )}
+        {normalizedPlatform === 'mixed' && (
+          <p>
+            {t(
+              'Use the public model alias and capabilities shared by all pool members. Configure its price before enabling mixed scheduling.'
             )}
           </p>
         )}

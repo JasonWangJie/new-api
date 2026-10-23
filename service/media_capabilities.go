@@ -42,6 +42,24 @@ func RegisteredImageProvider(provider string) bool {
 
 var FreezeAsyncImageBillingFunc func(context.Context, model.Token, AsyncImageRequest, string, *model.Channel) (MediaBillingSnapshot, error)
 
+// ValidateMixedImageChannelRequestFunc validates provider parameters locally,
+// before a mixed pool assigns weight or creates an upstream submission.
+var ValidateMixedImageChannelRequestFunc func(model.Channel, AsyncImageRequest) error
+
+// ImageRoutingPlatform includes the administrative mixed routing scope without
+// registering it as an upstream provider or accepting provider=mixed publicly.
+func ImageRoutingPlatform(platform string) bool {
+	return platform == "mixed" || RegisteredMediaProvider(platform)
+}
+
+func MixedImageChannelRequestSupported(channel model.Channel, request AsyncImageRequest) bool {
+	capability := ImageChannelCapability(channel, request.Model)
+	if !ImageChannelSupportsPlatform(channel, request.Model, "mixed") || !ImageCapabilitySupportsRequest(capability, request) || request.ReferenceImageCount() > channel.GetImageMaxReferenceImages() {
+		return false
+	}
+	return ValidateMixedImageChannelRequestFunc == nil || ValidateMixedImageChannelRequestFunc(channel, request) == nil
+}
+
 func RegisteredImageProviders() []string {
 	providers := make([]string, 0)
 	seen := make(map[string]bool)
@@ -62,7 +80,7 @@ func ImageCapabilitySupportsRequest(capability dto.ImageCapability, request Asyn
 	if request.Kind != "image_to_image" {
 		return true
 	}
-	return capability.Edit || capability.ReferenceField != "" && request.Dialect == "async" && strings.HasSuffix(request.SourcePath, "generations_async")
+	return capability.Edit || capability.ReferenceField != "" && request.Dialect == "async"
 }
 
 func RegisteredMediaProviders() []string {

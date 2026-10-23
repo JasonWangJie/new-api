@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -76,6 +77,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	if err != nil {
 		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
+	validatedImageCount := imageCount
 	promptExtend := request.BillingParameters != nil && request.BillingParameters.PromptExtend != nil && *request.BillingParameters.PromptExtend
 
 	var requestBody io.Reader
@@ -93,7 +95,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			if err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
-			if mapped := c.GetString(asyncImageResolutionModelContextKey); mapped != "" {
+			mapped := c.GetString(asyncImageResolutionModelContextKey)
+			if info.ChannelType == constant.ChannelTypeVolcEngine || info.ImageMixedBilling {
+				mapped = info.UpstreamModelName
+			}
+			if mapped != "" {
 				jsonData, err = sjson.SetBytes(jsonData, "model", mapped)
 				if err != nil {
 					return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
@@ -116,41 +122,25 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		case *bytes.Buffer:
 			requestBody = convertedRequest.(io.Reader)
 		default:
-			jsonData, err = common.Marshal(convertedRequest)
-			if err != nil {
-				return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-			}
-			if c.GetBool("async_image_execution") {
-				if info.ApiType != constant.APITypeAli && info.ApiType != constant.APITypeReplicate && info.ApiType != constant.APITypeGemini && info.ApiType != constant.APITypeVertexAi && info.ApiType != constant.APITypeXai {
-					var fields map[string]common.RawMessage
-					if err := common.Unmarshal(jsonData, &fields); err != nil {
-						return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
-					}
-					for key, value := range request.Extra {
-						fields[key] = value
-					}
-					jsonData, err = common.Marshal(fields)
-					if err != nil {
-						return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
-					}
-				}
-			}
-
-			// apply param override
-			requiresModel := gjson.GetBytes(jsonData, "model").Exists()
-			if len(info.ParamOverride) > 0 {
-				jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
-				if err != nil {
-					return nil, newAPIErrorFromParamOverride(err)
-				}
-			}
-			if err := validateAsyncImageResolutionModel(c, jsonData, requiresModel); err != nil {
-				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			jsonData, newAPIError = prepareImageJSONSubmission(c, info, request, convertedRequest)
+			if newAPIError != nil {
+				return nil, newAPIError
 			}
 
 		}
 	}
 	if jsonData != nil {
+		if info.ImageMixedBilling {
+			// A provider converter or channel override cannot change the mixed
+			// task's admitted quantity, including native Imagen sampleCount.
+			probe, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(jsonData))
+			if err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			if err := service.ValidateMixedImageSubmitCount(probe, validatedImageCount); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
 		// This is a different trust boundary from ingress: channel overrides
 		// and pass-through bodies can change the quantity actually submitted.
 		var outbound struct {
@@ -217,6 +207,12 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 			}
 		}
+		if info.ChannelType == constant.ChannelTypeVolcEngine {
+			jsonData, err = volcengine.PrepareImageSubmission(jsonData, info.UpstreamModelName, imageCount, c.GetBool("async_image_execution"))
+			if err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
 		if c.GetBool("async_image_execution") && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
 			if err := service.ValidateTianyueImageSubmission(jsonData, imageCount); err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -254,6 +250,29 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeConvertRequestFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		if asyncProfile.Submit.Request.Body != nil {
+			if info.ChannelType == constant.ChannelTypeVolcEngine {
+				if submitRequest.GetBody == nil {
+					return nil, types.NewErrorWithStatusCode(fmt.Errorf("Seedream image submit body is unavailable"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				reader, readErr := submitRequest.GetBody()
+				if readErr != nil {
+					return nil, types.NewError(readErr, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+				}
+				encoded, readErr := io.ReadAll(io.LimitReader(reader, (64<<20)+1))
+				_ = reader.Close()
+				if readErr == nil && len(encoded) <= 64<<20 {
+					encoded, readErr = volcengine.PrepareImageSubmission(encoded, info.UpstreamModelName, imageCount, true)
+				} else if readErr == nil {
+					readErr = fmt.Errorf("Seedream image submit body exceeds the byte limit")
+				}
+				if readErr != nil {
+					return nil, types.NewErrorWithStatusCode(readErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
+				_ = submitRequest.Body.Close()
+				submitRequest.Body = io.NopCloser(bytes.NewReader(encoded))
+				submitRequest.ContentLength = int64(len(encoded))
+				submitRequest.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(encoded)), nil }
+			}
 			if info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
 				if submitRequest.GetBody == nil {
 					return nil, types.NewErrorWithStatusCode(fmt.Errorf("TianYue image submit body is unavailable"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -276,7 +295,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			if err := validateAsyncImageResolutionSubmitModel(c, submitRequest); err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
-			if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, imageCount); err != nil {
+			validateCount := service.ValidateUpstreamAsyncImageSubmitCount
+			if info.ImageMixedBilling {
+				validateCount = service.ValidateMixedImageSubmitCount
+			}
+			if err := validateCount(submitRequest, imageCount); err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
 		}
@@ -460,4 +483,37 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError
 	}
 	service.PostTextConsumeQuota(c, info, result.Usage, logContent)
 	return nil
+}
+
+// prepareImageJSONSubmission is shared by admission and dispatch. It performs
+// no I/O and applies the same native-field and administrator-override rules.
+func prepareImageJSONSubmission(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ImageRequest, converted any) ([]byte, *types.NewAPIError) {
+	data, err := common.Marshal(converted)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	if c.GetBool("async_image_execution") && info.ApiType != constant.APITypeAli && info.ApiType != constant.APITypeReplicate && info.ApiType != constant.APITypeGemini && info.ApiType != constant.APITypeVertexAi && info.ApiType != constant.APITypeXai {
+		var fields map[string]common.RawMessage
+		if err := common.Unmarshal(data, &fields); err != nil || fields == nil {
+			return nil, types.NewError(fmt.Errorf("image adaptor must produce a JSON object"), types.ErrorCodeConvertRequestFailed)
+		}
+		for key, value := range request.Extra {
+			fields[key] = value
+		}
+		data, err = common.Marshal(fields)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
+		}
+	}
+	requiresModel := gjson.GetBytes(data, "model").Exists()
+	if len(info.ParamOverride) > 0 {
+		data, err = relaycommon.ApplyParamOverrideWithRelayInfo(data, info)
+		if err != nil {
+			return nil, newAPIErrorFromParamOverride(err)
+		}
+	}
+	if err := validateAsyncImageResolutionModel(c, data, requiresModel); err != nil {
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	return data, nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -107,114 +108,18 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
-	switch info.RelayMode {
-	case constant.RelayModeImagesGenerations:
-		return request, nil
-	// 根据官方文档,并没有发现豆包生图支持表单请求:https://www.volcengine.com/docs/82379/1824121
-	//case constant.RelayModeImagesEdits:
-	//
-	//	var requestBody bytes.Buffer
-	//	writer := multipart.NewWriter(&requestBody)
-	//
-	//	writer.WriteField("model", request.Model)
-	//
-	//	formData := c.Request.PostForm
-	//	for key, values := range formData {
-	//		if key == "model" {
-	//			continue
-	//		}
-	//		for _, value := range values {
-	//			writer.WriteField(key, value)
-	//		}
-	//	}
-	//
-	//	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
-	//		return nil, errors.New("failed to parse multipart form")
-	//	}
-	//
-	//	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
-	//		var imageFiles []*multipart.FileHeader
-	//		var exists bool
-	//
-	//		if imageFiles, exists = c.Request.MultipartForm.File["image"]; !exists || len(imageFiles) == 0 {
-	//			if imageFiles, exists = c.Request.MultipartForm.File["image[]"]; !exists || len(imageFiles) == 0 {
-	//				foundArrayImages := false
-	//				for fieldName, files := range c.Request.MultipartForm.File {
-	//					if strings.HasPrefix(fieldName, "image[") && len(files) > 0 {
-	//						foundArrayImages = true
-	//						for _, file := range files {
-	//							imageFiles = append(imageFiles, file)
-	//						}
-	//					}
-	//				}
-	//
-	//				if !foundArrayImages && (len(imageFiles) == 0) {
-	//					return nil, errors.New("image is required")
-	//				}
-	//			}
-	//		}
-	//
-	//		for i, fileHeader := range imageFiles {
-	//			file, err := fileHeader.Open()
-	//			if err != nil {
-	//				return nil, fmt.Errorf("failed to open image file %d: %w", i, err)
-	//			}
-	//			defer file.Close()
-	//
-	//			fieldName := "image"
-	//			if len(imageFiles) > 1 {
-	//				fieldName = "image[]"
-	//			}
-	//
-	//			mimeType := detectImageMimeType(fileHeader.Filename)
-	//
-	//			h := make(textproto.MIMEHeader)
-	//			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, fileHeader.Filename))
-	//			h.Set("Content-Type", mimeType)
-	//
-	//			part, err := writer.CreatePart(h)
-	//			if err != nil {
-	//				return nil, fmt.Errorf("create form part failed for image %d: %w", i, err)
-	//			}
-	//
-	//			if _, err := io.Copy(part, file); err != nil {
-	//				return nil, fmt.Errorf("copy file failed for image %d: %w", i, err)
-	//			}
-	//		}
-	//
-	//		if maskFiles, exists := c.Request.MultipartForm.File["mask"]; exists && len(maskFiles) > 0 {
-	//			maskFile, err := maskFiles[0].Open()
-	//			if err != nil {
-	//				return nil, errors.New("failed to open mask file")
-	//			}
-	//			defer maskFile.Close()
-	//
-	//			mimeType := detectImageMimeType(maskFiles[0].Filename)
-	//
-	//			h := make(textproto.MIMEHeader)
-	//			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename="%s"`, maskFiles[0].Filename))
-	//			h.Set("Content-Type", mimeType)
-	//
-	//			maskPart, err := writer.CreatePart(h)
-	//			if err != nil {
-	//				return nil, errors.New("create form file failed for mask")
-	//			}
-	//
-	//			if _, err := io.Copy(maskPart, maskFile); err != nil {
-	//				return nil, errors.New("copy mask file failed")
-	//			}
-	//		}
-	//	} else {
-	//		return nil, errors.New("no multipart form data found")
-	//	}
-	//
-	//	writer.Close()
-	//	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
-	//	return bytes.NewReader(requestBody.Bytes()), nil
-
-	default:
-		return request, nil
+	// Ark uses the same JSON endpoint for generation and reference-image edits.
+	// Preserve native options that are not represented by the OpenAI image DTO.
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return nil, err
 	}
+	var fields map[string]common.RawMessage
+	if err := common.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	maps.Copy(fields, request.Extra)
+	return fields, nil
 }
 
 func detectImageMimeType(filename string) string {
@@ -404,5 +309,13 @@ func (a *Adaptor) GetChannelName() string {
 }
 
 func (a *Adaptor) ImageCapability(model string) dto.ImageCapability {
-	return dto.ImageCapability{Models: []string{"doubao-seedream-*", "seedream-*"}, Parameters: []string{"model", "prompt", "n", "size", "response_format", "image", "seed", "watermark", "sequential_image_generation", "sequential_image_generation_options", "provider_extensions"}, ReferenceField: "image", Provider: "volcengine", Protocol: "openai_images", Generate: true, Edit: false}
+	parameters := []string{"model", "prompt", "n", "size", "response_format", "image", "seed", "watermark", "output_format", "provider_extensions"}
+	name := strings.TrimPrefix(strings.ToLower(model), "doubao-")
+	if !strings.HasPrefix(name, "seedream-5-0-pro-") && !strings.HasPrefix(name, "seedream-5-0-flash-") {
+		parameters = append(parameters, "sequential_image_generation", "sequential_image_generation_options")
+	}
+	if strings.HasPrefix(name, "seedream-5-0-") && !strings.HasPrefix(name, "seedream-5-0-pro-") && !strings.HasPrefix(name, "seedream-5-0-flash-") {
+		parameters = append(parameters, "web_search")
+	}
+	return dto.ImageCapability{Models: []string{"doubao-seedream-*", "seedream-*"}, Parameters: parameters, ReferenceField: "image", Provider: "volcengine", Protocol: "openai_images", Generate: true, Edit: false, TokenUsage: true, OpenAICompatibleRequest: true}
 }

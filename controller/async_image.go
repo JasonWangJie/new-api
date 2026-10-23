@@ -101,6 +101,10 @@ func SubmitAsyncImage(c *gin.Context) {
 			return
 		}
 	}
+	if err := service.PrepareMixedImageAdmission(ctx, token, &request); err != nil {
+		AsyncImagePublicError(c, 403, "async_image_unavailable", err.Error())
+		return
+	}
 	policy, _, err := service.ValidateAsyncImageEligibility(ctx, token, request, cfg)
 	if err != nil {
 		var invalid *service.AsyncImageFailure
@@ -124,6 +128,20 @@ func SubmitAsyncImage(c *gin.Context) {
 	if request.Dialect == "async" {
 		request.PolicyPlatform = policy.Platform
 		request.ClientIP = c.ClientIP()
+		if service.FreezeAsyncImageBillingFunc == nil {
+			AsyncImagePublicError(c, 503, "pricing_unavailable", "Image pricing is unavailable")
+			return
+		}
+		if request.MixedRouting != nil {
+			// Freeze the public alias before assigning channel weights, so an
+			// incompatible usage contract cannot displace a billable candidate.
+			billing, err := service.FreezeAsyncImageBillingFunc(ctx, token, request, task.Group, nil)
+			if err != nil {
+				AsyncImagePublicError(c, 400, "pricing_unavailable", err.Error())
+				return
+			}
+			request.Billing = &billing
+		}
 		selected, _, err := service.PickImageChannel(ctx, policy, request, service.ImageAccountRouting{})
 		if err != nil {
 			AsyncImagePublicError(c, 503, "channel_unavailable", err.Error())
@@ -131,7 +149,9 @@ func SubmitAsyncImage(c *gin.Context) {
 		}
 		capability := service.ImageChannelCapability(*selected, request.Model)
 		task.Provider, task.ExecutionProtocol, task.ChannelId = capability.Provider, capability.Protocol, selected.Id
-		request.Provider = capability.Provider
+		if request.MixedRouting == nil {
+			request.Provider = capability.Provider
+		}
 		if capability.Protocol == "gemini_native" {
 			request.Platform = "gemini"
 		} else {
@@ -145,16 +165,14 @@ func SubmitAsyncImage(c *gin.Context) {
 			AsyncImagePublicError(c, 503, "encryption_unavailable", "Image channel could not be frozen")
 			return
 		}
-		if service.FreezeAsyncImageBillingFunc == nil {
-			AsyncImagePublicError(c, 503, "pricing_unavailable", "Image pricing is unavailable")
-			return
+		if request.Billing == nil {
+			billing, err := service.FreezeAsyncImageBillingFunc(ctx, token, request, task.Group, selected)
+			if err != nil {
+				AsyncImagePublicError(c, 400, "pricing_unavailable", err.Error())
+				return
+			}
+			request.Billing = &billing
 		}
-		billing, err := service.FreezeAsyncImageBillingFunc(ctx, token, request, task.Group, selected)
-		if err != nil {
-			AsyncImagePublicError(c, 400, "pricing_unavailable", err.Error())
-			return
-		}
-		request.Billing = &billing
 		task.Platform = request.Platform
 	}
 	if urls := request.ReferenceURLs(); len(urls) > 0 {
