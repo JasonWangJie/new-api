@@ -145,7 +145,7 @@ test('saved pool partitions start collapsed until their header is expanded', asy
   renderPool([savedBinding])
 
   const partition = screen.getByRole('button', {
-    name: /premium.*gemini.*All resolutions/,
+    name: /premium.*gemini/,
   })
   expect(partition).toHaveAttribute('aria-expanded', 'false')
   expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
@@ -191,30 +191,34 @@ test('keyboard and toolbar controls expand and collapse pool partitions', async 
   expect(screen.queryByRole('table')).not.toBeInTheDocument()
 })
 
-test('refreshing pool data preserves expanded partitions while new partitions stay collapsed', async () => {
+test('refreshing pool data keeps added resolutions inside expanded partitions while new partitions stay collapsed', async () => {
   const user = userEvent.setup()
   const { refreshPools } = renderPool([savedBinding])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
 
   refreshPools([
     savedBinding,
-    { ...savedBinding, binding_key: 'another-model', model: 'image-gamma' },
+    {
+      ...savedBinding,
+      binding_key: 'another-resolution',
+      mode: 'model_resolution',
+      resolution: '4K',
+    },
     { ...savedBinding, binding_key: 'default-pool', group: 'default' },
   ])
 
   expect(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
+    screen.getByRole('button', { name: /premium.*gemini/ })
   ).toHaveAttribute('aria-expanded', 'true')
   expect(
-    screen.getByRole('button', { name: /default.*gemini.*All resolutions/ })
+    screen.getByRole('button', { name: /default.*gemini/ })
   ).toHaveAttribute('aria-expanded', 'false')
   expect(screen.getAllByRole('table')).toHaveLength(1)
   const table = screen.getByRole('table', {
-    name: 'premium / gemini / All resolutions',
+    name: 'premium / gemini',
   })
-  expect(within(table).getByRole('cell', { name: 'image-gamma' })).toBeVisible()
+  expect(within(table).getAllByRole('row')).toHaveLength(3)
+  expect(within(table).getByRole('cell', { name: '4K' })).toBeVisible()
 })
 
 test('an empty channel pool disables expanding all and still offers adding a binding', () => {
@@ -233,7 +237,7 @@ test('an empty channel pool disables expanding all and still offers adding a bin
   ).not.toBeInTheDocument()
 })
 
-test('pool partitions sort by group, platform and resolution while their bindings keep natural model order and merged channels', async () => {
+test('pool partitions group all resolutions by group and platform while bindings keep natural model and resolution order', async () => {
   vi.mocked(imageRequest).mockResolvedValue(openAIOptions)
   const binding = {
     group: 'default',
@@ -282,47 +286,48 @@ test('pool partitions sort by group, platform and resolution while their binding
 
   const partitions = screen.getAllByRole('button', { expanded: false })
   const expectedOrder = [
-    /default.*gemini.*2K/,
-    /default.*openai.*All resolutions/,
-    /default.*openai.*1K/,
-    /default.*openai.*2K/,
-    /default.*openai.*4K/,
-    /default.*openai.*10K/,
-    /premium.*openai.*1K/,
+    /default.*gemini/,
+    /default.*openai/,
+    /premium.*openai/,
   ]
   expect(partitions).toHaveLength(expectedOrder.length)
   for (const [index, name] of expectedOrder.entries()) {
     expect(partitions[index]).toHaveAccessibleName(name)
   }
+  expect(partitions[1]).not.toHaveTextContent(/All resolutions|\d+K/)
   expect(
-    within(partitions[2]).getByLabelText('Pool binding: 2')
-  ).toHaveTextContent('2')
-  expect(
-    within(partitions[3]).getByLabelText('Pool binding: 1')
-  ).toHaveTextContent('1')
+    within(partitions[1]).getByLabelText('Pool binding: 6')
+  ).toHaveTextContent('6')
   expect(screen.queryByRole('table')).not.toBeInTheDocument()
 
   const user = userEvent.setup()
-  await user.click(partitions[2])
+  await user.click(partitions[1])
   const modelTable = screen.getByRole('table', {
-    name: 'default / openai / 1K',
+    name: 'default / openai',
   })
   const rows = within(modelTable).getAllByRole('row').slice(1)
   expect(
-    rows.map((row) => within(row).getAllByRole('cell')[1].textContent)
-  ).toEqual(['image-2', 'image-10'])
+    rows.map((row) =>
+      within(row)
+        .getAllByRole('cell')
+        .slice(1, 3)
+        .map((cell) => cell.textContent)
+    )
+  ).toEqual([
+    ['image-2', 'All resolutions'],
+    ['image-2', '1K'],
+    ['image-2', '2K'],
+    ['image-2', '4K'],
+    ['image-2', '10K'],
+    ['image-10', '1K'],
+  ])
   expect(
     within(modelTable)
       .getAllByRole('columnheader')
       .map((header) => header.textContent)
-  ).toEqual(['Pool binding', 'Model', 'Channel', 'Actions'])
+  ).toEqual(['Pool binding', 'Model', 'Resolution', 'Channel', 'Actions'])
 
-  await user.click(partitions[3])
-  const mergedTable = screen.getByRole('table', {
-    name: 'default / openai / 2K',
-  })
-  expect(within(mergedTable).getAllByRole('row')).toHaveLength(2)
-  const mergedRow = within(mergedTable).getAllByRole('row')[1]
+  const mergedRow = rows[2]
   expect(within(mergedRow).getByText('11 (7), 22 (3)')).toBeVisible()
 
   await user.click(within(mergedRow).getByRole('button', { name: 'Edit' }))
@@ -337,6 +342,47 @@ test('pool partitions sort by group, platform and resolution while their binding
   ).toHaveTextContent('2K')
   expect(screen.getByRole('spinbutton', { name: 'Weight 11' })).toHaveValue(7)
   expect(screen.getByRole('spinbutton', { name: 'Weight 22' })).toHaveValue(3)
+})
+
+test('deleting a resolution binding in a shared partition targets its binding key', async () => {
+  vi.mocked(imageRequest).mockResolvedValue(undefined)
+  const user = userEvent.setup()
+  const { onSuccess } = renderPool([
+    {
+      ...savedBinding,
+      binding_key: 'image-beta-1k',
+      mode: 'model_resolution',
+      resolution: '1K',
+    },
+    {
+      ...savedBinding,
+      binding_key: 'image-beta-2k',
+      mode: 'model_resolution',
+      resolution: '2K',
+    },
+  ])
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  const table = screen.getByRole('table', { name: 'premium / gemini' })
+  const row = within(table).getByRole('row', { name: /image-beta 2K/ })
+
+  await user.click(within(row).getByRole('button', { name: 'Delete' }))
+  const dialog = screen.getByRole('alertdialog', {
+    name: 'Delete channel pool binding',
+  })
+  expect(dialog).toHaveTextContent('image-beta · 2K')
+  await user.click(within(dialog).getByRole('button', { name: 'Delete' }))
+
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool/image-beta-2k',
+      'DELETE'
+    )
+  )
+  expect(imageRequest).not.toHaveBeenCalledWith(
+    '/api/option/images/pool/image-beta-1k',
+    'DELETE'
+  )
+  await waitFor(() => expect(onSuccess).toHaveBeenCalledOnce())
 })
 
 test('switching platform replaces the selectable models and channels', async () => {
@@ -422,9 +468,7 @@ test.each([7, -3])(
       },
     ])
 
-    await user.click(
-      screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-    )
+    await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
     await user.click(screen.getByRole('button', { name: 'Edit' }))
 
     await waitFor(() =>
@@ -477,9 +521,7 @@ test.each(['Cancel', 'Escape'])(
   async (dismiss) => {
     const user = userEvent.setup()
     renderPool([savedBinding])
-    await user.click(
-      screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-    )
+    await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
     const edit = screen.getByRole('button', { name: 'Edit' })
     await user.click(edit)
     const weight = await screen.findByRole('spinbutton', { name: 'Weight 22' })
@@ -514,9 +556,7 @@ test.each(['Cancel', 'Escape'])(
 test('a failed pool save keeps the dialog and draft available for retry', async () => {
   const user = userEvent.setup()
   const { onSuccess } = renderPool([savedBinding])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   const weight = screen.getByRole('spinbutton', { name: 'Weight 22' })
   await user.clear(weight)
@@ -551,9 +591,7 @@ test('a pending pool save blocks dismissal and duplicate submissions until it su
     finish = resolve
   })
   const { onSuccess } = renderPool([savedBinding])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   const save = screen.getByRole('button', { name: 'Save' })
   await waitFor(() => expect(save).toBeEnabled())
@@ -588,9 +626,7 @@ test('copying a binding into another group replaces choices and preserves the so
   })
   const user = userEvent.setup()
   renderPool([savedBinding])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   await waitFor(() =>
     expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
@@ -654,9 +690,7 @@ test('copying a binding into another group replaces choices and preserves the so
 test('reopening a closed binding submits the original placeholder row ID for concurrency protection', async () => {
   const user = userEvent.setup()
   renderPool([{ ...savedBinding, id: 50, channel_id: 0 }])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*gemini.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   expect(screen.getByRole('status')).toHaveTextContent(
     'Saving an empty channel list closes this binding to new requests.'
@@ -687,9 +721,7 @@ test('copying a pool to mixed scheduling preserves channels and weights without 
   })
   const user = userEvent.setup()
   renderPool([{ ...savedBinding, platform: 'newapi' }])
-  await user.click(
-    screen.getByRole('button', { name: /premium.*newapi.*All resolutions/ })
-  )
+  await user.click(screen.getByRole('button', { name: /premium.*newapi/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   await user.click(screen.getByRole('button', { name: 'Copy binding' }))
   await user.click(screen.getByRole('combobox', { name: 'Platform' }))

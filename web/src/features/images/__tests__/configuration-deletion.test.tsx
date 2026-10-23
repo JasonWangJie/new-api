@@ -158,9 +158,7 @@ test.each(cases)(
     renderSettings()
     await user.click(await screen.findByRole('tab', { name: tab }))
     if (tab === 'Channel pools') {
-      await user.click(
-        screen.getByRole('button', { name: /default.*gemini.*1K/ })
-      )
+      await user.click(screen.getByRole('button', { name: /default.*gemini/ }))
     }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
@@ -238,9 +236,7 @@ test.each(cases)(
     renderSettings(true, () => pending)
     await user.click(await screen.findByRole('tab', { name: tab }))
     if (tab === 'Channel pools') {
-      await user.click(
-        screen.getByRole('button', { name: /default.*gemini.*1K/ })
-      )
+      await user.click(screen.getByRole('button', { name: /default.*gemini/ }))
     }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
@@ -282,9 +278,7 @@ test.each(cases)(
     })
     await user.click(await screen.findByRole('tab', { name: tab }))
     if (tab === 'Channel pools') {
-      await user.click(
-        screen.getByRole('button', { name: /default.*gemini.*1K/ })
-      )
+      await user.click(screen.getByRole('button', { name: /default.*gemini/ }))
     }
     await user.click(screen.getByRole('button', { name: 'Delete' }))
     const dialog = screen.getByRole('alertdialog', { name: title })
@@ -313,9 +307,7 @@ test.each(cases)(
     renderSettings(false)
     await user.click(await screen.findByRole('tab', { name: tab }))
     if (tab === 'Channel pools') {
-      await user.click(
-        screen.getByRole('button', { name: /default.*gemini.*1K/ })
-      )
+      await user.click(screen.getByRole('button', { name: /default.*gemini/ }))
     }
     const remove = screen.getByRole('button', { name: 'Delete' })
     expect(remove).toBeDisabled()

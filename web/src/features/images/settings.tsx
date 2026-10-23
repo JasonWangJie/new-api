@@ -1221,16 +1221,11 @@ export function ImagePoolForm({
         key: string
         group: string
         platform: string
-        resolution: string
         bindings: ImagePoolBinding[]
       }
     >()
     for (const binding of bindings) {
-      const key = JSON.stringify([
-        binding.group,
-        binding.platform,
-        binding.resolution,
-      ])
+      const key = JSON.stringify([binding.group, binding.platform])
       const section = grouped.get(key)
       if (section) {
         section.bindings.push(binding)
@@ -1239,7 +1234,6 @@ export function ImagePoolForm({
           key,
           group: binding.group,
           platform: binding.platform,
-          resolution: binding.resolution,
           bindings: [binding],
         })
       }
@@ -1248,8 +1242,7 @@ export function ImagePoolForm({
     return [...grouped.values()].sort(
       (a, b) =>
         collator.compare(a.group, b.group) ||
-        collator.compare(a.platform, b.platform) ||
-        collator.compare(a.resolution, b.resolution)
+        collator.compare(a.platform, b.platform)
     )
   }, [bindings])
   const expandedKeys = new Set(expanded)
@@ -1266,6 +1259,11 @@ export function ImagePoolForm({
       id: 'model',
       header: t('Model'),
       cell: (binding) => binding.model || '—',
+    },
+    {
+      id: 'resolution',
+      header: t('Resolution'),
+      cell: (binding) => binding.resolution || t('All resolutions'),
     },
     {
       id: 'channels',
@@ -1371,12 +1369,6 @@ export function ImagePoolForm({
                   >
                     {t(imagePlatformLabel(section.platform))}
                   </Badge>
-                  <Badge
-                    variant='secondary'
-                    className='h-auto min-h-5 max-w-full whitespace-normal'
-                  >
-                    {section.resolution || t('All resolutions')}
-                  </Badge>
                 </span>
                 <Badge
                   variant='secondary'
@@ -1390,7 +1382,7 @@ export function ImagePoolForm({
                   data={section.bindings}
                   getRowKey={(binding) => binding.binding_key}
                   tableProps={{
-                    'aria-label': `${section.group} / ${section.platform} / ${section.resolution || t('All resolutions')}`,
+                    'aria-label': `${section.group} / ${section.platform}`,
                   }}
                   columns={columns}
                 />
