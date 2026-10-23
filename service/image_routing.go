@@ -789,7 +789,7 @@ type ImageAccount struct {
 	Key                   string `json:"-"`
 }
 
-var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the requested size or resolution")
+var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the request")
 
 type ImageAccountRouting struct {
 	Pin                     string
@@ -1135,7 +1135,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 				routing.TimedOutCredentials = append(routing.TimedOutCredentials, attempt.CredentialFingerprint)
 			}
 		}
-		if attempt.FinishedAt > 0 && attempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage) {
+		if imageAttemptCompatibilityCode(attempt) != "" {
 			if attempt.KeyFingerprint != "" && !slices.Contains(routing.IncompatibleAccounts, attempt.KeyFingerprint) {
 				routing.IncompatibleAccounts = append(routing.IncompatibleAccounts, attempt.KeyFingerprint)
 			}
@@ -1165,11 +1165,11 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
-	lastIncompatible := lastAttempt.FinishedAt > 0 && lastAttempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(lastAttempt.HTTPStatus, lastAttempt.ProviderCode, lastAttempt.ErrorMessage)
+	lastIncompatible := imageAttemptCompatibilityCode(lastAttempt) != ""
 	if legacy {
 		routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
 		for _, attempt := range attempts {
-			if attempt.Dispatched && attempt.FinishedAt > 0 && routing.PinChannel == attempt.ChannelId && (attempt.TimedOut || attempt.UpstreamTaskID == "" && isImageRouteCompatibilityRejection(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)) {
+			if attempt.Dispatched && attempt.FinishedAt > 0 && routing.PinChannel == attempt.ChannelId && (attempt.TimedOut || imageAttemptCompatibilityCode(attempt) != "") {
 				routing.PinChannel = 0
 				break
 			}

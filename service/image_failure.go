@@ -264,6 +264,41 @@ func isImageRouteCompatibilityRejection(status int, providerCode, message string
 	return ClassifyAsyncImageFailure(errors.New(providerCode+" "+message), status).Code != 601
 }
 
+// imageAccountCompatibilityCode only permits a new account after an explicit
+// input rejection. Authentication, policy and ambiguous server failures keep
+// their existing execution and retry semantics.
+func imageAccountCompatibilityCode(status int, providerCode, message string) string {
+	if isImageRouteCompatibilityRejection(status, providerCode, message) {
+		return "upstream_image_route_incompatible"
+	}
+	if status == http.StatusBadRequest && isGenericImageInputRejectionCode(providerCode) && imageYouTubeNoticePattern.MatchString(strings.TrimSpace(message)) {
+		return "upstream_image_reference_incompatible"
+	}
+	return ""
+}
+
+func isGenericImageInputRejectionCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "", "400", "invalid_argument", "invalid_request", "invalid_request_error":
+		return true
+	}
+	return false
+}
+
+func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
+	if !attempt.Dispatched || attempt.FinishedAt <= 0 || attempt.UpstreamTaskID != "" || attempt.Code == 601 {
+		return ""
+	}
+	if ClassifyAsyncImageFailure(errors.New(attempt.ProviderStatus), attempt.HTTPStatus).Code == 601 {
+		return ""
+	}
+	compatibilityCode := imageAccountCompatibilityCode(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)
+	if compatibilityCode == "upstream_image_reference_incompatible" && !isGenericImageInputRejectionCode(attempt.ProviderStatus) {
+		return ""
+	}
+	return compatibilityCode
+}
+
 func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response, statusCodeMapping string, classifyErrorType bool) *AsyncImageFailure {
 	if response == nil {
 		return ClassifyAsyncImageFailure(errors.New("upstream image response is missing"), 0)
@@ -334,8 +369,17 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	mappedStatus := types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, status)
 	ResetStatusCode(mappedStatus, statusCodeMapping)
 	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
-	if failure.Code != 601 && isImageRouteCompatibilityRejection(status, classificationCode, providerMessage) {
-		failure.Code, failure.InternalCode = 603, "upstream_image_route_incompatible"
+	compatibilityCode := imageAccountCompatibilityCode(status, classificationCode, providerMessage)
+	if compatibilityCode == "upstream_image_reference_incompatible" && (!isGenericImageInputRejectionCode(providerCode) || !isGenericImageInputRejectionCode(providerError.Type) || !isGenericImageInputRejectionCode(providerStatus)) {
+		compatibilityCode = ""
+	}
+	// OpenAI error types are normally diagnostic-only, but a policy type must
+	// still prevent an explicit compatibility message from authorizing failover.
+	if ClassifyAsyncImageFailure(errors.New(providerError.Type), status).Code == 601 {
+		compatibilityCode = ""
+	}
+	if failure.Code != 601 && compatibilityCode != "" {
+		failure.Code, failure.InternalCode = 603, compatibilityCode
 	}
 	failure.HTTPStatus = status
 	if providerMessage != "" {

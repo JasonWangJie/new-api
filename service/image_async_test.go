@@ -1117,6 +1117,8 @@ func TestAsyncImageFailureNoticeReadableHistoricalDiagnostics(t *testing.T) {
 		{name: "inline reference per-image limit", code: "upstream_failed", publicCode: 610, message: "Request rejected before routing: the inline image in the image field is too large. The per-image limit is 20971520 bytes (20 MiB).", summary: "参考图超过上游 20MiB 限制", advice: "压缩"},
 		{name: "dimension multiple", code: "upstream_job_failed", publicCode: 610, message: "The requested image size is invalid. Width and height must both be divisible by 16.", summary: "图片宽度和高度都必须是 16 的整数倍", advice: "16 的整数倍"},
 		{name: "unsupported reference source", code: "upstream_failed", publicCode: 610, message: "Provider API error: Only a specific YouTube video URL is supported (request id: 20261021090758101641609AE8GcbCM)", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
+		{name: "reference compatibility retains its actual cause", code: "upstream_image_reference_incompatible", publicCode: 603, message: "Provider API error: Only a specific YouTube video URL is supported", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
+		{name: "exhausted reference accounts retain their actual cause", code: "image_reference_accounts_exhausted", publicCode: 603, message: "No other eligible image account supports the reference input", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
 		{name: "unsupported thinking level", code: "upstream_failed", publicCode: 610, message: "AI Studio 请求参数无效: 模型不支持 thinking level", summary: "当前模型不支持请求中的思考级别参数", advice: "思考级别参数"},
 		{name: "no usable output or invalid count is not assumed to exceed maximum", code: "output_parse_failed", publicCode: 609, storageFailed: true, message: "upstream must return between 1 and 128 complete images", summary: "上游未返回符合要求的完整图片结果", advice: "没有可用图片或数量不符合要求"},
 		{name: "output URL security remains enforced", code: "output_parse_failed", publicCode: 609, storageFailed: true, message: "image reference requires an HTTPS URL without credentials", summary: "上游返回的图片地址不符合安全 HTTPS 要求", advice: "联系服务方修正结果地址"},
@@ -1134,6 +1136,10 @@ func TestAsyncImageFailureNoticeReadableHistoricalDiagnostics(t *testing.T) {
 			original := task
 			notice := ImageTaskFailureNotice(task)
 			assert.Equal(t, tc.summary, notice.SummaryText())
+			if tc.code == "upstream_image_reference_incompatible" || tc.code == "image_reference_accounts_exhausted" {
+				assert.NotContains(t, notice.SummaryText(), "尺寸")
+				assert.NotContains(t, notice.SummaryText(), "分辨率")
+			}
 			assert.Contains(t, notice.SuggestionText(), tc.advice)
 			assert.Contains(t, notice.MessageText(task.ErrorMessage), tc.summary+"\n处理建议：")
 			assert.Contains(t, notice.MessageText(task.ErrorMessage), "\n原始错误："+tc.message)
@@ -1394,6 +1400,8 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		{name: "unknown execution retains its hold", failure: AsyncImageFailure{Code: 608, ExecutionUnknown: true}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "compatibility rejection cannot replace an accepted job", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "terminal accepted compatibility failure cannot resubmit", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "reference incompatibility cannot replace an accepted job", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_reference_incompatible", HTTPStatus: http.StatusBadRequest, ProviderCode: "400"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
+		{name: "terminal accepted reference incompatibility cannot resubmit", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_reference_incompatible", HTTPStatus: http.StatusBadRequest, ProviderCode: "400", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "a settled bill cannot fund another submission", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "applied", wantStatus: model.ImageTaskFailed, wantBill: "applied"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1502,6 +1510,7 @@ func TestAsyncImageWorkerCompletionRecoveryUsesLocalBudgets(t *testing.T) {
 		{name: "billing", failure: AsyncImageFailure{Code: 606, InternalCode: "bill_preparation_failed"}, paused: model.ImageTaskBillingFailed},
 		{name: "saved output timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout"}, paused: model.ImageTaskStorageFailed},
 		{name: "size rejection after output acceptance remains local", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, paused: model.ImageTaskStorageFailed},
+		{name: "reference rejection after output acceptance remains local", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_reference_incompatible", HTTPStatus: http.StatusBadRequest, ProviderCode: "400"}, paused: model.ImageTaskStorageFailed},
 		{name: "invalid output", failure: AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing checkpoint", failure: AsyncImageFailure{Code: 607, InternalCode: "completion_checkpoint_invalid"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
 		{name: "missing usage re-queries the same job", failure: AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing"}, paused: model.ImageTaskBillingFailed, requeryUsage: true},
@@ -1836,9 +1845,11 @@ func TestAsyncImageWorkerSingleAccountTransientRetriesRemainBounded(t *testing.T
 
 func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 	const compatibilityMessage = "No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."
+	const referenceMessage = "Provider API error: Only a specific YouTube video URL is supported (request id: upstream-reference-rejection)"
 	for _, tc := range []struct {
 		name       string
 		mode       string
+		reference  bool
 		wantCalls  int
 		wantRetry  int
 		wantError  string
@@ -1853,14 +1864,34 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		{name: "ordinary invalid dimensions remain terminal", mode: "invalid dimensions", wantCalls: 1, wantError: "upstream_failed", wantReason: "invalid_input"},
 		{name: "safety rejection remains terminal", mode: "safety", wantCalls: 1, wantError: "upstream_failed", wantReason: "content_policy"},
 		{name: "unknown execution is never resubmitted", mode: "unknown", wantCalls: 1, wantError: "upstream_image_route_incompatible", wantReason: "execution_unknown"},
+		{name: "Gemini reference rejection then alternate success", reference: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini copied rejected credential is excluded", mode: "copied credential", reference: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference rejection has no alternative", mode: "no alternate", reference: true, wantCalls: 1, wantRetry: 1, wantError: "image_reference_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "Gemini all accounts reject the reference", mode: "all reject", reference: true, wantCalls: 2, wantRetry: 2, wantError: "image_reference_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "Gemini reference capacity retries disabled", mode: "no capacity retry", reference: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "compatibility_retry_budget_exhausted"},
+		{name: "Gemini reference total retries disabled", mode: "no total retry", reference: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "total_retry_budget_exhausted"},
+		{name: "Gemini reference zero account switches stops", mode: "no account switch", reference: true, wantCalls: 1, wantRetry: 1, wantError: "account_switches_exhausted", wantReason: "account_switch_limit"},
+		{name: "Gemini reference one account switch succeeds", mode: "one account switch", reference: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference unknown execution is never resubmitted", mode: "unknown", reference: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "execution_unknown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
+			platform := "openai"
+			if tc.reference {
+				platform = "gemini"
+				request.Platform, request.Provider, request.PolicyPlatform = platform, platform, platform
+				task.Platform, task.Provider, task.ExecutionProtocol = platform, platform, "gemini_native"
+				ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+					return dto.ImageCapability{Provider: "gemini", Protocol: "gemini_native", Generate: true, Edit: true}
+				}
+				require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", ImageIdentityHash("default", "openai")).Updates(map[string]any{"policy_key": ImageIdentityHash("default", platform), "platform": platform}).Error)
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"platform": task.Platform, "provider": task.Provider, "execution_protocol": task.ExecutionProtocol}).Error)
+			}
 			request.Size, request.Resolution = "4096x3272", "4K"
 			catalog, err := common.Marshal([]ImageModelCapability{{Id: request.Model, Resolutions: []string{"4K"}, MaxOutputImages: 1, MaxReferenceImages: 1}})
 			require.NoError(t, err)
-			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", ImageIdentityHash("default", "openai")).Update("models", string(catalog)).Error)
+			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", ImageIdentityHash("default", platform)).Update("models", string(catalog)).Error)
 			payload, err := common.Marshal(request)
 			require.NoError(t, err)
 			task.RequestCipher, err = EncryptImagePayload(payload, "task:"+task.TaskId)
@@ -1879,6 +1910,10 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 				cfg.CapacityRetries = 0
 			case "no total retry":
 				cfg.TotalRetries = 0
+			case "no account switch":
+				cfg.GeminiAccountSwitches = 0
+			case "one account switch":
+				cfg.GeminiAccountSwitches = 1
 			}
 			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
 			outputEntities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
@@ -1887,6 +1922,10 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(outputEntities...)) })
 			}
 			code, message := "image_size_not_supported", compatibilityMessage
+			status, reason := http.StatusUnprocessableEntity, "incompatible_image_route"
+			if tc.reference {
+				code, message, status, reason = "400", referenceMessage, http.StatusBadRequest, "incompatible_image_reference"
+			}
 			switch tc.mode {
 			case "invalid dimensions":
 				code, message = "invalid_request", "unsupported_image_dimensions: dimensions must be even"
@@ -1897,13 +1936,13 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 			require.NoError(t, err)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnprocessableEntity)
+				w.WriteHeader(status)
 				_, _ = w.Write(body)
 			}))
 			t.Cleanup(upstream.Close)
 			var selected []string
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
-				assert.NotContains(t, selected, channel.Key, "a rejected credential cannot be reused for the same dimensions")
+				assert.NotContains(t, selected, channel.Key, "a rejected credential cannot be reused for the same request")
 				selected = append(selected, channel.Key)
 				assert.Equal(t, request.Size, outbound.Size, "failover never reduces image dimensions")
 				assert.Equal(t, request.Resolution, outbound.Resolution)
@@ -1918,7 +1957,12 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 					require.NoError(t, requestErr)
 					response, responseErr := upstream.Client().Do(httpRequest)
 					require.NoError(t, responseErr)
-					failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, response, "")
+					var failure *AsyncImageFailure
+					if tc.reference {
+						failure = ClassifyGeminiAsyncImageHTTPFailure(ctx, response)
+					} else {
+						failure = ClassifyOpenAIAsyncImageHTTPFailure(ctx, response, "")
+					}
 					if tc.mode == "unknown" {
 						failure.ExecutionUnknown = true
 					}
@@ -1936,7 +1980,7 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 				var decision ImageRetryDecision
 				require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
 				assert.Equal(t, "switch_account", decision.Action)
-				assert.Equal(t, "incompatible_image_route", decision.Reason)
+				assert.Equal(t, reason, decision.Reason)
 				assert.Equal(t, "capacity", decision.Budget)
 				assert.Zero(t, task.DispatchedAt)
 				assert.Equal(t, startedAt, task.StartedAt)
@@ -1989,7 +2033,7 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 				stateKeys := []string{ImageRedisKey("breaker", "async", strconv.Itoa(primaryID)) + ":count", ImageAccountCooldownKey(ImageIdentityHash("image-account", strconv.Itoa(primaryID), "upstream-key-a"))}
 				states, stateErr := common.RDB.Exists(t.Context(), stateKeys...).Result()
 				require.NoError(t, stateErr)
-				assert.Zero(t, states, "dimension incompatibility cannot penalize unrelated requests through global circuit or cooldown state")
+				assert.Zero(t, states, "request incompatibility cannot penalize unrelated requests through global circuit or cooldown state")
 			}
 		})
 	}
@@ -2396,6 +2440,7 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	transientA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 606}
 	rateLimitedB := ImageChannelAttempt{ChannelId: 20, KeyFingerprint: "account-b", Dispatched: true, FinishedAt: 1, Code: 605}
 	incompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}
+	referenceIncompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "Provider API error: Only a specific YouTube video URL is supported (request id: old-attempt)"}
 	for _, tc := range []struct {
 		name        string
 		history     []ImageChannelAttempt
@@ -2417,6 +2462,13 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		{name: "legacy size rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai", want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
 		{name: "accepted jobs cannot authorize size failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTaskID: "accepted-job"}}, platform: "openai"},
 		{name: "unfinished rejection cannot exclude an account", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai"},
+		{name: "historical reference rejection excludes its credential", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "Gemini zero switches stops reference failover", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
+		{name: "legacy reference rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
+		{name: "accepted jobs cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
+		{name: "safety category cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 601, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "historical safety status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderStatus: "SAFETY", ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "historical authentication status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ProviderStatus: "UNAUTHENTICATED", ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, ImageAccountAttemptRouting(tc.history, 2, tc.platform, tc.maxSwitches))
@@ -2582,6 +2634,15 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "compatibility wording cannot override safety", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier; safety review did not pass"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "safety review", httpStatus: http.StatusUnprocessableEntity},
 		{name: "provider safety status precedes compatibility code", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier.","status":"SAFETY"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusUnprocessableEntity},
 		{name: "authorization is not compatibility rejection", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier."}}`, expectedCode: 610, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusForbidden},
+		{name: "provider reference compatibility rejection", body: `{"error":{"code":400,"message":"Provider API error: Only a specific YouTube video URL is supported (request id: provider-reference-request)"}}`, expectedCode: 603, providerCode: "400", message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference compatibility without provider code", body: `{"error":{"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 603, message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference compatibility is case insensitive", body: `{"error":{"code":"400","message":"ONLY A SPECIFIC YOUTUBE VIDEO URL IS SUPPORTED"}}`, expectedCode: 603, providerCode: "400", message: "YOUTUBE", internalCode: "upstream_image_reference_incompatible"},
+		{name: "generic YouTube input error remains terminal", body: `{"error":{"code":400,"message":"The supplied YouTube video URL is invalid"}}`, expectedCode: 610, providerCode: "400", message: "YouTube video URL is invalid"},
+		{name: "quoted request text is not a reference rejection", body: `{"error":{"code":400,"message":"Invalid input: prompt contains Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "400", message: "prompt contains"},
+		{name: "reference compatibility cannot override safety", body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported; safety review did not pass"}}`, expectedCode: 601, providerCode: "400", message: "safety review"},
+		{name: "provider safety status precedes reference compatibility", body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported","status":"SAFETY"}}`, expectedCode: 601, providerCode: "400", message: "YouTube"},
+		{name: "authorization is not reference compatibility", body: `{"error":{"code":403,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "403", message: "YouTube", httpStatus: http.StatusForbidden},
+		{name: "server failure is not reference rejection", body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 606, providerCode: "500", message: "YouTube", httpStatus: http.StatusInternalServerError},
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
 		{name: "reference fetch without Google envelope fields", body: `{"error":{"message":"reference image fetch: Get https://signed.example/image?token=private: i/o timeout"}}`, expectedCode: 602, message: "reference image fetch", fallback: true},
 		{name: "reference download proxy failure", body: `{"error":{"code":400,"message":"Proxy error: Reference image download failed; direct=timeout; proxy=502"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download failed", fallback: true},
@@ -2663,21 +2724,40 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		})
 	}
 	for _, tc := range []struct {
-		name       string
-		status     int
-		mapping    string
-		wantCode   int
-		wantCompat bool
+		name         string
+		status       int
+		mapping      string
+		body         string
+		wantCode     int
+		wantInternal string
 	}{
-		{name: "actual rejection despite server error mapping", status: 422, mapping: `{"422":"500"}`, wantCode: 603, wantCompat: true},
+		{name: "actual rejection despite server error mapping", status: 422, mapping: `{"422":"500"}`, wantCode: 603, wantInternal: "upstream_image_route_incompatible"},
 		{name: "mapped server error is not a compatibility rejection", status: 500, mapping: `{"500":"422"}`, wantCode: 610},
+		{name: "reference rejection despite server error mapping", status: 400, mapping: `{"400":"500"}`, body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported"}}`, wantCode: 603, wantInternal: "upstream_image_reference_incompatible"},
+		{name: "mapped server error is not a reference rejection", status: 500, mapping: `{"500":"400"}`, body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI policy type with a provider code cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"type":"content_policy_violation","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI safety type without a provider code cannot trigger reference failover", status: 400, body: `{"error":{"type":"safety","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI invalid API key code cannot trigger reference failover", status: 400, body: `{"error":{"code":"invalid_api_key","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI forbidden provider code cannot trigger reference failover", status: 400, body: `{"error":{"code":403,"message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI authentication type with a generic provider code cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"type":"authentication_error","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI unauthenticated status cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"status":"UNAUTHENTICATED","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI permission denied status cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"status":"PERMISSION_DENIED","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
+		{name: "OpenAI safety status survives a successful status mapping", status: 400, mapping: `{"400":"200"}`, body: `{"error":{"code":400,"status":"SAFETY","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 601},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			response := &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"image_size_not_supported","message":"This route does not support the requested size"}}`))}
+			body := tc.body
+			if body == "" {
+				body = `{"error":{"code":"image_size_not_supported","message":"This route does not support the requested size"}}`
+			}
+			response := &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(body))}
 			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), response, tc.mapping)
 			assert.Equal(t, tc.wantCode, failure.Code)
 			assert.Equal(t, tc.status, failure.HTTPStatus)
-			assert.Equal(t, tc.wantCompat, failure.InternalCode == "upstream_image_route_incompatible")
+			if tc.wantInternal != "" {
+				assert.Equal(t, tc.wantInternal, failure.InternalCode)
+			} else {
+				assert.NotContains(t, failure.InternalCode, "incompatible")
+			}
 		})
 	}
 	assert.Equal(t, 603, ClassifyAsyncImageFailure(errors.New("no eligible image account in the selected pool"), 0).Code)

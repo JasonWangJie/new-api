@@ -681,6 +681,13 @@ test.each([
     visible: false,
   },
   {
+    action: 'switch_account',
+    rule: 'upstream_image_reference_incompatible',
+    reason: 'incompatible_image_reference',
+    retryable: true,
+    visible: true,
+  },
+  {
     action: 'manual_recovery',
     rule: 'quota_cache_reservation_unknown',
     retryable: false,
@@ -688,7 +695,7 @@ test.each([
   },
 ])(
   '$action/$rule keeps recovery status in the list and recovery information in details',
-  async ({ action, rule, retryable, visible }) => {
+  async ({ action, rule, reason = 'temporary_failure', retryable, visible }) => {
     const message = 'Previous upstream diagnostic'
     const retryTask: ImageTask = {
       ...task,
@@ -701,7 +708,7 @@ test.each([
         version: 1,
         stage: 'poll',
         action,
-        reason: 'temporary_failure',
+        reason,
         rule,
         used: 1,
         limit: 2,
@@ -747,6 +754,14 @@ test.each([
     }
     expect(within(notice).getByText('Next retry')).toBeVisible()
     expect(within(notice).getByText('Total retries')).toBeVisible()
+    if (reason === 'incompatible_image_reference') {
+      expect(
+        within(dialog).getByText(
+          i18next.t('The selected image route is incompatible')
+        )
+      ).toBeVisible()
+      expect(within(dialog).queryByText(reason)).not.toBeInTheDocument()
+    }
     if (action === 'poll_same_job') {
       expect(
         within(notice).getByText(

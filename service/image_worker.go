@@ -378,7 +378,18 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		channel, account, err = PickImageChannel(ctx, policy, request, routing)
 		if err != nil {
 			if errors.Is(err, ErrImageCompatibleAccountsExhausted) {
-				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 603, InternalCode: "image_compatible_accounts_exhausted", Message: "No other eligible image account supports the requested size or resolution"}, cfg)
+				failure := &AsyncImageFailure{Code: 603, InternalCode: "image_compatible_accounts_exhausted", Message: "No other eligible image account supports the requested size or resolution"}
+				for i := len(attempts) - 1; i >= 0; i-- {
+					compatibilityCode := imageAttemptCompatibilityCode(attempts[i])
+					if compatibilityCode == "" {
+						continue
+					}
+					if compatibilityCode == "upstream_image_reference_incompatible" {
+						failure.InternalCode, failure.Message = "image_reference_accounts_exhausted", "No other eligible image account supports the reference input"
+					}
+					break
+				}
+				return failAsyncImageInvocation(ctx, *task, failure, cfg)
 			}
 			if errors.Is(err, ErrImageTimeoutAccountsExhausted) {
 				return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 606, InternalCode: "timeout_accounts_exhausted", Message: "No unused image account remains after request timeouts"}, cfg)
@@ -719,7 +730,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	submissionTransientRetries := 0
 	timeoutRetries := 0
 	timeoutAttempt := task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && failure.InternalCode == "upstream_transport_timeout"
-	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible"
+	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible"
 	if task.Attempts != "" {
 		var attempts []ImageChannelAttempt
 		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
@@ -877,7 +888,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				}
 			case 603:
 				count, maximum, base, maxDelay, key = task.CapacityRetryCount, cfg.CapacityRetries, cfg.CapacityRetryBase, cfg.CapacityRetryMax, "capacity_retry_count"
-				if failure.InternalCode == "account_switches_exhausted" || failure.InternalCode == "image_compatible_accounts_exhausted" {
+				if failure.InternalCode == "account_switches_exhausted" || failure.InternalCode == "image_compatible_accounts_exhausted" || failure.InternalCode == "image_reference_accounts_exhausted" {
 					maximum = 0
 				}
 			case 605, 606:

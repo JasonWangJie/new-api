@@ -80,6 +80,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   temporary_failure: 'Temporary failure is retryable',
   no_available_capacity: 'No available capacity',
   incompatible_image_route: 'The selected image route is incompatible',
+  incompatible_image_reference: 'The selected image route is incompatible',
   compatibility_retry_budget_exhausted:
     'Image compatibility retry budget exhausted',
   no_compatible_account: 'No compatible image account is available',
