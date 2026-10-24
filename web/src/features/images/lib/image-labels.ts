@@ -78,6 +78,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   eligible_account: 'Eligible account selected',
   reference_transport_fallback: 'Remote reference fetch failed',
   temporary_failure: 'Temporary failure is retryable',
+  submission_rejected_without_diagnostic: 'Temporary failure is retryable',
   no_available_capacity: 'No available capacity',
   incompatible_image_route: 'The selected image route is incompatible',
   incompatible_image_reference: 'The selected image route is incompatible',

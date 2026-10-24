@@ -46,7 +46,7 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 		case 603:
 			decision.Budget, decision.Used, decision.Limit = "capacity", task.CapacityRetryCount, cfg.CapacityRetries
 			decision.Reason = "capacity_retry_budget_exhausted"
-			if failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible" {
+			if failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible" || failure.InternalCode == "upstream_image_submission_rejected" {
 				decision.Reason = "compatibility_retry_budget_exhausted"
 			}
 		case 605, 606:
@@ -77,6 +77,7 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 		decision.Budget, decision.Used, decision.Limit = "reference", task.ReferenceRetryCount, 1
 	}
 	if failure.Code == 602 {
+		localFallback = localFallback || IsImageReferenceDownloadTimeout(failure)
 		if !failure.ReferenceTransportFallback && task.DispatchedAt > 0 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal) {
 			decision.Limit++
 		}
@@ -114,6 +115,8 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 			decision.Action, decision.Reason = "switch_account", "incompatible_image_route"
 		} else if failure.InternalCode == "upstream_image_reference_incompatible" {
 			decision.Action, decision.Reason = "switch_account", "incompatible_image_reference"
+		} else if failure.InternalCode == "upstream_image_submission_rejected" {
+			decision.Action, decision.Reason = "switch_account", "submission_rejected_without_diagnostic"
 		} else if failure.Code == 603 {
 			decision.Action, decision.Reason = "wait_capacity", "no_available_capacity"
 		}

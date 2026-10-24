@@ -85,7 +85,7 @@ func RecordImageAccountCooldown(ctx context.Context, fingerprint string, failure
 	if fingerprint == "" || cfg.AccountCooldownSeconds == 0 || failure == nil {
 		return nil
 	}
-	if failure.Code != 605 && failure.Code != 606 && failure.HTTPStatus != 429 && failure.InternalCode != "upstream_transport_timeout" {
+	if failure.Code != 605 && failure.Code != 606 && failure.HTTPStatus != 429 && failure.InternalCode != "upstream_transport_timeout" && !IsImageReferenceDownloadTimeout(failure) {
 		return nil
 	}
 	if common.RDB == nil {

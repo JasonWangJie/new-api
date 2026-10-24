@@ -66,6 +66,14 @@ func NewImageReferenceFailure(index int, err error) *AsyncImageFailure {
 	return &AsyncImageFailure{Code: 602, InternalCode: "reference_download_failed", Message: message}
 }
 
+func IsImageReferenceDownloadTimeout(failure *AsyncImageFailure) bool {
+	if failure == nil || failure.Code != 602 {
+		return false
+	}
+	message := strings.ToLower(failure.Message)
+	return strings.Contains(message, "timeout") || strings.Contains(message, "timed out") || strings.Contains(message, "deadline exceeded") || strings.Contains(message, "超时")
+}
+
 func ImageRetryAfter(value string, now time.Time) time.Duration {
 	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 32); err == nil {
 		return time.Duration(max(0, min(seconds, 86400))) * time.Second
@@ -285,12 +293,68 @@ func isGenericImageInputRejectionCode(code string) bool {
 	return false
 }
 
+func isUndiagnosedImageSubmissionResponse(body []byte) bool {
+	if strings.TrimSpace(string(body)) == "" {
+		return true
+	}
+	var fields map[string]any
+	if common.Unmarshal(body, &fields) != nil || fields == nil {
+		return false
+	}
+	scopes := []map[string]any{fields}
+	switch providerError := fields["error"].(type) {
+	case nil:
+	case string:
+		if strings.TrimSpace(providerError) != "" {
+			return false
+		}
+	case map[string]any:
+		scopes = append(scopes, providerError)
+	default:
+		return false
+	}
+	for index, scope := range scopes {
+		for field, value := range scope {
+			switch field {
+			case "error":
+				if index != 0 {
+					return false
+				}
+			case "code", "type", "status":
+				if value == nil {
+					continue
+				}
+				if _, numeric := value.(float64); numeric && field != "code" {
+					return false
+				}
+				if !isGenericImageInputRejectionCode(fmt.Sprint(value)) {
+					return false
+				}
+			case "message", "msg", "detail", "reason":
+				if value != nil && value != "" {
+					return false
+				}
+			case "request_id", "requestId", "requestID":
+				if _, ok := value.(string); value != nil && !ok {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 	if !attempt.Dispatched || attempt.FinishedAt <= 0 || attempt.UpstreamTaskID != "" || attempt.Code == 601 {
 		return ""
 	}
 	if ClassifyAsyncImageFailure(errors.New(attempt.ProviderStatus), attempt.HTTPStatus).Code == 601 {
 		return ""
+	}
+	if attempt.Code == 603 && attempt.HTTPStatus == http.StatusBadRequest && attempt.ErrorMessage == "Upstream image request failed" && isGenericImageInputRejectionCode(attempt.ProviderCode) && isGenericImageInputRejectionCode(attempt.ProviderStatus) {
+		return "upstream_image_submission_rejected"
 	}
 	compatibilityCode := imageAccountCompatibilityCode(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)
 	if compatibilityCode == "upstream_image_reference_incompatible" && !isGenericImageInputRejectionCode(attempt.ProviderStatus) {
@@ -310,7 +374,8 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 		body, readErr = io.ReadAll(io.LimitReader(response.Body, asyncImageProviderErrorBodyLimit+1))
 		CloseResponseBodyGracefully(response)
 	}
-	if len(body) > asyncImageProviderErrorBodyLimit {
+	bodyTruncated := len(body) > asyncImageProviderErrorBodyLimit
+	if bodyTruncated {
 		body = body[:asyncImageProviderErrorBodyLimit]
 	}
 
@@ -381,6 +446,13 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	if failure.Code != 601 && compatibilityCode != "" {
 		failure.Code, failure.InternalCode = 603, compatibilityCode
 	}
+	// A complete, explicit submission rejection without any diagnostic may use
+	// another account. Do not infer this from a read failure or a provider's
+	// authentication, policy or input error fields.
+	if status == http.StatusBadRequest && readErr == nil && !bodyTruncated && providerMessage == "" && failure.Code == 610 && isGenericImageInputRejectionCode(providerCode) && isGenericImageInputRejectionCode(providerError.Type) && isGenericImageInputRejectionCode(providerStatus) && isUndiagnosedImageSubmissionResponse(body) {
+		failure.Code, failure.InternalCode = 603, "upstream_image_submission_rejected"
+		failure.Message = "Upstream image request failed"
+	}
 	failure.HTTPStatus = status
 	if providerMessage != "" {
 		failure.Message = providerMessage
@@ -432,7 +504,7 @@ func ClassifyAsyncImageFailure(err error, status int) *AsyncImageFailure {
 		code = 612
 	case status == http.StatusRequestEntityTooLarge || strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "参考图过大") || strings.Contains(lowered, "image too large") || strings.Contains(lowered, "image is too large") || strings.Contains(lowered, "image size exceeds") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
 		code = 604
-	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download failed") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "国内下载中转失败"):
+	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download failed") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "国内下载中转失败"):
 		code = 602
 	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel") || strings.Contains(lowered, "no eligible image account"):
 		code = 603

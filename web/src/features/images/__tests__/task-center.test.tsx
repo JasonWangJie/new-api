@@ -688,6 +688,13 @@ test.each([
     visible: true,
   },
   {
+    action: 'switch_account',
+    rule: 'upstream_image_submission_rejected',
+    reason: 'submission_rejected_without_diagnostic',
+    retryable: true,
+    visible: true,
+  },
+  {
     action: 'manual_recovery',
     rule: 'quota_cache_reservation_unknown',
     retryable: false,
@@ -759,6 +766,12 @@ test.each([
         within(dialog).getByText(
           i18next.t('The selected image route is incompatible')
         )
+      ).toBeVisible()
+      expect(within(dialog).queryByText(reason)).not.toBeInTheDocument()
+    }
+    if (reason === 'submission_rejected_without_diagnostic') {
+      expect(
+        within(dialog).getByText(i18next.t('Temporary failure is retryable'))
       ).toBeVisible()
       expect(within(dialog).queryByText(reason)).not.toBeInTheDocument()
     }

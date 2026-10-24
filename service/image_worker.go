@@ -479,6 +479,16 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	capability := ImageChannelCapability(*channel, request.Model)
 	upstreamAsyncConfigured := channel.GetOtherSettings().UpstreamAsync != nil
 	if !knownUpstreamTask && !acceptedOutput {
+		for _, attempt := range attempts {
+			if attempt.Dispatched && attempt.FinishedAt > 0 && attempt.ReferenceFailure && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage}) {
+				// This attempt uses local input even when the next channel normally
+				// passes URLs through. Freeze the override without changing the channel.
+				settings := channel.GetSetting()
+				settings.ImageReferenceTransportMode = "local"
+				channel.SetSetting(settings)
+				break
+			}
+		}
 		encodedChannel, err := common.Marshal(channel)
 		if err != nil {
 			return err
@@ -648,7 +658,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
-		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
+		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown || IsImageReferenceDownloadTimeout(failure)) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
 			if task.UpstreamTaskId == "" || failure.UpstreamTerminal {
 				_ = RecordImageAccountCooldown(context.WithoutCancel(ctx), account.Fingerprint, failure, cfg)
@@ -730,7 +740,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	submissionTransientRetries := 0
 	timeoutRetries := 0
 	timeoutAttempt := task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && failure.InternalCode == "upstream_transport_timeout"
-	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible"
+	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible" || failure.InternalCode == "upstream_image_submission_rejected"
 	if task.Attempts != "" {
 		var attempts []ImageChannelAttempt
 		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
@@ -858,13 +868,13 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		resubmit := task.UpstreamTaskId == ""
 		if failure.UpstreamTerminal {
 			resubmit = false
-			if !mixedRouting && !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
+			if !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (task.StartedAt == 0 || time.Now().Unix() < task.StartedAt+int64(cfg.ExecutionTimeout)) && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
 				reservation, err := model.GetAsyncImageReservation(ctx, task)
 				if err != nil {
 					return err
 				}
 				var resultMilestones int64
-				if err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "upstream_result_received").Count(&resultMilestones).Error; err != nil {
+				if err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type IN ?", task.TaskId, []string{"upstream_result_received", "output_received", "upstream_succeeded"}).Count(&resultMilestones).Error; err != nil {
 					return err
 				}
 				resubmit = reservation != nil && reservation.Status == "reserved" && resultMilestones == 0

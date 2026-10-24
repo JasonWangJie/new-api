@@ -799,6 +799,7 @@ type ImageAccountRouting struct {
 	ExcludedChannels        []int
 	AvoidChannel            int
 	Cooling                 map[string]bool
+	WaitForCooldown         bool
 	TimedOutAccounts        []string
 	TimedOutCredentials     []string
 	IncompatibleAccounts    []string
@@ -981,6 +982,9 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 					earliest, selected = remaining, i
 				}
 			}
+			if routing.WaitForCooldown && earliest > 0 {
+				return nil, ImageAccount{}, &ImageAccountCooling{DelaySeconds: int(min(earliest/time.Second+1, time.Duration(max(1, cfg.AccountCooldownSeconds))))}
+			}
 			routing.Cooling[fingerprints[selected]] = false
 		}
 		channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return len(ImageChannelAccounts(channel, routing)) == 0 })
@@ -988,6 +992,13 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	// Prefer another healthy compatible account after a transient rejection.
 	// A pool with no alternative retains its bounded same-account retry path.
 	if routing.Avoid != "" || routing.AvoidChannel != 0 {
+		if routing.Avoid != "" && routing.AvoidChannel != 0 && !slices.ContainsFunc(channels, func(channel model.Channel) bool {
+			return channel.Id != routing.AvoidChannel && len(ImageChannelAccounts(channel, routing)) > 0
+		}) {
+			// A multi-key channel can still offer another healthy account when
+			// no other channel in the binding is available.
+			routing.AvoidChannel = 0
+		}
 		alternative := false
 		for _, channel := range channels {
 			if channel.Id == routing.AvoidChannel {
@@ -1160,14 +1171,19 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 		last = attempt.KeyFingerprint
 		lastAttempt = attempt
-		if attempt.ReferenceFailure {
+		referenceTimeout := attempt.ReferenceFailure && attempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage})
+		routing.WaitForCooldown = routing.WaitForCooldown || referenceTimeout
+		if attempt.ReferenceFailure && !referenceTimeout {
 			reference = append(reference, attempt)
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
+	lastReferenceTimeout := lastAttempt.ReferenceFailure && lastAttempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: lastAttempt.Code, Message: lastAttempt.ErrorMessage})
 	lastIncompatible := imageAttemptCompatibilityCode(lastAttempt) != ""
 	if legacy {
-		routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
+		if !routing.WaitForCooldown {
+			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
+		}
 		for _, attempt := range attempts {
 			if attempt.Dispatched && attempt.FinishedAt > 0 && routing.PinChannel == attempt.ChannelId && (attempt.TimedOut || imageAttemptCompatibilityCode(attempt) != "") {
 				routing.PinChannel = 0
@@ -1177,7 +1193,10 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut {
+		if lastReferenceTimeout {
+			routing.AvoidChannel = lastAttempt.ChannelId
+		}
+		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {
 			if lastIncompatible || slices.Contains(routing.ExcludedChannels, lastChannel) || routing.PinChannel != 0 && routing.PinChannel != lastChannel {
 				routing.Stop = true
 				return routing
@@ -1186,7 +1205,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 		return routing
 	}
-	if len(reference) > 0 {
+	if len(reference) > 0 && !routing.WaitForCooldown {
 		first := reference[0].KeyFingerprint
 		for _, attempt := range reference {
 			if attempt.KeyFingerprint != first {
@@ -1208,7 +1227,10 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut {
+	if lastReferenceTimeout {
+		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
+	}
+	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {
 		if lastIncompatible || slices.Contains(routing.Excluded, last) || routing.Pin != "" && routing.Pin != last {
 			routing.Stop = true
 			return routing
@@ -1226,7 +1248,7 @@ func ImageAttemptRouting(attempts []ImageChannelAttempt, retries int) (pin int, 
 		if !attempt.Dispatched {
 			continue
 		}
-		if attempt.ReferenceFailure {
+		if attempt.ReferenceFailure && !(attempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage})) {
 			reference = append(reference, attempt)
 		}
 	}
