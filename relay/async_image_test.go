@@ -408,8 +408,15 @@ func TestMixedImageBillingExecutionAndRecovery(t *testing.T) {
 }
 
 func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
+	var referencePNG bytes.Buffer
+	require.NoError(t, png.Encode(&referencePNG, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	dataReference := "data:image/png;base64," + base64.StdEncoding.EncodeToString(referencePNG.Bytes())
+	previousAddress := system_setting.ServerAddress
+	system_setting.ServerAddress = "https://gateway.example"
+	t.Cleanup(func() { system_setting.ServerAddress = previousAddress })
 	for _, tc := range []struct {
 		name, upstream    string
+		referenceURL      string
 		count, references int
 		channelType       int
 		override          string
@@ -440,6 +447,11 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 		{name: "openai_empty_mask_override_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, references: 1, mask: true, override: `{"operations":[{"path":"mask","mode":"set","value":""}]}`, wantError: "mask"},
 		{name: "openai_passthrough_skips_override", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, passThrough: true, override: `{"operations":[{"path":"n","mode":"set","value":2}]}`},
 		{name: "tianyue_mask_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, mask: true, tianyue: true, wantError: "mask"},
+		{name: "tianyue_uploaded_local_reference_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: dataReference, tianyue: true},
+		{name: "tianyue_gateway_reference_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: "https://gateway.example/api/image-objects/imo_owned/content", tianyue: true},
+		{name: "tianyue_local_reference_batch_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 2, references: 1, referenceURL: dataReference, tianyue: true, wantError: "require n=1"},
+		{name: "tianyue_local_reference_mask_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: dataReference, mask: true, tianyue: true, wantError: "mask"},
+		{name: "tianyue_private_external_reference_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: "https://127.0.0.1/reference.png", tianyue: true, wantError: "address is not public"},
 		{name: "tianyue_builtin_token_usage_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, tokenPrice: true, tianyue: true, wantError: "token usage"},
 		{name: "custom_profile_without_usage_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, wantError: "token usage"},
 		{name: "custom_profile_total_only_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, tokenPrice: true, customProfile: true, usagePaths: map[string]string{"total_tokens": "usage.total"}, wantError: "token usage"},
@@ -481,7 +493,12 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 				request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{QuotaToPreConsume: 1000}, Tiered: &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ExprString: `tier("tokens", p * 2 + c * 8)`}}
 			}
 			for i := range tc.references {
-				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: fmt.Sprintf("https://example.com/%d.png", i)})
+				reference := fmt.Sprintf("https://example.com/%d.png", i)
+				if tc.referenceURL != "" {
+					reference = tc.referenceURL
+					request.Kind, request.Dialect = "image_to_image", "async"
+				}
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: reference})
 			}
 			if tc.mask {
 				request.Kind, request.Dialect = "image_to_image", "async"
@@ -491,7 +508,9 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 				assert.False(t, service.MixedImageChannelRequestSupported(ch, request), "an adaptor must declare the mapped model before mixed admission")
 				return
 			}
+			originalParts := append([]service.AsyncImageInputPart(nil), request.Parts...)
 			err = validateMixedImageChannelRequest(ch, request)
+			assert.Equal(t, originalParts, request.Parts, "admission must not replace the persisted reference input")
 			if tc.wantError != "" {
 				require.ErrorContains(t, err, tc.wantError)
 			} else {
@@ -898,6 +917,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		localReferenceRejected     bool
 		unreadableResponse         bool
 		maxReferences              int
+		referenceRetryCount        int
 		status, failureCode        int
 		responseMessage            string
 		providerCode               string
@@ -934,6 +954,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "edits_async", path: "/v1/images/edits_async", referenceField: "image"},
 		{name: "generations_oa_with_reference", path: "/v1/images/generations_oa", referenceField: "images"},
 		{name: "generations_async_with_reference", path: "/v1/images/generations_async", referenceField: "images"},
+		{name: "channel_switch_keeps_original_reference_after_retry", path: "/v1/images/generations_async", referenceField: "images", referenceRetryCount: 1},
 		{name: "edits_oa_body_passthrough", path: "/v1/images/edits_oa", referenceField: "images", passThrough: true},
 		{name: "edits_async_body_passthrough", path: "/v1/images/edits_async", referenceField: "image", passThrough: true},
 		{name: "edits_async_multipart_png", path: "/v1/images/edits_async", fileFormat: "png"},
@@ -1028,6 +1049,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			channel.StatusCodeMapping = &tc.statusMapping
 			channelSettings := dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough}
+			if tc.referenceRetryCount > 0 {
+				channelSettings.ImageReferenceTransportMode = "passthrough"
+			}
 			if tc.resolutionMapping {
 				channelSettings.ImageResolutionModelMapping = dto.ImageResolutionModelMapping{"image-alias": {"1K": "gpt-image-2", "2K": "gpt-image-2-2k"}}
 				mapping = `{"image-alias":"gpt-image-2","gpt-image-2":"gpt-image-2"}`
@@ -1106,6 +1130,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			cfg := service.DefaultImageRuntimeConfig()
 			cfg.OpenAIReferenceMode = "passthrough"
+			if tc.referenceRetryCount > 0 {
+				cfg.OpenAIReferenceMode = "passthrough_fallback_local"
+			}
 			if tc.maxReferences > 0 {
 				cfg.MaxReferences = tc.maxReferences
 			}
@@ -1116,7 +1143,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			require.NoError(t, err)
 			request = service.AsyncImageRequest{}
 			require.NoError(t, common.Unmarshal(persisted, &request))
-			task := model.AsyncImageTask{TaskId: "openai-outbound-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			task := model.AsyncImageTask{TaskId: "openai-outbound-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120, ReferenceRetryCount: tc.referenceRetryCount}
 			require.NoError(t, db.Create(&task).Error)
 			dispatches := 0
 			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, cfg, func() error {

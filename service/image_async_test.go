@@ -444,18 +444,45 @@ func TestMixedImageFailurePreservesAcceptanceBoundary(t *testing.T) {
 	}
 }
 
-func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T) {
-	for _, mixed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		mixed                   bool
+		channelMode             string
+		sameChannel             bool
+		otherKey                bool
+		earlierAlternateTimeout bool
+	}{
+		{name: "single pool switches channel with original URL", channelMode: "passthrough"},
+		{name: "mixed pool switches channel with original URL", mixed: true, channelMode: "passthrough"},
+		{name: "new channel does not inherit global local fallback"},
+		{name: "new channel uses original URL instead of local override", mixed: true, channelMode: "local"},
+		{name: "same channel uses local fallback", sameChannel: true, channelMode: "passthrough"},
+		{name: "mixed pool same channel uses local fallback", mixed: true, sameChannel: true},
+		{name: "same channel other key uses local fallback", sameChannel: true, otherKey: true},
+		{name: "returning to an earlier failed channel uses original URL", mixed: true, earlierAlternateTimeout: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
 			cfg.CircuitBreaker = false
 			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
 			request.Kind = "image_to_image"
 			request.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://reference.example/input.png"}}
-			alternate.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: "passthrough"})
-			require.NoError(t, db.Model(&alternate).Update("setting", alternate.Setting).Error)
-			if mixed {
+			target := alternate
+			if tc.sameChannel {
+				target = model.Channel{}
+				require.NoError(t, db.First(&target, task.ChannelId).Error)
+				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			}
+			if tc.otherKey {
+				target.Key += "\nnext-account"
+				target.ChannelInfo.IsMultiKey = true
+				require.NoError(t, db.Model(&target).Updates(map[string]any{"key": target.Key, "channel_info": target.ChannelInfo}).Error)
+			}
+			target.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: tc.channelMode})
+			require.NoError(t, db.Model(&target).Update("setting", target.Setting).Error)
+			if tc.mixed {
 				var policy model.ImageGroupPolicy
 				require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&policy).Error)
 				policy.Id, policy.Platform, policy.PolicyKey = 0, "mixed", ImageIdentityHash(task.Group, "mixed")
@@ -471,10 +498,15 @@ func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T
 			require.NoError(t, err)
 			task.DispatchedAt, task.UpstreamTaskId = time.Now().Unix(), "failed-reference-job"
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
-			encoded, err = common.Marshal([]ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote"}})
+			initialHistory := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote"}}
+			if tc.earlierAlternateTimeout {
+				initialHistory = append([]ImageChannelAttempt{{ChannelId: alternate.Id, KeyFingerprint: ImageIdentityHash("image-account", strconv.Itoa(alternate.Id), alternate.Key), Dispatched: true, FinishedAt: task.DispatchedAt - 1, ReferenceFailure: true, Code: 602, ErrorMessage: "reference material download timeout", TransportUsed: "remote"}}, initialHistory...)
+				task.ReferenceRetryCount, task.RetryCount = 1, 1
+			}
+			encoded, err = common.Marshal(initialHistory)
 			require.NoError(t, err)
 			task.Attempts = string(encoded)
-			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "attempts": task.Attempts, "upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "attempts": task.Attempts, "upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt, "reference_retry_count": task.ReferenceRetryCount, "retry_count": task.RetryCount}).Error)
 			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
 			calls := 0
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, config ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
@@ -487,8 +519,16 @@ func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T
 					failure.InternalCode, failure.UpstreamTerminal = "upstream_job_failed", true
 					return nil, model.AsyncImageBill{}, failure
 				}
-				assert.Equal(t, alternate.Id, channel.Id)
-				assert.Equal(t, "local", ImageChannelReferenceTransport(*channel, outbound.Platform, current.ReferenceRetryCount, config))
+				assert.Equal(t, target.Id, channel.Id)
+				if tc.otherKey {
+					assert.Equal(t, "next-account", channel.Key)
+				}
+				wantMode := "passthrough"
+				if tc.sameChannel {
+					wantMode = "local"
+				}
+				assert.Equal(t, wantMode, ImageChannelReferenceTransport(*channel, outbound.Platform, current.ReferenceRetryCount, config))
+				assert.Equal(t, request.Parts, outbound.Parts, "retry keeps the original reference URL")
 				assert.Equal(t, request.Billing, outbound.Billing)
 				assert.Equal(t, request.MixedRouting, outbound.MixedRouting)
 				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
@@ -499,11 +539,14 @@ func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			require.Equal(t, model.ImageTaskQueued, task.Status)
-			assert.Equal(t, 1, task.ReferenceRetryCount)
+			assert.Equal(t, len(initialHistory), task.ReferenceRetryCount)
 			assert.Empty(t, task.UpstreamTaskId)
 			cooling, err := common.RDB.TTL(t.Context(), ImageAccountCooldownKey(fingerprint)).Result()
 			require.NoError(t, err)
 			assert.Positive(t, cooling)
+			if tc.sameChannel && !tc.otherKey {
+				require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(fingerprint)).Err())
+			}
 			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
 			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "reference-retry-worker", cfg.WorkerLease)
 			require.NoError(t, err)
@@ -513,12 +556,17 @@ func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T
 			assert.Equal(t, "replacement-job", task.UpstreamTaskId)
 			var history []ImageChannelAttempt
 			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
-			require.Len(t, history, 2)
-			assert.Equal(t, "failed-reference-job", history[0].UpstreamTaskID)
-			assert.True(t, history[1].ReferenceFallback)
+			require.Len(t, history, len(initialHistory)+1)
+			assert.Equal(t, "failed-reference-job", history[len(history)-2].UpstreamTaskID)
+			assert.Equal(t, tc.sameChannel, history[len(history)-1].ReferenceFallback)
+			if tc.sameChannel {
+				assert.Equal(t, "local", history[len(history)-1].ReferenceMode)
+			} else {
+				assert.Equal(t, "passthrough", history[len(history)-1].ReferenceMode)
+			}
 			var persistedChannel model.Channel
-			require.NoError(t, db.First(&persistedChannel, alternate.Id).Error)
-			assert.Equal(t, "passthrough", persistedChannel.GetSetting().ImageReferenceTransportMode, "fallback must not change administrator settings")
+			require.NoError(t, db.First(&persistedChannel, target.Id).Error)
+			assert.Equal(t, tc.channelMode, persistedChannel.GetSetting().ImageReferenceTransportMode, "retry must not change administrator settings")
 			var bill model.AsyncImageBill
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
 			assert.Equal(t, "reserved", bill.Status)

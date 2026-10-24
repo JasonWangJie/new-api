@@ -479,15 +479,23 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	capability := ImageChannelCapability(*channel, request.Model)
 	upstreamAsyncConfigured := channel.GetOtherSettings().UpstreamAsync != nil
 	if !knownUpstreamTask && !acceptedOutput {
-		for _, attempt := range attempts {
-			if attempt.Dispatched && attempt.FinishedAt > 0 && attempt.ReferenceFailure && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage}) {
-				// This attempt uses local input even when the next channel normally
-				// passes URLs through. Freeze the override without changing the channel.
-				settings := channel.GetSetting()
-				settings.ImageReferenceTransportMode = "local"
-				channel.SetSetting(settings)
-				break
+		for i := len(attempts) - 1; i >= 0; i-- {
+			attempt := attempts[i]
+			if !attempt.Dispatched || attempt.FinishedAt == 0 || !attempt.ReferenceFailure {
+				continue
 			}
+			if IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage}) {
+				// A different channel gets the original URL. Only retrying the
+				// same channel uses local input; the cumulative retry count must
+				// not enable local fallback on a newly selected channel.
+				settings := channel.GetSetting()
+				settings.ImageReferenceTransportMode = "passthrough"
+				if channel.Id == attempt.ChannelId {
+					settings.ImageReferenceTransportMode = "local"
+				}
+				channel.SetSetting(settings)
+			}
+			break
 		}
 		encodedChannel, err := common.Marshal(channel)
 		if err != nil {

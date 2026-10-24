@@ -125,7 +125,14 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 			fields["mask"], _ = common.Marshal(map[string]string{"image_url": part.URL})
 		}
 		if part.Type == "image_url" {
-			references = append(references, part.URL)
+			reference := part.URL
+			if ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility && (strings.HasPrefix(strings.ToLower(reference), "data:") || service.IsGatewayImageReference(reference)) {
+				// Dispatch resolves local input and replaces it with a signed
+				// gateway URL. Probe that URL shape without downloading, signing
+				// or changing the persisted reference during mixed admission.
+				reference = fmt.Sprintf("https://image-admission.invalid/references/%d", len(references))
+			}
+			references = append(references, reference)
 		}
 	}
 	if len(references) > 0 {
