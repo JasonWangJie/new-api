@@ -1093,31 +1093,32 @@ func RecordImageCircuit(ctx context.Context, scope string, channelId int, succes
 }
 
 type ImageChannelAttempt struct {
-	Provider              string              `json:"provider,omitempty"`
-	Protocol              string              `json:"protocol,omitempty"`
-	UpstreamModel         string              `json:"upstream_model,omitempty"`
-	AuditVersion          int                 `json:"audit_version,omitempty"`
-	Decision              *ImageRetryDecision `json:"decision,omitempty"`
-	ChannelId             int                 `json:"channel_id"`
-	KeyFingerprint        string              `json:"key_fingerprint,omitempty"`
-	CredentialFingerprint string              `json:"credential_fingerprint,omitempty"`
-	KeyIndex              int                 `json:"key_index"`
-	StartedAt             int64               `json:"started_at"`
-	FinishedAt            int64               `json:"finished_at,omitempty"`
-	Dispatched            bool                `json:"dispatched"`
-	TimedOut              bool                `json:"timed_out,omitempty"`
-	RetryOnTimeout        bool                `json:"retry_on_timeout,omitempty"`
-	ReferenceMode         string              `json:"reference_mode"`
-	TransportUsed         string              `json:"reference_transport_used,omitempty"`
-	ReferenceFallback     bool                `json:"reference_fallback,omitempty"`
-	Code                  int                 `json:"error_code,omitempty"`
-	HTTPStatus            int                 `json:"http_status,omitempty"`
-	ErrorMessage          string              `json:"error_message,omitempty"`
-	ProviderCode          string              `json:"provider_code,omitempty"`
-	ProviderStatus        string              `json:"provider_status,omitempty"`
-	UpstreamRequestID     string              `json:"upstream_request_id,omitempty"`
-	UpstreamTaskID        string              `json:"upstream_task_id,omitempty"`
-	ReferenceFailure      bool                `json:"upstream_reference_failure,omitempty"`
+	Provider                     string              `json:"provider,omitempty"`
+	Protocol                     string              `json:"protocol,omitempty"`
+	UpstreamModel                string              `json:"upstream_model,omitempty"`
+	AuditVersion                 int                 `json:"audit_version,omitempty"`
+	Decision                     *ImageRetryDecision `json:"decision,omitempty"`
+	ChannelId                    int                 `json:"channel_id"`
+	KeyFingerprint               string              `json:"key_fingerprint,omitempty"`
+	CredentialFingerprint        string              `json:"credential_fingerprint,omitempty"`
+	KeyIndex                     int                 `json:"key_index"`
+	StartedAt                    int64               `json:"started_at"`
+	FinishedAt                   int64               `json:"finished_at,omitempty"`
+	Dispatched                   bool                `json:"dispatched"`
+	TimedOut                     bool                `json:"timed_out,omitempty"`
+	RetryOnTimeout               bool                `json:"retry_on_timeout,omitempty"`
+	SynchronousRetryableResponse bool                `json:"synchronous_retryable_response,omitempty"`
+	ReferenceMode                string              `json:"reference_mode"`
+	TransportUsed                string              `json:"reference_transport_used,omitempty"`
+	ReferenceFallback            bool                `json:"reference_fallback,omitempty"`
+	Code                         int                 `json:"error_code,omitempty"`
+	HTTPStatus                   int                 `json:"http_status,omitempty"`
+	ErrorMessage                 string              `json:"error_message,omitempty"`
+	ProviderCode                 string              `json:"provider_code,omitempty"`
+	ProviderStatus               string              `json:"provider_status,omitempty"`
+	UpstreamRequestID            string              `json:"upstream_request_id,omitempty"`
+	UpstreamTaskID               string              `json:"upstream_task_id,omitempty"`
+	ReferenceFailure             bool                `json:"upstream_reference_failure,omitempty"`
 }
 
 func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, platform string, maxSwitches int) ImageAccountRouting {
@@ -1172,13 +1173,14 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		last = attempt.KeyFingerprint
 		lastAttempt = attempt
 		referenceTimeout := attempt.ReferenceFailure && attempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage})
-		routing.WaitForCooldown = routing.WaitForCooldown || referenceTimeout
+		routing.WaitForCooldown = routing.WaitForCooldown || referenceTimeout || attempt.SynchronousRetryableResponse && attempt.FinishedAt > 0
 		if attempt.ReferenceFailure && !referenceTimeout {
 			reference = append(reference, attempt)
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
 	lastReferenceTimeout := lastAttempt.ReferenceFailure && lastAttempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: lastAttempt.Code, Message: lastAttempt.ErrorMessage})
+	lastSynchronousResponse := lastAttempt.SynchronousRetryableResponse && lastAttempt.FinishedAt > 0
 	lastIncompatible := imageAttemptCompatibilityCode(lastAttempt) != ""
 	if legacy {
 		if !routing.WaitForCooldown {
@@ -1193,7 +1195,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if lastReferenceTimeout {
+		if lastReferenceTimeout || lastSynchronousResponse {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {
@@ -1227,7 +1229,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if lastReferenceTimeout {
+	if lastReferenceTimeout || lastSynchronousResponse {
 		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {

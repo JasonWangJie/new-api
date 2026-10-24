@@ -390,9 +390,13 @@ func TestMixedImageFailurePreservesAcceptanceBoundary(t *testing.T) {
 	}{
 		{name: "unknown transport timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout", ExecutionUnknown: true}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "unconfirmed server error", failure: AsyncImageFailure{Code: 606, HTTPStatus: 503}, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "unconfirmed gateway error", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, ProviderCode: "upstream_request_failed", RetryableHTTPResponse: true}, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "complete synchronous gateway failure can retry", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true}, wantStatus: model.ImageTaskQueued},
+		{name: "cancelled synchronous response stays unknown", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true, ExecutionUnknown: true}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "crash recovery never resubmits", wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "explicit rate rejection can retry", failure: AsyncImageFailure{Code: 605, HTTPStatus: 429}, wantStatus: model.ImageTaskQueued},
 		{name: "accepted job polling stays fixed", failure: AsyncImageFailure{Code: 606}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskInvoking},
+		{name: "accepted job cannot become a synchronous retry", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskInvoking},
 		{name: "confirmed terminal transient failure can retry", failure: AsyncImageFailure{Code: 606, UpstreamTerminal: true}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskQueued},
 		{name: "empty submission rejection can switch account", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_submission_rejected", HTTPStatus: http.StatusBadRequest}, wantStatus: model.ImageTaskQueued},
 		{name: "empty poll rejection cannot replace an accepted job", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_submission_rejected", HTTPStatus: http.StatusBadRequest}, acceptedID: "accepted-provider-job", wantStatus: model.ImageTaskExecutionUnknown},
@@ -519,6 +523,86 @@ func TestAsyncImageReferenceTimeoutSwitchesChannelWithLocalFallback(t *testing.T
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
 			assert.Equal(t, "reserved", bill.Status)
 			assert.Equal(t, 100, bill.ReservedQuota, "account switching reuses the original hold")
+		})
+	}
+}
+
+func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
+	for _, onlyAccount := range []bool{false, true} {
+		t.Run(fmt.Sprintf("only_account=%t", onlyAccount), func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			cfg.CircuitBreaker, cfg.TransientRetries = false, 1
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			var policy model.ImageGroupPolicy
+			require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&policy).Error)
+			policy.Id, policy.Platform, policy.PolicyKey = 0, "mixed", ImageIdentityHash(task.Group, "mixed")
+			require.NoError(t, db.Create(&policy).Error)
+			request.Provider, request.PolicyPlatform, request.Resolution = "", "mixed", "2K"
+			key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+			request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: key, PoolMode: policy.PoolMode}
+			require.NoError(t, db.Create(&[]model.ImageChannelPool{{BindingKey: key, ChannelId: task.ChannelId, Priority: 1}, {BindingKey: key, ChannelId: alternate.Id, Priority: 0}}).Error)
+			require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = EncryptImagePayload(encoded, "task:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
+			primaryID, calls := task.ChannelId, 0
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				wantID := primaryID
+				if calls > 1 && !onlyAccount {
+					wantID = alternate.Id
+				}
+				assert.Equal(t, wantID, channel.Id)
+				assert.Equal(t, request.MixedRouting, outbound.MixedRouting)
+				assert.Equal(t, request.Billing, outbound.Billing)
+				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+				require.NoError(t, beforeInvoke())
+				return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", Message: "The upstream image service could not complete the image request. Please retry shortly.", HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true}
+			}
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			require.Equal(t, model.ImageTaskQueued, task.Status)
+			assert.Equal(t, 1, task.TransientRetryCount)
+			assert.Equal(t, 1, task.RetryCount)
+			assert.Empty(t, task.UpstreamTaskId, "a synchronous upstream never needs a task ID")
+			assert.Equal(t, 606, task.PublicErrorCode)
+			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(primaryID), "upstream-key-a")
+			ttl, err := common.RDB.TTL(t.Context(), ImageAccountCooldownKey(fingerprint)).Result()
+			require.NoError(t, err)
+			assert.Positive(t, ttl)
+			var history []ImageChannelAttempt
+			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
+			require.Len(t, history, 1)
+			if !onlyAccount {
+				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusEnabled).Error)
+			}
+			if onlyAccount {
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "wait-cooling", cfg.WorkerLease)
+				require.NoError(t, err)
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, 1, calls, "cooldown must defer without making another upstream call")
+				assert.Equal(t, 1, task.RetryCount)
+				require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(fingerprint)).Err())
+			}
+			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "bounded-response-retry", cfg.WorkerLease)
+			require.NoError(t, err)
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, 2, calls)
+			assert.Equal(t, model.ImageTaskFailed, task.Status)
+			var bill model.AsyncImageBill
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, "refunded", bill.Status)
+			assert.Equal(t, 100, bill.ReservedQuota, "retries must reuse one reservation")
+			var refunds int64
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+			assert.EqualValues(t, 1, refunds)
 		})
 	}
 }
@@ -1485,6 +1569,7 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		resultEvent  string
 		noRetries    bool
 		expired      bool
+		synchronous  bool
 	}{
 		{name: "confirmed generation timeout", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskQueued, wantBill: "reserved"},
 		{name: "policy rejection is terminal", failure: AsyncImageFailure{Code: 601, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
@@ -1503,6 +1588,10 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		{name: "mixed terminal failure cannot replace checkpointed output", mixed: true, resultEvent: "output_received", failure: AsyncImageFailure{Code: 602, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "mixed terminal failure obeys the total retry budget", mixed: true, noRetries: true, failure: AsyncImageFailure{Code: 602, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "mixed terminal failure cannot extend its deadline", mixed: true, expired: true, failure: AsyncImageFailure{Code: 602, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "synchronous response cannot reuse a refunded hold", mixed: true, synchronous: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, billStatus: "refunded", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "synchronous response obeys the total budget", mixed: true, synchronous: true, noRetries: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "synchronous response obeys the deadline", mixed: true, synchronous: true, expired: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "synchronous response cannot replace received output", mixed: true, synchronous: true, resultEvent: "output_received", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, _ := asyncImageWorkerFixture(t)
@@ -1518,6 +1607,9 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 				require.NoError(t, db.Create(&model.AsyncImageEvent{TaskId: task.TaskId, EventKey: "accepted-output", EventType: tc.resultEvent}).Error)
 			}
 			task.UpstreamTaskId, task.DispatchedAt = "original-provider-job", time.Now().Unix()-1
+			if tc.synchronous {
+				task.UpstreamTaskId = ""
+			}
 			task.TransientRetryCount = tc.pollFailures
 			if tc.wantStatus == model.ImageTaskInvoking || tc.noRetries {
 				cfg.TotalRetries = 0
@@ -1620,6 +1712,7 @@ func TestAsyncImageWorkerCompletionRecoveryUsesLocalBudgets(t *testing.T) {
 		{name: "download", failure: AsyncImageFailure{Code: 606, InternalCode: "result_download_failed"}, paused: model.ImageTaskStorageFailed},
 		{name: "billing", failure: AsyncImageFailure{Code: 606, InternalCode: "bill_preparation_failed"}, paused: model.ImageTaskBillingFailed},
 		{name: "saved output timeout", failure: AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout"}, paused: model.ImageTaskStorageFailed},
+		{name: "synchronous response after output stays local", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, SynchronousRetryableResponse: true}, paused: model.ImageTaskStorageFailed},
 		{name: "size rejection after output acceptance remains local", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, paused: model.ImageTaskStorageFailed},
 		{name: "reference rejection after output acceptance remains local", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_reference_incompatible", HTTPStatus: http.StatusBadRequest, ProviderCode: "400"}, paused: model.ImageTaskStorageFailed},
 		{name: "invalid output", failure: AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed"}, paused: model.ImageTaskStorageFailed, noAutomaticRetry: true},
@@ -2766,6 +2859,40 @@ func TestAsyncImageChannelReferenceCapacityRouting(t *testing.T) {
 	selected, _, err = PickImageChannel(t.Context(), policy, request, ImageAccountRouting{})
 	require.NoError(t, err)
 	assert.Equal(t, legacy.Id, selected.Id, "routing falls back to the original priority order when no channel covers the request")
+}
+
+func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
+	const gatewayError = `{"error":{"code":"upstream_request_failed","type":"new_api_error","message":"The upstream image service could not complete the image request. Please retry shortly."}}`
+	for _, tc := range []struct {
+		name, body           string
+		status               int
+		readError, retryable bool
+	}{
+		{name: "complete gateway failure", body: gatewayError, status: 502, retryable: true},
+		{name: "different status", body: gatewayError, status: 504},
+		{name: "different error code", body: strings.Replace(gatewayError, "upstream_request_failed", "do_request_failed", 1), status: 502},
+		{name: "read failure", body: gatewayError, status: 502, readError: true},
+		{name: "truncated response", body: gatewayError + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), status: 502},
+		{name: "invalid JSON", body: gatewayError[:len(gatewayError)-1], status: 502},
+		{name: "HTML response", body: "<html>Bad Gateway</html>", status: 502},
+		{name: "empty response", status: 502},
+		{name: "accepted task evidence", body: strings.TrimSuffix(gatewayError, "}") + `,"task_id":"already-accepted"}`, status: 502},
+		{name: "result evidence", body: strings.TrimSuffix(gatewayError, "}") + `,"data":[{"url":"https://result.example/image.png"}]}`, status: 502},
+		{name: "policy signal", body: strings.Replace(gatewayError, "new_api_error", "content_policy_violation", 1), status: 502},
+		{name: "authentication signal", body: strings.Replace(gatewayError, "new_api_error", "authentication_error", 1), status: 502},
+		{name: "parameter signal", body: strings.Replace(gatewayError, "The upstream image service could not complete the image request. Please retry shortly.", "unsupported_image_dimensions", 1), status: 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reader io.Reader = strings.NewReader(tc.body)
+			if tc.readError {
+				reader = io.MultiReader(reader, iotest.ErrReader(io.ErrUnexpectedEOF))
+			}
+			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{StatusCode: tc.status, Body: io.NopCloser(reader)}, "")
+			assert.Equal(t, tc.retryable, failure.RetryableHTTPResponse)
+			assert.False(t, failure.SynchronousRetryableResponse, "the HTTP classifier cannot infer the upstream execution protocol")
+			assert.False(t, failure.UpstreamTerminal)
+		})
+	}
 }
 
 func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testing.T) {

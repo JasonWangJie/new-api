@@ -712,6 +712,21 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	return nil
 }
 
+func canRetryAsyncImageSubmission(ctx context.Context, task model.AsyncImageTask, cfg ImageRuntimeConfig) (bool, error) {
+	if task.UpstreamSucceededAt > 0 || task.ImageCount > 0 || task.ResultCount > 0 || task.StartedAt > 0 && time.Now().Unix() >= task.StartedAt+int64(cfg.ExecutionTimeout) {
+		return false, nil
+	}
+	reservation, err := model.GetAsyncImageReservation(ctx, task)
+	if err != nil || reservation == nil || reservation.Status != "reserved" {
+		return false, err
+	}
+	var received int64
+	if err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type IN ?", task.TaskId, []string{"upstream_result_received", "output_received", "upstream_succeeded"}).Count(&received).Error; err != nil {
+		return false, err
+	}
+	return received == 0, nil
+}
+
 func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
 	failure.Message = SanitizeAsyncImageDiagnostic(failure.Message, asyncImageProviderMessageLimit)
 	failure.ProviderCode = limitAsyncImageProviderDiagnostic(failure.ProviderCode, asyncImageProviderCodeLimit)
@@ -721,16 +736,19 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		failure.Message = "Upstream image request failed"
 	}
 	mixedRouting := false
+	acceptedOutput := task.UpstreamSucceededAt > 0
 	if len(task.RequestCipher) > 0 {
 		data, err := DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
 		if err == nil {
 			var request AsyncImageRequest
 			if common.Unmarshal(data, &request) == nil {
 				mixedRouting = request.MixedRouting != nil
+				acceptedOutput = acceptedOutput || request.Completion != nil
 			}
 		}
 	}
-	if mixedRouting && task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
+	synchronousResponseRetry := failure.SynchronousRetryableResponse && !failure.ExecutionUnknown && failure.Code == 606 && failure.HTTPStatus == http.StatusBadGateway && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
+	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !synchronousResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
 		// A transport interruption or server error cannot prove non-acceptance.
 		// Keep the hold and require reconciliation instead of crossing providers.
 		failure.ExecutionUnknown = true
@@ -771,6 +789,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.ProviderStatus = failure.ProviderStatus
 				last.UpstreamRequestID = failure.UpstreamRequestID
 				last.UpstreamTaskID = task.UpstreamTaskId
+				last.SynchronousRetryableResponse = synchronousResponseRetry
 				last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal))
 				encoded, err := common.Marshal(attempts)
 				if err != nil {
@@ -780,7 +799,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			}
 		}
 	}
-	if task.UpstreamSucceededAt > 0 {
+	if acceptedOutput {
 		// The encrypted completion is authoritative. Retry only its local
 		// download or billing phase, including after the generation deadline.
 		key, count, maximum, paused := "storage_retry_count", task.StorageRetryCount, cfg.StorageRetries, model.ImageTaskStorageFailed
@@ -866,18 +885,14 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		status = model.ImageTaskExpired
 	} else {
 		resubmit := task.UpstreamTaskId == ""
-		if failure.UpstreamTerminal {
+		if failure.UpstreamTerminal || synchronousResponseRetry {
 			resubmit = false
-			if !compatibilityFailure && task.ImageCount == 0 && task.ResultCount == 0 && (task.StartedAt == 0 || time.Now().Unix() < task.StartedAt+int64(cfg.ExecutionTimeout)) && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
-				reservation, err := model.GetAsyncImageReservation(ctx, task)
+			if !compatibilityFailure && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
+				var err error
+				resubmit, err = canRetryAsyncImageSubmission(ctx, task, cfg)
 				if err != nil {
 					return err
 				}
-				var resultMilestones int64
-				if err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type IN ?", task.TaskId, []string{"upstream_result_received", "output_received", "upstream_succeeded"}).Count(&resultMilestones).Error; err != nil {
-					return err
-				}
-				resubmit = reservation != nil && reservation.Status == "reserved" && resultMilestones == 0
 			}
 		}
 		count, maximum, base, maxDelay, key := 0, 0, 0, 0, ""

@@ -906,6 +906,8 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		passThrough                bool
 		volcengine                 bool
 		xai                        bool
+		newapi                     bool
+		synchronousRetry           bool
 		resolutionMapping          bool
 		resolution                 string
 		parameterOverride          string
@@ -944,6 +946,8 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "accepted_response_parse_failure_keeps_request_id", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusOK, unreadableResponse: true},
 		{name: "reference_fetch_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 602, providerCode: "image_fetch_failed", responseMessage: "image_url fetch failed for https://example.com/private.png?token=secret-url; authorization=Bearer secret-bearer api_key=secret-key"},
 		{name: "upstream_service_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, providerCode: "overloaded", responseMessage: "upstream image worker unavailable"},
+		{name: "synchronous_gateway_failure_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "The upstream image service could not complete the image request. Please retry shortly."},
+		{name: "asynchronous_gateway_failure_keeps_acceptance_boundary", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "The upstream image service could not complete the image request. Please retry shortly.", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
 		{name: "mapped_status_keeps_original_diagnostic", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 605, providerCode: "overloaded", responseMessage: "upstream image worker unavailable", statusMapping: `{"502":"429"}`},
 		{name: "mapped_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 605, responseMessage: "please retry later", statusMapping: `{"400":"429"}`},
 		{name: "server_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, responseMessage: "please retry later"},
@@ -1010,6 +1014,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			headers := `{"X-Image-Probe":"synthetic"}`
 			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
+			if tc.newapi {
+				channel.Type = constant.ChannelTypeNewAPI
+			}
 			if tc.xai {
 				channel.Type = constant.ChannelTypeXai
 				mapping = `{"image-alias":"grok-imagine-image-quality"}`
@@ -1152,6 +1159,8 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
 				assert.Equal(t, tc.failureCode, failure.Code)
+				assert.Equal(t, tc.synchronousRetry, failure.SynchronousRetryableResponse)
+				assert.False(t, failure.UpstreamTerminal)
 				assert.Equal(t, tc.status, failure.HTTPStatus, "attempt diagnostics must keep the real upstream status")
 				assert.Equal(t, 7*time.Second, failure.RetryAfter)
 				if len(tc.secrets) > 0 {

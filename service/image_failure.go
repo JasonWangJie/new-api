@@ -32,17 +32,19 @@ var (
 )
 
 type AsyncImageFailure struct {
-	Code                       int
-	InternalCode               string
-	Message                    string
-	HTTPStatus                 int
-	ProviderCode               string
-	ProviderStatus             string
-	UpstreamRequestID          string
-	RetryAfter                 time.Duration
-	ExecutionUnknown           bool
-	UpstreamTerminal           bool `json:"-"`
-	ReferenceTransportFallback bool
+	Code                         int
+	InternalCode                 string
+	Message                      string
+	HTTPStatus                   int
+	ProviderCode                 string
+	ProviderStatus               string
+	UpstreamRequestID            string
+	RetryAfter                   time.Duration
+	ExecutionUnknown             bool
+	UpstreamTerminal             bool `json:"-"`
+	RetryableHTTPResponse        bool `json:"-"`
+	SynchronousRetryableResponse bool `json:"-"`
+	ReferenceTransportFallback   bool
 }
 
 type AsyncImagePending struct{ TaskId string }
@@ -346,6 +348,80 @@ func isUndiagnosedImageSubmissionResponse(body []byte) bool {
 	return true
 }
 
+// isRetryableImageGatewayResponse recognizes the bounded gateway error response
+// allowed by the retry policy. The relay must confirm synchronous execution before the
+// worker may use it to submit another generation.
+func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bool {
+	if failure == nil || failure.HTTPStatus != http.StatusBadGateway || failure.Code != 606 || failure.InternalCode != "upstream_failed" || failure.ProviderCode != "upstream_request_failed" {
+		return false
+	}
+	envelope, ok := decoded.(map[string]any)
+	if !ok {
+		return false
+	}
+	providerError, ok := envelope["error"].(map[string]any)
+	if !ok || providerError["code"] != "upstream_request_failed" {
+		return false
+	}
+	for index, scope := range []map[string]any{envelope, providerError} {
+		for field, value := range scope {
+			if index == 0 && field == "error" {
+				continue
+			}
+			if field == "request_id" || field == "requestId" || field == "requestID" {
+				if _, ok := value.(string); value != nil && !ok {
+					return false
+				}
+				continue
+			}
+			if field == "param" {
+				if value != nil && value != "" {
+					return false
+				}
+				continue
+			}
+			if index == 0 {
+				return false
+			}
+			text, isString := value.(string)
+			if value != nil && !isString {
+				return false
+			}
+			switch field {
+			case "code":
+				if text != "upstream_request_failed" {
+					return false
+				}
+			case "type":
+				switch text {
+				case "", "upstream_request_failed", "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", "bad_gateway":
+				default:
+					return false
+				}
+			case "status":
+				switch strings.ToLower(text) {
+				case "", "error", "failed", "failure", "bad_gateway", "502":
+				default:
+					return false
+				}
+			case "message", "msg", "detail", "reason":
+				if ClassifyAsyncImageFailure(errors.New(text), http.StatusBadRequest).Code != 610 {
+					return false
+				}
+				lowered := strings.ToLower(text)
+				for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
+					if strings.Contains(lowered, signal) {
+						return false
+					}
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 	if !attempt.Dispatched || attempt.FinishedAt <= 0 || attempt.UpstreamTaskID != "" || attempt.Code == 601 {
 		return ""
@@ -462,6 +538,9 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	failure.ProviderStatus = providerStatus
 	failure.UpstreamRequestID = requestID
 	failure.RetryAfter = ImageRetryAfter(response.Header.Get("Retry-After"), time.Now())
+	if !classifyErrorType && readErr == nil && !bodyTruncated {
+		failure.RetryableHTTPResponse = isRetryableImageGatewayResponse(failure, decoded)
+	}
 	return failure
 }
 
