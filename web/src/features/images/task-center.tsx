@@ -828,9 +828,7 @@ function TaskCenterSession({
       shell: 'border-cyan-500/20 bg-cyan-500/10',
       dot: 'bg-cyan-500',
     },
-  ]
-  if (admin) {
-    statistics.push({
+    {
       label: t('Successful task cost'),
       value:
         stats?.succeeded_cost == null
@@ -839,8 +837,8 @@ function TaskCenterSession({
       color: 'text-primary',
       shell: 'border-primary/20 bg-primary/10',
       dot: 'bg-primary',
-    })
-  }
+    },
+  ]
   const batchActions = canManage && (
     <>
       <Button

@@ -489,9 +489,14 @@ test('replacing a protected image releases the previous preview URL', async () =
   }
 })
 
-test.each([false, true])(
-  'administrator successful task cost uses all filtered results after average duration (mobile=%s)',
-  async (mobile) => {
+test.each([
+  { admin: false, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: false },
+  { admin: true, mobile: true },
+])(
+  'successful task cost uses all filtered results after average duration (admin=$admin, mobile=$mobile)',
+  async ({ admin, mobile }) => {
     if (mobile) setMobileViewport()
     vi.mocked(getImageTasks).mockResolvedValue({
       items: [
@@ -506,8 +511,9 @@ test.each([false, true])(
       pages: 5,
       stats: { succeeded: 96, succeeded_cost: 12.3456789 },
     })
-    mount(<ImageTaskCenter admin />)
+    mount(<ImageTaskCenter admin={admin} />)
     await screen.findByRole('button', { name: task.id })
+    expect(vi.mocked(getImageTasks).mock.calls[0]?.[0]).toBe(admin)
     const statistics = screen.getByLabelText('Task statistics')
     const costLabel = within(statistics).getByText('Successful task cost')
     expect(costLabel.nextElementSibling?.textContent).toBe('$12.345679')
@@ -526,33 +532,40 @@ test.each([false, true])(
   }
 )
 
-test('administrator successful task cost follows applied filters and reset without using draft filters', async () => {
-  vi.mocked(getImageTasks).mockImplementation(async (_admin, params) => ({
-    items: [task],
-    total: 1,
-    pages: 1,
-    stats: { succeeded_cost: params.get('q') === 'flare' ? 0.25 : 0.75 },
-  }))
-  mount(<ImageTaskCenter admin />)
-  const statistics = screen.getByLabelText('Task statistics')
-  expect(await within(statistics).findByText('$0.75')).toBeVisible()
-  const user = userEvent.setup()
-  await user.type(screen.getByLabelText('Search tasks'), 'flare')
-  expect(within(statistics).getByText('$0.75')).toBeVisible()
-  await user.click(screen.getByRole('button', { name: 'Apply filters' }))
-  expect(await within(statistics).findByText('$0.25')).toBeVisible()
-  await user.click(screen.getByRole('button', { name: 'Reset' }))
-  expect(await within(statistics).findByText('$0.75')).toBeVisible()
-  expect(screen.getByLabelText('Search tasks')).toHaveValue('')
-})
+test.each([false, true])(
+  'successful task cost follows applied filters and reset without using draft filters (admin=%s)',
+  async (admin) => {
+    vi.mocked(getImageTasks).mockImplementation(async (_admin, params) => ({
+      items: [task],
+      total: 1,
+      pages: 1,
+      stats: { succeeded_cost: params.get('q') === 'flare' ? 0.25 : 0.75 },
+    }))
+    mount(<ImageTaskCenter admin={admin} />)
+    const statistics = screen.getByLabelText('Task statistics')
+    expect(await within(statistics).findByText('$0.75')).toBeVisible()
+    const user = userEvent.setup()
+    await user.type(screen.getByLabelText('Search tasks'), 'flare')
+    expect(within(statistics).getByText('$0.75')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    expect(await within(statistics).findByText('$0.25')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    expect(await within(statistics).findByText('$0.75')).toBeVisible()
+    expect(screen.getByLabelText('Search tasks')).toHaveValue('')
+  }
+)
 
-test.each([
-  { name: 'empty results', succeededCost: 0, expected: '$0' },
-  { name: 'missing total', succeededCost: undefined, expected: '—' },
-  { name: 'unavailable total', succeededCost: null, expected: '—' },
-])(
-  'administrator successful task cost displays $expected for $name',
-  async ({ succeededCost, expected }) => {
+test.each(
+  [false, true].flatMap((admin) =>
+    [
+      { name: 'empty results', succeededCost: 0, expected: '$0' },
+      { name: 'missing total', succeededCost: undefined, expected: '—' },
+      { name: 'unavailable total', succeededCost: null, expected: '—' },
+    ].map((scenario) => ({ ...scenario, admin }))
+  )
+)(
+  'successful task cost displays $expected for $name (admin=$admin)',
+  async ({ admin, succeededCost, expected }) => {
     vi.mocked(getImageTasks).mockResolvedValue({
       items: [],
       total: 0,
@@ -560,7 +573,7 @@ test.each([
       stats:
         succeededCost === undefined ? {} : { succeeded_cost: succeededCost },
     })
-    mount(<ImageTaskCenter admin />)
+    mount(<ImageTaskCenter admin={admin} />)
     await screen.findByText('No image tasks found')
     expect(
       within(screen.getByLabelText('Task statistics')).getByText(
@@ -570,7 +583,7 @@ test.each([
   }
 )
 
-test('user task statistics do not expose the administrator successful task cost total', async () => {
+test('user successful task cost updates from the user response on refresh', async () => {
   vi.mocked(getImageTasks).mockResolvedValue({
     items: [task],
     total: 1,
@@ -580,10 +593,18 @@ test('user task statistics do not expose the administrator successful task cost 
   mount(<ImageTaskCenter />)
   await screen.findByRole('button', { name: task.id })
   const statistics = screen.getByLabelText('Task statistics')
-  expect(
-    within(statistics).queryByText('Successful task cost')
-  ).not.toBeInTheDocument()
-  expect(within(statistics).queryByText('$12.34')).not.toBeInTheDocument()
+  expect(within(statistics).getByText('$12.34')).toBeVisible()
+  expect(vi.mocked(getImageTasks).mock.calls[0]?.[0]).toBe(false)
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [task],
+    total: 1,
+    pages: 1,
+    stats: { succeeded_cost: 13.5 },
+  })
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Refresh' }))
+  expect(await within(statistics).findByText('$13.5')).toBeVisible()
+  expect(vi.mocked(getImageTasks).mock.lastCall?.[0]).toBe(false)
 })
 
 test.each([
@@ -702,7 +723,13 @@ test.each([
   },
 ])(
   '$action/$rule keeps recovery status in the list and recovery information in details',
-  async ({ action, rule, reason = 'temporary_failure', retryable, visible }) => {
+  async ({
+    action,
+    rule,
+    reason = 'temporary_failure',
+    retryable,
+    visible,
+  }) => {
     const message = 'Previous upstream diagnostic'
     const retryTask: ImageTask = {
       ...task,
