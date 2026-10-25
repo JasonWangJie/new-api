@@ -302,12 +302,10 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) (notice ImageFailureNotic
 	case "admin_terminated":
 		notice.Summary = "The task was manually terminated"
 		specificCause = true
-	case "image_reference_accounts_exhausted", "account_switches_exhausted":
-		if task.ErrorCode == "image_reference_accounts_exhausted" || imageAttemptCompatibilityCode(lastAttempt) == "upstream_image_reference_incompatible" {
-			notice.Summary = "The upstream only supports a specific YouTube video URL format"
-			specificAdvice = "Check the supported reference link format with the service provider, or use a model that accepts your reference material."
+	case "upstream_failed", "upstream_job_failed", "invalid_reference_image", "upstream_image_reference_incompatible", "image_reference_accounts_exhausted", "account_switches_exhausted":
+		if task.ErrorCode == "image_reference_accounts_exhausted" || task.ErrorCode == "account_switches_exhausted" && imageAttemptCompatibilityCode(lastAttempt) == "upstream_image_reference_incompatible" {
+			message = lastAttempt.ErrorMessage
 		}
-	case "upstream_failed", "upstream_job_failed", "invalid_reference_image", "upstream_image_reference_incompatible":
 		limitMatch := imageReferenceLimitNoticePattern.FindStringSubmatch(message)
 		if len(limitMatch) != 2 && strings.Contains(strings.ToLower(message), "inline image") {
 			limitMatch = imageInlineLimitNoticePattern.FindStringSubmatch(message)

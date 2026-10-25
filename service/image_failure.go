@@ -26,10 +26,12 @@ const (
 )
 
 var (
-	asyncImageBearerCredentialPattern = regexp.MustCompile(`(?i)(\bbearer\s+)[^\s,;"']+`)
-	asyncImageNamedCredentialPattern  = regexp.MustCompile(`(?i)(\b(?:api[_ -]?key|authorization|access[_ -]?token|secret|password)\b(?:\s+(?:provided|supplied))?["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
-	asyncImageGoogleAPIKeyPattern     = regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{20,}\b`)
-	asyncImageOpenAIAPIKeyPattern     = regexp.MustCompile(`\bsk-[0-9A-Za-z_-]+`)
+	asyncImageBearerCredentialPattern    = regexp.MustCompile(`(?i)(\bbearer\s+)[^\s,;"']+`)
+	asyncImageNamedCredentialPattern     = regexp.MustCompile(`(?i)(\b(?:api[_ -]?key|authorization|access[_ -]?token|secret|password)\b(?:\s+(?:provided|supplied))?["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
+	asyncImageGoogleAPIKeyPattern        = regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{20,}\b`)
+	asyncImageOpenAIAPIKeyPattern        = regexp.MustCompile(`\bsk-[0-9A-Za-z_-]+`)
+	imageReferenceSizeRejectionPattern   = regexp.MustCompile(`(?i)^reference image exceeds limit:\s*[0-9]{1,12}(?:\.[0-9]{1,6})?\s*(?:GB|MB|KB|B)\s+limit exceeded\.?$`)
+	imageReferenceDownloadTimeoutPattern = regexp.MustCompile(`(?i)^error while downloading https?://\S+\s+(?:get|head)\s+"https?://[^"\s]+(?:"\s*:)?\s+dial tcp [^\r\n]+: i/o timeout(?:\s+(?:400|invalid_argument)){0,2}$`)
 )
 
 type AsyncImageFailure struct {
@@ -282,7 +284,7 @@ func imageAccountCompatibilityCode(status int, providerCode, message string) str
 	if isImageRouteCompatibilityRejection(status, providerCode, message) {
 		return "upstream_image_route_incompatible"
 	}
-	if status == http.StatusBadRequest && isGenericImageInputRejectionCode(providerCode) && imageYouTubeNoticePattern.MatchString(strings.TrimSpace(message)) {
+	if status == http.StatusBadRequest && isGenericImageInputRejectionCode(providerCode) && (imageYouTubeNoticePattern.MatchString(strings.TrimSpace(message)) || imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(message))) {
 		return "upstream_image_reference_incompatible"
 	}
 	return ""
@@ -294,6 +296,95 @@ func isGenericImageInputRejectionCode(code string) bool {
 		return true
 	}
 	return false
+}
+
+// isImageReferenceRejectionEnvelope rejects contradictory execution evidence,
+// including nested receipts, without restricting harmless provider metadata.
+func isImageReferenceRejectionEnvelope(value any, depth int) bool {
+	if depth > 12 {
+		return false
+	}
+	switch value := value.(type) {
+	case map[string]any:
+		for field, child := range value {
+			name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(field, "_", ""), "-", ""))
+			switch name {
+			case "requestid", "traceid", "spanid", "correlationid":
+				if _, ok := child.(string); child != nil && !ok {
+					return false
+				}
+				continue
+			case "success", "issuccess", "accepted", "submitted", "succeeded", "completed":
+				if child != nil && child != false {
+					return false
+				}
+				continue
+			case "status", "state", "code":
+				if child == nil || child == float64(http.StatusBadRequest) {
+					continue
+				}
+				text, ok := child.(string)
+				if !ok {
+					return false
+				}
+				switch strings.ToLower(text) {
+				case "", "error", "failed", "failure", "rejected", "400", "invalid_argument", "invalid_request", "invalid_request_error":
+					continue
+				default:
+					return false
+				}
+			}
+			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts", "receipt"}, name)
+			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "result") || strings.Contains(name, "output") || strings.Contains(name, "b64") || strings.Contains(name, "base64") || strings.HasSuffix(name, "url") || strings.HasSuffix(name, "urls") || slices.Contains([]string{"image", "images"}, name) {
+				switch child := child.(type) {
+				case nil:
+				case string:
+					if strings.TrimSpace(child) != "" {
+						return false
+					}
+				case []any:
+					if len(child) > 0 {
+						return false
+					}
+				case map[string]any:
+					if len(child) > 0 {
+						return false
+					}
+				default:
+					return false
+				}
+				continue
+			}
+			if !isImageReferenceRejectionEnvelope(child, depth+1) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if !isImageReferenceRejectionEnvelope(child, depth+1) {
+				return false
+			}
+		}
+	case string:
+		if ClassifyAsyncImageFailure(errors.New(value), http.StatusBadRequest).Code == 601 {
+			return false
+		}
+		lowered := strings.ToLower(value)
+		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "invalid_api_key", "submission_unknown", "execution_unknown"} {
+			if strings.Contains(lowered, signal) {
+				return false
+			}
+		}
+		for word := range strings.FieldsFuncSeq(lowered, func(character rune) bool { return character < 'a' || character > 'z' }) {
+			if slices.Contains([]string{"accepted", "pending", "queued", "running", "processing", "generating", "success", "succeeded", "completed", "submitted"}, word) {
+				return false
+			}
+		}
+	case nil, bool, float64:
+	default:
+		return false
+	}
+	return true
 }
 
 func isUndiagnosedImageSubmissionResponse(body []byte) bool {
@@ -506,6 +597,10 @@ func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 		return "upstream_image_submission_rejected"
 	}
 	compatibilityCode := imageAccountCompatibilityCode(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)
+	if imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(attempt.ErrorMessage)) && attempt.Code != 603 {
+		// Only a validated complete rejection may exclude a size-limited account.
+		return ""
+	}
 	if compatibilityCode == "upstream_image_reference_incompatible" && !isGenericImageInputRejectionCode(attempt.ProviderStatus) {
 		return ""
 	}
@@ -540,7 +635,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 		_ = common.Unmarshal(envelope.Error, &providerError)
 	}
 	var decoded any
-	_ = common.Unmarshal(body, &decoded)
+	decodeErr := common.Unmarshal(body, &decoded)
 	providerMessage := SanitizeAsyncImageDiagnostic(asyncImageErrorMessage(decoded, 0), asyncImageProviderMessageLimit)
 	providerCode := ""
 	switch common.GetJsonType(providerError.Code) {
@@ -584,6 +679,20 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	ResetStatusCode(mappedStatus, statusCodeMapping)
 	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
 	compatibilityCode := imageAccountCompatibilityCode(status, classificationCode, providerMessage)
+	sizeRejection := imageReferenceSizeRejectionPattern.MatchString(providerMessage)
+	downloadRejection := imageReferenceDownloadTimeoutPattern.MatchString(providerMessage)
+	if sizeRejection || downloadRejection {
+		_, object := decoded.(map[string]any)
+		completeRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && isGenericImageInputRejectionCode(providerCode) && isGenericImageInputRejectionCode(providerError.Type) && isGenericImageInputRejectionCode(providerStatus) && isImageReferenceRejectionEnvelope(decoded, 0)
+		if !completeRejection {
+			if sizeRejection {
+				compatibilityCode = ""
+			}
+			if downloadRejection && failure.Code == 602 {
+				failure = ClassifyAsyncImageFailure(errors.New("Upstream image request failed"), mappedStatus.StatusCode)
+			}
+		}
+	}
 	if compatibilityCode == "upstream_image_reference_incompatible" && (!isGenericImageInputRejectionCode(providerCode) || !isGenericImageInputRejectionCode(providerError.Type) || !isGenericImageInputRejectionCode(providerStatus)) {
 		compatibilityCode = ""
 	}
@@ -628,6 +737,11 @@ func ShouldFallbackGeminiReferenceTransport(failure *AsyncImageFailure) bool {
 	if failure.Code == 602 {
 		return true
 	}
+	if failure.Code == 610 && imageReferenceDownloadTimeoutPattern.MatchString(failure.Message) {
+		// A recognized download rejection remains unclassified only when its
+		// response failed validation; ambiguous-input fallback cannot replay it.
+		return false
+	}
 	if !strings.EqualFold(failure.ProviderStatus, "INVALID_ARGUMENT") || failure.ProviderCode != "400" {
 		return false
 	}
@@ -654,9 +768,9 @@ func ClassifyAsyncImageFailure(err error, status int) *AsyncImageFailure {
 		code = 613
 	case strings.Contains(lowered, "请上传") || strings.Contains(lowered, "未检测到参考图") || strings.Contains(lowered, "reference images are required") || strings.Contains(lowered, "missing reference image") || strings.Contains(lowered, "reference_image_required") || strings.Contains(lowered, "no_reference_image"):
 		code = 612
-	case status == http.StatusRequestEntityTooLarge || strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "参考图过大") || strings.Contains(lowered, "image too large") || strings.Contains(lowered, "image is too large") || strings.Contains(lowered, "image size exceeds") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
+	case status == http.StatusRequestEntityTooLarge || strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "reference image exceeds limit:") || strings.Contains(lowered, "参考图过大") || strings.Contains(lowered, "image too large") || strings.Contains(lowered, "image is too large") || strings.Contains(lowered, "image size exceeds") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
 		code = 604
-	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "参考素材链接无法访问") || strings.Contains(lowered, "参考图链接无法访问") || strings.Contains(lowered, "国内下载中转失败"):
+	case imageReferenceDownloadTimeoutPattern.MatchString(strings.TrimSpace(message)) || strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "参考素材链接无法访问") || strings.Contains(lowered, "参考图链接无法访问") || strings.Contains(lowered, "国内下载中转失败"):
 		code = 602
 	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel") || strings.Contains(lowered, "no eligible image account"):
 		code = 603

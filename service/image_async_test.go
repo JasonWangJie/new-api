@@ -465,6 +465,8 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 		{name: "unreachable reference switches channel with original URL", mixed: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
 		{name: "unreachable reference uses another key with local input", sameChannel: true, otherKey: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
 		{name: "unreachable reference waits before retrying the same account locally", sameChannel: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
+		{name: "provider download timeout switches channel with original URL", failureMessage: `Error while downloading https://***.com/***/***/*** Get "https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout`},
+		{name: "provider download timeout retries another key with local input", sameChannel: true, otherKey: true, failureMessage: `Error while downloading https://***.com/***/***/*** Get "https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
@@ -1306,6 +1308,9 @@ func TestAsyncImageFailureNoticeExplainsRecordedCauses(t *testing.T) {
 	}{
 		{name: "safety rejection", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 601}, summary: "Upstream safety review did not pass", summaryText: "上游安全审核未通过"},
 		{name: "reference byte limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "image_url exceeds 50MB limit"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "50MB"}, summaryText: "参考图超过上游 50MB 限制"},
+		{name: "reference size compatibility retains provider limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_image_reference_incompatible", PublicErrorCode: 603, ErrorMessage: "reference image exceeds limit: 20 MB limit exceeded"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "参考图超过上游 20MB 限制"},
+		{name: "exhausted reference accounts retain provider limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "image_reference_accounts_exhausted", PublicErrorCode: 603}, attempts: []ImageChannelAttempt{{Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "reference image exceeds limit: 20 MB limit exceeded", Dispatched: true, FinishedAt: 1}}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "参考图超过上游 20MB 限制"},
+		{name: "exhausted reference accounts retain recorded link format", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "image_reference_accounts_exhausted", PublicErrorCode: 603}, attempts: []ImageChannelAttempt{{Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "Only a specific YouTube video URL is supported", Dispatched: true, FinishedAt: 1}}, summary: "The upstream only supports a specific YouTube video URL format", summaryText: "上游只支持指定格式的 YouTube 视频链接"},
 		{name: "measured size is not the limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "Reference image size 25.4MB exceeds limit 20MB"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "参考图超过上游 20MB 限制"},
 		{name: "Chinese byte limit", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "参考图大小25.4MB，上限20MB"}, summary: "Reference image exceeds the upstream limit of {{limit}}", params: map[string]any{"limit": "20MB"}, summaryText: "参考图超过上游 20MB 限制"},
 		{name: "measured size without a limit is not guessed", task: model.AsyncImageTask{Status: model.ImageTaskFailed, ErrorCode: "upstream_failed", PublicErrorCode: 604, ErrorMessage: "image_url rejected, image size 25.4MB"}, summary: "Upstream rejected image input or parameters", summaryText: "上游拒绝了图片输入或参数"},
@@ -1369,7 +1374,7 @@ func TestAsyncImageFailureNoticeReadableHistoricalDiagnostics(t *testing.T) {
 		{name: "dimension multiple", code: "upstream_job_failed", publicCode: 610, message: "The requested image size is invalid. Width and height must both be divisible by 16.", summary: "图片宽度和高度都必须是 16 的整数倍", advice: "16 的整数倍"},
 		{name: "unsupported reference source", code: "upstream_failed", publicCode: 610, message: "Provider API error: Only a specific YouTube video URL is supported (request id: 20261021090758101641609AE8GcbCM)", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
 		{name: "reference compatibility retains its actual cause", code: "upstream_image_reference_incompatible", publicCode: 603, message: "Provider API error: Only a specific YouTube video URL is supported", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
-		{name: "exhausted reference accounts retain their actual cause", code: "image_reference_accounts_exhausted", publicCode: 603, message: "No other eligible image account supports the reference input", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
+		{name: "exhausted reference accounts do not assume a link format without history", code: "image_reference_accounts_exhausted", publicCode: 603, message: "No other eligible image account supports the reference input", summary: "图片处理容量暂时不可用", advice: "核查请求格式"},
 		{name: "unsupported thinking level", code: "upstream_failed", publicCode: 610, message: "AI Studio 请求参数无效: 模型不支持 thinking level", summary: "当前模型不支持请求中的思考级别参数", advice: "思考级别参数"},
 		{name: "no usable output or invalid count is not assumed to exceed maximum", code: "output_parse_failed", publicCode: 609, storageFailed: true, message: "upstream must return between 1 and 128 complete images", summary: "上游未返回符合要求的完整图片结果", advice: "没有可用图片或数量不符合要求"},
 		{name: "output URL security remains enforced", code: "output_parse_failed", publicCode: 609, storageFailed: true, message: "image reference requires an HTTPS URL without credentials", summary: "上游返回的图片地址不符合安全 HTTPS 要求", advice: "联系服务方修正结果地址"},
@@ -2130,6 +2135,7 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		name       string
 		mode       string
 		reference  bool
+		byteLimit  bool
 		wantCalls  int
 		wantRetry  int
 		wantError  string
@@ -2153,6 +2159,13 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		{name: "Gemini reference zero account switches stops", mode: "no account switch", reference: true, wantCalls: 1, wantRetry: 1, wantError: "account_switches_exhausted", wantReason: "account_switch_limit"},
 		{name: "Gemini reference one account switch succeeds", mode: "one account switch", reference: true, wantCalls: 2, wantRetry: 1},
 		{name: "Gemini reference unknown execution is never resubmitted", mode: "unknown", reference: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "execution_unknown"},
+		{name: "Gemini reference byte limit switches account", reference: true, byteLimit: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference byte limit excludes copied credentials", mode: "copied credential", reference: true, byteLimit: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference byte limit has no alternate account", mode: "no alternate", reference: true, byteLimit: true, wantCalls: 1, wantRetry: 1, wantError: "image_reference_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "Gemini reference byte limit capacity budget is enforced", mode: "no capacity retry", reference: true, byteLimit: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "compatibility_retry_budget_exhausted"},
+		{name: "Gemini reference byte limit total budget is enforced", mode: "no total retry", reference: true, byteLimit: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "total_retry_budget_exhausted"},
+		{name: "Gemini reference byte limit switch budget is enforced", mode: "no account switch", reference: true, byteLimit: true, wantCalls: 1, wantRetry: 1, wantError: "account_switches_exhausted", wantReason: "account_switch_limit"},
+		{name: "Gemini reference byte limit unknown execution stays held", mode: "unknown", reference: true, byteLimit: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "execution_unknown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
@@ -2205,6 +2218,9 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 			status, reason := http.StatusUnprocessableEntity, "incompatible_image_route"
 			if tc.reference {
 				code, message, status, reason = "400", referenceMessage, http.StatusBadRequest, "incompatible_image_reference"
+			}
+			if tc.byteLimit {
+				message = "reference image exceeds limit: 20 MB limit exceeded"
 			}
 			switch tc.mode {
 			case "invalid dimensions":
@@ -3062,6 +3078,8 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		fallback     bool
 		httpStatus   int
 		internalCode string
+		readError    bool
+		truncated    bool
 	}{
 		{name: "size compatibility rejection", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."}}`, expectedCode: 603, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusUnprocessableEntity, internalCode: "upstream_image_route_incompatible"},
 		{name: "compatibility rejection without provider code", body: `{"error":{"message":"No eligible upstream image provider supports the requested image size or resolution tier. Adjust size/resolution or select a compatible route."}}`, expectedCode: 603, message: "resolution tier", internalCode: "upstream_image_route_incompatible"},
@@ -3080,6 +3098,38 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "server failure is not reference rejection", body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 606, providerCode: "500", message: "YouTube", httpStatus: http.StatusInternalServerError},
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
 		{name: "reference image total download budget exceeded", body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg?token=private-key (budgetMs=35000; reason=timeout)"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download exceeded its total time budget", fallback: true},
+		{name: "provider reference byte limit compatibility", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "generic reference byte limit stays terminal", body: `{"error":{"code":400,"message":"reference image size exceeds 20MB"}}`, expectedCode: 604, providerCode: "400", message: "20MB"},
+		{name: "reference byte limit quoted as input is not compatibility", body: `{"error":{"code":400,"message":"Invalid input: prompt contains reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "prompt contains"},
+		{name: "reference byte limit safety remains terminal", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded; safety review failed"}}`, expectedCode: 601, providerCode: "400", message: "safety"},
+		{name: "reference byte limit authentication status cannot switch", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded","status":"UNAUTHENTICATED"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference byte limit authentication type cannot switch", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded","type":"authentication_error"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference byte limit forbidden code cannot switch", body: `{"error":{"code":403,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "403", message: "20 MB"},
+		{name: "reference byte limit server error is not rejection", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB", httpStatus: http.StatusBadGateway},
+		{name: "provider reference download dial timeout", body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
+		{name: "raw provider reference download dial timeout", body: `{"error":{"code":400,"message":"Error while downloading https://reference.example/image Get \"https://reference.example/image\": dial tcp 203.0.113.1:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
+		{name: "provider download policy rejection stays terminal", body: `{"error":{"code":400,"message":"Error while downloading https://reference.example/image Get \"https://reference.example/image\": dial tcp 203.0.113.1:443: i/o timeout; safety review failed"}}`, expectedCode: 601, providerCode: "400", message: "safety"},
+		{name: "unrelated downloading timeout stays unclassified", body: `{"error":{"code":400,"message":"Error while downloading webhook: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "webhook"},
+		{name: "quoted provider download timeout stays unclassified", body: `{"error":{"code":400,"message":"Invalid input: Error while downloading https://reference.example/image Get \"https://reference.example/image\": dial tcp 203.0.113.1:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Invalid input"},
+		{name: "download timeout without HTTP transport remains unclassified", body: `{"error":{"code":400,"message":"Error while downloading https://reference.example/image: operation timeout"}}`, expectedCode: 610, providerCode: "400", message: "operation timeout"},
+		{name: "reference size read failure cannot authorize failover", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB", readError: true},
+		{name: "reference size truncated response cannot authorize failover", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB", truncated: true},
+		{name: "reference size task receipt cannot authorize failover", body: `{"task_id":"accepted-job","error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference size running metadata cannot authorize failover", body: `{"metadata":{"state":"running"},"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference size output cannot authorize failover", body: `{"data":{"output_url":"https://output.example/image"},"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference size success cannot authorize failover", body: `{"success":true,"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference size harmless tracking metadata is allowed", body: `{"success":false,"data":null,"metadata":{"trace_id":"provider-trace","attempt":2},"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "download read failure cannot authorize retry or local fallback", body: `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading", readError: true},
+		{name: "download truncated response cannot authorize retry or local fallback", body: `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading", truncated: true},
+		{name: "download task receipt cannot authorize retry or local fallback", body: `{"metadata":{"operation_id":"accepted-operation"},"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
+		{name: "download result cannot authorize retry", body: `{"result":{"url":"https://output.example/image"},"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
+		{name: "download accepted status cannot authorize retry", body: `{"metadata":{"status":202},"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
+		{name: "download unauthorized response cannot authorize retry", body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading", httpStatus: http.StatusUnauthorized},
+		{name: "download forbidden code cannot authorize retry", body: `{"error":{"code":403,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "403", message: "Error while downloading"},
+		{name: "download authentication type cannot authorize retry or local fallback", body: `{"error":{"code":400,"status":"INVALID_ARGUMENT","type":"authentication_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
+		{name: "download authentication status cannot authorize retry", body: `{"error":{"code":400,"status":"UNAUTHENTICATED","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
+		{name: "reference size base64 image cannot authorize failover", body: `{"metadata":{"b64_image":"aW1hZ2U="},"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "download base64 image cannot authorize local fallback", body: `{"metadata":{"b64_image":"aW1hZ2U="},"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
 		{name: "reference fetch without Google envelope fields", body: `{"error":{"message":"reference image fetch: Get https://signed.example/image?token=private: i/o timeout"}}`, expectedCode: 602, message: "reference image fetch", fallback: true},
 		{name: "reference download proxy failure", body: `{"error":{"code":400,"message":"Proxy error: Reference image download failed; direct=timeout; proxy=502"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download failed", fallback: true},
 		{name: "domestic reference relay failure", body: `{"error":{"code":400,"message":"参考图 #1 国内下载中转失败"}}`, expectedCode: 602, providerCode: "400", message: "国内下载中转失败", fallback: true},
@@ -3135,10 +3185,17 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			if status == 0 {
 				status = http.StatusBadRequest
 			}
+			var body io.Reader = strings.NewReader(testCase.body)
+			if testCase.readError {
+				body = io.MultiReader(body, iotest.ErrReader(errors.New("response interrupted")))
+			}
+			if testCase.truncated {
+				body = io.MultiReader(body, strings.NewReader(strings.Repeat(" ", asyncImageProviderErrorBodyLimit+1)))
+			}
 			response := &http.Response{
 				StatusCode: status,
 				Header:     testCase.header,
-				Body:       io.NopCloser(strings.NewReader(testCase.body)),
+				Body:       io.NopCloser(body),
 			}
 
 			failure := ClassifyGeminiAsyncImageHTTPFailure(t.Context(), response)
@@ -3179,6 +3236,11 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "OpenAI unauthenticated status cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"status":"UNAUTHENTICATED","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
 		{name: "OpenAI permission denied status cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"status":"PERMISSION_DENIED","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
 		{name: "OpenAI safety status survives a successful status mapping", status: 400, mapping: `{"400":"200"}`, body: `{"error":{"code":400,"status":"SAFETY","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 601},
+		{name: "OpenAI download unauthorized response cannot retry", status: 401, body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, wantCode: 610},
+		{name: "OpenAI download forbidden response cannot retry", status: 403, body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, wantCode: 610},
+		{name: "OpenAI download authentication type cannot retry", status: 400, body: `{"error":{"code":400,"type":"authentication_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, wantCode: 610},
+		{name: "OpenAI download authentication status cannot retry", status: 400, body: `{"error":{"code":400,"status":"UNAUTHENTICATED","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, wantCode: 610},
+		{name: "OpenAI mapped server failure is not download rejection", status: 502, mapping: `{"502":"400"}`, body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, wantCode: 610},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := tc.body
