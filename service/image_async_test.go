@@ -624,7 +624,9 @@ func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
 				assert.Equal(t, request.Billing, outbound.Billing)
 				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
 				require.NoError(t, beforeInvoke())
-				return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", Message: "The upstream image service could not complete the image request. Please retry shortly.", HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true}
+				failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(`{"success":false,"status":"error","data":null,"error":{"type":"upstream_request_failed","message":"The upstream image service could not complete the image request. Please retry shortly.","metadata":{"trace_id":"provider-trace"}}}`))}, "")
+				failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse
+				return nil, model.AsyncImageBill{}, failure
 			}
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
@@ -640,6 +642,16 @@ func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
 			var history []ImageChannelAttempt
 			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
 			require.Len(t, history, 1)
+			assert.True(t, history[0].SynchronousRetryableResponse)
+			var decision ImageRetryDecision
+			require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+			assert.Equal(t, "retry_submission", decision.Action)
+			assert.Equal(t, "transient", decision.Budget)
+			reservation, err := model.GetAsyncImageReservation(t.Context(), task)
+			require.NoError(t, err)
+			require.NotNil(t, reservation)
+			assert.Equal(t, "reserved", reservation.Status)
+			assert.Equal(t, 100, reservation.ReservedQuota)
 			if !onlyAccount {
 				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusEnabled).Error)
 			}
@@ -2933,6 +2945,32 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 		readError, retryable bool
 	}{
 		{name: "complete gateway failure", body: gatewayError, status: 502, retryable: true},
+		{name: "empty failed envelope", body: strings.TrimSuffix(gatewayError, "}") + `,"success":false,"status":"error","code":502,"data":null}`, status: 502, retryable: true},
+		{name: "top level failure diagnostic", body: strings.TrimSuffix(gatewayError, "}") + `,"message":"The upstream image service could not complete the image request. Please retry shortly."}`, status: 502, retryable: true},
+		{name: "error type supplies missing code", body: `{"error":{"type":"upstream_request_failed","message":"Please retry shortly."}}`, status: 502, retryable: true},
+		{name: "error type supplies null code", body: `{"error":{"code":null,"type":"upstream_request_failed","message":"Please retry shortly."}}`, status: 502, retryable: true},
+		{name: "error type supplies empty code", body: `{"error":{"code":"","type":"upstream_request_failed","message":"Please retry shortly."}}`, status: 502, retryable: true},
+		{name: "error type cannot override conflicting code", body: `{"error":{"code":"do_request_failed","type":"upstream_request_failed","message":"Please retry shortly."}}`, status: 502},
+		{name: "request trace metadata", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"request_id":"upstream-request-1","trace":{"trace_id":"trace-1","attempt":2,"region":"region-a"}}`, 1), status: 502, retryable: true},
+		{name: "envelope trace metadata", body: strings.TrimSuffix(gatewayError, "}") + `,"request_id":"gateway-request-1","trace_id":"trace-1","metadata":{"request_id":"upstream-request-1"}}`, status: 502, retryable: true},
+		{name: "empty output fields", body: strings.TrimSuffix(gatewayError, "}") + `,"success":false,"data":[],"result":null,"task_id":""}`, status: 502, retryable: true},
+		{name: "successful envelope", body: strings.TrimSuffix(gatewayError, "}") + `,"success":true}`, status: 502},
+		{name: "running envelope", body: strings.TrimSuffix(gatewayError, "}") + `,"status":"running"}`, status: 502},
+		{name: "conflicting envelope code", body: strings.TrimSuffix(gatewayError, "}") + `,"code":"invalid_api_key"}`, status: 502},
+		{name: "metadata accepted task", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"task_id":"accepted-task"}}`, 1), status: 502},
+		{name: "metadata generation receipt", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"generation_id":"gen-123"}`, 1), status: 502},
+		{name: "metadata operation receipt", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"operation_id":"op-123"}`, 1), status: 502},
+		{name: "metadata prediction receipt", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"prediction_id":"pred-123"}`, 1), status: 502},
+		{name: "metadata choices output", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"choices":[{"message":{"content":"generated output"}}]}`, 1), status: 502},
+		{name: "metadata content output", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"content":"generated output"}`, 1), status: 502},
+		{name: "metadata nested receipt ID", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"receipts":[{"id":"accepted-job"}]}`, 1), status: 502},
+		{name: "metadata running job", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"state":"processing"}}`, 1), status: 502},
+		{name: "metadata success", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"success":true}}`, 1), status: 502},
+		{name: "metadata output", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"response":{"images":[{"url":"https://result.example/image.png"}]}}`, 1), status: 502},
+		{name: "metadata policy rejection", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"reason":"content_policy_violation"}}`, 1), status: 502},
+		{name: "metadata authentication rejection", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"code":"invalid_api_key"}}`, 1), status: 502},
+		{name: "metadata input rejection", body: strings.Replace(gatewayError, `"type":"new_api_error"`, `"type":"new_api_error","metadata":{"upstream":{"message":"unsupported_image_dimensions"}}`, 1), status: 502},
+		{name: "raw diagnostic beyond retained limit", body: strings.Replace(gatewayError, "Please retry shortly.", strings.Repeat("x", asyncImageProviderMessageLimit+20)+" accepted task_id=already-submitted", 1), status: 502},
 		{name: "different status", body: gatewayError, status: 504},
 		{name: "different error code", body: strings.Replace(gatewayError, "upstream_request_failed", "do_request_failed", 1), status: 502},
 		{name: "read failure", body: gatewayError, status: 502, readError: true},

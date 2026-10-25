@@ -920,6 +920,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		referenceRetryCount        int
 		status, failureCode        int
 		responseMessage            string
+		responseJSON               string
 		providerCode               string
 		statusMapping              string
 		fileFormat                 string
@@ -968,7 +969,12 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "reference_fetch_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 602, providerCode: "image_fetch_failed", responseMessage: "image_url fetch failed for https://example.com/private.png?token=secret-url; authorization=Bearer secret-bearer api_key=secret-key"},
 		{name: "upstream_service_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, providerCode: "overloaded", responseMessage: "upstream image worker unavailable"},
 		{name: "synchronous_gateway_failure_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "The upstream image service could not complete the image request. Please retry shortly."},
+		{name: "synchronous_gateway_failure_with_metadata_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"success":false,"code":502,"status":"error","data":null,"error":{"code":"upstream_request_failed","type":"new_api_error","message":"image worker unavailable","metadata":{"trace_id":"provider-trace","retryable":true}}}`},
+		{name: "synchronous_gateway_error_type_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"error":{"type":"upstream_request_failed","message":"image worker unavailable"}}`},
+		{name: "gateway_metadata_with_accepted_job_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"error":{"code":"upstream_request_failed","message":"image worker unavailable","metadata":{"task_id":"accepted-job"}}}`},
+		{name: "gateway_metadata_with_output_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"error":{"code":"upstream_request_failed","message":"image worker unavailable","metadata":{"result":{"url":"https://result.example/image.png"}}}}`},
 		{name: "asynchronous_gateway_failure_keeps_acceptance_boundary", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "The upstream image service could not complete the image request. Please retry shortly.", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
+		{name: "asynchronous_gateway_metadata_keeps_acceptance_boundary", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"success":false,"data":null,"error":{"type":"upstream_request_failed","message":"image worker unavailable","metadata":{"trace_id":"provider-trace"}}}`, templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
 		{name: "mapped_status_keeps_original_diagnostic", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 605, providerCode: "overloaded", responseMessage: "upstream image worker unavailable", statusMapping: `{"502":"429"}`},
 		{name: "mapped_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 605, responseMessage: "please retry later", statusMapping: `{"400":"429"}`},
 		{name: "server_status_not_overridden_by_generic_error_type", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, responseMessage: "please retry later"},
@@ -1011,6 +1017,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			responseBody, err := common.Marshal(map[string]any{"error": providerError})
 			require.NoError(t, err)
+			if tc.responseJSON != "" {
+				responseBody = []byte(tc.responseJSON)
+			}
 			if tc.unreadableResponse {
 				responseBody = []byte(`{"data":[`)
 			}

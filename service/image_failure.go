@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -360,64 +361,136 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 		return false
 	}
 	providerError, ok := envelope["error"].(map[string]any)
-	if !ok || providerError["code"] != "upstream_request_failed" {
+	if !ok {
 		return false
 	}
+	providerCode, codeIsString := providerError["code"].(string)
+	if providerError["code"] != nil && !codeIsString {
+		return false
+	}
+	if providerCode == "" {
+		providerCode, _ = providerError["type"].(string)
+	}
+	if providerCode != "upstream_request_failed" {
+		return false
+	}
+	// Normalize common failure envelopes before checking every raw diagnostic.
+	// Optional tracking fields and empty result fields do not imply acceptance.
 	for index, scope := range []map[string]any{envelope, providerError} {
-		for field, value := range scope {
+		for field := range scope {
 			if index == 0 && field == "error" {
 				continue
 			}
-			if field == "request_id" || field == "requestId" || field == "requestID" {
-				if _, ok := value.(string); value != nil && !ok {
-					return false
-				}
-				continue
-			}
-			if field == "param" {
-				if value != nil && value != "" {
-					return false
-				}
-				continue
-			}
-			if index == 0 {
-				return false
-			}
-			text, isString := value.(string)
-			if value != nil && !isString {
-				return false
-			}
-			switch field {
-			case "code":
-				if text != "upstream_request_failed" {
-					return false
-				}
-			case "type":
-				switch text {
-				case "", "upstream_request_failed", "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", "bad_gateway":
-				default:
-					return false
-				}
-			case "status":
-				switch strings.ToLower(text) {
-				case "", "error", "failed", "failure", "bad_gateway", "502":
-				default:
-					return false
-				}
-			case "message", "msg", "detail", "reason":
-				if ClassifyAsyncImageFailure(errors.New(text), http.StatusBadRequest).Code != 610 {
-					return false
-				}
-				lowered := strings.ToLower(text)
-				for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
-					if strings.Contains(lowered, signal) {
-						return false
-					}
-				}
+			switch strings.ToLower(strings.ReplaceAll(field, "_", "")) {
+			case "code", "type", "status", "state", "success", "message", "msg", "detail", "reason", "param", "metadata", "requestid", "traceid", "spanid", "correlationid", "data", "result", "results", "taskid", "jobid":
 			default:
 				return false
 			}
 		}
+	}
+	return isImageGatewayFailureMetadata(envelope, 0)
+}
+
+// isImageGatewayFailureMetadata checks the complete decoded response, including
+// nested metadata that is deliberately omitted from retained public diagnostics.
+// A job receipt, output or contradictory rejection must never authorize replay.
+func isImageGatewayFailureMetadata(value any, depth int) bool {
+	if depth > 12 {
+		return false
+	}
+	switch value := value.(type) {
+	case map[string]any:
+		for field, child := range value {
+			name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(field, "_", ""), "-", ""))
+			switch name {
+			case "requestid", "traceid", "spanid", "correlationid":
+				if _, ok := child.(string); child != nil && !ok {
+					return false
+				}
+				continue
+			case "param":
+				if child != nil && child != "" {
+					return false
+				}
+				continue
+			case "success", "issuccess", "accepted", "submitted", "succeeded", "completed":
+				if child != nil && child != false {
+					return false
+				}
+				continue
+			case "status", "state", "code":
+				if child == nil || child == float64(http.StatusBadGateway) {
+					continue
+				}
+				text, ok := child.(string)
+				if !ok {
+					return false
+				}
+				switch strings.ToLower(text) {
+				case "", "error", "failed", "failure", "bad_gateway", "502", "upstream_request_failed":
+					continue
+				default:
+					return false
+				}
+			case "type":
+				if child == nil {
+					continue
+				}
+				text, ok := child.(string)
+				if !ok {
+					return false
+				}
+				switch text {
+				case "", "upstream_request_failed", "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", "bad_gateway":
+					continue
+				default:
+					return false
+				}
+			}
+			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts"}, name)
+			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "result") || strings.Contains(name, "image") || strings.Contains(name, "output") || strings.Contains(name, "url") || strings.Contains(name, "b64") || strings.Contains(name, "base64") {
+				switch child := child.(type) {
+				case nil:
+				case string:
+					if strings.TrimSpace(child) != "" {
+						return false
+					}
+				case []any:
+					if len(child) > 0 {
+						return false
+					}
+				case map[string]any:
+					if len(child) > 0 {
+						return false
+					}
+				default:
+					return false
+				}
+				continue
+			}
+			if !isImageGatewayFailureMetadata(field, depth+1) || !isImageGatewayFailureMetadata(child, depth+1) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if !isImageGatewayFailureMetadata(child, depth+1) {
+				return false
+			}
+		}
+	case string:
+		if ClassifyAsyncImageFailure(errors.New(value), http.StatusBadRequest).Code != 610 {
+			return false
+		}
+		lowered := strings.ToLower(value)
+		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "pending", "running", "processing", "queued", "submitted", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
+			if strings.Contains(lowered, signal) {
+				return false
+			}
+		}
+	case nil, bool, float64:
+	default:
+		return false
 	}
 	return true
 }
