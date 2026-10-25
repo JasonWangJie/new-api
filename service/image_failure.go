@@ -681,9 +681,18 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	compatibilityCode := imageAccountCompatibilityCode(status, classificationCode, providerMessage)
 	sizeRejection := imageReferenceSizeRejectionPattern.MatchString(providerMessage)
 	downloadRejection := imageReferenceDownloadTimeoutPattern.MatchString(providerMessage)
+	referenceTypeAllowed := isGenericImageInputRejectionCode(providerError.Type)
+	if sizeRejection || downloadRejection {
+		// Gateways may wrap an explicit reference rejection in their own
+		// diagnostic type. The complete envelope still has to prove rejection.
+		switch strings.ToLower(strings.TrimSpace(providerError.Type)) {
+		case "upstream_error", "api_error", "new_api_error", "one_api_error", "bad_request", "bad_request_error", "bad_response_status_code":
+			referenceTypeAllowed = true
+		}
+	}
 	if sizeRejection || downloadRejection {
 		_, object := decoded.(map[string]any)
-		completeRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && isGenericImageInputRejectionCode(providerCode) && isGenericImageInputRejectionCode(providerError.Type) && isGenericImageInputRejectionCode(providerStatus) && isImageReferenceRejectionEnvelope(decoded, 0)
+		completeRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && isGenericImageInputRejectionCode(providerCode) && referenceTypeAllowed && isGenericImageInputRejectionCode(providerStatus) && isImageReferenceRejectionEnvelope(decoded, 0)
 		if !completeRejection {
 			if sizeRejection {
 				compatibilityCode = ""
@@ -693,7 +702,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 			}
 		}
 	}
-	if compatibilityCode == "upstream_image_reference_incompatible" && (!isGenericImageInputRejectionCode(providerCode) || !isGenericImageInputRejectionCode(providerError.Type) || !isGenericImageInputRejectionCode(providerStatus)) {
+	if compatibilityCode == "upstream_image_reference_incompatible" && (!isGenericImageInputRejectionCode(providerCode) || !referenceTypeAllowed || !isGenericImageInputRejectionCode(providerStatus)) {
 		compatibilityCode = ""
 	}
 	// OpenAI error types are normally diagnostic-only, but a policy type must

@@ -77,7 +77,7 @@ export const meta = {
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.4",
+  version: "1.1.5",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
@@ -300,16 +300,9 @@ function normalizeRequest(request, model, operation) {
 
   const body = { model: req.model, prompt, resolution, aspect_ratio: ratio };
   if (action !== "edit_video") body.seconds = seconds;
-  if (firstFrame) body.image = firstFrame;
-  if (lastFrame) body.last_frame = lastFrame;
-  for (const type of ["image", "video", "audio"]) {
-    let items = references.filter((reference) => reference.type === type && !["first_frame", "last_frame"].includes(reference.role)).map((reference) => reference.source);
-    if (type === "video" && ["edit_video", "extend_video"].includes(action)) {
-      body.video = items[0];
-      items = items.slice(1);
-    }
-    if (items.length) body["reference_" + (type === "audio" ? "audios" : type + "s")] = items;
-  }
+  // Keep one ordered representation across repeated decode and driver calls.
+  // Regrouping aliases here would change mixed-media and pinned-frame positions.
+  if (references.length) body.references = references;
   if (action === "extend_video") body.extension_direction = "backward";
   for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
     if (req[name] === undefined) continue;

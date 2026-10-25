@@ -15,7 +15,7 @@ import (
 func SetApiRouter(router *gin.Engine) {
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
-	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
+	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{"/api/media-inputs/"})))
 	apiRouter.Use(middleware.CanvasIntegrationCredentials())
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
@@ -33,6 +33,8 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.GET("/image-objects/:object_id/content", middleware.DisableCache(), controller.GetImageObjectContent)
 	apiRouter.GET("/image-task-references/:task_id/:index/content", middleware.DisableCache(), controller.TianyueImageReferenceContent)
 	apiRouter.HEAD("/image-task-references/:task_id/:index/content", middleware.DisableCache(), controller.TianyueImageReferenceContent)
+	apiRouter.GET("/media-inputs/:object_id/content", middleware.DisableCache(), controller.MediaInputContent)
+	apiRouter.HEAD("/media-inputs/:object_id/content", middleware.DisableCache(), controller.MediaInputContent)
 	imageOptions := apiRouter.Group("/option/images", middleware.RootAuth(), middleware.DisableCache())
 	imageOptions.GET("", middleware.RequirePermission(authz.ImageConfigRead), controller.GetImageConfiguration)
 	imageOptions.GET("/pool/options", middleware.RequirePermission(authz.ImageConfigRead), controller.GetImageChannelPoolOptions)

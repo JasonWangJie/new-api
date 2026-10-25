@@ -48,24 +48,25 @@ const (
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
 
 type Task struct {
-	ID         int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
-	CreatedAt  int64                 `json:"created_at" gorm:"index"`
-	UpdatedAt  int64                 `json:"updated_at"`
-	TaskID     string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
-	Platform   constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId     int                   `json:"user_id" gorm:"index"`
-	Group      string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
-	ChannelId  int                   `json:"channel_id" gorm:"index"`
-	Quota      int                   `json:"quota"`
-	Action     string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
-	Status     TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
-	FailReason string                `json:"fail_reason"`
-	SubmitTime int64                 `json:"submit_time" gorm:"index"`
-	StartTime  int64                 `json:"start_time" gorm:"index"`
-	FinishTime int64                 `json:"finish_time" gorm:"index"`
-	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties Properties            `json:"properties" gorm:"type:json"`
-	Username   string                `json:"username,omitempty" gorm:"-"`
+	ID                int64                 `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
+	CreatedAt         int64                 `json:"created_at" gorm:"index"`
+	UpdatedAt         int64                 `json:"updated_at"`
+	TaskID            string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
+	Platform          constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
+	UserId            int                   `json:"user_id" gorm:"index"`
+	Group             string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
+	ChannelId         int                   `json:"channel_id" gorm:"index"`
+	Quota             int                   `json:"quota"`
+	Action            string                `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
+	Status            TaskStatus            `json:"status" gorm:"type:varchar(20);index"` // 任务状态
+	FailReason        string                `json:"fail_reason"`
+	SubmitTime        int64                 `json:"submit_time" gorm:"index"`
+	StartTime         int64                 `json:"start_time" gorm:"index"`
+	FinishTime        int64                 `json:"finish_time" gorm:"index"`
+	Progress          string                `json:"progress" gorm:"type:varchar(20);index"`
+	AttemptGeneration int64                 `json:"-" gorm:"not null;default:0"`
+	Properties        Properties            `json:"properties" gorm:"type:json"`
+	Username          string                `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -145,7 +146,20 @@ type TaskPrivateData struct {
 	// only replaced when a hook explicitly returns state.
 	PluginState json.RawMessage `json:"plugin_state,omitempty"`
 	// PollFailures counts consecutive unrecognized or transient poll outcomes.
-	PollFailures int `json:"poll_failures,omitempty"`
+	PollFailures           int                `json:"poll_failures,omitempty"`
+	VideoAttempts          []VideoTaskAttempt `json:"video_attempts,omitempty"`
+	VideoTerminalConfirmed bool               `json:"video_terminal_confirmed,omitempty"`
+}
+
+// VideoTaskAttempt keeps the failed native operation separate from a later
+// submission. Diagnostics are sanitized by the caller before persistence.
+type VideoTaskAttempt struct {
+	Generation     int64  `json:"generation"`
+	UpstreamTaskID string `json:"upstream_task_id"`
+	Status         string `json:"status"`
+	Reason         string `json:"reason"`
+	StartedAt      int64  `json:"started_at"`
+	FinishedAt     int64  `json:"finished_at"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -217,7 +231,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 	if !p.AsyncMedia && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.UpstreamAsync == nil && len(p.UpstreamAsyncResponse) == 0 && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
-		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 {
+		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 && len(p.VideoAttempts) == 0 && !p.VideoTerminalConfirmed {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -498,19 +512,21 @@ func (Task *Task) InsertWithContext(ctx context.Context) error {
 }
 
 type taskSnapshot struct {
-	Status       TaskStatus
-	Progress     string
-	StartTime    int64
-	FinishTime   int64
-	FailReason   string
-	ResultURL    string
-	Data         json.RawMessage
-	PluginState  json.RawMessage
-	PollFailures int
+	AttemptGeneration      int64
+	VideoTerminalConfirmed bool
+	Status                 TaskStatus
+	Progress               string
+	StartTime              int64
+	FinishTime             int64
+	FailReason             string
+	ResultURL              string
+	Data                   json.RawMessage
+	PluginState            json.RawMessage
+	PollFailures           int
 }
 
 func (s taskSnapshot) Equal(other taskSnapshot) bool {
-	return s.Status == other.Status &&
+	return s.AttemptGeneration == other.AttemptGeneration && s.VideoTerminalConfirmed == other.VideoTerminalConfirmed && s.Status == other.Status &&
 		s.Progress == other.Progress &&
 		s.StartTime == other.StartTime &&
 		s.FinishTime == other.FinishTime &&
@@ -523,26 +539,26 @@ func (s taskSnapshot) Equal(other taskSnapshot) bool {
 
 func (t *Task) Snapshot() taskSnapshot {
 	return taskSnapshot{
-		Status:       t.Status,
-		Progress:     t.Progress,
-		StartTime:    t.StartTime,
-		FinishTime:   t.FinishTime,
-		FailReason:   t.FailReason,
-		ResultURL:    t.PrivateData.ResultURL,
-		Data:         t.Data,
-		PluginState:  t.PrivateData.PluginState,
-		PollFailures: t.PrivateData.PollFailures,
+		AttemptGeneration:      t.AttemptGeneration,
+		VideoTerminalConfirmed: t.PrivateData.VideoTerminalConfirmed,
+		Status:                 t.Status,
+		Progress:               t.Progress,
+		StartTime:              t.StartTime,
+		FinishTime:             t.FinishTime,
+		FailReason:             t.FailReason,
+		ResultURL:              t.PrivateData.ResultURL,
+		Data:                   t.Data,
+		PluginState:            t.PrivateData.PluginState,
+		PollFailures:           t.PrivateData.PollFailures,
 	}
 }
 
 func (Task *Task) Update() error {
-	var err error
-	err = DB.Save(Task).Error
-	return err
+	return DB.Model(Task).Where("id = ? AND attempt_generation = ?", Task.ID, Task.AttemptGeneration).Select("*").Updates(Task).Error
 }
 
 func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+	return DB.Model(t).Where("id = ? AND attempt_generation = ?", t.ID, t.AttemptGeneration).Update("quota", t.Quota).Error
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).
@@ -555,14 +571,15 @@ func (t *Task) UpdateQuota() error {
 // falls back to INSERT ON CONFLICT when the WHERE-guarded UPDATE matches
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
-	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
+	result := DB.Model(t).Where("id = ? AND status = ? AND attempt_generation = ?", t.ID, fromStatus, t.AttemptGeneration).Select("*").Updates(t)
 	if result.Error != nil {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
 }
 
-// TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
+// TaskBulkUpdateByID updates only legacy generation-zero tasks by primary key.
+// Recovery attempts require individual generation-aware compare-and-set writes.
 // WARNING: This function has NO CAS (Compare-And-Swap) guard — it will overwrite
 // any concurrent status changes. DO NOT use in billing/quota lifecycle flows
 // (e.g., timeout, success, failure transitions that trigger refunds or settlements).
@@ -573,6 +590,7 @@ func TaskBulkUpdateByID(ids []int64, params map[string]any) error {
 	}
 	return DB.Model(&Task{}).
 		Where("id in (?)", ids).
+		Where("attempt_generation = ?", 0).
 		Updates(params).Error
 }
 

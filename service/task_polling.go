@@ -123,6 +123,11 @@ func sweepTimedOutTasks(ctx context.Context) {
 	timedOutCount := 0
 
 	for _, task := range tasks {
+		if task.PrivateData.AsyncMedia && task.AttemptGeneration > 0 && task.PrivateData.UpstreamTaskID == "" {
+			// Preparation owns the original deadline. An unconfirmed replacement
+			// submission retains its hold until explicit upstream reconciliation.
+			continue
+		}
 		if task.PrivateData.Key == "" {
 			if channel, err := model.CacheGetChannel(task.ChannelId); err == nil {
 				if _, credentialErr := taskPollingCredential(task, channel); credentialErr != nil {
@@ -602,8 +607,10 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 				if freezeErr != nil {
 					return freezeErr
 				}
-				cacheGetChannel, err = frozen, nil
-				break
+				if frozen != nil {
+					cacheGetChannel, err = frozen, nil
+					break
+				}
 			}
 		}
 	}
@@ -682,14 +689,22 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if task := taskM[taskId]; task != nil {
-		frozen, err := FrozenAsyncMediaChannel(ctx, task)
-		if err != nil {
-			return err
-		}
-		if frozen != nil {
-			ch = frozen
-		}
+	task := taskM[taskId]
+	if task == nil {
+		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
+		return fmt.Errorf("task %s not found", taskId)
+	}
+	if task.PrivateData.AsyncMedia && task.AttemptGeneration > 0 && task.PrivateData.UpstreamTaskID == "" {
+		// Preparation, receipt reconciliation and pending refunds belong to
+		// the host. They need neither an upstream poll nor channel decryption.
+		return nil
+	}
+	frozen, frozenErr := FrozenAsyncMediaChannel(ctx, task)
+	if frozenErr != nil {
+		return frozenErr
+	}
+	if frozen != nil {
+		ch = frozen
 	}
 	baseURL := constant.GetChannelBaseURL(ch.Type)
 	if ch.GetBaseURL() != "" {
@@ -697,11 +712,6 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 	proxy := ch.GetSetting().Proxy
 
-	task := taskM[taskId]
-	if task == nil {
-		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
-		return fmt.Errorf("task %s not found", taskId)
-	}
 	key, keyErr := taskPollingCredential(task, ch)
 	if keyErr != nil {
 		return keyErr
@@ -832,6 +842,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
+	if parsedStatus == model.TaskStatusFailure {
+		scheduled, recoveryErr := TryAsyncVideoReferenceRecovery(ctx, *task, taskResult, resp.StatusCode, responseBody)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		if scheduled {
+			return nil
+		}
+	}
 	measuredActualQuota := 0
 	var measuredClamp *common.QuotaClamp
 	if measuredVideo && parsedStatus == model.TaskStatusSuccess {
@@ -952,6 +971,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	task.Data = redactVideoResponseBody(task.Data)
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	if isDone && task.PrivateData.AsyncMedia && task.Platform == "drama" && task.AttemptGeneration > 0 {
+		task.PrivateData.VideoTerminalConfirmed = resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+	}
 	if measuredVideo && isDone {
 		won, settleErr := SettleMeasuredVideoTask(ctx, task, snap.Status, measuredActualQuota, taskResult.UsageFacts, measuredClamp)
 		if settleErr != nil {

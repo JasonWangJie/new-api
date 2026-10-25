@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -91,6 +92,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		status = "invoking"
 		progress = 10
 	}
+	if job.ReferenceRecoveryStage == "prepare" || job.ReferenceRecoveryStage == "submit" || job.ReferenceRecoveryStage == "dispatched" || job.ReferenceRecoveryStage == "refund" {
+		status, progress = "queued", 0
+	}
 	if job.StorageStatus == "ready" || job.StorageStatus == "saving" {
 		status = "uploading"
 		progress = 80
@@ -107,8 +111,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		status, progress = "expired", 100
 	}
 	canTerminate := job.LeaseExpiresAt <= time.Now().Unix() &&
-		(job.Status == "queued" && job.DispatchedAt == 0 || admin && job.Status == "execution_unknown")
+		(job.Status == "queued" && job.DispatchedAt == 0 && job.AttemptGeneration == 0 || admin && job.Status == "execution_unknown")
 	view := gin.H{"id": job.TaskId, "task_id": job.TaskId, "media_type": "video", "platform": job.Provider, "provider": job.Provider, "protocol": "openai_video", "model": job.Model, "request_type": "text_to_video", "status": status, "stage": mediaStage(status), "progress": progress, "billing_status": job.BillingStatus, "storage_status": job.StorageStatus, "quota": job.Quota, "cost": float64(job.Quota) / common.QuotaPerUnit, "group": job.Group, "api_key_id": job.TokenId, "image_count": 0, "result_count": 0, "created_at": job.CreatedAt, "started_at": job.DispatchedAt, "finished_at": int64(0), "expires_at": job.ExpiresAt, "next_attempt_at": job.NextAttemptAt, "retry_count": 0, "storage_retry_count": job.StorageRetries, "error_message": job.ErrorMessage, "error_code": "", "prompt_summary": "", "requested_size": "", "actual_size": "", "aspect_ratio": "", "can_resume": false, "can_terminate": canTerminate, "storage_providers": []string{"local"}}
+	view["retry_count"] = job.ReferenceRetryCount
 	if admin {
 		view["user_id"], view["channel_id"] = job.UserId, job.ChannelId
 	}
@@ -140,7 +145,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err == nil {
 		if job.Status == "execution_unknown" {
-			view["can_terminate"] = false
+			view["can_terminate"] = admin && job.ReferenceRecoveryStage == "unknown" && task.AttemptGeneration == job.AttemptGeneration && task.Status == model.TaskStatusUnknown && job.LeaseExpiresAt <= now
 		}
 		view["can_resume"] = task.Status == model.TaskStatusSuccess && job.ExpiresAt > time.Now().Unix() && job.LeaseExpiresAt <= time.Now().Unix() &&
 			(job.Status == "submitted" && job.StorageStatus == "failed" || job.Status == "succeeded" && job.StorageStatus == "upstream")
@@ -186,7 +191,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if job.Provider == "drama" && job.ExpiresAt <= now {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
-	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && view["status"] == "failed" && errors.Is(err, gorm.ErrRecordNotFound) {
+	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && (errors.Is(err, gorm.ErrRecordNotFound) || job.ReferenceRecoveryStage == "unknown") {
 		view["error_code"], view["error_retryable"] = "execution_unknown", false
 	}
 	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" {
@@ -466,7 +471,12 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		imageManagementData(c, gin.H{"task_id": task.TaskId})
 		return
 	}
-	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ? AND lease_expires_at <= ? AND expires_at > ?", c.Param("task_id"), time.Now().Unix(), time.Now().Unix())
+	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ? AND lease_expires_at <= ?", c.Param("task_id"), time.Now().Unix())
+	if admin {
+		query = query.Where("expires_at > ? OR (status = ? AND reference_retry_count = ? AND reference_recovery_stage = ?)", time.Now().Unix(), "execution_unknown", 1, "unknown")
+	} else {
+		query = query.Where("expires_at > ?", time.Now().Unix())
+	}
 	if !admin {
 		query = query.Where("user_id = ?", c.GetInt("id"))
 		var job model.AsyncMediaJob
@@ -488,6 +498,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		}
 	}
 	updates := map[string]any{}
+	var reconciledTask *model.Task
 	switch action {
 	case "resume":
 		query = query.Where("((status = ? AND storage_status = ?) OR (status = ? AND storage_status = ?))", "submitted", "failed", "succeeded", "upstream").
@@ -516,15 +527,37 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 				imageManagementError(c, http.StatusConflict, errors.New("Verify the upstream task before terminating local processing"))
 				return
 			}
-			query = query.Where("status = ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id)", "execution_unknown")
 			// Unknown submission does not prove whether upstream billing occurred.
 			reason := "Terminated by administrator after upstream verification"
 			if detail := service.VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
 				reason += "\n" + detail
 			}
 			updates["error_message"] = service.VideoTaskFailureReason(reason)
+			if job.ReferenceRetryCount == 1 && job.ReferenceRecoveryStage == "unknown" {
+				var task model.Task
+				if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", job.TaskId, job.UserId, job.AttemptGeneration).Take(&task).Error; err != nil || !task.PrivateData.DurableBilling || task.PrivateData.UpstreamTaskID != "" {
+					imageManagementError(c, http.StatusConflict, errors.New("Media task reservation requires reconciliation"))
+					return
+				}
+				if task.Status == model.TaskStatusUnknown {
+					task.Status, task.FailReason, task.Progress, task.FinishTime = model.TaskStatusFailure, updates["error_message"].(string), "100%", time.Now().Unix()
+					won, settleErr := service.SettleTaskBillingOnComplete(c.Request.Context(), nil, &task, model.TaskStatusUnknown, relaycommon.FailTaskInfo(task.FailReason))
+					if settleErr != nil || !won {
+						imageManagementError(c, http.StatusConflict, errors.New("Media task reservation could not be reconciled"))
+						return
+					}
+				} else if task.Status != model.TaskStatusFailure || task.Quota != 0 {
+					imageManagementError(c, http.StatusConflict, errors.New("Media task cannot be changed in its current phase"))
+					return
+				}
+				reconciledTask = &task
+				query = query.Where("id = ? AND attempt_generation = ? AND reference_recovery_stage = ? AND status = ?", job.ID, job.AttemptGeneration, "unknown", "execution_unknown")
+				updates["billing_status"], updates["quota"], updates["reference_recovery_stage"] = "refunded", 0, "complete"
+			} else {
+				query = query.Where("status = ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id)", "execution_unknown")
+			}
 		} else {
-			query = query.Where("status = ? AND dispatched_at = 0", "queued")
+			query = query.Where("status = ? AND dispatched_at = 0 AND attempt_generation = 0", "queued")
 			updates["billing_status"] = "not_billable"
 		}
 		updates["status"], updates["request_cipher"] = "failed", nil
@@ -541,6 +574,11 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 	if result.RowsAffected != 1 {
 		imageManagementError(c, 409, errors.New("Media task cannot be changed in its current phase"))
 		return
+	}
+	if reconciledTask != nil {
+		if err := service.RetireMediaInputObjects(c.Request.Context(), reconciledTask); err != nil {
+			common.SysError("media input retirement: " + err.Error())
+		}
 	}
 	imageManagementData(c, gin.H{"task_id": c.Param("task_id")})
 }

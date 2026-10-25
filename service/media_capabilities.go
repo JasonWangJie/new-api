@@ -539,11 +539,48 @@ func ValidateVideoProfileRequest(profile jsplugin.VideoProfile, action string, r
 	} else if hasField("extension_direction") {
 		return fmt.Errorf("video extension direction is only valid for extension requests")
 	}
+	referenceInputs := make(map[string][]any)
+	if references, exists := body["references"]; exists {
+		items, valid := references.([]any)
+		if !valid {
+			return fmt.Errorf("video references must be an array")
+		}
+		primaryVideoAssigned := videoValueCount(body["video"]) > 0
+		for _, raw := range items {
+			reference, valid := raw.(map[string]any)
+			if !valid {
+				return fmt.Errorf("video reference is invalid")
+			}
+			kind, _ := reference["type"].(string)
+			role, _ := reference["role"].(string)
+			name := ""
+			switch {
+			case kind == "image" && role == "first_frame":
+				name = "image"
+			case kind == "image" && role == "last_frame":
+				name = "last_frame"
+			case slices.Contains([]string{"image", "video", "audio"}, kind) && (role == "" || role == "reference" || role == "reference_"+kind):
+				name = "reference_" + kind + "s"
+				if kind == "video" && (action == "edit_video" || action == "extend_video") && !primaryVideoAssigned {
+					name, primaryVideoAssigned = "video", true
+				}
+			default:
+				return fmt.Errorf("video reference type or role is invalid")
+			}
+			referenceInputs[name] = append(referenceInputs[name], reference["source"])
+		}
+	}
 	counts := videoInputCounts(body, metadata, files)
+	for name, values := range referenceInputs {
+		counts[name] += len(values)
+	}
 	declaredInputs := make(map[string]jsplugin.VideoInputProfile, len(mode.Inputs))
 	for _, input := range mode.Inputs {
 		declaredInputs[input.Name] = input
 		sources := videoInputSources(input.Name, body, metadata, files)
+		for _, value := range referenceInputs[input.Name] {
+			sources = append(sources, classifyVideoInputSource(value, input.Name))
+		}
 		count, knownInput := counts[input.Name]
 		if !knownInput {
 			count = len(sources)

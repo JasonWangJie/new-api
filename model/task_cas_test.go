@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -351,4 +353,293 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 	assert.EqualValues(t, TaskStatusInProgress, reloaded.Status)
 	assert.JSONEq(t, `{"req_key":"new"}`, string(reloaded.PrivateData.PluginState))
 	assert.Equal(t, 4, reloaded.PrivateData.PollFailures)
+}
+
+func asyncVideoRecoveryFixture(t *testing.T) (*gorm.DB, Task, AsyncMediaJob) {
+	t.Helper()
+	db, image, _ := imageDatabaseFixture(t)
+	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &MediaInputObject{}))
+	require.NoError(t, db.Model(&User{}).Where("id = ?", image.UserId).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
+	require.NoError(t, db.Model(&Token{}).Where("id = ?", image.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+	require.NoError(t, db.Model(&Channel{}).Where("id = ?", image.ChannelId).Update("used_quota", 100).Error)
+	now := time.Now().Unix()
+	task := Task{TaskID: "task_video_recovery", Platform: "drama", UserId: image.UserId, ChannelId: image.ChannelId, Quota: 100, Status: TaskStatusInProgress, SubmitTime: now - 10, StartTime: now - 5, Progress: "40%", Data: json.RawMessage(`{"status":"IN_PROGRESS"}`),
+		Properties:  Properties{OriginModelName: "video-model", UpstreamModelName: "native-video-model"},
+		PrivateData: TaskPrivateData{AsyncMedia: true, UpstreamTaskID: "native-original", TokenId: image.TokenId, BillingSource: "wallet", DurableBilling: true, SubmitAccountingRecorded: true, VideoTerminalConfirmed: true, PluginState: json.RawMessage(`{"native_id":"original"}`)}}
+	require.NoError(t, db.Create(&task).Error)
+	job := AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "video-recovery-identity", UserId: task.UserId, TokenId: image.TokenId, ChannelId: image.ChannelId, Provider: "drama", Model: "video-model", RequestCipher: []byte("encrypted-request"), Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: task.Quota, DispatchedAt: now - 10, CreatedAt: now - 10, ExpiresAt: now + 1800}
+	require.NoError(t, db.Create(&job).Error)
+	return db, task, job
+}
+
+func TestAsyncVideoReferenceRecoveryPreservesHoldAndFencesOldAttempt(t *testing.T) {
+	db, task, job := asyncVideoRecoveryFixture(t)
+	original := task
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference image could not be downloaded")
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	assert.EqualValues(t, 1, task.AttemptGeneration)
+	assert.EqualValues(t, TaskStatusQueued, task.Status)
+	assert.Empty(t, task.PrivateData.UpstreamTaskID)
+	assert.Empty(t, task.PrivateData.PluginState)
+	assert.False(t, task.PrivateData.VideoTerminalConfirmed)
+	assert.Empty(t, task.Data)
+	require.Len(t, task.PrivateData.VideoAttempts, 1)
+	assert.Equal(t, "native-original", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+	assert.Equal(t, string(TaskStatusFailure), task.PrivateData.VideoAttempts[0].Status)
+	assert.Equal(t, "reference image could not be downloaded", task.PrivateData.VideoAttempts[0].Reason)
+	assert.EqualValues(t, 1, job.AttemptGeneration)
+	assert.Equal(t, 1, job.ReferenceRetryCount)
+	assert.Equal(t, "prepare", job.ReferenceRecoveryStage)
+	assert.Equal(t, "reserved", job.BillingStatus)
+	assert.Equal(t, original.Quota, job.Quota)
+
+	stale := original
+	stale.Status, stale.Quota = TaskStatusFailure, 0
+	won, err = stale.UpdateWithStatus(original.Status)
+	require.NoError(t, err)
+	assert.False(t, won)
+	require.NoError(t, stale.Update())
+	require.NoError(t, stale.UpdateQuota())
+	require.NoError(t, TaskBulkUpdateByID([]int64{task.ID}, map[string]any{"status": TaskStatusFailure}))
+	stale.Quota = original.Quota
+	won, _, err = SettleTaskBilling(t.Context(), &stale, original.Status, 0, nil, "")
+	require.NoError(t, err)
+	assert.False(t, won)
+	_, err = RecordMeasuredTaskSubmitAccounting(t.Context(), &original)
+	assert.ErrorIs(t, err, ErrTaskAttemptConflict)
+	assert.Error(t, SaveAsyncMediaSubmissionRefund(t.Context(), job.TaskId, job.UserId, map[string]any{"billing_status": "refunded", "quota": 0}, nil))
+	require.NoError(t, db.First(&task, task.ID).Error)
+	assert.EqualValues(t, TaskStatusQueued, task.Status)
+	assert.Equal(t, 100, task.Quota)
+
+	claimed, err := ClaimAsyncMediaJob(t.Context(), &job, "recovery-lease", 60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"reference_recovery_stage": "dispatched", "status": "submitting", "dispatched_at": time.Now().Unix()}))
+	won, err = CommitAsyncVideoReferenceSubmission(t.Context(), job, task, "native-replacement", []byte(`{"status":"SUBMITTED"}`), []byte(`{"native_id":"replacement"}`))
+	require.NoError(t, err)
+	require.True(t, won)
+	won, err = CommitAsyncVideoReferenceSubmission(t.Context(), job, task, "duplicate-replacement", nil, nil)
+	require.NoError(t, err)
+	assert.False(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	assert.Equal(t, "native-replacement", task.PrivateData.UpstreamTaskID)
+	assert.EqualValues(t, TaskStatusSubmitted, task.Status)
+	assert.False(t, task.PrivateData.VideoTerminalConfirmed)
+	assert.Equal(t, "waiting", job.ReferenceRecoveryStage)
+	assert.Equal(t, "reserved", job.BillingStatus)
+	task.Status = TaskStatusSuccess
+	task.PrivateData.VideoTerminalConfirmed = true
+	won, held, err := SettleTaskBilling(t.Context(), &task, TaskStatusSubmitted, 80, nil, "")
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, 100, held)
+	require.Len(t, task.PrivateData.VideoAttempts, 2)
+	assert.Equal(t, "native-original", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+	assert.Equal(t, string(TaskStatusFailure), task.PrivateData.VideoAttempts[0].Status)
+	assert.Equal(t, "native-replacement", task.PrivateData.VideoAttempts[1].UpstreamTaskID)
+	assert.Equal(t, string(TaskStatusSuccess), task.PrivateData.VideoAttempts[1].Status)
+	assert.True(t, task.PrivateData.VideoTerminalConfirmed)
+	var user User
+	var token Token
+	var channel Channel
+	require.NoError(t, db.First(&user, task.UserId).Error)
+	require.NoError(t, db.First(&token, task.PrivateData.TokenId).Error)
+	require.NoError(t, db.First(&channel, task.ChannelId).Error)
+	assert.Equal(t, 920, user.Quota)
+	assert.Equal(t, 80, user.UsedQuota)
+	assert.Equal(t, 1, user.RequestCount)
+	assert.Equal(t, 920, token.RemainQuota)
+	assert.Equal(t, 80, token.UsedQuota)
+	assert.EqualValues(t, 80, channel.UsedQuota)
+}
+
+func TestAsyncVideoReferenceRecoveryRejectsUnsafeTransitions(t *testing.T) {
+	for _, reason := range []string{"settled hold", "missing durable accounting", "second recovery", "expired job", "foreign provider", "existing output", "buffered output", "missing native receipt"} {
+		t.Run(reason, func(t *testing.T) {
+			db, task, job := asyncVideoRecoveryFixture(t)
+			switch reason {
+			case "settled hold":
+				job.BillingStatus = "settled"
+			case "missing durable accounting":
+				task.PrivateData.SubmitAccountingRecorded = false
+			case "second recovery":
+				job.ReferenceRetryCount = 1
+			case "expired job":
+				job.ExpiresAt = time.Now().Unix() - 1
+			case "foreign provider":
+				job.Provider = "other-provider"
+			case "existing output":
+				task.PrivateData.ResultURL = "https://output.example/video.mp4"
+			case "buffered output":
+				job.OutputObjectKey = "buffered/output"
+			case "missing native receipt":
+				task.PrivateData.UpstreamTaskID = ""
+			}
+			require.NoError(t, db.Save(&task).Error)
+			require.NoError(t, db.Save(&job).Error)
+			won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+			require.NoError(t, err)
+			assert.False(t, won)
+			var currentTask Task
+			var currentJob AsyncMediaJob
+			require.NoError(t, db.First(&currentTask, task.ID).Error)
+			require.NoError(t, db.First(&currentJob, job.ID).Error)
+			assert.Equal(t, task.Status, currentTask.Status)
+			assert.Equal(t, task.Quota, currentTask.Quota)
+			assert.Equal(t, task.AttemptGeneration, currentTask.AttemptGeneration)
+			assert.Equal(t, job.BillingStatus, currentJob.BillingStatus)
+			assert.Equal(t, job.ReferenceRetryCount, currentJob.ReferenceRetryCount)
+			assert.Empty(t, currentTask.PrivateData.VideoAttempts)
+		})
+	}
+}
+
+func TestAsyncVideoReferenceSubmissionReceiptRemainsPrivate(t *testing.T) {
+	db, task, job := asyncVideoRecoveryFixture(t)
+	task.PrivateData.UpstreamAsync = &dto.UpstreamAsyncProfile{}
+	require.NoError(t, db.Model(&task).Update("private_data", task.PrivateData).Error)
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	claimed, err := ClaimAsyncMediaJob(t.Context(), &job, "profile-recovery-lease", 60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}))
+	response := []byte(`{"task_id":"private-native-receipt","video_url":"https://private.example/secret"}`)
+	won, err = CommitAsyncVideoReferenceSubmission(t.Context(), job, task, "private-native-receipt", response, nil)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	assert.Empty(t, task.Data)
+	assert.JSONEq(t, string(response), string(task.PrivateData.UpstreamAsyncResponse))
+	public, err := common.Marshal(task)
+	require.NoError(t, err)
+	assert.NotContains(t, string(public), "private-native-receipt")
+	assert.NotContains(t, string(public), "private.example")
+}
+
+func TestAsyncVideoReferenceRecoveryUnknownRetainsHold(t *testing.T) {
+	db, task, job := asyncVideoRecoveryFixture(t)
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	claimed, err := ClaimAsyncMediaJob(t.Context(), &job, "unknown-recovery-lease", 60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}))
+	staleJob := job
+	staleJob.LeaseToken = "superseded-lease"
+	won, err = MarkAsyncVideoReferenceSubmissionUnknown(t.Context(), staleJob, task, "replacement receipt could not be confirmed")
+	require.NoError(t, err)
+	assert.False(t, won)
+	won, err = MarkAsyncVideoReferenceSubmissionUnknown(t.Context(), job, task, "replacement receipt could not be confirmed")
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	assert.EqualValues(t, TaskStatusUnknown, task.Status)
+	assert.Equal(t, 100, task.Quota)
+	assert.Empty(t, task.PrivateData.UpstreamTaskID)
+	require.Len(t, task.PrivateData.VideoAttempts, 2)
+	assert.Equal(t, string(TaskStatusUnknown), task.PrivateData.VideoAttempts[1].Status)
+	assert.EqualValues(t, 1, task.PrivateData.VideoAttempts[1].Generation)
+	assert.Equal(t, "execution_unknown", job.Status)
+	assert.Equal(t, "unknown", job.BillingStatus)
+	assert.Equal(t, 100, job.Quota)
+	assert.Zero(t, job.NextAttemptAt)
+	var user User
+	var token Token
+	require.NoError(t, db.First(&user, task.UserId).Error)
+	require.NoError(t, db.First(&token, task.PrivateData.TokenId).Error)
+	assert.Equal(t, 900, user.Quota)
+	assert.Equal(t, 900, token.RemainQuota)
+}
+
+func TestMediaInputObjectOwnershipAndSlotIdentity(t *testing.T) {
+	db, task, job := asyncVideoRecoveryFixture(t)
+	now := time.Now().Unix()
+	object := MediaInputObject{ObjectId: "media-input-original", TaskId: task.TaskID, UserId: task.UserId, TokenId: job.TokenId, Slot: "0", Kind: "image", SourceHash: strings.Repeat("a", 64), Checksum: strings.Repeat("b", 64), RootPath: t.TempDir(), ObjectKey: "input/original", MimeType: "image/png", ByteSize: 32, Status: "active", CreatedAt: now, ExpiresAt: now + 300}
+	saved, err := SaveMediaInputObject(t.Context(), object)
+	require.NoError(t, err)
+	assert.Positive(t, saved.ID)
+	repeated := object
+	repeated.ObjectId, repeated.ObjectKey = "media-input-repeated", "input/repeated"
+	repeated.ExpiresAt += 60
+	reused, err := SaveMediaInputObject(t.Context(), repeated)
+	require.NoError(t, err)
+	assert.Equal(t, saved.ObjectId, reused.ObjectId)
+	assert.Equal(t, saved.CreatedAt, reused.CreatedAt)
+	assert.Equal(t, saved.ExpiresAt, reused.ExpiresAt)
+	repeated.SourceHash = strings.Repeat("c", 64)
+	_, err = SaveMediaInputObject(t.Context(), repeated)
+	assert.ErrorIs(t, err, ErrImageConflict)
+	repeated = object
+	repeated.UserId++
+	_, err = SaveMediaInputObject(t.Context(), repeated)
+	assert.Error(t, err)
+	repeated = object
+	repeated.ExpiresAt = job.ExpiresAt + 1
+	_, err = SaveMediaInputObject(t.Context(), repeated)
+	assert.ErrorIs(t, err, ErrImageConflict)
+	repeated = object
+	repeated.ObjectId = "media-input-slot-conflict"
+	assert.Error(t, db.Create(&repeated).Error, "task input slots remain unique independently of helper checks")
+	stale := saved
+	stale.Checksum = strings.Repeat("d", 64)
+	require.NoError(t, DeleteMediaInputObject(t.Context(), stale))
+	objects, err := ListMediaInputObjects(t.Context(), task.TaskID, task.UserId, job.TokenId)
+	require.NoError(t, err)
+	require.Len(t, objects, 1)
+	require.NoError(t, DeleteMediaInputObject(t.Context(), saved))
+	objects, err = ListMediaInputObjects(t.Context(), task.TaskID, task.UserId, job.TokenId)
+	require.NoError(t, err)
+	assert.Empty(t, objects)
+}
+
+func TestAsyncVideoReferenceRecoveryQueuePhases(t *testing.T) {
+	db, _, pending := asyncVideoRecoveryFixture(t)
+	jobs := []AsyncMediaJob{
+		{TaskId: "legacy-submit", IdentityHash: "legacy-submit", Status: "queued", StorageStatus: "pending"},
+		{TaskId: "reference-prepare", IdentityHash: "reference-prepare", Status: "queued", StorageStatus: "pending", ReferenceRecoveryStage: "prepare", ReferenceRetryCount: 1, AttemptGeneration: 1},
+		{TaskId: "reference-submit", IdentityHash: "reference-submit", Status: "queued", StorageStatus: "pending", ReferenceRecoveryStage: "submit", ReferenceRetryCount: 1, AttemptGeneration: 1},
+		{TaskId: "video-output-ready", IdentityHash: "video-output-ready", Status: "submitted", StorageStatus: "ready"},
+	}
+	for i := range jobs {
+		require.NoError(t, db.Create(&jobs[i]).Error)
+	}
+	require.NoError(t, db.Model(&jobs[0]).Update("reference_recovery_stage", nil).Error)
+	for _, tc := range []struct {
+		phase string
+		ids   []string
+	}{
+		{phase: "submit", ids: []string{"legacy-submit", "reference-submit"}},
+		{phase: "status", ids: []string{pending.TaskId}},
+		{phase: "download", ids: []string{"reference-prepare", "video-output-ready"}},
+	} {
+		due, err := GetDueAsyncMediaJobsForPhase(t.Context(), time.Now().Unix(), 10, tc.phase)
+		require.NoError(t, err)
+		ids := make([]string, len(due))
+		for i := range due {
+			ids[i] = due[i].TaskId
+		}
+		assert.ElementsMatch(t, tc.ids, ids)
+	}
+	preparing := jobs[1]
+	require.NoError(t, db.Model(&AsyncMediaJob{}).Where("id = ?", preparing.ID).Update("reference_recovery_stage", "submit").Error)
+	claimed, err := ClaimAsyncMediaJob(t.Context(), &preparing, "stale-phase-lease", 30)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+	preparing.ReferenceRecoveryStage = "submit"
+	claimed, err = ClaimAsyncMediaJob(t.Context(), &preparing, "current-phase-lease", 30)
+	require.NoError(t, err)
+	assert.True(t, claimed)
 }

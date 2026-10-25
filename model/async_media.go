@@ -15,34 +15,37 @@ import (
 // AsyncMediaJob owns submission and storage leases. Upstream task accounting
 // remains in Task; retrying storage never enters the submission path.
 type AsyncMediaJob struct {
-	ID               int    `json:"-"`
-	TaskId           string `json:"task_id" gorm:"size:64;uniqueIndex"`
-	IdentityHash     string `json:"-" gorm:"size:64;uniqueIndex"`
-	RequestHash      string `json:"-" gorm:"size:64"`
-	UserId           int    `json:"user_id" gorm:"index"`
-	TokenId          int    `json:"api_key_id" gorm:"index"`
-	ChannelId        int    `json:"-"`
-	Provider         string `json:"provider" gorm:"size:32"`
-	Model            string `json:"model" gorm:"size:255"`
-	Group            string `json:"group" gorm:"size:64"`
-	RequestCipher    []byte `json:"-"`
-	ChannelCipher    []byte `json:"-"`
-	OutputRootPath   string `json:"-" gorm:"type:text"`
-	OutputObjectKey  string `json:"-" gorm:"size:128"`
-	ArtifactKeys     string `json:"-" gorm:"type:text"`
-	Status           string `json:"status" gorm:"size:32;index"`
-	StorageStatus    string `json:"storage_status" gorm:"size:32"`
-	BillingStatus    string `json:"billing_status" gorm:"size:32"`
-	RefundLogPayload string `json:"-" gorm:"type:text"`
-	Quota            int    `json:"quota"`
-	DispatchedAt     int64  `json:"-"`
-	LeaseToken       string `json:"-" gorm:"size:64"`
-	LeaseExpiresAt   int64  `json:"-"`
-	NextAttemptAt    int64  `json:"-" gorm:"index"`
-	StorageRetries   int    `json:"storage_retry_count"`
-	ErrorMessage     string `json:"error_message,omitempty" gorm:"type:text"`
-	CreatedAt        int64  `json:"created_at" gorm:"index"`
-	ExpiresAt        int64  `json:"expires_at"`
+	ID                     int    `json:"-"`
+	TaskId                 string `json:"task_id" gorm:"size:64;uniqueIndex"`
+	IdentityHash           string `json:"-" gorm:"size:64;uniqueIndex"`
+	RequestHash            string `json:"-" gorm:"size:64"`
+	UserId                 int    `json:"user_id" gorm:"index"`
+	TokenId                int    `json:"api_key_id" gorm:"index"`
+	ChannelId              int    `json:"-"`
+	Provider               string `json:"provider" gorm:"size:32"`
+	Model                  string `json:"model" gorm:"size:255"`
+	Group                  string `json:"group" gorm:"size:64"`
+	RequestCipher          []byte `json:"-"`
+	ChannelCipher          []byte `json:"-"`
+	OutputRootPath         string `json:"-" gorm:"type:text"`
+	OutputObjectKey        string `json:"-" gorm:"size:128"`
+	ArtifactKeys           string `json:"-" gorm:"type:text"`
+	Status                 string `json:"status" gorm:"size:32;index"`
+	StorageStatus          string `json:"storage_status" gorm:"size:32"`
+	BillingStatus          string `json:"billing_status" gorm:"size:32"`
+	RefundLogPayload       string `json:"-" gorm:"type:text"`
+	Quota                  int    `json:"quota"`
+	DispatchedAt           int64  `json:"-"`
+	LeaseToken             string `json:"-" gorm:"size:64"`
+	LeaseExpiresAt         int64  `json:"-"`
+	NextAttemptAt          int64  `json:"-" gorm:"index"`
+	StorageRetries         int    `json:"storage_retry_count"`
+	AttemptGeneration      int64  `json:"-" gorm:"not null;default:0"`
+	ReferenceRetryCount    int    `json:"-" gorm:"not null;default:0"`
+	ReferenceRecoveryStage string `json:"-" gorm:"size:32"`
+	ErrorMessage           string `json:"error_message,omitempty" gorm:"type:text"`
+	CreatedAt              int64  `json:"created_at" gorm:"index"`
+	ExpiresAt              int64  `json:"expires_at"`
 }
 
 type MediaArtifactObject struct {
@@ -77,11 +80,11 @@ func GetDueAsyncMediaJobsForPhase(ctx context.Context, now int64, limit int, pha
 	query := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, now, now)
 	switch phase {
 	case "submit":
-		query = query.Where("status IN ?", []string{"queued", "submitting"})
+		query = query.Where("status IN ? AND COALESCE(reference_recovery_stage, '') <> ?", []string{"queued", "submitting"}, "prepare")
 	case "status":
 		query = query.Where("status = ? AND storage_status NOT IN ?", "submitted", []string{"ready", "saving", "failed"})
 	case "download":
-		query = query.Where("status = ? AND storage_status IN ?", "submitted", []string{"ready", "saving", "failed"})
+		query = query.Where("((status = ? AND reference_recovery_stage = ?) OR (status = ? AND storage_status IN ?))", "queued", "prepare", "submitted", []string{"ready", "saving", "failed"})
 	case "":
 	default:
 		return nil, errors.New("invalid async media worker phase")
@@ -127,7 +130,7 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int) (bool, error) {
 	now := time.Now().Unix()
 	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted"}).
-		Where("status = ? AND storage_status = ?", job.Status, job.StorageStatus).
+		Where("status = ? AND storage_status = ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", job.Status, job.StorageStatus, job.AttemptGeneration, job.ReferenceRecoveryStage).
 		Updates(map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds)})
 	if result.Error != nil || result.RowsAffected == 0 {
 		return false, result.Error
@@ -137,7 +140,7 @@ func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, s
 }
 
 func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any) error {
-	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ?", job.ID, job.LeaseToken).Updates(updates)
+	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -149,7 +152,14 @@ func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[str
 
 // SaveAsyncMediaSubmissionRefund persists the confirmed rollback and its log
 // command together. Retrying log delivery must never repeat the refund itself.
-func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID int, updates map[string]any, refund *RecordTaskBillingLogParams) error {
+func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID int, updates map[string]any, refund *RecordTaskBillingLogParams, expectedGeneration ...int64) error {
+	generation := int64(0)
+	if len(expectedGeneration) > 1 || len(expectedGeneration) == 1 && expectedGeneration[0] < 0 {
+		return ErrImageConflict
+	}
+	if len(expectedGeneration) == 1 {
+		generation = expectedGeneration[0]
+	}
 	var payload string
 	if refund != nil {
 		if refund.LogType != LogTypeRefund || refund.UserId != userID || refund.TokenId <= 0 || refund.Quota <= 0 || updates["billing_status"] != "refunded" {
@@ -166,7 +176,7 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 	if err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job AsyncMediaJob
 		if err := lockForUpdate(tx).Select("id", "token_id", "billing_status", "refund_log_payload").
-			Where("task_id = ? AND user_id = ?", taskID, userID).Take(&job).Error; err != nil {
+			Where("task_id = ? AND user_id = ? AND attempt_generation = ?", taskID, userID, generation).Take(&job).Error; err != nil {
 			return err
 		}
 		changes := maps.Clone(updates)
@@ -192,7 +202,7 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 		}
 		// The locked read proves ownership even when an identical MySQL update
 		// reports zero changed rows. Keep an already-pending log immutable.
-		return tx.Model(&AsyncMediaJob{}).Where("id = ? AND task_id = ? AND user_id = ?", job.ID, taskID, userID).Updates(changes).Error
+		return tx.Model(&AsyncMediaJob{}).Where("id = ? AND task_id = ? AND user_id = ? AND attempt_generation = ?", job.ID, taskID, userID, generation).Updates(changes).Error
 	}); err != nil {
 		return err
 	}

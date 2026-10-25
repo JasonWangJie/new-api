@@ -244,14 +244,23 @@ func VerifyMediaObjectAccess(object model.MediaArtifactObject, expires, access s
 func CleanupMediaObjects(ctx context.Context) error {
 	var jobs []model.AsyncMediaJob
 	now := time.Now().Unix()
-	if err := model.DB.WithContext(ctx).Where("expires_at <= ? AND lease_expires_at <= ? AND (status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, "expired").Limit(100).Find(&jobs).Error; err != nil {
+	if err := model.DB.WithContext(ctx).
+		Where("expires_at <= ? AND lease_expires_at <= ? AND (status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, "expired").
+		Where("COALESCE(reference_recovery_stage, '') <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL", "refund").
+		Limit(100).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for _, job := range jobs {
 		if err := RemoveAsyncMediaOutput(job); err != nil {
 			return err
 		}
-		if err := model.DB.WithContext(ctx).Model(&job).Where("lease_expires_at <= ?", now).Updates(map[string]any{"status": "expired", "storage_status": "expired", "request_cipher": nil, "channel_cipher": nil, "output_root_path": "", "output_object_key": ""}).Error; err != nil {
+		changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil, "output_root_path": "", "output_object_key": ""}
+		if job.ReferenceRecoveryStage != "refund" {
+			changes["status"] = "expired"
+		}
+		// Expire private payloads without removing a pending refund from its
+		// queue. Financial completion does not require a live replay envelope.
+		if err := model.DB.WithContext(ctx).Model(&job).Where("lease_expires_at <= ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", now, job.AttemptGeneration, job.ReferenceRecoveryStage).Updates(changes).Error; err != nil {
 			return err
 		}
 	}

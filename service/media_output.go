@@ -33,6 +33,9 @@ func CaptureAsyncMediaOutput(ctx context.Context, task *model.Task) (bool, error
 	if err != nil {
 		return false, err
 	}
+	if job.AttemptGeneration != task.AttemptGeneration {
+		return false, model.ErrImageConflict
+	}
 	cfg, err := GetMediaRuntimeConfig(ctx)
 	if err != nil {
 		return true, err
@@ -76,9 +79,15 @@ func CaptureAsyncMediaOutput(ctx context.Context, task *model.Task) (bool, error
 	if err := root.Rename(key+".part", key); err != nil {
 		return true, err
 	}
-	if err := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).Where("id = ?", job.ID).Updates(map[string]any{"output_root_path": rootPath, "output_object_key": key}).Error; err != nil {
+	result := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+		Where("id = ? AND attempt_generation = ? AND COALESCE(output_object_key, '') = ?", job.ID, task.AttemptGeneration, job.OutputObjectKey).
+		Updates(map[string]any{"output_root_path": rootPath, "output_object_key": key})
+	if result.Error != nil || result.RowsAffected != 1 {
 		_ = root.Remove(key)
-		return true, err
+		if result.Error != nil {
+			return true, result.Error
+		}
+		return true, model.ErrImageConflict
 	}
 	if job.OutputObjectKey != "" {
 		oldRoot, err := os.OpenRoot(job.OutputRootPath)
@@ -91,6 +100,9 @@ func CaptureAsyncMediaOutput(ctx context.Context, task *model.Task) (bool, error
 }
 
 func RestoreAsyncMediaOutput(ctx context.Context, job model.AsyncMediaJob, task *model.Task) error {
+	if job.AttemptGeneration != task.AttemptGeneration {
+		return model.ErrImageConflict
+	}
 	if job.OutputObjectKey == "" {
 		return os.ErrNotExist
 	}

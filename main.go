@@ -143,6 +143,7 @@ func main() {
 	service.EstimateAsyncImageQuotaFunc = relay.EstimateAsyncImageQuota
 	service.FreezeAsyncImageBillingFunc = relay.FreezeAsyncImageBilling
 	service.SubmitAsyncVideoFunc = controller.ExecuteAsyncVideo
+	service.SubmitAsyncVideoReferenceRetryFunc = controller.ExecuteAsyncVideoReferenceRetry
 	service.PersistAsyncVideoFunc = controller.PersistAsyncVideo
 	stopMediaWorkers := service.StartAsyncMediaWorkers(context.Background())
 	defer stopMediaWorkers()

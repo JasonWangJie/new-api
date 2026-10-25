@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -22,6 +23,9 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 		var current Task
 		if err := lockForUpdate(tx).Where("id = ?", task.ID).Take(&current).Error; err != nil {
 			return err
+		}
+		if current.AttemptGeneration != task.AttemptGeneration {
+			return ErrTaskAttemptConflict
 		}
 		if current.PrivateData.SubmitAccountingRecorded {
 			return nil
@@ -62,7 +66,7 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 			}
 		}
 		current.PrivateData.SubmitAccountingRecorded = true
-		if err := tx.Model(&Task{}).Where("id = ?", task.ID).Update("private_data", current.PrivateData).Error; err != nil {
+		if err := tx.Model(&Task{}).Where("id = ? AND attempt_generation = ?", task.ID, task.AttemptGeneration).Update("private_data", current.PrivateData).Error; err != nil {
 			return err
 		}
 		recorded = true
@@ -121,7 +125,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if err := lockForUpdate(tx).Where("id = ?", task.ID).Take(&current).Error; err != nil {
 			return err
 		}
-		if current.Status != fromStatus || current.Quota != reservedQuota {
+		if current.Status != fromStatus || current.Quota != reservedQuota || current.AttemptGeneration != task.AttemptGeneration || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID {
 			return errMeasuredTaskCASLost
 		}
 		if current.PrivateData.DurableBilling && !current.PrivateData.SubmitAccountingRecorded {
@@ -222,6 +226,26 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			updated.PrivateData.UpstreamAsyncResponse = nil
 			delta = -reservedQuota
 		}
+		if current.AttemptGeneration > 0 && current.PrivateData.AsyncMedia && current.Platform == "drama" {
+			updated.PrivateData.VideoAttempts = append([]VideoTaskAttempt(nil), current.PrivateData.VideoAttempts...)
+			attemptIndex := -1
+			for i := range updated.PrivateData.VideoAttempts {
+				if updated.PrivateData.VideoAttempts[i].Generation == current.AttemptGeneration {
+					attemptIndex = i
+					break
+				}
+			}
+			if attemptIndex < 0 {
+				startedAt := current.StartTime
+				if startedAt <= 0 {
+					startedAt = current.SubmitTime
+				}
+				updated.PrivateData.VideoAttempts = append(updated.PrivateData.VideoAttempts, VideoTaskAttempt{Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, StartedAt: startedAt})
+				attemptIndex = len(updated.PrivateData.VideoAttempts) - 1
+			}
+			attempt := &updated.PrivateData.VideoAttempts[attemptIndex]
+			attempt.Status, attempt.Reason, attempt.FinishedAt = string(updated.Status), updated.FailReason, time.Now().Unix()
+		}
 		if delta != 0 {
 			credit := -delta
 			if privateData.BillingSource == "subscription" && samePeriod {
@@ -291,7 +315,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 				}
 			}
 		}
-		claim := tx.Model(&Task{}).Where("id = ? AND status = ? AND quota = ?", task.ID, fromStatus, reservedQuota).Select("*").Updates(&updated)
+		claim := tx.Model(&Task{}).Where("id = ? AND status = ? AND quota = ? AND attempt_generation = ?", task.ID, fromStatus, reservedQuota, task.AttemptGeneration).Select("*").Updates(&updated)
 		if claim.Error != nil {
 			return claim.Error
 		}

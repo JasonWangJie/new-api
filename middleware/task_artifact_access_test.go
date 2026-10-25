@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -163,6 +164,36 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	assert.Contains(t, output.String(), "/api/image-task-references/task-1/0/content")
 	for _, secret := range []string{"1893456789", "reference-key-never-log", "reference-signature-never-log"} {
 		assert.NotContains(t, output.String(), secret)
+	}
+	router.Match([]string{http.MethodGet, http.MethodHead}, "/api/media-inputs/:object_id/content", func(c *gin.Context) {
+		assert.Equal(t, "1893456790", c.Query("expires"))
+		access := c.Query("access")
+		assert.Contains(t, c.Request.URL.RawQuery, "access="+access, "log redaction must preserve the handler's signed query")
+		if access == "media-input-capability-never-log" {
+			c.Status(http.StatusNoContent)
+		} else {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, testCase := range []struct {
+			access string
+			status int
+		}{
+			{access: "media-input-capability-never-log", status: http.StatusNoContent},
+			{access: "tampered-media-input-capability-never-log", status: http.StatusNotFound},
+		} {
+			t.Run(method+"/"+strconv.Itoa(testCase.status), func(t *testing.T) {
+				output.Reset()
+				request := httptest.NewRequest(method, "/api/media-inputs/minput_private/content?expires=1893456790&access="+testCase.access, nil)
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, request)
+				assert.Equal(t, testCase.status, recorder.Code)
+				assert.Contains(t, output.String(), "/api/media-inputs/minput_private/content")
+				assert.NotContains(t, output.String(), testCase.access)
+				assert.NotContains(t, output.String(), "1893456790")
+			})
+		}
 	}
 }
 

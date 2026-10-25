@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
@@ -1185,7 +1186,9 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
 	lastReferenceFetchFailure := isCompletedImageReferenceFetchFailure(lastAttempt)
 	lastSynchronousResponse := lastAttempt.SynchronousRetryableResponse && lastAttempt.FinishedAt > 0
-	lastIncompatible := imageAttemptCompatibilityCode(lastAttempt) != ""
+	lastCompatibilityCode := imageAttemptCompatibilityCode(lastAttempt)
+	lastIncompatible := lastCompatibilityCode != ""
+	lastReferenceSizeRejection := lastAttempt.Code == 603 && lastAttempt.HTTPStatus == http.StatusBadRequest && lastCompatibilityCode == "upstream_image_reference_incompatible" && imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(lastAttempt.ErrorMessage))
 	if legacy {
 		if !routing.WaitForCooldown {
 			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)
@@ -1199,7 +1202,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if lastReferenceFetchFailure || lastSynchronousResponse {
+		if lastReferenceFetchFailure || lastSynchronousResponse || lastReferenceSizeRejection {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {
@@ -1233,7 +1236,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if lastReferenceFetchFailure || lastSynchronousResponse {
+	if lastReferenceFetchFailure || lastSynchronousResponse || lastReferenceSizeRejection {
 		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {

@@ -254,9 +254,8 @@ func (details *AsyncVideoRequestDetails) collectReferenceMedia(value any, mediaT
 	}
 }
 
-// retainAsyncVideoRequestDetails discards the replay envelope once a durable
-// upstream task exists. Only an encrypted, bounded display snapshot survives
-// until the existing task-expiry cleanup clears RequestCipher.
+// retainAsyncVideoRequestDetails keeps recoverable input until generation has
+// finished. Legacy tasks retain only their bounded encrypted display snapshot.
 func retainAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
 	if len(job.RequestCipher) == 0 {
 		return nil
@@ -269,6 +268,9 @@ func retainAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
 	if err != nil {
 		common.SysError("media task " + job.TaskId + ": request details could not be retained")
 		return nil
+	}
+	if request.ReferenceRecoveryVersion == 1 && len(request.Body) > 0 && job.Status != "failed" && job.Status != "expired" && job.Status != "succeeded" {
+		return job.RequestCipher
 	}
 	if request.Details != nil && len(request.Body) == 0 {
 		var envelope map[string]common.RawMessage

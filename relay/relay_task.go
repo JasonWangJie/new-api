@@ -429,9 +429,17 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if c.GetBool("async_media_prepare") {
 		return &TaskSubmitResult{Quota: info.PriceData.Quota}, nil
 	}
+	referenceRetry := false
+	if value, exists := c.Get("async_media_reference_retry_task"); exists {
+		task, valid := value.(model.Task)
+		if !valid || !c.GetBool("async_media_execution") || task.Platform != "drama" || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.AttemptGeneration != 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || task.Quota <= 0 || task.Quota != info.PriceData.Quota || task.UserId != info.UserId || task.ChannelId != info.ChannelId || info.TaskRelayInfo == nil || task.TaskID != info.TaskRelayInfo.PublicTaskID {
+			return nil, service.TaskErrorWrapperLocal(errors.New("video recovery requires its original durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
+		}
+		referenceRetry = true
+	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
-	if hook, exists := c.Get("async_media_before_billing"); exists {
+	if hook, exists := c.Get("async_media_before_billing"); exists && !referenceRetry {
 		record, ok := hook.(func() error)
 		if !ok {
 			return nil, service.TaskErrorWrapperLocal(errors.New("invalid media billing hook"), "media_billing_failed", http.StatusInternalServerError)
@@ -440,7 +448,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(err, "media_billing_failed", http.StatusInternalServerError)
 		}
 	}
-	if info.Billing != nil {
+	if info.Billing != nil && !referenceRetry {
 		if !service.HasDurableTaskReservation(info, 0) {
 			return nil, service.TaskErrorWrapperLocal(errors.New("measured video retry requires a durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
@@ -451,7 +459,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(errors.New("measured video reservation does not cover estimated cost"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
 	}
-	if info.Billing == nil && !info.PriceData.FreeModel {
+	if info.Billing == nil && !info.PriceData.FreeModel && !referenceRetry {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeDurableTaskBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
@@ -541,7 +549,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
 	finalQuota := info.PriceData.Quota
-	if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusFailure {
+	if referenceRetry {
+		// Replacement generation shares the persisted task reservation. Neither
+		// pre-consume nor submit-time billing adjustments run a second time.
+		finalQuota = info.PriceData.Quota
+	} else if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusFailure {
 		finalQuota = 0
 	} else if snap := info.TieredBillingSnapshot; snap != nil {
 		if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusSuccess && len(parsed.Immediate.UsageFacts) > 0 {

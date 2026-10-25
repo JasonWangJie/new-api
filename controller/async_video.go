@@ -513,6 +513,11 @@ func AcceptAsyncVideo(c *gin.Context) {
 	}
 	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
 	request.Details = request.RequestDetails()
+	canonical, _ := c.Get("task_request")
+	if err := service.FreezeAsyncVideoReferenceRecovery(&request, canonical, job.ExpiresAt); err != nil {
+		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
+		return
+	}
 	if provider := c.GetString("async_media_provider"); provider != "" && request.Details != nil {
 		request.Details.RequestParameters["provider"] = provider
 	}
@@ -560,6 +565,18 @@ func respondAsyncVideoAccepted(c *gin.Context, job model.AsyncMediaJob, reused b
 }
 
 func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest) error {
+	return executeAsyncVideoAttempt(ctx, job, request, nil)
+}
+
+func ExecuteAsyncVideoReferenceRetry(ctx context.Context, job model.AsyncMediaJob, task model.Task, request service.AsyncVideoRequest) error {
+	if task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.AttemptGeneration != job.AttemptGeneration || job.ReferenceRetryCount != 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 {
+		return errors.New("video reference recovery reservation is unavailable")
+	}
+	return executeAsyncVideoAttempt(ctx, job, request, &task)
+}
+
+func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest, retryTask *model.Task) error {
+	var executionErr error
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
 		return err
@@ -569,10 +586,37 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 		authenticate = middleware.CanvasAsyncMediaWorkerAuth(job.TokenId, job.UserId)
 	} else if err := validateMediaToken(ctx, token, request.ClientIP); err != nil {
 		return err
+	} else if retryTask != nil {
+		// The original task already reserved its quota. Fresh database checks
+		// above still enforce expiry, disabled users/tokens and IP restrictions.
+		authenticate = func(c *gin.Context) {
+			var owner model.User
+			if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", token.UserId, common.UserStatusEnabled).Take(&owner).Error; err != nil {
+				executionErr = errors.New("media owner is unavailable")
+				c.Abort()
+				return
+			}
+			owner.ToBaseUser().WriteContext(c)
+			group := owner.Group
+			if token.Group != "" {
+				if !service.GroupInUserUsableGroups(owner.Group, token.Group) || token.Group != "auto" && !ratio_setting.ContainsGroupRatio(token.Group) {
+					executionErr = errors.New("video Token group permission changed")
+					c.Abort()
+					return
+				}
+				group = token.Group
+			}
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, group)
+			if err := middleware.SetupContextForToken(c, &token); err != nil {
+				executionErr = err
+				c.Abort()
+				return
+			}
+			c.Next()
+		}
 	}
 	engine := gin.New()
 	_ = engine.SetTrustedProxies(nil)
-	var executionErr error
 	operation := request.Operation
 	path, validOperation := asyncVideoInternalPath(operation)
 	if !validOperation {
@@ -604,6 +648,13 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 		if liveChannel.Type == constant.ChannelTypeTaskPlugin && liveChannel.GetSetting().TaskPluginKey != job.Provider || liveChannel.Type != constant.ChannelTypeTaskPlugin && !slices.Contains(pinned.Plugin.Meta.ChannelTypes, liveChannel.Type) {
 			executionErr = errors.New("selected video channel capability changed")
 			return
+		}
+		if retryTask != nil {
+			keyIndex := slices.Index(liveChannel.GetKeys(), request.Channel.Key)
+			if keyIndex < 0 || liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != 0 && liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusEnabled {
+				executionErr = errors.New("original video account is unavailable")
+				return
+			}
 		}
 		var ability model.Ability
 		if err := model.DB.WithContext(ctx).Where(map[string]any{"channel_id": job.ChannelId, "group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Take(&ability).Error; err != nil {
@@ -662,7 +713,49 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{PublicTaskID: job.TaskId}
 		info.LockedChannel = &request.Channel
 		c.Set("async_media_execution", true)
+		if retryTask != nil {
+			// Submit-time provider adjustments may have changed the original
+			// reservation. Preserve its settled hold and all frozen rates.
+			request.Billing.Price.Quota = retryTask.Quota
+		}
 		c.Set("async_media_billing", request.Billing)
+		if retryTask != nil {
+			c.Set("async_media_reference_retry_task", *retryTask)
+			c.Set("async_media_before_dispatch", func(info *relaycommon.RelayInfo) error {
+				var active model.Task
+				if err := model.DB.WithContext(ctx).Where("id = ? AND attempt_generation = ? AND status = ?", retryTask.ID, retryTask.AttemptGeneration, model.TaskStatusQueued).Take(&active).Error; err != nil {
+					return err
+				}
+				if active.Quota != retryTask.Quota || active.PrivateData.UpstreamTaskID != "" || !active.PrivateData.DurableBilling {
+					return errors.New("video reference recovery reservation changed")
+				}
+				return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()})
+			})
+			result, taskErr := relay.RelayTaskSubmit(c, info)
+			if taskErr != nil {
+				executionErr = fmt.Errorf("video recovery submission failed (HTTP %d, code %s)", taskErr.StatusCode, taskErr.Code)
+				return
+			}
+			if result != nil && result.Immediate != nil && result.Immediate.Status == model.TaskStatusFailure && result.UpstreamTaskID == "" && result.Immediate.Url == "" && result.Immediate.RemoteUrl == "" {
+				executionErr = &service.AsyncVideoReferenceRejectedError{Reason: service.VideoTaskFailureReason(result.Immediate.Reason)}
+				return
+			}
+			if result == nil || result.UpstreamTaskID == "" || result.Immediate != nil {
+				executionErr = errors.New("video recovery receipt could not be confirmed")
+				return
+			}
+			data := result.TaskData
+			if result.UpstreamAsync != nil {
+				data = result.UpstreamAsyncResponse
+			}
+			won, commitErr := model.CommitAsyncVideoReferenceSubmission(context.WithoutCancel(ctx), job, *retryTask, result.UpstreamTaskID, data, result.PluginState)
+			if commitErr != nil {
+				executionErr = commitErr
+			} else if !won {
+				executionErr = model.ErrImageConflict
+			}
+			return
+		}
 		c.Set("async_media_before_billing", func() error {
 			return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"billing_status": "reserving"})
 		})

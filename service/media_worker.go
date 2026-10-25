@@ -27,15 +27,19 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
-	Body        []byte
-	ContentType string
-	ClientIP    string
-	Operation   string
-	Channel     model.Channel
-	Execution   *model.TaskExecutionSnapshot
-	Billing     MediaBillingSnapshot
-	PluginHash  string
-	Details     *AsyncVideoRequestDetails `json:"request_details,omitempty"`
+	Body                      []byte
+	ContentType               string
+	ClientIP                  string
+	Operation                 string
+	Channel                   model.Channel
+	Execution                 *model.TaskExecutionSnapshot
+	Billing                   MediaBillingSnapshot
+	PluginHash                string
+	Details                   *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
+	ReferenceInputs           []AsyncVideoReferenceInput `json:"reference_inputs,omitempty"`
+	ReferenceRecoveryVersion  int                        `json:"reference_recovery_version,omitempty"`
+	ReferenceRecoveryDeadline int64                      `json:"reference_recovery_deadline,omitempty"`
+	ReferenceURLExpiresAt     int64                      `json:"reference_url_expires_at,omitempty"`
 }
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
@@ -106,6 +110,9 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			}
 			if err := CleanupMediaObjects(ctx); err != nil {
 				common.SysError("media cleanup: " + err.Error())
+			}
+			if err := CleanupMediaInputs(ctx, time.Now().Unix()); err != nil {
+				common.SysError("media input cleanup: " + err.Error())
 			}
 			if _, err := DispatchAsyncMediaJobs(ctx, cfg); err != nil {
 				common.SysError("media queue: " + err.Error())
@@ -182,9 +189,15 @@ func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.
 func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg MediaRuntimeConfig) error {
 	if job.Status == "failed" || job.Status == "expired" || job.Status == "execution_unknown" {
 		if job.Status == "execution_unknown" {
+			if job.ReferenceRecoveryStage == "unknown" {
+				return nil
+			}
 			return model.UpdateAsyncMediaJob(parent, job, map[string]any{"status": "failed", "next_attempt_at": 0})
 		}
 		return nil
+	}
+	if job.ReferenceRecoveryStage == "prepare" || job.ReferenceRecoveryStage == "submit" || job.ReferenceRecoveryStage == "dispatched" || job.ReferenceRecoveryStage == "unknown" || job.ReferenceRecoveryStage == "refund" {
+		return ProcessAsyncVideoReferenceRecovery(parent, job, cfg.withWorkerDefaults())
 	}
 	cfg = cfg.withWorkerDefaults()
 	timeout := cfg.DownloadTimeout
@@ -204,7 +217,17 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		}
 		if err := model.UpdateAsyncMediaJob(context.WithoutCancel(parent), job, updates); err != nil {
 			common.SysError("media lease confirmation: " + err.Error())
-		} else if updates["status"] == "succeeded" || updates["status"] == "expired" {
+			return
+		}
+		if updates["status"] == "succeeded" || updates["status"] == "failed" || updates["status"] == "submitted" {
+			var task model.Task
+			if err := model.DB.WithContext(context.WithoutCancel(parent)).Where("task_id = ? AND attempt_generation = ?", job.TaskId, job.AttemptGeneration).Take(&task).Error; err == nil && (task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure) {
+				if err := RetireMediaInputObjects(context.WithoutCancel(parent), &task); err != nil {
+					common.SysError("media input retirement: " + err.Error())
+				}
+			}
+		}
+		if updates["status"] == "succeeded" || updates["status"] == "expired" {
 			var current model.AsyncMediaJob
 			cleanupCtx := context.WithoutCancel(parent)
 			if err := model.DB.WithContext(cleanupCtx).Where("id = ?", job.ID).Take(&current).Error; err == nil {
@@ -226,7 +249,13 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return err
 	}
 	if err == nil {
-		updates["status"], updates["quota"], updates["request_cipher"] = "submitted", task.Quota, retainAsyncVideoRequestDetails(job)
+		retentionJob := job
+		if task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusSuccess {
+			// Confirmed generation completion releases the replay envelope even
+			// while generated output still waits for the storage worker.
+			retentionJob.Status = "failed"
+		}
+		updates["status"], updates["quota"], updates["request_cipher"] = "submitted", task.Quota, retainAsyncVideoRequestDetails(retentionJob)
 		if job.BillingStatus != "failed" {
 			updates["billing_status"] = "reserved"
 			if task.Status == model.TaskStatusSuccess {
@@ -266,7 +295,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			fallbackAllowed := errors.Is(err, ErrAsyncMediaDownloadTransport) || errors.As(err, &storageErr)
 			if fallbackAllowed && job.StorageRetries >= cfg.StorageRetries && PublicUpstreamAsyncVideoResultURL(&task) != "" {
 				if task.PrivateData.ResultURL != previousResultURL {
-					updated := model.DB.WithContext(ctx).Model(&model.Task{}).Where("id = ? AND status = ?", task.ID, model.TaskStatusSuccess).Update("private_data", task.PrivateData)
+					updated := model.DB.WithContext(ctx).Model(&model.Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, model.TaskStatusSuccess, task.AttemptGeneration).Update("private_data", task.PrivateData)
 					if updated.Error != nil || updated.RowsAffected != 1 {
 						return errors.New("updated upstream video result could not be saved")
 					}

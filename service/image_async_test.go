@@ -453,6 +453,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 		otherKey                bool
 		earlierAlternateTimeout bool
 		failureMessage          string
+		gemini                  bool
 	}{
 		{name: "single pool switches channel with original URL", channelMode: "passthrough"},
 		{name: "mixed pool switches channel with original URL", mixed: true, channelMode: "passthrough"},
@@ -467,14 +468,32 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 		{name: "unreachable reference waits before retrying the same account locally", sameChannel: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
 		{name: "provider download timeout switches channel with original URL", failureMessage: `Error while downloading https://***.com/***/***/*** Get "https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout`},
 		{name: "provider download timeout retries another key with local input", sameChannel: true, otherKey: true, failureMessage: `Error while downloading https://***.com/***/***/*** Get "https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout`},
+		{name: "Gemini wrapped download timeout switches channel with original URL", gemini: true},
+		{name: "Gemini wrapped download timeout uses another key with local input", gemini: true, sameChannel: true, otherKey: true},
+		{name: "Gemini wrapped download timeout waits before retrying the same account locally", gemini: true, sameChannel: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
 			cfg.CircuitBreaker = false
+			if tc.gemini {
+				cfg.GeminiReferenceMode = "passthrough_fallback_local"
+			}
 			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
 			request.Kind = "image_to_image"
 			request.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://reference.example/input.png"}}
+			if tc.gemini {
+				request.Platform, request.Provider, request.PolicyPlatform = "gemini", "gemini", "gemini"
+				task.Platform, task.Provider, task.ExecutionProtocol = "gemini", "gemini", "gemini_native"
+				ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+					return dto.ImageCapability{Provider: "gemini", Protocol: "gemini_native", Generate: true, Edit: true}
+				}
+				require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Updates(map[string]any{"policy_key": ImageIdentityHash(task.Group, "gemini"), "platform": "gemini"}).Error)
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"platform": task.Platform, "provider": task.Provider, "execution_protocol": task.ExecutionProtocol}).Error)
+				outputEntities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+				require.NoError(t, db.AutoMigrate(outputEntities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(outputEntities...)) })
+			}
 			target := alternate
 			if tc.sameChannel {
 				target = model.Channel{}
@@ -505,6 +524,9 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			task.DispatchedAt, task.UpstreamTaskId = time.Now().Unix(), "failed-reference-job"
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
 			initialHistory := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote"}}
+			if tc.gemini {
+				task.DispatchedAt, task.UpstreamTaskId, initialHistory = 0, "", nil
+			}
 			if tc.earlierAlternateTimeout {
 				initialHistory = append([]ImageChannelAttempt{{ChannelId: alternate.Id, KeyFingerprint: ImageIdentityHash("image-account", strconv.Itoa(alternate.Id), alternate.Key), Dispatched: true, FinishedAt: task.DispatchedAt - 1, ReferenceFailure: true, Code: 602, ErrorMessage: "reference material download timeout", TransportUsed: "remote"}}, initialHistory...)
 				task.ReferenceRetryCount, task.RetryCount = 1, 1
@@ -515,9 +537,22 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "attempts": task.Attempts, "upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt, "reference_retry_count": task.ReferenceRetryCount, "retry_count": task.RetryCount}).Error)
 			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
 			calls := 0
+			rejectedKey := "upstream-key-a"
+			completedAttempts := max(1, len(initialHistory))
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, config ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
 				calls++
 				if calls == 1 {
+					if tc.gemini {
+						rejectedKey = channel.Key
+						fingerprint = ImageIdentityHash("image-account", strconv.Itoa(channel.Id), rejectedKey)
+						require.Empty(t, current.UpstreamTaskId)
+						require.NotNil(t, outbound.ReferenceTransportUsed)
+						*outbound.ReferenceTransportUsed = "remote"
+						require.NoError(t, beforeInvoke())
+						failure := ClassifyGeminiAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"error":{"code":400,"type":"upstream_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`))})
+						failure.ReferenceTransportFallback = ShouldFallbackGeminiReferenceTransport(failure)
+						return nil, model.AsyncImageBill{}, failure
+					}
 					assert.Equal(t, "failed-reference-job", current.UpstreamTaskId)
 					assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
 					message := tc.failureMessage
@@ -531,7 +566,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 				}
 				assert.Equal(t, target.Id, channel.Id)
 				if tc.otherKey {
-					assert.Equal(t, "next-account", channel.Key)
+					assert.NotEqual(t, rejectedKey, channel.Key)
 				}
 				wantMode := "passthrough"
 				if tc.sameChannel {
@@ -543,13 +578,16 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 				assert.Equal(t, request.MixedRouting, outbound.MixedRouting)
 				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
 				require.NoError(t, beforeInvoke())
+				if tc.gemini {
+					return &AsyncImageOutput{Images: []ImageBytes{asyncImageBytesFixture(t)}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "reference-retry-success-bill", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+				}
 				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", task.TaskId).Update("upstream_task_id", "replacement-job").Error)
 				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
 			}
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			require.Equal(t, model.ImageTaskQueued, task.Status)
-			assert.Equal(t, len(initialHistory), task.ReferenceRetryCount)
+			assert.Equal(t, completedAttempts, task.ReferenceRetryCount)
 			assert.Empty(t, task.UpstreamTaskId)
 			cooling, err := common.RDB.TTL(t.Context(), ImageAccountCooldownKey(fingerprint)).Result()
 			require.NoError(t, err)
@@ -561,7 +599,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 				assert.Equal(t, 1, calls, "a cooling account must not submit another upstream request")
-				assert.Equal(t, len(initialHistory), task.ReferenceRetryCount, "cooldown waiting does not spend a reference retry")
+				assert.Equal(t, completedAttempts, task.ReferenceRetryCount, "cooldown waiting does not spend a reference retry")
 				assert.Equal(t, model.ImageTaskQueued, task.Status)
 				require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(fingerprint)).Err())
 			}
@@ -571,11 +609,21 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			assert.Equal(t, 2, calls)
-			assert.Equal(t, "replacement-job", task.UpstreamTaskId)
+			if tc.gemini {
+				assert.Empty(t, task.UpstreamTaskId)
+				assert.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+			} else {
+				assert.Equal(t, "replacement-job", task.UpstreamTaskId)
+			}
 			var history []ImageChannelAttempt
 			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
-			require.Len(t, history, len(initialHistory)+1)
-			assert.Equal(t, "failed-reference-job", history[len(history)-2].UpstreamTaskID)
+			require.Len(t, history, completedAttempts+1)
+			if tc.gemini {
+				assert.Empty(t, history[len(history)-2].UpstreamTaskID)
+				assert.Equal(t, 602, history[len(history)-2].Code)
+			} else {
+				assert.Equal(t, "failed-reference-job", history[len(history)-2].UpstreamTaskID)
+			}
 			assert.Equal(t, tc.sameChannel, history[len(history)-1].ReferenceFallback)
 			if tc.sameChannel {
 				assert.Equal(t, "local", history[len(history)-1].ReferenceMode)
@@ -587,7 +635,11 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			assert.Equal(t, tc.channelMode, persistedChannel.GetSetting().ImageReferenceTransportMode, "retry must not change administrator settings")
 			var bill model.AsyncImageBill
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
-			assert.Equal(t, "reserved", bill.Status)
+			if tc.gemini {
+				assert.Equal(t, "fixed", bill.Status, "successful native output prepares the final bill")
+			} else {
+				assert.Equal(t, "reserved", bill.Status)
+			}
 			assert.Equal(t, 100, bill.ReservedQuota, "account switching reuses the original hold")
 		})
 	}
@@ -2136,6 +2188,8 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		mode       string
 		reference  bool
 		byteLimit  bool
+		errorType  string
+		spareKey   bool
 		wantCalls  int
 		wantRetry  int
 		wantError  string
@@ -2160,6 +2214,9 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		{name: "Gemini reference one account switch succeeds", mode: "one account switch", reference: true, wantCalls: 2, wantRetry: 1},
 		{name: "Gemini reference unknown execution is never resubmitted", mode: "unknown", reference: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "execution_unknown"},
 		{name: "Gemini reference byte limit switches account", reference: true, byteLimit: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference byte limit upstream wrapper switches channel", reference: true, byteLimit: true, errorType: "upstream_error", wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference byte limit prefers another channel over spare key", reference: true, byteLimit: true, spareKey: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini reference byte limit uses spare key without another channel", mode: "no alternate", reference: true, byteLimit: true, spareKey: true, wantCalls: 2, wantRetry: 1},
 		{name: "Gemini reference byte limit excludes copied credentials", mode: "copied credential", reference: true, byteLimit: true, wantCalls: 2, wantRetry: 1},
 		{name: "Gemini reference byte limit has no alternate account", mode: "no alternate", reference: true, byteLimit: true, wantCalls: 1, wantRetry: 1, wantError: "image_reference_accounts_exhausted", wantReason: "no_compatible_account"},
 		{name: "Gemini reference byte limit capacity budget is enforced", mode: "no capacity retry", reference: true, byteLimit: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "compatibility_retry_budget_exhausted"},
@@ -2191,6 +2248,12 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
 			primaryID, startedAt := task.ChannelId, task.StartedAt
+			if tc.spareKey {
+				var primary model.Channel
+				require.NoError(t, db.First(&primary, primaryID).Error)
+				primary.Key, primary.ChannelInfo.IsMultiKey = "upstream-key-a\nupstream-key-c", true
+				require.NoError(t, db.Model(&primary).Updates(map[string]any{"key": primary.Key, "channel_info": primary.ChannelInfo}).Error)
+			}
 			switch tc.mode {
 			case "copied credential":
 				priority := int64(90)
@@ -2228,7 +2291,7 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 			case "safety":
 				code, message = "content_policy_violation", "Upstream safety review rejected the image"
 			}
-			body, err := common.Marshal(map[string]any{"error": map[string]string{"code": code, "message": message}})
+			body, err := common.Marshal(map[string]any{"error": map[string]string{"code": code, "message": message, "type": tc.errorType}})
 			require.NoError(t, err)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -2264,7 +2327,11 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 					}
 					return nil, model.AsyncImageBill{}, failure
 				}
-				assert.Equal(t, alternate.Id, channel.Id)
+				if tc.spareKey && tc.mode == "no alternate" {
+					assert.Equal(t, primaryID, channel.Id)
+				} else {
+					assert.Equal(t, alternate.Id, channel.Id)
+				}
 				return &AsyncImageOutput{Images: []ImageBytes{asyncImageBytesFixture(t)}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "compatible-success-bill", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
 			}
 			for range 3 {
@@ -2779,6 +2846,8 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	rateLimitedB := ImageChannelAttempt{ChannelId: 20, KeyFingerprint: "account-b", Dispatched: true, FinishedAt: 1, Code: 605}
 	incompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}
 	referenceIncompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "Provider API error: Only a specific YouTube video URL is supported (request id: old-attempt)"}
+	referenceSizeA := referenceIncompatibleA
+	referenceSizeA.Code, referenceSizeA.ErrorMessage = 603, "reference image exceeds limit: 20 MB limit exceeded"
 	for _, tc := range []struct {
 		name        string
 		history     []ImageChannelAttempt
@@ -2801,6 +2870,13 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		{name: "accepted jobs cannot authorize size failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTaskID: "accepted-job"}}, platform: "openai"},
 		{name: "unfinished rejection cannot exclude an account", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai"},
 		{name: "historical reference rejection excludes its credential", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "confirmed reference size rejection prefers another channel", history: []ImageChannelAttempt{referenceSizeA}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{Avoid: "account-a", AvoidChannel: 10, IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "reference size channel preference obeys switch budget", history: []ImageChannelAttempt{referenceSizeA}, platform: "gemini", want: ImageAccountRouting{Avoid: "account-a", AvoidChannel: 10, IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
+		{name: "legacy confirmed reference size rejection prefers another channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{AvoidChannel: 10, IncompatibleChannels: []int{10}}},
+		{name: "unfinished reference size rejection cannot prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "undispatched reference size rejection cannot prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "accepted reference size rejection cannot prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
+		{name: "unconfirmed reference size category cannot exclude accounts or prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 604, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
 		{name: "Gemini zero switches stops reference failover", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
 		{name: "legacy reference rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
 		{name: "accepted jobs cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
@@ -3099,6 +3175,13 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
 		{name: "reference image total download budget exceeded", body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg?token=private-key (budgetMs=35000; reason=timeout)"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download exceeded its total time budget", fallback: true},
 		{name: "provider reference byte limit compatibility", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference byte limit upstream error type", body: `{"error":{"code":400,"type":"upstream_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference byte limit gateway error type", body: `{"error":{"code":400,"type":"new_api_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference byte limit api error type", body: `{"error":{"code":400,"type":"api_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference byte limit bad request error type", body: `{"error":{"code":400,"type":"bad_request_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
+		{name: "reference byte limit authentication type stays terminal", body: `{"error":{"code":400,"type":"authentication_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference byte limit unknown execution type stays terminal", body: `{"error":{"code":400,"type":"submission_unknown","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
+		{name: "reference byte limit wrapper cannot hide accepted job", body: `{"error":{"code":400,"type":"upstream_error","message":"reference image exceeds limit: 20 MB limit exceeded","metadata":{"operation_id":"op-123"}}}`, expectedCode: 604, providerCode: "400", message: "20 MB"},
 		{name: "generic reference byte limit stays terminal", body: `{"error":{"code":400,"message":"reference image size exceeds 20MB"}}`, expectedCode: 604, providerCode: "400", message: "20MB"},
 		{name: "reference byte limit quoted as input is not compatibility", body: `{"error":{"code":400,"message":"Invalid input: prompt contains reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "prompt contains"},
 		{name: "reference byte limit safety remains terminal", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded; safety review failed"}}`, expectedCode: 601, providerCode: "400", message: "safety"},
@@ -3107,6 +3190,10 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "reference byte limit forbidden code cannot switch", body: `{"error":{"code":403,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "403", message: "20 MB"},
 		{name: "reference byte limit server error is not rejection", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 604, providerCode: "400", message: "20 MB", httpStatus: http.StatusBadGateway},
 		{name: "provider reference download dial timeout", body: `{"error":{"code":400,"message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
+		{name: "download timeout with upstream diagnostic type", body: `{"error":{"code":400,"type":"upstream_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
+		{name: "download timeout with gateway diagnostic type", body: `{"error":{"code":400,"type":"new_api_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
+		{name: "wrapped download read failure cannot authorize retry", body: `{"error":{"code":400,"type":"upstream_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading", readError: true},
+		{name: "wrapped download receipt cannot authorize retry", body: `{"error":{"code":400,"type":"upstream_error","message":"Error while downloading https://***.com/***/***/*** Get \"https://***.com/***/***/*** dial tcp ***.***.***.***:443: i/o timeout","metadata":{"operation_id":"op-123"}}}`, expectedCode: 610, providerCode: "400", message: "Error while downloading"},
 		{name: "raw provider reference download dial timeout", body: `{"error":{"code":400,"message":"Error while downloading https://reference.example/image Get \"https://reference.example/image\": dial tcp 203.0.113.1:443: i/o timeout"}}`, expectedCode: 602, providerCode: "400", message: "Error while downloading", fallback: true},
 		{name: "provider download policy rejection stays terminal", body: `{"error":{"code":400,"message":"Error while downloading https://reference.example/image Get \"https://reference.example/image\": dial tcp 203.0.113.1:443: i/o timeout; safety review failed"}}`, expectedCode: 601, providerCode: "400", message: "safety"},
 		{name: "unrelated downloading timeout stays unclassified", body: `{"error":{"code":400,"message":"Error while downloading webhook: i/o timeout"}}`, expectedCode: 610, providerCode: "400", message: "webhook"},
@@ -3979,6 +4066,29 @@ func TestVideoCapabilityNarrowingAndRequestValidation(t *testing.T) {
 	request["reference_images"] = []any{"https://cdn.example/one.png"}
 	request["reference_videos"] = []any{"https://cdn.example/video.mp4"}
 	assert.ErrorContains(t, ValidateVideoProfileRequest(narrowed, "reference_to_video", request, nil), "not enabled")
+	for _, tc := range []struct {
+		name, action, wantError string
+		references              []any
+	}{
+		{name: "canonical image references", action: "reference_to_video", references: []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/one.png"}}},
+		{name: "canonical references enforce source policy", action: "reference_to_video", references: []any{map[string]any{"type": "image", "role": "reference_image", "source": "asset://one"}}, wantError: "source"},
+		{name: "canonical references enforce narrowed limit", action: "reference_to_video", references: []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/one.png"}, map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/two.png"}, map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/three.png"}, map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/four.png"}}, wantError: "limit"},
+		{name: "canonical references enforce media kind policy", action: "reference_to_video", references: []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/one.png"}, map[string]any{"type": "video", "role": "reference_video", "source": "https://cdn.example/video.mp4"}}, wantError: "not enabled"},
+		{name: "canonical first frame satisfies required image", action: "image_to_video", references: []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/first.png"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := narrowed
+			if tc.action == "image_to_video" {
+				selected = profile
+			}
+			err := ValidateVideoProfileRequest(selected, tc.action, map[string]any{"references": tc.references}, nil)
+			if tc.wantError != "" {
+				assert.ErrorContains(t, err, tc.wantError)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 
 	legacyNative := map[string]any{"metadata": map[string]any{"content": []any{map[string]any{
 		"type": "image_url", "image_url": map[string]any{"url": "https://cdn.example/legacy.png"},

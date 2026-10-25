@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,9 +20,12 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -2112,5 +2117,220 @@ func TestAsyncVideoRequestDetails(t *testing.T) {
 	})
 	for _, request := range []service.AsyncVideoRequest{{Body: []byte(`{"model":`), ContentType: "application/json"}, {Body: []byte(`{}`), ContentType: "invalid"}} {
 		assert.Nil(t, request.RequestDetails())
+	}
+}
+
+func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name, changed, wantError string
+	}{
+		{name: "exhausted token reuses its original reservation"},
+		{name: "submit adjustment retains the actual original reservation", changed: "adjusted hold"},
+		{name: "current user group restrictions apply", changed: "group", wantError: "group permission changed"},
+		{name: "disabled token cannot resubmit", changed: "disabled token", wantError: "Token is unavailable"},
+		{name: "expired token cannot resubmit", changed: "expired token", wantError: "Token is unavailable"},
+		{name: "disabled owner cannot resubmit", changed: "disabled owner", wantError: "owner is unavailable"},
+		{name: "client IP restriction remains active", changed: "IP", wantError: "outside Token permissions"},
+		{name: "removed model permission cannot resubmit", changed: "model", wantError: "model permission changed"},
+		{name: "removed original account cannot resubmit", changed: "account", wantError: "account is unavailable"},
+		{name: "disabled original account cannot resubmit", changed: "disabled account", wantError: "account is unavailable"},
+		{name: "disabled channel cannot resubmit", changed: "channel", wantError: "channel is unavailable"},
+		{name: "changed plugin cannot resubmit", changed: "plugin", wantError: "provider changed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, token := setupResponsesWSRequestTest(t)
+			db := model.DB
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+			require.NoError(t, db.Model(user).Updates(map[string]any{"group": "vip", "quota": 900, "used_quota": 100, "request_count": 1}).Error)
+			require.NoError(t, db.Model(token).Updates(map[string]any{"group": "default", "status": common.TokenStatusExhausted, "remain_quota": 0, "used_quota": 100}).Error)
+			require.NoError(t, db.Take(user, user.Id).Error)
+			require.NoError(t, db.Take(token, token.Id).Error)
+			groups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+			previousGroups := groups.ReadAll()
+			t.Cleanup(func() { groups.Clear(); groups.AddAll(previousGroups) })
+			groups.Set("vip", map[string]string{})
+
+			source, err := builtinplugins.Source("drama")
+			require.NoError(t, err)
+			previousRegistry := jsplugin.DefaultRegistry
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+			plugin, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "drama"})
+			require.NoError(t, err)
+			var submissions atomic.Int32
+			posted := make(chan map[string]any, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				submissions.Add(1)
+				assert.Equal(t, "/v1/videos", r.URL.Path)
+				assert.Equal(t, "Bearer original-upstream-key", r.Header.Get("Authorization"))
+				var body map[string]any
+				if err := common.DecodeJson(r.Body, &body); !assert.NoError(t, err) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				posted <- body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"replacement-native-job","status":"queued"}`))
+			}))
+			t.Cleanup(upstream.Close)
+			setting := `{"task_plugin_key":"drama"}`
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "original-upstream-key", BaseURL: &upstream.URL, Models: "seedance2.5-E", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting, UsedQuota: 100}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: "seedance2.5-E", Enabled: true}).Error)
+			now := time.Now().Unix()
+			job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: fmt.Sprintf("reference-retry-%d", user.Id), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: "drama", Model: "seedance2.5-E", Group: "default", Status: "queued", BillingStatus: "reserved", StorageStatus: "pending", Quota: 100, AttemptGeneration: 1, ReferenceRetryCount: 1, ReferenceRecoveryStage: "submit", LeaseToken: "reference-recovery-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
+			require.NoError(t, db.Create(&job).Error)
+			execution := &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version, APIVersion: 1}}
+			task := model.Task{TaskID: job.TaskId, Platform: "drama", UserId: user.Id, ChannelId: channel.Id, Group: "default", Status: model.TaskStatusQueued, Quota: 100, AttemptGeneration: 1, SubmitTime: now, Properties: model.Properties{OriginModelName: job.Model, UpstreamModelName: job.Model}, PrivateData: model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, TokenId: token.Id, Key: channel.Key, Execution: execution}}
+			require.NoError(t, db.Create(&task).Error)
+			references := []any{map[string]any{"type": "audio", "role": "reference", "source": "https://gateway.example/audio.mp3"}, map[string]any{"type": "image", "role": "reference", "source": "https://gateway.example/image.png"}, map[string]any{"type": "video", "role": "reference", "source": "https://gateway.example/video.mp4"}}
+			body, err := common.Marshal(map[string]any{"model": job.Model, "prompt": "keep media order", "seconds": 8, "resolution": "720p", "references": references})
+			require.NoError(t, err)
+			request := service.AsyncVideoRequest{Body: body, ContentType: "application/json", ClientIP: "203.0.113.10", Channel: channel, Execution: execution, PluginHash: plugin.Engine.SourceFingerprint(), Billing: service.MediaBillingSnapshot{Price: types.PriceData{Quota: 100, QuotaToPreConsume: 100}}}
+			switch tc.changed {
+			case "adjusted hold":
+				request.Billing.Price.Quota, request.Billing.Price.QuotaToPreConsume = 80, 80
+			case "group":
+				groups.Set("vip", map[string]string{"-:default": "restricted"})
+			case "disabled token":
+				require.NoError(t, db.Model(token).Update("status", common.TokenStatusDisabled).Error)
+			case "expired token":
+				require.NoError(t, db.Model(token).Update("expired_time", now-1).Error)
+			case "disabled owner":
+				require.NoError(t, db.Model(user).Update("status", common.UserStatusDisabled).Error)
+			case "IP":
+				require.NoError(t, db.Model(token).Update("allow_ips", "198.51.100.0/24").Error)
+			case "model":
+				require.NoError(t, db.Model(token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "other-video-model"}).Error)
+			case "account":
+				require.NoError(t, db.Model(&channel).Update("key", "different-upstream-key").Error)
+			case "disabled account":
+				info := model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}
+				require.NoError(t, db.Model(&channel).Update("channel_info", info).Error)
+			case "channel":
+				require.NoError(t, db.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "plugin":
+				request.PluginHash = "different-plugin-fingerprint"
+			}
+			err = ExecuteAsyncVideoReferenceRetry(t.Context(), job, task, request)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				assert.Zero(t, submissions.Load(), "rejected recovery must not reach upstream")
+			} else {
+				require.NoError(t, err)
+				assert.EqualValues(t, 1, submissions.Load())
+				assert.Equal(t, references, (<-posted)["references"], "retry changes no material position or role")
+				require.Error(t, ExecuteAsyncVideoReferenceRetry(t.Context(), job, task, request), "the stale queued attempt must not dispatch twice")
+				assert.EqualValues(t, 1, submissions.Load())
+			}
+			var storedTask model.Task
+			require.NoError(t, db.Take(&storedTask, task.ID).Error)
+			assert.Equal(t, task.TaskID, storedTask.TaskID)
+			assert.Equal(t, 100, storedTask.Quota)
+			if tc.wantError == "" {
+				assert.Equal(t, "replacement-native-job", storedTask.PrivateData.UpstreamTaskID)
+				assert.EqualValues(t, model.TaskStatusSubmitted, storedTask.Status)
+			}
+			var tasks, logs int64
+			require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", task.TaskID).Count(&tasks).Error)
+			require.NoError(t, db.Model(&model.Log{}).Where("user_id = ?", user.Id).Count(&logs).Error)
+			assert.EqualValues(t, 1, tasks, "replacement native receipt belongs to the original task")
+			assert.Zero(t, logs, "recovery must not emit a second consume or refund")
+			require.NoError(t, db.Take(user, user.Id).Error)
+			require.NoError(t, db.Take(token, token.Id).Error)
+			require.NoError(t, db.Take(&channel, channel.Id).Error)
+			assert.Equal(t, 900, user.Quota)
+			assert.Equal(t, 100, user.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			assert.Zero(t, token.RemainQuota)
+			assert.Equal(t, 100, token.UsedQuota)
+			assert.EqualValues(t, 100, channel.UsedQuota)
+		})
+	}
+}
+
+func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
+	for _, tc := range []struct {
+		name, stage, body string
+		admin, expired    bool
+		want              int
+	}{
+		{name: "administrator confirms unknown submission", stage: "unknown", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusOK},
+		{name: "administrator may reconcile an expired unknown submission", stage: "unknown", admin: true, expired: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusOK},
+		{name: "administrator must confirm upstream verification", stage: "unknown", admin: true, body: `{}`, want: http.StatusConflict},
+		{name: "owner cannot reconcile unknown submission", stage: "unknown", body: `{"confirm_upstream_checked":true}`, want: http.StatusForbidden},
+		{name: "administrator cannot terminate an ordinary queued recovery", stage: "prepare", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
+		{name: "owner cannot terminate an ordinary queued recovery", stage: "prepare", body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, token := setupResponsesWSRequestTest(t)
+			db := model.DB
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.AsyncMediaJob{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
+			require.NoError(t, db.Model(user).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
+			require.NoError(t, db.Model(token).Updates(map[string]any{"remain_quota": 0, "used_quota": 100}).Error)
+			channel := model.Channel{Key: "original-upstream-key", UsedQuota: 100}
+			require.NoError(t, db.Create(&channel).Error)
+			now := time.Now().Unix()
+			job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: fmt.Sprintf("reference-reconcile-%d", user.Id), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: "drama", Model: "seedance2.5-E", Group: "default", Status: "execution_unknown", BillingStatus: "unknown", StorageStatus: "pending", Quota: 100, AttemptGeneration: 1, ReferenceRetryCount: 1, ReferenceRecoveryStage: tc.stage, RequestCipher: []byte("encrypted-original-request"), CreatedAt: now, ExpiresAt: now + 86400, ErrorMessage: "Upstream recovery submission could not be confirmed"}
+			task := model.Task{TaskID: job.TaskId, Platform: "drama", UserId: user.Id, ChannelId: channel.Id, Group: "default", Status: model.TaskStatusUnknown, Quota: 100, AttemptGeneration: 1, SubmitTime: now, PrivateData: model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, TokenId: token.Id, BillingSource: "wallet", Key: channel.Key}}
+			if tc.expired {
+				job.ExpiresAt = now - 1
+			}
+			if tc.stage == "prepare" {
+				job.Status, job.BillingStatus, task.Status = "queued", "reserved", model.TaskStatusQueued
+			}
+			require.NoError(t, db.Create(&job).Error)
+			require.NoError(t, db.Create(&task).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("id", user.Id)
+			c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+job.TaskId+"/terminate", strings.NewReader(tc.body))
+			ManageMediaTask(c, tc.admin, "terminate")
+			require.Equal(t, tc.want, recorder.Code, recorder.Body.String())
+			var storedTask model.Task
+			var storedJob model.AsyncMediaJob
+			require.NoError(t, db.Take(&storedTask, task.ID).Error)
+			require.NoError(t, db.Take(&storedJob, job.ID).Error)
+			wallet, quota, used, refunds := 900, 100, 100, int64(0)
+			if tc.want == http.StatusOK {
+				wallet, quota, used, refunds = 1000, 0, 0, 1
+				assert.EqualValues(t, model.TaskStatusFailure, storedTask.Status)
+				assert.Equal(t, "failed", storedJob.Status)
+				assert.Equal(t, "refunded", storedJob.BillingStatus)
+				assert.Equal(t, "complete", storedJob.ReferenceRecoveryStage)
+				assert.Empty(t, storedJob.RequestCipher)
+				repeated := httptest.NewRecorder()
+				repeatContext, _ := gin.CreateTestContext(repeated)
+				repeatContext.Set("id", user.Id)
+				repeatContext.Params = c.Params
+				repeatContext.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(tc.body))
+				ManageMediaTask(repeatContext, tc.admin, "terminate")
+				assert.Equal(t, http.StatusConflict, repeated.Code, "confirmation cannot refund a second time")
+			} else {
+				assert.Equal(t, task.Status, storedTask.Status)
+				assert.Equal(t, job.Status, storedJob.Status)
+				assert.Equal(t, job.BillingStatus, storedJob.BillingStatus)
+				assert.Equal(t, job.RequestCipher, storedJob.RequestCipher)
+			}
+			assert.Equal(t, quota, storedTask.Quota)
+			assert.Equal(t, quota, storedJob.Quota)
+			require.NoError(t, db.Take(user, user.Id).Error)
+			require.NoError(t, db.Take(token, token.Id).Error)
+			require.NoError(t, db.Take(&channel, channel.Id).Error)
+			assert.Equal(t, wallet, user.Quota)
+			assert.Equal(t, wallet-900, token.RemainQuota)
+			assert.Equal(t, used, user.UsedQuota)
+			assert.Equal(t, used, token.UsedQuota)
+			assert.EqualValues(t, used, channel.UsedQuota)
+			assert.Equal(t, 1, user.RequestCount)
+			var logs []model.Log
+			require.NoError(t, db.Where("user_id = ?", user.Id).Find(&logs).Error)
+			require.Len(t, logs, int(refunds))
+			if len(logs) > 0 {
+				assert.Equal(t, model.LogTypeRefund, logs[0].Type)
+				assert.Equal(t, 100, logs[0].Quota)
+			}
+		})
 	}
 }

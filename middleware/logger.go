@@ -29,9 +29,9 @@ func SetUpLogger(server *gin.Engine) {
 			tag = "web"
 		}
 		path := param.Path
-		// Callbacks and image reference URLs carry credentials in the query string.
+		// Callbacks and reference-media URLs carry credentials in the query string.
 		// Redact the log value only; the handler still needs the original query.
-		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(path, "/api/integrations/canvas/") || strings.HasPrefix(path, "/canvas/") || strings.HasPrefix(path, "/api/image-task-references/") {
+		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") || strings.HasPrefix(path, "/api/integrations/canvas/") || strings.HasPrefix(path, "/canvas/") || strings.HasPrefix(path, "/api/image-task-references/") || strings.HasPrefix(path, "/api/media-inputs/") {
 			path, _, _ = strings.Cut(path, "?")
 		}
 		// Stats never accept query credentials; avoid recording rejected keys.
