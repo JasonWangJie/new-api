@@ -484,7 +484,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if !attempt.Dispatched || attempt.FinishedAt == 0 || !attempt.ReferenceFailure {
 				continue
 			}
-			if IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage}) {
+			if isCompletedImageReferenceFetchFailure(attempt) {
 				// A different channel gets the original URL. Only retrying the
 				// same channel uses local input; the cumulative retry count must
 				// not enable local fallback on a newly selected channel.
@@ -666,7 +666,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
-		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown || IsImageReferenceDownloadTimeout(failure)) {
+		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 602 || failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
 			if task.UpstreamTaskId == "" || failure.UpstreamTerminal {
 				_ = RecordImageAccountCooldown(context.WithoutCancel(ctx), account.Fingerprint, failure, cfg)

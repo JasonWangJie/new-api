@@ -444,7 +444,7 @@ func TestMixedImageFailurePreservesAcceptanceBoundary(t *testing.T) {
 	}
 }
 
-func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T) {
+func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
 		mixed                   bool
@@ -452,6 +452,7 @@ func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T)
 		sameChannel             bool
 		otherKey                bool
 		earlierAlternateTimeout bool
+		failureMessage          string
 	}{
 		{name: "single pool switches channel with original URL", channelMode: "passthrough"},
 		{name: "mixed pool switches channel with original URL", mixed: true, channelMode: "passthrough"},
@@ -461,6 +462,9 @@ func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T)
 		{name: "mixed pool same channel uses local fallback", mixed: true, sameChannel: true},
 		{name: "same channel other key uses local fallback", sameChannel: true, otherKey: true},
 		{name: "returning to an earlier failed channel uses original URL", mixed: true, earlierAlternateTimeout: true},
+		{name: "unreachable reference switches channel with original URL", mixed: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
+		{name: "unreachable reference uses another key with local input", sameChannel: true, otherKey: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
+		{name: "unreachable reference waits before retrying the same account locally", sameChannel: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
@@ -514,8 +518,12 @@ func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T)
 				if calls == 1 {
 					assert.Equal(t, "failed-reference-job", current.UpstreamTaskId)
 					assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
-					failure := ClassifyAsyncImageFailure(errors.New("参考素材下载超时（建连>4s 或读取>15s）"), http.StatusOK)
-					failure.Message = "参考素材下载超时（建连>4s 或读取>15s）"
+					message := tc.failureMessage
+					if message == "" {
+						message = "参考素材下载超时（建连>4s 或读取>15s）"
+					}
+					failure := ClassifyAsyncImageFailure(errors.New(message), http.StatusOK)
+					failure.Message = message
 					failure.InternalCode, failure.UpstreamTerminal = "upstream_job_failed", true
 					return nil, model.AsyncImageBill{}, failure
 				}
@@ -545,6 +553,14 @@ func TestAsyncImageReferenceTimeoutSelectsTransportForChannelRetry(t *testing.T)
 			require.NoError(t, err)
 			assert.Positive(t, cooling)
 			if tc.sameChannel && !tc.otherKey {
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "reference-cooling-worker", cfg.WorkerLease)
+				require.NoError(t, err)
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, 1, calls, "a cooling account must not submit another upstream request")
+				assert.Equal(t, len(initialHistory), task.ReferenceRetryCount, "cooldown waiting does not spend a reference retry")
+				assert.Equal(t, model.ImageTaskQueued, task.Status)
 				require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(fingerprint)).Err())
 			}
 			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
@@ -2967,6 +2983,14 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 		{name: "unclassified input rejection cannot switch", status: 422, code: 610},
 		{name: "Chinese reference material timeout", status: 400, body: `{"error":{"message":"参考素材下载超时（建连>4s 或读取>15s）"}}`, code: 602, timeout: true},
 		{name: "English reference material timeout", status: 400, body: `{"error":{"message":"reference material download timed out"}}`, code: 602, timeout: true},
+		{name: "reference image total download budget exceeded", status: 400, body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg (budgetMs=35000; reason=timeout)"}}`, code: 602, timeout: true},
+		{name: "reference image total download budget without timeout suffix", status: 400, body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget"}}`, code: 602, timeout: true},
+		{name: "reference image download safety rejection stays terminal", status: 400, body: `{"error":{"message":"Reference image download exceeded its total time budget; safety review did not pass"}}`, code: 601},
+		{name: "reference image download byte limit stays terminal", status: 400, body: `{"error":{"message":"Reference image download failed: image size exceeds limit"}}`, code: 604},
+		{name: "reference material link is unreachable", status: 400, body: `{"error":{"message":"参考素材链接无法访问（域名/端口不可达）"}}`, code: 602},
+		{name: "reference image link is unreachable", status: 400, body: `{"error":{"message":"参考图链接无法访问（域名/端口不可达）"}}`, code: 602},
+		{name: "unrelated link error remains unclassified", status: 400, body: `{"error":{"message":"Webhook link is unreachable"}}`, code: 610},
+		{name: "reference link safety rejection stays terminal", status: 400, body: `{"error":{"message":"参考素材链接无法访问；内容安全审核失败"}}`, code: 601},
 		{name: "reference policy rejection remains terminal", status: 400, body: `{"error":{"message":"content_policy: reference material download timeout"}}`, code: 601},
 		{name: "reference byte limit remains terminal", status: 400, body: `{"error":{"message":"reference material download: image size exceeds limit"}}`, code: 604},
 	} {
@@ -3017,6 +3041,7 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "authorization is not reference compatibility", body: `{"error":{"code":403,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "403", message: "YouTube", httpStatus: http.StatusForbidden},
 		{name: "server failure is not reference rejection", body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 606, providerCode: "500", message: "YouTube", httpStatus: http.StatusInternalServerError},
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
+		{name: "reference image total download budget exceeded", body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg?token=private-key (budgetMs=35000; reason=timeout)"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download exceeded its total time budget", fallback: true},
 		{name: "reference fetch without Google envelope fields", body: `{"error":{"message":"reference image fetch: Get https://signed.example/image?token=private: i/o timeout"}}`, expectedCode: 602, message: "reference image fetch", fallback: true},
 		{name: "reference download proxy failure", body: `{"error":{"code":400,"message":"Proxy error: Reference image download failed; direct=timeout; proxy=502"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download failed", fallback: true},
 		{name: "domestic reference relay failure", body: `{"error":{"code":400,"message":"参考图 #1 国内下载中转失败"}}`, expectedCode: 602, providerCode: "400", message: "国内下载中转失败", fallback: true},
@@ -3206,8 +3231,10 @@ func TestGeminiAsyncImageReferenceFailureSchedulesSingleLocalFallback(t *testing
 				ProviderStatus: "INVALID_ARGUMENT",
 			}
 			if code == 602 {
-				failure.ProviderStatus = ""
-				failure.Message = "reference image fetch: i/o timeout"
+				failure = ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg (budgetMs=35000; reason=timeout)"}}`)),
+				})
 			}
 			failure.ReferenceTransportFallback = ShouldFallbackGeminiReferenceTransport(failure)
 			require.True(t, failure.ReferenceTransportFallback)

@@ -73,7 +73,7 @@ func IsImageReferenceDownloadTimeout(failure *AsyncImageFailure) bool {
 		return false
 	}
 	message := strings.ToLower(failure.Message)
-	return strings.Contains(message, "timeout") || strings.Contains(message, "timed out") || strings.Contains(message, "deadline exceeded") || strings.Contains(message, "超时")
+	return strings.Contains(message, "timeout") || strings.Contains(message, "timed out") || strings.Contains(message, "deadline exceeded") || strings.Contains(message, "exceeded its total time budget") || strings.Contains(message, "超时")
 }
 
 func ImageRetryAfter(value string, now time.Time) time.Duration {
@@ -583,7 +583,7 @@ func ClassifyAsyncImageFailure(err error, status int) *AsyncImageFailure {
 		code = 612
 	case status == http.StatusRequestEntityTooLarge || strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "参考图过大") || strings.Contains(lowered, "image too large") || strings.Contains(lowered, "image is too large") || strings.Contains(lowered, "image size exceeds") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
 		code = 604
-	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download failed") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "国内下载中转失败"):
+	case strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "参考素材链接无法访问") || strings.Contains(lowered, "参考图链接无法访问") || strings.Contains(lowered, "国内下载中转失败"):
 		code = 602
 	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel") || strings.Contains(lowered, "no eligible image account"):
 		code = 603

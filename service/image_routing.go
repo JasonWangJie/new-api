@@ -1121,6 +1121,10 @@ type ImageChannelAttempt struct {
 	ReferenceFailure             bool                `json:"upstream_reference_failure,omitempty"`
 }
 
+func isCompletedImageReferenceFetchFailure(attempt ImageChannelAttempt) bool {
+	return attempt.Dispatched && attempt.FinishedAt > 0 && attempt.ReferenceFailure && attempt.Code == 602
+}
+
 func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, platform string, maxSwitches int) ImageAccountRouting {
 	routing := ImageAccountRouting{}
 	effectiveRetries := retries
@@ -1172,14 +1176,14 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		}
 		last = attempt.KeyFingerprint
 		lastAttempt = attempt
-		referenceTimeout := attempt.ReferenceFailure && attempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage})
-		routing.WaitForCooldown = routing.WaitForCooldown || referenceTimeout || attempt.SynchronousRetryableResponse && attempt.FinishedAt > 0
-		if attempt.ReferenceFailure && !referenceTimeout {
+		referenceFetchFailure := isCompletedImageReferenceFetchFailure(attempt)
+		routing.WaitForCooldown = routing.WaitForCooldown || referenceFetchFailure || attempt.SynchronousRetryableResponse && attempt.FinishedAt > 0
+		if attempt.ReferenceFailure && !referenceFetchFailure {
 			reference = append(reference, attempt)
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
-	lastReferenceTimeout := lastAttempt.ReferenceFailure && lastAttempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: lastAttempt.Code, Message: lastAttempt.ErrorMessage})
+	lastReferenceFetchFailure := isCompletedImageReferenceFetchFailure(lastAttempt)
 	lastSynchronousResponse := lastAttempt.SynchronousRetryableResponse && lastAttempt.FinishedAt > 0
 	lastIncompatible := imageAttemptCompatibilityCode(lastAttempt) != ""
 	if legacy {
@@ -1195,10 +1199,10 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if lastReferenceTimeout || lastSynchronousResponse {
+		if lastReferenceFetchFailure || lastSynchronousResponse {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {
+		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {
 			if lastIncompatible || slices.Contains(routing.ExcludedChannels, lastChannel) || routing.PinChannel != 0 && routing.PinChannel != lastChannel {
 				routing.Stop = true
 				return routing
@@ -1229,10 +1233,10 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if lastReferenceTimeout || lastSynchronousResponse {
+	if lastReferenceFetchFailure || lastSynchronousResponse {
 		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
 	}
-	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceTimeout {
+	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {
 		if lastIncompatible || slices.Contains(routing.Excluded, last) || routing.Pin != "" && routing.Pin != last {
 			routing.Stop = true
 			return routing
@@ -1242,15 +1246,15 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	return routing
 }
 
-// ImageAttemptRouting derives the durable A/A/A/B rule from completed upstream
-// fetch failures. Server download failures do not enter that account history.
+// ImageAttemptRouting retains the legacy bounded account fallback for ambiguous
+// reference failures. Confirmed fetch failures use account cooldown and rotation.
 func ImageAttemptRouting(attempts []ImageChannelAttempt, retries int) (pin int, excluded []int, stop bool) {
 	var reference []ImageChannelAttempt
 	for _, attempt := range attempts {
 		if !attempt.Dispatched {
 			continue
 		}
-		if attempt.ReferenceFailure && !(attempt.FinishedAt > 0 && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: attempt.Code, Message: attempt.ErrorMessage})) {
+		if attempt.ReferenceFailure && !isCompletedImageReferenceFetchFailure(attempt) {
 			reference = append(reference, attempt)
 		}
 	}
