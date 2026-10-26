@@ -755,7 +755,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			}
 		}
 	}
-	synchronousResponseRetry := failure.SynchronousRetryableResponse && !failure.ExecutionUnknown && failure.Code == 606 && failure.HTTPStatus == http.StatusBadGateway && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
+	synchronousResponseRetry := failure.SynchronousRetryableResponse && !failure.ExecutionUnknown && failure.Code == 606 && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
 	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !synchronousResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
 		// A transport interruption or server error cannot prove non-acceptance.
 		// Keep the hold and require reconciliation instead of crossing providers.

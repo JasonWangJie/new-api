@@ -440,11 +440,23 @@ func isUndiagnosedImageSubmissionResponse(body []byte) bool {
 	return true
 }
 
-// isRetryableImageGatewayResponse recognizes the bounded gateway error response
+// isRetryableImageGatewayResponse recognizes bounded gateway error responses
 // allowed by the retry policy. The relay must confirm synchronous execution before the
 // worker may use it to submit another generation.
 func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bool {
-	if failure == nil || failure.HTTPStatus != http.StatusBadGateway || failure.Code != 606 || failure.InternalCode != "upstream_failed" || failure.ProviderCode != "upstream_request_failed" {
+	if failure == nil || failure.Code != 606 || failure.InternalCode != "upstream_failed" {
+		return false
+	}
+	switch failure.HTTPStatus {
+	case http.StatusBadGateway:
+		if failure.ProviderCode != "upstream_request_failed" {
+			return false
+		}
+	case http.StatusServiceUnavailable:
+		if failure.ProviderCode != "upstream_quota_unavailable" {
+			return false
+		}
+	default:
 		return false
 	}
 	envelope, ok := decoded.(map[string]any)
@@ -462,7 +474,7 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 	if providerCode == "" {
 		providerCode, _ = providerError["type"].(string)
 	}
-	if providerCode != "upstream_request_failed" {
+	if providerCode != failure.ProviderCode {
 		return false
 	}
 	// Normalize common failure envelopes before checking every raw diagnostic.
@@ -479,18 +491,19 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 			}
 		}
 	}
-	return isImageGatewayFailureMetadata(envelope, 0)
+	return isImageGatewayFailureMetadata(envelope, failure.HTTPStatus, providerCode, 0)
 }
 
 // isImageGatewayFailureMetadata checks the complete decoded response, including
 // nested metadata that is deliberately omitted from retained public diagnostics.
 // A job receipt, output or contradictory rejection must never authorize replay.
-func isImageGatewayFailureMetadata(value any, depth int) bool {
+func isImageGatewayFailureMetadata(value any, status int, providerCode string, depth int) bool {
 	if depth > 12 {
 		return false
 	}
 	switch value := value.(type) {
 	case map[string]any:
+		statusName := strings.ToLower(strings.ReplaceAll(http.StatusText(status), " ", "_"))
 		for field, child := range value {
 			name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(field, "_", ""), "-", ""))
 			switch name {
@@ -510,7 +523,7 @@ func isImageGatewayFailureMetadata(value any, depth int) bool {
 				}
 				continue
 			case "status", "state", "code":
-				if child == nil || child == float64(http.StatusBadGateway) {
+				if child == nil || child == float64(status) {
 					continue
 				}
 				text, ok := child.(string)
@@ -518,7 +531,7 @@ func isImageGatewayFailureMetadata(value any, depth int) bool {
 					return false
 				}
 				switch strings.ToLower(text) {
-				case "", "error", "failed", "failure", "bad_gateway", "502", "upstream_request_failed":
+				case "", "error", "failed", "failure", statusName, strconv.Itoa(status), providerCode:
 					continue
 				default:
 					return false
@@ -532,7 +545,7 @@ func isImageGatewayFailureMetadata(value any, depth int) bool {
 					return false
 				}
 				switch text {
-				case "", "upstream_request_failed", "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", "bad_gateway":
+				case "", providerCode, "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", statusName:
 					continue
 				default:
 					return false
@@ -559,13 +572,13 @@ func isImageGatewayFailureMetadata(value any, depth int) bool {
 				}
 				continue
 			}
-			if !isImageGatewayFailureMetadata(field, depth+1) || !isImageGatewayFailureMetadata(child, depth+1) {
+			if !isImageGatewayFailureMetadata(field, status, providerCode, depth+1) || !isImageGatewayFailureMetadata(child, status, providerCode, depth+1) {
 				return false
 			}
 		}
 	case []any:
 		for _, child := range value {
-			if !isImageGatewayFailureMetadata(child, depth+1) {
+			if !isImageGatewayFailureMetadata(child, status, providerCode, depth+1) {
 				return false
 			}
 		}

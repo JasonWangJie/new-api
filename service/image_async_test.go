@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -392,6 +391,9 @@ func TestMixedImageFailurePreservesAcceptanceBoundary(t *testing.T) {
 		{name: "unconfirmed server error", failure: AsyncImageFailure{Code: 606, HTTPStatus: 503}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "unconfirmed gateway error", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, ProviderCode: "upstream_request_failed", RetryableHTTPResponse: true}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "complete synchronous gateway failure can retry", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true}, wantStatus: model.ImageTaskQueued},
+		{name: "unconfirmed quota response stays unknown", failure: AsyncImageFailure{Code: 606, HTTPStatus: 503, ProviderCode: "upstream_quota_unavailable", RetryableHTTPResponse: true}, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "complete synchronous quota rejection can retry", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", HTTPStatus: 503, ProviderCode: "upstream_quota_unavailable", SynchronousRetryableResponse: true}, wantStatus: model.ImageTaskQueued},
+		{name: "cancelled quota response stays unknown", failure: AsyncImageFailure{Code: 606, HTTPStatus: 503, ProviderCode: "upstream_quota_unavailable", SynchronousRetryableResponse: true, ExecutionUnknown: true}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "cancelled synchronous response stays unknown", failure: AsyncImageFailure{Code: 606, HTTPStatus: 502, ProviderCode: "upstream_request_failed", SynchronousRetryableResponse: true, ExecutionUnknown: true}, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "crash recovery never resubmits", wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "explicit rate rejection can retry", failure: AsyncImageFailure{Code: 605, HTTPStatus: 429}, wantStatus: model.ImageTaskQueued},
@@ -645,9 +647,21 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 	}
 }
 
-func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
-	for _, onlyAccount := range []bool{false, true} {
-		t.Run(fmt.Sprintf("only_account=%t", onlyAccount), func(t *testing.T) {
+func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
+	const gatewayError = `{"success":false,"status":"error","data":null,"error":{"type":"upstream_request_failed","message":"The upstream image service could not complete the image request. Please retry shortly.","metadata":{"trace_id":"provider-trace"}}}`
+	const quotaError = `{"success":false,"code":503,"status":"service_unavailable","data":null,"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"The selected upstream image service has no available quota. Please retry shortly."}}`
+	for _, tc := range []struct {
+		name        string
+		status      int
+		body        string
+		onlyAccount bool
+	}{
+		{name: "gateway failure switches channel", status: 502, body: gatewayError},
+		{name: "gateway failure waits for only account", status: 502, body: gatewayError, onlyAccount: true},
+		{name: "quota rejection switches channel", status: 503, body: quotaError},
+		{name: "quota rejection waits for only account", status: 503, body: quotaError, onlyAccount: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
 			cfg.CircuitBreaker, cfg.TransientRetries = false, 1
@@ -670,7 +684,7 @@ func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
 				calls++
 				wantID := primaryID
-				if calls > 1 && !onlyAccount {
+				if calls > 1 && !tc.onlyAccount {
 					wantID = alternate.Id
 				}
 				assert.Equal(t, wantID, channel.Id)
@@ -678,7 +692,7 @@ func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
 				assert.Equal(t, request.Billing, outbound.Billing)
 				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
 				require.NoError(t, beforeInvoke())
-				failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(`{"success":false,"status":"error","data":null,"error":{"type":"upstream_request_failed","message":"The upstream image service could not complete the image request. Please retry shortly.","metadata":{"trace_id":"provider-trace"}}}`))}, "")
+				failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, "")
 				failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse
 				return nil, model.AsyncImageBill{}, failure
 			}
@@ -706,10 +720,10 @@ func TestAsyncImageSynchronous502RetriesUseExistingHold(t *testing.T) {
 			require.NotNil(t, reservation)
 			assert.Equal(t, "reserved", reservation.Status)
 			assert.Equal(t, 100, reservation.ReservedQuota)
-			if !onlyAccount {
+			if !tc.onlyAccount {
 				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusEnabled).Error)
 			}
-			if onlyAccount {
+			if tc.onlyAccount {
 				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
 				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "wait-cooling", cfg.WorkerLease)
 				require.NoError(t, err)
@@ -3031,12 +3045,27 @@ func TestAsyncImageChannelReferenceCapacityRouting(t *testing.T) {
 
 func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 	const gatewayError = `{"error":{"code":"upstream_request_failed","type":"new_api_error","message":"The upstream image service could not complete the image request. Please retry shortly."}}`
+	const quotaError = `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"The selected upstream image service has no available quota. Please retry shortly."}}`
 	for _, tc := range []struct {
 		name, body           string
 		status               int
 		readError, retryable bool
 	}{
 		{name: "complete gateway failure", body: gatewayError, status: 502, retryable: true},
+		{name: "explicit quota rejection", body: quotaError, status: 503, retryable: true},
+		{name: "quota rejection with status metadata", body: strings.TrimSuffix(quotaError, "}") + `,"success":false,"status":"service_unavailable","code":503,"data":null,"metadata":{"upstream":{"status":"503","code":"upstream_quota_unavailable","type":"service_unavailable","trace_id":"quota-trace"}}}`, status: 503, retryable: true},
+		{name: "quota error type supplies missing code", body: `{"error":{"type":"upstream_quota_unavailable","message":"The selected upstream image service has no available quota. Please retry shortly."}}`, status: 503, retryable: true},
+		{name: "quota code requires service unavailable status", body: quotaError, status: 502},
+		{name: "generic gateway failure is not a quota rejection", body: gatewayError, status: 503},
+		{name: "quota rejection with conflicting status", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"status":502}}`, status: 503},
+		{name: "quota rejection with conflicting gateway name", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"type":"bad_gateway"}}`, status: 503},
+		{name: "quota rejection with conflicting error code", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"code":"upstream_request_failed"}}`, status: 503},
+		{name: "quota rejection with accepted task", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"task_id":"accepted-task"}}`, status: 503},
+		{name: "quota rejection with accepted status", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"accepted":true}}`, status: 503},
+		{name: "quota rejection with output", body: strings.TrimSuffix(quotaError, "}") + `,"data":[{"url":"https://result.example/image.png"}]}`, status: 503},
+		{name: "quota rejection with policy signal", body: strings.Replace(quotaError, "new_api_error", "content_policy_violation", 1), status: 503},
+		{name: "quota rejection read failure", body: quotaError, status: 503, readError: true},
+		{name: "quota rejection truncated response", body: quotaError + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), status: 503},
 		{name: "empty failed envelope", body: strings.TrimSuffix(gatewayError, "}") + `,"success":false,"status":"error","code":502,"data":null}`, status: 502, retryable: true},
 		{name: "top level failure diagnostic", body: strings.TrimSuffix(gatewayError, "}") + `,"message":"The upstream image service could not complete the image request. Please retry shortly."}`, status: 502, retryable: true},
 		{name: "error type supplies missing code", body: `{"error":{"type":"upstream_request_failed","message":"Please retry shortly."}}`, status: 502, retryable: true},
