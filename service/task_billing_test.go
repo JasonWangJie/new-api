@@ -132,7 +132,7 @@ func setupMeasuredTaskBillingDB(t *testing.T) {
 	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
 	model.DB, model.LOG_DB = db, logDB
 	common.SetDatabaseTypes(dbType, logType)
-	rows := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.UserSubscription{}}
+	rows := []any{&model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.UserSubscription{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}}
 	t.Cleanup(func() {
 		for _, row := range rows {
 			require.NoError(t, db.Unscoped().Where("1 = 1").Delete(row).Error)

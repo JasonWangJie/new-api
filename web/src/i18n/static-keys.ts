@@ -1076,4 +1076,6 @@ export const STATIC_I18N_KEYS = [
   'Model mapping is invalid',
   'Select an API key to preview automatic routing groups',
   'Mixed scheduling',
+  'Reference media ready',
+  'Billing status unknown',
 ] as const

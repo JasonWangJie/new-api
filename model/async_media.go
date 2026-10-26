@@ -122,7 +122,10 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 		}
 		job.Status, job.StorageStatus, job.BillingStatus = "queued", "pending", "pending"
 		job.CreatedAt = time.Now().Unix()
-		return tx.Create(&job).Error
+		if err := tx.Create(&job).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaEventTx(tx, job, "accepted", "", nil, "")
 	})
 	return job, reused, err
 }
@@ -140,14 +143,37 @@ func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, s
 }
 
 func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any) error {
-	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Updates(updates)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
+	query := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration)
+	return ChangeAsyncMediaJob(query, updates, "")
+}
+
+// DispatchAsyncMediaJob records the selected live account slot only when the
+// current lease actually crosses the provider-dispatch barrier.
+func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any, keyIndex int, referenceMode string) error {
+	if keyIndex < -1 || referenceMode != "" && referenceMode != "original" && referenceMode != "local_download" {
 		return ErrImageConflict
 	}
-	return nil
+	var slot *int
+	if keyIndex >= 0 {
+		slot = &keyIndex
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var before AsyncMediaJob
+		if err := lockForUpdate(tx).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Take(&before).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrImageConflict
+			}
+			return err
+		}
+		if err := tx.Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Updates(updates).Error; err != nil {
+			return err
+		}
+		var after AsyncMediaJob
+		if err := tx.Where("id = ?", job.ID).Take(&after).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, before, after, slot, referenceMode)
+	})
 }
 
 // SaveAsyncMediaSubmissionRefund persists the confirmed rollback and its log
@@ -175,7 +201,7 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 	}
 	if err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job AsyncMediaJob
-		if err := lockForUpdate(tx).Select("id", "token_id", "billing_status", "refund_log_payload").
+		if err := lockForUpdate(tx).
 			Where("task_id = ? AND user_id = ? AND attempt_generation = ?", taskID, userID, generation).Take(&job).Error; err != nil {
 			return err
 		}
@@ -202,7 +228,14 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 		}
 		// The locked read proves ownership even when an identical MySQL update
 		// reports zero changed rows. Keep an already-pending log immutable.
-		return tx.Model(&AsyncMediaJob{}).Where("id = ? AND task_id = ? AND user_id = ? AND attempt_generation = ?", job.ID, taskID, userID, generation).Updates(changes).Error
+		if err := tx.Model(&AsyncMediaJob{}).Where("id = ? AND task_id = ? AND user_id = ? AND attempt_generation = ?", job.ID, taskID, userID, generation).Updates(changes).Error; err != nil {
+			return err
+		}
+		var after AsyncMediaJob
+		if err := tx.Where("id = ?", job.ID).Take(&after).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, job, after, nil, "")
 	}); err != nil {
 		return err
 	}

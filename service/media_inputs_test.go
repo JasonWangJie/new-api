@@ -34,7 +34,7 @@ import (
 func mediaInputFixture(t *testing.T) (model.AsyncMediaJob, MediaRuntimeConfig, ImageRuntimeConfig) {
 	t.Helper()
 	db, imageTask, _, imageCfg, _ := asyncImageWorkerFixture(t)
-	entities := []any{&model.Task{}, &model.AsyncMediaJob{}, &model.MediaInputObject{}, &model.MediaArtifactObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}, &model.ImageStorageObject{}}
+	entities := []any{&model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaInputObject{}, &model.MediaArtifactObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}, &model.ImageStorageObject{}}
 	require.NoError(t, db.AutoMigrate(entities...))
 	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(entities...)) })
 	oldSecret, oldAddress, oldTaskAddress := common.CryptoSecret, system_setting.ServerAddress, system_setting.TaskPublicAddress

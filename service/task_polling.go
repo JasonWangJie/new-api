@@ -971,7 +971,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	task.Data = redactVideoResponseBody(task.Data)
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
-	if isDone && task.PrivateData.AsyncMedia && task.Platform == "drama" && task.AttemptGeneration > 0 {
+	if isDone && task.PrivateData.AsyncMedia {
 		task.PrivateData.VideoTerminalConfirmed = resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 	}
 	if measuredVideo && isDone {

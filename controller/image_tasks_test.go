@@ -79,7 +79,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetMainDatabaseType(common.DatabaseType(engine))
 			common.SetLogDatabaseType(common.DatabaseType(logEngine))
-			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB, model.LOG_DB = previousDB, previousLogDB
 				common.SetMainDatabaseType(previousType)
@@ -96,7 +96,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}))
+				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 			}
 			// Rebuild the released table shape, then exercise the same startup
 			// migration against both existing data and its unique task identifier.
@@ -392,10 +392,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							{name: "video model filter accepts partial names", params: url.Values{"model": {"VIDEO-MOD"}}, videoIDs: []string{"video_search_owned"}},
 						} {
 							t.Run(tc.name, func(t *testing.T) {
-								date := time.Unix(now, 0).UTC().Format("2006-01-02")
 								if tc.params.Get("start_date") == "" {
-									tc.params.Set("start_date", date)
-									tc.params.Set("end_date", date)
+									tc.params.Set("start_date", time.Unix(now-50, 0).UTC().Format("2006-01-02"))
+									tc.params.Set("end_date", time.Unix(now, 0).UTC().Format("2006-01-02"))
 								}
 								tc.params.Set("timezone", "UTC")
 								recorder := httptest.NewRecorder()
@@ -658,8 +657,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					recorder := httptest.NewRecorder()
 					c, _ := gin.CreateTestContext(recorder)
 					c.Set("id", 101)
-					date := time.Now().UTC().Format("2006-01-02")
-					c.Request = httptest.NewRequest(http.MethodGet, "/?start_date="+date+"&end_date="+date+"&timezone=UTC", nil)
+					startDate, endDate := time.Unix(now-50, 0).UTC().Format("2006-01-02"), time.Unix(now, 0).UTC().Format("2006-01-02")
+					c.Request = httptest.NewRequest(http.MethodGet, "/?start_date="+startDate+"&end_date="+endDate+"&timezone=UTC", nil)
 					ListImageTasks(c, admin)
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 					var list struct {
@@ -740,8 +739,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Set("id", 101)
-				date := time.Now().UTC().Format("2006-01-02")
-				c.Request = httptest.NewRequest(http.MethodGet, "/?status="+status+"&start_date="+date+"&end_date="+date+"&timezone=UTC", nil)
+				startDate, endDate := time.Unix(now-50, 0).UTC().Format("2006-01-02"), time.Unix(now, 0).UTC().Format("2006-01-02")
+				c.Request = httptest.NewRequest(http.MethodGet, "/?status="+status+"&start_date="+startDate+"&end_date="+endDate+"&timezone=UTC", nil)
 				ListImageTasks(c, false)
 				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 				var response struct {
@@ -1359,6 +1358,95 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				assert.NotContains(t, expiredRecorder.Body.String(), latestURL)
 			}
 
+			t.Run("video durable account audit and timeline", func(t *testing.T) {
+				job, reused, err := model.AcceptAsyncMediaJob(t.Context(), model.AsyncMediaJob{TaskId: "task_video_audit", IdentityHash: "video-audit", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", ExpiresAt: now + 3600})
+				require.NoError(t, err)
+				require.False(t, reused)
+				readDetail := func(userID int, admin bool) (gin.H, []gin.H) {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", userID)
+					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
+					GetMediaTask(c, admin)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Task   gin.H
+							Events []gin.H
+						}
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					return response.Data.Task, response.Data.Events
+				}
+				view, events := readDetail(102, true)
+				assert.Empty(t, view["attempt_history"])
+				assert.Equal(t, false, view["attempt_history_unavailable"])
+				require.Len(t, events, 1)
+				assert.Equal(t, "accepted", events[0]["event_type"])
+				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitting"}))
+				require.NoError(t, model.DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": now, "billing_status": "reserved"}, 2, "original"))
+				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted"}))
+				view, events = readDetail(102, true)
+				history := view["attempt_history"].([]any)
+				require.Len(t, history, 1)
+				attempt := history[0].(map[string]any)
+				assert.Equal(t, "accepted", attempt["status"], "receipt must not be displayed as successful generation")
+				assert.Equal(t, float64(2), attempt["key_index"])
+				assert.Zero(t, attempt["finished_at"])
+				assert.Equal(t, "original", attempt["reference_mode"])
+				assert.Equal(t, true, attempt["dispatched"])
+				assert.NotEmpty(t, attempt["channel_name"])
+				assert.Equal(t, "reserved", view["reconciliation_status"])
+				before := len(events)
+				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted", "lease_token": "", "next_attempt_at": now + 3}))
+				_, events = readDetail(102, true)
+				assert.Len(t, events, before, "polls and identical transitions must not add timeline noise")
+				owner, ownerEvents := readDetail(101, false)
+				assert.NotContains(t, owner, "attempt_history")
+				assert.NotContains(t, owner, "reconciliation_status")
+				require.NotEmpty(t, ownerEvents)
+				for _, event := range ownerEvents {
+					assert.Len(t, event, 5, "only the public event contract may leave the API")
+					assert.Empty(t, event["message"])
+					for _, field := range []string{"channel_id", "key_index", "event_key", "attempt_generation", "reference_mode"} {
+						assert.NotContains(t, event, field)
+					}
+				}
+				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "failed", "billing_status": "unknown", "error_message": "submission receipt lost; authorization: Bearer audit-secret-canary; https://private.example/ref.png?signature=audit-url-canary"}))
+				view, _ = readDetail(102, true)
+				history = view["attempt_history"].([]any)
+				attempt = history[0].(map[string]any)
+				assert.Equal(t, "execution_unknown", attempt["status"])
+				assert.Equal(t, "upstream_unconfirmed", view["reconciliation_status"])
+				assert.NotZero(t, attempt["finished_at"])
+				assert.Zero(t, attempt["error_code"], "an unavailable provider error code must not be invented")
+				assert.NotEmpty(t, attempt["error_message"])
+				assert.NotContains(t, attempt["error_message"], "audit-secret-canary")
+				assert.NotContains(t, attempt["error_message"], "audit-url-canary")
+				recorder := httptest.NewRecorder()
+				other, _ := gin.CreateTestContext(recorder)
+				other.Set("id", 102)
+				other.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+				other.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
+				GetMediaTask(other, false)
+				assert.Equal(t, http.StatusNotFound, recorder.Code)
+				assert.NotContains(t, recorder.Body.String(), "attempt_history")
+				legacy := model.AsyncMediaJob{TaskId: "task_video_audit_legacy", IdentityHash: "video-audit-legacy", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", Status: "failed", BillingStatus: "unknown", CreatedAt: now - 100, ExpiresAt: now + 3600}
+				require.NoError(t, db.Create(&legacy).Error)
+				job = legacy
+				view, events = readDetail(102, true)
+				assert.Equal(t, true, view["attempt_history_unavailable"])
+				assert.Empty(t, view["attempt_history"])
+				assert.Empty(t, events, "reading historical tasks must not manufacture timeline records")
+				require.NoError(t, model.DispatchAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitting", "dispatched_at": now}, -1, ""))
+				view, _ = readDetail(102, true)
+				history = view["attempt_history"].([]any)
+				require.Len(t, history, 1)
+				assert.Nil(t, history[0].(map[string]any)["key_index"], "a missing live key index must not become slot zero")
+				assert.Equal(t, true, view["attempt_history_unavailable"], "future observed dispatch cannot fill missing historical records")
+			})
+
 			t.Run("video request details survive submission and storage", func(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
@@ -1636,16 +1724,20 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							require.NoError(t, db.Model(&job).Updates(map[string]any{"status": "submitting", "billing_status": "reserved", "quota": reservedQuota, "dispatched_at": now}).Error)
 							require.NoError(t, db.Take(&job, job.ID).Error)
 						}
+						lateRefundTriggered := false
 						if item.lateRefund {
 							refundPending := true
-							require.NoError(t, db.Callback().Update().Before("gorm:begin_transaction").Register("video-refund-before-recovery", func(tx *gorm.DB) {
-								updates, ok := tx.Statement.Dest.(map[string]any)
-								if refundPending && ok && tx.Statement.Table == "async_media_jobs" && updates["status"] == "failed" {
+							// The worker still holds its stale job snapshot. Refund
+							// before its native-task lookup, outside the later job
+							// transaction (SQLite may lock at BEGIN IMMEDIATE).
+							require.NoError(t, db.Callback().Query().Before("gorm:query").Register("video-refund-before-recovery", func(tx *gorm.DB) {
+								if refundPending && tx.Statement.Table == "tasks" {
 									refundPending = false
+									lateRefundTriggered = true
 									info.Billing.Refund(c)
 								}
 							}))
-							t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("video-refund-before-recovery")) })
+							t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("video-refund-before-recovery")) })
 						}
 						var submissions int
 						submitErr := errors.New("video submission failed (HTTP 429, code fail_to_fetch_task): upstream capacity exhausted")
@@ -1700,6 +1792,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							return submitErr
 						}
 						processErr := service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig())
+						if item.lateRefund {
+							require.True(t, lateRefundTriggered, "the independent refund must arrive after the worker snapshot and before its CAS transaction")
+						}
 						if item.recovery {
 							require.NoError(t, processErr)
 						} else {
@@ -2140,7 +2235,7 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := model.DB
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"group": "vip", "quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"group": "default", "status": common.TokenStatusExhausted, "remain_quota": 0, "used_quota": 100}).Error)
 			require.NoError(t, db.Take(user, user.Id).Error)
@@ -2265,7 +2360,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := model.DB
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.AsyncMediaJob{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"remain_quota": 0, "used_quota": 100}).Error)
 			channel := model.Channel{Key: "original-upstream-key", UsedQuota: 100}

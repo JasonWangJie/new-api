@@ -196,7 +196,7 @@ func TestAsyncTaskStats(t *testing.T) {
 	now := time.Now().In(location)
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
 	model.DB = imageRouterDatabase(t, "stats")
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.Task{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Task{}))
 	versionQuery := "SELECT version()"
 	if model.DB.Dialector.Name() == "sqlite" {
 		versionQuery = "SELECT sqlite_version()"
@@ -1137,7 +1137,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.AdjustUserQuotaDurable(user.Id, 1000000))
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
 		require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota", 1000000).Err())
-		require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
+		require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
 		previousSubmit, previousPersist, previousAdaptor := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc
 		service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = controller.ExecuteAsyncVideo, controller.PersistAsyncVideo
 		service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }

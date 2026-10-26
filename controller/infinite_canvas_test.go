@@ -87,7 +87,7 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 	sqlDB, err := f.db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}, &model.ImageStorageProfile{}, &model.AsyncImageEvent{}, &model.Option{}))
+	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageStorageProfile{}, &model.AsyncImageEvent{}, &model.Option{}))
 	f.redis = miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: f.redis.Addr()})
 	model.DB, model.LOG_DB, common.RedisEnabled, common.RDB, common.SessionSecret = f.db, f.db, true, client, "canvas-fixture-signing-secret"

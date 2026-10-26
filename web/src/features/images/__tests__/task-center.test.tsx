@@ -2383,6 +2383,165 @@ test('video details leave missing historical request data unavailable', async ()
   ).not.toBeInTheDocument()
 })
 
+test('video details explain when no stage history was recorded', async () => {
+  vi.mocked(getImageTask).mockResolvedValue({
+    task: {
+      ...task,
+      media_type: 'video',
+      attempt_history: undefined,
+      attempt_history_unavailable: true,
+      reconciliation_status: 'upstream_unconfirmed',
+    },
+    results: [],
+    events: [],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin
+      userId={101}
+      canManage={false}
+      onClose={vi.fn()}
+      onManage={vi.fn()}
+    />
+  )
+  expect(await screen.findByText('No history data available')).toBeVisible()
+  expect(
+    screen.getByText('Attempt history is unavailable for this task.')
+  ).toBeVisible()
+  expect(
+    screen.getAllByText('Upstream execution could not be confirmed')
+  ).toHaveLength(2)
+  expect(screen.queryByRole('list')).not.toBeInTheDocument()
+})
+
+test.each([
+  {
+    status: 'accepted',
+    label: 'Upstream task already accepted',
+    keyIndex: null,
+  },
+  {
+    status: 'execution_unknown',
+    label: 'Execution unknown',
+    keyIndex: undefined,
+  },
+  { status: 'failed', label: 'Failed', keyIndex: 0 },
+  { status: 'succeeded', label: 'Succeeded', keyIndex: 2 },
+] as const)(
+  'video attempt $status retains its explicit outcome and known account slot',
+  async ({ status, label, keyIndex }) => {
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: {
+        ...task,
+        media_type: 'video',
+        reconciliation_status: 'resolved',
+        attempt_history: [
+          {
+            channel_name: 'Current video upstream',
+            key_index: keyIndex,
+            started_at: 1789600001,
+            finished_at: 1789600009,
+            dispatched: true,
+            reference_mode: 'remote',
+            error_code: 0,
+            status,
+          },
+        ],
+      },
+      results: [],
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin
+        userId={101}
+        canManage={false}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    await user.click(
+      await screen.findByRole('button', { name: 'Attempt history (1)' })
+    )
+    const row = screen.getByRole('row', { name: /Current video upstream/ })
+    expect(within(row).getByText(label)).toBeVisible()
+    if (keyIndex == null) {
+      expect(within(row).getByText('Unknown')).toBeVisible()
+      expect(within(row).queryByText(/Account slot/)).not.toBeInTheDocument()
+    } else {
+      expect(
+        within(row).getByText(`Account slot ${keyIndex + 1}`)
+      ).toBeVisible()
+    }
+    if (status !== 'succeeded') {
+      expect(within(row).queryByText('Succeeded')).not.toBeInTheDocument()
+    }
+  }
+)
+
+test.each([false, true])(
+  'video stage history is translated and keeps routing diagnostics administrator-only (admin=%s)',
+  async (admin) => {
+    vi.mocked(getImageTask).mockResolvedValue({
+      task: { ...task, media_type: 'video' },
+      results: [],
+      events: [
+        {
+          id: 1,
+          event_type: 'reference_ready',
+          status: 'processing',
+          message: 'private-video-audit-diagnostic',
+          created_at: 1789600001,
+        },
+        {
+          id: 2,
+          event_type: 'submitted',
+          status: 'processing',
+          message: '',
+          created_at: 1789600002,
+        },
+        {
+          id: 3,
+          event_type: 'billing_unknown',
+          status: 'execution_unknown',
+          message: '',
+          created_at: 1789600003,
+        },
+      ],
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={admin}
+        userId={101}
+        canManage={false}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    expect(await screen.findByText('Reference media ready')).toBeVisible()
+    expect(screen.getByText('Upstream task already accepted')).toBeVisible()
+    expect(screen.getByText('Billing status unknown')).toBeVisible()
+    if (admin) {
+      expect(screen.getByText('private-video-audit-diagnostic')).toBeVisible()
+      expect(
+        screen.getByText('Account attempts and reconciliation')
+      ).toBeVisible()
+    } else {
+      expect(
+        screen.queryByText('private-video-audit-diagnostic')
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('Account attempts and reconciliation')
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText('Previous upstream')).not.toBeInTheDocument()
+    }
+  }
+)
+
 test('admin details show named attempts and generated images without rendering raw fingerprints', async () => {
   const user = userEvent.setup()
   mount(

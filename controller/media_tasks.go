@@ -430,7 +430,121 @@ func GetMediaTask(c *gin.Context, admin bool) {
 			}
 		}
 	}
-	imageManagementData(c, gin.H{"task": view, "results": results, "events": []any{}})
+	events, err := videoTaskAudit(c, job, view, admin)
+	if err != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, err)
+		return
+	}
+	imageManagementData(c, gin.H{"task": view, "results": results, "events": events})
+}
+
+// videoTaskAudit projects only persisted milestones. In particular, a native
+// receipt is acceptance, not proof that generation succeeded, and an old task
+// without a dispatch record must not acquire a fictitious account attempt.
+func videoTaskAudit(c *gin.Context, job model.AsyncMediaJob, view gin.H, admin bool) ([]model.AsyncMediaEvent, error) {
+	events, err := model.ListAsyncMediaEvents(c.Request.Context(), job.TaskId)
+	if err != nil {
+		return nil, err
+	}
+	if !admin {
+		for i := range events {
+			events[i].Message = ""
+		}
+		return events, nil
+	}
+	view["reconciliation_status"] = view["billing_status"]
+	switch view["billing_status"] {
+	case "unknown":
+		view["reconciliation_status"] = "upstream_unconfirmed"
+	case "not_billable":
+		view["reconciliation_status"] = "not_charged"
+	case "failed":
+		view["reconciliation_status"] = "billing_failed"
+	}
+	attempts := make([]gin.H, 0)
+	positions := make(map[int64]int)
+	channelIDs := make([]int, 0)
+	completeHistory := false
+	for _, event := range events {
+		if event.EventType == "accepted" {
+			completeHistory = true
+		}
+		position, exists := positions[event.AttemptGeneration]
+		if event.EventType == "attempt_started" || event.EventType == "dispatched" {
+			if !exists {
+				position = len(attempts)
+				positions[event.AttemptGeneration] = position
+				attempts = append(attempts, gin.H{"channel_name": "", "channel_id": event.ChannelId, "key_index": nil, "started_at": event.CreatedAt, "finished_at": int64(0), "dispatched": false, "reference_mode": "", "error_code": 0, "status": "selected"})
+				channelIDs = append(channelIDs, event.ChannelId)
+			}
+		} else if !exists {
+			continue
+		}
+		attempt := attempts[position]
+		switch event.EventType {
+		case "dispatched":
+			attempt["dispatched"], attempt["reference_mode"] = true, event.ReferenceMode
+			attempt["key_index"] = event.KeyIndex
+			attempt["status"] = "processing"
+		case "submitted":
+			if attempt["finished_at"] == int64(0) {
+				attempt["status"] = "accepted"
+			}
+		case "upstream_succeeded":
+			attempt["status"], attempt["finished_at"], attempt["error_code"] = "succeeded", event.CreatedAt, 0
+		case "upstream_failed":
+			attempt["status"], attempt["finished_at"] = "failed", event.CreatedAt
+		case "execution_unknown", "billing_unknown", "expired":
+			if attempt["status"] != "succeeded" && attempt["status"] != "failed" {
+				attempt["status"], attempt["finished_at"] = "execution_unknown", event.CreatedAt
+			}
+		case "failed":
+			if attempt["finished_at"] == int64(0) {
+				status := "failed"
+				if view["billing_status"] == "unknown" {
+					status = "execution_unknown"
+				}
+				attempt["status"], attempt["finished_at"] = status, event.CreatedAt
+			}
+		}
+	}
+	if len(channelIDs) > 0 {
+		var native model.Task
+		if err := model.DB.WithContext(c.Request.Context()).Select("private_data", "attempt_generation", "fail_reason").Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&native).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		for _, previous := range native.PrivateData.VideoAttempts {
+			if position, exists := positions[previous.Generation]; exists && strings.TrimSpace(previous.Reason) != "" {
+				attempts[position]["error_message"] = service.VideoTaskFailureReason(previous.Reason)
+			}
+		}
+		if position, exists := positions[job.AttemptGeneration]; exists {
+			attempt := attempts[position]
+			if attempt["status"] == "failed" || attempt["status"] == "execution_unknown" {
+				reason := job.ErrorMessage
+				if native.AttemptGeneration == job.AttemptGeneration && strings.TrimSpace(native.FailReason) != "" {
+					reason = native.FailReason
+				}
+				if strings.TrimSpace(reason) != "" {
+					attempt["error_message"] = service.VideoTaskFailureReason(reason)
+				}
+			}
+		}
+		var channels []model.Channel
+		if err := model.DB.WithContext(c.Request.Context()).Select("id", "name").Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+		names := make(map[int]string, len(channels))
+		for _, channel := range channels {
+			names[channel.Id] = channel.Name
+		}
+		for _, attempt := range attempts {
+			attempt["channel_name"] = names[attempt["channel_id"].(int)]
+			delete(attempt, "channel_id")
+		}
+	}
+	view["attempt_history"], view["attempt_history_unavailable"] = attempts, !completeHistory
+	return events, nil
 }
 
 func ManageMediaTask(c *gin.Context, admin bool, action string) {
@@ -566,13 +680,16 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		imageManagementError(c, 400, errors.New("Invalid media task operation"))
 		return
 	}
-	result := query.Updates(updates)
-	if result.Error != nil {
-		imageManagementError(c, 503, result.Error)
-		return
+	eventType := "terminated"
+	if action == "resume" {
+		eventType = "resume_requested"
 	}
-	if result.RowsAffected != 1 {
-		imageManagementError(c, 409, errors.New("Media task cannot be changed in its current phase"))
+	if err := model.ChangeAsyncMediaJob(query, updates, eventType); err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, model.ErrImageConflict) || errors.Is(err, gorm.ErrRecordNotFound) {
+			status = http.StatusConflict
+		}
+		imageManagementError(c, status, errors.New("Media task cannot be changed in its current phase"))
 		return
 	}
 	if reconciledTask != nil {

@@ -171,7 +171,14 @@ export type ImageTask = {
   reconciliation_status?: string
   attempt_history?: {
     channel_name: string
-    key_index: number
+    key_index?: number | null
+    status?:
+      | 'selected'
+      | 'processing'
+      | 'accepted'
+      | 'succeeded'
+      | 'failed'
+      | 'execution_unknown'
     started_at: number
     finished_at: number
     dispatched: boolean

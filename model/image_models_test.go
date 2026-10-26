@@ -106,7 +106,7 @@ func imageDatabaseFixture(t *testing.T) (*gorm.DB, AsyncImageTask, AsyncImageBil
 		initCol()
 		common.RedisEnabled, common.DataExportEnabled, common.LogConsumeEnabled = previousRedis, previousExport, previousLogs
 	})
-	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}))
+	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}, &AsyncMediaJob{}, &AsyncMediaEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&Log{}))
 	require.NoError(t, MigrateImageLogs(logDB))
 	user := User{Username: "image-test", Quota: 1000, Status: common.UserStatusEnabled}

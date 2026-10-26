@@ -322,6 +322,9 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if claim.RowsAffected != 1 {
 			return errMeasuredTaskCASLost
 		}
+		if err := recordAsyncMediaNativeTaskTx(tx, *task, false); err != nil {
+			return err
+		}
 		transactionBodySucceeded = true
 		return nil
 	})

@@ -782,7 +782,7 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}, &model.AsyncMediaJob{}, &model.AsyncImageTask{}, &model.MediaArtifactObject{}, &model.Option{}, &model.CanvasGrant{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.AsyncImageTask{}, &model.MediaArtifactObject{}, &model.Option{}, &model.CanvasGrant{}))
 	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), service.DefaultMediaRuntimeConfig()))
 	for _, tc := range []struct {
 		name, diagnostic, summary string

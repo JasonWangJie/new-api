@@ -338,7 +338,7 @@ func migrateDB() error {
 	}
 
 	err := DB.AutoMigrate(
-		&AsyncMediaJob{}, &MediaArtifactObject{}, &MediaInputObject{},
+		&AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaArtifactObject{}, &MediaInputObject{},
 		&Channel{},
 		&Token{},
 		&CanvasGrant{},

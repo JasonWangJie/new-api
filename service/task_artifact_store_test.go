@@ -57,7 +57,7 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 	old := model.DB
 	model.DB = db
 	t.Cleanup(func() { model.DB = old; connection, _ := db.DB(); _ = connection.Close() })
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
 	cfg := DefaultMediaRuntimeConfig()
 	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
 	require.NoError(t, SaveMediaRuntimeConfig(t.Context(), cfg))
@@ -191,7 +191,7 @@ func TestLocalMediaStorageAndRecovery(t *testing.T) {
 func TestAsyncMediaPoolsKeepSubmissionAndStatusAvailableDuringDownload(t *testing.T) {
 	setupTaskPollingDatabase(t)
 	asyncImageKeyFixture(t)
-	entities := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}}
+	entities := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
 	for range 2 {
 		require.NoError(t, model.DB.AutoMigrate(entities...))
 	}
@@ -330,7 +330,7 @@ func TestAsyncMediaPollingWithoutFrozenJobUsesMissingChannelFailure(t *testing.T
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled, GetTaskAdaptorFunc = previousCache, previousFactory
 	})
-	require.NoError(t, model.DB.AutoMigrate(&model.AsyncMediaJob{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 	seedUser(t, 1, 1000)
 	seedToken(t, 1, 1, "missing-channel-token", 1000)
 	task := &model.Task{TaskID: "public-missing-job", UserId: 1, ChannelId: 99999, Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: 1, UpstreamTaskID: "native-missing-job"}}
@@ -414,7 +414,7 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 			t.Run(funding+"/"+outcome, func(t *testing.T) {
 				setupMeasuredTaskBillingDB(t)
 				asyncImageKeyFixture(t)
-				extra := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}}
+				extra := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}}
 				for range 2 {
 					require.NoError(t, model.DB.AutoMigrate(extra...))
 				}

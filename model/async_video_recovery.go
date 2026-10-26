@@ -63,7 +63,14 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		if result.RowsAffected != 1 {
 			return ErrTaskAttemptConflict
 		}
-		return nil
+		if err := recordAsyncMediaEventTx(tx, currentJob, "upstream_failed", "", nil, ""); err != nil {
+			return err
+		}
+		var after AsyncMediaJob
+		if err := tx.Where("id = ?", currentJob.ID).Take(&after).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, currentJob, after, nil, "")
 	})
 	if errors.Is(err, ErrTaskAttemptConflict) {
 		return false, nil
@@ -132,7 +139,14 @@ func CommitAsyncVideoReferenceSubmission(ctx context.Context, job AsyncMediaJob,
 		if result.RowsAffected != 1 {
 			return ErrTaskAttemptConflict
 		}
-		return nil
+		var after AsyncMediaJob
+		if err := tx.Where("id = ?", currentJob.ID).Take(&after).Error; err != nil {
+			return err
+		}
+		if err := recordAsyncMediaEventTx(tx, after, "submitted", "", nil, ""); err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, currentJob, after, nil, "")
 	})
 	if errors.Is(err, ErrTaskAttemptConflict) {
 		return false, nil
@@ -179,7 +193,11 @@ func MarkAsyncVideoReferenceSubmissionUnknown(ctx context.Context, job AsyncMedi
 		if result.RowsAffected != 1 {
 			return ErrTaskAttemptConflict
 		}
-		return nil
+		var after AsyncMediaJob
+		if err := tx.Where("id = ?", currentJob.ID).Take(&after).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, currentJob, after, nil, "")
 	})
 	if errors.Is(err, ErrTaskAttemptConflict) {
 		return false, nil

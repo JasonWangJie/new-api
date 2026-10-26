@@ -1013,6 +1013,7 @@ func (a *scriptedBatchPollingAdaptor) ParseBatchResult([]*model.Task, *http.Resp
 }
 
 func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 	testCases := []struct {
 		name          string
 		statusCode    int
@@ -1028,7 +1029,17 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 		wantReason    string
 		wantState     string
 		wantUnchanged bool
+		wantConfirmed bool
 	}{
+		{
+			name:          "confirmed upstream failure is distinguished from a polling cutoff",
+			statusCode:    http.StatusOK,
+			parse:         &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "provider generation failed"},
+			wantStatus:    model.TaskStatusFailure,
+			wantRefund:    true,
+			wantReason:    "provider generation failed",
+			wantConfirmed: true,
+		},
 		{
 			name:          "404 fails immediately and refunds",
 			statusCode:    http.StatusNotFound,
@@ -1117,6 +1128,7 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
 			task.TaskID = "task_poll_class"
 			task.PrivateData.UpstreamTaskID = "upstream_poll_class"
+			task.PrivateData.AsyncMedia = true
 			task.PrivateData.PollFailures = testCase.priorFailures
 			if testCase.priorState != "" {
 				task.PrivateData.PluginState = []byte(testCase.priorState)
@@ -1132,6 +1144,7 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 			assert.EqualValues(t, testCase.wantStatus, persisted.Status)
 			assert.Equal(t, testCase.wantFailures, persisted.PrivateData.PollFailures)
+			assert.Equal(t, testCase.wantConfirmed, persisted.PrivateData.VideoTerminalConfirmed)
 			if testCase.wantUnchanged {
 				assert.Empty(t, persisted.FailReason)
 			}

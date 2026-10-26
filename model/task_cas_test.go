@@ -40,6 +40,8 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&Task{},
+		&AsyncMediaJob{},
+		&AsyncMediaEvent{},
 		&User{},
 		&UserSession{},
 		&AuthFlow{},
@@ -358,7 +360,7 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 func asyncVideoRecoveryFixture(t *testing.T) (*gorm.DB, Task, AsyncMediaJob) {
 	t.Helper()
 	db, image, _ := imageDatabaseFixture(t)
-	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaInputObject{}))
 	require.NoError(t, db.Model(&User{}).Where("id = ?", image.UserId).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 	require.NoError(t, db.Model(&Token{}).Where("id = ?", image.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
 	require.NoError(t, db.Model(&Channel{}).Where("id = ?", image.ChannelId).Update("used_quota", 100).Error)
@@ -370,6 +372,119 @@ func asyncVideoRecoveryFixture(t *testing.T) (*gorm.DB, Task, AsyncMediaJob) {
 	job := AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "video-recovery-identity", UserId: task.UserId, TokenId: image.TokenId, ChannelId: image.ChannelId, Provider: "drama", Model: "video-model", RequestCipher: []byte("encrypted-request"), Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: task.Quota, DispatchedAt: now - 10, CreatedAt: now - 10, ExpiresAt: now + 1800}
 	require.NoError(t, db.Create(&job).Error)
 	return db, task, job
+}
+
+func TestAsyncMediaAuditLifecycle(t *testing.T) {
+	db, image, _ := imageDatabaseFixture(t)
+	require.NoError(t, db.AutoMigrate(&Task{}))
+	job, reused, err := AcceptAsyncMediaJob(t.Context(), AsyncMediaJob{TaskId: "audit-video", IdentityHash: "audit-video", RequestHash: "request", UserId: image.UserId, TokenId: image.TokenId, ChannelId: image.ChannelId, Provider: "drama", Model: "video", ExpiresAt: time.Now().Unix() + 3600})
+	require.NoError(t, err)
+	require.False(t, reused)
+	_, reused, err = AcceptAsyncMediaJob(t.Context(), job)
+	require.NoError(t, err)
+	require.True(t, reused)
+	events, err := ListAsyncMediaEvents(t.Context(), job.TaskId)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.Equal(t, "accepted", events[0].EventType)
+	assert.Nil(t, events[0].KeyIndex, "an accepted task has no confirmed dispatch account")
+	claimed, err := ClaimAsyncMediaJob(t.Context(), &job, "audit-lease", 60)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"next_attempt_at": 0}))
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitting"}))
+	dispatchedAt := time.Now().Unix()
+	require.NoError(t, DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": dispatchedAt, "billing_status": "reserved"}, 0, "original"))
+	require.NoError(t, DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": dispatchedAt, "billing_status": "reserved"}, 0, "original"))
+	require.NoError(t, DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": dispatchedAt}, -1, ""), "unknown historical key slots must not block submission")
+	stale := job
+	stale.LeaseToken = "lost-lease"
+	assert.ErrorIs(t, UpdateAsyncMediaJob(t.Context(), stale, map[string]any{"status": "failed"}), ErrImageConflict)
+	assert.ErrorIs(t, DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": dispatchedAt}, 0, "https://private.example/?key=secret"), ErrImageConflict)
+	task := Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Status: TaskStatusSuccess, PrivateData: TaskPrivateData{AsyncMedia: true, TokenId: job.TokenId, UpstreamTaskID: "private-native-id"}}
+	require.NoError(t, task.InsertWithContext(t.Context()))
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted", "storage_status": "ready", "billing_status": "settled"}))
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted", "storage_status": "ready", "billing_status": "settled", "next_attempt_at": time.Now().Unix() + 3}))
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"storage_status": "saving"}))
+	require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "succeeded", "storage_status": "succeeded", "error_message": "secret https://private.example/video.mp4?key=secret"}))
+	events, err = ListAsyncMediaEvents(t.Context(), job.TaskId)
+	require.NoError(t, err)
+	types := make([]string, 0, len(events))
+	for _, event := range events {
+		types = append(types, event.EventType)
+		assert.NotContains(t, event.Message, "private")
+		if event.EventType == "dispatched" {
+			require.NotNil(t, event.KeyIndex)
+			assert.Zero(t, *event.KeyIndex, "the first key slot must not be mistaken for unknown")
+			assert.Equal(t, "original", event.ReferenceMode)
+			assert.Equal(t, job.ChannelId, event.ChannelId)
+		}
+	}
+	assert.Equal(t, []string{"accepted", "attempt_started", "dispatched", "billing_reserved", "submitted", "upstream_succeeded", "storage_ready", "billing_settled", "storage_saving", "succeeded", "storage_succeeded"}, types)
+	public, err := common.Marshal(events)
+	require.NoError(t, err)
+	for _, private := range []string{"private", "key_index", "channel_id", "reference_mode", "attempt_generation", "event_key", "task_id"} {
+		assert.NotContains(t, string(public), private)
+	}
+}
+
+func TestAsyncMediaAuditAtomicTransitions(t *testing.T) {
+	t.Run("repeated local storage recovery keeps distinct cycles", func(t *testing.T) {
+		db, _, job := asyncVideoRecoveryFixture(t)
+		for range 2 {
+			require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"storage_status": "saving"}))
+			require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"storage_status": "failed", "storage_retries": 1, "next_attempt_at": 1000}))
+			query := db.WithContext(t.Context()).Model(&AsyncMediaJob{}).Where("id = ? AND status = ? AND storage_status = ?", job.ID, "submitted", "failed")
+			changes := map[string]any{"next_attempt_at": 0, "storage_retries": 0}
+			require.NoError(t, ChangeAsyncMediaJob(query, changes, "resume_requested"))
+			require.NoError(t, ChangeAsyncMediaJob(query, changes, "resume_requested"), "the same accepted resume is a no-op")
+		}
+		require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"storage_status": "saving"}))
+		require.NoError(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "succeeded", "storage_status": "succeeded"}))
+		events, err := ListAsyncMediaEvents(t.Context(), job.TaskId)
+		require.NoError(t, err)
+		counts := make(map[string]int)
+		for _, event := range events {
+			counts[event.EventType]++
+		}
+		assert.Equal(t, 3, counts["storage_saving"])
+		assert.Equal(t, 2, counts["storage_failed"])
+		assert.Equal(t, 2, counts["resume_requested"])
+		assert.Equal(t, 1, counts["storage_succeeded"])
+	})
+	t.Run("eligibility and rollback", func(t *testing.T) {
+		db, _, job := asyncVideoRecoveryFixture(t)
+		query := db.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId+1)
+		assert.ErrorIs(t, ChangeAsyncMediaJob(query, map[string]any{"status": "failed"}, "terminated"), ErrImageConflict)
+		query = db.Model(&AsyncMediaJob{}).Where("task_id = ?", job.TaskId).
+			Where("EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.status = ?)", TaskStatusSuccess)
+		assert.ErrorIs(t, ChangeAsyncMediaJob(query, map[string]any{"status": "failed"}, "terminated"), ErrImageConflict)
+		events, err := ListAsyncMediaEvents(t.Context(), job.TaskId)
+		require.NoError(t, err)
+		assert.Empty(t, events, "pre-existing tasks must not acquire invented acceptance or dispatch records")
+		require.NoError(t, db.Migrator().DropTable(&AsyncMediaEvent{}))
+		assert.Error(t, UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "failed"}))
+		var after AsyncMediaJob
+		require.NoError(t, db.First(&after, job.ID).Error)
+		assert.Equal(t, "submitted", after.Status, "a missing audit write rolls back the corresponding transition")
+	})
+	t.Run("refund and expiration are replay safe", func(t *testing.T) {
+		db, _, job := asyncVideoRecoveryFixture(t)
+		changes := map[string]any{"billing_status": "refunded", "status": "failed", "quota": 0}
+		require.NoError(t, SaveAsyncMediaSubmissionRefund(t.Context(), job.TaskId, job.UserId, changes, nil))
+		require.NoError(t, SaveAsyncMediaSubmissionRefund(t.Context(), job.TaskId, job.UserId, changes, nil))
+		require.NoError(t, db.Model(&job).Update("expires_at", time.Now().Unix()-1).Error)
+		require.NoError(t, db.First(&job, job.ID).Error)
+		require.NoError(t, ExpireAsyncMediaJob(t.Context(), job, time.Now().Unix()))
+		require.NoError(t, ExpireAsyncMediaJob(t.Context(), job, time.Now().Unix()))
+		events, err := ListAsyncMediaEvents(t.Context(), job.TaskId)
+		require.NoError(t, err)
+		types := make([]string, 0, len(events))
+		for _, event := range events {
+			types = append(types, event.EventType)
+		}
+		assert.Equal(t, []string{"failed", "billing_refunded", "expired", "storage_expired"}, types)
+	})
 }
 
 func TestAsyncVideoReferenceRecoveryPreservesHoldAndFencesOldAttempt(t *testing.T) {

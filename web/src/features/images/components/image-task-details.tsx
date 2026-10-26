@@ -24,6 +24,7 @@ import { useTranslation } from 'react-i18next'
 import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
+import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
@@ -794,20 +795,33 @@ export function ImageTaskDetails(props: {
                           header: t('Status'),
                           cell: (attempt) => {
                             let status = t('Not selected')
-                            if (attempt.started_at) status = t('Selected')
-                            if (attempt.dispatched) status = t('Processing')
-                            if (attempt.finished_at) {
-                              status = t(
-                                attempt.error_code ? 'Failed' : 'Succeeded'
-                              )
+                            let succeeded = Boolean(
+                              attempt.finished_at && !attempt.error_code
+                            )
+                            let failed = Boolean(attempt.error_code)
+                            if (attempt.status) {
+                              status = t(imageLabel(attempt.status))
+                              if (attempt.status === 'accepted') {
+                                status = t('Upstream task already accepted')
+                              }
+                              succeeded = attempt.status === 'succeeded'
+                              failed =
+                                attempt.status === 'failed' ||
+                                attempt.status === 'execution_unknown'
+                            } else {
+                              if (attempt.started_at) status = t('Selected')
+                              if (attempt.dispatched) status = t('Processing')
+                              if (attempt.finished_at) {
+                                status = t(
+                                  attempt.error_code ? 'Failed' : 'Succeeded'
+                                )
+                              }
                             }
                             return (
                               <Badge
-                                variant={
-                                  attempt.error_code ? 'warning' : 'outline'
-                                }
+                                variant={failed ? 'warning' : 'outline'}
                                 className={
-                                  attempt.finished_at && !attempt.error_code
+                                  succeeded
                                     ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
                                     : undefined
                                 }
@@ -827,9 +841,12 @@ export function ImageTaskDetails(props: {
                                   t('Channel unavailable')}
                               </p>
                               <p className='text-muted-foreground'>
-                                {t('Account slot {{index}}', {
-                                  index: attempt.key_index + 1,
-                                })}
+                                {attempt.key_index != null &&
+                                attempt.key_index >= 0
+                                  ? t('Account slot {{index}}', {
+                                      index: attempt.key_index + 1,
+                                    })
+                                  : t('Unknown')}
                               </p>
                             </div>
                           ),
@@ -945,38 +962,47 @@ export function ImageTaskDetails(props: {
             title={t('Stage timeline')}
             accentClassName='border-l-4 border-l-blue-500/70'
           >
-            <ol className='space-y-0'>
-              {task.data.events.map((event) => (
-                <li
-                  key={event.id}
-                  className='relative ml-1 border-l pb-5 pl-5 last:border-l-transparent last:pb-0'
-                >
-                  <span
-                    className={cn(
-                      'absolute top-1.5 -left-[5px] size-2 rounded-full',
-                      imageTimelineDotClass(event)
+            {task.data.events.length === 0 ? (
+              <EmptyState
+                className='min-h-24'
+                title={t('No history data available')}
+              />
+            ) : (
+              <ol className='space-y-0'>
+                {task.data.events.map((event) => (
+                  <li
+                    key={event.id}
+                    className='relative ml-1 border-l pb-5 pl-5 last:border-l-transparent last:pb-0'
+                  >
+                    <span
+                      className={cn(
+                        'absolute top-1.5 -left-[5px] size-2 rounded-full',
+                        imageTimelineDotClass(event)
+                      )}
+                      aria-hidden
+                    />
+                    <div className='flex flex-wrap items-center justify-between gap-2'>
+                      <span className='text-sm font-medium'>
+                        {t(imageTimelineLabel(event))}
+                      </span>
+                      <time
+                        className='text-muted-foreground text-xs tabular-nums'
+                        dateTime={new Date(
+                          event.created_at * 1000
+                        ).toISOString()}
+                      >
+                        {formatTimestampToDate(event.created_at)}
+                      </time>
+                    </div>
+                    {props.admin && event.message && (
+                      <p className='text-muted-foreground mt-1 text-xs break-words'>
+                        {t(event.message)}
+                      </p>
                     )}
-                    aria-hidden
-                  />
-                  <div className='flex flex-wrap items-center justify-between gap-2'>
-                    <span className='text-sm font-medium'>
-                      {t(imageTimelineLabel(event))}
-                    </span>
-                    <time
-                      className='text-muted-foreground text-xs tabular-nums'
-                      dateTime={new Date(event.created_at * 1000).toISOString()}
-                    >
-                      {formatTimestampToDate(event.created_at)}
-                    </time>
-                  </div>
-                  {props.admin && event.message && (
-                    <p className='text-muted-foreground mt-1 text-xs break-words'>
-                      {t(event.message)}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ol>
+                  </li>
+                ))}
+              </ol>
+            )}
           </DetailSection>
         </>
       )}

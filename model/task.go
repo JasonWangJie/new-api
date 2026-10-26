@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -508,6 +509,14 @@ func (Task *Task) Insert() error {
 }
 
 func (Task *Task) InsertWithContext(ctx context.Context) error {
+	if Task.PrivateData.AsyncMedia {
+		return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(Task).Error; err != nil {
+				return err
+			}
+			return recordAsyncMediaNativeTaskTx(tx, *Task, true)
+		})
+	}
 	return DB.WithContext(ctx).Create(Task).Error
 }
 

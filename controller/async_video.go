@@ -729,7 +729,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				if active.Quota != retryTask.Quota || active.PrivateData.UpstreamTaskID != "" || !active.PrivateData.DurableBilling {
 					return errors.New("video reference recovery reservation changed")
 				}
-				return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()})
+				return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), "local_download")
 			})
 			result, taskErr := relay.RelayTaskSubmit(c, info)
 			if taskErr != nil {
@@ -760,7 +760,11 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"billing_status": "reserving"})
 		})
 		c.Set("async_media_before_dispatch", func(info *relaycommon.RelayInfo) error {
-			return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved"})
+			referenceMode := ""
+			if details := request.RequestDetails(); details != nil && len(details.ReferenceMedia) > 0 {
+				referenceMode = "original"
+			}
+			return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved"}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
 		})
 		_, taskErr := executeTaskSubmissionWith(c, info, relay.RelayTaskSubmit)
 		if taskErr != nil {

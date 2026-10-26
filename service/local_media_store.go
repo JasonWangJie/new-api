@@ -254,13 +254,9 @@ func CleanupMediaObjects(ctx context.Context) error {
 		if err := RemoveAsyncMediaOutput(job); err != nil {
 			return err
 		}
-		changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil, "output_root_path": "", "output_object_key": ""}
-		if job.ReferenceRecoveryStage != "refund" {
-			changes["status"] = "expired"
-		}
 		// Expire private payloads without removing a pending refund from its
 		// queue. Financial completion does not require a live replay envelope.
-		if err := model.DB.WithContext(ctx).Model(&job).Where("lease_expires_at <= ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", now, job.AttemptGeneration, job.ReferenceRecoveryStage).Updates(changes).Error; err != nil {
+		if err := model.ExpireAsyncMediaJob(ctx, job, now); err != nil && !errors.Is(err, model.ErrImageConflict) {
 			return err
 		}
 	}

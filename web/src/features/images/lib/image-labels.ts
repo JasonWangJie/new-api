@@ -106,6 +106,8 @@ export const IMAGE_LABELS: Record<string, string> = {
   mixed: 'Mixed reference transport',
   unknown: 'Unknown',
   remote: 'Upstream URL fetch',
+  original: 'Upstream URL fetch',
+  local_download: 'Server download',
   retry_control_wait: 'Waiting for image retry controls',
   queued: 'Queued',
   invoking: 'Processing',
@@ -119,6 +121,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   failed: 'Failed',
   expired: 'Expired',
   execution_unknown: 'Execution unknown',
+  upstream_unconfirmed: 'Upstream execution could not be confirmed',
   pending: 'Pending',
   not_billable: 'No charge',
   pending_review: 'Pending review',
@@ -179,7 +182,28 @@ export const IMAGE_LABELS: Record<string, string> = {
   local: 'Server download',
   passthrough_fallback_local: 'Upstream fetch with local fallback',
   accepted: 'Queued',
+  selected: 'Selected',
   claimed: 'Task claimed',
+  attempt_started: 'Channel selected',
+  dispatched: 'Dispatched to upstream',
+  submitted: 'Upstream task already accepted',
+  upstream_failed: 'Invocation failed',
+  retry_scheduled: 'Retry scheduled',
+  reference_ready: 'Reference media ready',
+  storage_saving: 'Saving media',
+  storage_ready: 'Output received',
+  storage_stored: 'Storage confirmed',
+  storage_expired: 'Expired',
+  storage_succeeded: 'Storage confirmed',
+  storage_upstream: 'Upstream link',
+  billing_reserving: 'Confirming billing',
+  billing_reserved: 'Reserved',
+  billing_settled: 'Settled',
+  billing_refunded: 'Refunded',
+  billing_unknown: 'Billing status unknown',
+  billing_not_billable: 'No charge',
+  reconciliation: 'Reconciliation status',
+  resume_requested: 'Resumed',
   channel_selected: 'Channel selected',
   upstream_dispatched: 'Dispatched to upstream',
   invocation_failed: 'Invocation failed',
@@ -222,7 +246,11 @@ export function imageTimelineDotClass(event: {
   if (keys.some((key) => ['queued', 'accepted', 'recovered'].includes(key))) {
     return 'bg-warning'
   }
-  if (keys.some((key) => ['succeeded', 'completed', 'settled'].includes(key))) {
+  if (
+    keys.some((key) =>
+      ['succeeded', 'completed', 'settled', 'billing_settled'].includes(key)
+    )
+  ) {
     return 'bg-success'
   }
   if (
@@ -236,6 +264,8 @@ export function imageTimelineDotClass(event: {
         'postprocessing_failed',
         'storage_failed',
         'billing_failed',
+        'upstream_failed',
+        'billing_unknown',
       ].includes(key)
     )
   ) {
