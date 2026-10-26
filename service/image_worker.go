@@ -557,7 +557,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if err != nil {
 			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "invalid_model_mapping", Message: "Image channel model mapping is invalid"}, cfg)
 		}
-		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
+		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
 			return err
@@ -728,11 +728,17 @@ func canRetryAsyncImageSubmission(ctx context.Context, task model.AsyncImageTask
 	if err != nil || reservation == nil || reservation.Status != "reserved" {
 		return false, err
 	}
-	var received int64
-	if err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type IN ?", task.TaskId, []string{"upstream_result_received", "output_received", "upstream_succeeded"}).Count(&received).Error; err != nil {
-		return false, err
+	received, err := hasAsyncImageOutput(ctx, task)
+	return !received, err
+}
+
+func hasAsyncImageOutput(ctx context.Context, task model.AsyncImageTask) (bool, error) {
+	if task.UpstreamSucceededAt > 0 || task.ImageCount > 0 || task.ResultCount > 0 {
+		return true, nil
 	}
-	return received == 0, nil
+	var received int64
+	err := model.DB.WithContext(ctx).Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type IN ?", task.TaskId, []string{"upstream_result_received", "output_received", "upstream_succeeded"}).Count(&received).Error
+	return received > 0, err
 }
 
 func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
@@ -765,6 +771,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	updates := map[string]any{"public_error_code": failure.Code, "error_code": failure.InternalCode, "error_message": failure.Message, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "finished_at": time.Now().Unix(), "next_attempt_at": 0}
 	submissionTransientRetries := 0
 	timeoutRetries := 0
+	mixedTimeoutRetry := false
 	timeoutAttempt := task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && failure.InternalCode == "upstream_transport_timeout"
 	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible" || failure.InternalCode == "upstream_image_submission_rejected"
 	if task.Attempts != "" {
@@ -785,6 +792,9 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			// Selection and capacity failures can occur before a new attempt is
 			// recorded. Never overwrite an earlier completed account failure.
 			if last.FinishedAt == 0 && last.ChannelId == task.ChannelId {
+				// Freeze this policy with the selected attempt. Enabling it later
+				// must never authorize replay of an older uncertain dispatch.
+				mixedTimeoutRetry = last.Dispatched && last.RetryOnTimeout
 				if task.UpstreamTaskId == "" || failure.UpstreamTerminal || task.UpstreamSucceededAt > 0 {
 					last.FinishedAt = time.Now().Unix()
 				}
@@ -806,6 +816,13 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				updates["attempts"] = string(encoded)
 			}
 		}
+	}
+	if mixedRouting && timeoutAttempt && mixedTimeoutRetry {
+		received, err := hasAsyncImageOutput(ctx, task)
+		if err != nil {
+			return err
+		}
+		mixedTimeoutRetry = !received
 	}
 	if acceptedOutput {
 		// The encrypted completion is authoritative. Retry only its local
@@ -845,7 +862,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				updates["request_cipher"] = cipher
 			}
 		}
-	} else if timeoutAttempt && !mixedRouting {
+	} else if timeoutAttempt && (!mixedRouting || mixedTimeoutRetry) {
 		// Unknown execution belongs to the attempt. The task may continue on
 		// another credential under the administrator's bounded retry policy.
 		updates["public_error_code"] = 606

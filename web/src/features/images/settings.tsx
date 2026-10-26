@@ -49,6 +49,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
+import { SettingsSwitchField } from '@/features/system-settings/components/settings-form-layout'
 import { hasPermission } from '@/lib/admin-permissions'
 import { handleServerError } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
@@ -194,6 +195,11 @@ const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
   {
     key: 'account_attempt_timeout_seconds',
     description: 'Maximum time for one upstream account attempt, in seconds.',
+  },
+  {
+    key: 'mixed_timeout_retry_enabled',
+    description:
+      'Disabled by default. New mixed-pool attempts may retry within existing timeout limits, which can cause duplicate upstream generation and charges. Historical unknown tasks are not restarted.',
   },
   {
     key: 'image_concurrency',
@@ -497,7 +503,10 @@ export function ImageRuntimeForm({
   onSuccess: () => Promise<unknown>
 }) {
   const { t } = useTranslation()
-  const [values, setValues] = useState(initial)
+  const [values, setValues] = useState<ImageConfiguration['runtime']>(() => ({
+    mixed_timeout_retry_enabled: false,
+    ...initial,
+  }))
   const [advanced, setAdvanced] = useState('')
   const [busy, setBusy] = useState(false)
   const advancedValues = useMemo(() => {
@@ -570,6 +579,22 @@ export function ImageRuntimeForm({
             </div>
           ))}
         </div>
+        <SettingsSwitchField
+          controlId='mixed_timeout_retry_enabled'
+          checked={values.mixed_timeout_retry_enabled === true}
+          onCheckedChange={(checked) => {
+            setValues((previous) => ({
+              ...previous,
+              mixed_timeout_retry_enabled: checked,
+            }))
+            setAdvanced('')
+          }}
+          label={t('Allow timeout retries in mixed image pools')}
+          description={t(
+            'Disabled by default. New mixed-pool attempts may retry within existing timeout limits, which can cause duplicate upstream generation and charges. Historical unknown tasks are not restarted.'
+          )}
+          disabled={busy}
+        />
         <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
           {RUNTIME_FIELDS.map(({ key, label, min, max }) => (
             <div key={key} className='space-y-2'>

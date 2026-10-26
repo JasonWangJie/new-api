@@ -31,6 +31,7 @@ afterEach(() => {
 
 const runtime = {
   async_enabled: true,
+  mixed_timeout_retry_enabled: false,
   failed_request_retention_hours: 24,
   account_cooldown_seconds: 60,
   supplier_retry_capacity: 10,
@@ -144,6 +145,62 @@ test('saves disabled encrypted retention and bounded retry controls from the run
     )
   )
 })
+
+test('keeps mixed-pool timeout retries disabled when loading a legacy runtime configuration', async () => {
+  vi.mocked(imageRequest).mockResolvedValue(undefined)
+  const legacyRuntime: Record<string, string | number | boolean> = {
+    ...runtime,
+  }
+  delete legacyRuntime.mixed_timeout_retry_enabled
+  render(<ImageRuntimeForm initial={legacyRuntime} onSuccess={vi.fn()} />)
+  const retrySwitch = screen.getByRole('switch', {
+    name: 'Allow timeout retries in mixed image pools',
+  })
+  expect(retrySwitch).not.toBeChecked()
+  expect(retrySwitch).toHaveAccessibleDescription(
+    'Disabled by default. New mixed-pool attempts may retry within existing timeout limits, which can cause duplicate upstream generation and charges. Historical unknown tasks are not restarted.'
+  )
+
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/runtime',
+      'PUT',
+      runtime
+    )
+  )
+})
+
+test.each([false, true])(
+  'saves a keyboard change to mixed-pool timeout retries when initially %s',
+  async (enabled) => {
+    vi.mocked(imageRequest).mockResolvedValue(undefined)
+    render(
+      <ImageRuntimeForm
+        initial={{ ...runtime, mixed_timeout_retry_enabled: enabled }}
+        onSuccess={vi.fn()}
+      />
+    )
+    const retrySwitch = screen.getByRole('switch', {
+      name: 'Allow timeout retries in mixed image pools',
+    })
+    expect(retrySwitch).toHaveAttribute('aria-checked', String(enabled))
+    const user = userEvent.setup()
+    retrySwitch.focus()
+    await user.keyboard(' ')
+    expect(retrySwitch).toHaveAttribute('aria-checked', String(!enabled))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        '/api/option/images/runtime',
+        'PUT',
+        { ...runtime, mixed_timeout_retry_enabled: !enabled }
+      )
+    )
+  }
+)
 
 test('explains every advanced runtime field outside the strict JSON document', async () => {
   const user = userEvent.setup()

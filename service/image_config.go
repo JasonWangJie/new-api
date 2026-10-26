@@ -43,6 +43,7 @@ type ImageRuntimeConfig struct {
 	TransientRetryBase          int    `json:"upstream_transient_retry_base_seconds"`
 	TransientRetryMax           int    `json:"upstream_transient_retry_max_seconds"`
 	TimeoutRetries              int    `json:"upstream_timeout_max_retries"`
+	MixedTimeoutRetryEnabled    bool   `json:"mixed_timeout_retry_enabled"`
 	TimeoutRetryBase            int    `json:"upstream_timeout_retry_base_seconds"`
 	TimeoutRetryMax             int    `json:"upstream_timeout_retry_max_seconds"`
 	CapacityRetries             int    `json:"capacity_max_retries"`
