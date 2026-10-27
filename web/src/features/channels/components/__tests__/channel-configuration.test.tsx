@@ -1605,6 +1605,51 @@ test('a New API channel saves, restores and disables TianYue image compatibility
   )
 })
 
+test('a channel can enable, restore and disable local reference-timeout recovery without changing its transport', async () => {
+  editingChannel.setting = '{"image_reference_transport_mode":"passthrough"}'
+  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, data) => {
+    const payload = data as { setting: string }
+    editingChannel = { ...editingChannel, setting: payload.setting }
+    return { data: { success: true } }
+  })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+
+  const label = 'Retry reference download timeouts locally on this channel'
+  const toggle = screen.getByRole('switch', { name: label })
+  expect(toggle).not.toBeChecked()
+  await user.click(toggle)
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+  expect(JSON.parse(editingChannel.setting || '{}')).toMatchObject({
+    image_reference_timeout_retry_same_channel: true,
+    image_reference_transport_mode: 'passthrough',
+  })
+  expect(
+    transformChannelToFormDefaults({ ...editingChannel, id: 43, setting: '' })
+  ).toHaveProperty('image_reference_timeout_retry_same_channel', false)
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Open channel' }))
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const restored = screen.getByRole('switch', { name: label })
+  expect(restored).toBeChecked()
+  restored.focus()
+  await user.keyboard(' ')
+  expect(restored).not.toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
+  const settings = JSON.parse(editingChannel.setting || '{}')
+  expect(settings).not.toHaveProperty(
+    'image_reference_timeout_retry_same_channel'
+  )
+  expect(settings.image_reference_transport_mode).toBe('passthrough')
+})
+
 test('other providers hide TianYue image compatibility and omit it when saved', async () => {
   editingChannel.setting = '{"tianyue_media_compatibility":true}'
   const put = vi

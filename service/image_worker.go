@@ -557,7 +557,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if err != nil {
 			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "invalid_model_mapping", Message: "Image channel model mapping is invalid"}, cfg)
 		}
-		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
+		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled, RetryReferenceTimeoutLocally: channel.GetSetting().ImageReferenceTimeoutRetrySameChannel, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
 			return err

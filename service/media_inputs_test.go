@@ -7,9 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"image"
 	"image/jpeg"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -135,6 +138,112 @@ func TestMediaInputDownloadLimitsAndRawStorage(t *testing.T) {
 	reader := mediaInputBudgetReader{ctx: cancelled, reader: bytes.NewReader(data), remaining: &remaining}
 	_, err = io.ReadAll(&reader)
 	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestMediaInputDownloadRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason, source string
+		failure              error
+		status, failures     int
+		calls                int
+		partial, limited     bool
+		cancel, retryAfter   bool
+		success              bool
+	}{
+		{name: "timeout then success", failure: context.DeadlineExceeded, failures: 1, calls: 2, success: true},
+		{name: "connection then success", failure: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection reset")}, failures: 1, calls: 2, success: true},
+		{name: "bad gateway then success", status: 502, failures: 1, calls: 2, success: true},
+		{name: "rate limited then success", status: 429, failures: 1, calls: 2, success: true},
+		{name: "interrupted body then success", partial: true, failures: 1, calls: 2, success: true},
+		{name: "exhausted timeout", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts"},
+		{name: "missing source", status: 404, failures: 3, calls: 1, reason: "HTTP 404"},
+		{name: "forbidden source", status: 403, failures: 3, calls: 1, reason: "HTTP 403"},
+		{name: "unsupported source server", status: 501, failures: 3, calls: 1, reason: "HTTP 501"},
+		{name: "security rejection", failure: errors.New("reference resolved to a non-public address"), failures: 3, calls: 1, reason: "request or read failed"},
+		{name: "retry after exceeds budget", status: 429, failures: 3, calls: 1, retryAfter: true, reason: "remaining deadline"},
+		{name: "interrupted bytes remain charged", partial: true, limited: true, failures: 1, calls: 2, reason: "batch byte limit"},
+		{name: "cancel during retry", status: 503, failures: 3, calls: 1, cancel: true, reason: "context canceled"},
+		{name: "private URL", source: "http://127.0.0.1/private?token=private", failures: 3, calls: 0, reason: "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job, cfg, imageCfg := mediaInputFixture(t)
+			data := asyncImageBytesFixture(t).Data
+			input := AsyncVideoReferenceInput{Index: 0, Kind: "image", Source: "https://public.example/reference.png?token=private"}
+			if tc.source != "" {
+				input.Source = tc.source
+			}
+			var remaining atomic.Int64
+			budget := cfg.MaxFileBytes
+			if tc.limited {
+				budget = int64(len(data))
+			}
+			remaining.Store(budget)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			calls := 0
+			client := &http.Client{Transport: mediaInputRoundTripper(func(request *http.Request) (*http.Response, error) {
+				calls++
+				assert.Equal(t, http.MethodGet, request.Method)
+				assert.Empty(t, request.Header.Get("Authorization"))
+				if tc.cancel {
+					cancel()
+				}
+				status := http.StatusOK
+				var body io.Reader = bytes.NewReader(data)
+				if calls <= tc.failures {
+					if tc.failure != nil {
+						return nil, tc.failure
+					}
+					if tc.status != 0 {
+						status = tc.status
+					}
+					if tc.partial {
+						body = io.MultiReader(bytes.NewReader(data[:len(data)/2]), iotest.ErrReader(io.ErrUnexpectedEOF))
+					}
+				}
+				header := http.Header{"Content-Type": {"image/png"}}
+				if tc.retryAfter {
+					header.Set("Retry-After", "3600")
+				}
+				return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(body), ContentLength: int64(len(data)), Request: request}, nil
+			})}
+			object, err := downloadMediaInput(ctx, job, input, cfg, imageCfg, job.ExpiresAt, &remaining, client)
+			assert.Equal(t, tc.calls, calls)
+			if tc.success {
+				require.NoError(t, err)
+				stored, readErr := os.ReadFile(filepath.Join(object.RootPath, object.ObjectKey))
+				require.NoError(t, readErr)
+				assert.Equal(t, data, stored)
+				consumed := int64(len(data))
+				if tc.partial {
+					consumed += int64(len(data) / 2)
+				}
+				assert.Equal(t, budget-consumed, remaining.Load())
+			} else {
+				require.ErrorContains(t, err, tc.reason)
+				assert.NotContains(t, err.Error(), "token=private")
+				assert.NotContains(t, err.Error(), "public.example")
+				notice := VideoTaskFailureNotice("reference 1 (image): " + err.Error())
+				assert.Contains(t, notice.Summary, "本站下载参考素材失败")
+				assert.Contains(t, notice.Suggestion, "原渠道")
+				if tc.cancel {
+					assert.ErrorIs(t, err, context.Canceled)
+				}
+			}
+			objects, listErr := model.ListMediaInputObjects(t.Context(), job.TaskId, job.UserId, job.TokenId)
+			require.NoError(t, listErr)
+			objectCount := 0
+			if tc.success {
+				objectCount = 1
+			}
+			assert.Len(t, objects, objectCount)
+			entries, readErr := os.ReadDir(filepath.Join(cfg.LocalPath, "inputs"))
+			if !os.IsNotExist(readErr) {
+				require.NoError(t, readErr)
+				assert.Len(t, entries, len(objects), "failed attempts must leave no partial files")
+			}
+		})
+	}
 }
 
 func TestMediaInputPreparationPreservesCanonicalSlots(t *testing.T) {

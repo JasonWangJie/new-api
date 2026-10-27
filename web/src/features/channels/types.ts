@@ -88,6 +88,7 @@ export interface ChannelSettings {
   image_attempt_timeout_seconds?: number
   image_concurrency_limit?: number
   tianyue_media_compatibility?: boolean
+  image_reference_timeout_retry_same_channel?: boolean
   image_reference_transport_mode?:
     | ''
     | 'passthrough'

@@ -15,15 +15,16 @@ import (
 )
 
 type ChannelSettings struct {
-	TaskPluginKey               string `json:"task_plugin_key,omitempty"`
-	ForceFormat                 bool   `json:"force_format,omitempty"`
-	ThinkingToContent           bool   `json:"thinking_to_content,omitempty"`
-	ImageMaxReferenceImages     *int   `json:"image_max_reference_images,omitempty"`
-	ImageMaxReferenceBytes      *int64 `json:"image_max_reference_bytes,omitempty"`
-	ImageAttemptTimeoutSeconds  *int   `json:"image_attempt_timeout_seconds,omitempty"`
-	ImageConcurrencyLimit       *int   `json:"image_concurrency_limit,omitempty"`
-	ImageReferenceTransportMode string `json:"image_reference_transport_mode,omitempty"`
-	TianyueMediaCompatibility   bool   `json:"tianyue_media_compatibility,omitempty"`
+	TaskPluginKey                         string `json:"task_plugin_key,omitempty"`
+	ForceFormat                           bool   `json:"force_format,omitempty"`
+	ThinkingToContent                     bool   `json:"thinking_to_content,omitempty"`
+	ImageMaxReferenceImages               *int   `json:"image_max_reference_images,omitempty"`
+	ImageMaxReferenceBytes                *int64 `json:"image_max_reference_bytes,omitempty"`
+	ImageAttemptTimeoutSeconds            *int   `json:"image_attempt_timeout_seconds,omitempty"`
+	ImageConcurrencyLimit                 *int   `json:"image_concurrency_limit,omitempty"`
+	ImageReferenceTransportMode           string `json:"image_reference_transport_mode,omitempty"`
+	ImageReferenceTimeoutRetrySameChannel bool   `json:"image_reference_timeout_retry_same_channel,omitempty"`
+	TianyueMediaCompatibility             bool   `json:"tianyue_media_compatibility,omitempty"`
 	// ImageResolutionModelMapping selects final upstream names for asynchronous
 	// images only. A configured model cannot use a tier absent from its map.
 	ImageResolutionModelMapping ImageResolutionModelMapping `json:"image_resolution_model_mapping,omitempty"`

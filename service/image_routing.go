@@ -1108,6 +1108,7 @@ type ImageChannelAttempt struct {
 	Dispatched                   bool                `json:"dispatched"`
 	TimedOut                     bool                `json:"timed_out,omitempty"`
 	RetryOnTimeout               bool                `json:"retry_on_timeout,omitempty"`
+	RetryReferenceTimeoutLocally bool                `json:"retry_reference_timeout_locally,omitempty"`
 	SynchronousRetryableResponse bool                `json:"synchronous_retryable_response,omitempty"`
 	ReferenceMode                string              `json:"reference_mode"`
 	TransportUsed                string              `json:"reference_transport_used,omitempty"`
@@ -1189,6 +1190,20 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	lastCompatibilityCode := imageAttemptCompatibilityCode(lastAttempt)
 	lastIncompatible := lastCompatibilityCode != ""
 	lastReferenceSizeRejection := lastAttempt.Code == 603 && lastAttempt.HTTPStatus == http.StatusBadRequest && lastCompatibilityCode == "upstream_image_reference_incompatible" && imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(lastAttempt.ErrorMessage))
+	if lastReferenceFetchFailure && lastAttempt.RetryReferenceTimeoutLocally && !lastAttempt.ReferenceFallback && lastAttempt.ReferenceMode != "local" &&
+		(lastAttempt.TransportUsed == "remote" || lastAttempt.TransportUsed == "mixed") && IsImageReferenceDownloadTimeout(&AsyncImageFailure{Code: lastAttempt.Code, Message: lastAttempt.ErrorMessage}) {
+		localAttempted := slices.ContainsFunc(attempts, func(attempt ImageChannelAttempt) bool {
+			return attempt.ChannelId == lastAttempt.ChannelId && attempt.Dispatched && attempt.ReferenceFallback && attempt.ReferenceMode == "local"
+		})
+		if !localAttempted {
+			// This channel opted into one local recovery before pool rotation.
+			// Keep credential exclusions and cooldowns; pinning the channel must
+			// not authorize another dispatch while its only account is cooling.
+			routing.Pin, routing.AvoidChannel = "", 0
+			routing.PinChannel, routing.Avoid = lastAttempt.ChannelId, lastAttempt.KeyFingerprint
+			return routing
+		}
+	}
 	if legacy {
 		if !routing.WaitForCooldown {
 			routing.PinChannel, routing.ExcludedChannels, routing.Stop = ImageAttemptRouting(attempts, effectiveRetries)

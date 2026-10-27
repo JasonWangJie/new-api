@@ -282,6 +282,7 @@ const SENSITIVE_FORM_FIELDS = [
   'http2_connection_shards',
   'image_max_reference_images',
   'image_reference_transport_mode',
+  'image_reference_timeout_retry_same_channel',
   'tianyue_media_compatibility',
   'image_resolution_model_mapping',
   'image_max_reference_bytes',
@@ -2097,6 +2098,33 @@ export function ChannelMutateDrawer({
                 )}
               </FormDescription>
               <FormMessage />
+            </FormItem>
+          )}
+        />
+        <FormField
+          control={form.control}
+          name='image_reference_timeout_retry_same_channel'
+          render={({ field }) => (
+            <FormItem className='flex items-center justify-between gap-4 sm:col-span-2'>
+              <div className='space-y-0.5'>
+                <FormLabel>
+                  {t(
+                    'Retry reference download timeouts locally on this channel'
+                  )}
+                </FormLabel>
+                <FormDescription>
+                  {t(
+                    'After a confirmed upstream reference-image download timeout, download the image here and retry this channel. Another account may be used; otherwise wait for cooldown.'
+                  )}
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Switch
+                  checked={field.value === true}
+                  onCheckedChange={field.onChange}
+                  disabled={sensitiveLocked || isSubmitting}
+                />
+              </FormControl>
             </FormItem>
           )}
         />

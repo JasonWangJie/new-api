@@ -498,7 +498,12 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 		earlierAlternateTimeout bool
 		failureMessage          string
 		gemini                  bool
+		localTimeoutRetry       bool
+		alternateAvailable      bool
 	}{
+		{name: "channel timeout preference keeps the original channel with healthy alternatives", sameChannel: true, alternateAvailable: true, localTimeoutRetry: true},
+		{name: "channel timeout preference selects another original channel account", sameChannel: true, alternateAvailable: true, otherKey: true, localTimeoutRetry: true},
+		{name: "channel timeout preference does not affect unreachable references", localTimeoutRetry: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
 		{name: "single pool switches channel with original URL", channelMode: "passthrough"},
 		{name: "mixed pool switches channel with original URL", mixed: true, channelMode: "passthrough"},
 		{name: "new channel does not inherit global local fallback"},
@@ -542,7 +547,9 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			if tc.sameChannel {
 				target = model.Channel{}
 				require.NoError(t, db.First(&target, task.ChannelId).Error)
-				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+				if !tc.alternateAvailable {
+					require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
+				}
 			}
 			if tc.otherKey {
 				target.Key += "\nnext-account"
@@ -551,6 +558,18 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			}
 			target.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: tc.channelMode})
 			require.NoError(t, db.Model(&target).Update("setting", target.Setting).Error)
+			if tc.localTimeoutRetry {
+				var original model.Channel
+				require.NoError(t, db.First(&original, task.ChannelId).Error)
+				settings := make(map[string]any)
+				if original.Setting != nil {
+					require.NoError(t, common.UnmarshalJsonStr(*original.Setting, &settings))
+				}
+				settings["image_reference_timeout_retry_same_channel"] = true
+				encoded, err := common.Marshal(settings)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&original).Update("setting", string(encoded)).Error)
+			}
 			if tc.mixed {
 				var policy model.ImageGroupPolicy
 				require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&policy).Error)
@@ -567,7 +586,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			require.NoError(t, err)
 			task.DispatchedAt, task.UpstreamTaskId = time.Now().Unix(), "failed-reference-job"
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
-			initialHistory := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote"}}
+			initialHistory := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote", RetryReferenceTimeoutLocally: tc.localTimeoutRetry}}
 			if tc.gemini {
 				task.DispatchedAt, task.UpstreamTaskId, initialHistory = 0, "", nil
 			}
@@ -669,6 +688,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 				assert.Equal(t, "failed-reference-job", history[len(history)-2].UpstreamTaskID)
 			}
 			assert.Equal(t, tc.sameChannel, history[len(history)-1].ReferenceFallback)
+			assert.Equal(t, tc.localTimeoutRetry && tc.sameChannel, history[len(history)-1].RetryReferenceTimeoutLocally)
 			if tc.sameChannel {
 				assert.Equal(t, "local", history[len(history)-1].ReferenceMode)
 			} else {
@@ -2608,6 +2628,33 @@ func TestAsyncImageReferenceTimeoutWaitsForCooldown(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, alternate.Id, selected.Id, "earlier reference failures must not pin a timed-out channel")
 	}
+	t.Run("channel preference respects capacity and stops pinning after local dispatch", func(t *testing.T) {
+		remote := ImageChannelAttempt{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, FinishedAt: time.Now().Unix(), ReferenceFailure: true, Code: 602, ErrorMessage: "参考素材下载超时（建连>4s 或读取>15s）", TransportUsed: "remote", RetryReferenceTimeoutLocally: true}
+		routing := ImageAccountAttemptRouting([]ImageChannelAttempt{remote}, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+		assert.Equal(t, task.ChannelId, routing.PinChannel)
+		assert.Equal(t, fingerprint, routing.Avoid)
+		require.True(t, routing.WaitForCooldown)
+		selected, _, err := PickImageChannel(t.Context(), policy, request, routing)
+		require.NoError(t, err)
+		assert.Equal(t, task.ChannelId, selected.Id)
+		assert.Equal(t, "next-account", selected.Key)
+		slotKey := ImageChannelConcurrencyKey(task.ChannelId)
+		slots := make([]*redis.Z, cfg.ImageConcurrency)
+		for i := range slots {
+			slots[i] = &redis.Z{Score: float64(time.Now().Unix() + 60), Member: strconv.Itoa(i)}
+		}
+		require.NoError(t, common.RDB.ZAdd(t.Context(), slotKey, slots...).Err())
+		_, _, err = PickImageChannel(t.Context(), policy, request, routing)
+		assert.ErrorIs(t, err, ErrImageLocalCapacityBusy, "a full original channel must wait instead of silently switching channels")
+		require.NoError(t, common.RDB.Del(t.Context(), slotKey).Err())
+		local := remote
+		local.ReferenceMode, local.TransportUsed, local.ReferenceFallback = "local", "local", true
+		routing = ImageAccountAttemptRouting([]ImageChannelAttempt{remote, local}, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+		assert.Zero(t, routing.PinChannel)
+		selected, _, err = PickImageChannel(t.Context(), policy, request, routing)
+		require.NoError(t, err)
+		assert.Equal(t, alternate.Id, selected.Id, "a failed local dispatch returns to bounded pool rotation")
+	})
 }
 
 func TestAsyncImageWorkerTimeoutPreservesExecutionBarriers(t *testing.T) {

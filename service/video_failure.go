@@ -89,6 +89,9 @@ func VideoTaskFailureNotice(raw string) VideoFailureNotice {
 	case strings.Contains(lower, "generated video could not be saved locally") || lower == "storage_failed":
 		notice.Summary = "视频结果未能保存到本地。"
 		notice.Suggestion = "请联系管理员检查本地存储，并优先恢复现有视频结果的保存；不要重复发起视频生成。"
+	case strings.Contains(lower, "local reference media download"):
+		notice.Summary = "本站下载参考素材失败，未能再次向上游提交视频生成。"
+		notice.Suggestion = "请检查素材链接的有效期及本站到素材源的网络连接；下载成功后才能在原渠道重试。"
 	case strings.Contains(lower, "billing settlement failed") || lower == "billing_failed":
 		notice.Summary = "视频任务结算失败。"
 		notice.Suggestion = "请保留任务号并联系管理员核查结算记录；此错误不能用于判断上游是否已生成视频。"

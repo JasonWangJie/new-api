@@ -31,6 +31,20 @@ import (
 
 var ErrMediaInputUnavailable = errors.New("reference media is unavailable")
 
+var errMediaInputDownloadTransient = errors.New("temporary reference media download failure")
+var errMediaInputBatchLimit = errors.New("reference media batch byte limit exceeded")
+
+type mediaInputRetryAfterError struct {
+	status int
+	delay  time.Duration
+}
+
+func (err *mediaInputRetryAfterError) Error() string {
+	return fmt.Sprintf("temporary reference media download failure: HTTP %d", err.status)
+}
+
+func (err *mediaInputRetryAfterError) Unwrap() error { return errMediaInputDownloadTransient }
+
 var mediaInputDataURIPattern = regexp.MustCompile(`^data:[^;,]+;base64,[A-Za-z0-9+/]+={0,2}$`)
 
 // PrepareAsyncVideoLocalReferences replaces only frozen canonical reference
@@ -76,7 +90,7 @@ func PrepareAsyncVideoLocalReferences(ctx context.Context, job model.AsyncMediaJ
 	var remaining atomic.Int64
 	remaining.Store(cfg.MaxFileBytes)
 	objects := make([]*model.MediaInputObject, len(request.ReferenceInputs))
-	client := mediaInputClient(cfg, imageCfg, net.DefaultResolver, (&net.Dialer{Timeout: time.Duration(cfg.DownloadTimeout) * time.Second}).DialContext)
+	client := mediaInputClient(cfg, imageCfg, net.DefaultResolver, (&net.Dialer{Timeout: time.Duration(min(cfg.DownloadTimeout, imageCfg.DownloadTimeout)) * time.Second}).DialContext)
 	defer client.CloseIdleConnections()
 	// The outer media download pool owns the shared concurrency budget. A
 	// serial batch cannot multiply that global limit by its reference count.
@@ -158,14 +172,55 @@ func (reader *mediaInputBudgetReader) Read(target []byte) (int, error) {
 	}
 	n, err := reader.reader.Read(target)
 	if n > 0 && !reserveMediaInputBytes(reader.remaining, int64(n)) {
-		return 0, errors.New("reference media batch byte limit exceeded")
+		return 0, errMediaInputBatchLimit
 	}
 	return n, err
 }
 
 func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input AsyncVideoReferenceInput, cfg MediaRuntimeConfig, imageCfg ImageRuntimeConfig, expiresAt int64, remaining *atomic.Int64, client *http.Client) (model.MediaInputObject, error) {
+	// Retries are safe material GETs, not additional video submissions. Keep
+	// one deadline and byte budget even when an interrupted body is discarded.
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
 	defer cancel()
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", err)
+		}
+		attemptTimeout := cfg.DownloadTimeout
+		if input.Kind == "image" {
+			attemptTimeout = min(attemptTimeout, imageCfg.DownloadTimeout)
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Duration(attemptTimeout)*time.Second)
+		object, err := downloadMediaInputAttempt(attemptCtx, job, input, cfg, imageCfg, expiresAt, remaining, client)
+		attemptCancel()
+		if err == nil {
+			return object, nil
+		}
+		if ctx.Err() != nil {
+			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", ctx.Err())
+		}
+		if attempt == 3 || !errors.Is(err, errMediaInputDownloadTransient) {
+			return model.MediaInputObject{}, fmt.Errorf("local reference media download failed after %d attempts: %w", attempt, err)
+		}
+		delay := time.Duration(attempt) * time.Second
+		var retryAfter *mediaInputRetryAfterError
+		if errors.As(err, &retryAfter) {
+			delay = max(delay, retryAfter.delay)
+		}
+		if deadline, ok := ctx.Deadline(); ok && delay >= time.Until(deadline) {
+			return model.MediaInputObject{}, fmt.Errorf("local reference media download retry exceeds remaining deadline: %w", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func downloadMediaInputAttempt(ctx context.Context, job model.AsyncMediaJob, input AsyncVideoReferenceInput, cfg MediaRuntimeConfig, imageCfg ImageRuntimeConfig, expiresAt int64, remaining *atomic.Int64, client *http.Client) (model.MediaInputObject, error) {
 	urlValue, err := validateMediaInputURL(input.Source)
 	if err != nil {
 		return model.MediaInputObject{}, ErrMediaInputUnavailable
@@ -177,14 +232,21 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 	req.Header.Set("Accept-Encoding", "identity")
 	response, err := client.Do(req)
 	if err != nil {
-		return model.MediaInputObject{}, errors.New("reference media download failed")
+		return model.MediaInputObject{}, mediaInputDownloadFailure(ctx, err)
 	}
 	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return model.MediaInputObject{}, &mediaInputRetryAfterError{status: response.StatusCode, delay: ImageRetryAfter(response.Header.Get("Retry-After"), time.Now())}
+	case http.StatusOK:
+	default:
+		return model.MediaInputObject{}, fmt.Errorf("reference media returned HTTP %d", response.StatusCode)
+	}
 	limit := cfg.MaxFileBytes
 	if input.Kind == "image" {
 		limit = min(limit, imageCfg.DownloadMaxBytes)
 	}
-	if response.StatusCode != http.StatusOK || response.ContentLength > limit || response.Header.Get("Content-Encoding") != "" && response.Header.Get("Content-Encoding") != "identity" {
+	if response.ContentLength > limit || response.Header.Get("Content-Encoding") != "" && response.Header.Get("Content-Encoding") != "identity" {
 		return model.MediaInputObject{}, errors.New("reference media response is unavailable or exceeds limits")
 	}
 	rootPath, err := filepath.Abs(filepath.Join(cfg.LocalPath, "inputs"))
@@ -211,9 +273,12 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 	reader := &mediaInputBudgetReader{reader: io.LimitReader(response.Body, limit+1), remaining: remaining, ctx: ctx}
 	size, err := io.Copy(io.MultiWriter(file, hash), reader)
 	if err != nil {
-		return model.MediaInputObject{}, err
+		return model.MediaInputObject{}, mediaInputDownloadFailure(ctx, err)
 	}
-	if size <= 0 || size > limit || response.ContentLength >= 0 && response.ContentLength != size {
+	if response.ContentLength > size && size <= limit {
+		return model.MediaInputObject{}, fmt.Errorf("%w: truncated response", errMediaInputDownloadTransient)
+	}
+	if size <= 0 || size > limit || response.ContentLength >= 0 && size > response.ContentLength {
 		return model.MediaInputObject{}, errors.New("truncated or oversized reference media")
 	}
 	contentType, extension, err := ValidateMediaInputFile(ctx, file, size, input.Kind, response.Header.Get("Content-Type"), imageCfg)
@@ -238,6 +303,33 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 	return saved, err
 }
 
+// Classify without retaining URL-bearing transport errors or source response
+// bodies. Policy, validation and filesystem failures must not authorize retries.
+func mediaInputDownloadFailure(ctx context.Context, err error) error {
+	if errors.Is(err, errMediaInputBatchLimit) {
+		return errMediaInputBatchLimit
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return context.Canceled
+	}
+	var fileError *os.PathError
+	if errors.As(err, &fileError) {
+		return errors.New("reference media local write failed")
+	}
+	var networkError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+		return fmt.Errorf("%w: timeout", errMediaInputDownloadTransient)
+	}
+	var connectionError *net.OpError
+	if errors.As(err, &connectionError) {
+		return fmt.Errorf("%w: connection failure", errMediaInputDownloadTransient)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: interrupted response", errMediaInputDownloadTransient)
+	}
+	return errors.New("reference media request or read failed")
+}
+
 func validateMediaInputURL(raw string) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || len(raw) > 8192 || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || strings.Contains(raw, "\\") || strings.ContainsFunc(raw, unicode.IsSpace) || strings.ContainsFunc(raw, unicode.IsControl) {
@@ -254,8 +346,11 @@ func validateMediaInputURL(raw string) (*url.URL, error) {
 }
 
 func mediaInputClient(cfg MediaRuntimeConfig, imageCfg ImageRuntimeConfig, resolver imageReferenceResolver, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
-	imageCfg.DownloadTimeout = cfg.DownloadTimeout
+	imageCfg.DownloadTimeout = min(cfg.DownloadTimeout, imageCfg.DownloadTimeout)
 	client := imageReferenceClient(imageCfg, resolver, dial)
+	// Large video/audio bodies retain the media timeout, while connection and
+	// response headers use the shorter reference timeout to leave retry room.
+	client.Timeout = time.Duration(cfg.DownloadTimeout) * time.Second
 	client.CheckRedirect = func(redirect *http.Request, previous []*http.Request) error {
 		if len(previous) > imageCfg.DownloadRedirects {
 			return errors.New("reference media redirect limit exceeded")

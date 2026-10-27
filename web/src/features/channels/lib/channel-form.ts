@@ -365,6 +365,7 @@ export const channelFormSchema = z
       .enum(['', 'passthrough', 'local', 'passthrough_fallback_local'])
       .optional(),
     tianyue_media_compatibility: z.boolean().optional(),
+    image_reference_timeout_retry_same_channel: z.boolean().optional(),
     image_resolution_model_mapping: imageResolutionMappingSchema.optional(),
     image_max_reference_bytes: imageChannelLimitSchema(
       IMAGE_CHANNEL_EXECUTION_LIMITS.image_max_reference_bytes
@@ -568,6 +569,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   image_reference_transport_mode: '',
   tianyue_media_compatibility: false,
+  image_reference_timeout_retry_same_channel: false,
   image_resolution_model_mapping: [],
   image_max_reference_bytes: undefined,
   image_attempt_timeout_seconds: undefined,
@@ -620,6 +622,7 @@ export function transformChannelToFormDefaults(
       ChannelFormValues['image_reference_transport_mode']
     >,
     tianyue_media_compatibility: false,
+    image_reference_timeout_retry_same_channel: false,
     image_resolution_model_mapping: [] as NonNullable<
       ChannelFormValues['image_resolution_model_mapping']
     >,
@@ -655,6 +658,8 @@ export function transformChannelToFormDefaults(
         tianyue_media_compatibility:
           channel.type === CHANNEL_TYPE_NEW_API &&
           parsed.tianyue_media_compatibility === true,
+        image_reference_timeout_retry_same_channel:
+          parsed.image_reference_timeout_retry_same_channel === true,
         image_reference_transport_mode: [
           'passthrough',
           'local',
@@ -842,6 +847,9 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   if (formData.image_reference_transport_mode) {
     settingObj.image_reference_transport_mode =
       formData.image_reference_transport_mode
+  }
+  if (formData.image_reference_timeout_retry_same_channel === true) {
+    settingObj.image_reference_timeout_retry_same_channel = true
   }
   if (
     formData.type === CHANNEL_TYPE_NEW_API &&
