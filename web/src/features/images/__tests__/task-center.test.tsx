@@ -28,7 +28,7 @@ import {
 import userEvent from '@testing-library/user-event'
 import i18next from 'i18next'
 import { toast, Toaster } from 'sonner'
-import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, assert, beforeEach, expect, test, vi } from 'vitest'
 
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
 import en from '@/i18n/locales/en.json'
@@ -1929,6 +1929,69 @@ test.each([
 )
 
 test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'task lists show requested video duration and resolution without substituting output size (admin=$admin mobile=$mobile)',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    const video: ImageTask = {
+      ...task,
+      id: 'video_requested_specifications',
+      media_type: 'video',
+      model: 'video-model',
+      requested_seconds: 8,
+      requested_resolution: '720p',
+      requested_size: '',
+      actual_size: '1920x1080',
+    }
+    const resolutionOnly: ImageTask = {
+      ...video,
+      id: 'video_resolution_only',
+      requested_seconds: undefined,
+      requested_resolution: '',
+      requested_size: '1280x720',
+    }
+    const unavailable: ImageTask = {
+      ...resolutionOnly,
+      id: 'video_missing_specifications',
+      requested_size: '',
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [video, resolutionOnly, unavailable, task],
+      total: 4,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: video.id })
+    for (const [id, expected] of [
+      [video.id, '8s · 720p'],
+      [resolutionOnly.id, '1280x720'],
+      [unavailable.id, '—'],
+      [task.id, '2K'],
+    ]) {
+      const container = mobile
+        ? screen.getByRole('article', { name: id })
+        : screen.getByRole('button', { name: id }).closest('tr')
+      assert(container)
+      const specifications = mobile
+        ? within(container).getByText('Resolution').nextElementSibling
+        : within(container).getByText(id === task.id ? task.model : video.model)
+            .parentElement
+      assert(specifications)
+      expect(specifications).toHaveTextContent(expected)
+      if (id !== task.id) {
+        expect(container).not.toHaveTextContent('1920x1080')
+        expect(container).not.toHaveTextContent('undefined')
+      }
+    }
+  }
+)
+
+test.each([
   { admin: false, scope: 'user' },
   { admin: true, scope: 'administrator' },
 ])(
@@ -2254,7 +2317,7 @@ test.each([
   { admin: true, mobile: false },
   { admin: false, mobile: true },
 ])(
-  'video details show requested duration and reference links and open original parameters on demand (admin=$admin mobile=$mobile)',
+  'video details show requested duration and resolution before reference links and open original parameters on demand (admin=$admin mobile=$mobile)',
   async ({ admin, mobile }) => {
     if (mobile) setMobileViewport()
     const parameters = {
@@ -2270,6 +2333,8 @@ test.each([
         ...task,
         media_type: 'video',
         requested_seconds: 8,
+        requested_resolution: '720p',
+        actual_size: '1920x1080',
         request_parameters: parameters,
         reference_media: [
           { type: 'image', url: 'https://example.com/first-frame.png' },
@@ -2294,7 +2359,16 @@ test.each([
       name: 'Media task details',
     })
     expect(await within(details).findByText('Requested duration')).toBeVisible()
-    expect(within(details).getByText('8s')).toBeVisible()
+    const requestedSpecifications = within(details)
+      .getByText('Requested duration')
+      .closest('dl')
+    assert(requestedSpecifications)
+    expect(within(requestedSpecifications).getByText('8s')).toBeVisible()
+    expect(
+      within(requestedSpecifications).getByText('Resolution').nextElementSibling
+    ).toHaveTextContent('720p')
+    expect(requestedSpecifications).toHaveTextContent(/8s.*Resolution.*720p/)
+    expect(requestedSpecifications).not.toHaveTextContent('1920x1080')
     expect(within(details).getByText('Time spent')).toBeVisible()
     for (const reference of [
       {

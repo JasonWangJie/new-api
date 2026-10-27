@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { TFunction } from 'i18next'
+
 import type { ImageTask, ImageTaskList } from '../types'
 
 const FINAL_ISSUE_STATUSES = new Set([
@@ -168,6 +170,22 @@ export function imageTaskSpecifications(task: ImageTask): string {
     return `${requested} → ${task.actual_size}`
   }
   return task.actual_size || requested || '—'
+}
+
+export function imageTaskListSpecifications(
+  task: ImageTask,
+  t: TFunction
+): string {
+  if (task.media_type !== 'video') return imageTaskSpecifications(task)
+  const duration =
+    task.requested_seconds != null
+      ? t('{{seconds}}s', { seconds: task.requested_seconds })
+      : ''
+  return (
+    [duration, task.requested_resolution || task.requested_size]
+      .filter(Boolean)
+      .join(' · ') || '—'
+  )
 }
 
 export function imageTaskSuccessRate(

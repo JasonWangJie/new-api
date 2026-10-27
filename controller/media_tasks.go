@@ -410,24 +410,21 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	// Request payloads are owner/admin detail data only. Public polling and list
-	// views never decrypt requests or include caller-owned signed reference URLs.
-	if job.ExpiresAt > time.Now().Unix() && len(job.RequestCipher) > 0 {
-		plain, decryptErr := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
-		var request service.AsyncVideoRequest
-		if decryptErr == nil && common.Unmarshal(plain, &request) == nil {
-			if details := request.RequestDetails(); details != nil {
-				if details.RequestedSeconds != nil {
-					view["requested_seconds"] = *details.RequestedSeconds
-				}
-				if len(details.ReferenceMedia) > 0 {
-					view["reference_media"] = details.ReferenceMedia
-				}
-				view["request_parameters"] = details.RequestParameters
-				if prompt, ok := details.RequestParameters["prompt"].(string); ok {
-					view["prompt_summary"] = service.SanitizeAsyncImageText(prompt, 512)
-				}
-			}
+	// Complete request parameters and caller-owned signed reference URLs remain
+	// owner/admin detail data. Management lists project specifications only.
+	if details := videoJobRequestDetails(job); details != nil {
+		if details.RequestedSeconds != nil {
+			view["requested_seconds"] = *details.RequestedSeconds
+		}
+		if details.RequestedResolution != "" {
+			view["requested_resolution"] = details.RequestedResolution
+		}
+		if len(details.ReferenceMedia) > 0 {
+			view["reference_media"] = details.ReferenceMedia
+		}
+		view["request_parameters"] = details.RequestParameters
+		if prompt, ok := details.RequestParameters["prompt"].(string); ok {
+			view["prompt_summary"] = service.SanitizeAsyncImageText(prompt, 512)
 		}
 	}
 	events, err := videoTaskAudit(c, job, view, admin)
@@ -436,6 +433,23 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		return
 	}
 	imageManagementData(c, gin.H{"task": view, "results": results, "events": events})
+}
+
+// videoJobRequestDetails uses the already-loaded encrypted request, without
+// additional database reads or inferring missing historical request settings.
+func videoJobRequestDetails(job model.AsyncMediaJob) *service.AsyncVideoRequestDetails {
+	if job.ExpiresAt <= time.Now().Unix() || len(job.RequestCipher) == 0 {
+		return nil
+	}
+	plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+	if err != nil {
+		return nil
+	}
+	var request service.AsyncVideoRequest
+	if common.Unmarshal(plain, &request) != nil {
+		return nil
+	}
+	return request.RequestDetails()
 }
 
 // videoTaskAudit projects only persisted milestones. In particular, a native
@@ -936,6 +950,14 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		if err != nil {
 			imageManagementError(c, 503, err)
 			return
+		}
+		if details := videoJobRequestDetails(job); details != nil {
+			if details.RequestedSeconds != nil {
+				view["requested_seconds"] = *details.RequestedSeconds
+			}
+			if details.RequestedResolution != "" {
+				view["requested_resolution"] = details.RequestedResolution
+			}
 		}
 		byID[job.TaskId] = view
 	}

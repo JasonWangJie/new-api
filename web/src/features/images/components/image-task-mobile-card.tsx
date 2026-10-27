@@ -28,7 +28,7 @@ import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { imageLabel } from '../lib/image-labels'
 import {
   imageTaskElapsedSeconds,
-  imageTaskSpecifications,
+  imageTaskListSpecifications,
   imageTaskIssue,
   imageTaskProgress,
   imageTaskUpstreamProgress,
@@ -149,7 +149,7 @@ export function ImageTaskMobileCard(props: {
         <div>
           <dt>{t('Resolution')}</dt>
           <dd>
-            {imageTaskSpecifications(task)}
+            {imageTaskListSpecifications(task, t)}
             {task.aspect_ratio && (
               <span className='text-muted-foreground block font-normal'>
                 {task.aspect_ratio}

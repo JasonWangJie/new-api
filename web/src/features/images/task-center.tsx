@@ -77,7 +77,7 @@ import { ImageTaskRefreshActions } from './components/image-task-refresh-actions
 import { imageLabel } from './lib/image-labels'
 import {
   imageTaskElapsedSeconds,
-  imageTaskSpecifications,
+  imageTaskListSpecifications,
   imageTaskSuccessRate,
   imageTaskIssue,
   imageTaskProgress,
@@ -308,7 +308,7 @@ function TaskCenterSession({
               {row.original.model}
             </p>
             <p className='text-muted-foreground whitespace-normal'>
-              {imageTaskSpecifications(row.original)}{' '}
+              {imageTaskListSpecifications(row.original, t)}{' '}
               {row.original.aspect_ratio}
             </p>
           </div>

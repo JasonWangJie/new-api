@@ -440,6 +440,10 @@ export function ImageTaskDetails(props: {
                     ? t('{{seconds}}s', { seconds: data.requested_seconds })
                     : '—'}
                 </dd>
+                <dt className='text-muted-foreground'>{t('Resolution')}</dt>
+                <dd className='font-semibold tabular-nums'>
+                  {data.requested_resolution || data.requested_size || '—'}
+                </dd>
               </dl>
             )}
             {data.prompt_summary && (

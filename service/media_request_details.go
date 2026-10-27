@@ -8,6 +8,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,9 +22,10 @@ import (
 // AsyncVideoRequestDetails contains only client-supplied display data. The
 // channel, credentials, execution and billing snapshots never belong here.
 type AsyncVideoRequestDetails struct {
-	RequestedSeconds  *float64                   `json:"requested_seconds,omitempty"`
-	ReferenceMedia    []AsyncVideoReferenceMedia `json:"reference_media,omitempty"`
-	RequestParameters map[string]any             `json:"request_parameters,omitempty"`
+	RequestedSeconds    *float64                   `json:"requested_seconds,omitempty"`
+	RequestedResolution string                     `json:"requested_resolution,omitempty"`
+	ReferenceMedia      []AsyncVideoReferenceMedia `json:"reference_media,omitempty"`
+	RequestParameters   map[string]any             `json:"request_parameters,omitempty"`
 }
 
 type AsyncVideoReferenceMedia struct {
@@ -35,7 +37,9 @@ type AsyncVideoReferenceMedia struct {
 // snapshots retained after submission. Uploaded bytes are never included.
 func (request AsyncVideoRequest) RequestDetails() *AsyncVideoRequestDetails {
 	if request.Details != nil {
-		return request.Details
+		details := *request.Details
+		details.populateSpecifications()
+		return &details
 	}
 	var parameters map[string]any
 	mediaType, params, err := mime.ParseMediaType(request.ContentType)
@@ -89,18 +93,37 @@ func (request AsyncVideoRequest) RequestDetails() *AsyncVideoRequestDetails {
 	sanitizer := asyncVideoRequestSanitizer{remaining: 256 << 10, nodes: 4096}
 	parameters = sanitizer.sanitize(parameters, 0).(map[string]any)
 	details := &AsyncVideoRequestDetails{RequestParameters: parameters}
-	// Check only generation settings, never durations of reference material or
+	details.populateSpecifications()
+	details.collectReferenceMedia(parameters, "", make(map[string]bool))
+	return details
+}
+
+var asyncVideoResolutionPattern = regexp.MustCompile(`(?i)^(?:[1-9][0-9]{1,4}p|[1-9](?:\.[0-9])?k|[1-9][0-9]{1,4}[x×][1-9][0-9]{1,4}|auto|sd|hd|fhd|qhd|uhd)$`)
+
+// populateSpecifications also supports historical display snapshots, which
+// retained generation parameters before the resolution field was introduced.
+func (details *AsyncVideoRequestDetails) populateSpecifications() {
+	// Check only generation settings, never specifications of reference material or
 	// inferred billing ratios, which need not equal the user's requested length.
+	parameters := details.RequestParameters
 	settings := []map[string]any{parameters}
 	for _, key := range []string{"parameters", "metadata", "input"} {
 		if nested, ok := parameters[key].(map[string]any); ok {
 			settings = append(settings, nested)
-			if nestedParameters, ok := nested["parameters"].(map[string]any); ok {
-				settings = append(settings, nestedParameters)
+			for _, nestedKey := range []string{"parameters", "metadata", "input"} {
+				if nestedSetting, ok := nested[nestedKey].(map[string]any); ok {
+					settings = append(settings, nestedSetting)
+				}
 			}
 		}
 	}
+	if seconds := details.RequestedSeconds; seconds != nil && (math.IsNaN(*seconds) || math.IsInf(*seconds, 0) || *seconds <= 0 || *seconds > relaycommon.MaxTaskDurationSeconds) {
+		details.RequestedSeconds = nil
+	}
 	for _, setting := range settings {
+		if details.RequestedSeconds != nil {
+			break
+		}
 		for _, key := range []string{"seconds", "duration"} {
 			value, exists := setting[key]
 			if !exists {
@@ -118,12 +141,28 @@ func (request AsyncVideoRequest) RequestDetails() *AsyncVideoRequestDetails {
 				break
 			}
 		}
-		if details.RequestedSeconds != nil {
-			break
+	}
+	resolution := strings.TrimSpace(details.RequestedResolution)
+	if len(resolution) <= 32 && asyncVideoResolutionPattern.MatchString(resolution) {
+		details.RequestedResolution = resolution
+		return
+	}
+	details.RequestedResolution = ""
+	// Prefer a named resolution tier to a pixel-size fallback, even when the
+	// tier is nested inside the generation parameters.
+	for _, key := range []string{"resolution", "size"} {
+		for _, setting := range settings {
+			resolution, ok := setting[key].(string)
+			if !ok {
+				continue
+			}
+			resolution = strings.TrimSpace(resolution)
+			if len(resolution) <= 32 && asyncVideoResolutionPattern.MatchString(resolution) {
+				details.RequestedResolution = resolution
+				return
+			}
 		}
 	}
-	details.collectReferenceMedia(parameters, "", make(map[string]bool))
-	return details
 }
 
 type asyncVideoRequestSanitizer struct {

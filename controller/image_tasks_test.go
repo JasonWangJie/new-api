@@ -1451,7 +1451,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
 				request := service.AsyncVideoRequest{
-					Body:        []byte(`{"model":"video-model","prompt":"A cinematic landscape","seconds":"8","image":"https://cdn.example.com/input.png?signature=owner-signature","reference_images":["https://cdn.example.com/input.png?signature=owner-signature"],"metadata":{"content":[{"type":"video_url","video_url":{"url":"https://cdn.example.com/reference.mp4"}},{"type":"audio_url","audio_url":{"url":"https://cdn.example.com/sound.mp3"}}],"authorization":"nested-secret-canary"},"watermark":false,"seed":0,"api_key":"body-key-canary","image_base64":"binary-canary"}`),
+					Body:        []byte(`{"model":"video-model","prompt":"A cinematic landscape","seconds":"8","size":"1280x720","image":"https://cdn.example.com/input.png?signature=owner-signature","reference_images":["https://cdn.example.com/input.png?signature=owner-signature"],"metadata":{"resolution":"720p","content":[{"type":"video_url","video_url":{"url":"https://cdn.example.com/reference.mp4"}},{"type":"audio_url","audio_url":{"url":"https://cdn.example.com/sound.mp3"}}],"authorization":"nested-secret-canary"},"watermark":false,"seed":0,"api_key":"body-key-canary","image_base64":"binary-canary"}`),
 					ContentType: "application/json", ClientIP: "client-ip-canary", Channel: model.Channel{Key: "channel-credential-canary"},
 					Execution: &model.TaskExecutionSnapshot{RequestID: "private-request-id-canary"},
 				}
@@ -1533,27 +1533,51 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 						require.NotNil(t, response.Data.Task.RequestedSeconds)
 						assert.Equal(t, float64(8), *response.Data.Task.RequestedSeconds)
+						assert.Contains(t, recorder.Body.String(), `"requested_resolution":"720p"`)
 						assert.ElementsMatch(t, []service.AsyncVideoReferenceMedia{{Type: "image", URL: "https://cdn.example.com/input.png?signature=owner-signature"}, {Type: "video", URL: "https://cdn.example.com/reference.mp4"}, {Type: "audio", URL: "https://cdn.example.com/sound.mp3"}}, response.Data.Task.ReferenceMedia)
 						assert.Equal(t, false, response.Data.Task.RequestParameters["watermark"])
 						assert.Equal(t, float64(0), response.Data.Task.RequestParameters["seed"])
 					})
 				}
-				for _, list := range []bool{false, true} {
+				for _, scope := range []string{"poll", "owner list", "admin list"} {
 					recorder := httptest.NewRecorder()
 					c, _ := gin.CreateTestContext(recorder)
 					c.Set("id", 101)
 					c.Set("token_id", 201)
 					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
 					c.Request = httptest.NewRequest(http.MethodGet, "/?task_id="+job.TaskId, nil)
-					if list {
-						ListMediaTasks(c, false)
+					if scope != "poll" {
+						ListMediaTasks(c, scope == "admin list")
 					} else {
 						QueryAsyncMedia(c)
 					}
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-					for _, private := range []string{"request_parameters", "reference_media", "requested_seconds", "owner-signature", "A cinematic landscape"} {
+					for _, private := range []string{"request_parameters", "reference_media", "owner-signature", "A cinematic landscape"} {
 						assert.NotContains(t, recorder.Body.String(), private)
 					}
+					if scope == "poll" {
+						assert.NotContains(t, recorder.Body.String(), "requested_seconds")
+						assert.NotContains(t, recorder.Body.String(), "requested_resolution")
+					} else {
+						assert.Contains(t, recorder.Body.String(), `"requested_seconds":8`)
+						assert.Contains(t, recorder.Body.String(), `"requested_resolution":"720p"`)
+					}
+				}
+				require.NoError(t, db.Model(&job).Update("request_cipher", []byte("damaged-request-cipher")).Error)
+				for _, list := range []bool{false, true} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/?task_id="+job.TaskId, nil)
+					if list {
+						ListMediaTasks(c, false)
+					} else {
+						GetMediaTask(c, false)
+					}
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					assert.NotContains(t, recorder.Body.String(), "requested_seconds")
+					assert.NotContains(t, recorder.Body.String(), "requested_resolution")
 				}
 				require.NoError(t, db.Model(&job).Update("expires_at", now-1).Error)
 				require.NoError(t, db.Where("id = ?", job.ID).Take(&job).Error)
@@ -1569,7 +1593,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
 					GetMediaTask(c, false)
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-					for _, field := range []string{"request_parameters", "reference_media", "requested_seconds"} {
+					for _, field := range []string{"request_parameters", "reference_media", "requested_seconds", "requested_resolution"} {
 						assert.NotContains(t, recorder.Body.String(), field, "expired and legacy tasks must not fabricate request parameters")
 					}
 				}
@@ -2141,23 +2165,46 @@ func TestAsyncImageExternalReferencePreview(t *testing.T) {
 
 func TestAsyncVideoRequestDetails(t *testing.T) {
 	for _, item := range []struct {
-		name    string
-		body    string
-		seconds float64
-		media   []service.AsyncVideoReferenceMedia
-		absent  []string
+		name       string
+		body       string
+		seconds    float64
+		resolution string
+		media      []service.AsyncVideoReferenceMedia
+		absent     []string
 	}{
 		{
-			name:    "nested generation settings and mixed references",
-			body:    `{"parameters":{"duration":6},"metadata":{"duration":9,"input":{"media":[{"type":"reference_video","url":"https://cdn.example.com/clip.mp4?signature=caller-owned"},{"type":"reference_audio","url":"https://cdn.example.com/audio.mp3"}]},"first_frame_url":"https://cdn.example.com/first.png","private_key":"private-key-canary"},"prompt":"landscape Bearer text-credential-canary","nested":{"x-api-key":"nested-key-canary"}}`,
-			seconds: 6,
-			media:   []service.AsyncVideoReferenceMedia{{Type: "video", URL: "https://cdn.example.com/clip.mp4?signature=caller-owned"}, {Type: "audio", URL: "https://cdn.example.com/audio.mp3"}, {Type: "image", URL: "https://cdn.example.com/first.png"}},
-			absent:  []string{"private-key-canary", "text-credential-canary", "nested-key-canary"},
+			name:       "nested generation settings and mixed references",
+			body:       `{"parameters":{"duration":6,"resolution":"1080p"},"size":"1920x1080","metadata":{"duration":9,"input":{"media":[{"type":"reference_video","url":"https://cdn.example.com/clip.mp4?signature=caller-owned"},{"type":"reference_audio","url":"https://cdn.example.com/audio.mp3"}]},"first_frame_url":"https://cdn.example.com/first.png","private_key":"private-key-canary"},"prompt":"landscape Bearer text-credential-canary","nested":{"x-api-key":"nested-key-canary"}}`,
+			seconds:    6,
+			resolution: "1080p",
+			media:      []service.AsyncVideoReferenceMedia{{Type: "video", URL: "https://cdn.example.com/clip.mp4?signature=caller-owned"}, {Type: "audio", URL: "https://cdn.example.com/audio.mp3"}, {Type: "image", URL: "https://cdn.example.com/first.png"}},
+			absent:     []string{"private-key-canary", "text-credential-canary", "nested-key-canary"},
 		},
 		{
-			name:  "reference duration does not become requested duration",
-			body:  `{"reference_videos":[{"url":"https://cdn.example.com/reference.mp4","duration":15}]}`,
+			name:  "reference specifications do not become requested specifications",
+			body:  `{"reference_videos":[{"url":"https://cdn.example.com/reference.mp4","duration":15,"resolution":"4K","size":"3840x2160"}]}`,
 			media: []service.AsyncVideoReferenceMedia{{Type: "video", URL: "https://cdn.example.com/reference.mp4"}},
+		},
+		{
+			name:       "pixel size is retained when resolution is absent",
+			body:       `{"input":{"parameters":{"seconds":5,"size":"1280x720"}}}`,
+			seconds:    5,
+			resolution: "1280x720",
+		},
+		{
+			name:       "top level resolution takes precedence over nested settings",
+			body:       `{"resolution":"2K","metadata":{"resolution":"720p"}}`,
+			resolution: "2K",
+		},
+		{
+			name:       "metadata input retains generation settings",
+			body:       `{"metadata":{"input":{"duration":"10","resolution":"720p"}}}`,
+			seconds:    10,
+			resolution: "720p",
+		},
+		{
+			name: "non-specification resolution data is not projected",
+			body: `{"resolution":"https://cdn.example.com/video.mp4?signature=private-canary","size":{"resolution":"720p"}}`,
 		},
 		{
 			name:   "binary payloads and unsafe URLs stay hidden",
@@ -2183,6 +2230,29 @@ func TestAsyncVideoRequestDetails(t *testing.T) {
 			assert.ElementsMatch(t, item.media, details.ReferenceMedia)
 			encoded, err := common.Marshal(details)
 			require.NoError(t, err)
+			var projected map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &projected))
+			if item.resolution == "" {
+				assert.NotContains(t, projected, "requested_resolution")
+			} else {
+				assert.Equal(t, item.resolution, projected["requested_resolution"])
+			}
+			legacy := &service.AsyncVideoRequestDetails{RequestParameters: details.RequestParameters}
+			retained := (service.AsyncVideoRequest{Details: legacy}).RequestDetails()
+			require.NotNil(t, retained)
+			retainedJSON, err := common.Marshal(retained)
+			require.NoError(t, err)
+			var retainedProjection map[string]any
+			require.NoError(t, common.Unmarshal(retainedJSON, &retainedProjection))
+			if item.resolution != "" {
+				assert.Equal(t, item.resolution, retainedProjection["requested_resolution"], "historical snapshots derive specifications from retained parameters")
+			} else {
+				assert.NotContains(t, retainedProjection, "requested_resolution")
+			}
+			if item.seconds != 0 {
+				require.NotNil(t, retained.RequestedSeconds)
+				assert.Equal(t, item.seconds, *retained.RequestedSeconds)
+			}
 			for _, private := range item.absent {
 				assert.NotContains(t, string(encoded), private)
 			}
@@ -2193,6 +2263,7 @@ func TestAsyncVideoRequestDetails(t *testing.T) {
 		var body bytes.Buffer
 		writer := multipart.NewWriter(&body)
 		require.NoError(t, writer.WriteField("seconds", "12"))
+		require.NoError(t, writer.WriteField("size", "720x1280"))
 		require.NoError(t, writer.WriteField("metadata", `{"audio_url":"https://cdn.example.com/sound.mp3","password":"form-secret-canary"}`))
 		file, err := writer.CreateFormFile("input_reference", "reference.png")
 		require.NoError(t, err)
@@ -2203,6 +2274,7 @@ func TestAsyncVideoRequestDetails(t *testing.T) {
 		require.NotNil(t, details)
 		require.NotNil(t, details.RequestedSeconds)
 		assert.Equal(t, float64(12), *details.RequestedSeconds)
+		assert.Equal(t, "720x1280", details.RequestedResolution)
 		assert.Equal(t, []service.AsyncVideoReferenceMedia{{Type: "audio", URL: "https://cdn.example.com/sound.mp3"}}, details.ReferenceMedia)
 		encoded, err := common.Marshal(details)
 		require.NoError(t, err)
