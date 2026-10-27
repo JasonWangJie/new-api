@@ -47,6 +47,7 @@ type AsyncImageFailure struct {
 	UpstreamTerminal             bool `json:"-"`
 	RetryableHTTPResponse        bool `json:"-"`
 	SynchronousRetryableResponse bool `json:"-"`
+	SubmissionRejected           bool `json:"-"`
 	ReferenceTransportFallback   bool
 }
 
@@ -494,6 +495,23 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 	return isImageGatewayFailureMetadata(envelope, failure.HTTPStatus, providerCode, 0)
 }
 
+// A task-creation refusal is distinct from a failed request whose acceptance
+// cannot be determined. Only the complete rejection envelope can authorize it.
+func isImageTaskCreationRejection(failure *AsyncImageFailure, decoded any) bool {
+	if failure == nil || failure.Code != 606 || failure.HTTPStatus != http.StatusInternalServerError || failure.Message != "上游创建任务失败，状态码:502" {
+		return false
+	}
+	switch failure.ProviderCode {
+	case "", "500", "internal_server_error", "upstream_error", "new_api_error", "one_api_error":
+	default:
+		return false
+	}
+	if _, object := decoded.(map[string]any); !object {
+		return false
+	}
+	return isImageGatewayFailureMetadata(decoded, http.StatusInternalServerError, failure.ProviderCode, 0)
+}
+
 // isImageGatewayFailureMetadata checks the complete decoded response, including
 // nested metadata that is deliberately omitted from retained public diagnostics.
 // A job receipt, output or contradictory rejection must never authorize replay.
@@ -551,8 +569,8 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 					return false
 				}
 			}
-			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts"}, name)
-			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "result") || strings.Contains(name, "image") || strings.Contains(name, "output") || strings.Contains(name, "url") || strings.Contains(name, "b64") || strings.Contains(name, "base64") {
+			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts", "video", "videos", "audio", "audios", "file", "files", "binary", "bytes", "receipt", "receipts"}, name)
+			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "receipt") || strings.Contains(name, "result") || strings.Contains(name, "image") || strings.Contains(name, "output") || strings.Contains(name, "url") || strings.Contains(name, "b64") || strings.Contains(name, "base64") {
 				switch child := child.(type) {
 				case nil:
 				case string:
@@ -587,6 +605,11 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 			return false
 		}
 		lowered := strings.ToLower(value)
+		for _, signal := range []string{"moderation", "content filter", "censor", "policy", "parameter", "execution_unknown", "submission_unknown", "could not confirm", "could not be confirmed", "could not be determined", "审核", "违规", "不合规", "安全", "结果未知", "受理状态未知"} {
+			if strings.Contains(lowered, signal) {
+				return false
+			}
+		}
 		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "pending", "running", "processing", "queued", "submitted", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
 			if strings.Contains(lowered, signal) {
 				return false
@@ -744,6 +767,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	failure.RetryAfter = ImageRetryAfter(response.Header.Get("Retry-After"), time.Now())
 	if !classifyErrorType && readErr == nil && !bodyTruncated {
 		failure.RetryableHTTPResponse = isRetryableImageGatewayResponse(failure, decoded)
+		failure.SubmissionRejected = decodeErr == nil && isImageTaskCreationRejection(failure, decoded)
 	}
 	return failure
 }

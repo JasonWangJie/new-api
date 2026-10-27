@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -149,6 +151,84 @@ func NormalizeTianyueImageTask(body []byte, baseURL string) ([]byte, error) {
 		}
 	}
 	return common.Marshal(fields)
+}
+
+// IsRetryableTianyueImageTaskFailure permits the vendor's explicit temporary
+// failure only for the accepted task being polled. The complete raw envelope
+// must remain free of output or contradictory diagnostics before normalization
+// drops fields that are not part of the host's status projection.
+func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	var envelope map[string]any
+	if common.Unmarshal(body, &envelope) != nil || envelope == nil {
+		return false
+	}
+	normalized, err := NormalizeTianyueImageTask(body, "")
+	if err != nil || gjson.GetBytes(normalized, "task_id").Str != taskID || gjson.GetBytes(normalized, "reason").Str != "生成失败，请稍后重试" {
+		return false
+	}
+	status := gjson.GetBytes(normalized, "status").Str
+	if status != "FAILED" && status != "FAILURE" {
+		return false
+	}
+	task, wrapped := envelope["data"].(map[string]any)
+	if wrapped {
+		delete(envelope, "data")
+	} else {
+		task = envelope
+	}
+	scopes := []map[string]any{envelope, task}
+	if native, ok := task["data"].(map[string]any); ok && len(native) > 0 {
+		// The gateway's failed task may include its own failed provider task.
+		// Only this closed operation is lineage, rather than a new receipt.
+		nativeStatus, _ := native["status"].(string)
+		nativeTaskID, _ := native["task_id"].(string)
+		providerError, ok := native["error"].(map[string]any)
+		if !ok || !strings.EqualFold(nativeStatus, "failed") || !strings.HasPrefix(nativeTaskID, "task_") || len(nativeTaskID) > 191 || providerError["code"] != "task_failed" || providerError["message"] != "生成失败，请稍后重试" || native["message"] != "生成失败，请稍后重试" || native["fail_reason"] != "生成失败，请稍后重试" {
+			return false
+		}
+		delete(task, "data")
+		delete(native, "status")
+		delete(native, "task_id")
+		delete(providerError, "code")
+		scopes = append(scopes, native)
+	}
+	for index, scope := range scopes {
+		for _, field := range []string{"task_id", "id"} {
+			if value, exists := scope[field]; exists {
+				// The outer gateway row has a numeric database ID in addition to
+				// its authoritative public task_id; it is not an operation receipt.
+				if number, ok := value.(float64); wrapped && index == 1 && field == "id" && ok && number > 0 && math.Trunc(number) == number {
+					delete(scope, field)
+					continue
+				}
+				if value != nil && value != "" && value != taskID {
+					return false
+				}
+				delete(scope, field)
+			}
+		}
+		if value, exists := scope["status"]; exists {
+			text, ok := value.(string)
+			if value != nil && (!ok || text != "" && !strings.EqualFold(text, "FAILED") && !strings.EqualFold(text, "FAILURE")) {
+				return false
+			}
+			delete(scope, "status")
+		}
+		// "success" is the vendor envelope's transport code, not the failed
+		// native task status. It is allowed only on the outer wrapped response.
+		if index == 0 && wrapped && scope["code"] == "success" {
+			delete(scope, "code")
+		}
+	}
+	for _, scope := range scopes {
+		if !isImageGatewayFailureMetadata(scope, http.StatusInternalServerError, "", 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateTianyueImageSubmission runs after administrator parameter overrides,

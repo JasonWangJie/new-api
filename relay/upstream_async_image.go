@@ -40,6 +40,7 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 	defer service.CloseResponseBodyGracefully(response)
 	resumeTaskID := c.GetString("async_image_resume_task")
 	body, err := service.ReadUpstreamAsyncResponse(response, c.GetInt64("async_image_response_limit"))
+	rawBody := body
 	if err == nil && c.GetBool(contextKeyTianyueImageProfile) {
 		body, err = service.NormalizeTianyueImageTask(body, info.ChannelBaseUrl)
 	}
@@ -83,6 +84,9 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 			message = "Upstream image task failed"
 		}
 		failure := service.ClassifyAsyncImageFailure(errors.New(message), 0)
+		if failure.Code == 610 && c.GetBool(contextKeyTianyueImageProfile) && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices && service.IsRetryableTianyueImageTaskFailure(rawBody, resumeTaskID) {
+			failure.Code = 606
+		}
 		failure.Message = message
 		failure.InternalCode = "upstream_job_failed"
 		failure.UpstreamTerminal = true

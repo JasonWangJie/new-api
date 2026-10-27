@@ -1110,6 +1110,7 @@ type ImageChannelAttempt struct {
 	RetryOnTimeout               bool                `json:"retry_on_timeout,omitempty"`
 	RetryReferenceTimeoutLocally bool                `json:"retry_reference_timeout_locally,omitempty"`
 	SynchronousRetryableResponse bool                `json:"synchronous_retryable_response,omitempty"`
+	SubmissionRejected           bool                `json:"submission_rejected,omitempty"`
 	ReferenceMode                string              `json:"reference_mode"`
 	TransportUsed                string              `json:"reference_transport_used,omitempty"`
 	ReferenceFallback            bool                `json:"reference_fallback,omitempty"`
@@ -1179,14 +1180,14 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		last = attempt.KeyFingerprint
 		lastAttempt = attempt
 		referenceFetchFailure := isCompletedImageReferenceFetchFailure(attempt)
-		routing.WaitForCooldown = routing.WaitForCooldown || referenceFetchFailure || attempt.SynchronousRetryableResponse && attempt.FinishedAt > 0
+		routing.WaitForCooldown = routing.WaitForCooldown || referenceFetchFailure || (attempt.SynchronousRetryableResponse || attempt.SubmissionRejected) && attempt.FinishedAt > 0
 		if attempt.ReferenceFailure && !referenceFetchFailure {
 			reference = append(reference, attempt)
 		}
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
 	lastReferenceFetchFailure := isCompletedImageReferenceFetchFailure(lastAttempt)
-	lastSynchronousResponse := lastAttempt.SynchronousRetryableResponse && lastAttempt.FinishedAt > 0
+	lastSubmissionResponse := (lastAttempt.SynchronousRetryableResponse || lastAttempt.SubmissionRejected) && lastAttempt.FinishedAt > 0
 	lastCompatibilityCode := imageAttemptCompatibilityCode(lastAttempt)
 	lastIncompatible := lastCompatibilityCode != ""
 	lastReferenceSizeRejection := lastAttempt.Code == 603 && lastAttempt.HTTPStatus == http.StatusBadRequest && lastCompatibilityCode == "upstream_image_reference_incompatible" && imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(lastAttempt.ErrorMessage))
@@ -1217,7 +1218,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if lastReferenceFetchFailure || lastSynchronousResponse || lastReferenceSizeRejection {
+		if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {
@@ -1251,7 +1252,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if lastReferenceFetchFailure || lastSynchronousResponse || lastReferenceSizeRejection {
+	if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection {
 		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {

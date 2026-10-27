@@ -365,6 +365,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				if !reserve && c.GetBool("async_image_execution") && (info.ApiType == constant.APITypeOpenAI || info.ApiType == constant.APITypeXai || info.ApiType == constant.APITypeNewAPI) {
 					failure := service.ClassifyOpenAIAsyncImageHTTPFailure(c.Request.Context(), httpResp, statusCodeMappingStr)
 					failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse && !hasAsyncProfile && c.GetString("async_image_resume_task") == ""
+					failure.SubmissionRejected = failure.SubmissionRejected && hasAsyncProfile && c.GetString("async_image_resume_task") == ""
 					if info.ApiType == constant.APITypeNewAPI && c.GetString("async_image_resume_task") == "" {
 						// A gateway's error codes describe its own upstream call, not
 						// this connection. Keep ambiguous submissions reserved while

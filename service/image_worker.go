@@ -761,8 +761,8 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			}
 		}
 	}
-	synchronousResponseRetry := failure.SynchronousRetryableResponse && !failure.ExecutionUnknown && failure.Code == 606 && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
-	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !synchronousResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
+	submissionResponseRetry := (failure.SynchronousRetryableResponse || failure.SubmissionRejected) && !failure.ExecutionUnknown && failure.Code == 606 && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
+	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !submissionResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
 		// A transport interruption or server error cannot prove non-acceptance.
 		// Keep the hold and require reconciliation instead of crossing providers.
 		failure.ExecutionUnknown = true
@@ -807,7 +807,8 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.ProviderStatus = failure.ProviderStatus
 				last.UpstreamRequestID = failure.UpstreamRequestID
 				last.UpstreamTaskID = task.UpstreamTaskId
-				last.SynchronousRetryableResponse = synchronousResponseRetry
+				last.SynchronousRetryableResponse = submissionResponseRetry && failure.SynchronousRetryableResponse
+				last.SubmissionRejected = submissionResponseRetry && failure.SubmissionRejected
 				last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal))
 				encoded, err := common.Marshal(attempts)
 				if err != nil {
@@ -910,7 +911,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		status = model.ImageTaskExpired
 	} else {
 		resubmit := task.UpstreamTaskId == ""
-		if failure.UpstreamTerminal || synchronousResponseRetry {
+		if failure.UpstreamTerminal || submissionResponseRetry {
 			resubmit = false
 			if !compatibilityFailure && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
 				var err error

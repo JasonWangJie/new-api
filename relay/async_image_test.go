@@ -1519,6 +1519,7 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 	service.InitHttpClient()
 	var bitmap bytes.Buffer
 	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	const temporaryTianyueFailure = `{"code":"success","message":"","data":{"id":1104911,"task_id":"tianyue-job","status":"FAILURE","fail_reason":"生成失败，请稍后重试","progress":"100%","data":{"error":{"code":"task_failed","message":"生成失败，请稍后重试"},"object":"video","status":"failed","message":"生成失败，请稍后重试","task_id":"task_inner-failed-operation","metadata":{},"progress":100,"fail_reason":"生成失败，请稍后重试"}}}`
 	for _, tc := range []struct {
 		name                       string
 		model, resolution          string
@@ -1526,6 +1527,9 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		disabled, badOverride      bool
 		badTemplate, customProfile bool
 		providerErrorCode          string
+		creationFailure            bool
+		pollFailure                string
+		failureCode                int
 		disconnect, failed         bool
 	}{
 		{name: "asynchronous_text_1k"},
@@ -1535,11 +1539,25 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		{name: "provider_bad_response", providerErrorCode: "bad_response"},
 		{name: "provider_bad_response_body", providerErrorCode: "bad_response_body"},
 		{name: "provider_empty_response", providerErrorCode: "empty_response"},
+		{name: "explicit_creation_rejection", creationFailure: true},
+		{name: "creation_text_with_transport_code_stays_unknown", creationFailure: true, providerErrorCode: "do_request_failed"},
 		{name: "transport_eof", disconnect: true},
 		{name: "uploaded_reference", reference: true},
 		{name: "multipart_reference_2k", reference: true, multipart: true, model: "seedream-5-pro-2K", resolution: "2K"},
 		{name: "asynchronous_yb_receipt_and_poll", reference: true, model: "gpt-image-2-yb"},
 		{name: "asynchronous_failure", failed: true},
+		{name: "asynchronous_temporary_failure", pollFailure: temporaryTianyueFailure, failureCode: 606},
+		{name: "temporary_failure_wrong_outer_task", pollFailure: strings.Replace(temporaryTianyueFailure, `"task_id":"tianyue-job"`, `"task_id":"another-job"`, 1)},
+		{name: "temporary_failure_inner_still_running", pollFailure: strings.Replace(temporaryTianyueFailure, `"status":"failed"`, `"status":"running"`, 1)},
+		{name: "temporary_failure_inner_different_error", pollFailure: strings.Replace(temporaryTianyueFailure, `"code":"task_failed"`, `"code":"invalid_argument"`, 1)},
+		{name: "temporary_failure_raw_output", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"result":{"url":"https://result.example/image.png"}}`, 1)},
+		{name: "temporary_failure_raw_receipt", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"task_id":"other-accepted-job"}`, 1)},
+		{name: "temporary_failure_raw_success", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"success":true}`, 1)},
+		{name: "temporary_failure_raw_policy", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"error":{"type":"content_policy_violation"}}`, 1)},
+		{name: "temporary_failure_raw_moderation", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"reason":"content moderation rejected"}`, 1)},
+		{name: "temporary_failure_raw_Chinese_review", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"reason":"审核未通过"}`, 1)},
+		{name: "temporary_failure_raw_authentication", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"error":{"type":"authentication_error"}}`, 1)},
+		{name: "temporary_failure_raw_parameter", pollFailure: strings.Replace(temporaryTianyueFailure, `"metadata":{}`, `"metadata":{"error":{"message":"unsupported parameter resolution"}}`, 1)},
 		{name: "mask_is_rejected", reference: true, mask: true},
 		{name: "unsafe_override_is_rejected", badOverride: true},
 		{name: "unsafe_async_template_is_rejected", badTemplate: true},
@@ -1574,10 +1592,18 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				if tc.providerErrorCode != "" {
+				if tc.providerErrorCode != "" || tc.creationFailure {
 					w.Header().Set(common.RequestIdKey, "tianyue-provider-request-id")
 					w.WriteHeader(http.StatusInternalServerError)
-					encoded, err := common.Marshal(map[string]any{"error": map[string]string{"message": "TianYue could not confirm image generation; Authorization: Bearer private-provider-key", "type": "new_api_error", "code": tc.providerErrorCode}})
+					message := "TianYue could not confirm image generation; Authorization: Bearer private-provider-key"
+					providerError := map[string]string{"message": message, "type": "new_api_error", "code": tc.providerErrorCode}
+					if tc.creationFailure {
+						providerError = map[string]string{"message": "上游创建任务失败，状态码:502"}
+						if tc.providerErrorCode != "" {
+							providerError["code"] = tc.providerErrorCode
+						}
+					}
+					encoded, err := common.Marshal(map[string]any{"error": providerError})
 					if assert.NoError(t, err) {
 						_, _ = w.Write(encoded)
 					}
@@ -1605,6 +1631,8 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"IN_PROGRESS","progress":"30%"}}`))
 					} else if tc.failed {
 						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"FAILURE","fail_reason":"Image generation rejected"}}`))
+					} else if tc.pollFailure != "" {
+						_, _ = w.Write([]byte(tc.pollFailure))
 					} else {
 						_, _ = w.Write([]byte(`{"code":"success","data":{"task_id":"tianyue-job","status":"SUCCESS","data":{"content_url":"/image.png"}}}`))
 					}
@@ -1698,9 +1726,18 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			assert.JSONEq(t, `"1:1"`, string(sent.body["aspect_ratio"]))
 			assert.JSONEq(t, `"`+request.Resolution+`"`, string(sent.body["output_resolution"]))
 			assert.NotContains(t, sent.body, "size")
-			if tc.providerErrorCode != "" || tc.disconnect {
+			if tc.providerErrorCode != "" || tc.disconnect || tc.creationFailure {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
+				if tc.creationFailure && tc.providerErrorCode == "" {
+					assert.Equal(t, 606, failure.Code)
+					assert.True(t, failure.SubmissionRejected)
+					assert.False(t, failure.ExecutionUnknown)
+					assert.False(t, failure.UpstreamTerminal)
+					assert.False(t, failure.SynchronousRetryableResponse)
+					assert.Equal(t, "上游创建任务失败，状态码:502", failure.Message)
+					return
+				}
 				assert.Equal(t, 608, failure.Code)
 				assert.True(t, failure.ExecutionUnknown, "an unconfirmed dispatched generation must retain its reservation for reconciliation")
 				assert.False(t, failure.UpstreamTerminal)
@@ -1712,7 +1749,12 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 					assert.Empty(t, failure.ProviderCode)
 				} else {
 					assert.Equal(t, "execution_unknown", failure.InternalCode)
-					assert.Contains(t, failure.Message, "TianYue could not confirm image generation")
+					if tc.creationFailure {
+						assert.False(t, failure.SubmissionRejected)
+						assert.Equal(t, "上游创建任务失败，状态码:502", failure.Message)
+					} else {
+						assert.Contains(t, failure.Message, "TianYue could not confirm image generation")
+					}
 					assert.NotContains(t, failure.Message, "private-provider-key")
 					assert.Equal(t, http.StatusInternalServerError, failure.HTTPStatus)
 					assert.Equal(t, "tianyue-provider-request-id", failure.UpstreamRequestID)
@@ -1748,12 +1790,21 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			assert.Equal(t, http.MethodGet, polled.method)
 			assert.Equal(t, 1, dispatches, "polling a known task must never submit again")
 			output, bill, err := ExecuteAsyncImage(t.Context(), task, recovered, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
-			if tc.failed {
+			if tc.failed || tc.pollFailure != "" {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
 				assert.True(t, failure.UpstreamTerminal)
 				assert.Equal(t, "upstream_job_failed", failure.InternalCode)
-				assert.Equal(t, "Image generation rejected", failure.Message)
+				if tc.pollFailure != "" {
+					wantCode := tc.failureCode
+					if wantCode == 0 {
+						wantCode = 610
+					}
+					assert.Equal(t, wantCode, failure.Code)
+					assert.Equal(t, "生成失败，请稍后重试", failure.Message)
+				} else {
+					assert.Equal(t, "Image generation rejected", failure.Message)
+				}
 				require.Len(t, received, 1)
 				assert.Equal(t, expectedPollPath, (<-received).path)
 				assert.Equal(t, 1, dispatches, "a failed upstream job must not be submitted again")

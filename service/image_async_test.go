@@ -712,6 +712,7 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 	const gatewayError = `{"success":false,"status":"error","data":null,"error":{"type":"upstream_request_failed","message":"The upstream image service could not complete the image request. Please retry shortly.","metadata":{"trace_id":"provider-trace"}}}`
 	const quotaError = `{"success":false,"code":503,"status":"service_unavailable","data":null,"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"The selected upstream image service has no available quota. Please retry shortly."}}`
+	const creationError = `{"error":{"type":"new_api_error","message":"上游创建任务失败，状态码:502"}}`
 	for _, tc := range []struct {
 		name        string
 		status      int
@@ -722,6 +723,8 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 		{name: "gateway failure waits for only account", status: 502, body: gatewayError, onlyAccount: true},
 		{name: "quota rejection switches channel", status: 503, body: quotaError},
 		{name: "quota rejection waits for only account", status: 503, body: quotaError, onlyAccount: true},
+		{name: "task creation rejection switches channel", status: 500, body: creationError},
+		{name: "task creation rejection waits for only account", status: 500, body: creationError, onlyAccount: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
@@ -763,7 +766,7 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 			require.Equal(t, model.ImageTaskQueued, task.Status)
 			assert.Equal(t, 1, task.TransientRetryCount)
 			assert.Equal(t, 1, task.RetryCount)
-			assert.Empty(t, task.UpstreamTaskId, "a synchronous upstream never needs a task ID")
+			assert.Empty(t, task.UpstreamTaskId, "a rejected submission has no accepted upstream task")
 			assert.Equal(t, 606, task.PublicErrorCode)
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(primaryID), "upstream-key-a")
 			ttl, err := common.RDB.TTL(t.Context(), ImageAccountCooldownKey(fingerprint)).Result()
@@ -772,7 +775,8 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 			var history []ImageChannelAttempt
 			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
 			require.Len(t, history, 1)
-			assert.True(t, history[0].SynchronousRetryableResponse)
+			assert.Equal(t, tc.status != 500, history[0].SynchronousRetryableResponse)
+			assert.Equal(t, tc.status == 500, history[0].SubmissionRejected)
 			var decision ImageRetryDecision
 			require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
 			assert.Equal(t, "retry_submission", decision.Action)
@@ -1780,6 +1784,12 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		expired      bool
 		synchronous  bool
 	}{
+		{name: "explicit native creation refusal reuses the hold", synchronous: true, mixed: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskQueued, wantBill: "reserved"},
+		{name: "native creation refusal cannot reuse a refunded hold", synchronous: true, mixed: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "refunded", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "native creation refusal obeys total retry budget", synchronous: true, mixed: true, noRetries: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "native creation refusal obeys deadline", synchronous: true, mixed: true, expired: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "native creation refusal cannot replace output", synchronous: true, mixed: true, resultEvent: "output_received", failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "creation rejection flag cannot replace an accepted job", mixed: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskInvoking, wantBill: "reserved"},
 		{name: "confirmed generation timeout", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskQueued, wantBill: "reserved"},
 		{name: "policy rejection is terminal", failure: AsyncImageFailure{Code: 601, InternalCode: "upstream_job_failed", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "poll interruption stays with the existing job", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_poll_failed"}, billStatus: "reserved", wantStatus: model.ImageTaskInvoking, wantBill: "reserved"},
@@ -3268,6 +3278,7 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 }
 
 func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testing.T) {
+	const creationError = `{"error":{"type":"new_api_error","message":"上游创建任务失败，状态码:502"}}`
 	for _, tc := range []struct {
 		name, body string
 		status     int
@@ -3275,7 +3286,24 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 		timeout    bool
 		switchable bool
 		readError  bool
+		rejected   bool
 	}{
+		{name: "explicit native task creation rejection", status: 500, body: creationError, code: 606, rejected: true},
+		{name: "task creation diagnostic needs its HTTP status", status: 502, body: creationError, code: 606},
+		{name: "ambiguous server error is not a creation refusal", status: 500, body: `{"error":{"message":"Upstream request failed"}}`, code: 606},
+		{name: "creation refusal cannot override a transport error code", status: 500, body: strings.Replace(creationError, `"type":"new_api_error"`, `"type":"new_api_error","code":"do_request_failed"`, 1), code: 606},
+		{name: "creation refusal cannot contain a task receipt", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"task_id":"accepted-task"}}`, code: 606},
+		{name: "creation refusal cannot contain output", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"data":[{"url":"https://result.example/image.png"}]}`, code: 606},
+		{name: "creation refusal cannot contain inline media", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"video":"opaque-output"}}`, code: 606},
+		{name: "creation refusal cannot contradict policy", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"content_policy_violation"}}`, code: 606},
+		{name: "creation refusal cannot contradict moderation", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"content moderation rejected"}}`, code: 606},
+		{name: "creation refusal cannot contradict Chinese review", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"审核未通过"}}`, code: 606},
+		{name: "creation refusal cannot contradict uncertain acceptance", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"execution_unknown"}}`, code: 606},
+		{name: "creation refusal cannot contradict authentication", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"unauthorized"}}`, code: 606},
+		{name: "creation refusal cannot contradict parameters", status: 500, body: strings.TrimSuffix(creationError, "}") + `,"metadata":{"reason":"invalid parameter"}}`, code: 606},
+		{name: "creation refusal read must finish", status: 500, body: creationError, readError: true, code: 606},
+		{name: "creation refusal response cannot be truncated", status: 500, body: creationError + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), code: 606},
+		{name: "creation refusal needs valid JSON", status: 500, body: creationError[:len(creationError)-1], code: 606},
 		{name: "empty explicit rejection", status: 400, code: 603, switchable: true},
 		{name: "unreadable rejection is not empty", status: 400, code: 610, readError: true},
 		{name: "truncated rejection is not empty", status: 400, body: strings.Repeat(" ", asyncImageProviderErrorBodyLimit+1), code: 610},
@@ -3309,6 +3337,7 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 			}
 			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{StatusCode: tc.status, Body: body}, "")
 			assert.Equal(t, tc.code, failure.Code)
+			assert.Equal(t, tc.rejected, failure.SubmissionRejected)
 			assert.Equal(t, tc.timeout, IsImageReferenceDownloadTimeout(failure))
 			assert.Equal(t, tc.switchable, failure.InternalCode == "upstream_image_submission_rejected")
 			routing := ImageAccountAttemptRouting([]ImageChannelAttempt{{ChannelId: 1, KeyFingerprint: "failed-account", CredentialFingerprint: "same-credential", Dispatched: true, FinishedAt: 1, Code: failure.Code, HTTPStatus: failure.HTTPStatus, ErrorMessage: failure.Message, ProviderCode: failure.ProviderCode, ProviderStatus: failure.ProviderStatus}}, 2, "openai", 3)
