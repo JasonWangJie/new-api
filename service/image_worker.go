@@ -666,7 +666,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, time.Now().Unix()+10, "recovered", "Upstream image task polling will continue")
 		}
-		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 602 || failure.Code == 605 || failure.Code == 606 || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
+		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 602 || failure.Code == 605 || failure.Code == 606 || failure.Code == 603 && (failure.SubmissionRejected || failure.SynchronousRetryableResponse) || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)
 			if task.UpstreamTaskId == "" || failure.UpstreamTerminal {
 				_ = RecordImageAccountCooldown(context.WithoutCancel(ctx), account.Fingerprint, failure, cfg)
@@ -761,7 +761,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			}
 		}
 	}
-	submissionResponseRetry := (failure.SynchronousRetryableResponse || failure.SubmissionRejected) && !failure.ExecutionUnknown && failure.Code == 606 && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
+	submissionResponseRetry := (failure.SynchronousRetryableResponse || failure.SubmissionRejected) && !failure.ExecutionUnknown && (failure.Code == 603 || failure.Code == 606) && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
 	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !submissionResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
 		// A transport interruption or server error cannot prove non-acceptance.
 		// Keep the hold and require reconciliation instead of crossing providers.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"regexp"
@@ -35,7 +36,13 @@ var (
 	imageQuotaUnavailablePattern         = regexp.MustCompile(`\b(?:quotas?|balances?|credits?|capacity)(?:\s+(?:is|are|was|were|currently|temporarily|now|has|been|completely|fully|already|remaining|available)){0,4}\s+(?:unavailable|exhausted|insufficient|depleted|exceeded|empty|not\s+available)\b|` +
 		`\b(?:insufficient|exhausted|unavailable|depleted|no(?:\s+available|\s+remaining)?|not\s+enough|out\s+of|(?:run|ran)\s+out\s+of)\s+(?:(?:upstream|provider|account|image|generation|available|remaining)\s+){0,3}(?:quotas?|balances?|credits?|capacity)\b|` +
 		`(?:额度|配额|余额|积分|点数|容量)(?:已经|已被|当前|目前|暂时|可用|剩余|全部|基本|均|已|暂){0,3}(?:不足|不够|耗尽|用尽|用完|不可用)|(?:没有|暂无|无)(?:足够的?|可用的?|剩余的?)?(?:上游|供应商|账户)?(?:额度|配额|余额|积分|点数|容量)`)
-	imageQuotaNegationPattern = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no longer)\s+(?:currently\s+|temporarily\s+|fully\s+|been\s+)?(?:unavailable|exhausted|insufficient|depleted|exceeded)\b|(?:并非|并不|不是|未出现|未发生|如果|假如|若)(?:由于|因为)?(?:额度|配额|余额|积分|点数|容量)`)
+	imageQuotaNegationPattern            = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no longer)\s+(?:currently\s+|temporarily\s+|fully\s+|been\s+)?(?:unavailable|exhausted|insufficient|depleted|exceeded)\b|(?:并非|并不|不是|未出现|未发生|如果|假如|若)(?:由于|因为)?(?:额度|配额|余额|积分|点数|容量)`)
+	imageSubmissionURLPattern            = regexp.MustCompile(`(?i)\bhttps?://[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
+	imageSubmissionTracePattern          = regexp.MustCompile(`(?i)(?:\b(?:request|trace|span|correlation)[ _-]?id|请求\s*id)\s*[:=：]\s*[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
+	imageCapacitySubjectPattern          = regexp.MustCompile(`并发|槽位|账户池|账号池|资源池|资源(?:已经|当前|可用|剩余|全部|已|暂时){0,3}(?:耗尽|用尽|不足|不可用)|\b(?:concurrency|concurrent|capacity|slots?|account[ _-]+pools?|resource[ _-]+pools?)\b|\bresources?(?:[ _-]+(?:is|are|has|have|been|currently|completely)){0,4}[ _-]+(?:exhausted|unavailable)\b`)
+	imageCapacityFailurePattern          = regexp.MustCompile(`已满|满载|耗尽|用尽|不足|不可用|超时|\b(?:full|saturated|exhausted|unavailable|timeout|timed[ _-]+out|no[ _-]+available|none[ _-]+available)\b`)
+	imageRequestProcessingFailurePattern = regexp.MustCompile(`(?:请求|操作)(?:处理|执行)(?:失败|出错)|\b(?:request[ _-]+processing[ _-]+(?:failed|failure)|(?:failed|unable|could[ _-]+not)[ _-]+to[ _-]+process[ _-]+(?:the[ _-]+)?request|could[ _-]+not[ _-]+process[ _-]+(?:the[ _-]+)?request)\b`)
+	imageSubmissionNegationPattern       = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no[ _-]+longer)[ _-]+(?:(?:currently|temporarily|fully|been|ever|yet)[ _-]+){0,3}(?:full|exhausted|unavailable|saturated|failed|failing)\b|\bno[ _-]+request[ _-]+processing[ _-]+failure\b|并非|并不|不是|未出现|未发生|没有发生|没有(?:请求|操作)(?:处理|执行)(?:失败|出错)|如果|假如|若`)
 )
 
 type AsyncImageFailure struct {
@@ -524,6 +531,90 @@ func isImageTaskCreationRejection(failure *AsyncImageFailure, decoded any) bool 
 	return isImageGatewayFailureMetadata(decoded, http.StatusInternalServerError, failure.ProviderCode, 0)
 }
 
+// imageSubmissionRejection distinguishes a recognized refusal from an unsafe
+// envelope with the same diagnostic. A failed validation must not fall back to
+// generic capacity-text retries.
+func imageSubmissionRejection(decoded any) (int, bool) {
+	envelope, ok := decoded.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	providerError, ok := envelope["error"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	message, ok := providerError["message"].(string)
+	if !ok {
+		return 0, false
+	}
+	for _, pattern := range []*regexp.Regexp{imageSubmissionURLPattern, imageSubmissionTracePattern} {
+		message = pattern.ReplaceAllStringFunc(message, func(value string) string {
+			trimmed := strings.TrimRight(value, ".!?")
+			return " [opaque]" + value[len(trimmed):]
+		})
+	}
+	normalized := strings.ToLower(strings.Join(strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(message)), " "))
+	candidate, category := 0, 0
+	for clause := range strings.FieldsFuncSeq(normalized, func(character rune) bool { return strings.ContainsRune(".!?;,\n\r。！？；，", character) }) {
+		code := 0
+		if imageCapacitySubjectPattern.MatchString(clause) && imageCapacityFailurePattern.MatchString(clause) {
+			code = 603
+		} else if imageRequestProcessingFailurePattern.MatchString(clause) {
+			code = 606
+		}
+		if code != 0 {
+			candidate = code
+			if !imageSubmissionNegationPattern.MatchString(clause) && (category == 0 || code == 603) {
+				category = code
+			}
+		}
+	}
+	if category == 0 {
+		return candidate, false
+	}
+	// Only the rejected request-processing phrase may contain "processing".
+	// Other accepted/unknown execution diagnostics must remain authoritative.
+	diagnostic := imageRequestProcessingFailurePattern.ReplaceAllString(normalized, "request failure")
+	rawDiagnostic := imageRequestProcessingFailurePattern.ReplaceAllString(strings.ToLower(message), "request failure")
+	if !isImageGatewayFailureDiagnostic(diagnostic, true) || !isImageGatewayFailureDiagnostic(rawDiagnostic, true) {
+		return category, false
+	}
+	for _, signal := range []string{"已排队", "正在排队", "排队成功", "已提交", "正在处理", "处理中", "已创建任务", "受理未知", "输入图片", "输入图像", "参考图", "输入参数"} {
+		if strings.Contains(diagnostic, signal) {
+			return category, false
+		}
+	}
+	checkedError := maps.Clone(providerError)
+	for _, field := range []string{"code", "status", "type"} {
+		value := providerError[field]
+		text := ""
+		switch value := value.(type) {
+		case nil:
+		case string:
+			text = strings.ToLower(strings.TrimSpace(value))
+		case float64:
+			if field != "code" || value != http.StatusBadRequest {
+				return category, false
+			}
+			text = "400"
+		default:
+			return category, false
+		}
+		generic := isGenericImageInputRejectionCode(text)
+		if field == "type" {
+			generic = generic || slices.Contains([]string{"upstream_error", "api_error", "new_api_error", "one_api_error", "server_error", "bad_request", "bad_request_error", "bad_response_status_code"}, text)
+		}
+		if !generic {
+			return category, false
+		}
+		checkedError[field] = ""
+	}
+	checkedError["message"] = ""
+	checked := maps.Clone(envelope)
+	checked["error"] = checkedError
+	return category, isImageGatewayFailureMetadata(checked, http.StatusBadRequest, "", 0)
+}
+
 // isImageGatewayFailureMetadata checks the complete decoded response, including
 // nested metadata that is deliberately omitted from retained public diagnostics.
 // A job receipt, output or contradictory rejection must never authorize replay.
@@ -815,9 +906,21 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	failure.ProviderStatus = providerStatus
 	failure.UpstreamRequestID = requestID
 	failure.RetryAfter = ImageRetryAfter(response.Header.Get("Retry-After"), time.Now())
+	if status == http.StatusBadRequest {
+		category, rejected := imageSubmissionRejection(decoded)
+		if rejected && readErr == nil && !bodyTruncated && decodeErr == nil {
+			failure.Code, failure.InternalCode = category, "upstream_request_processing_failed"
+			if category == 603 {
+				failure.InternalCode = "upstream_capacity_unavailable"
+			}
+			failure.SubmissionRejected, failure.RetryableHTTPResponse = true, true
+		} else if failure.InternalCode == "upstream_failed" && (failure.Code == 603 || category != 0 && failure.Code == 606) {
+			failure.Code, failure.InternalCode = 610, "upstream_failed"
+		}
+	}
 	if !classifyErrorType && readErr == nil && !bodyTruncated {
-		failure.RetryableHTTPResponse = isRetryableImageGatewayResponse(failure, decoded)
-		failure.SubmissionRejected = decodeErr == nil && isImageTaskCreationRejection(failure, decoded)
+		failure.RetryableHTTPResponse = failure.RetryableHTTPResponse || isRetryableImageGatewayResponse(failure, decoded)
+		failure.SubmissionRejected = failure.SubmissionRejected || decodeErr == nil && isImageTaskCreationRejection(failure, decoded)
 		if failure.RetryableHTTPResponse && status == http.StatusServiceUnavailable {
 			// A validated quota rejection uses the existing transient submission
 			// budget, including diagnostics otherwise classified as capacity.

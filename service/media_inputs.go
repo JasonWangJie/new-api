@@ -188,7 +188,9 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 		}
 		attemptTimeout := cfg.DownloadTimeout
 		if input.Kind == "image" {
-			attemptTimeout = min(attemptTimeout, imageCfg.DownloadTimeout)
+			// A slow source gets more time on each safe GET while all attempts
+			// still share the original media download and task deadlines.
+			attemptTimeout = min(attemptTimeout, imageCfg.DownloadTimeout*(1<<(attempt-1)))
 		}
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Duration(attemptTimeout)*time.Second)
 		object, err := downloadMediaInputAttempt(attemptCtx, job, input, cfg, imageCfg, expiresAt, remaining, client)
@@ -346,11 +348,10 @@ func validateMediaInputURL(raw string) (*url.URL, error) {
 }
 
 func mediaInputClient(cfg MediaRuntimeConfig, imageCfg ImageRuntimeConfig, resolver imageReferenceResolver, dial func(context.Context, string, string) (net.Conn, error)) *http.Client {
-	imageCfg.DownloadTimeout = min(cfg.DownloadTimeout, imageCfg.DownloadTimeout)
+	// The request context owns each attempt's timeout. A shorter transport
+	// header timeout would otherwise cut every later image attempt short.
+	imageCfg.DownloadTimeout = cfg.DownloadTimeout
 	client := imageReferenceClient(imageCfg, resolver, dial)
-	// Large video/audio bodies retain the media timeout, while connection and
-	// response headers use the shorter reference timeout to leave retry room.
-	client.Timeout = time.Duration(cfg.DownloadTimeout) * time.Second
 	client.CheckRedirect = func(redirect *http.Request, previous []*http.Request) error {
 		if len(previous) > imageCfg.DownloadRedirects {
 			return errors.New("reference media redirect limit exceeded")

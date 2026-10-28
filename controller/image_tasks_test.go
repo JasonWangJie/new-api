@@ -79,7 +79,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetMainDatabaseType(common.DatabaseType(engine))
 			common.SetLogDatabaseType(common.DatabaseType(logEngine))
-			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
+			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncImageUsageProjection{}, &model.QuotaData{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB, model.LOG_DB = previousDB, previousLogDB
 				common.SetMainDatabaseType(previousType)
@@ -1699,33 +1699,45 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
 				previousSubmit, previousRedis := service.SubmitAsyncVideoFunc, common.RedisEnabled
+				previousDataExport, previousNodeName := common.DataExportEnabled, common.NodeName
 				common.RedisEnabled = false
+				common.DataExportEnabled, common.NodeName = true, "video-refund-node"
 				t.Cleanup(func() {
 					service.SubmitAsyncVideoFunc, common.RedisEnabled = previousSubmit, previousRedis
+					common.DataExportEnabled, common.NodeName = previousDataExport, previousNodeName
 				})
 				const initialQuota, reservedQuota = 1000, 120
 				for index, item := range []struct {
-					name, failedTable, billing                string
-					reserve, recovery, lateRefund             bool
-					logFailure, ackFailure, disableConsumeLog bool
-					wallet, token, quota, logs                int
+					name, failedTable, billing                                  string
+					reserve, recovery, lateRefund                               bool
+					logFailure, refundLogFailure, ackFailure, disableConsumeLog bool
+					existingConsume, usageFailure, disableDataExport            bool
+					wallet, token, quota, logs                                  int
 				}{
-					{name: "refunded", reserve: true, disableConsumeLog: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "refunded with consume logging disabled", reserve: true, disableConsumeLog: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "refunded with matching preconsume log", reserve: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "refunded with usage export disabled", reserve: true, disableDataExport: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
 					{name: "funding failure", reserve: true, failedTable: "users", billing: "failed", wallet: initialQuota - reservedQuota, token: initialQuota, quota: reservedQuota},
 					{name: "token failure", reserve: true, failedTable: "tokens", billing: "failed", wallet: initialQuota, token: initialQuota - reservedQuota, quota: reservedQuota},
 					{name: "not reserved", billing: "not_billable", wallet: initialQuota, token: initialQuota},
 					{name: "reservation recovered after interruption", reserve: true, recovery: true, billing: "unknown", wallet: initialQuota - reservedQuota, token: initialQuota - reservedQuota, quota: reservedQuota},
-					{name: "late refund survives stale recovery update", reserve: true, recovery: true, lateRefund: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
-					{name: "refund log database unavailable", reserve: true, logFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
-					{name: "refund log written before acknowledgement failure", reserve: true, ackFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 1},
+					{name: "late refund survives stale recovery update", reserve: true, recovery: true, lateRefund: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "refund log database unavailable", reserve: true, logFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "refund log failure rolls back paired consume", reserve: true, logFailure: true, refundLogFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "refund log written before acknowledgement failure", reserve: true, ackFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "refund usage projection unavailable", reserve: true, usageFailure: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
+					{name: "existing consume log is not duplicated", reserve: true, existingConsume: true, billing: "refunded", wallet: initialQuota, token: initialQuota, logs: 2},
 				} {
 					t.Run(item.name, func(t *testing.T) {
-						if item.disableConsumeLog {
-							previousConsumeLog := common.LogConsumeEnabled
-							common.LogConsumeEnabled = false
-							t.Cleanup(func() { common.LogConsumeEnabled = previousConsumeLog })
-						}
-						user := model.User{Id: 1101 + index, Username: "video-refund-" + strings.ReplaceAll(item.name, " ", "-"), AffCode: "video-refund-" + string(rune('a'+index)), Quota: initialQuota, UsedQuota: 37}
+						previousConsumeLog := common.LogConsumeEnabled
+						previousDataExport, previousNodeName := common.DataExportEnabled, common.NodeName
+						common.LogConsumeEnabled = !item.disableConsumeLog
+						common.DataExportEnabled = !item.disableDataExport
+						t.Cleanup(func() {
+							common.LogConsumeEnabled = previousConsumeLog
+							common.DataExportEnabled, common.NodeName = previousDataExport, previousNodeName
+						})
+						user := model.User{Id: 1101 + index, Username: "video-refund-" + strings.ReplaceAll(item.name, " ", "-"), AffCode: "video-refund-" + string(rune('a'+index)), Quota: initialQuota, UsedQuota: 37, RequestCount: 3}
 						token := model.Token{Id: 1201 + index, UserId: user.Id, Name: "Refund key", Key: "video-refund-key-" + string(rune('a'+index)), RemainQuota: initialQuota, UsedQuota: 23}
 						require.NoError(t, db.Create(&user).Error)
 						require.NoError(t, db.Create(&token).Error)
@@ -1737,6 +1749,19 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						c, _ := gin.CreateTestContext(httptest.NewRecorder())
 						c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
 						c.Set("async_media_execution", true)
+						c.Set(common.RequestIdKey, "video-refund-request-"+string(rune('a'+index)))
+						var channelBefore model.Channel
+						require.NoError(t, db.Take(&channelBefore, job.ChannelId).Error)
+						if item.existingConsume {
+							other := model.NewLogOther()
+							other.SetPublic("task_id", job.TaskId)
+							other.SetPublic("is_task", true)
+							other.SetPublic("billing_source", service.BillingSourceWallet)
+							other.SetPublic("reason", "Existing task consumption")
+							other.SetPublic("billing_phase", "submitted")
+							require.NoError(t, logDB.Create(&model.Log{UserId: user.Id, Username: user.Username, TokenId: token.Id, ChannelId: job.ChannelId, Type: model.LogTypeConsume, ModelName: job.Model, Group: job.Group, Quota: reservedQuota, CreatedAt: now, RequestId: c.GetString(common.RequestIdKey), Other: other.JSONString()}).Error)
+							require.NoError(t, db.Create(&model.QuotaData{UserID: user.Id, Username: user.Username, ModelName: job.Model, CreatedAt: now - now%3600, UseGroup: job.Group, TokenID: token.Id, ChannelID: job.ChannelId, NodeName: "video-refund-node", Count: 1, Quota: reservedQuota}).Error)
+						}
 						info := &relaycommon.RelayInfo{
 							UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: job.Model, UsingGroup: job.Group,
 							UserSetting:   dto.UserSetting{BillingPreference: "wallet_only"},
@@ -1790,6 +1815,12 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							if item.logFailure {
 								require.NoError(t, logDB.Callback().Create().Before("gorm:create").Register("video-refund-log-failure", func(tx *gorm.DB) {
 									if tx.Statement.Table == "logs" {
+										if item.refundLogFailure {
+											log, ok := tx.Statement.Dest.(*model.Log)
+											if !ok || log.Type != model.LogTypeRefund {
+												return
+											}
+										}
 										tx.AddError(errors.New("injected refund log database failure"))
 									}
 								}))
@@ -1803,6 +1834,14 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 									}
 								}))
 								t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("video-refund-log-ack-failure")) })
+							}
+							if item.usageFailure {
+								require.NoError(t, db.Callback().Create().Before("gorm:create").Register("video-refund-usage-failure", func(tx *gorm.DB) {
+									if tx.Statement.Table == "async_image_usage_projections" {
+										tx.AddError(errors.New("injected refund usage projection failure"))
+									}
+								}))
+								t.Cleanup(func() { assert.NoError(t, db.Callback().Create().Remove("video-refund-usage-failure")) })
 							}
 							// Refund must survive cancellation of the upstream submission context.
 							cancelled, cancel := context.WithCancel(c.Request.Context())
@@ -1830,24 +1869,30 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Equal(t, item.quota, job.Quota)
 						assert.Empty(t, job.LeaseToken)
 						assert.Zero(t, job.NextAttemptAt)
-						if item.logFailure || item.ackFailure {
+						if item.logFailure || item.ackFailure || item.usageFailure {
 							assert.NotEmpty(t, job.RefundLogPayload, "refund log stays pending until its persistence can be acknowledged")
 							var count int64
 							require.NoError(t, logDB.Model(&model.Log{}).Where("token_id = ?", token.Id).Count(&count).Error)
-							if item.ackFailure {
-								assert.EqualValues(t, 1, count, "the log was committed before the acknowledgement failed")
+							if item.ackFailure || item.usageFailure {
+								assert.EqualValues(t, item.logs, count, "both logs commit before the acknowledgement can fail")
 							} else {
 								assert.Zero(t, count)
 							}
+							require.NoError(t, db.Model(&model.AsyncImageUsageProjection{}).Where("event_id = ?", "video-submission-preconsume:"+job.TaskId).Count(&count).Error)
+							assert.Zero(t, count, "usage delivery and acknowledgement must commit together")
 							require.NoError(t, db.Take(&user, user.Id).Error)
 							require.NoError(t, db.Take(&token, token.Id).Error)
 							assert.Equal(t, initialQuota, user.Quota, "log failure must not undo the completed wallet refund")
 							assert.Equal(t, initialQuota, token.RemainQuota)
 							if item.logFailure {
 								require.NoError(t, logDB.Callback().Create().Remove("video-refund-log-failure"))
-							} else {
+							} else if item.ackFailure {
 								require.NoError(t, db.Callback().Update().Remove("video-refund-log-ack-failure"))
+							} else {
+								require.NoError(t, db.Callback().Create().Remove("video-refund-usage-failure"))
 							}
+							common.LogConsumeEnabled = false
+							common.DataExportEnabled, common.NodeName = false, "different-replay-node"
 							for range 2 {
 								require.NoError(t, model.ReplayAsyncMediaRefundLogs(t.Context(), 10))
 							}
@@ -1869,25 +1914,156 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Equal(t, item.wallet, user.Quota)
 						assert.Equal(t, item.token, token.RemainQuota)
 						assert.Equal(t, 23+initialQuota-item.token, token.UsedQuota)
-						assert.Equal(t, 37, user.UsedQuota, "submission rollback must not reverse consumption that was never recorded")
+						assert.Equal(t, 37, user.UsedQuota, "new audit logs must not change finalized usage counters")
+						assert.Equal(t, 3, user.RequestCount, "a preconsume audit is not another request")
+						var channelAfter model.Channel
+						require.NoError(t, db.Take(&channelAfter, job.ChannelId).Error)
+						assert.Equal(t, channelBefore.UsedQuota, channelAfter.UsedQuota)
 						var logs []model.Log
 						require.NoError(t, logDB.Where("token_id = ?", token.Id).Find(&logs).Error)
-						require.Len(t, logs, item.logs, "only completed refunds produce a usage-log entry; failed submission needs no consume log")
-						if item.logs > 0 {
-							assert.Equal(t, model.LogTypeRefund, logs[0].Type)
-							assert.Equal(t, reservedQuota, logs[0].Quota)
-							assert.Equal(t, job.Model, logs[0].ModelName)
-							assert.Equal(t, job.Group, logs[0].Group)
-							assert.Equal(t, job.ChannelId, logs[0].ChannelId)
+						require.Len(t, logs, item.logs, "confirmed rollback delivers each audit entry once")
+						var consumed, refunded, consumeCount, refundCount int
+						var consumeCreatedAt int64
+						for _, log := range logs {
+							require.Contains(t, []int{model.LogTypeConsume, model.LogTypeRefund}, log.Type)
+							switch log.Type {
+							case model.LogTypeConsume:
+								consumeCount++
+								consumed += log.Quota
+								consumeCreatedAt = log.CreatedAt
+								assert.Zero(t, log.PromptTokens)
+								assert.Zero(t, log.CompletionTokens)
+								assert.Zero(t, log.UseTime)
+							case model.LogTypeRefund:
+								refundCount++
+								refunded += log.Quota
+							}
+							assert.Equal(t, reservedQuota, log.Quota)
+							assert.Equal(t, job.Model, log.ModelName)
+							assert.Equal(t, job.Group, log.Group)
+							assert.Equal(t, job.ChannelId, log.ChannelId)
+							assert.Equal(t, c.GetString(common.RequestIdKey), log.RequestId)
 							var other map[string]any
-							require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+							require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
 							assert.Equal(t, true, other["is_task"])
 							assert.Equal(t, job.TaskId, other["task_id"])
 							assert.Equal(t, service.BillingSourceWallet, other["billing_source"])
 							assert.NotEmpty(t, other["reason"])
+							if log.Type == model.LogTypeConsume && !item.existingConsume {
+								assert.Equal(t, "submission_preconsume", other["billing_phase"])
+							}
+						}
+						if item.logs == 2 {
+							assert.Equal(t, 1, consumeCount)
+							assert.Equal(t, 1, refundCount)
+							assert.Equal(t, consumed, refunded, "the completed refund has zero net consumption")
+						} else {
+							assert.Zero(t, consumeCount)
+							assert.Equal(t, item.logs, refundCount)
+						}
+						var projections []model.AsyncImageUsageProjection
+						require.NoError(t, db.Where("event_id = ?", "video-submission-preconsume:"+job.TaskId).Find(&projections).Error)
+						projectsUsage := item.logs == 2 && !item.disableDataExport && !item.existingConsume
+						expectedUsage, expectedCount := 0, 0
+						if projectsUsage {
+							require.Len(t, projections, 1, "replaying delivery must leave exactly one usage projection")
+							actual := projections[0]
+							actual.Id = 0
+							assert.Equal(t, model.AsyncImageUsageProjection{EventId: "video-submission-preconsume:" + job.TaskId, UserID: user.Id, Username: user.Username, ModelName: job.Model, CreatedAt: consumeCreatedAt - consumeCreatedAt%3600, UseGroup: job.Group, TokenID: token.Id, ChannelID: job.ChannelId, NodeName: "video-refund-node", Quota: reservedQuota}, actual, "usage keeps the captured billing dimensions without adding request or token counts")
+							expectedUsage = reservedQuota
+						} else {
+							assert.Empty(t, projections, "disabled exports and adopted consumption must not acquire a second usage entry")
+						}
+						if item.existingConsume {
+							expectedUsage, expectedCount = reservedQuota, 1
+						}
+						recorder := httptest.NewRecorder()
+						usageContext, _ := gin.CreateTestContext(recorder)
+						usageContext.Request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/data/?username=%s&start_timestamp=%d&end_timestamp=%d", url.QueryEscape(user.Username), now-3600, time.Now().Unix()+3600), nil)
+						GetAllQuotaDates(usageContext)
+						require.Equal(t, http.StatusOK, recorder.Code)
+						var usageResponse struct {
+							Success bool              `json:"success"`
+							Data    []model.QuotaData `json:"data"`
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &usageResponse))
+						require.True(t, usageResponse.Success)
+						var usageQuota, usageCount, usageTokens int
+						for _, usage := range usageResponse.Data {
+							usageQuota += usage.Quota
+							usageCount += usage.Count
+							usageTokens += usage.TokenUsed
+						}
+						assert.Equal(t, expectedUsage, usageQuota, "/api/data includes each newly delivered preconsume exactly once")
+						assert.Equal(t, expectedCount, usageCount)
+						assert.Zero(t, usageTokens)
+						if expectedUsage != 0 {
+							assert.Zero(t, usageQuota-refunded, "the API usage-minus-refund formula must net a fully refunded submission to zero")
 						}
 					})
 				}
+				t.Run("legacy pending refund does not gain a consume entry", func(t *testing.T) {
+					previousConsumeLog := common.LogConsumeEnabled
+					common.LogConsumeEnabled = true
+					t.Cleanup(func() { common.LogConsumeEnabled = previousConsumeLog })
+					var ownerBefore model.User
+					var tokenBefore model.Token
+					require.NoError(t, db.Take(&ownerBefore, 101).Error)
+					require.NoError(t, db.Take(&tokenBefore, 201).Error)
+					other := model.NewLogOther()
+					other.SetPublic("is_task", true)
+					other.SetPublic("task_id", "video-legacy-pending-refund")
+					legacyLog := model.Log{UserId: 101, TokenId: 201, ChannelId: 301, ModelName: "legacy-video", Type: model.LogTypeRefund, Quota: reservedQuota, Group: "default", RequestId: "legacy-video-refund-request", CreatedAt: now - 10, Other: other.JSONString()}
+					payload, err := common.Marshal(legacyLog)
+					require.NoError(t, err)
+					job := model.AsyncMediaJob{TaskId: "video-legacy-pending-refund", IdentityHash: "video-legacy-pending-refund", UserId: 101, TokenId: 201, ChannelId: 301, Model: legacyLog.ModelName, Group: "default", Status: "failed", BillingStatus: "refunded", RefundLogPayload: string(payload), CreatedAt: now - 10, ExpiresAt: now + 3600}
+					require.NoError(t, db.Create(&job).Error)
+					for range 2 {
+						require.NoError(t, model.ReplayAsyncMediaRefundLogs(t.Context(), 100))
+					}
+					var logs []model.Log
+					require.NoError(t, logDB.Where("request_id = ?", legacyLog.RequestId).Find(&logs).Error)
+					require.Len(t, logs, 1)
+					assert.Equal(t, model.LogTypeRefund, logs[0].Type)
+					assert.Equal(t, reservedQuota, logs[0].Quota)
+					var projectionCount int64
+					require.NoError(t, db.Model(&model.AsyncImageUsageProjection{}).Where("event_id = ?", "video-submission-preconsume:"+job.TaskId).Count(&projectionCount).Error)
+					assert.Zero(t, projectionCount, "legacy refund-only replay must not backfill usage implicitly")
+					require.NoError(t, db.Take(&job, job.ID).Error)
+					assert.Empty(t, job.RefundLogPayload)
+					var ownerAfter model.User
+					var tokenAfter model.Token
+					require.NoError(t, db.Take(&ownerAfter, ownerBefore.Id).Error)
+					require.NoError(t, db.Take(&tokenAfter, tokenBefore.Id).Error)
+					assert.Equal(t, ownerBefore.Quota, ownerAfter.Quota)
+					assert.Equal(t, ownerBefore.UsedQuota, ownerAfter.UsedQuota)
+					assert.Equal(t, ownerBefore.RequestCount, ownerAfter.RequestCount)
+					assert.Equal(t, tokenBefore.RemainQuota, tokenAfter.RemainQuota)
+					assert.Equal(t, tokenBefore.UsedQuota, tokenAfter.UsedQuota)
+				})
+				t.Run("accepted task does not gain a missing submission consume entry", func(t *testing.T) {
+					previousConsumeLog := common.LogConsumeEnabled
+					common.LogConsumeEnabled = true
+					t.Cleanup(func() { common.LogConsumeEnabled = previousConsumeLog })
+					job := model.AsyncMediaJob{TaskId: "video-accepted-refund-audit", IdentityHash: "video-accepted-refund-audit", UserId: 101, TokenId: 201, ChannelId: 301, Model: "accepted-video", Group: "default", Status: "submitted", BillingStatus: "reserved", Quota: reservedQuota, CreatedAt: now, ExpiresAt: now + 3600}
+					require.NoError(t, db.Create(&job).Error)
+					require.NoError(t, db.Create(&model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Status: model.TaskStatusSubmitted, Quota: reservedQuota}).Error)
+					other := model.NewLogOther()
+					other.SetPublic("is_task", true)
+					other.SetPublic("task_id", job.TaskId)
+					refund := model.RecordTaskBillingLogParams{UserId: job.UserId, TokenId: job.TokenId, ChannelId: job.ChannelId, ModelName: job.Model, LogType: model.LogTypeRefund, Quota: reservedQuota, Group: job.Group, Other: other, RequestId: "accepted-video-refund-request"}
+					for range 2 {
+						require.NoError(t, model.SaveAsyncMediaSubmissionRefund(t.Context(), job.TaskId, job.UserId, map[string]any{"billing_status": "refunded", "quota": 0}, &refund))
+					}
+					var logs []model.Log
+					require.NoError(t, logDB.Where("request_id = ?", refund.RequestId).Find(&logs).Error)
+					require.Len(t, logs, 1)
+					assert.Equal(t, model.LogTypeRefund, logs[0].Type)
+					assert.Equal(t, reservedQuota, logs[0].Quota)
+					var projectionCount int64
+					require.NoError(t, db.Model(&model.AsyncImageUsageProjection{}).Where("event_id = ?", "video-submission-preconsume:"+job.TaskId).Count(&projectionCount).Error)
+					assert.Zero(t, projectionCount, "accepted tasks keep their existing consume/export path")
+				})
 			})
 			t.Run("video submission errors retain diagnostics without replay", func(t *testing.T) {
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")

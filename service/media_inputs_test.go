@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
@@ -122,6 +123,9 @@ func TestMediaInputDownloadLimitsAndRawStorage(t *testing.T) {
 	}
 	client = mediaInputClient(cfg, imageCfg, nil, nil)
 	defer client.CloseIdleConnections()
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, time.Duration(cfg.DownloadTimeout)*time.Second, transport.ResponseHeaderTimeout, "header waiting must leave later image download attempts their longer request deadlines")
 	redirect, err := http.NewRequest(http.MethodGet, "http://other.example.com/reference", nil)
 	require.NoError(t, err)
 	redirect.Header.Set("Authorization", "secret")
@@ -143,21 +147,37 @@ func TestMediaInputDownloadLimitsAndRawStorage(t *testing.T) {
 func TestMediaInputDownloadRetries(t *testing.T) {
 	for _, tc := range []struct {
 		name, reason, source string
+		kind                 string
 		failure              error
 		status, failures     int
 		calls                int
 		partial, limited     bool
 		cancel, retryAfter   bool
+		invalid              bool
 		success              bool
+		attemptSeconds       []int
+		mediaTimeout         int
+		parentTimeout        int
 	}{
 		{name: "timeout then success", failure: context.DeadlineExceeded, failures: 1, calls: 2, success: true},
+		{name: "image timeout budgets increase", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}},
+		{name: "image timeout respects media budget", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}, mediaTimeout: 45},
+		{name: "image timeout respects parent deadline", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}, parentTimeout: 45},
+		{name: "wrapped timeout with different diagnostic", failure: fmt.Errorf("the remote service did not answer: %w", context.DeadlineExceeded), failures: 1, calls: 2, success: true},
+		{name: "typed timeout with different diagnostic", failure: &net.DNSError{Err: "a different upstream diagnostic", Name: "private.example", IsTimeout: true}, failures: 1, calls: 2, success: true},
 		{name: "connection then success", failure: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection reset")}, failures: 1, calls: 2, success: true},
 		{name: "bad gateway then success", status: 502, failures: 1, calls: 2, success: true},
 		{name: "rate limited then success", status: 429, failures: 1, calls: 2, success: true},
 		{name: "interrupted body then success", partial: true, failures: 1, calls: 2, success: true},
 		{name: "exhausted timeout", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts"},
 		{name: "missing source", status: 404, failures: 3, calls: 1, reason: "HTTP 404"},
+		{name: "bad request is terminal", status: 400, failures: 3, calls: 1, reason: "HTTP 400"},
+		{name: "authentication is terminal", status: 401, failures: 3, calls: 1, reason: "HTTP 401"},
 		{name: "forbidden source", status: 403, failures: 3, calls: 1, reason: "HTTP 403"},
+		{name: "expired source is terminal", status: 410, failures: 3, calls: 1, reason: "HTTP 410"},
+		{name: "invalid image is terminal", invalid: true, calls: 1, reason: "reference image"},
+		{name: "video timeout budget is unchanged", kind: "video", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts", attemptSeconds: []int{900, 900, 900}},
+		{name: "audio timeout budget is unchanged", kind: "audio", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts", attemptSeconds: []int{900, 900, 900}},
 		{name: "unsupported source server", status: 501, failures: 3, calls: 1, reason: "HTTP 501"},
 		{name: "security rejection", failure: errors.New("reference resolved to a non-public address"), failures: 3, calls: 1, reason: "request or read failed"},
 		{name: "retry after exceeds budget", status: 429, failures: 3, calls: 1, retryAfter: true, reason: "remaining deadline"},
@@ -167,8 +187,17 @@ func TestMediaInputDownloadRetries(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			job, cfg, imageCfg := mediaInputFixture(t)
+			if tc.mediaTimeout > 0 {
+				cfg.DownloadTimeout = tc.mediaTimeout
+			}
 			data := asyncImageBytesFixture(t).Data
+			if tc.invalid {
+				data = []byte("invalid image bytes")
+			}
 			input := AsyncVideoReferenceInput{Index: 0, Kind: "image", Source: "https://public.example/reference.png?token=private"}
+			if tc.kind != "" {
+				input.Kind = tc.kind
+			}
 			if tc.source != "" {
 				input.Source = tc.source
 			}
@@ -180,11 +209,31 @@ func TestMediaInputDownloadRetries(t *testing.T) {
 			remaining.Store(budget)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			if tc.parentTimeout > 0 {
+				var deadlineCancel context.CancelFunc
+				ctx, deadlineCancel = context.WithTimeout(ctx, time.Duration(tc.parentTimeout)*time.Second)
+				defer deadlineCancel()
+			}
+			downloadStartedAt := time.Now()
+			downloadDeadline := downloadStartedAt.Add(time.Duration(cfg.DownloadTimeout) * time.Second)
+			if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(downloadDeadline) {
+				downloadDeadline = parentDeadline
+			}
 			calls := 0
 			client := &http.Client{Transport: mediaInputRoundTripper(func(request *http.Request) (*http.Response, error) {
 				calls++
 				assert.Equal(t, http.MethodGet, request.Method)
 				assert.Empty(t, request.Header.Get("Authorization"))
+				if len(tc.attemptSeconds) > 0 {
+					requestedAt := time.Now()
+					expectedDeadline := requestedAt.Add(time.Duration(tc.attemptSeconds[calls-1]) * time.Second)
+					if downloadDeadline.Before(expectedDeadline) {
+						expectedDeadline = downloadDeadline
+					}
+					deadline, ok := request.Context().Deadline()
+					require.True(t, ok)
+					assert.WithinDuration(t, expectedDeadline, deadline, 500*time.Millisecond, "GET %d must use its attempt budget bounded by the original download and parent deadlines", calls)
+				}
 				if tc.cancel {
 					cancel()
 				}

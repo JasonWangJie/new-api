@@ -46,7 +46,9 @@ var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRe
 var PersistAsyncVideoFunc func(context.Context, model.AsyncMediaJob, *model.Task) error
 
 // recordAsyncVideoSubmissionRefund records only confirmed reservation rollbacks.
-// Submit failures have not accumulated usage, so RefundTaskQuota cannot be used.
+// Missing consumption and its gross usage projection share a durable outbox,
+// without changing financial counters. Submit failures have not accumulated
+// settled usage, so RefundTaskQuota cannot be used.
 func recordAsyncVideoSubmissionRefund(c *gin.Context, info *relaycommon.RelayInfo, quota int, refundErr error) {
 	if info.TaskRelayInfo == nil || info.TaskRelayInfo.PublicTaskID == "" {
 		return

@@ -36,22 +36,25 @@ type AsyncVideoReferenceRejectedError struct{ Reason string }
 func (err *AsyncVideoReferenceRejectedError) Error() string { return err.Reason }
 
 var (
-	videoReferenceTimeoutPattern        = regexp.MustCompile(`^(?:[（(](?:图片|视频|音频)[0-9]{1,2}(?:[、,，](?:图片|视频|音频)?[0-9]{1,2})*[）)]\s*)?素材下载超时[，,]请联系管理员处理[。.]?$`)
+	videoReferenceURLPattern            = regexp.MustCompile(`(?i)\bhttps?://[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
 	videoReferenceInputPattern          = regexp.MustCompile(`素材|参考(?:图(?:片|像)?|视频|音频|资源|文件|链接)|引用(?:资源|素材|图片|图像|视频|音频|文件|链接)|输入(?:图片|图像|视频|音频|资源|文件)|\b(?:references?|materials?|assets?)\b|\b(?:input|source|referenced|uploaded)[ _-]+(?:images?|videos?|audio|media|files?|resources?|urls?|links?)\b|\bmedia[ _-]+(?:urls?|links?|files?|resources?)\b`)
 	videoReferenceFetchPattern          = regexp.MustCompile(`下载|读取|读入|访问|拉取|获取|加载|抓取|不可达|无法连接|连不上|过期|\b(?:download(?:ing|ed)?|fetch(?:ing|ed)?|read(?:ing)?|access(?:ing|ed|ible)?|load(?:ing|ed)?|retriev(?:e|ing|ed)|unreachable|inaccessible|expired)\b`)
 	videoReferenceFailedPattern         = regexp.MustCompile(`失败|超时|无法|不能|未能|不可|不通|受限|限制|受阻|拒绝|禁止|过期|错误|\b(?:fail(?:ed|ure|ing)?|error|timeout|timed?[ _-]*out|unable|cannot|can['’]?t|couldn['’]t|could[ _-]+not|not[ _-]+(?:publicly[ _-]+)?accessible|unreachable|inaccessible|restricted|restrictions?|blocked|forbidden|denied|expired)\b`)
-	videoReferenceFetchSucceededPattern = regexp.MustCompile(`成功(?:下载|读取|读入|访问|拉取|获取|加载|抓取)|(?:下载|读取|读入|访问|拉取|获取|加载|抓取)(?:已经|已)?成功|(?:没有|并未|未|不)(?:发生)?(?:失败|超时|过期|受限)|不受(?:到)?(?:访问)?限制|\b(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)[ _-]+(?:successfully|succeeded)\b|\bsuccessfully[ _-]+(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)\b|\b(?:not|never|didn['’]t|doesn['’]t)[ _-]+(?:fail(?:ed)?|timeout|timed?[ _-]*out|expired|restricted|blocked|unreachable|inaccessible)\b`)
-	videoReferenceOtherFailurePattern   = regexp.MustCompile(`参数|尺寸|宽高|分辨率|时长|不支持|格式|解码|审核|违规|不合规|安全|版权|鉴权|认证|凭证|登录|登錄|限流|余额|额度|成片|输出|生成结果|生成产物|\b(?:invalid|unsupported|parameters?|aspect[ _-]?ratio|dimensions?|resolution|width|height|duration|safety|censor(?:ship)?|moderation|policy|copyright|violation|auth(?:entication|orization)?|unauthenticated|unauthorized|credentials?|login|log[ _-]+in|api[ _-]?key|access[ _-]?token|rate[ _-]?limit|quota|outputs?|results?|generated[ _-]+(?:video|media))\b`)
+	videoReferenceFetchSucceededPattern = regexp.MustCompile(`成功(?:下载|读取|读入|访问|拉取|获取|加载|抓取)|(?:下载|读取|读入|访问|拉取|获取|加载|抓取)(?:已经|已)?成功|(?:没有|并未|未|不)(?:发生)?(?:下载|读取|读入|访问|拉取|获取|加载|抓取)?(?:失败|超时|过期|受限)|不受(?:到)?(?:访问)?限制|\b(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)[ _-]+(?:successfully|succeeded)\b|\bsuccessfully[ _-]+(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)\b|\bno[ _-]+(?:failures?|errors?|timeouts?)[ _-]+(?:occurred|happened|(?:was|were)[ _-]+reported)\b|\b(?:not|never|didn['’]t|doesn['’]t)[ _-]+(?:fail(?:ed)?|timeout|timed?[ _-]*out|expired|restricted|blocked|unreachable|inaccessible)\b`)
+	videoReferenceOtherFailurePattern   = regexp.MustCompile(`参数|尺寸|宽高|分辨率|时长|不支持|格式|解码|损坏|損壞|审核|违规|不合规|安全|版权|鉴权|认证|凭证|登录|登錄|限流|余额|额度|成片|输出|生成结果|生成产物|\b(?:invalid|unsupported|decod(?:e|ed|ing|er)|corrupt(?:ed|ion)?|parameters?|aspect[ _-]?ratio|dimensions?|resolution|width|height|duration|safety|censor(?:ship)?|moderation|policy|copyright|violation|auth(?:entication|orization)?|unauthenticated|unauthorized|credentials?|login|log[ _-]+in|api[ _-]?key|access[ _-]?token|rate[ _-]?limit|quota|outputs?|results?|generated[ _-]+(?:video|media))\b`)
 )
 
 func isAsyncVideoReferenceDownloadFailure(reason string) bool {
+	// URL paths and signed parameters are opaque, not failure diagnostics. Mask
+	// them before normalization, preserving sentence ends and attached CJK text.
+	reason = videoReferenceURLPattern.ReplaceAllStringFunc(reason, func(value string) string {
+		trimmed := strings.TrimRight(value, ".!?")
+		return " [url]" + value[len(trimmed):]
+	})
 	reason = strings.NewReplacer("_", " ", "-", " ").Replace(reason)
 	reason = strings.ToLower(strings.Join(strings.Fields(reason), " "))
 	if videoReferenceOtherFailurePattern.MatchString(reason) {
 		return false
-	}
-	if videoReferenceTimeoutPattern.MatchString(reason) {
-		return true
 	}
 	if !videoReferenceInputPattern.MatchString(reason) {
 		return false

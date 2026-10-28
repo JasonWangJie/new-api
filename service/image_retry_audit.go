@@ -117,6 +117,10 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 			decision.Action, decision.Reason = "switch_account", "incompatible_image_reference"
 		} else if failure.InternalCode == "upstream_image_submission_rejected" {
 			decision.Action, decision.Reason = "switch_account", "submission_rejected_without_diagnostic"
+		} else if failure.InternalCode == "upstream_capacity_unavailable" && (failure.SubmissionRejected || failure.SynchronousRetryableResponse) {
+			decision.Action, decision.Reason = "switch_account", "no_available_capacity"
+		} else if failure.InternalCode == "upstream_request_processing_failed" && (failure.SubmissionRejected || failure.SynchronousRetryableResponse) {
+			decision.Action = "switch_account"
 		} else if failure.Code == 603 {
 			decision.Action, decision.Reason = "wait_capacity", "no_available_capacity"
 		}

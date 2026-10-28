@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // AsyncMediaJob owns submission and storage leases. Upstream task accounting
@@ -176,8 +177,33 @@ func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[s
 	})
 }
 
-// SaveAsyncMediaSubmissionRefund persists the confirmed rollback and its log
-// command together. Retrying log delivery must never repeat the refund itself.
+type asyncMediaSubmissionRefundLogs struct {
+	Version int                        `json:"version"`
+	Consume *Log                       `json:"consume,omitempty"`
+	Refund  *Log                       `json:"refund"`
+	Usage   *AsyncImageUsageProjection `json:"usage,omitempty"`
+}
+
+func parseAsyncMediaSubmissionRefundLogs(payload string) (asyncMediaSubmissionRefundLogs, error) {
+	var logs asyncMediaSubmissionRefundLogs
+	if err := common.UnmarshalJsonStr(payload, &logs); err != nil {
+		return logs, err
+	}
+	if logs.Version == 0 && logs.Consume == nil && logs.Refund == nil && logs.Usage == nil {
+		// Existing commands contain only the refund. Deliver them unchanged;
+		// replay must not backfill historical consumption implicitly.
+		logs.Refund = &Log{}
+		if err := common.UnmarshalJsonStr(payload, logs.Refund); err != nil {
+			return logs, err
+		}
+	} else if logs.Version != 1 || logs.Consume == nil || logs.Refund == nil {
+		return logs, ErrImageConflict
+	}
+	return logs, nil
+}
+
+// SaveAsyncMediaSubmissionRefund persists confirmed rollback logs together.
+// Retrying their delivery must never repeat financial adjustments.
 func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID int, updates map[string]any, refund *RecordTaskBillingLogParams, expectedGeneration ...int64) error {
 	generation := int64(0)
 	if len(expectedGeneration) > 1 || len(expectedGeneration) == 1 && expectedGeneration[0] < 0 {
@@ -187,13 +213,14 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 		generation = expectedGeneration[0]
 	}
 	var payload string
+	var refundLog *Log
 	if refund != nil {
 		if refund.LogType != LogTypeRefund || refund.UserId != userID || refund.TokenId <= 0 || refund.Quota <= 0 || updates["billing_status"] != "refunded" {
 			return ErrImageConflict
 		}
-		log := newTaskBillingLog(*refund)
-		ensureLogRequestId(log)
-		data, err := common.Marshal(log)
+		refundLog = newTaskBillingLog(*refund)
+		ensureLogRequestId(refundLog)
+		data, err := common.Marshal(refundLog)
 		if err != nil {
 			return err
 		}
@@ -215,14 +242,59 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 				return ErrImageConflict
 			}
 			if job.RefundLogPayload != "" {
-				var existing Log
-				if err := common.UnmarshalJsonStr(job.RefundLogPayload, &existing); err != nil {
+				existingLogs, err := parseAsyncMediaSubmissionRefundLogs(job.RefundLogPayload)
+				if err != nil {
 					return err
 				}
+				existing := existingLogs.Refund
 				if existing.Type != refund.LogType || existing.UserId != refund.UserId || existing.TokenId != refund.TokenId || existing.ChannelId != refund.ChannelId || existing.ModelName != refund.ModelName || existing.Quota != refund.Quota {
 					return ErrImageConflict
 				}
 			} else if job.BillingStatus != "refunded" {
+				if common.LogConsumeEnabled && job.AttemptGeneration == 0 {
+					var acceptedTasks int64
+					if err := tx.Model(&Task{}).Where("task_id = ? AND user_id = ?", taskID, userID).Count(&acceptedTasks).Error; err != nil {
+						return err
+					}
+					if acceptedTasks == 0 {
+						var other map[string]any
+						if err := common.UnmarshalJsonStr(refundLog.Other, &other); err != nil {
+							return err
+						}
+						if other == nil {
+							other = make(map[string]any)
+						}
+						other["is_task"], other["task_id"], other["billing_phase"] = true, taskID, "submission_preconsume"
+						other["reason"] = "Task submission failed; recording its reserved quota"
+						encodedOther, err := common.Marshal(other)
+						if err != nil {
+							return err
+						}
+						consume := *refundLog
+						consume.Type, consume.Content, consume.Other = LogTypeConsume, "视频提交失败，补记预扣消费", string(encodedOther)
+						consume.PromptTokens, consume.CompletionTokens, consume.UseTime = 0, 0, 0
+						command := asyncMediaSubmissionRefundLogs{Version: 1, Consume: &consume, Refund: refundLog}
+						if common.DataExportEnabled {
+							nodeName := refund.NodeName
+							if nodeName == "" {
+								nodeName = common.NodeName
+							}
+							// Reuse the durable per-event usage table. This audit adds
+							// its gross quota without counting a generated request.
+							command.Usage = &AsyncImageUsageProjection{
+								EventId: "video-submission-preconsume:" + taskID,
+								UserID:  consume.UserId, Username: consume.Username, ModelName: consume.ModelName,
+								CreatedAt: consume.CreatedAt - consume.CreatedAt%3600, UseGroup: consume.Group,
+								TokenID: consume.TokenId, ChannelID: consume.ChannelId, NodeName: nodeName, Quota: consume.Quota,
+							}
+						}
+						data, err := common.Marshal(command)
+						if err != nil {
+							return err
+						}
+						payload = string(data)
+					}
+				}
 				changes["refund_log_payload"] = payload
 			}
 		}
@@ -245,8 +317,9 @@ func SaveAsyncMediaSubmissionRefund(ctx context.Context, taskID string, userID i
 	return nil
 }
 
-// ConfirmAsyncMediaRefundLog delivers a persisted refund event without changing
-// wallet, subscription, or token balances. The payload survives log-store errors.
+// ConfirmAsyncMediaRefundLog delivers rollback logs and their gross usage
+// projection without changing balances or settled usage counters. Captured
+// logging and export decisions survive subsequent settings changes.
 func ConfirmAsyncMediaRefundLog(ctx context.Context, taskID string) error {
 	var job AsyncMediaJob
 	if err := DB.WithContext(ctx).Select("id", "task_id", "user_id", "token_id", "refund_log_payload").Where("task_id = ?", taskID).Take(&job).Error; err != nil {
@@ -255,22 +328,174 @@ func ConfirmAsyncMediaRefundLog(ctx context.Context, taskID string) error {
 	if job.RefundLogPayload == "" {
 		return nil
 	}
-	var log Log
-	if err := common.UnmarshalJsonStr(job.RefundLogPayload, &log); err != nil {
+	logs, err := parseAsyncMediaSubmissionRefundLogs(job.RefundLogPayload)
+	if err != nil {
 		return err
 	}
+	log := logs.Refund
 	if log.Type != LogTypeRefund || log.UserId != job.UserId || log.TokenId != job.TokenId || log.Quota <= 0 || log.RequestId == "" || log.Id != 0 {
 		return ErrImageConflict
 	}
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(job.RefundLogPayload)))
-	if err := recordTaskBillingLogOnce(ctx, &log, "video-refund:"+job.TaskId, fingerprint); err != nil {
+	projectUsage := false
+	if logs.Consume != nil {
+		consume := logs.Consume
+		if consume.Id != 0 || consume.Type != LogTypeConsume || consume.UserId != log.UserId || consume.TokenId != log.TokenId || consume.ChannelId != log.ChannelId || consume.ModelName != log.ModelName || consume.Group != log.Group || consume.Quota != log.Quota || consume.RequestId != log.RequestId || consume.PromptTokens != 0 || consume.CompletionTokens != 0 || consume.UseTime != 0 {
+			return ErrImageConflict
+		}
+		var other map[string]any
+		if common.UnmarshalJsonStr(consume.Other, &other) != nil || other["task_id"] != job.TaskId || other["billing_phase"] != "submission_preconsume" {
+			return ErrImageConflict
+		}
+		if usage := logs.Usage; usage != nil {
+			if usage.Id != 0 || usage.EventId != "video-submission-preconsume:"+job.TaskId || usage.UserID != consume.UserId || usage.Username != consume.Username || usage.ModelName != consume.ModelName || usage.CreatedAt != consume.CreatedAt-consume.CreatedAt%3600 || usage.UseGroup != consume.Group || usage.TokenID != consume.TokenId || usage.ChannelID != consume.ChannelId || usage.Quota != consume.Quota || usage.Count != 0 || usage.TokenUsed != 0 {
+				return ErrImageConflict
+			}
+		}
+		if err := recordAsyncMediaSubmissionRefundPair(ctx, job.TaskId, *consume, *log); err != nil {
+			return err
+		}
+		if logs.Usage != nil {
+			var existing []Log
+			if err := imageConsumeLogsQuery(LOG_DB.WithContext(ctx)).Where("request_id = ? AND user_id = ? AND token_id = ? AND type = ?", consume.RequestId, consume.UserId, consume.TokenId, LogTypeConsume).Limit(2).Find(&existing).Error; err != nil {
+				return err
+			}
+			if len(existing) != 1 || !isAsyncMediaSubmissionConsumption(existing[0], *consume, job.TaskId) {
+				return ErrImageConflict
+			}
+			// An adopted older consumption already owns its normal usage
+			// export. Only the exact log captured by this command needs this
+			// projection, including when delivery committed before a crash.
+			existing[0].Id = 0
+			projectUsage = existing[0] == *consume
+		}
+	} else if err := recordTaskBillingLogOnce(ctx, log, "video-refund:"+job.TaskId, fmt.Sprintf("%x", sha256.Sum256([]byte(job.RefundLogPayload)))); err != nil {
 		return err
 	}
-	// Another delivery may already have acknowledged this exact payload. A
-	// compare-and-set avoids clearing a different command written concurrently.
-	return DB.WithContext(ctx).Model(&AsyncMediaJob{}).
-		Where("id = ? AND user_id = ? AND refund_log_payload = ?", job.ID, job.UserId, job.RefundLogPayload).
-		Update("refund_log_payload", "").Error
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current AsyncMediaJob
+		if err := lockForUpdate(tx).Select("refund_log_payload").Where("id = ? AND user_id = ?", job.ID, job.UserId).Take(&current).Error; err != nil {
+			return err
+		}
+		if current.RefundLogPayload == "" {
+			return nil
+		}
+		if current.RefundLogPayload != job.RefundLogPayload {
+			return ErrImageConflict
+		}
+		if projectUsage {
+			projection := *logs.Usage
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "event_id"}}, DoNothing: true}).Create(&projection).Error; err != nil {
+				return err
+			}
+			var existing AsyncImageUsageProjection
+			if err := tx.Where("event_id = ?", logs.Usage.EventId).Take(&existing).Error; err != nil {
+				return err
+			}
+			existing.Id = 0
+			if existing != *logs.Usage {
+				return ErrImageConflict
+			}
+		}
+		// The projection and acknowledgement commit together. A failure at
+		// either point leaves the immutable command available for replay.
+		return tx.Model(&AsyncMediaJob{}).
+			Where("id = ? AND user_id = ? AND refund_log_payload = ?", job.ID, job.UserId, job.RefundLogPayload).
+			Update("refund_log_payload", "").Error
+	})
+}
+
+// recordAsyncMediaSubmissionRefundPair commits relational log entries together.
+// ClickHouse uses the existing per-event delivery and the persisted command to
+// finish a partially delivered pair. Neither path changes financial state.
+func recordAsyncMediaSubmissionRefundPair(ctx context.Context, taskID string, consume, refund Log) error {
+	logs := []Log{consume, refund}
+	eventIDs := []string{"video-submission-preconsume:" + taskID, "video-refund:" + taskID}
+	fingerprints := make([]string, len(logs))
+	for index := range logs {
+		encoded, err := common.Marshal(logs[index])
+		if err != nil {
+			return err
+		}
+		fingerprints[index] = fmt.Sprintf("%x", sha256.Sum256(encoded))
+	}
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		for index := range logs {
+			if index == 0 {
+				var existing []Log
+				if err := imageConsumeLogsQuery(LOG_DB.WithContext(ctx)).Where("request_id = ? AND user_id = ? AND token_id = ? AND type = ?", consume.RequestId, consume.UserId, consume.TokenId, LogTypeConsume).Limit(2).Find(&existing).Error; err != nil {
+					return err
+				}
+				if len(existing) > 0 {
+					if len(existing) != 1 || !isAsyncMediaSubmissionConsumption(existing[0], consume, taskID) {
+						return ErrImageConflict
+					}
+					continue
+				}
+			}
+			if err := recordTaskBillingLogOnce(ctx, &logs[index], eventIDs[index], fingerprints[index]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	err := LOG_DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for index := range logs {
+			var receipt AsyncImageLogReceipt
+			err := tx.Where("event_id = ?", eventIDs[index]).Take(&receipt).Error
+			if err == nil {
+				if receipt.Fingerprint != fingerprints[index] {
+					return ErrImageConflict
+				}
+				continue
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err := tx.Create(&AsyncImageLogReceipt{EventId: eventIDs[index], Fingerprint: fingerprints[index]}).Error; err != nil {
+				return err
+			}
+			if index == 0 {
+				var existing []Log
+				if err := tx.Where("request_id = ? AND user_id = ? AND token_id = ? AND type = ?", consume.RequestId, consume.UserId, consume.TokenId, LogTypeConsume).Limit(2).Find(&existing).Error; err != nil {
+					return err
+				}
+				if len(existing) > 0 {
+					if len(existing) != 1 || !isAsyncMediaSubmissionConsumption(existing[0], consume, taskID) {
+						return ErrImageConflict
+					}
+					continue
+				}
+			}
+			if err := tx.Create(&logs[index]).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	// A concurrent delivery can win the unique event IDs. After rollback, both
+	// matching receipts prove that its complete transaction already committed.
+	var receipts []AsyncImageLogReceipt
+	if lookupErr := LOG_DB.WithContext(ctx).Where("event_id IN ?", eventIDs).Find(&receipts).Error; lookupErr != nil || len(receipts) != len(eventIDs) {
+		return err
+	}
+	for _, receipt := range receipts {
+		if receipt.EventId == eventIDs[0] && receipt.Fingerprint == fingerprints[0] || receipt.EventId == eventIDs[1] && receipt.Fingerprint == fingerprints[1] {
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
+func isAsyncMediaSubmissionConsumption(existing, expected Log, taskID string) bool {
+	if existing.Quota != expected.Quota || existing.ChannelId != expected.ChannelId || existing.ModelName != expected.ModelName || existing.Group != expected.Group {
+		return false
+	}
+	var other map[string]any
+	return common.UnmarshalJsonStr(existing.Other, &other) == nil && other["task_id"] == taskID
 }
 
 // ReplayAsyncMediaRefundLogs repairs missing usage logs, including terminal and

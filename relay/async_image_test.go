@@ -929,6 +929,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		xai                        bool
 		newapi                     bool
 		synchronousRetry           bool
+		submissionRejected         bool
 		resolutionMapping          bool
 		resolution                 string
 		parameterOverride          string
@@ -972,6 +973,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "synchronous_gateway_failure_with_metadata_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"success":false,"code":502,"status":"error","data":null,"error":{"code":"upstream_request_failed","type":"new_api_error","message":"image worker unavailable","metadata":{"trace_id":"provider-trace","retryable":true}}}`},
 		{name: "synchronous_gateway_error_type_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"error":{"type":"upstream_request_failed","message":"image worker unavailable"}}`},
 		{name: "synchronous_quota_rejection_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 503, failureCode: 606, providerCode: "upstream_quota_unavailable", responseMessage: "The selected upstream image service has no available quota. Please retry shortly."},
+		{name: "synchronous_capacity_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 400, failureCode: 603, providerCode: "400", responseMessage: "排队等待可用账户槽位超时，当前并发已满"},
+		{name: "synchronous_processing_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 400, failureCode: 606, responseMessage: "请求处理失败，请提供请求 ID 联系支持"},
+		{name: "asynchronous_capacity_creation_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, submissionRejected: true, status: 400, failureCode: 603, responseMessage: "Account slots unavailable", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
+		{name: "capacity_refusal_with_receipt_does_not_retry", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 400, failureCode: 610, responseMessage: "Upstream capacity is full", responseJSON: `{"error":{"type":"invalid_request_error","message":"Upstream capacity is full","metadata":{"task_id":"accepted-job"}}}`},
 		{name: "synchronous_quota_semantics_and_metadata_retry", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 503, failureCode: 606, providerCode: "quota_exhausted", responseMessage: "额度已经用尽，请稍后再试", responseJSON: `{"status_code":503,"retryable":true,"documentation_url":"https://docs.example/errors#quota","error":{"code":"quota_exhausted","type":"insufficient_quota","message":"额度已经用尽，请稍后再试","metadata":{"source":{"code":"insufficient_credits","http_status":503}}}}`},
 		{name: "quota_rejection_with_receipt_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 503, failureCode: 606, providerCode: "upstream_quota_unavailable", responseMessage: "No available quota", responseJSON: `{"error":{"code":"upstream_quota_unavailable","message":"No available quota","metadata":{"task_id":"accepted-job"}}}`},
 		{name: "asynchronous_quota_rejection_keeps_acceptance_boundary", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 503, failureCode: 606, providerCode: "upstream_quota_unavailable", responseMessage: "No available quota", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
@@ -1200,6 +1205,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				require.ErrorAs(t, err, &failure)
 				assert.Equal(t, tc.failureCode, failure.Code)
 				assert.Equal(t, tc.synchronousRetry, failure.SynchronousRetryableResponse)
+				assert.Equal(t, tc.submissionRejected, failure.SubmissionRejected)
 				assert.False(t, failure.UpstreamTerminal)
 				assert.Equal(t, tc.status, failure.HTTPStatus, "attempt diagnostics must keep the real upstream status")
 				assert.Equal(t, 7*time.Second, failure.RetryAfter)

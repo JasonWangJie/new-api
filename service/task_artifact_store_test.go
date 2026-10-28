@@ -502,6 +502,16 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 						{"reference_access_not_restricted", string(response), "参考素材访问不受限制", 200},
 						{"reference_source_not_expired", string(response), "Source URL is not expired", 200},
 						{"reference_download_did_not_fail", string(response), "Reference image download did not fail", 200},
+						{"reference_did_not_download_fail", `{"status":"failed"}`, "参考素材没有下载失败，只是渲染出错", 200},
+						{"no_failure_during_reference_download", `{"status":"failed"}`, "No failure occurred while downloading the reference image; rendering failed", 200},
+						{"reference_decode_failure", `{"status":"failed"}`, "Could not decode downloaded reference image", 200},
+						{"reference_decoding_failure", `{"status":"failed"}`, "Reference image decoding failed after download", 200},
+						{"reference_corrupt_media", `{"status":"failed"}`, "Reference image could not be read because the downloaded media is corrupt", 200},
+						{"reference_corrupted_media", `{"status":"failed"}`, "Failed to read the corrupted reference image", 200},
+						{"reference_damaged_media", `{"status":"failed"}`, "参考素材读取失败：文件已损坏", 200},
+						{"policy_after_reference_url", `{"status":"failed"}`, "参考素材下载失败 https://source.example/image.png内容安全审核拒绝", 200},
+						{"copyright_after_reference_url", `{"status":"failed"}`, "Reference image download failed https://source.example/image.png,copyright", 200},
+						{"reference_url_sentence_then_rendering_failure", `{"status":"failed"}`, "Reference image download https://source.example/image.png. Renderer failed", 200},
 						{"generation_connection_failure", string(response), "素材已下载成功；无法连接生成服务", 200},
 						{"generated_video_download_failure", string(response), "素材已下载成功；无法下载生成视频", 200},
 						{"output_download_failed", string(response), "素材下载成功；生成的视频成片下载失败", 200},
@@ -559,6 +569,11 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 							{"english_restricted_access", "Access to reference material is restricted. Please use public hosting."},
 							{"english_contraction", "The material store couldn't be accessed; retry with a public link."},
 							{"english_expired_source", "Source URL expired, please upload the reference again."},
+							{"english_reference_url_timeout", "Reference image https://source.example/ref_image-1.png download timed out"},
+							{"chinese_reference_url_timeout", "参考素材https://source.example/ref_image-1.png?signature=opaque_token下载超时"},
+							{"reference_url_contains_processing_words", "Reference image https://source.example/generated_video/corrupted-reference.png download timed out"},
+							{"reference_failure_without_error_details", "Reference image download failed with no error details"},
+							{"reference_timeout_without_error_code", "Reference image download timed out with no error code"},
 						} {
 							t.Run(variant.name, func(t *testing.T) {
 								body, err := common.Marshal(map[string]any{"id": fixture.nativeID, "status": "failed", "metadata": map[string]any{"url": variant.reason}})

@@ -718,6 +718,11 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 		status      int
 		body        string
 		onlyAccount bool
+		capacity    bool
+		gemini      bool
+		success     bool
+		blocked     string
+		cancel      bool
 	}{
 		{name: "gateway failure switches channel", status: 502, body: gatewayError},
 		{name: "gateway failure waits for only account", status: 502, body: gatewayError, onlyAccount: true},
@@ -728,20 +733,39 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 		{name: "translated quota rejection switches channel", status: 503, body: `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"上游可用额度不足，请稍后重试"},"retry_after_seconds":10,"region":"region-a"}`},
 		{name: "quota category variant uses existing hold", status: 503, body: `{"error":{"code":"quota_exhausted","type":"insufficient_quota","message":"The upstream quota has been exhausted."},"data":{"retry_after_seconds":10}}`},
 		{name: "credit diagnostic waits for only account", status: 503, body: `{"error":{"type":"server_error","message":"Insufficient upstream credits. Please retry later."},"support_url":"https://provider.example/help"}`, onlyAccount: true},
+		{name: "capacity refusal switches channel and settles once", status: 400, body: `{"error":{"code":400,"message":"上游并发已满，请稍后重试"}}`, capacity: true, success: true},
+		{name: "Gemini slots refusal switches channel and settles once", status: 400, body: `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"排队等待可用账户槽位超时，当前并发已满"}}`, capacity: true, gemini: true, success: true},
+		{name: "processing refusal switches channel and settles once", status: 400, body: `{"error":{"message":"请求处理失败，请提供请求 ID 联系支持"}}`, success: true},
+		{name: "capacity refusal waits for only account", status: 400, body: `{"error":{"message":"Account slots unavailable"}}`, capacity: true, onlyAccount: true},
+		{name: "processing refusal waits for only account", status: 400, body: `{"error":{"message":"Request processing failed"}}`, onlyAccount: true},
+		{name: "capacity receipt cannot bypass validation", status: 400, body: `{"error":{"message":"Upstream capacity is full","metadata":{"accepted":true,"task_id":"accepted-job"}}}`, blocked: model.ImageTaskFailed},
+		{name: "unclassified capacity receipt cannot use old fallback", status: 400, body: `{"error":{"message":"Capacity check failed"},"metadata":{"accepted":true}}`, blocked: model.ImageTaskFailed},
+		{name: "negated capacity cannot use generic capacity fallback", status: 400, body: `{"error":{"message":"Upstream capacity is not full; request processing did not fail"}}`, blocked: model.ImageTaskFailed},
+		{name: "capacity refusal after parent cancellation stays unknown", status: 400, body: `{"error":{"message":"Account slots unavailable"}}`, capacity: true, cancel: true, blocked: model.ImageTaskExecutionUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
-			cfg.CircuitBreaker, cfg.TransientRetries = false, 1
+			cfg.CircuitBreaker, cfg.TransientRetries, cfg.CapacityRetries = false, 1, 1
 			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
 			var policy model.ImageGroupPolicy
 			require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash(task.Group, "openai")).Take(&policy).Error)
-			policy.Id, policy.Platform, policy.PolicyKey = 0, "mixed", ImageIdentityHash(task.Group, "mixed")
-			require.NoError(t, db.Create(&policy).Error)
-			request.Provider, request.PolicyPlatform, request.Resolution = "", "mixed", "2K"
-			key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
-			request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: key, PoolMode: policy.PoolMode}
-			require.NoError(t, db.Create(&[]model.ImageChannelPool{{BindingKey: key, ChannelId: task.ChannelId, Priority: 1}, {BindingKey: key, ChannelId: alternate.Id, Priority: 0}}).Error)
+			if tc.gemini {
+				policy.Platform, policy.PolicyKey = "gemini", ImageIdentityHash(task.Group, "gemini")
+				require.NoError(t, db.Save(&policy).Error)
+				request.Platform, request.Provider, request.PolicyPlatform = "gemini", "gemini", "gemini"
+				ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+					return dto.ImageCapability{Provider: "gemini", Protocol: "gemini_native", Generate: true, Edit: true}
+				}
+				require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{task.ChannelId, alternate.Id}).Update("type", constant.ChannelTypeGemini).Error)
+			} else {
+				policy.Id, policy.Platform, policy.PolicyKey = 0, "mixed", ImageIdentityHash(task.Group, "mixed")
+				require.NoError(t, db.Create(&policy).Error)
+				request.Provider, request.PolicyPlatform, request.Resolution = "", "mixed", "2K"
+				key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+				request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: key, PoolMode: policy.PoolMode}
+				require.NoError(t, db.Create(&[]model.ImageChannelPool{{BindingKey: key, ChannelId: task.ChannelId, Priority: 1}, {BindingKey: key, ChannelId: alternate.Id, Priority: 0}}).Error)
+			}
 			require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
 			encoded, err := common.Marshal(request)
 			require.NoError(t, err)
@@ -749,6 +773,13 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
 			primaryID, calls := task.ChannelId, 0
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.success {
+				entities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+				require.NoError(t, db.AutoMigrate(entities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(entities...)) })
+			}
 			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
 				calls++
 				wantID := primaryID
@@ -760,17 +791,51 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 				assert.Equal(t, request.Billing, outbound.Billing)
 				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
 				require.NoError(t, beforeInvoke())
+				if calls > 1 && tc.success {
+					return &AsyncImageOutput{Images: []ImageBytes{asyncImageBytesFixture(t)}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "submission-retry-success", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+				}
 				failure := ClassifyOpenAIAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, "")
-				failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse
+				if tc.gemini {
+					failure = ClassifyGeminiAsyncImageHTTPFailure(ctx, &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))})
+				} else {
+					failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse
+					if tc.status == 400 {
+						failure.SubmissionRejected = false // Match the synchronous relay gate.
+					}
+				}
+				if tc.cancel {
+					cancel()
+				}
 				return nil, model.AsyncImageBill{}, failure
 			}
-			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, invokeAsyncImageTask(ctx, &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			if tc.blocked != "" {
+				assert.Equal(t, tc.blocked, task.Status)
+				assert.Zero(t, task.NextAttemptAt)
+				assert.Zero(t, task.RetryCount)
+				assert.Equal(t, 1, calls)
+				var bill model.AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				wantBill := "refunded"
+				if tc.blocked == model.ImageTaskExecutionUnknown {
+					wantBill = "reserved"
+				}
+				assert.Equal(t, wantBill, bill.Status)
+				return
+			}
 			require.Equal(t, model.ImageTaskQueued, task.Status)
-			assert.Equal(t, 1, task.TransientRetryCount)
+			wantCode, wantBudget := 606, "transient"
+			if tc.capacity {
+				wantCode, wantBudget = 603, "capacity"
+				assert.Equal(t, 1, task.CapacityRetryCount)
+				assert.Zero(t, task.TransientRetryCount)
+			} else {
+				assert.Equal(t, 1, task.TransientRetryCount)
+			}
 			assert.Equal(t, 1, task.RetryCount)
 			assert.Empty(t, task.UpstreamTaskId, "a rejected submission has no accepted upstream task")
-			assert.Equal(t, 606, task.PublicErrorCode)
+			assert.Equal(t, wantCode, task.PublicErrorCode)
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(primaryID), "upstream-key-a")
 			ttl, err := common.RDB.TTL(t.Context(), ImageAccountCooldownKey(fingerprint)).Result()
 			require.NoError(t, err)
@@ -778,12 +843,16 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 			var history []ImageChannelAttempt
 			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
 			require.Len(t, history, 1)
-			assert.Equal(t, tc.status != 500, history[0].SynchronousRetryableResponse)
-			assert.Equal(t, tc.status == 500, history[0].SubmissionRejected)
+			assert.Equal(t, !tc.gemini && tc.status != 500, history[0].SynchronousRetryableResponse)
+			assert.Equal(t, tc.gemini || tc.status == 500, history[0].SubmissionRejected)
 			var decision ImageRetryDecision
 			require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
-			assert.Equal(t, "retry_submission", decision.Action)
-			assert.Equal(t, "transient", decision.Budget)
+			wantAction := "retry_submission"
+			if tc.status == 400 {
+				wantAction = "switch_account"
+			}
+			assert.Equal(t, wantAction, decision.Action)
+			assert.Equal(t, wantBudget, decision.Budget)
 			reservation, err := model.GetAsyncImageReservation(t.Context(), task)
 			require.NoError(t, err)
 			require.NotNil(t, reservation)
@@ -808,6 +877,22 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			assert.Equal(t, 2, calls)
+			if tc.success {
+				require.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+				require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				for range 2 {
+					require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "submission-retry-success"))
+				}
+				var user model.User
+				require.NoError(t, db.First(&user, task.UserId).Error)
+				assert.Equal(t, 920, user.Quota, "a replacement success is charged once against the original reservation")
+				var bill model.AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				assert.Equal(t, "applied", bill.Status)
+				assert.Equal(t, 100, bill.ReservedQuota)
+				return
+			}
 			assert.Equal(t, model.ImageTaskFailed, task.Status)
 			var bill model.AsyncImageBill
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
@@ -3302,6 +3387,8 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 
 func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testing.T) {
 	const creationError = `{"error":{"type":"new_api_error","message":"上游创建任务失败，状态码:502"}}`
+	const capacityError = `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"排队等待可用账户槽位超时，当前并发已满"}}`
+	const processingError = `{"error":{"message":"请求处理失败，请提供请求 ID 联系支持"}}`
 	for _, tc := range []struct {
 		name, body string
 		status     int
@@ -3310,7 +3397,43 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 		switchable bool
 		readError  bool
 		rejected   bool
+		gemini     bool
 	}{
+		{name: "Gemini concurrency refusal switches account", status: 400, body: capacityError, code: 603, rejected: true, gemini: true},
+		{name: "request processing refusal switches account", status: 400, body: processingError, code: 606, rejected: true},
+		{name: "English concurrent slots refusal", status: 400, body: `{"error":{"code":"400","type":"invalid_request_error","message":"Concurrent execution slots are full. Retry later."}}`, code: 603, rejected: true},
+		{name: "resource pool exhausted refusal", status: 400, body: `{"error":{"message":"Upstream resource pool exhausted"}}`, code: 603, rejected: true},
+		{name: "English request processing refusal", status: 400, body: `{"error":{"message":"Request processing failed. Provide the request ID to support."}}`, code: 606, rejected: true},
+		{name: "unable to process request refusal", status: 400, body: `{"error":{"type":"new_api_error","message":"Unable to process the request; contact support."}}`, code: 606, rejected: true},
+		{name: "negated full capacity cannot fall back to capacity code", status: 400, body: `{"error":{"message":"Upstream capacity is not full; request processing did not fail"}}`, code: 610},
+		{name: "conditional capacity advice is not a refusal", status: 400, body: `{"error":{"message":"If upstream capacity is full, retry later"}}`, code: 610},
+		{name: "capacity compound negation is not a refusal", status: 400, body: `{"error":{"message":"Capacity has not been exhausted"}}`, code: 610},
+		{name: "English processing failure negation is terminal", status: 400, body: `{"error":{"message":"No request processing failure occurred"}}`, code: 610},
+		{name: "Chinese processing failure negation is terminal", status: 400, body: `{"error":{"message":"没有请求处理失败"}}`, code: 610},
+		{name: "conditional capacity does not change processing budget", status: 400, body: `{"error":{"message":"请求处理失败；如果并发已满，请重试"}}`, code: 606, rejected: true},
+		{name: "explicit capacity is more specific than request failure", status: 400, body: `{"error":{"message":"并发已满；请求处理失败"}}`, code: 603, rejected: true},
+		{name: "resource download timeout is not concurrency", status: 400, body: `{"error":{"message":"素材资源下载超时"}}`, code: 610},
+		{name: "URL capacity words cannot authorize retry", status: 400, body: `{"error":{"message":"Request failed; see https://provider.example/capacity_full"}}`, code: 610},
+		{name: "trace ID capacity words cannot authorize retry", status: 400, body: `{"error":{"message":"Request failed; request_id=capacity_full"}}`, code: 610},
+		{name: "Chinese request ID cannot authorize retry", status: 400, body: `{"error":{"message":"请求失败；请求 ID：capacity_full"}}`, code: 610},
+		{name: "trace ID processing words cannot authorize retry", status: 400, body: `{"error":{"message":"Request failed; trace-id:request_processing_failed"}}`, code: 610},
+		{name: "opaque ID cannot change processing budget", status: 400, body: `{"error":{"message":"Request processing failed; request_id=capacity_full"}}`, code: 606, rejected: true},
+		{name: "bare capacity fallback cannot bypass accepted metadata", status: 400, body: `{"error":{"message":"Capacity check failed"},"metadata":{"accepted":true}}`, code: 610},
+		{name: "capacity with structured queued state is not a refusal", status: 400, body: `{"error":{"message":"Upstream capacity is full","metadata":{"state":"queued"}}}`, code: 610},
+		{name: "capacity with accepted receipt cannot fall back", status: 400, body: `{"error":{"message":"Upstream capacity is full","metadata":{"accepted":true,"task_id":"job-1"}}}`, code: 610},
+		{name: "capacity with output cannot fall back", status: 400, body: `{"error":{"message":"Upstream capacity is full"},"data":[{"url":"https://result.example/image.png"}]}`, code: 610},
+		{name: "capacity authentication code is not generic", status: 400, body: `{"error":{"code":"unauthorized","message":"Upstream capacity is full"}}`, code: 610},
+		{name: "capacity unknown acceptance remains blocked", status: 400, body: `{"error":{"message":"Upstream capacity is full; execution_unknown"}}`, code: 610},
+		{name: "capacity body must finish reading", status: 400, body: capacityError, readError: true, code: 610},
+		{name: "capacity response may not be truncated", status: 400, body: `{"error":{"message":"Upstream capacity is full"}}` + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), code: 610},
+		{name: "capacity safety refusal stays terminal", status: 400, body: `{"error":{"message":"Upstream capacity is full; safety violation"}}`, code: 601},
+		{name: "processing input parameters are terminal", status: 400, body: `{"error":{"message":"Request processing failed: invalid input parameters","param":"n"}}`, code: 610},
+		{name: "processing authentication type is terminal", status: 400, body: `{"error":{"type":"authentication_error","message":"Request processing failed"}}`, code: 610},
+		{name: "processing unknown provider code is terminal", status: 400, body: `{"error":{"code":"request_transport_failed","message":"Request processing failed"}}`, code: 610},
+		{name: "processing output success cannot retry", status: 400, body: `{"error":{"message":"Request processing failed"},"success":true}`, code: 610},
+		{name: "processing raw execution marker prevents retry", status: 400, body: `{"error":{"message":"Request processing failed; execution_unknown"}}`, code: 610},
+		{name: "processing raw submission marker prevents retry", status: 400, body: `{"error":{"message":"Request processing failed; submission_unknown"}}`, code: 610},
+		{name: "unknown execution beyond retained diagnostic still prevents retry", status: 400, body: `{"error":{"message":"Request processing failed` + strings.Repeat(" extra detail", asyncImageProviderMessageLimit/8) + `; execution_unknown"}}`, code: 610},
 		{name: "explicit native task creation rejection", status: 500, body: creationError, code: 606, rejected: true},
 		{name: "task creation diagnostic needs its HTTP status", status: 502, body: creationError, code: 606},
 		{name: "ambiguous server error is not a creation refusal", status: 500, body: `{"error":{"message":"Upstream request failed"}}`, code: 606},
@@ -3358,7 +3481,12 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 			if tc.readError {
 				body = io.NopCloser(iotest.ErrReader(errors.New("response interrupted")))
 			}
-			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{StatusCode: tc.status, Body: body}, "")
+			response := &http.Response{StatusCode: tc.status, Body: body}
+			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), response, "")
+			if tc.gemini {
+				response.Body = io.NopCloser(strings.NewReader(tc.body))
+				failure = ClassifyGeminiAsyncImageHTTPFailure(t.Context(), response)
+			}
 			assert.Equal(t, tc.code, failure.Code)
 			assert.Equal(t, tc.rejected, failure.SubmissionRejected)
 			assert.Equal(t, tc.timeout, IsImageReferenceDownloadTimeout(failure))
