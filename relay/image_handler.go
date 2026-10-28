@@ -65,6 +65,9 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	adaptor.Init(info)
 	imageOperation := upstreamAsyncImageOperation(c)
 	asyncProfile, hasAsyncProfile := info.ChannelOtherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, imageOperation)
+	if info.ChannelType == constant.ChannelTypeTabTab {
+		asyncProfile, hasAsyncProfile = service.TabtabAsyncImageProfile(info.UpstreamModelName), true
+	}
 	if !hasAsyncProfile && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
 		asyncProfile = service.TianyueAsyncImageProfile(info.UpstreamModelName)
 		hasAsyncProfile = asyncProfile != nil
@@ -218,6 +221,12 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
 		}
+		if info.ChannelType == constant.ChannelTypeTabTab && c.GetString("async_image_resume_task") == "" {
+			jsonData, err = service.TabtabImageSubmission(jsonData, info.UpstreamModelName, imageCount)
+			if err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
 		if reserve {
 			logger.LogDebug(c, "image request body: %s", jsonData)
 		}
@@ -236,6 +245,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 	}
 	if billingErr != nil {
 		return nil, billingErr
+	}
+	if info.ChannelType == constant.ChannelTypeTabTab {
+		if err := validateMixedImageTokenUsage(&service.MediaBillingSnapshot{Price: info.PriceData, Tiered: info.TieredBillingSnapshot}, service.TabtabImageCapability(info.UpstreamModelName), asyncProfile); err != nil {
+			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
 	}
 
 	statusCodeMappingStr := c.GetString("status_code_mapping")
@@ -363,7 +377,11 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 					c.Set("async_image_retry_after", httpResp.Header.Get("Retry-After"))
 				}
 				if !reserve && c.GetBool("async_image_execution") && (info.ApiType == constant.APITypeOpenAI || info.ApiType == constant.APITypeXai || info.ApiType == constant.APITypeNewAPI) {
-					failure := service.ClassifyOpenAIAsyncImageHTTPFailure(c.Request.Context(), httpResp, statusCodeMappingStr)
+					classify := service.ClassifyOpenAIAsyncImageHTTPFailure
+					if info.ChannelType == constant.ChannelTypeTabTab && c.GetString("async_image_resume_task") == "" {
+						classify = service.ClassifyTabtabImageHTTPFailure
+					}
+					failure := classify(c.Request.Context(), httpResp, statusCodeMappingStr)
 					failure.SynchronousRetryableResponse = failure.RetryableHTTPResponse && !hasAsyncProfile && c.GetString("async_image_resume_task") == ""
 					failure.SubmissionRejected = failure.SubmissionRejected && hasAsyncProfile && c.GetString("async_image_resume_task") == ""
 					if info.ApiType == constant.APITypeNewAPI && c.GetString("async_image_resume_task") == "" {

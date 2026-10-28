@@ -48,6 +48,146 @@ const options = {
   background: 'opaque',
 }
 describe('capability-driven image request contracts', () => {
+  it('rejects a ratio for an explicitly fixed mixed AUTO capability instead of submitting a rejected upstream specification', () => {
+    expect(() =>
+      buildImageRequest({
+        ...options,
+        model: {
+          ...model,
+          platform: 'mixed',
+          protocol: 'openai_images',
+          supported_parameters: ['model', 'prompt', 'n'],
+          capability: { ...model.capability, resolutions: ['AUTO'] },
+        },
+        resolution: 'AUTO',
+        ratio: '1:1',
+        quality: '',
+        format: '',
+        background: '',
+      })
+    ).toThrow('Unsupported image dimensions')
+  })
+  it('preserves legacy mixed AUTO dimensions when the provider has not declared supported parameter metadata', () => {
+    const request = buildImageRequest({
+      ...options,
+      model: {
+        ...model,
+        platform: 'mixed',
+        protocol: 'openai_images',
+        capability: { ...model.capability, resolutions: ['AUTO'] },
+      },
+      resolution: 'AUTO',
+      ratio: '4:3',
+    })
+    expect(JSON.parse(request.body)).toMatchObject({
+      resolution: 'AUTO',
+      aspect_ratio: '4:3',
+    })
+  })
+  it.each([
+    {
+      name: 'fixed image dimensions',
+      parameters: [],
+      resolution: 'AUTO',
+      ratio: 'auto',
+      dimensions: { resolution: 'AUTO' },
+    },
+    {
+      name: 'fixed image resolution with a configurable ratio',
+      parameters: ['ratio', 'aspect_ratio'],
+      resolution: 'AUTO',
+      ratio: '4:3',
+      dimensions: { resolution: 'AUTO', aspect_ratio: '4:3' },
+    },
+    {
+      name: 'named resolution and ratio',
+      parameters: ['size', 'resolution', 'ratio', 'aspect_ratio'],
+      resolution: '2K',
+      ratio: '4:3',
+      dimensions: { resolution: '2K', aspect_ratio: '4:3' },
+    },
+    {
+      name: 'pixel dimensions',
+      parameters: ['size', 'width', 'height'],
+      resolution: '2K',
+      ratio: '4:3',
+      dimensions: { size: '2048x1536' },
+    },
+  ])(
+    'builds TabTab $name using mapped capability metadata for an alias',
+    (spec) => {
+      const current: ImageModel = {
+        ...model,
+        id: 'customer-image-alias',
+        platform: 'tabtab',
+        provider: 'tabtab',
+        protocol: 'openai_images',
+        supported_parameters: ['model', 'prompt', 'n', ...spec.parameters],
+        supports_reference_generation: true,
+        capability: { max_output_images: 1, max_reference_images: 3 },
+      }
+      const request = buildImageRequest({
+        ...options,
+        model: current,
+        resolution: spec.resolution,
+        ratio: spec.ratio,
+        quality: '',
+        format: '',
+        background: '',
+      })
+      expect(request.url).toBe('/v1/images/generations_async')
+      expect(JSON.parse(request.body)).toEqual({
+        model: 'customer-image-alias',
+        provider: 'tabtab',
+        prompt: 'A vase',
+        n: 1,
+        ...spec.dimensions,
+      })
+      expect(
+        imageRequestDimensions(current, spec.resolution, spec.ratio)?.size
+      ).toBe(spec.dimensions.size)
+    }
+  )
+  it.each([
+    { parameters: [], resolution: '1K', ratio: 'auto', quality: '' },
+    { parameters: [], resolution: 'AUTO', ratio: '4:3', quality: '' },
+    {
+      parameters: ['size', 'resolution', 'aspect_ratio'],
+      resolution: '4K',
+      ratio: '4:3',
+      quality: '',
+    },
+    {
+      parameters: ['size', 'resolution', 'aspect_ratio'],
+      resolution: '1K',
+      ratio: 'auto',
+      quality: '',
+    },
+    {
+      parameters: ['aspect_ratio'],
+      resolution: 'AUTO',
+      ratio: '4:3',
+      quality: 'high',
+    },
+  ])(
+    'rejects unsupported TabTab settings before submission: $resolution $ratio $quality',
+    (spec) => {
+      expect(() =>
+        buildImageRequest({
+          ...options,
+          ...spec,
+          model: {
+            ...model,
+            provider: 'tabtab',
+            supported_parameters: spec.parameters,
+            capability: { ...model.capability, resolutions: ['1K', '2K'] },
+          },
+          format: '',
+          background: '',
+        })
+      ).toThrow()
+    }
+  )
   it('rejects a resolution outside the selected model capabilities before submission', () => {
     expect(() =>
       buildImageRequest({

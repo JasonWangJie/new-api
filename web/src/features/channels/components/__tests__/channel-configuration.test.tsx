@@ -40,6 +40,7 @@ import {
   CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
   CHANNEL_TYPE_SGLANG,
+  CHANNEL_TYPE_TABTAB,
   CHANNEL_TYPE_VLLM,
 } from '../../constants'
 import {
@@ -166,6 +167,7 @@ beforeEach(() => {
             24: 'https://gemini.server.example',
             43: 'https://deepseek.server.example',
             45: 'https://volcengine.server.example',
+            [CHANNEL_TYPE_TABTAB]: 'https://api.tabtabapi.com',
           },
         },
       }
@@ -217,6 +219,115 @@ test('changing built-in providers updates server-provided URL placeholders witho
   expect(screen.getByRole('textbox', { name: 'Base URL' })).toHaveAttribute(
     'placeholder',
     'Leave empty to use default'
+  )
+})
+
+test('TabTab offers asynchronous image models and saves its channel without a video plugin binding', async () => {
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness />)
+  await user.click(screen.getByRole('option', { name: 'TabTab Built-in #64' }))
+  expect(
+    screen.getByText(
+      'TabTab Task API supports one image per task through asynchronous image endpoints. Use an sk_ API key; connect video models through the TabTab task plugin.'
+    )
+  ).toBeVisible()
+  expect(screen.getByLabelText('API Key *')).toHaveAttribute(
+    'placeholder',
+    'TabTab API key (sk_...)'
+  )
+  await waitFor(() =>
+    expect(screen.getByRole('textbox', { name: 'Base URL' })).toHaveAttribute(
+      'placeholder',
+      'https://api.tabtabapi.com'
+    )
+  )
+  expect(
+    screen.queryByRole('button', { name: /Fetch models/i })
+  ).not.toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('API Key *'), {
+    target: { value: 'sk_fixture' },
+  })
+  await user.click(
+    screen.getByRole('combobox', { name: 'Select models or add custom ones' })
+  )
+  expect(screen.getByRole('option', { name: 'gpt-image-2' })).toBeVisible()
+  await user.click(
+    screen.getByRole('option', { name: 'gemini-nano-banana-2.1' })
+  )
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.queryByRole('button', { name: 'Configure upstream async' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+  await waitFor(() => expect(post).toHaveBeenCalled())
+  const payload = post.mock.calls[0]?.[1] as {
+    channel: {
+      type: number
+      name: string
+      key: string
+      models: string
+      setting: string
+    }
+  }
+  expect(payload.channel).toMatchObject({
+    type: CHANNEL_TYPE_TABTAB,
+    name: 'TabTab',
+    key: 'sk_fixture',
+    models: 'gemini-nano-banana-2.1',
+  })
+  expect(JSON.parse(payload.channel.setting)).not.toHaveProperty(
+    'task_plugin_key'
+  )
+})
+
+test('switching a TabTab video draft to the image provider keeps its key and removes the task plugin binding from the saved channel', async () => {
+  pluginOptions = [
+    {
+      key: 'tabtab',
+      name: 'TabTab',
+      baseUrl: 'https://api.tabtabapi.com',
+      models: ['seedance-2.0'],
+    },
+  ]
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness />)
+  await user.click(
+    await screen.findByRole('option', { name: 'TabTab Plugin tabtab' })
+  )
+  fireEvent.change(screen.getByLabelText('API Key *'), {
+    target: { value: 'sk_draft_fixture' },
+  })
+  await user.click(screen.getByRole('button', { name: 'Change provider' }))
+  await user.click(screen.getByRole('option', { name: 'TabTab Built-in #64' }))
+  expect(screen.getByLabelText('API Key *')).toHaveValue('sk_draft_fixture')
+  expect(screen.getByRole('textbox', { name: 'Base URL' })).toHaveValue(
+    'https://api.tabtabapi.com'
+  )
+  await user.click(
+    screen.getByRole('combobox', { name: 'Select models or add custom ones' })
+  )
+  await user.click(screen.getByRole('option', { name: 'seedance-2.0' }))
+  await user.click(screen.getByRole('option', { name: 'gpt-image-2' }))
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  const payload = post.mock.calls[0][1] as {
+    channel: { setting: string; type: number; models: string; key: string }
+  }
+  expect(payload.channel).toMatchObject({
+    type: CHANNEL_TYPE_TABTAB,
+    models: 'gpt-image-2',
+    key: 'sk_draft_fixture',
+  })
+  expect(JSON.parse(payload.channel.setting)).not.toHaveProperty(
+    'task_plugin_key'
   )
 })
 

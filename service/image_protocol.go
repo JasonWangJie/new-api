@@ -657,7 +657,14 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	}
 	if request.Platform == "openai" {
 		halfK := strings.EqualFold(strings.TrimSpace(request.Resolution), "0.5K") || strings.EqualFold(strings.TrimSpace(request.Size), "0.5K")
-		if request.Dialect == "async" && (request.Provider == "gemini" || request.Provider == "" && halfK) {
+		if request.Dialect == "async" && request.Provider == "tabtab" {
+			// TabTab models include fixed-size and extreme-ratio image APIs.
+			// Preserve their dimensions until the selected channel mapping is
+			// known; its shared admission/submission validator owns the limits.
+			request.Size = strings.TrimSpace(request.Size)
+			request.Resolution = strings.ToUpper(strings.TrimSpace(request.Resolution))
+			request.AspectRatio = strings.TrimSpace(request.AspectRatio)
+		} else if request.Dialect == "async" && (request.Provider == "gemini" || request.Provider == "" && halfK) {
 			if err := normalizeAsyncGeminiDimensions(&request); err != nil {
 				return request, err
 			}

@@ -69,7 +69,6 @@ import {
   formatRelativeTime,
   formatResponseTime,
   getBalanceVariant,
-  getChannelTypeIcon,
   getChannelTypeLabel,
   getResponseTimeConfig,
   isMultiKeyChannel,
@@ -86,7 +85,7 @@ import {
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
-import { TaskPluginChannelBadge } from './channel-type-badge'
+import { ChannelTypeLogo, TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
 import { DataTableRowActions } from './data-table-row-actions'
 import { DataTableTagRowActions } from './data-table-tag-row-actions'
@@ -814,7 +813,6 @@ export function useChannelsColumns(
           const type = row.getValue('type') as number
           const typeNameKey = getChannelTypeLabel(type)
           const typeName = t(typeNameKey)
-          const iconName = getChannelTypeIcon(type)
           const channel = row.original as Channel
           const isMultiKey = isMultiKeyChannel(channel)
           const multiKeyMode = channel.channel_info?.multi_key_mode ?? 'random'
@@ -865,8 +863,7 @@ export function useChannelsColumns(
                       }
                     >
                       <ProviderBadge
-                        iconKey={`${iconName}.Color`}
-                        iconSize={18}
+                        iconNode={<ChannelTypeLogo type={type} size={18} />}
                         label={typeName}
                         colorText={false}
                         copyable={false}

@@ -3,7 +3,9 @@ package controller
 import (
 	"bytes"
 	"cmp"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,6 +38,162 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestTabtabWorkbenchCapabilitiesDatabaseMatrix(t *testing.T) {
+	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "tabtab-capabilities.db"))
+			if engine == "mysql" {
+				dsn := os.Getenv("IMAGE_CONFIG_TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("IMAGE_CONFIG_TEST_MYSQL_DSN is not configured")
+				}
+				require.Contains(t, dsn, "/new_api_image_config_test")
+				dialector = mysql.Open(dsn)
+			} else if engine == "postgres" {
+				dsn := os.Getenv("IMAGE_CONFIG_TEST_PG_DSN")
+				if dsn == "" {
+					t.Skip("IMAGE_CONFIG_TEST_PG_DSN is not configured")
+				}
+				require.True(t, strings.Contains(dsn, "dbname=new_api_image_config_test") || strings.Contains(dsn, "/new_api_image_config_test"))
+				dialector = postgres.Open(dsn)
+			}
+			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			previousDB, previousType, previousRedis, previousRedisEnabled := model.DB, common.MainDatabaseType(), common.RDB, common.RedisEnabled
+			model.DB = db
+			common.SetMainDatabaseType(common.DatabaseType(engine))
+			redisServer := miniredis.RunT(t)
+			redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB, common.RedisEnabled = redisClient, true
+			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}, &model.User{}, &model.Token{}, &model.ImageStorageProfile{}}
+			t.Cleanup(func() {
+				model.DB, common.RDB, common.RedisEnabled = previousDB, previousRedis, previousRedisEnabled
+				common.SetMainDatabaseType(previousType)
+				assert.NoError(t, redisClient.Close())
+				assert.NoError(t, db.Migrator().DropTable(entities...))
+				assert.NoError(t, connection.Close())
+			})
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tabtab-cap:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tabtab-cap")
+			require.NoError(t, db.AutoMigrate(entities...))
+			cfg := service.DefaultImageRuntimeConfig()
+			cfg.AsyncEnabled = true
+			require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "tabtab-storage", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir(), Active: true}).Error)
+			user := model.User{Username: "tabtab-cap-user", Group: "default", Status: common.UserStatusEnabled, Quota: 1000000}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "tabtab-cap-token", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+			require.NoError(t, db.Create(&token).Error)
+			channel := model.Channel{Type: constant.ChannelTypeTabTab, Name: "TabTab capability fixture", Key: "sk_private-capability-key", Models: "public-gpt,fixed,lite", Group: "default", Status: common.ChannelStatusEnabled, ModelMapping: common.GetPointer(`{"public-gpt":"redirect","redirect":"gpt-image-2","fixed":"mj","lite":"gemini-3.1-flash-lite-image"}`)}
+			require.NoError(t, db.Create(&channel).Error)
+			for _, name := range []string{"public-gpt", "fixed", "lite"} {
+				require.NoError(t, db.Create(&model.Ability{Group: "default", Model: name, ChannelId: channel.Id, Enabled: true}).Error)
+			}
+			catalog, err := common.Marshal([]service.ImageModelCapability{
+				{Id: "public-gpt", MaxOutputImages: 8, MaxReferenceImages: 4, Resolutions: []string{"1K", "2K", "4K"}, Qualities: []string{"high", "xhigh"}, Formats: []string{"png", "gif"}, Backgrounds: []string{"opaque", "invalid"}},
+				{Id: "fixed", MaxOutputImages: 8, MaxReferenceImages: 4, Resolutions: []string{"1K", "2K"}},
+				{Id: "lite", MaxOutputImages: 8, MaxReferenceImages: 4, Resolutions: []string{"1K", "2K"}},
+			})
+			require.NoError(t, err)
+			policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "tabtab"), Group: "default", Platform: "tabtab", PoolMode: "model_resolution", Models: string(catalog), Enabled: true, AsyncEnabled: true}
+			require.NoError(t, db.Create(&policy).Error)
+			fixedBinding := model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(policy, "fixed", "AUTO"), Group: "default", Platform: "tabtab", Mode: "model_resolution", Model: "fixed", Resolution: "AUTO", ChannelId: channel.Id}
+			liteBinding := model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(policy, "lite", "AUTO"), Group: "default", Platform: "tabtab", Mode: "model_resolution", Model: "lite", Resolution: "AUTO", ChannelId: channel.Id}
+			require.NoError(t, db.Create(&fixedBinding).Error)
+			require.NoError(t, db.Create(&liteBinding).Error)
+			mixedCatalog, err := common.Marshal([]service.ImageModelCapability{{Id: "fixed", MaxOutputImages: 8, MaxReferenceImages: 4, Resolutions: []string{"1K", "2K"}}})
+			require.NoError(t, err)
+			mixedPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "mixed"), Group: "default", Platform: "mixed", PoolMode: "model_resolution", Models: string(mixedCatalog), Enabled: true, AsyncEnabled: true}
+			require.NoError(t, db.Create(&mixedPolicy).Error)
+			require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(mixedPolicy, "fixed", "AUTO"), Group: "default", Platform: "mixed", Mode: "model_resolution", Model: "fixed", Resolution: "AUTO", ChannelId: channel.Id}).Error)
+			previousPrices := ratio_setting.ModelPrice2JSONString()
+			t.Cleanup(func() { assert.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
+			prices := ratio_setting.GetModelPriceCopy()
+			prices["fixed"] = 0.01
+			encodedPrices, err := common.Marshal(prices)
+			require.NoError(t, err)
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encodedPrices)))
+			for _, closed := range []bool{false, true} {
+				t.Run(fmt.Sprintf("closed_AUTO_%t", closed), func(t *testing.T) {
+					if closed {
+						require.NoError(t, db.Model(&fixedBinding).Update("channel_id", 0).Error)
+					}
+					router := gin.New()
+					router.Use(func(c *gin.Context) { c.Set("id", user.Id) })
+					router.GET("/capabilities/:token_id", GetImageWorkbenchCapabilities)
+					recorder := httptest.NewRecorder()
+					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/capabilities/"+strconv.Itoa(token.Id), nil))
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					assert.NotContains(t, recorder.Body.String(), "sk_private-capability-key")
+					var response struct {
+						Data struct {
+							Models []struct {
+								ID         string                       `json:"id"`
+								Platform   string                       `json:"platform"`
+								Available  bool                         `json:"available"`
+								Parameters []string                     `json:"supported_parameters"`
+								Capability service.ImageModelCapability `json:"capability"`
+							} `json:"models"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					seen := make(map[string]bool)
+					mixedFixed := false
+					for _, entry := range response.Data.Models {
+						if entry.Platform == "mixed" && entry.ID == "fixed" {
+							mixedFixed = true
+							assert.True(t, entry.Available)
+							assert.Equal(t, []string{"AUTO"}, entry.Capability.Resolutions)
+							assert.NotContains(t, entry.Parameters, "size")
+							assert.NotContains(t, entry.Parameters, "aspect_ratio")
+						}
+						if entry.Platform != "tabtab" {
+							continue
+						}
+						seen[entry.ID] = true
+						assert.True(t, entry.Available)
+						assert.Equal(t, 1, entry.Capability.MaxOutputImages)
+						if entry.ID == "public-gpt" {
+							assert.Equal(t, []string{"1K", "2K"}, entry.Capability.Resolutions)
+							assert.Equal(t, []string{"high"}, entry.Capability.Qualities)
+							assert.Equal(t, []string{"png"}, entry.Capability.Formats)
+							assert.Equal(t, []string{"opaque"}, entry.Capability.Backgrounds)
+						} else {
+							assert.Equal(t, []string{"AUTO"}, entry.Capability.Resolutions)
+							assert.NotContains(t, entry.Parameters, "size")
+							assert.NotContains(t, entry.Parameters, "resolution")
+							if entry.ID == "lite" {
+								assert.Contains(t, entry.Parameters, "aspect_ratio")
+							} else {
+								assert.NotContains(t, entry.Parameters, "aspect_ratio")
+							}
+						}
+					}
+					assert.True(t, seen["public-gpt"], "chained aliases must resolve through discovery and admission")
+					assert.True(t, seen["lite"])
+					assert.Equal(t, !closed, seen["fixed"], "fixed variants must honor the actual AUTO pool")
+					assert.True(t, mixedFixed, "mixed AUTO bindings must be discovered even without an AUTO catalog entry")
+				})
+			}
+			request, err := service.ParseAsyncImageRequest([]byte(`{"model":"fixed","prompt":"draw","resolution":"AUTO","n":1}`), "application/json", "/v1/images/generations_async", cfg)
+			require.NoError(t, err)
+			require.NoError(t, service.PrepareMixedImageAdmission(t.Context(), token, &request))
+			require.NotNil(t, request.MixedRouting)
+			chosen, _, err := service.PickImageChannel(t.Context(), mixedPolicy, request, service.ImageAccountRouting{})
+			require.NoError(t, err)
+			assert.Equal(t, channel.Id, chosen.Id)
+			named := service.AsyncImageRequest{Platform: "openai", Provider: "tabtab", Dialect: "async", Model: "public-gpt", Prompt: "draw", Count: 2}
+			_, _, err = service.PickImageChannel(t.Context(), policy, named, service.ImageAccountRouting{})
+			require.Error(t, err, "provider count validation must run before account selection")
+			named.Count, named.Resolution = 1, "4K"
+			_, _, err = service.PickImageChannel(t.Context(), policy, named, service.ImageAccountRouting{})
+			require.Error(t, err, "unsupported provider dimensions must run before account selection")
+		})
+	}
+}
 
 func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 	gin.SetMode(gin.TestMode)

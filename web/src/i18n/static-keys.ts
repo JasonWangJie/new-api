@@ -19,6 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'TabTab',
+  'Generate asynchronous images through the TabTab Task API',
+  'TabTab API key (sk_...)',
+  'TabTab Task API supports one image per task through asynchronous image endpoints. Use an sk_ API key; connect video models through the TabTab task plugin.',
   // Public asynchronous image failure summaries, suggestions and stages.
   'Upstream safety review did not pass',
   'Reference image could not be fetched',

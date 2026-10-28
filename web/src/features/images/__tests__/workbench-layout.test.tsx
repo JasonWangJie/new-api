@@ -67,7 +67,10 @@ const referenceImageModel: ImageModel = {
   capability: { max_output_images: 1, max_reference_images: 4 },
 }
 
-async function prepareImageSubmission(imageModel = referenceImageModel) {
+async function prepareImageSubmission(
+  imageModel = referenceImageModel,
+  additionalModels: ImageModel[] = []
+) {
   const user = userEvent.setup()
   keyApiMocks.getApiKeys.mockResolvedValue({
     data: { items: [{ id: 7, name: 'Primary', status: 1 }] },
@@ -80,7 +83,7 @@ async function prepareImageSubmission(imageModel = referenceImageModel) {
     api_key_id: 7,
     capability_version: 'test',
     gateway_base_url: '',
-    models: [imageModel],
+    models: [imageModel, ...additionalModels],
     platforms: [],
   })
   imageApiMocks.imageRelayRequest.mockResolvedValue({ task_id: 'image_queued' })
@@ -273,6 +276,299 @@ test('a mixed model limited to 2K selects and submits its supported resolution',
   expect(
     JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
   ).toMatchObject({ model: 'mixed-2k', resolution: '2K' })
+})
+
+test.each([
+  { name: 'fixed dimensions', parameters: [], hasRatio: false },
+  {
+    name: 'fixed resolution',
+    parameters: ['ratio', 'aspect_ratio'],
+    hasRatio: true,
+  },
+])(
+  'a TabTab alias with $name hides unsupported settings and submits AUTO without pixels',
+  async ({ parameters, hasRatio }) => {
+    const user = await prepareImageSubmission({
+      ...referenceImageModel,
+      id: 'private-image-alias',
+      label: 'TabTab Alias',
+      platform: 'tabtab',
+      provider: 'tabtab',
+      protocol: 'openai_images',
+      supports_reference_generation: true,
+      supported_parameters: ['model', 'prompt', 'n', ...parameters],
+      capability: {
+        max_output_images: 1,
+        max_reference_images: 3,
+        resolutions: ['1K', '2K', '4K'],
+        qualities: ['high'],
+        formats: ['png'],
+        backgrounds: ['opaque'],
+      },
+    })
+    expect(
+      screen.queryByRole('combobox', { name: 'Resolution' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('combobox', { name: 'Quality' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('combobox', { name: 'Output format' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('combobox', { name: 'Background' })
+    ).not.toBeInTheDocument()
+    if (hasRatio) {
+      expect(
+        screen.getByRole('combobox', { name: 'Aspect Ratio' })
+      ).toHaveTextContent('1:1')
+    } else {
+      expect(
+        screen.queryByRole('combobox', { name: 'Aspect Ratio' })
+      ).not.toBeInTheDocument()
+    }
+    await user.click(screen.getByRole('button', { name: 'Generate image' }))
+    await waitFor(() =>
+      expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+    )
+    const body = JSON.parse(
+      String(imageApiMocks.imageRelayRequest.mock.calls[0][2])
+    )
+    expect(body).toMatchObject({
+      provider: 'tabtab',
+      model: 'private-image-alias',
+      resolution: 'AUTO',
+      n: 1,
+    })
+    expect(body).not.toHaveProperty('size')
+    if (hasRatio) expect(body.aspect_ratio).toBe('1:1')
+    else expect(body).not.toHaveProperty('aspect_ratio')
+  }
+)
+
+test.each([
+  {
+    name: 'fixed dimensions',
+    parameters: ['model', 'prompt', 'n'],
+    hasRatio: false,
+  },
+  {
+    name: 'fixed resolution',
+    parameters: ['model', 'prompt', 'n', 'aspect_ratio'],
+    hasRatio: true,
+  },
+])(
+  'a mixed AUTO alias with $name exposes only supported controls and remains providerless',
+  async ({ parameters, hasRatio }) => {
+    const user = await prepareImageSubmission({
+      ...referenceImageModel,
+      id: 'fixed-mixed-alias',
+      label: 'Fixed Mixed',
+      platform: 'mixed',
+      protocol: 'openai_images',
+      supported_parameters: parameters,
+      supports_reference_generation: true,
+      capability: {
+        max_output_images: 1,
+        max_reference_images: 3,
+        resolutions: ['AUTO'],
+      },
+    })
+    expect(
+      screen.queryByRole('combobox', { name: 'Resolution' })
+    ).not.toBeInTheDocument()
+    if (hasRatio) {
+      expect(
+        screen.getByRole('combobox', { name: 'Aspect Ratio' })
+      ).toHaveTextContent('1:1')
+    } else {
+      expect(
+        screen.queryByRole('combobox', { name: 'Aspect Ratio' })
+      ).not.toBeInTheDocument()
+    }
+    await user.click(screen.getByRole('button', { name: 'Generate image' }))
+    await waitFor(() =>
+      expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+    )
+    const body = JSON.parse(
+      String(imageApiMocks.imageRelayRequest.mock.calls[0][2])
+    )
+    expect(body).toMatchObject({
+      model: 'fixed-mixed-alias',
+      resolution: 'AUTO',
+      n: 1,
+    })
+    expect(body).not.toHaveProperty('provider')
+    expect(body).not.toHaveProperty('size')
+    if (hasRatio) expect(body.aspect_ratio).toBe('1:1')
+    else expect(body).not.toHaveProperty('aspect_ratio')
+  }
+)
+
+test('a TabTab model exposes only compatible tier resolutions and sends the selected ratio without a pixel-size approximation', async () => {
+  const user = await prepareImageSubmission({
+    ...referenceImageModel,
+    id: 'tabtab-tier-alias',
+    label: 'TabTab Tier',
+    platform: 'tabtab',
+    provider: 'tabtab',
+    protocol: 'openai_images',
+    supported_parameters: ['size', 'resolution', 'ratio', 'aspect_ratio'],
+    capability: {
+      max_output_images: 1,
+      max_reference_images: 3,
+      resolutions: ['1K', '2K'],
+    },
+  })
+  await user.click(screen.getByRole('combobox', { name: 'Resolution' }))
+  expect(screen.queryByRole('option', { name: '4K' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: '2K' }))
+  await user.click(screen.getByRole('combobox', { name: 'Aspect Ratio' }))
+  expect(screen.queryByRole('option', { name: 'auto' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: '4:3' }))
+  expect(screen.queryByText(/Submitted size:/)).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
+  ).toMatchObject({ provider: 'tabtab', resolution: '2K', aspect_ratio: '4:3' })
+})
+
+test('switching TabTab pixel, fixed, and tier aliases resets hidden settings and selects the new model resolution', async () => {
+  const shared: ImageModel = {
+    ...referenceImageModel,
+    platform: 'tabtab',
+    provider: 'tabtab',
+    protocol: 'openai_images',
+    supports_reference_generation: true,
+    capability: { max_output_images: 1, max_reference_images: 3 },
+  }
+  const user = await prepareImageSubmission(
+    {
+      ...shared,
+      id: 'pixel-alias',
+      label: 'Pixel Alias',
+      supported_parameters: [
+        'model',
+        'prompt',
+        'n',
+        'size',
+        'width',
+        'height',
+        'quality',
+        'output_format',
+        'background',
+      ],
+      capability: {
+        ...shared.capability,
+        resolutions: ['1K', '2K'],
+        qualities: ['high'],
+        formats: ['png'],
+        backgrounds: ['opaque'],
+      },
+    },
+    [
+      {
+        ...shared,
+        id: 'lite-alias',
+        label: 'Lite Alias',
+        supported_parameters: ['model', 'prompt', 'n', 'aspect_ratio'],
+        capability: { ...shared.capability, resolutions: ['AUTO'] },
+      },
+      {
+        ...shared,
+        id: 'fixed-alias',
+        label: 'Fixed Alias',
+        supported_parameters: ['model', 'prompt', 'n'],
+        capability: { ...shared.capability, resolutions: ['AUTO'] },
+      },
+      {
+        ...shared,
+        id: 'tier-alias',
+        label: 'Tier Alias',
+        supported_parameters: [
+          'model',
+          'prompt',
+          'n',
+          'size',
+          'resolution',
+          'aspect_ratio',
+        ],
+        capability: { ...shared.capability, resolutions: ['4K'] },
+      },
+    ]
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Quality' }))
+  await user.click(screen.getByRole('option', { name: 'high' }))
+  await user.click(screen.getByRole('combobox', { name: 'Output format' }))
+  await user.click(screen.getByRole('option', { name: 'png' }))
+  await user.click(screen.getByRole('combobox', { name: 'Background' }))
+  await user.click(screen.getByRole('option', { name: 'opaque' }))
+  await user.click(screen.getByRole('combobox', { name: 'Resolution' }))
+  await user.click(screen.getByRole('option', { name: '2K' }))
+  await user.click(screen.getByRole('combobox', { name: 'Aspect Ratio' }))
+  await user.click(screen.getByRole('option', { name: '4:3' }))
+
+  await user.click(screen.getByRole('combobox', { name: 'Model' }))
+  await user.click(
+    screen.getByRole('option', { name: 'Lite Alias · tabtab · Asynchronous' })
+  )
+  expect(
+    screen.queryByRole('combobox', { name: 'Resolution' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('combobox', { name: 'Quality' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('combobox', { name: 'Output format' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('combobox', { name: 'Background' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('combobox', { name: 'Aspect Ratio' })
+  ).toHaveTextContent('4:3')
+
+  await user.click(screen.getByRole('combobox', { name: 'Model' }))
+  await user.click(
+    screen.getByRole('option', { name: 'Fixed Alias · tabtab · Asynchronous' })
+  )
+  expect(
+    screen.queryByRole('combobox', { name: 'Resolution' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('combobox', { name: 'Aspect Ratio' })
+  ).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole('combobox', { name: 'Model' }))
+  await user.click(
+    screen.getByRole('option', { name: 'Tier Alias · tabtab · Asynchronous' })
+  )
+  expect(
+    screen.getByRole('combobox', { name: 'Resolution' })
+  ).toHaveTextContent('4K')
+  expect(
+    screen.getByRole('combobox', { name: 'Aspect Ratio' })
+  ).toHaveTextContent('1:1')
+  expect(
+    screen.queryByRole('spinbutton', { name: 'Image count' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  await waitFor(() =>
+    expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+  )
+  expect(
+    JSON.parse(String(imageApiMocks.imageRelayRequest.mock.calls[0][2]))
+  ).toEqual({
+    provider: 'tabtab',
+    model: 'tier-alias',
+    prompt: 'Keep the subject consistent',
+    resolution: '4K',
+    aspect_ratio: '1:1',
+    n: 1,
+  })
 })
 
 test.each(['newapi', 'volcengine', 'gemini'])(

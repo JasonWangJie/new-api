@@ -860,11 +860,14 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		return nil, ImageAccount{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
-		if policy.Platform == "mixed" {
+		capability := ImageChannelCapability(channel, request.Model)
+		if request.Provider != "" && capability.Provider != request.Provider {
+			return true
+		}
+		if policy.Platform == "mixed" || channel.Type == constant.ChannelTypeTabTab {
 			return !MixedImageChannelRequestSupported(channel, request)
 		}
-		capability := ImageChannelCapability(channel, request.Model)
-		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
+		return !ImageCapabilitySupportsRequest(capability, request)
 	})
 	// Rejected compatibility and timeout exclusions belong to this task and
 	// survive cooldown fallback, including copied credentials in other channels.
@@ -1367,11 +1370,14 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 		return policy, model.ImageFundingSelection{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(ch model.Channel) bool {
-		if policy.Platform == "mixed" {
+		capability := ImageChannelCapability(ch, request.Model)
+		if request.Provider != "" && capability.Provider != request.Provider {
+			return true
+		}
+		if policy.Platform == "mixed" || ch.Type == constant.ChannelTypeTabTab {
 			return !MixedImageChannelRequestSupported(ch, request)
 		}
-		capability := ImageChannelCapability(ch, request.Model)
-		return request.Provider != "" && capability.Provider != request.Provider || !ImageCapabilitySupportsRequest(capability, request)
+		return !ImageCapabilitySupportsRequest(capability, request)
 	})
 	if len(channels) == 0 {
 		return policy, model.ImageFundingSelection{}, errors.New("no eligible image channel in the selected pool")

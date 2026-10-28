@@ -64,12 +64,52 @@ export type ImageRequestOptions = {
   background: string
 }
 
+// Keep workbench choices within the common Task API dimensions. The public
+// endpoint still accepts the provider's wider model-specific API contract.
+export function imageDimensionOptions(model?: ImageModel): {
+  resolutions?: string[]
+  ratios?: string[]
+} {
+  const resolutions = model?.capability.resolutions?.length
+    ? model.capability.resolutions
+    : ['1K', '2K', '4K']
+  const parameters = model?.supported_parameters
+  const fixedMixed =
+    model?.platform === 'mixed' &&
+    parameters !== undefined &&
+    resolutions.length === 1 &&
+    resolutions[0] === 'AUTO' &&
+    !parameters.includes('size') &&
+    !parameters.includes('resolution')
+  if (model?.provider !== 'tabtab' && !fixedMixed) {
+    return { resolutions, ratios: IMAGE_RATIOS }
+  }
+  const declared = parameters ?? []
+  return {
+    resolutions:
+      !fixedMixed && declared.includes('size')
+        ? resolutions.filter(
+            (value) =>
+              !declared.includes('width') || ['1K', '2K'].includes(value)
+          )
+        : undefined,
+    ratios:
+      declared.includes('aspect_ratio') ||
+      declared.includes('ratio') ||
+      declared.includes('width')
+        ? ['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2']
+        : undefined,
+  }
+}
+
 export function imageRequestDimensions(
   model: ImageModel,
   resolution: string,
   ratio: string
 ): { size: string; approximate: boolean } | undefined {
   if (
+    (model.provider === 'tabtab' &&
+      !model.supported_parameters?.includes('width')) ||
     model.protocol === 'gemini_native' ||
     (!model.provider && model.platform === 'gemini') ||
     (model.mode === 'async' &&
@@ -121,6 +161,7 @@ export function buildImageRequest(options: ImageRequestOptions): {
     background,
   } = options
   const references = parts.filter((part) => part.type === 'image_url')
+  const dimensions = imageDimensionOptions(model)
   if (
     !model.available ||
     !prompt.trim() ||
@@ -128,11 +169,38 @@ export function buildImageRequest(options: ImageRequestOptions): {
     count < 1 ||
     count > Math.min(128, model.capability.max_output_images) ||
     references.length > model.capability.max_reference_images ||
-    (model.capability.resolutions?.length &&
+    (model.provider !== 'tabtab' &&
+      model.capability.resolutions?.length &&
       !model.capability.resolutions.includes(resolution)) ||
     !IMAGE_RATIOS.includes(ratio)
   ) {
     throw new Error('Invalid image request')
+  }
+  if (
+    model.provider === 'tabtab' ||
+    (model.platform === 'mixed' && dimensions.resolutions === undefined)
+  ) {
+    if (
+      (dimensions.resolutions
+        ? !dimensions.resolutions.includes(resolution)
+        : resolution !== 'AUTO') ||
+      (dimensions.ratios
+        ? !dimensions.ratios.includes(ratio)
+        : ratio !== 'auto')
+    ) {
+      throw new Error('Unsupported image dimensions')
+    }
+  }
+  if (model.provider === 'tabtab') {
+    for (const [field, value] of [
+      ['quality', quality],
+      ['output_format', format],
+      ['background', background],
+    ]) {
+      if (value && !model.supported_parameters?.includes(field)) {
+        throw new Error('Invalid image request')
+      }
+    }
   }
   if (
     (model.protocol === 'gemini_native' ||
@@ -153,6 +221,29 @@ export function buildImageRequest(options: ImageRequestOptions): {
       throw new Error('Invalid image request')
     }
     const size = imageRequestDimensions(model, resolution, ratio)?.size
+    let requestedDimensions: {
+      size?: string
+      resolution?: string
+      aspect_ratio?: string
+    }
+    if (model.provider === 'tabtab') {
+      requestedDimensions = model.supported_parameters?.includes('width')
+        ? { size }
+        : {
+            resolution: dimensions.resolutions ? resolution : 'AUTO',
+            ...(dimensions.ratios && ratio !== 'auto'
+              ? { aspect_ratio: ratio }
+              : {}),
+          }
+    } else {
+      requestedDimensions =
+        model.platform === 'mixed' ||
+        model.protocol === 'gemini_native' ||
+        (model.provider === 'newapi' &&
+          model.supported_parameters?.includes('output_resolution'))
+          ? { resolution, ...(ratio === 'auto' ? {} : { aspect_ratio: ratio }) }
+          : { size }
+    }
     return {
       url:
         references.length && !model.supports_reference_generation
@@ -170,12 +261,7 @@ export function buildImageRequest(options: ImageRequestOptions): {
             .map((part) => part.text),
         ].join('\n'),
         n: count,
-        ...(model.platform === 'mixed' ||
-        model.protocol === 'gemini_native' ||
-        (model.provider === 'newapi' &&
-          model.supported_parameters?.includes('output_resolution'))
-          ? { resolution, ...(ratio === 'auto' ? {} : { aspect_ratio: ratio }) }
-          : { size }),
+        ...requestedDimensions,
         ...(quality ? { quality } : {}),
         ...(format ? { output_format: format } : {}),
         ...(background ? { background } : {}),

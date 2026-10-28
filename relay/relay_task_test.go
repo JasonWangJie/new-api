@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -700,6 +701,78 @@ func TestTaskRetryDoesNotCarryPreviousPluginExpression(t *testing.T) {
 	require.NotNil(t, info.TieredBillingSnapshot)
 	assert.Equal(t, first.Quota, prepared.Quota)
 	assert.Equal(t, frozen.Tiered.ExprString, info.TieredBillingSnapshot.ExprString)
+}
+
+func TestRelayTaskSubmitRecoversHTTPErrorReceiptsAndSanitizesDiagnostics(t *testing.T) {
+	service.InitHttpClient()
+	const source = `
+export const meta = {apiVersion:1,key:"http-receipt",name:"HTTP Receipt",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx) {return {url:ctx.baseUrl+"/submit",method:"POST",body:{model:ctx.upstreamModel},action:"text_to_video"};}
+export function parseSubmitResponse(ctx,response) {
+  const body=response.body;
+  if (!body || typeof body.id!=="string" || !body.id) throw new Error("task id unavailable");
+  return {taskId:body.id,taskData:body,state:{seconds:5},immediate:{status:"FAILURE",reason:"untrusted failure"}};
+}
+export function buildQueryRequest(ctx) {return {url:ctx.baseUrl+"/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+export function extractUsageOnSubmit(){return {seconds:99};}
+`
+	for _, tc := range []struct {
+		name, body                   string
+		status                       int
+		profile, accepted, truncated bool
+	}{
+		{"plugin 429 accepted", `{"id":"accepted-id","status":"failed"}`, 429, false, true, false},
+		{"plugin 500 accepted", `{"id":"accepted-id","output":"https://cdn.example/result.mp4"}`, 500, false, true, false},
+		{"profile 400 accepted", `{"job":{"id":"accepted-id"}}`, 400, true, true, false},
+		{"output without id", `{"results":[{"url":"https://cdn.example/result.mp4"}]}`, 502, false, false, false},
+		{"proper 429 rejection retains retry", `{"message":"rate limited"}`, 429, false, false, false},
+		{"credentialed rejection", `{"message":"API key=sk_current-secret Authorization=Bearer sk_other-secret","request":{"prompt":"private-prompt-canary","api_key":"unrelated-secret"}}`, 401, false, false, false},
+		{"malformed response", `{"message":"Bearer sk_current-secret"`, 502, false, false, false},
+		{"truncated transport", `{"message":"sk_current-secret"}`, 502, false, false, true},
+		{"oversized response", strings.Repeat("private-prompt-canary", (1<<20)/20+1), 503, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if tc.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(tc.body)+1))
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer upstream.Close()
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			pinMappingOrderPlugin(t, c, source)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "sk_current-secret")
+			info.OriginModelName = "declared-model"
+			c.Set("async_media_billing", service.MediaBillingSnapshot{Price: types.PriceData{Quota: 123, FreeModel: true}})
+			if tc.profile {
+				var rules kitdto.UpstreamAsyncConfig
+				require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"http","media_type":"video","models":["declared-model"],"operations":["generate"],"submit":{"task_id_path":"job.id"},"poll":{"request":{"method":"GET","path":"/query/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}]}`, &rules))
+				require.NoError(t, rules.Validate())
+				common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, kitdto.ChannelOtherSettings{UpstreamAsync: &rules})
+			}
+			result, taskErr := RelayTaskSubmit(c, info)
+			if tc.accepted {
+				require.Nil(t, taskErr)
+				require.NotNil(t, result)
+				assert.Equal(t, "accepted-id", result.UpstreamTaskID)
+				assert.Nil(t, result.Immediate, "a conflicting HTTP status must not cause an immediate refund")
+				assert.Equal(t, 123, result.Quota, "retain the reservation instead of applying error-body adjustments")
+				return
+			}
+			require.NotNil(t, taskErr)
+			assert.Nil(t, result)
+			assert.Equal(t, tc.truncated || len(tc.body) > 1<<20, taskErr.NoRetry, "ordinary complete HTTP errors keep their existing retry policy")
+			assert.Equal(t, tc.status, taskErr.StatusCode)
+			for _, secret := range []string{"sk_current-secret", "sk_other-secret", "unrelated-secret", "private-prompt-canary", `"request"`} {
+				assert.NotContains(t, taskErr.Message, secret)
+				assert.NotContains(t, taskErr.Error.Error(), secret)
+			}
+		})
+	}
 }
 
 func TestMeasuredVideoPrechargeRequiresSecondsContract(t *testing.T) {

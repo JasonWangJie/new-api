@@ -878,7 +878,7 @@ func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task mode
 			}
 		}
 		download := service.DownloadUpstreamAsyncImages
-		if info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+		if info.ChannelType == constant.ChannelTypeTabTab || info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
 			download = service.DownloadTianyueImages
 		}
 		images, err = download(ctx, urls, profile, info.ChannelBaseUrl, info.ChannelSetting.Proxy, service.UpstreamAsyncTemplateContext{

@@ -30,7 +30,7 @@ var (
 	asyncImageBearerCredentialPattern    = regexp.MustCompile(`(?i)(\bbearer\s+)[^\s,;"']+`)
 	asyncImageNamedCredentialPattern     = regexp.MustCompile(`(?i)(\b(?:api[_ -]?key|authorization|access[_ -]?token|secret|password)\b(?:\s+(?:provided|supplied))?["']?\s*[:=]\s*["']?)[^\s,;"'}]+`)
 	asyncImageGoogleAPIKeyPattern        = regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{20,}\b`)
-	asyncImageOpenAIAPIKeyPattern        = regexp.MustCompile(`\bsk-[0-9A-Za-z_-]+`)
+	asyncImageOpenAIAPIKeyPattern        = regexp.MustCompile(`\bsk[-_][0-9A-Za-z_-]+`)
 	imageReferenceSizeRejectionPattern   = regexp.MustCompile(`(?i)^reference image exceeds limit:\s*[0-9]{1,12}(?:\.[0-9]{1,6})?\s*(?:GB|MB|KB|B)\s+limit exceeded\.?$`)
 	imageReferenceDownloadTimeoutPattern = regexp.MustCompile(`(?i)^error while downloading https?://\S+\s+(?:get|head)\s+"https?://[^"\s]+(?:"\s*:)?\s+dial tcp [^\r\n]+: i/o timeout(?:\s+(?:400|invalid_argument)){0,2}$`)
 	imageQuotaUnavailablePattern         = regexp.MustCompile(`\b(?:quotas?|balances?|credits?|capacity)(?:\s+(?:is|are|was|were|currently|temporarily|now|has|been|completely|fully|already|remaining|available)){0,4}\s+(?:unavailable|exhausted|insufficient|depleted|exceeded|empty|not\s+available)\b|` +

@@ -90,6 +90,9 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 		operation = dto.UpstreamAsyncOperationEdit
 	}
 	profile, hasProfile := otherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, operation)
+	if ch.Type == constant.ChannelTypeTabTab {
+		profile, hasProfile = service.TabtabAsyncImageProfile(info.UpstreamModelName), true
+	}
 	if !hasProfile && ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility {
 		profile = service.TianyueAsyncImageProfile(info.UpstreamModelName)
 		hasProfile = profile != nil
@@ -112,6 +115,13 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 	fields["n"], _ = common.Marshal(request.Count)
 	if request.Size != "" {
 		fields["size"], _ = common.Marshal(request.Size)
+	}
+	if ch.Type == constant.ChannelTypeTabTab {
+		for name, value := range map[string]string{"resolution": request.Resolution, "aspect_ratio": request.AspectRatio} {
+			if value != "" {
+				fields[name], _ = common.Marshal(value)
+			}
+		}
 	}
 	delete(fields, "images")
 	delete(fields, "image_urls")
@@ -214,6 +224,11 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 			return err
 		}
 	}
+	if ch.Type == constant.ChannelTypeTabTab {
+		if _, err := service.TabtabImageSubmission(data, info.UpstreamModelName, request.Count); err != nil {
+			return err
+		}
+	}
 	probe, err := http.NewRequest(http.MethodPost, path, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -288,7 +303,13 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 	}
 	// Model mappings determine the upstream protocol, while the original name
 	// continues to identify permissions and billing.
-	if ch.ModelMapping != nil && *ch.ModelMapping != "" {
+	if ch.Type == constant.ChannelTypeTabTab {
+		var err error
+		modelName, err = service.ResolveImageChannelUpstreamModel(ch, modelName)
+		if err != nil {
+			return dto.ImageCapability{}
+		}
+	} else if ch.ModelMapping != nil && *ch.ModelMapping != "" {
 		var mapping map[string]string
 		if common.UnmarshalJsonStr(*ch.ModelMapping, &mapping) != nil {
 			return dto.ImageCapability{}
@@ -311,6 +332,9 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 		}
 	}
 	capability := provider.ImageCapability(modelName)
+	if ch.Type == constant.ChannelTypeTabTab {
+		capability = service.TabtabImageCapability(modelName)
+	}
 	if ch.Type == constant.ChannelTypeNewAPI && ch.GetSetting().TianyueMediaCompatibility {
 		capability.Mask = false
 		capability.ReferenceField = "images"

@@ -59,7 +59,7 @@ import { imageLabel, imagePlatformLabel } from './lib/image-labels'
 import {
   buildImageRequest,
   extractImageResponse,
-  IMAGE_RATIOS,
+  imageDimensionOptions,
   imageRequestDimensions,
   terminalImageStatus,
   type ImageRequestPart,
@@ -238,7 +238,11 @@ function WorkbenchSession({ userId }: { userId: number }) {
     setFormat('')
     setBackground('')
     setCount(1)
-    setResolution(selectedModel?.capability.resolutions?.[0] || '1K')
+    const dimensions = imageDimensionOptions(selectedModel)
+    setResolution(dimensions.resolutions?.[0] || 'AUTO')
+    if (!dimensions.ratios?.includes(ratio)) {
+      setRatio(dimensions.ratios?.[0] || 'auto')
+    }
   }
   const loadReferences = async (files: File[]) => {
     if (
@@ -451,6 +455,9 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const dimensions = model
     ? imageRequestDimensions(model, resolution, ratio)
     : undefined
+  const dimensionOptions = imageDimensionOptions(model)
+  const supportedParameters = model?.supported_parameters ?? []
+  const isTabtab = model?.provider === 'tabtab'
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Image Workbench')}</SectionPageLayout.Title>
@@ -556,24 +563,26 @@ function WorkbenchSession({ userId }: { userId: number }) {
                 {t('Generation settings')}
               </h4>
               <div className='grid grid-cols-2 gap-3'>
-                <ImageSelect
-                  label={t('Resolution')}
-                  value={resolution}
-                  options={options(
-                    model?.capability.resolutions?.length
-                      ? model.capability.resolutions
-                      : ['1K', '2K', '4K']
-                  )}
-                  onChange={setResolution}
-                  disabled={busy || activeTask}
-                />
-                <ImageSelect
-                  label={t('Aspect Ratio')}
-                  value={ratio}
-                  options={options(IMAGE_RATIOS)}
-                  onChange={setRatio}
-                  disabled={busy || activeTask}
-                />
+                {dimensionOptions.resolutions && (
+                  <ImageSelect
+                    label={t('Resolution')}
+                    value={resolution}
+                    options={options(dimensionOptions.resolutions)}
+                    onChange={setResolution}
+                    disabled={
+                      busy || activeTask || !dimensionOptions.resolutions.length
+                    }
+                  />
+                )}
+                {dimensionOptions.ratios && (
+                  <ImageSelect
+                    label={t('Aspect Ratio')}
+                    value={ratio}
+                    options={options(dimensionOptions.ratios)}
+                    onChange={setRatio}
+                    disabled={busy || activeTask}
+                  />
+                )}
               </div>
               {dimensions && (
                 <p role='status' className='text-muted-foreground text-sm'>
@@ -591,7 +600,8 @@ function WorkbenchSession({ userId }: { userId: number }) {
                   )}
                 </p>
               )}
-              {model?.capability.qualities?.length ? (
+              {model?.capability.qualities?.length &&
+              (!isTabtab || supportedParameters.includes('quality')) ? (
                 <ImageSelect
                   label={t('Quality')}
                   value={quality}
@@ -603,7 +613,8 @@ function WorkbenchSession({ userId }: { userId: number }) {
                   disabled={busy || activeTask}
                 />
               ) : null}
-              {model?.capability.formats?.length ? (
+              {model?.capability.formats?.length &&
+              (!isTabtab || supportedParameters.includes('output_format')) ? (
                 <ImageSelect
                   label={t('Output format')}
                   value={format}
@@ -615,7 +626,8 @@ function WorkbenchSession({ userId }: { userId: number }) {
                   disabled={busy || activeTask}
                 />
               ) : null}
-              {model?.capability.backgrounds?.length ? (
+              {model?.capability.backgrounds?.length &&
+              (!isTabtab || supportedParameters.includes('background')) ? (
                 <ImageSelect
                   label={t('Background')}
                   value={background}
@@ -649,7 +661,13 @@ function WorkbenchSession({ userId }: { userId: number }) {
               <Button
                 type='submit'
                 className='h-11 w-full gap-2 rounded-xl shadow-sm'
-                disabled={!model || busy || activeTask || loadingReferences}
+                disabled={
+                  !model ||
+                  busy ||
+                  activeTask ||
+                  loadingReferences ||
+                  dimensionOptions.resolutions?.length === 0
+                }
               >
                 {busy || activeTask || loadingReferences ? (
                   <Loader2

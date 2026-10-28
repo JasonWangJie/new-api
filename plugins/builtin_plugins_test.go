@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "tianyue", "vertex-ai", "vidu", "xai", "yali"}
+var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "tabtab", "tianyue", "vertex-ai", "vidu", "xai", "yali"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -91,7 +91,7 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			plugin, registerErr := registry.RegisterFactory(source, jsplugin.Options{Key: key})
 			require.NoError(t, registerErr)
 
-			if key == "xai" || key == "drama" || key == "yali" || key == "tianyue" {
+			if key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" {
 				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/videos", plugin.Meta.Models[0])
 				require.True(t, claimed)
 				assert.Same(t, plugin, binding.Plugin)
@@ -138,7 +138,7 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 	bodyOverrides := map[string]map[string]any{}
 	for _, key := range expectedKeys {
 		t.Run(key, func(t *testing.T) {
-			if key == "xai" || key == "drama" || key == "yali" || key == "tianyue" {
+			if key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" {
 				t.Skip("This plugin exposes only the host-owned OpenAI Video protocol")
 			}
 			source, sourceErr := Source(key)

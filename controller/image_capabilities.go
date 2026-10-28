@@ -126,10 +126,14 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				continue
 			}
 			mode := "realtime"
-			if policy.AsyncEnabled {
+			if policy.AsyncEnabled || platform == "tabtab" {
 				mode = "async"
 			}
 			available := valid && policy.Enabled
+			if platform == "tabtab" && !policy.AsyncEnabled {
+				available = false
+				providerReason = "Async image service is disabled"
+			}
 			if platform == "mixed" && !helper.HasPriceOrRatioEntry(capability.Id) {
 				available = false
 				providerReason = "Image model price is not configured"
@@ -151,7 +155,11 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			resolutions := make([]string, 0, len(capability.Resolutions))
 			var channels []model.Channel
 			mixedMaxOutput := min(capability.MaxOutputImages, dto.MaxImageN)
-			for _, resolution := range capability.Resolutions {
+			candidateResolutions := slices.Clone(capability.Resolutions)
+			if (platform == "tabtab" || platform == "mixed") && !slices.Contains(candidateResolutions, "AUTO") {
+				candidateResolutions = append(candidateResolutions, "AUTO")
+			}
+			for _, resolution := range candidateResolutions {
 				candidates, err := service.ImageCandidateChannels(ctx, policy, capability.Id, resolution)
 				if err != nil {
 					imageManagementError(c, 503, err)
@@ -180,6 +188,21 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 						}
 						return false
 					}
+					if platform == "tabtab" {
+						declared := service.ImageChannelCapability(channel, capability.Id)
+						if declared.Provider != platform {
+							return true
+						}
+						fixedSize := !slices.Contains(declared.Parameters, "size")
+						if fixedSize != (resolution == "AUTO") {
+							return true
+						}
+						probe := service.AsyncImageRequest{Platform: "openai", Provider: platform, Dialect: "async", Model: capability.Id, Kind: "text_to_image", Count: 1}
+						if slices.Contains(declared.Parameters, "size") {
+							probe.Resolution = resolution
+						}
+						return !service.MixedImageChannelRequestSupported(channel, probe)
+					}
 					return service.ImageChannelCapability(channel, capability.Id).Provider != platform
 				})
 				if len(candidates) > 0 {
@@ -206,6 +229,17 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			capability.MaxReferenceImages = min(capability.MaxReferenceImages, cfg.MaxReferences)
 			declared := service.ImageChannelCapability(channels[0], capability.Id)
+			if platform == "tabtab" {
+				mappedModel, mappingErr := service.ResolveImageChannelUpstreamModel(channels[0], capability.Id)
+				if mappingErr != nil {
+					continue
+				}
+				var supported bool
+				capability, supported = service.TabtabWorkbenchImageCapability(mappedModel, capability)
+				if !supported {
+					continue
+				}
+			}
 			if platform == "mixed" {
 				// Only executable members contribute to the common request surface.
 				// Execution checks concrete inputs again before weighted selection.

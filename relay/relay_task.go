@@ -514,9 +514,19 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
 	}
 	defer resp.Body.Close()
-	if (!hasAsyncProfile && resp.StatusCode != http.StatusOK) || (hasAsyncProfile && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices)) {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+	unexpectedHTTPStatus := (!hasAsyncProfile && resp.StatusCode != http.StatusOK) || (hasAsyncProfile && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices))
+	var httpErrorBody []byte
+	if unexpectedHTTPStatus {
+		var readErr error
+		httpErrorBody, readErr = io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+		if readErr != nil || len(httpErrorBody) > 1<<20 {
+			failure := service.TaskErrorWrapper(errors.New("upstream task error response could not be read safely"), "fail_to_fetch_task", resp.StatusCode)
+			failure.NoRetry = true
+			return nil, failure
+		}
+		// The existing driver owns receipt extraction even when its upstream
+		// sends an error status with an accepted operation identifier.
+		resp.Body = io.NopCloser(bytes.NewReader(httpErrorBody))
 	}
 
 	// 10. Parse only. The controller presents the response after the durable
@@ -526,22 +536,40 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if hasAsyncProfile {
 		responseBody, readErr := service.ReadUpstreamAsyncResponse(resp, 1<<20)
 		if readErr != nil {
-			failure := service.TaskErrorWrapper(readErr, "upstream_async_submit_invalid", http.StatusBadGateway)
-			failure.NoRetry = true
-			return nil, failure
+			taskErr = service.TaskErrorWrapper(readErr, "upstream_async_submit_invalid", http.StatusBadGateway)
+		} else {
+			upstreamTaskID, parseErr := service.ParseUpstreamAsyncTaskID(asyncProfile, responseBody)
+			if parseErr != nil {
+				taskErr = service.TaskErrorWrapper(parseErr, "upstream_async_submit_invalid", http.StatusBadGateway)
+			} else {
+				parsed = &channel.TaskSubmitResponse{UpstreamTaskID: upstreamTaskID, TaskData: responseBody}
+			}
 		}
-		upstreamTaskID, parseErr := service.ParseUpstreamAsyncTaskID(asyncProfile, responseBody)
-		if parseErr != nil {
-			failure := service.TaskErrorWrapper(parseErr, "upstream_async_submit_invalid", http.StatusBadGateway)
-			failure.NoRetry = true
-			return nil, failure
+		if taskErr != nil {
+			taskErr.NoRetry = true
 		}
-		parsed = &channel.TaskSubmitResponse{UpstreamTaskID: upstreamTaskID, TaskData: responseBody}
 	} else {
 		parsed, taskErr = adaptor.ParseResponse(c, resp, info)
-		if taskErr != nil {
-			return nil, taskErr
+	}
+	if unexpectedHTTPStatus {
+		if taskErr != nil || parsed == nil || strings.TrimSpace(parsed.UpstreamTaskID) == "" {
+			diagnostic := string(httpErrorBody)
+			if info.ApiKey != "" {
+				diagnostic = strings.ReplaceAll(diagnostic, info.ApiKey, "[redacted]")
+			}
+			message := service.SanitizeAsyncImageDiagnostic(diagnostic, common.LocalLogContentLimit)
+			if message == "" {
+				message = "upstream task submission failed"
+			}
+			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), "fail_to_fetch_task", resp.StatusCode)
+			return nil, failure
 		}
+		// Preserve the reservation and poll the known operation. Neither an
+		// error envelope nor its immediate result proves a final charge/refund.
+		parsed.Immediate = nil
+	}
+	if taskErr != nil {
+		return nil, taskErr
 	}
 	if parsed == nil {
 		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
@@ -549,7 +577,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
 	finalQuota := info.PriceData.Quota
-	if referenceRetry {
+	if referenceRetry || unexpectedHTTPStatus {
 		// Replacement generation shares the persisted task reservation. Neither
 		// pre-consume nor submit-time billing adjustments run a second time.
 		finalQuota = info.PriceData.Quota

@@ -141,6 +141,7 @@ import {
   CHANNEL_TYPE_OLLAMA,
   CHANNEL_TYPE_OPTIONS,
   CHANNEL_TYPE_TASK_PLUGIN,
+  CHANNEL_TYPE_TABTAB,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
   CHANNEL_TYPE_WARNINGS,
@@ -850,13 +851,14 @@ export function ChannelMutateDrawer({
     const allModels = new Set([
       ...allModelsList,
       ...currentModelsArray,
+      ...(getChannelTypeConfig(currentType).supportedModels ?? []),
       ...pluginExtensions.flatMap((plugin) => plugin.models),
     ])
     return [...allModels].map((model) => ({
       value: model,
       label: model,
     }))
-  }, [allModelsList, currentModelsArray, pluginExtensions])
+  }, [allModelsList, currentModelsArray, currentType, pluginExtensions])
 
   const modelMappingGuardrail = useMemo<ModelMappingGuardrail>(() => {
     if (!currentModelMapping?.trim()) {
@@ -2171,44 +2173,46 @@ export function ChannelMutateDrawer({
         )}
       />
 
-      <div className='rounded-lg border p-4'>
-        <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
-          <div className='space-y-1'>
-            <div className='flex flex-wrap items-center gap-2'>
-              <p className='text-sm font-medium'>
-                {t('Upstream asynchronous tasks')}
-              </p>
-              <Badge variant={currentUpstreamAsync ? 'default' : 'secondary'}>
-                {currentUpstreamAsync
-                  ? t('Channel override')
-                  : t('Built-in parsing')}
-              </Badge>
-              {currentUpstreamAsync ? (
-                <Badge variant='outline'>
-                  {t('{{count}} profiles', {
-                    count: currentUpstreamAsync.profiles.length,
-                  })}
+      {currentType !== CHANNEL_TYPE_TABTAB && (
+        <div className='rounded-lg border p-4'>
+          <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+            <div className='space-y-1'>
+              <div className='flex flex-wrap items-center gap-2'>
+                <p className='text-sm font-medium'>
+                  {t('Upstream asynchronous tasks')}
+                </p>
+                <Badge variant={currentUpstreamAsync ? 'default' : 'secondary'}>
+                  {currentUpstreamAsync
+                    ? t('Channel override')
+                    : t('Built-in parsing')}
                 </Badge>
-              ) : null}
+                {currentUpstreamAsync ? (
+                  <Badge variant='outline'>
+                    {t('{{count}} profiles', {
+                      count: currentUpstreamAsync.profiles.length,
+                    })}
+                  </Badge>
+                ) : null}
+              </div>
+              <p className='text-muted-foreground text-xs'>
+                {t(
+                  'Dynamically extract an upstream task ID, poll its status, and collect local image or video results.'
+                )}
+              </p>
             </div>
-            <p className='text-muted-foreground text-xs'>
-              {t(
-                'Dynamically extract an upstream task ID, poll its status, and collect local image or video results.'
-              )}
-            </p>
+            <Button
+              type='button'
+              variant='outline'
+              size='sm'
+              disabled={sensitiveLocked}
+              onClick={() => setUpstreamAsyncEditorOpen(true)}
+            >
+              <Settings aria-hidden='true' />
+              {t('Configure upstream async')}
+            </Button>
           </div>
-          <Button
-            type='button'
-            variant='outline'
-            size='sm'
-            disabled={sensitiveLocked}
-            onClick={() => setUpstreamAsyncEditorOpen(true)}
-          >
-            <Settings aria-hidden='true' />
-            {t('Configure upstream async')}
-          </Button>
         </div>
-      </div>
+      )}
     </div>
   )
 
@@ -4757,25 +4761,27 @@ export function ChannelMutateDrawer({
         />
       )}
 
-      {upstreamAsyncEditorOpen && !sensitiveLocked && (
-        <UpstreamAsyncEditorDialog
-          open={upstreamAsyncEditorOpen}
-          value={currentUpstreamAsync}
-          onOpenChange={setUpstreamAsyncEditorOpen}
-          onSave={(nextValue: UpstreamAsyncConfig | null) => {
-            const settings = parseSettingsRecord(form.getValues('settings'))
-            if (nextValue) {
-              settings.upstream_async = nextValue
-            } else {
-              delete settings.upstream_async
-            }
-            form.setValue('settings', JSON.stringify(settings), {
-              shouldDirty: true,
-              shouldValidate: true,
-            })
-          }}
-        />
-      )}
+      {upstreamAsyncEditorOpen &&
+        !sensitiveLocked &&
+        currentType !== CHANNEL_TYPE_TABTAB && (
+          <UpstreamAsyncEditorDialog
+            open={upstreamAsyncEditorOpen}
+            value={currentUpstreamAsync}
+            onOpenChange={setUpstreamAsyncEditorOpen}
+            onSave={(nextValue: UpstreamAsyncConfig | null) => {
+              const settings = parseSettingsRecord(form.getValues('settings'))
+              if (nextValue) {
+                settings.upstream_async = nextValue
+              } else {
+                delete settings.upstream_async
+              }
+              form.setValue('settings', JSON.stringify(settings), {
+                shouldDirty: true,
+                shouldValidate: true,
+              })
+            }}
+          />
+        )}
 
       <SecureVerificationDialog {...verification.dialogProps} />
 

@@ -20,6 +20,7 @@ import {
   CHANNEL_TYPES,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
+  CHANNEL_TYPE_TABTAB,
 } from '../constants'
 
 // ============================================================================
@@ -49,6 +50,27 @@ export interface ChannelTypeConfig {
  * Configuration for each channel type
  */
 export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
+  [CHANNEL_TYPE_TABTAB]: {
+    id: CHANNEL_TYPE_TABTAB,
+    name: CHANNEL_TYPES[CHANNEL_TYPE_TABTAB],
+    icon: 'text:TT',
+    supportedModels: [
+      'gemini-nano-banana-2.1',
+      'gemini-3-pro-image',
+      'gemini-3.1-flash-image',
+      'gemini-3.1-flash-lite-image',
+      'gpt-image-2',
+      'gpt-image-2.5-flare',
+      'gpt-image-2.5-sunburst',
+      'gpt-image-2-r',
+      'gpt-image-2.5-r',
+      'seedream-5-pro',
+      'mj',
+    ],
+    hints: {
+      key: 'TabTab API key (sk_...)',
+    },
+  },
   [CHANNEL_TYPE_SGLANG]: {
     id: CHANNEL_TYPE_SGLANG,
     name: CHANNEL_TYPES[CHANNEL_TYPE_SGLANG],

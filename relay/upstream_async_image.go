@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -43,6 +44,9 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 	rawBody := body
 	if err == nil && c.GetBool(contextKeyTianyueImageProfile) {
 		body, err = service.NormalizeTianyueImageTask(body, info.ChannelBaseUrl)
+	}
+	if err == nil && info != nil && info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeTabTab {
+		body, err = service.NormalizeTabtabImageTask(body, info.ChannelBaseUrl, resumeTaskID)
 	}
 	if err != nil {
 		if resumeTaskID == "" {

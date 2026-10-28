@@ -699,6 +699,42 @@ test('every built-in provider has a description and Anthropic includes compatibl
   ).toBeVisible()
 })
 
+test('TabTab remains selectable without plugin permission and describes its image protocol in the current language', async () => {
+  const language = createInstance()
+  await language.init({
+    lng: 'en',
+    fallbackLng: 'en',
+    resources: { en: { translation: {} }, zh },
+  })
+  const select = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <I18nextProvider i18n={language}>
+      <ChannelProviderPicker
+        plugins={[]}
+        canBindPlugin={false}
+        loading={false}
+        failed={false}
+        disabled={false}
+        onRetry={vi.fn()}
+        onSelect={select}
+      />
+    </I18nextProvider>
+  )
+  await user.type(screen.getByRole('combobox'), 'TabTab')
+  const provider = screen.getByRole('option', { name: 'TabTab Built-in #64' })
+  expect(provider).toHaveAccessibleDescription(
+    'Generate asynchronous images through the TabTab Task API'
+  )
+  expect(within(provider).getByText('TT')).toBeVisible()
+  await act(() => language.changeLanguage('zh'))
+  expect(provider).toHaveAccessibleDescription(
+    '通过 TabTab Task API 异步生成图片'
+  )
+  await user.click(provider)
+  expect(select).toHaveBeenCalledWith({ kind: 'builtin', type: 64 })
+})
+
 test('deprecated and flexible integration badges preserve provider selection and expose the full explanation', async () => {
   const select = vi.fn()
   const user = userEvent.setup()
