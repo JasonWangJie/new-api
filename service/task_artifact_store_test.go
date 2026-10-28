@@ -404,14 +404,30 @@ func TestAsyncVideoReferenceRecoverySnapshotWindow(t *testing.T) {
 func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 	// These are fixed, sanitized diagnostic fixtures from already-refunded
 	// operations. Tests create new local rows; historical tasks are never replayed.
+	const accessFailure = "Network Error, Generation Failed. 可能是您提供的素材存储链接无法被我们的服务访问，或受到访问限制，导致素材读取失败。请切换到我们的素材存储后再提交，具体使用方法请参阅文档。我们的素材仅存储 2 小时，并针对常见访问限制做了适配，可有效减少此类问题。"
 	fixtures := []struct{ taskID, nativeID, reason string }{
 		{"task_FwV2DiYrdzCducOB6afosCUjmfAPDBZu", "task_cbOfBRgeOKfwVr55TqUlglRzj6wGujFQ", "（图片1、图片2、图片3）素材下载超时，请联系管理员处理"},
 		{"task_PTZmKMXaTwOZUeGry9Fhe4FL3CFKaVgH", "task_Tx94WYxNNea4pAMZD93i0AzCFZNlVGNd", "（图片1）素材下载超时，请联系管理员处理"},
 		{"task_wn9d7GWnH2QFqlziTtF4XDmvg5GaSEuc", "task_Wb0fFbn2r0yyrU0F12NAnqtAA3kbIlV1", "（图片1）素材下载超时，请联系管理员处理"},
+		{"task_gd54MLEovqx1TcoHvLc4OhqCLhTnObct", "task_PpDB8GnxAkBU1IRBaLcsl6j7QjxJStkk", accessFailure},
+		{"task_RaD05eH47s8QouGKYpUewxrg0twZ3kQc", "task_7D0cVrqLjXIKXRgD5RCVL9CL4yUxpWai", accessFailure},
+		{"task_iaBKWpln9O4V1LzqDywTbhQtAsZlrGLc", "task_WAORtCnyJnTbwEgTxj4UMfrNcJTcEogQ", accessFailure},
+		{"task_CPV3DGDT8swevT3l4V1aBGLmLc6J5PUP", "task_5RS8MpltthtFophnFWiYIKnCNCEzpXvG", accessFailure},
+	}
+	type recoveryCase struct {
+		outcome string
+		fixture int
 	}
 	for _, funding := range []string{"wallet", "subscription"} {
-		for _, outcome := range []string{"success", "second_failure", "download_failure", "refund_failure", "submission_unknown", "explicit_rejection"} {
-			t.Run(funding+"/"+outcome, func(t *testing.T) {
+		cases := []recoveryCase{{"success", 0}, {"second_failure", 1}, {"download_failure", 2}, {"refund_failure", 0}, {"submission_unknown", 0}, {"explicit_rejection", 0}}
+		if funding == "wallet" {
+			cases = append(cases, recoveryCase{"success", 3}, recoveryCase{"download_failure", 5})
+		} else {
+			cases = append(cases, recoveryCase{"second_failure", 4}, recoveryCase{"submission_unknown", 6})
+		}
+		for _, test := range cases {
+			outcome, fixture := test.outcome, fixtures[test.fixture]
+			t.Run(funding+"/"+outcome+"/"+fixture.taskID, func(t *testing.T) {
 				setupMeasuredTaskBillingDB(t)
 				asyncImageKeyFixture(t)
 				extra := []any{&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}}
@@ -442,13 +458,6 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 				cfg.LocalPath, cfg.MaxFileBytes = t.TempDir(), 1<<20
 				require.NoError(t, SaveMediaRuntimeConfig(t.Context(), cfg))
 				now := time.Now().Unix()
-				fixture := fixtures[0]
-				if outcome == "second_failure" {
-					fixture = fixtures[1]
-				}
-				if outcome == "download_failure" {
-					fixture = fixtures[2]
-				}
 				task := makeTask(1, 1, 100, 1, funding, 1)
 				task.TaskID, task.Platform, task.SubmitTime = fixture.taskID, "drama", now-20
 				task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
@@ -482,8 +491,29 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 					}{
 						{"incomplete", `{"status":"failed"`, fixture.reason, 200},
 						{"poll_timeout", string(response), "upstream request timeout", 200},
+						{"generic_network_error", string(response), "Network Error, Generation Failed.", 200},
+						{"reference_ready_with_network_error", string(response), "参考素材已就绪。Network Error, Generation Failed.", 200},
+						{"reference_download_succeeded", string(response), "素材下载成功但视频生成失败", 200},
+						{"reference_download_succeeded_then_generation_failed", string(response), "素材下载成功后视频生成失败", 200},
+						{"reference_download_succeeded_english", string(response), "Reference image downloaded successfully but video generation failed", 200},
+						{"reference_download_succeeded_with_network_error", string(response), "素材下载成功后出现网络错误", 200},
+						{"reference_download_succeeded_with_network_error_english", string(response), "Reference image downloaded successfully and an unrelated network error occurred", 200},
+						{"reference_download_not_failed", string(response), "素材下载没有失败", 200},
+						{"reference_access_not_restricted", string(response), "参考素材访问不受限制", 200},
+						{"reference_source_not_expired", string(response), "Source URL is not expired", 200},
+						{"reference_download_did_not_fail", string(response), "Reference image download did not fail", 200},
+						{"generation_connection_failure", string(response), "素材已下载成功；无法连接生成服务", 200},
+						{"generated_video_download_failure", string(response), "素材已下载成功；无法下载生成视频", 200},
+						{"output_download_failed", string(response), "素材下载成功；生成的视频成片下载失败", 200},
+						{"invalid_reference_dimensions", string(response), "参考图下载失败：图片尺寸非法，width must be at most 1600", 200},
+						{"reference_authentication_failure", string(response), "参考素材读取失败：authentication failed", 200},
+						{"reference_api_key_failure", string(response), "Source media fetch failed: invalid API key", 200},
+						{"ambiguous_generation_failure", string(response), "生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。", 200},
+						{"access_failure_with_policy_diagnostic", string(response), accessFailure + " 内容安全审核未通过", 200},
 						{"http_502", string(response), fixture.reason, 502},
 						{"safety", `{"status":"failed","error":{"code":"safety_violation"}}`, fixture.reason, 200},
+						{"copyright_type", `{"status":"failed","error":{"type":"copyright_restriction"}}`, fixture.reason, 200},
+						{"copyright_message", `{"status":"failed","error":{"message":"版权保护拒绝"}}`, fixture.reason, 200},
 						{"numeric_auth_code", `{"status":"failed","error":{"code":403}}`, fixture.reason, 200},
 						{"auth_type", `{"status":"failed","error":{"type":"authentication_error"}}`, fixture.reason, 200},
 						{"other_native_task", `{"id":"another-native-id","status":"failed"}`, fixture.reason, 200},
@@ -515,6 +545,30 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 					handled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: fixture.reason}, 200, response)
 					require.NoError(t, err)
 					assert.True(t, handled, "the submit receipt projection must finish before recovery or refund")
+					if fixture.reason == accessFailure {
+						for _, variant := range []struct{ name, reason string }{
+							{"timeout_with_new_wording", "上游提示：素材 下载 超时，请稍后处理。"},
+							{"reference_access_restricted", "参考图访问受限，请切换素材存储后重试"},
+							{"material_service_unreachable", "上游无法访问素材服务，请联系管理员"},
+							{"quoted_resource_unreachable", "引用资源地址不可达，请更换链接"},
+							{"input_image_load_failure", "输入图片加载失败，请检查素材地址"},
+							{"one_reference_succeeded_another_failed", "素材1下载成功；素材2下载失败，请更换来源"},
+							{"english_timeout", "Reference video download timed out; please use another media link."},
+							{"english_read_failure", "Failed to READ reference image. Please try an accessible source."},
+							{"english_fetch_failure", "Upstream could not fetch the INPUT_IMAGE; please retry with a public URL."},
+							{"english_restricted_access", "Access to reference material is restricted. Please use public hosting."},
+							{"english_contraction", "The material store couldn't be accessed; retry with a public link."},
+							{"english_expired_source", "Source URL expired, please upload the reference again."},
+						} {
+							t.Run(variant.name, func(t *testing.T) {
+								body, err := common.Marshal(map[string]any{"id": fixture.nativeID, "status": "failed", "metadata": map[string]any{"url": variant.reason}})
+								require.NoError(t, err)
+								handled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: variant.reason}, 200, body)
+								require.NoError(t, err)
+								assert.True(t, handled, "recognized reference failures wait for the existing receipt projection before scheduling")
+							})
+						}
+					}
 					var projection model.Task
 					require.NoError(t, model.DB.First(&projection, task.ID).Error)
 					assert.Zero(t, projection.AttemptGeneration)
@@ -529,6 +583,11 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 				require.NoError(t, model.DB.First(task, task.ID).Error)
 				assert.EqualValues(t, model.TaskStatusQueued, task.Status)
 				assert.Equal(t, 100, task.Quota)
+				require.Len(t, task.PrivateData.VideoAttempts, 1)
+				assert.Equal(t, fixture.reason, task.PrivateData.VideoAttempts[0].Reason, "retain the original diagnostic without relabeling it as a timeout")
+				scheduled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: fixture.reason}, 200, response)
+				require.NoError(t, err)
+				assert.False(t, scheduled, "a replacement generation cannot schedule another reference recovery")
 				// A duplicate old poll cannot settle or refund the new generation.
 				stale.Status, stale.FailReason = model.TaskStatusFailure, fixture.reason
 				won, err := SettleTaskBillingOnComplete(t.Context(), nil, &stale, model.TaskStatusInProgress, relaycommon.FailTaskInfo(fixture.reason))

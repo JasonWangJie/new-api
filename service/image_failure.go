@@ -32,6 +32,10 @@ var (
 	asyncImageOpenAIAPIKeyPattern        = regexp.MustCompile(`\bsk-[0-9A-Za-z_-]+`)
 	imageReferenceSizeRejectionPattern   = regexp.MustCompile(`(?i)^reference image exceeds limit:\s*[0-9]{1,12}(?:\.[0-9]{1,6})?\s*(?:GB|MB|KB|B)\s+limit exceeded\.?$`)
 	imageReferenceDownloadTimeoutPattern = regexp.MustCompile(`(?i)^error while downloading https?://\S+\s+(?:get|head)\s+"https?://[^"\s]+(?:"\s*:)?\s+dial tcp [^\r\n]+: i/o timeout(?:\s+(?:400|invalid_argument)){0,2}$`)
+	imageQuotaUnavailablePattern         = regexp.MustCompile(`\b(?:quotas?|balances?|credits?|capacity)(?:\s+(?:is|are|was|were|currently|temporarily|now|has|been|completely|fully|already|remaining|available)){0,4}\s+(?:unavailable|exhausted|insufficient|depleted|exceeded|empty|not\s+available)\b|` +
+		`\b(?:insufficient|exhausted|unavailable|depleted|no(?:\s+available|\s+remaining)?|not\s+enough|out\s+of|(?:run|ran)\s+out\s+of)\s+(?:(?:upstream|provider|account|image|generation|available|remaining)\s+){0,3}(?:quotas?|balances?|credits?|capacity)\b|` +
+		`(?:额度|配额|余额|积分|点数|容量)(?:已经|已被|当前|目前|暂时|可用|剩余|全部|基本|均|已|暂){0,3}(?:不足|不够|耗尽|用尽|用完|不可用)|(?:没有|暂无|无)(?:足够的?|可用的?|剩余的?)?(?:上游|供应商|账户)?(?:额度|配额|余额|积分|点数|容量)`)
+	imageQuotaNegationPattern = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no longer)\s+(?:currently\s+|temporarily\s+|fully\s+|been\s+)?(?:unavailable|exhausted|insufficient|depleted|exceeded)\b|(?:并非|并不|不是|未出现|未发生|如果|假如|若)(?:由于|因为)?(?:额度|配额|余额|积分|点数|容量)`)
 )
 
 type AsyncImageFailure struct {
@@ -441,23 +445,30 @@ func isUndiagnosedImageSubmissionResponse(body []byte) bool {
 	return true
 }
 
-// isRetryableImageGatewayResponse recognizes bounded gateway error responses
-// allowed by the retry policy. The relay must confirm synchronous execution before the
-// worker may use it to submit another generation.
-func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bool {
-	if failure == nil || failure.Code != 606 || failure.InternalCode != "upstream_failed" {
+// isImageQuotaUnavailable recognizes an error category or diagnostic, rather
+// than one provider's wording. The response envelope must still prove rejection.
+func isImageQuotaUnavailable(value string) bool {
+	if !isImageGatewayFailureDiagnostic(value, true) {
 		return false
 	}
-	switch failure.HTTPStatus {
-	case http.StatusBadGateway:
-		if failure.ProviderCode != "upstream_request_failed" {
-			return false
+	lowered := strings.ToLower(strings.NewReplacer("_", " ", "-", " ").Replace(value))
+	for clause := range strings.FieldsFuncSeq(lowered, func(character rune) bool { return strings.ContainsRune(".!?;,\n\r。！？；，", character) }) {
+		// Negated and conditional advice does not state that quota rejected
+		// this operation. Keep the subject and failure in the same clause.
+		if imageQuotaNegationPattern.MatchString(clause) {
+			continue
 		}
-	case http.StatusServiceUnavailable:
-		if failure.ProviderCode != "upstream_quota_unavailable" {
-			return false
+		if imageQuotaUnavailablePattern.MatchString(clause) {
+			return true
 		}
-	default:
+	}
+	return false
+}
+
+// isRetryableImageGatewayResponse recognizes complete gateway rejections.
+// The relay separately enforces its execution-protocol and known-job barriers.
+func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bool {
+	if failure == nil || failure.InternalCode != "upstream_failed" {
 		return false
 	}
 	envelope, ok := decoded.(map[string]any)
@@ -470,28 +481,29 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 	}
 	providerCode, codeIsString := providerError["code"].(string)
 	if providerError["code"] != nil && !codeIsString {
-		return false
+		if providerError["code"] != float64(failure.HTTPStatus) {
+			return false
+		}
+		providerCode = strconv.Itoa(failure.HTTPStatus)
 	}
 	if providerCode == "" {
 		providerCode, _ = providerError["type"].(string)
 	}
-	if providerCode != failure.ProviderCode {
+	providerCode = strings.ToLower(strings.TrimSpace(providerCode))
+	switch failure.HTTPStatus {
+	case http.StatusBadGateway:
+		if failure.Code != 606 || providerCode != "upstream_request_failed" {
+			return false
+		}
+	case http.StatusServiceUnavailable:
+		if failure.Code != 603 && failure.Code != 606 && failure.Code != 610 || !isImageQuotaUnavailable(providerCode) && !isImageQuotaUnavailable(asyncImageErrorMessage(providerError, 0)) {
+			return false
+		}
+	default:
 		return false
 	}
-	// Normalize common failure envelopes before checking every raw diagnostic.
-	// Optional tracking fields and empty result fields do not imply acceptance.
-	for index, scope := range []map[string]any{envelope, providerError} {
-		for field := range scope {
-			if index == 0 && field == "error" {
-				continue
-			}
-			switch strings.ToLower(strings.ReplaceAll(field, "_", "")) {
-			case "code", "type", "status", "state", "success", "message", "msg", "detail", "reason", "param", "metadata", "requestid", "traceid", "spanid", "correlationid", "data", "result", "results", "taskid", "jobid":
-			default:
-				return false
-			}
-		}
-	}
+	// Unknown metadata fields are permitted. Recursively inspect their values
+	// for receipts, outputs and contradictory failures instead of a field list.
 	return isImageGatewayFailureMetadata(envelope, failure.HTTPStatus, providerCode, 0)
 }
 
@@ -525,7 +537,7 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 		for field, child := range value {
 			name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(field, "_", ""), "-", ""))
 			switch name {
-			case "requestid", "traceid", "spanid", "correlationid":
+			case "requestid", "xrequestid", "upstreamrequestid", "providerrequestid", "traceid", "spanid", "correlationid", "documentationurl", "docsurl", "helpurl", "supporturl":
 				if _, ok := child.(string); child != nil && !ok {
 					return false
 				}
@@ -540,7 +552,7 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 					return false
 				}
 				continue
-			case "status", "state", "code":
+			case "status", "state", "code", "statuscode", "httpstatus", "upstreamstatus", "upstreamstatuscode", "errorcode", "errorstatus":
 				if child == nil || child == float64(status) {
 					continue
 				}
@@ -548,13 +560,25 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 				if !ok {
 					return false
 				}
-				switch strings.ToLower(text) {
+				text = strings.ToLower(strings.TrimSpace(text))
+				if !isImageGatewayFailureDiagnostic(text, status == http.StatusServiceUnavailable) {
+					return false
+				}
+				if status == http.StatusServiceUnavailable && isImageQuotaUnavailable(text) {
+					continue
+				}
+				switch text {
 				case "", "error", "failed", "failure", statusName, strconv.Itoa(status), providerCode:
 					continue
+				case "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error":
+					if name == "code" || name == "errorcode" {
+						continue
+					}
+					return false
 				default:
 					return false
 				}
-			case "type":
+			case "type", "errortype":
 				if child == nil {
 					continue
 				}
@@ -562,11 +586,31 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 				if !ok {
 					return false
 				}
+				text = strings.ToLower(strings.TrimSpace(text))
+				// This is a generic OpenAI envelope type, even for an upstream
+				// 5xx. Compound input, policy or receipt types are not exempt.
+				if text == "invalid_request_error" {
+					continue
+				}
+				if !isImageGatewayFailureDiagnostic(text, status == http.StatusServiceUnavailable) {
+					return false
+				}
+				if status == http.StatusServiceUnavailable && isImageQuotaUnavailable(text) {
+					continue
+				}
 				switch text {
 				case "", providerCode, "upstream_error", "server_error", "api_error", "new_api_error", "one_api_error", "invalid_request_error", statusName:
 					continue
 				default:
 					return false
+				}
+			}
+			if name == "data" {
+				if _, object := child.(map[string]any); object {
+					if !isImageGatewayFailureMetadata(child, status, providerCode, depth+1) {
+						return false
+					}
+					continue
 				}
 			}
 			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts", "video", "videos", "audio", "audios", "file", "files", "binary", "bytes", "receipt", "receipts"}, name)
@@ -601,23 +645,29 @@ func isImageGatewayFailureMetadata(value any, status int, providerCode string, d
 			}
 		}
 	case string:
-		if ClassifyAsyncImageFailure(errors.New(value), http.StatusBadRequest).Code != 610 {
-			return false
-		}
-		lowered := strings.ToLower(value)
-		for _, signal := range []string{"moderation", "content filter", "censor", "policy", "parameter", "execution_unknown", "submission_unknown", "could not confirm", "could not be confirmed", "could not be determined", "审核", "违规", "不合规", "安全", "结果未知", "受理状态未知"} {
-			if strings.Contains(lowered, signal) {
-				return false
-			}
-		}
-		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "pending", "running", "processing", "queued", "submitted", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
-			if strings.Contains(lowered, signal) {
-				return false
-			}
-		}
+		return isImageGatewayFailureDiagnostic(value, status == http.StatusServiceUnavailable)
 	case nil, bool, float64:
 	default:
 		return false
+	}
+	return true
+}
+
+func isImageGatewayFailureDiagnostic(value string, allowCapacity bool) bool {
+	classification := ClassifyAsyncImageFailure(errors.New(value), http.StatusBadRequest).Code
+	if classification != 610 && !(allowCapacity && classification == 603) {
+		return false
+	}
+	lowered := strings.ToLower(value)
+	for _, signal := range []string{"moderation", "content filter", "censor", "policy", "parameter", "execution_unknown", "submission_unknown", "could not confirm", "could not be confirmed", "could not be determined", "审核", "违规", "不合规", "安全", "结果未知", "受理状态未知"} {
+		if strings.Contains(lowered, signal) {
+			return false
+		}
+	}
+	for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "copyright", "api key", "api_key", "access token", "access_token", "invalid", "unsupported", "required", "must be", "not allowed", "bad request", "validation", "task_id", "taskid", "job_id", "jobid", "accepted", "success", "succeeded", "completed", "pending", "running", "processing", "queued", "submitted", "result", "image_url", "b64_json", "base64", "output_url", "参数", "鉴权", "认证", "授权", "无权限", "密钥", "版权", "不支持", "格式错误", "尺寸无效", "已受理", "已接收", "生成成功", "完成生成"} {
+		if strings.Contains(lowered, signal) {
+			return false
+		}
 	}
 	return true
 }
@@ -768,6 +818,11 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	if !classifyErrorType && readErr == nil && !bodyTruncated {
 		failure.RetryableHTTPResponse = isRetryableImageGatewayResponse(failure, decoded)
 		failure.SubmissionRejected = decodeErr == nil && isImageTaskCreationRejection(failure, decoded)
+		if failure.RetryableHTTPResponse && status == http.StatusServiceUnavailable {
+			// A validated quota rejection uses the existing transient submission
+			// budget, including diagnostics otherwise classified as capacity.
+			failure.Code = 606
+		}
 	}
 	return failure
 }

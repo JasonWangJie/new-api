@@ -725,6 +725,9 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 		{name: "quota rejection waits for only account", status: 503, body: quotaError, onlyAccount: true},
 		{name: "task creation rejection switches channel", status: 500, body: creationError},
 		{name: "task creation rejection waits for only account", status: 500, body: creationError, onlyAccount: true},
+		{name: "translated quota rejection switches channel", status: 503, body: `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"上游可用额度不足，请稍后重试"},"retry_after_seconds":10,"region":"region-a"}`},
+		{name: "quota category variant uses existing hold", status: 503, body: `{"error":{"code":"quota_exhausted","type":"insufficient_quota","message":"The upstream quota has been exhausted."},"data":{"retry_after_seconds":10}}`},
+		{name: "credit diagnostic waits for only account", status: 503, body: `{"error":{"type":"server_error","message":"Insufficient upstream credits. Please retry later."},"support_url":"https://provider.example/help"}`, onlyAccount: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
@@ -3212,6 +3215,23 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 	}{
 		{name: "complete gateway failure", body: gatewayError, status: 502, retryable: true},
 		{name: "explicit quota rejection", body: quotaError, status: 503, retryable: true},
+		{name: "known quota code accepts translated diagnostic and advice", body: `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"上游额度暂不可用，请切换供应商或稍后重试"},"retryable":true,"retry_after_seconds":5,"region":"region-a"}`, status: 503, retryable: true},
+		{name: "quota categories are case insensitive equivalents", body: `{"error":{"code":"QUOTA_EXHAUSTED","type":"INSUFFICIENT_QUOTA","message":"The upstream quota has been exhausted."},"metadata":{"code":"quota-unavailable","status":"503","type":"insufficient_balance"}}`, status: 503, retryable: true},
+		{name: "quota diagnostic without provider specific code", body: `{"error":{"type":"server_error","message":"No available upstream quota. Please retry later."}}`, status: 503, retryable: true},
+		{name: "insufficient credits with harmless data and links", body: `{"error":{"code":503,"type":"api_error","message":"Insufficient upstream credits."},"data":{"retry_after_seconds":5,"region":"region-a"},"support_url":"https://provider.example/help","upstream_request_id":"quota-success-trace"}`, status: 503, retryable: true},
+		{name: "Chinese balance denial without stable code", body: `{"error":{"type":"upstream_error","message":"上游账户余额不足，稍后重试"}}`, status: 503, retryable: true},
+		{name: "capacity denial uses transient submission budget", body: `{"error":{"type":"server_error","message":"Upstream capacity is temporarily unavailable."}}`, status: 503, retryable: true},
+		{name: "quota not exhausted is not a denial", body: `{"error":{"type":"server_error","message":"Quota is not exhausted; the service is unavailable."}}`, status: 503},
+		{name: "negated insufficient quota is not a denial", body: `{"error":{"type":"server_error","message":"Not insufficient quota; the service could not complete this request."}}`, status: 503},
+		{name: "conditional quota advice is not a denial", body: `{"error":{"type":"server_error","message":"If quota is exhausted, please add credits."}}`, status: 503},
+		{name: "unrelated quota and availability phrases are not combined", body: `{"error":{"type":"server_error","message":"Quota is sufficient. Image service is unavailable."}}`, status: 503},
+		{name: "Chinese negated balance denial is not a denial", body: `{"error":{"type":"server_error","message":"不是余额不足，服务暂不可用"}}`, status: 503},
+		{name: "Chinese unrelated quota and network clauses are not combined", body: `{"error":{"type":"server_error","message":"额度充足，网络不可用"}}`, status: 503},
+		{name: "quota message cannot override authentication code", body: `{"error":{"code":"invalid_api_key","type":"upstream_error","message":"Insufficient upstream credits."}}`, status: 503},
+		{name: "quota metadata category cannot hide policy", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"code":"quota_exhausted_content_policy_violation"}}`, status: 503},
+		{name: "quota metadata category cannot hide acceptance", body: strings.TrimSuffix(quotaError, "}") + `,"metadata":{"type":"quota_unavailable_task_accepted"}}`, status: 503},
+		{name: "quota primary category cannot hide acceptance", body: `{"error":{"code":"quota_unavailable_task_accepted","type":"server_error","message":"Quota unavailable."}}`, status: 503},
+		{name: "quota semantic denial cannot authorize other HTTP status", body: `{"error":{"code":"insufficient_quota","message":"Quota exhausted."}}`, status: 504},
 		{name: "quota rejection with status metadata", body: strings.TrimSuffix(quotaError, "}") + `,"success":false,"status":"service_unavailable","code":503,"data":null,"metadata":{"upstream":{"status":"503","code":"upstream_quota_unavailable","type":"service_unavailable","trace_id":"quota-trace"}}}`, status: 503, retryable: true},
 		{name: "quota error type supplies missing code", body: `{"error":{"type":"upstream_quota_unavailable","message":"The selected upstream image service has no available quota. Please retry shortly."}}`, status: 503, retryable: true},
 		{name: "quota code requires service unavailable status", body: quotaError, status: 502},
@@ -3271,6 +3291,9 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 			}
 			failure := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{StatusCode: tc.status, Body: io.NopCloser(reader)}, "")
 			assert.Equal(t, tc.retryable, failure.RetryableHTTPResponse)
+			if tc.retryable {
+				assert.Equal(t, 606, failure.Code, "validated gateway rejections use the existing transient budget")
+			}
 			assert.False(t, failure.SynchronousRetryableResponse, "the HTTP classifier cannot infer the upstream execution protocol")
 			assert.False(t, failure.UpstreamTerminal)
 		})

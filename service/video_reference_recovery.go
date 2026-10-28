@@ -35,7 +35,42 @@ type AsyncVideoReferenceRejectedError struct{ Reason string }
 
 func (err *AsyncVideoReferenceRejectedError) Error() string { return err.Reason }
 
-var videoReferenceTimeoutPattern = regexp.MustCompile(`^(?:[（(](?:图片|视频|音频)[0-9]{1,2}(?:[、,，](?:图片|视频|音频)?[0-9]{1,2})*[）)]\s*)?素材下载超时[，,]请联系管理员处理[。.]?$`)
+var (
+	videoReferenceTimeoutPattern        = regexp.MustCompile(`^(?:[（(](?:图片|视频|音频)[0-9]{1,2}(?:[、,，](?:图片|视频|音频)?[0-9]{1,2})*[）)]\s*)?素材下载超时[，,]请联系管理员处理[。.]?$`)
+	videoReferenceInputPattern          = regexp.MustCompile(`素材|参考(?:图(?:片|像)?|视频|音频|资源|文件|链接)|引用(?:资源|素材|图片|图像|视频|音频|文件|链接)|输入(?:图片|图像|视频|音频|资源|文件)|\b(?:references?|materials?|assets?)\b|\b(?:input|source|referenced|uploaded)[ _-]+(?:images?|videos?|audio|media|files?|resources?|urls?|links?)\b|\bmedia[ _-]+(?:urls?|links?|files?|resources?)\b`)
+	videoReferenceFetchPattern          = regexp.MustCompile(`下载|读取|读入|访问|拉取|获取|加载|抓取|不可达|无法连接|连不上|过期|\b(?:download(?:ing|ed)?|fetch(?:ing|ed)?|read(?:ing)?|access(?:ing|ed|ible)?|load(?:ing|ed)?|retriev(?:e|ing|ed)|unreachable|inaccessible|expired)\b`)
+	videoReferenceFailedPattern         = regexp.MustCompile(`失败|超时|无法|不能|未能|不可|不通|受限|限制|受阻|拒绝|禁止|过期|错误|\b(?:fail(?:ed|ure|ing)?|error|timeout|timed?[ _-]*out|unable|cannot|can['’]?t|couldn['’]t|could[ _-]+not|not[ _-]+(?:publicly[ _-]+)?accessible|unreachable|inaccessible|restricted|restrictions?|blocked|forbidden|denied|expired)\b`)
+	videoReferenceFetchSucceededPattern = regexp.MustCompile(`成功(?:下载|读取|读入|访问|拉取|获取|加载|抓取)|(?:下载|读取|读入|访问|拉取|获取|加载|抓取)(?:已经|已)?成功|(?:没有|并未|未|不)(?:发生)?(?:失败|超时|过期|受限)|不受(?:到)?(?:访问)?限制|\b(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)[ _-]+(?:successfully|succeeded)\b|\bsuccessfully[ _-]+(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)\b|\b(?:not|never|didn['’]t|doesn['’]t)[ _-]+(?:fail(?:ed)?|timeout|timed?[ _-]*out|expired|restricted|blocked|unreachable|inaccessible)\b`)
+	videoReferenceOtherFailurePattern   = regexp.MustCompile(`参数|尺寸|宽高|分辨率|时长|不支持|格式|解码|审核|违规|不合规|安全|版权|鉴权|认证|凭证|登录|登錄|限流|余额|额度|成片|输出|生成结果|生成产物|\b(?:invalid|unsupported|parameters?|aspect[ _-]?ratio|dimensions?|resolution|width|height|duration|safety|censor(?:ship)?|moderation|policy|copyright|violation|auth(?:entication|orization)?|unauthenticated|unauthorized|credentials?|login|log[ _-]+in|api[ _-]?key|access[ _-]?token|rate[ _-]?limit|quota|outputs?|results?|generated[ _-]+(?:video|media))\b`)
+)
+
+func isAsyncVideoReferenceDownloadFailure(reason string) bool {
+	reason = strings.NewReplacer("_", " ", "-", " ").Replace(reason)
+	reason = strings.ToLower(strings.Join(strings.Fields(reason), " "))
+	if videoReferenceOtherFailurePattern.MatchString(reason) {
+		return false
+	}
+	if videoReferenceTimeoutPattern.MatchString(reason) {
+		return true
+	}
+	if !videoReferenceInputPattern.MatchString(reason) {
+		return false
+	}
+	// Keep the failed fetch in one diagnostic clause. A successfully downloaded
+	// reference followed by an unrelated generation failure is not recoverable.
+	reason = strings.NewReplacer("但是", "，", "但", "，", " but ", "，", "generation failed", "", "generation failure", "", "生成失败", "").Replace(reason)
+	for _, clause := range strings.FieldsFunc(reason, func(character rune) bool {
+		return strings.ContainsRune("。！？.!?;；,，", character)
+	}) {
+		if videoReferenceFetchSucceededPattern.MatchString(clause) {
+			continue
+		}
+		if videoReferenceInputPattern.MatchString(clause) && videoReferenceFetchPattern.MatchString(clause) && videoReferenceFailedPattern.MatchString(clause) {
+			return true
+		}
+	}
+	return false
+}
 
 // FreezeAsyncVideoReferenceRecovery is called only for a validated Drama
 // request before its first dispatch. It captures the canonical reference order.
@@ -105,7 +140,7 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 // TryAsyncVideoReferenceRecovery runs before the terminal billing transition.
 // A transport or ambiguous polling failure must never reach this decision.
 func TryAsyncVideoReferenceRecovery(ctx context.Context, task model.Task, result *relaycommon.TaskInfo, httpStatus int, response []byte) (bool, error) {
-	if !task.PrivateData.AsyncMedia || task.Platform != "drama" || task.AttemptGeneration != 0 || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != "" || !videoReferenceTimeoutPattern.MatchString(strings.TrimSpace(result.Reason)) {
+	if !task.PrivateData.AsyncMedia || task.Platform != "drama" || task.AttemptGeneration != 0 || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != "" || !isAsyncVideoReferenceDownloadFailure(result.Reason) {
 		return false, nil
 	}
 	var snapshot map[string]any
@@ -182,7 +217,7 @@ func videoReferenceOutputEvidence(value any, diagnostic string, depth int) bool 
 					return true
 				}
 				if name == "error" || name == "errors" || name == "reason" || name == "message" || name == "type" {
-					for _, excluded := range []string{"safety", "censor", "policy", "violation", "invalid", "parameter", "auth", "forbidden", "permission", "rate_limit", "quota", "审核", "违规", "不合规", "参数", "安全", "鉴权", "权限"} {
+					for _, excluded := range []string{"safety", "censor", "policy", "violation", "copyright", "invalid", "parameter", "auth", "forbidden", "permission", "rate_limit", "quota", "审核", "违规", "不合规", "版权", "参数", "安全", "鉴权", "权限"} {
 						if strings.Contains(text, excluded) {
 							return true
 						}
