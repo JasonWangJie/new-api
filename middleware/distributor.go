@@ -157,6 +157,14 @@ func Distribute() func(c *gin.Context) {
 				}
 
 				if channel == nil {
+					var imageErr *types.NewAPIError
+					channel, imageErr = service.SelectSyncImageChannel(c, modelRequest.Model, nil)
+					if imageErr != nil {
+						abortWithOpenAiMessage(c, imageErr.StatusCode, imageErr.Error(), imageErr.GetErrorCode())
+						return
+					}
+				}
+				if channel == nil {
 					channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
 						Ctx:         c,
 						ModelName:   modelRequest.Model,
@@ -184,6 +192,11 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 			}
+		}
+		channel, imageErr := service.SelectSyncImageChannel(c, modelRequest.Model, channel)
+		if imageErr != nil {
+			abortWithOpenAiMessage(c, imageErr.StatusCode, imageErr.Error(), imageErr.GetErrorCode())
+			return
 		}
 		if channel != nil {
 			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {

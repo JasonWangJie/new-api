@@ -2757,8 +2757,39 @@ func TestBuildGeminiAsyncImagePartsReferenceTransport(t *testing.T) {
 		require.Len(t, parts, 2)
 		require.NotNil(t, parts[1].FileData)
 		assert.Equal(t, referenceURL, parts[1].FileData.FileUri)
-		assert.Empty(t, parts[1].FileData.MimeType)
+		assert.Equal(t, "image/jpeg", parts[1].FileData.MimeType)
 		assert.Nil(t, parts[1].InlineData)
+	})
+
+	t.Run("known image URL extensions include a MIME type", func(t *testing.T) {
+		cfg := service.DefaultImageRuntimeConfig()
+		cfg.GeminiReferenceMode = "passthrough_fallback_local"
+		for _, tc := range []struct{ extension, mimeType string }{
+			{"PNG", "image/png"},
+			{"webp", "image/webp"},
+			{"gif", "image/gif"},
+		} {
+			t.Run(tc.extension, func(t *testing.T) {
+				request := service.AsyncImageRequest{Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://signed.example/reference." + tc.extension + "?token=private"}}}
+				parts, err := buildGeminiAsyncImageParts(t.Context(), model.AsyncImageTask{TokenId: 7}, request, cfg)
+				require.NoError(t, err)
+				require.Len(t, parts, 1)
+				require.NotNil(t, parts[0].FileData)
+				assert.Equal(t, tc.mimeType, parts[0].FileData.MimeType)
+			})
+		}
+	})
+
+	t.Run("extensionless URL must be resolved instead of sending incomplete fileData", func(t *testing.T) {
+		previousRedis := common.RDB
+		common.RDB = nil
+		t.Cleanup(func() { common.RDB = previousRedis })
+		cfg := service.DefaultImageRuntimeConfig()
+		cfg.GeminiReferenceMode = "passthrough_fallback_local"
+		request := service.AsyncImageRequest{Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://signed.example/reference?token=private"}}}
+		parts, err := buildGeminiAsyncImageParts(t.Context(), model.AsyncImageTask{TokenId: 7}, request, cfg)
+		require.ErrorContains(t, err, "Redis is required for reference download admission")
+		assert.Empty(t, parts)
 	})
 
 	t.Run("indexes invalid locally transported reference without URL", func(t *testing.T) {

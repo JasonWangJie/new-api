@@ -101,6 +101,7 @@ test('previews eligible and excluded routes without generating media and clears 
       group: 'default',
       platform: 'openai',
       media_type: 'image',
+      execution_mode: 'async',
       model: 'image-model',
       resolution: '1K',
       operation: 'text_to_image',
@@ -142,6 +143,31 @@ test('video preview uses provider defaults and shows policy errors even when no 
       })
     )
   )
+})
+
+test('switching from background to synchronous preview clears stale routes and explains incompatible protocols', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({
+    binding_found: false,
+    routing_groups: ['default'],
+    eligible: [],
+    excluded: [{
+      channel_id: 43, group: 'default', name: 'Background only',
+      upstream_model: 'image-model', priority: 0, weight: 1,
+      available_accounts: 1, reasons: ['synchronous_protocol_not_supported'],
+    }],
+    reasons: [], warnings: [],
+  })
+  const user = userEvent.setup()
+  renderPreview()
+  await user.type(screen.getByRole('textbox', { name: 'Model' }), 'image-model')
+  await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+  expect(await screen.findByRole('table')).toBeVisible()
+  await user.click(screen.getByRole('combobox', { name: 'Execution mode' }))
+  await user.click(screen.getByRole('option', { name: 'Synchronous image API' }))
+  expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+  expect(await screen.findByRole('cell', { name: 'Channel supports background tasks only or does not accept this synchronous API' })).toBeVisible()
+  expect(imageRequest).toHaveBeenLastCalledWith('/api/option/images/routing/preview', 'POST', expect.objectContaining({ execution_mode: 'sync', model: 'image-model', resolution: '1K' }))
 })
 
 test('mixed preview explains missing bindings and incompatible image parameters in readable language', async () => {

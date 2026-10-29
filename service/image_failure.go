@@ -33,6 +33,7 @@ var (
 	asyncImageOpenAIAPIKeyPattern        = regexp.MustCompile(`\bsk[-_][0-9A-Za-z_-]+`)
 	imageReferenceSizeRejectionPattern   = regexp.MustCompile(`(?i)^reference image exceeds limit:\s*[0-9]{1,12}(?:\.[0-9]{1,6})?\s*(?:GB|MB|KB|B)\s+limit exceeded\.?$`)
 	imageReferenceDownloadTimeoutPattern = regexp.MustCompile(`(?i)^error while downloading https?://\S+\s+(?:get|head)\s+"https?://[^"\s]+(?:"\s*:)?\s+dial tcp [^\r\n]+: i/o timeout(?:\s+(?:400|invalid_argument)){0,2}$`)
+	imageExplicitReferenceFetchPattern   = regexp.MustCompile(`(?i)^(?:(?:provider api|proxy) error:\s*)?(?:(?:image_url fetch|image reference (?:download|fetch)|reference image (?:download|fetch)|reference material (?:download|fetch)|reference dns|fetch image|cannot fetch image)\b.*(?:failed|failure|timeout|timed out|deadline exceeded|exceeded|unreachable|refused|connection reset)|error while downloading https?://|参考图(?:\s*#?\d+)?\s*(?:拉取(?:失败|超时)|链接无法访问|国内下载中转失败)|参考素材(?:下载|拉取)(?:失败|超时)|参考素材(?:链接无法访问|域名解析失败)|无法下载参考图|国内下载中转失败)`)
 	imageQuotaUnavailablePattern         = regexp.MustCompile(`\b(?:quotas?|balances?|credits?|capacity)(?:\s+(?:is|are|was|were|currently|temporarily|now|has|been|completely|fully|already|remaining|available)){0,4}\s+(?:unavailable|exhausted|insufficient|depleted|exceeded|empty|not\s+available)\b|` +
 		`\b(?:insufficient|exhausted|unavailable|depleted|no(?:\s+available|\s+remaining)?|not\s+enough|out\s+of|(?:run|ran)\s+out\s+of)\s+(?:(?:upstream|provider|account|image|generation|available|remaining)\s+){0,3}(?:quotas?|balances?|credits?|capacity)\b|` +
 		`(?:额度|配额|余额|积分|点数|容量)(?:已经|已被|当前|目前|暂时|可用|剩余|全部|基本|均|已|暂){0,3}(?:不足|不够|耗尽|用尽|用完|不可用)|(?:没有|暂无|无)(?:足够的?|可用的?|剩余的?)?(?:上游|供应商|账户)?(?:额度|配额|余额|积分|点数|容量)`)
@@ -59,6 +60,7 @@ type AsyncImageFailure struct {
 	RetryableHTTPResponse        bool `json:"-"`
 	SynchronousRetryableResponse bool `json:"-"`
 	SubmissionRejected           bool `json:"-"`
+	ReferenceRejectionVerified   bool `json:"-"`
 	ReferenceTransportFallback   bool
 }
 
@@ -331,7 +333,7 @@ func isImageReferenceRejectionEnvelope(value any, depth int) bool {
 					return false
 				}
 				continue
-			case "status", "state", "code":
+			case "status", "state", "code", "statuscode", "httpstatus", "httpstatuscode", "upstreamstatus", "upstreamstatuscode", "errorcode", "errorstatus", "responsestatus", "responsestatuscode":
 				if child == nil || child == float64(http.StatusBadRequest) {
 					continue
 				}
@@ -340,14 +342,14 @@ func isImageReferenceRejectionEnvelope(value any, depth int) bool {
 					return false
 				}
 				switch strings.ToLower(text) {
-				case "", "error", "failed", "failure", "rejected", "400", "invalid_argument", "invalid_request", "invalid_request_error":
+				case "", "error", "failed", "failure", "rejected", "400", "invalid_argument", "invalid_request", "invalid_request_error", "image_fetch_failed":
 					continue
 				default:
 					return false
 				}
 			}
 			executionEvidence := slices.Contains([]string{"id", "data", "generationid", "operationid", "predictionid", "executionid", "runid", "choices", "content", "artifacts", "receipt"}, name)
-			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "result") || strings.Contains(name, "output") || strings.Contains(name, "b64") || strings.Contains(name, "base64") || strings.HasSuffix(name, "url") || strings.HasSuffix(name, "urls") || slices.Contains([]string{"image", "images"}, name) {
+			if executionEvidence || strings.Contains(name, "task") || strings.Contains(name, "job") || strings.Contains(name, "result") || strings.Contains(name, "output") || strings.Contains(name, "receipt") || strings.Contains(name, "accepted") || strings.Contains(name, "submitted") || strings.Contains(name, "queued") || strings.Contains(name, "started") || strings.Contains(name, "completed") || strings.Contains(name, "succeeded") || strings.Contains(name, "b64") || strings.Contains(name, "base64") || strings.HasSuffix(name, "url") || strings.HasSuffix(name, "urls") || slices.Contains([]string{"image", "images"}, name) {
 				switch child := child.(type) {
 				case nil:
 				case string:
@@ -382,7 +384,7 @@ func isImageReferenceRejectionEnvelope(value any, depth int) bool {
 			return false
 		}
 		lowered := strings.ToLower(value)
-		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "invalid_api_key", "submission_unknown", "execution_unknown"} {
+		for _, signal := range []string{"unauthorized", "unauthenticated", "authentication", "authorization", "permission", "forbidden", "invalid_api_key", "submission_unknown", "execution_unknown", "submission status unknown", "execution status unknown", "result unknown", "possibly accepted", "may have been accepted", "could not confirm", "已受理", "已接收", "已提交", "提交成功", "正在处理", "处理中", "排队成功", "已排队", "已入队", "队列中", "执行中", "运行中", "生成中", "已生成", "生成成功", "已完成", "受理状态未知", "执行状态未知", "结果未知", "可能受理", "可能已受理"} {
 			if strings.Contains(lowered, signal) {
 				return false
 			}
@@ -555,6 +557,13 @@ func imageSubmissionRejection(decoded any) (int, bool) {
 	}
 	normalized := strings.ToLower(strings.Join(strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(message)), " "))
 	candidate, category := 0, 0
+	providerCode, _ := providerError["code"].(string)
+	temporaryServiceRefusal := normalized == "service error, please try again later." && strings.EqualFold(strings.TrimSpace(providerCode), "invalid_request")
+	if temporaryServiceRefusal {
+		// This supplier uses a generic input code for a transient refusal.
+		// The complete envelope still has to prove that no job was accepted.
+		candidate, category = 606, 606
+	}
 	for clause := range strings.FieldsFuncSeq(normalized, func(character rune) bool { return strings.ContainsRune(".!?;,\n\r。！？；，", character) }) {
 		code := 0
 		if imageCapacitySubjectPattern.MatchString(clause) && imageCapacityFailurePattern.MatchString(clause) {
@@ -602,7 +611,7 @@ func imageSubmissionRejection(decoded any) (int, bool) {
 		}
 		generic := isGenericImageInputRejectionCode(text)
 		if field == "type" {
-			generic = generic || slices.Contains([]string{"upstream_error", "api_error", "new_api_error", "one_api_error", "server_error", "bad_request", "bad_request_error", "bad_response_status_code"}, text)
+			generic = generic || slices.Contains([]string{"upstream_error", "api_error", "new_api_error", "one_api_error", "server_error", "bad_request", "bad_request_error", "bad_response_status_code"}, text) || temporaryServiceRefusal && text == "openai_error"
 		}
 		if !generic {
 			return category, false
@@ -767,6 +776,11 @@ func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 	if !attempt.Dispatched || attempt.FinishedAt <= 0 || attempt.UpstreamTaskID != "" || attempt.Code == 601 {
 		return ""
 	}
+	if attempt.ReferenceFailure && attempt.TransportUsed == "remote" && attempt.Code == 603 && imageYouTubeNoticePattern.MatchString(attempt.ErrorMessage) {
+		// The URL transport was rejected, not the account's ability to use
+		// this model. Allow one local attempt on the same credential.
+		return ""
+	}
 	if ClassifyAsyncImageFailure(errors.New(attempt.ProviderStatus), attempt.HTTPStatus).Code == 601 {
 		return ""
 	}
@@ -774,8 +788,9 @@ func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 		return "upstream_image_submission_rejected"
 	}
 	compatibilityCode := imageAccountCompatibilityCode(attempt.HTTPStatus, attempt.ProviderCode, attempt.ErrorMessage)
-	if imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(attempt.ErrorMessage)) && attempt.Code != 603 {
-		// Only a validated complete rejection may exclude a size-limited account.
+	if compatibilityCode == "upstream_image_reference_incompatible" && attempt.Code != 603 {
+		// An incomplete rejection must not become a compatibility exclusion
+		// when a stored attempt is read back for another routing decision.
 		return ""
 	}
 	if compatibilityCode == "upstream_image_reference_incompatible" && !isGenericImageInputRejectionCode(attempt.ProviderStatus) {
@@ -857,27 +872,44 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
 	compatibilityCode := imageAccountCompatibilityCode(status, classificationCode, providerMessage)
 	sizeRejection := imageReferenceSizeRejectionPattern.MatchString(providerMessage)
-	downloadRejection := imageReferenceDownloadTimeoutPattern.MatchString(providerMessage)
+	youTubeRejection := imageYouTubeNoticePattern.MatchString(providerMessage)
 	referenceTypeAllowed := isGenericImageInputRejectionCode(providerError.Type)
-	if sizeRejection || downloadRejection {
+	if failure.Code == 602 || sizeRejection || youTubeRejection {
 		// Gateways may wrap an explicit reference rejection in their own
 		// diagnostic type. The complete envelope still has to prove rejection.
 		switch strings.ToLower(strings.TrimSpace(providerError.Type)) {
 		case "upstream_error", "api_error", "new_api_error", "one_api_error", "bad_request", "bad_request_error", "bad_response_status_code":
 			referenceTypeAllowed = true
+		case "openai_error":
+			referenceTypeAllowed = failure.Code == 602 || youTubeRejection
 		}
 	}
-	if sizeRejection || downloadRejection {
-		_, object := decoded.(map[string]any)
-		completeRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && isGenericImageInputRejectionCode(providerCode) && referenceTypeAllowed && isGenericImageInputRejectionCode(providerStatus) && isImageReferenceRejectionEnvelope(decoded, 0)
-		if !completeRejection {
-			if sizeRejection {
-				compatibilityCode = ""
+	fields, object := decoded.(map[string]any)
+	referenceEnvelope := decoded
+	referenceCodeAllowed := isGenericImageInputRejectionCode(providerCode)
+	if failure.Code == 602 && strings.EqualFold(providerCode, "image_fetch_failed") && object {
+		if errorFields, ok := fields["error"].(map[string]any); ok {
+			// Some gateways echo credential assignments inside an explicit fetch
+			// failure. Remove only those assignments before checking the text;
+			// keep every receipt, output, status, and other diagnostic field.
+			cleaned := maps.Clone(errorFields)
+			if message, ok := cleaned["message"].(string); ok {
+				cleaned["message"] = asyncImageNamedCredentialPattern.ReplaceAllString(message, "")
 			}
-			if downloadRejection && failure.Code == 602 {
-				failure = ClassifyAsyncImageFailure(errors.New("Upstream image request failed"), mappedStatus.StatusCode)
-			}
+			copy := maps.Clone(fields)
+			copy["error"] = cleaned
+			referenceEnvelope = copy
+			referenceCodeAllowed = true
 		}
+	}
+	explicitReferenceFetch := imageExplicitReferenceFetchPattern.MatchString(providerMessage)
+	verifiedReferenceRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && referenceCodeAllowed && referenceTypeAllowed && isGenericImageInputRejectionCode(providerStatus) && (failure.Code != 602 || explicitReferenceFetch) && isImageReferenceRejectionEnvelope(referenceEnvelope, 0)
+	unverifiedReferenceDiagnostic := !verifiedReferenceRejection && (failure.Code == 602 || status == http.StatusBadRequest && youTubeRejection)
+	if (youTubeRejection || sizeRejection) && !verifiedReferenceRejection {
+		compatibilityCode = ""
+	}
+	if failure.Code == 602 && !verifiedReferenceRejection {
+		failure.Code, failure.InternalCode = 610, "upstream_failed"
 	}
 	if compatibilityCode == "upstream_image_reference_incompatible" && (!isGenericImageInputRejectionCode(providerCode) || !referenceTypeAllowed || !isGenericImageInputRejectionCode(providerStatus)) {
 		compatibilityCode = ""
@@ -927,29 +959,29 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 			failure.Code = 606
 		}
 	}
+	unsafeMappedRetry := unverifiedReferenceDiagnostic || status == http.StatusBadRequest && strings.EqualFold(strings.TrimSpace(providerCode), "invalid_request") && strings.EqualFold(strings.TrimSpace(providerMessage), "service error, please try again later.") && !failure.SubmissionRejected
+	if unsafeMappedRetry && failure.Code == 606 {
+		failure.Code, failure.InternalCode = 610, "upstream_failed"
+		failure.RetryableHTTPResponse, failure.SubmissionRejected = false, false
+	}
+	failure.ReferenceRejectionVerified = verifiedReferenceRejection && (failure.Code == 602 || failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && youTubeRejection)
 	return failure
 }
 
-// ShouldFallbackGeminiReferenceTransport accepts explicit reference fetch
-// failures without requiring Google's optional error envelope fields. Ambiguous
-// errors still require the narrow compatibility response. The caller must also
-// verify that fallback is configured and a remote fileData reference was sent.
+// ShouldFallbackGeminiReferenceTransport requires a complete reference
+// rejection without a task receipt or output. The caller must also verify
+// that fallback is configured and a remote fileData reference was sent.
 func ShouldFallbackGeminiReferenceTransport(failure *AsyncImageFailure) bool {
 	if failure == nil || failure.HTTPStatus != http.StatusBadRequest || failure.ExecutionUnknown {
 		return false
 	}
-	if failure.Code == 602 {
+	if failure.Code == 602 && failure.ReferenceRejectionVerified {
 		return true
 	}
-	if failure.Code == 610 && imageReferenceDownloadTimeoutPattern.MatchString(failure.Message) {
-		// A recognized download rejection remains unclassified only when its
-		// response failed validation; ambiguous-input fallback cannot replay it.
-		return false
+	if failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && failure.ReferenceRejectionVerified && imageYouTubeNoticePattern.MatchString(failure.Message) {
+		return true
 	}
-	if !strings.EqualFold(failure.ProviderStatus, "INVALID_ARGUMENT") || failure.ProviderCode != "400" {
-		return false
-	}
-	return failure.Code == 601 || failure.Code == 610 || failure.Code == 613
+	return false
 }
 
 // ClassifyAsyncImageFailure gives policy and reference-network semantics
@@ -974,7 +1006,7 @@ func ClassifyAsyncImageFailure(err error, status int) *AsyncImageFailure {
 		code = 612
 	case status == http.StatusRequestEntityTooLarge || strings.Contains(lowered, "unsupported_image_dimensions") || strings.Contains(lowered, "invalid_image") || strings.Contains(lowered, "image_url exceeds") || strings.Contains(lowered, "image byte limit exceeded") || strings.Contains(lowered, "image reference byte limit exceeded") || strings.Contains(lowered, "reference image exceeds limit:") || strings.Contains(lowered, "参考图过大") || strings.Contains(lowered, "image too large") || strings.Contains(lowered, "image is too large") || strings.Contains(lowered, "image size exceeds") || strings.Contains(lowered, "prompt cannot exceed") || strings.Contains(lowered, "prompt exceeds") || strings.Contains(lowered, "prompt is too long") || strings.Contains(lowered, "prompt_too_long") || strings.Contains(lowered, "maximum prompt length") || strings.Contains(lowered, "提示词过长") || strings.Contains(lowered, "提示词长度超限"):
 		code = 604
-	case imageReferenceDownloadTimeoutPattern.MatchString(strings.TrimSpace(message)) || strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "参考素材链接无法访问") || strings.Contains(lowered, "参考图链接无法访问") || strings.Contains(lowered, "国内下载中转失败"):
+	case imageReferenceDownloadTimeoutPattern.MatchString(strings.TrimSpace(message)) || strings.Contains(lowered, "image_url fetch") || strings.Contains(lowered, "image reference download") || strings.Contains(lowered, "reference image fetch") || strings.Contains(lowered, "reference image download") || strings.Contains(lowered, "reference material download") || strings.Contains(lowered, "reference material fetch") || strings.Contains(lowered, "reference dns") || strings.Contains(lowered, "fetch image") || strings.Contains(lowered, "参考图拉取") || strings.Contains(lowered, "参考素材下载") || strings.Contains(lowered, "参考素材拉取") || strings.Contains(lowered, "参考素材链接无法访问") || strings.Contains(lowered, "参考图链接无法访问") || strings.Contains(lowered, "无法下载参考图") || strings.Contains(lowered, "参考素材域名解析失败") || strings.Contains(lowered, "国内下载中转失败"):
 		code = 602
 	case strings.Contains(lowered, "capacity") || strings.Contains(lowered, "quota exhausted") || strings.Contains(lowered, "no eligible image channel") || strings.Contains(lowered, "no eligible image account"):
 		code = 603

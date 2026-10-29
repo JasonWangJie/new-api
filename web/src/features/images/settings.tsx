@@ -1082,10 +1082,13 @@ function ImagePolicyForm({
               onCheckedChange={setAsyncEnabled}
             />
             <Label htmlFor='policy-async'>
-              {t('Use asynchronous execution')}
+              {t('Allow background task APIs')}
             </Label>
           </div>
         </div>
+        <p className='text-sm text-muted-foreground'>
+          {t('This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.')}
+        </p>
         <div className='flex flex-wrap items-center justify-between gap-2'>
           <Label htmlFor='image-model-catalog'>{t('Model capabilities')}</Label>
           <ImagePolicyExampleDialog platform={platform} />
@@ -1111,9 +1114,9 @@ function ImagePolicyForm({
             },
             {
               id: 'mode',
-              header: t('Execution mode'),
+              header: t('Background task APIs'),
               cell: (item) =>
-                t(item.async_enabled ? 'Asynchronous' : 'Realtime'),
+                t(item.async_enabled ? 'Enabled' : 'Disabled'),
             },
             {
               id: 'edit',

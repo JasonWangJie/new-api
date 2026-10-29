@@ -71,7 +71,14 @@ export function useSidebarData(): SidebarData {
             icon: FlaskConical,
           },
           ...(canvas?.enabled
-            ? [{ title: t('AI Infinite Canvas'), url: '/canvas', icon: Frame }]
+            ? [
+                {
+                  title: t('AI Infinite Canvas'),
+                  url: '/canvas',
+                  icon: Frame,
+                  openInNewTab: true,
+                },
+              ]
             : []),
           {
             title: t('Image Workbench'),

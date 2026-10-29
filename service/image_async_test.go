@@ -3405,6 +3405,14 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 		{name: "resource pool exhausted refusal", status: 400, body: `{"error":{"message":"Upstream resource pool exhausted"}}`, code: 603, rejected: true},
 		{name: "English request processing refusal", status: 400, body: `{"error":{"message":"Request processing failed. Provide the request ID to support."}}`, code: 606, rejected: true},
 		{name: "unable to process request refusal", status: 400, body: `{"error":{"type":"new_api_error","message":"Unable to process the request; contact support."}}`, code: 606, rejected: true},
+		{name: "provider temporary refusal with generic input code", status: 400, body: `{"error":{"code":"invalid_request","message":"service error, please try again later."}}`, code: 606, rejected: true},
+		{name: "provider temporary refusal with API wrapper", status: 400, body: `{"error":{"code":"invalid_request","type":"openai_error","message":"service error, please try again later."}}`, code: 606, rejected: true},
+		{name: "provider wrapper does not broaden other processing errors", status: 400, body: `{"error":{"code":"invalid_request","type":"openai_error","message":"Request processing failed."}}`, code: 604},
+		{name: "provider temporary refusal cannot hide accepted task", status: 400, body: `{"error":{"code":"invalid_request","message":"service error, please try again later."},"task_id":"accepted-job"}`, code: 604},
+		{name: "provider temporary refusal cannot hide output", status: 400, body: `{"error":{"code":"invalid_request","message":"service error, please try again later."},"data":[{"url":"https://result.example/image.png"}]}`, code: 604},
+		{name: "provider temporary refusal must be fully read", status: 400, body: `{"error":{"code":"invalid_request","message":"service error, please try again later."}}`, code: 610, readError: true},
+		{name: "provider temporary refusal cannot change authorization", status: 403, body: `{"error":{"code":"invalid_request","message":"service error, please try again later."}}`, code: 604},
+		{name: "similar input rejection is not retryable", status: 400, body: `{"error":{"code":"invalid_request","message":"service error, please try again later. Invalid dimensions"}}`, code: 604},
 		{name: "negated full capacity cannot fall back to capacity code", status: 400, body: `{"error":{"message":"Upstream capacity is not full; request processing did not fail"}}`, code: 610},
 		{name: "conditional capacity advice is not a refusal", status: 400, body: `{"error":{"message":"If upstream capacity is full, retry later"}}`, code: 610},
 		{name: "capacity compound negation is not a refusal", status: 400, body: `{"error":{"message":"Capacity has not been exhausted"}}`, code: 610},
@@ -3470,6 +3478,9 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 		{name: "reference image download safety rejection stays terminal", status: 400, body: `{"error":{"message":"Reference image download exceeded its total time budget; safety review did not pass"}}`, code: 601},
 		{name: "reference image download byte limit stays terminal", status: 400, body: `{"error":{"message":"Reference image download failed: image size exceeds limit"}}`, code: 604},
 		{name: "reference material link is unreachable", status: 400, body: `{"error":{"message":"参考素材链接无法访问（域名/端口不可达）"}}`, code: 602},
+		{name: "reference image cannot be downloaded", status: 400, body: `{"error":{"message":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录"}}`, code: 602},
+		{name: "reference material DNS fails", status: 400, body: `{"error":{"message":"参考素材域名解析失败（image.example.com），请确认链接可公开访问"}}`, code: 602},
+		{name: "ambiguous reference upload stays unclassified", status: 400, body: `{"error":{"message":"参考图上传失败，请检查文件格式与大小后重试"}}`, code: 610},
 		{name: "reference image link is unreachable", status: 400, body: `{"error":{"message":"参考图链接无法访问（域名/端口不可达）"}}`, code: 602},
 		{name: "unrelated link error remains unclassified", status: 400, body: `{"error":{"message":"Webhook link is unreachable"}}`, code: 610},
 		{name: "reference link safety rejection stays terminal", status: 400, body: `{"error":{"message":"参考素材链接无法访问；内容安全审核失败"}}`, code: 601},
@@ -3521,9 +3532,13 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "compatibility wording cannot override safety", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier; safety review did not pass"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "safety review", httpStatus: http.StatusUnprocessableEntity},
 		{name: "provider safety status precedes compatibility code", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier.","status":"SAFETY"}}`, expectedCode: 601, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusUnprocessableEntity},
 		{name: "authorization is not compatibility rejection", body: `{"error":{"code":"image_size_not_supported","message":"No eligible upstream image provider supports the requested image size or resolution tier."}}`, expectedCode: 610, providerCode: "image_size_not_supported", message: "resolution tier", httpStatus: http.StatusForbidden},
-		{name: "provider reference compatibility rejection", body: `{"error":{"code":400,"message":"Provider API error: Only a specific YouTube video URL is supported (request id: provider-reference-request)"}}`, expectedCode: 603, providerCode: "400", message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible"},
-		{name: "reference compatibility without provider code", body: `{"error":{"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 603, message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible"},
-		{name: "reference compatibility is case insensitive", body: `{"error":{"code":"400","message":"ONLY A SPECIFIC YOUTUBE VIDEO URL IS SUPPORTED"}}`, expectedCode: 603, providerCode: "400", message: "YOUTUBE", internalCode: "upstream_image_reference_incompatible"},
+		{name: "provider reference compatibility rejection", body: `{"error":{"code":400,"message":"Provider API error: Only a specific YouTube video URL is supported (request id: provider-reference-request)"}}`, expectedCode: 603, providerCode: "400", message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible", fallback: true},
+		{name: "provider wrapper allows verified local reference fallback", body: `{"error":{"code":400,"type":"openai_error","message":"Provider API error: Only a specific YouTube video URL is supported (request id: provider-reference-request)"}}`, expectedCode: 603, providerCode: "400", message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible", fallback: true},
+		{name: "provider wrapper with accepted job cannot fall back", body: `{"error":{"code":400,"type":"openai_error","message":"Only a specific YouTube video URL is supported"},"task_id":"accepted-job"}`, expectedCode: 610, providerCode: "400", message: "Only a specific YouTube"},
+		{name: "provider wrapper with output cannot fall back", body: `{"error":{"code":400,"type":"openai_error","message":"Only a specific YouTube video URL is supported"},"data":[{"url":"https://result.example/image.png"}]}`, expectedCode: 610, providerCode: "400", message: "Only a specific YouTube"},
+		{name: "provider wrapper must be fully read", body: `{"error":{"code":400,"type":"openai_error","message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "400", message: "Only a specific YouTube", readError: true},
+		{name: "reference compatibility without provider code", body: `{"error":{"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 603, message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible", fallback: true},
+		{name: "reference compatibility is case insensitive", body: `{"error":{"code":"400","message":"ONLY A SPECIFIC YOUTUBE VIDEO URL IS SUPPORTED"}}`, expectedCode: 603, providerCode: "400", message: "YOUTUBE", internalCode: "upstream_image_reference_incompatible", fallback: true},
 		{name: "generic YouTube input error remains terminal", body: `{"error":{"code":400,"message":"The supplied YouTube video URL is invalid"}}`, expectedCode: 610, providerCode: "400", message: "YouTube video URL is invalid"},
 		{name: "quoted request text is not a reference rejection", body: `{"error":{"code":400,"message":"Invalid input: prompt contains Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "400", message: "prompt contains"},
 		{name: "reference compatibility cannot override safety", body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported; safety review did not pass"}}`, expectedCode: 601, providerCode: "400", message: "safety review"},
@@ -3531,6 +3546,21 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "authorization is not reference compatibility", body: `{"error":{"code":403,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "403", message: "YouTube", httpStatus: http.StatusForbidden},
 		{name: "server failure is not reference rejection", body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 606, providerCode: "500", message: "YouTube", httpStatus: http.StatusInternalServerError},
 		{name: "reference fetch timeout", body: `{"error":{"code":400,"message":"reference image fetch: context deadline exceeded"}}`, expectedCode: 602, providerCode: "400", message: "reference image fetch", fallback: true},
+		{name: "explicit fetch code with echoed credential remains recoverable", body: `{"error":{"code":"image_fetch_failed","message":"image_url fetch failed for https://signed.example/image.png?token=private-key; authorization=Bearer private-key api_key=private-key"}}`, expectedCode: 602, providerCode: "image_fetch_failed", message: "image_url fetch failed", fallback: true},
+		{name: "explicit fetch code cannot hide accepted task", body: `{"error":{"code":"image_fetch_failed","message":"image_url fetch failed; authorization=Bearer private-key"},"task_id":"accepted-job"}`, expectedCode: 610, providerCode: "image_fetch_failed", message: "image_url fetch failed"},
+		{name: "quoted input is not an explicit reference fetch failure", body: `{"error":{"code":400,"type":"openai_error","message":"Invalid input: prompt contains image_url fetch failed"}}`, expectedCode: 610, providerCode: "400", message: "prompt contains"},
+		{name: "reference image download refusal", body: `{"error":{"code":400,"type":"openai_error","message":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录"}}`, expectedCode: 602, providerCode: "400", message: "无法下载参考图", fallback: true},
+		{name: "reference material DNS refusal", body: `{"error":{"code":400,"message":"参考素材域名解析失败（image.example.com），请确认链接可公开访问"}}`, expectedCode: 602, providerCode: "400", message: "参考素材域名解析失败", fallback: true},
+		{name: "Chinese accepted task in diagnostic cannot authorize fallback", body: `{"error":{"code":400,"message":"参考素材域名解析失败，但任务已受理"}}`, expectedCode: 610, providerCode: "400", message: "参考素材域名解析失败"},
+		{name: "Chinese unknown result in diagnostic cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图，结果未知"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download accepted HTTP metadata cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图"},"metadata":{"http_status":202}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download accepted upstream status cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图"},"metadata":{"upstream_status_code":"202"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download accepted timestamp cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图"},"metadata":{"accepted_at":"2026-10-29T22:00:00Z"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download rejected HTTP metadata remains recoverable", body: `{"error":{"code":400,"message":"无法下载参考图"},"metadata":{"http_status":400}}`, expectedCode: 602, providerCode: "400", message: "无法下载参考图", fallback: true},
+		{name: "reference download receipt cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图，请确认链接可直接访问"},"metadata":{"task_id":"accepted-job"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download output cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图，请确认链接可直接访问"},"result":{"url":"https://result.example/image.png"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图"},
+		{name: "reference download read failure cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图，请确认链接可直接访问"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图", readError: true},
+		{name: "reference download truncated response cannot authorize fallback", body: `{"error":{"code":400,"message":"无法下载参考图，请确认链接可直接访问"}}`, expectedCode: 610, providerCode: "400", message: "无法下载参考图", truncated: true},
 		{name: "reference image total download budget exceeded", body: `{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg?token=private-key (budgetMs=35000; reason=timeout)"}}`, expectedCode: 602, providerCode: "400", message: "Reference image download exceeded its total time budget", fallback: true},
 		{name: "provider reference byte limit compatibility", body: `{"error":{"code":400,"message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
 		{name: "reference byte limit upstream error type", body: `{"error":{"code":400,"type":"upstream_error","message":"reference image exceeds limit: 20 MB limit exceeded"}}`, expectedCode: 603, providerCode: "400", message: "20 MB", internalCode: "upstream_image_reference_incompatible"},
@@ -3612,15 +3642,15 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			providerCode: "400",
 			requestID:    "gemini-unprocessable",
 			message:      "prompt or input images could not be processed",
-			fallback:     true,
+			fallback:     false,
 		},
 		{
-			name:         "ambiguous safety rejection can retry remote references locally",
+			name:         "ambiguous safety rejection stays terminal",
 			body:         `{"error":{"code":400,"message":"The request was rejected by the upstream safety policy.","status":"INVALID_ARGUMENT"}}`,
 			expectedCode: 601,
 			providerCode: "400",
 			message:      "upstream safety policy",
-			fallback:     true,
+			fallback:     false,
 		},
 	}
 
@@ -3661,6 +3691,19 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			assert.False(t, failure.UpstreamTerminal, "an HTTP error alone does not prove a persisted upstream job is terminal")
 		})
 	}
+	receiptFailure := ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Only a specific YouTube video URL is supported"},"task_id":"accepted-job"}`)),
+	})
+	require.Equal(t, 610, receiptFailure.Code)
+	assert.Empty(t, imageAttemptCompatibilityCode(ImageChannelAttempt{
+		Dispatched:   true,
+		FinishedAt:   1,
+		Code:         receiptFailure.Code,
+		HTTPStatus:   receiptFailure.HTTPStatus,
+		ErrorMessage: receiptFailure.Message,
+		ProviderCode: receiptFailure.ProviderCode,
+	}))
 	for _, tc := range []struct {
 		name         string
 		status       int
@@ -3672,6 +3715,8 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "actual rejection despite server error mapping", status: 422, mapping: `{"422":"500"}`, wantCode: 603, wantInternal: "upstream_image_route_incompatible"},
 		{name: "mapped server error is not a compatibility rejection", status: 500, mapping: `{"500":"422"}`, wantCode: 610},
 		{name: "reference rejection despite server error mapping", status: 400, mapping: `{"400":"500"}`, body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported"}}`, wantCode: 603, wantInternal: "upstream_image_reference_incompatible"},
+		{name: "mapped YouTube receipt cannot retry as server failure", status: 400, mapping: `{"400":"500"}`, body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported"},"task_id":"accepted-job"}`, wantCode: 610},
+		{name: "mapped reference download receipt cannot retry as server failure", status: 400, mapping: `{"400":"500"}`, body: `{"error":{"code":400,"message":"无法下载参考图"},"metadata":{"http_status":202}}`, wantCode: 610},
 		{name: "mapped server error is not a reference rejection", status: 500, mapping: `{"500":"400"}`, body: `{"error":{"code":500,"message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
 		{name: "OpenAI policy type with a provider code cannot trigger reference failover", status: 400, body: `{"error":{"code":400,"type":"content_policy_violation","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
 		{name: "OpenAI safety type without a provider code cannot trigger reference failover", status: 400, body: `{"error":{"type":"safety","message":"Only a specific YouTube video URL is supported"}}`, wantCode: 610},
@@ -3703,7 +3748,28 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			}
 		})
 	}
+	mappedUnreadable := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: io.NopCloser(io.MultiReader(
+			strings.NewReader(`{"error":{"code":400,"message":"无法下载参考图"}}`),
+			iotest.ErrReader(errors.New("response interrupted")),
+		)),
+	}, `{"400":"500"}`)
+	assert.Equal(t, 610, mappedUnreadable.Code)
+	assert.False(t, ShouldFallbackGeminiReferenceTransport(mappedUnreadable))
+	mappedTemporaryUnreadable := ClassifyOpenAIAsyncImageHTTPFailure(t.Context(), &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body: io.NopCloser(io.MultiReader(
+			strings.NewReader(`{"error":{"code":"invalid_request","message":"service error, please try again later."}}`),
+			iotest.ErrReader(errors.New("response interrupted")),
+		)),
+	}, `{"400":"500"}`)
+	assert.Equal(t, 604, mappedTemporaryUnreadable.Code)
+	assert.False(t, mappedTemporaryUnreadable.RetryableHTTPResponse)
 	assert.Equal(t, 603, ClassifyAsyncImageFailure(errors.New("no eligible image account in the selected pool"), 0).Code)
+	assert.Equal(t, 602, ClassifyAsyncImageFailure(errors.New("无法下载参考图，请确认链接可直接访问，且未过期或要求登录"), 0).Code)
+	assert.Equal(t, 602, ClassifyAsyncImageFailure(errors.New("参考素材域名解析失败（image.example.com）"), 0).Code)
+	assert.Equal(t, 610, ClassifyAsyncImageFailure(errors.New("参考图上传失败，请检查文件格式与大小后重试"), 0).Code)
 	assert.Equal(t, 606, ClassifyAsyncImageFailure(errors.New("生成超时，请重试"), 0).Code)
 	assert.Equal(t, 606, ClassifyAsyncImageFailure(errors.Join(errors.New("prepare image request"), context.DeadlineExceeded), 0).Code)
 	assert.Equal(t, 606, ClassifyAsyncImageFailure(&url.Error{Op: "Get", URL: "https://signed.example/image", Err: os.ErrDeadlineExceeded}, 0).Code)
@@ -3714,7 +3780,7 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 }
 
 func TestGeminiAsyncImageReferenceFailureSchedulesSingleLocalFallback(t *testing.T) {
-	for _, code := range []int{601, 602} {
+	for _, code := range []int{602, 603} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
 			previousDB, previousType := model.DB, common.MainDatabaseType()
 			dialector := gorm.Dialector(sqlite.Open(filepath.Join(t.TempDir(), "gemini-reference-fallback.db")))
@@ -3746,6 +3812,7 @@ func TestGeminiAsyncImageReferenceFailureSchedulesSingleLocalFallback(t *testing
 				StartedAt:     now - 1,
 				Dispatched:    true,
 				ReferenceMode: "passthrough_fallback_local",
+				TransportUsed: "remote",
 			}})
 			require.NoError(t, err)
 			task := model.AsyncImageTask{
@@ -3767,18 +3834,16 @@ func TestGeminiAsyncImageReferenceFailureSchedulesSingleLocalFallback(t *testing
 			cfg.ReferenceRetryBase = 1
 			cfg.ReferenceRetryMax = 1
 			cfg.RetryJitter = 0
-			failure := &AsyncImageFailure{
-				Code:           code,
-				InternalCode:   "upstream_failed",
-				Message:        "The request was rejected by the upstream safety policy.",
-				HTTPStatus:     http.StatusBadRequest,
-				ProviderCode:   "400",
-				ProviderStatus: "INVALID_ARGUMENT",
-			}
+			var failure *AsyncImageFailure
 			if code == 602 {
 				failure = ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{
 					StatusCode: http.StatusBadRequest,
 					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Reference image download exceeded its total time budget for https://signed.example/reference.jpg (budgetMs=35000; reason=timeout)"}}`)),
+				})
+			} else if code == 603 {
+				failure = ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"type":"openai_error","message":"Provider API error: Only a specific YouTube video URL is supported (request id: provider-reference-request)"}}`)),
 				})
 			}
 			failure.ReferenceTransportFallback = ShouldFallbackGeminiReferenceTransport(failure)

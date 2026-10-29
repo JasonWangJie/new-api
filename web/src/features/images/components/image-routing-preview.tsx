@@ -76,6 +76,7 @@ export function ImageRoutingPreview(props: {
       props.config.image_providers?.[0] ||
       'openai',
     media_type: 'image',
+    execution_mode: 'async',
     model: '',
     resolution: '1K',
     operation: 'text_to_image',
@@ -160,6 +161,7 @@ export function ImageRoutingPreview(props: {
                 ...(value === 'mixed'
                   ? {
                       media_type: 'image',
+                      execution_mode: 'async',
                       operation: 'text_to_image',
                       resolution: '1K',
                       seconds: '',
@@ -181,12 +183,23 @@ export function ImageRoutingPreview(props: {
               setValues((previous) => ({
                 ...previous,
                 media_type: value,
+                execution_mode: value === 'video' ? 'async' : previous.execution_mode,
                 operation:
                   value === 'image' ? 'text_to_image' : 'text_to_video',
                 resolution: value === 'image' ? '1K' : '',
               }))
               preview.reset()
             }}
+          />
+          <ImageSelect
+            label={t('Execution mode')}
+            value={values.execution_mode}
+            disabled={preview.isPending || values.media_type === 'video' || values.platform === 'mixed'}
+            options={[
+              { value: 'sync', label: t('Synchronous image API') },
+              { value: 'async', label: t('Background task API') },
+            ]}
+            onChange={(value) => change('execution_mode', value)}
           />
           <div className='space-y-2'>
             <Label htmlFor='route-preview-model'>{t('Model')}</Label>
@@ -257,6 +270,9 @@ export function ImageRoutingPreview(props: {
           {t('Preview routing')}
         </Button>
       </form>
+      <p className='mt-3 text-sm text-muted-foreground'>
+        {t('Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.')}
+      </p>
       {preview.isPending && <LoadingState size='sm' />}
       {preview.error && (
         <ErrorState

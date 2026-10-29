@@ -67,8 +67,11 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 		}
 	}
 	if IsImageGenerationModel(modelName) {
-		// add to first
-		endpointTypes = append([]constant.EndpointType{constant.EndpointTypeImageGeneration}, endpointTypes...)
+		// Dedicated image models do not inherit a channel's generic text APIs.
+		if channelType == constant.ChannelTypeGemini || channelType == constant.ChannelTypeVertexAi {
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeGemini}
+		}
+		return []constant.EndpointType{constant.EndpointTypeImageGeneration}
 	}
 	return endpointTypes
 }

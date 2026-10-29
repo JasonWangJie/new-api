@@ -17,8 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Link, useLocation } from '@tanstack/react-router'
-import { ChevronRight } from 'lucide-react'
+import { ArrowUpRight, ChevronRight } from 'lucide-react'
 import { type ReactNode, useState, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 
 import { Badge } from '@/components/ui/badge'
 import {
@@ -46,6 +47,7 @@ import {
   SidebarMenuSubItem,
   useSidebar,
 } from '@/components/ui/sidebar'
+import { cn } from '@/lib/utils'
 
 import { checkIsActive } from '../lib/url-utils'
 import type {
@@ -121,22 +123,50 @@ function NavBadge({ children }: { children: ReactNode }) {
  * Sidebar menu link item
  */
 function SidebarMenuLink({ item, href }: { item: NavLink; href: string }) {
+  const { t } = useTranslation()
   const { isMobile, setOpenMobile } = useSidebar()
+  const isCanvas = item.url === '/canvas'
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         isActive={checkIsActive(href, item)}
-        tooltip={item.title}
+        tooltip={
+          item.openInNewTab
+            ? `${item.title} · ${t('Open in new tab')}`
+            : item.title
+        }
         render={
           <Link
             to={item.url}
-            preload={isMobile || item.url === '/canvas' ? false : undefined}
+            target={item.openInNewTab ? '_blank' : undefined}
+            rel={item.openInNewTab ? 'noopener noreferrer' : undefined}
+            preload={isMobile || isCanvas ? false : undefined}
             onClick={() => setOpenMobile(false)}
           />
         }
       >
-        {item.icon && <item.icon className='shrink-0' />}
-        <span className='min-w-0 flex-1 truncate'>{item.title}</span>
+        {item.icon && (
+          <item.icon
+            className={cn(
+              'shrink-0',
+              isCanvas && 'text-indigo-600 dark:text-sky-300'
+            )}
+          />
+        )}
+        <span className='min-w-0 flex-1 truncate'>
+          <span className={isCanvas ? 'canvas-entry-label' : undefined}>
+            {item.title}
+          </span>
+          {item.openInNewTab && (
+            <span className='sr-only'> ({t('Open in new tab')})</span>
+          )}
+        </span>
+        {item.openInNewTab && (
+          <ArrowUpRight
+            className='text-muted-foreground/70 shrink-0 group-data-[collapsible=icon]:hidden'
+            aria-hidden='true'
+          />
+        )}
         {item.badge && <NavBadge>{item.badge}</NavBadge>}
       </SidebarMenuButton>
     </SidebarMenuItem>

@@ -448,7 +448,7 @@ func TestCanvasHTTPAndManagedTokenProtection(t *testing.T) {
 func TestCanvasModelListUsesCurrentPermissions(t *testing.T) {
 	initModelListColumnNames(t)
 	f := newCanvasFixture(t)
-	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}))
 	previous := operation_setting.SelfUseModeEnabled
 	operation_setting.SelfUseModeEnabled = true
 	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = previous })
@@ -1294,7 +1294,7 @@ func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
 	})
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_mode": `{"canvas-text":"tiered_expr","canvas-image":"tiered_expr"}`, "billing_setting.billing_expr": `{"canvas-text":"tier(\"request\", fixed(0.002))","canvas-image":"tier(\"request\", fixed(0.002))"}`, "group_ratio_setting.group_ratio": `{"default":1}`, "perf_metrics_setting.enabled": "false"}))
-	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Log{}, &model.Option{}))
+	require.NoError(t, f.db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}))
 	require.NoError(t, f.db.Model(&model.User{}).Where("id = ?", f.user.Id).Update("setting", `{"billing_preference":"wallet_only"}`).Error)
 	grant := f.grant(t)
 	var record model.CanvasGrant
@@ -1308,11 +1308,20 @@ func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 		var owner model.User
 		if assert.NoError(t, f.db.First(&owner, f.user.Id).Error) {
 			assert.Less(t, owner.Quota, 1000000, "real gateway reserves wallet funds before the upstream call")
+			if requestNumber >= 5 {
+				assert.Equal(t, 996000, owner.Quota, "a synchronous retry reuses the original wallet hold")
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if requestNumber == 4 {
 			w.WriteHeader(400)
 			fmt.Fprint(w, `{"error":{"message":"test failure","type":"invalid_request_error"}}`)
+			return
+		}
+		if requestNumber == 5 {
+			assert.NoError(t, f.db.Model(&model.Channel{}).Where("name = ?", "canvas-real-relay").Update("status", common.ChannelStatusManuallyDisabled).Error)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"message":"temporary image failure","type":"server_error"}}`)
 			return
 		}
 		if strings.Contains(r.URL.Path, "/images/") {
@@ -1341,6 +1350,9 @@ func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 	for _, name := range []string{"canvas-text", "canvas-image"} {
 		require.NoError(t, f.db.Create(&model.Ability{ChannelId: channel.Id, Model: name, Group: "default", Enabled: true}).Error)
 	}
+	policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "openai"), Group: "default", Platform: "openai", Enabled: true, PoolMode: "model", Models: `[{"id":"canvas-image"}]`}
+	require.NoError(t, f.db.Create(&policy).Error)
+	require.NoError(t, f.db.Create(&model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(policy, "canvas-image", ""), Group: "default", Platform: "openai", Mode: "model", Model: "canvas-image", ChannelId: channel.Id}).Error)
 	engine := gin.New()
 	engine.POST("/v1/chat/completions", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
 	engine.POST("/v1/images/generations", middleware.TokenAuth(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAIImage) })
@@ -1385,6 +1397,27 @@ func TestCanvasRealRelayChargesTheAuthorizedOwner(t *testing.T) {
 	require.Equal(t, 400, response.Code, response.Body.String())
 	require.Eventually(t, func() bool { return f.db.First(&owner, f.user.Id).Error == nil && owner.Quota == 997000 }, time.Second, 10*time.Millisecond, "failed upstream request refunds its reservation")
 	assert.EqualValues(t, 4, seen.Load(), "invalid request errors do not create a paid retry")
+	previousRetries := common.RetryTimes
+	common.RetryTimes = 1
+	t.Cleanup(func() { common.RetryTimes = previousRetries })
+	backup := model.Channel{Name: "canvas-image-backup", Key: "upstream-test-secret", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Group: "default", Models: "canvas-image", BaseURL: &upstream.URL}
+	require.NoError(t, f.db.Create(&backup).Error)
+	require.NoError(t, f.db.Create(&model.Ability{ChannelId: backup.Id, Model: "canvas-image", Group: "default", Enabled: true}).Error)
+	poolKey := service.ImagePoolBindingKey(policy, "canvas-image", "")
+	require.NoError(t, f.db.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id = ?", poolKey, channel.Id).Update("priority", 10).Error)
+	require.NoError(t, f.db.Create(&model.ImageChannelPool{BindingKey: poolKey, Group: "default", Platform: "openai", Mode: "model", Model: "canvas-image", ChannelId: backup.Id}).Error)
+	response = f.request("POST", "/v1/images/generations", `{"model":"canvas-image","prompt":"retry within pool","n":1,"response_format":"b64_json"}`, "Bearer "+grant.APIKey, f.proof, "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.EqualValues(t, 6, seen.Load(), "the configured single retry submits exactly one replacement image request")
+	require.NoError(t, f.db.First(&owner, f.user.Id).Error)
+	assert.Equal(t, 996000, owner.Quota)
+	assert.Equal(t, 4000, owner.UsedQuota)
+	assert.Equal(t, 4, owner.RequestCount)
+	var retried model.Log
+	require.NoError(t, f.db.Where("type = ?", model.LogTypeConsume).Order("id DESC").First(&retried).Error)
+	assert.Equal(t, backup.Id, retried.ChannelId)
+	assert.Equal(t, 1000, retried.Quota)
+	assert.Equal(t, record.TokenID, retried.TokenId)
 }
 
 // External DSNs must name disposable databases. Prefixing this matrix leaves

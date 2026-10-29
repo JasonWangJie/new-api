@@ -12,12 +12,15 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -49,7 +52,7 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	model.DB = db
 	model.LOG_DB = db
 
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Channel{}, &model.Ability{}, &model.Model{}, &model.Vendor{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.ImageStorageProfile{}))
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()
@@ -319,6 +322,94 @@ func TestListModelsIncludesTieredBillingModel(t *testing.T) {
 	require.True(t, ok)
 	require.Empty(t, missingExprPricing.BillingMode)
 	require.Empty(t, missingExprPricing.BillingExpr)
+}
+
+func TestListModelsImageExecutionUsesCurrentGroupAndModelLimit(t *testing.T) {
+	withSelfUseModeEnabled(t)
+	db := setupModelListControllerTestDB(t)
+	previousCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousCache; model.InvalidatePricingCache() })
+	previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = previousRedis, previousRedisEnabled
+		assert.NoError(t, client.Close())
+	})
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.AsyncEnabled = true
+	require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+	require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "model-capability-test", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}).Error)
+	channels := []model.Channel{
+		{Type: constant.ChannelTypeOpenAI, Key: "model-list-fixture-key", Status: common.ChannelStatusEnabled, Group: "default", Models: "gpt-image-2,gpt-ordinary-text,custom-picture", ModelMapping: common.GetPointer(`{"custom-picture":"gpt-image-2"}`)},
+		{Type: constant.ChannelTypeGemini, Key: "model-list-native-key", Status: common.ChannelStatusEnabled, Group: "vip", Models: "gemini-2.5-flash-image"},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for _, channel := range channels {
+		for name := range strings.SplitSeq(channel.Models, ",") {
+			require.NoError(t, db.Create(&model.Ability{Group: channel.Group, Model: name, ChannelId: channel.Id, Enabled: true}).Error)
+		}
+	}
+	require.NoError(t, db.Create(&model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "openai"), Group: "default", Platform: "openai", Enabled: true, PoolMode: "model", Models: `[{"id":"gpt-image-2"},{"id":"custom-picture"}]`}).Error)
+	require.NoError(t, db.Create(&model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("vip", "gemini"), Group: "vip", Platform: "gemini", Enabled: true, PoolMode: "model", Models: `[{"id":"gemini-2.5-flash-image"}]`}).Error)
+	for _, tc := range []struct {
+		group      string
+		limited    bool
+		background bool
+		builtin    bool
+		want       map[string]*service.ImageExecutionCapability
+	}{
+		{"default", false, false, false, map[string]*service.ImageExecutionCapability{"gpt-image-2": {Sync: true, SyncEndpoint: "image-generation"}, "custom-picture": {Sync: true, SyncEndpoint: "image-generation"}, "gpt-ordinary-text": nil}},
+		{"default", true, false, false, map[string]*service.ImageExecutionCapability{"gpt-image-2": {Sync: true, SyncEndpoint: "image-generation"}}},
+		{"vip", false, false, false, map[string]*service.ImageExecutionCapability{"gemini-2.5-flash-image": {Sync: true, SyncEndpoint: "gemini"}}},
+		{"default", false, true, true, map[string]*service.ImageExecutionCapability{"gpt-image-2": {Async: true}, "custom-picture": {Async: true}, "gpt-ordinary-text": nil}},
+		{"vip", false, true, false, map[string]*service.ImageExecutionCapability{"gemini-2.5-flash-image": {Sync: true, Async: true, SyncEndpoint: "gemini"}}},
+	} {
+		t.Run(fmt.Sprintf("%s_limited_%t_background_%t", tc.group, tc.limited, tc.background), func(t *testing.T) {
+			platform := "openai"
+			if tc.group == "vip" {
+				platform = "gemini"
+			}
+			require.NoError(t, db.Model(&model.ImageGroupPolicy{}).Where("policy_key = ?", service.ImageIdentityHash(tc.group, platform)).Update("async_enabled", tc.background).Error)
+			if tc.builtin {
+				require.NoError(t, db.Model(&channels[0]).Updates(map[string]any{"type": constant.ChannelTypeNewAPI, "setting": `{"tianyue_media_compatibility":true}`}).Error)
+			}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+			common.SetContextKey(ctx, constant.ContextKeyTokenGroup, tc.group)
+			common.SetContextKey(ctx, constant.ContextKeyTokenModelLimitEnabled, tc.limited)
+			common.SetContextKey(ctx, constant.ContextKeyTokenModelLimit, map[string]bool{"gpt-image-2": true})
+			ListModels(ctx, constant.ChannelTypeOpenAI)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			var payload struct {
+				Data []struct {
+					ID        string                            `json:"id"`
+					Execution *service.ImageExecutionCapability `json:"image_execution"`
+					Endpoints []string                          `json:"supported_endpoint_types"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
+			got := make(map[string]*service.ImageExecutionCapability)
+			for _, item := range payload.Data {
+				got[item.ID] = item.Execution
+				if item.Execution != nil && item.Execution.Sync {
+					assert.Contains(t, item.Endpoints, item.Execution.SyncEndpoint, "declared synchronous image routes must also advertise their protocol")
+				}
+				if item.Execution != nil && item.Execution.Async {
+					assert.Contains(t, item.Endpoints, "image-generation", "background image routes must advertise the image protocol")
+				}
+			}
+			assert.Equal(t, tc.want, got)
+			assert.NotContains(t, recorder.Body.String(), "model-list-fixture-key")
+			assert.NotContains(t, recorder.Body.String(), "model-list-native-key")
+		})
+	}
 }
 
 func TestListModelsUsesAdvancedCustomEndpointTypesFromPricingCache(t *testing.T) {

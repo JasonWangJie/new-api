@@ -1,5 +1,13 @@
 {
   "translation": {
+    "Synchronous image API": "同步圖片介面",
+    "Background task API": "背景工作介面",
+    "Allow background task APIs": "允許背景工作介面",
+    "Background task APIs": "背景工作介面",
+    "Background task APIs are disabled by this policy": "此原則未允許背景工作介面",
+    "Channel supports background tasks only or does not accept this synchronous API": "通道僅支援背景工作，或不接受此同步介面",
+    "Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.": "使用相同模型與解析度對照兩種模式。OpenAI 同步預覽包含相容圖片通道；Gemini 使用原生同步介面。",
+    "This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.": "此開關允許提交背景工作。同步圖片介面仍會使用原則與集區內的相容通道；開啟此開關不會讓僅支援非同步的上游具備同步能力。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

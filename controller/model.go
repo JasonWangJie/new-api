@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -307,9 +308,33 @@ func ListModels(c *gin.Context, modelType int) {
 			"nextPageToken": nil,
 		})
 	default:
+		execution, err := service.ImageExecutionCapabilities(c.Request.Context(), c.GetInt("token_id"), groups.userGroup, ownerGroups, userModelNames)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "image routing configuration is unavailable", "type": "server_error"}})
+			return
+		}
+		type modelWithImageExecution struct {
+			dto.OpenAIModels
+			ImageExecution *service.ImageExecutionCapability `json:"image_execution,omitempty"`
+		}
+		models := make([]modelWithImageExecution, 0, len(userOpenAiModels))
+		for _, item := range userOpenAiModels {
+			entry := modelWithImageExecution{OpenAIModels: item}
+			if capability, exists := execution[item.Id]; exists {
+				entry.ImageExecution = &capability
+				endpoint := types.EndpointType(capability.SyncEndpoint)
+				if capability.Sync && !slices.Contains(entry.SupportedEndpointTypes, endpoint) {
+					entry.SupportedEndpointTypes = append(slices.Clone(entry.SupportedEndpointTypes), endpoint)
+				}
+				if capability.Async && !slices.Contains(entry.SupportedEndpointTypes, constant.EndpointTypeImageGeneration) {
+					entry.SupportedEndpointTypes = append(slices.Clone(entry.SupportedEndpointTypes), constant.EndpointTypeImageGeneration)
+				}
+			}
+			models = append(models, entry)
+		}
 		c.JSON(200, gin.H{
 			"success": true,
-			"data":    userOpenAiModels,
+			"data":    models,
 			"object":  "list",
 		})
 	}

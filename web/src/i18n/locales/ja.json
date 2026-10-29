@@ -1,5 +1,13 @@
 {
   "translation": {
+    "Synchronous image API": "同期画像 API",
+    "Background task API": "バックグラウンドタスク API",
+    "Allow background task APIs": "バックグラウンドタスク API を許可",
+    "Background task APIs": "バックグラウンドタスク API",
+    "Background task APIs are disabled by this policy": "このポリシーではバックグラウンドタスク API が無効です",
+    "Channel supports background tasks only or does not accept this synchronous API": "このチャネルはバックグラウンドタスク専用、またはこの同期 API に非対応です",
+    "Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.": "同じモデルと解像度で両モードを比較できます。OpenAI 同期プレビューには互換画像プロバイダーを含み、Gemini はネイティブ同期 API を使用します。",
+    "This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.": "この設定はバックグラウンドタスクの送信を許可します。同期画像 API はポリシーとプール内の対応チャネルを使用します。非同期専用の上流に同期機能を追加する設定ではありません。",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

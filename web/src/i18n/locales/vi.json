@@ -1,5 +1,13 @@
 {
   "translation": {
+    "Synchronous image API": "API ảnh đồng bộ",
+    "Background task API": "API tác vụ nền",
+    "Allow background task APIs": "Cho phép API tác vụ nền",
+    "Background task APIs": "API tác vụ nền",
+    "Background task APIs are disabled by this policy": "API tác vụ nền bị tắt bởi chính sách này",
+    "Channel supports background tasks only or does not accept this synchronous API": "Kênh chỉ hỗ trợ tác vụ nền hoặc không chấp nhận API đồng bộ này",
+    "Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.": "So sánh hai chế độ với cùng mô hình và độ phân giải. Bản xem trước đồng bộ OpenAI gồm các nhà cung cấp ảnh tương thích; Gemini dùng API đồng bộ gốc.",
+    "This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.": "Tùy chọn này cho phép gửi tác vụ nền. API ảnh đồng bộ vẫn sử dụng các kênh tương thích trong chính sách và nhóm; nó không bổ sung khả năng đồng bộ cho nhà cung cấp chỉ hỗ trợ bất đồng bộ.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

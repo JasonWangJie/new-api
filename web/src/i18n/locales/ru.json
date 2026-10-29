@@ -1,5 +1,13 @@
 {
   "translation": {
+    "Synchronous image API": "Синхронный API изображений",
+    "Background task API": "API фоновых задач",
+    "Allow background task APIs": "Разрешить API фоновых задач",
+    "Background task APIs": "API фоновых задач",
+    "Background task APIs are disabled by this policy": "API фоновых задач отключены этой политикой",
+    "Channel supports background tasks only or does not accept this synchronous API": "Канал поддерживает только фоновые задачи или не принимает этот синхронный API",
+    "Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.": "Сравните оба режима с одинаковыми моделью и разрешением. Синхронный просмотр OpenAI включает совместимых поставщиков изображений; Gemini использует свой синхронный API.",
+    "This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.": "Этот параметр разрешает фоновые задачи. Синхронные API изображений по-прежнему используют совместимые каналы политики и пула; он не добавляет синхронную поддержку асинхронному поставщику.",
     "360": "360",
     "1000": "1000",
     "10000": "10000",

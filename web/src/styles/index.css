@@ -32,6 +32,17 @@ For commercial licensing, please contact support@quantumnous.com
 
 /* Shiki dual themes: token colors follow dark theme (pre background stays `bg-background` on the block) */
 @layer components {
+  .canvas-entry-label {
+    @apply bg-linear-to-r from-indigo-700 via-violet-700 to-pink-700 bg-clip-text font-semibold text-transparent dark:from-sky-300 dark:via-violet-300 dark:to-pink-300;
+  }
+
+  @media (forced-colors: active) {
+    .canvas-entry-label {
+      background-image: none;
+      color: LinkText;
+    }
+  }
+
   .shiki span {
     color: var(--shiki-light) !important;
     font-style: var(--shiki-light-font-style) !important;

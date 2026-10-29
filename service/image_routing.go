@@ -52,14 +52,15 @@ type ImagePoolSelectionOptions struct {
 }
 
 type MediaRoutingPreviewRequest struct {
-	Group      string `json:"group"`
-	Platform   string `json:"platform"`
-	MediaType  string `json:"media_type"`
-	Model      string `json:"model"`
-	Resolution string `json:"resolution"`
-	Operation  string `json:"operation"`
-	Seconds    *int   `json:"seconds,omitempty"`
-	TokenID    int    `json:"token_id,omitempty"`
+	ExecutionMode string `json:"execution_mode"`
+	Group         string `json:"group"`
+	Platform      string `json:"platform"`
+	MediaType     string `json:"media_type"`
+	Model         string `json:"model"`
+	Resolution    string `json:"resolution"`
+	Operation     string `json:"operation"`
+	Seconds       *int   `json:"seconds,omitempty"`
+	TokenID       int    `json:"token_id,omitempty"`
 }
 
 type MediaRoutingPreviewChannel struct {
@@ -94,6 +95,10 @@ type MediaRoutingPreview struct {
 // PreviewMediaRouting reads configuration only. It deliberately avoids the
 // random picker, quota reservation, circuit probes and concurrency acquisition.
 func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) (MediaRoutingPreview, error) {
+	if input.ExecutionMode == "" {
+		input.ExecutionMode = "async"
+	}
+	synchronous := input.ExecutionMode == "sync"
 	preview := MediaRoutingPreview{
 		MediaRoutingPreviewRequest: input,
 		Eligible:                   make([]MediaRoutingPreviewChannel, 0), Excluded: make([]MediaRoutingPreviewChannel, 0),
@@ -118,6 +123,12 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 	if input.Operation == "image_to_image" {
 		imageRequest.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://preview.invalid/reference.png"}}
 	}
+	if synchronous {
+		imageRequest.Dialect, imageRequest.SourcePath = "", "/v1/images/generations"
+		if input.Operation == "image_to_image" {
+			imageRequest.SourcePath = "/v1/images/edits"
+		}
+	}
 	if input.TokenID > 0 {
 		var token model.Token
 		if err := model.DB.WithContext(ctx).First(&token, input.TokenID).Error; err != nil {
@@ -128,7 +139,16 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			return preview, err
 		}
 		var err error
-		if input.Platform == "mixed" {
+		if synchronous {
+			policy, catalog, err = ResolveImagePolicy(ctx, token, "openai")
+			if input.Platform == "gemini" {
+				group := token.Group
+				if group == "" {
+					group = owner.Group
+				}
+				policy, catalog = model.ImageGroupPolicy{Group: group, Platform: "gemini"}, nil
+			}
+		} else if input.Platform == "mixed" {
 			policy, catalog, err = ResolveImagePolicy(ctx, token, "mixed")
 		} else if input.MediaType == "image" {
 			policy, catalog, err = ResolveAsyncImagePolicy(ctx, token, imageRequest)
@@ -154,7 +174,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		if owner.Status != common.UserStatusEnabled {
 			policyReasons = append(policyReasons, "user_disabled")
 		}
-		if input.MediaType == "video" && policy.Group == "auto" {
+		if (input.MediaType == "video" || synchronous) && policy.Group == "auto" {
 			// Match SetupContextForToken/GetRequestAutoGroups: an empty stored
 			// list inherits global groups; malformed or revoked lists fail closed.
 			groups, parseErr := token.GetAutoGroups()
@@ -170,6 +190,15 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			}
 		} else if !GroupInUserUsableGroups(owner.Group, policy.Group) || input.MediaType == "image" && !IsUserSelectableGroup(owner.Group, policy.Group) {
 			policyReasons = append(policyReasons, "token_group_not_allowed")
+		}
+	} else if synchronous {
+		var err error
+		policy, catalog, err = ResolveImagePolicy(ctx, model.Token{Group: input.Group}, "openai")
+		if err != nil {
+			return preview, err
+		}
+		if input.Platform == "gemini" {
+			policy, catalog = model.ImageGroupPolicy{Group: input.Group, Platform: "gemini"}, nil
 		}
 	} else if input.Platform == "mixed" {
 		var err error
@@ -226,14 +255,34 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		}
 	}
 	preview.PoolMode, preview.PolicyEnabled, preview.AsyncEnabled = policy.PoolMode, policy.Enabled, policy.AsyncEnabled
-	if policy.Id == 0 && input.MediaType == "image" {
+	if synchronous && policy.Group == "auto" && input.TokenID > 0 {
+		preview.RoutingGroups, preview.Reasons = routingGroups, policyReasons
+		for _, group := range routingGroups {
+			request := input
+			request.TokenID, request.Group = 0, group
+			part, err := PreviewMediaRouting(ctx, request)
+			if err != nil {
+				return preview, err
+			}
+			for _, candidate := range append(part.Eligible, part.Excluded...) {
+				candidate.Reasons = append(candidate.Reasons, policyReasons...)
+				if len(candidate.Reasons) == 0 {
+					preview.Eligible = append(preview.Eligible, candidate)
+				} else {
+					preview.Excluded = append(preview.Excluded, candidate)
+				}
+			}
+		}
+		return preview, nil
+	}
+	if policy.Id == 0 && input.MediaType == "image" && !synchronous {
 		policyReasons = append(policyReasons, "policy_missing")
 	}
 	if policy.Id > 0 {
 		if !policy.Enabled {
 			policyReasons = append(policyReasons, "policy_disabled")
 		}
-		if !policy.AsyncEnabled {
+		if !policy.AsyncEnabled && !synchronous {
 			policyReasons = append(policyReasons, "async_disabled")
 		}
 	}
@@ -248,7 +297,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		if input.Resolution != "AUTO" && len(capability.Resolutions) > 0 && !slices.Contains(capability.Resolutions, input.Resolution) && !(input.Resolution == "0.5K" && capability.AllowHalfK) {
 			policyReasons = append(policyReasons, "resolution_not_in_policy")
 		}
-		if input.Operation == "image_to_image" && capability.MaxReferenceImages == 0 {
+		if input.Operation == "image_to_image" && capability.MaxReferenceImages == 0 && !synchronous {
 			policyReasons = append(policyReasons, "operation_not_supported")
 		}
 	}
@@ -275,6 +324,9 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		var bindings []model.ImageChannelPool
 		if err := model.DB.WithContext(ctx).Where("binding_key = ? AND channel_id >= ?", bindingKey, 0).Find(&bindings).Error; err != nil {
 			return preview, err
+		}
+		if synchronous && (policy.Id == 0 || input.Platform == "gemini") {
+			bindings = nil
 		}
 		if input.Platform == "mixed" && len(bindings) == 0 {
 			policyReasons = append(policyReasons, "mixed_pool_missing")
@@ -327,7 +379,8 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			if input.MediaType == "image" {
 				if mapped, found := imageCandidates[channel.Id]; found {
 					channel = mapped
-				} else if policy.AsyncEnabled {
+				}
+				if _, found := imageCandidates[channel.Id]; !found && policy.AsyncEnabled || synchronous && policy.Id > 0 && !policy.AsyncEnabled {
 					mapped, available, err := imageChannelForResolution(channel, input.Model, resolution)
 					if err != nil {
 						return preview, err
@@ -339,7 +392,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				}
 				capability := ImageChannelCapability(channel, input.Model)
 				candidate.Provider, candidate.Protocol = capability.Provider, capability.Protocol
-				if input.Platform != "mixed" && capability.Provider != input.Platform || !ImageChannelSupportsPlatform(channel, input.Model, policy.Platform) {
+				if input.Platform != "mixed" && !(synchronous && input.Platform == "openai") && capability.Provider != input.Platform || !ImageChannelSupportsPlatform(channel, input.Model, policy.Platform) {
 					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
 				}
 				if !ImageCapabilitySupportsRequest(capability, imageRequest) {
@@ -347,6 +400,15 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				}
 				if input.Platform == "mixed" && !MixedImageChannelRequestSupported(channel, imageRequest) {
 					candidate.Reasons = append(candidate.Reasons, "image_parameters_not_supported")
+				}
+				if synchronous {
+					path := imageRequest.SourcePath
+					if input.Platform == "gemini" {
+						path = "/v1beta/models/" + input.Model + ":generateContent"
+					}
+					if !SynchronousImageChannelSupported(channel, input.Model, path) {
+						candidate.Reasons = append(candidate.Reasons, "synchronous_protocol_not_supported")
+					}
 				}
 			} else {
 				if !mediaChannelSupportsVideoPlatform(&channel, input.Model, input.Platform) {
@@ -1135,7 +1197,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	routing := ImageAccountRouting{}
 	effectiveRetries := retries
 	for _, attempt := range attempts {
-		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 602 || attempt.Code == 610 || attempt.Code == 613) {
+		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 602 || attempt.Code == 610 || attempt.Code == 613 || attempt.Code == 603 && attempt.TransportUsed == "remote" && imageYouTubeNoticePattern.MatchString(attempt.ErrorMessage)) {
 			effectiveRetries = max(effectiveRetries, 1)
 			break
 		}

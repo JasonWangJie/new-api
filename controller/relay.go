@@ -266,7 +266,19 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			AutoBan: &autoBanInt,
 		}, nil
 	}
-	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
+	var channel *model.Channel
+	var imageErr *types.NewAPIError
+	if retryParam.TokenGroup != "auto" {
+		channel, imageErr = service.SelectSyncImageChannel(c, info.OriginModelName, nil)
+		if imageErr != nil {
+			return nil, imageErr
+		}
+	}
+	var selectGroup string
+	var err error
+	if channel == nil {
+		channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(retryParam)
+	}
 	if err != nil {
 		return nil, types.NewError(fmt.Errorf("获取分组 %s 下模型 %s 的可用渠道失败（retry）: %s", selectGroup, info.OriginModelName, err.Error()), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -274,6 +286,10 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 
+	channel, imageErr = service.SelectSyncImageChannel(c, info.OriginModelName, channel)
+	if imageErr != nil {
+		return nil, imageErr
+	}
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)

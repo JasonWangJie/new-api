@@ -26,3 +26,33 @@ func TestXAIModelEndpointTypes(t *testing.T) {
 	}
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAI}, GetEndpointTypesByChannelType(constant.ChannelTypeOpenAI, "grok-imagine-video"), "other channel types retain their own inference")
 }
+
+func TestDedicatedImageModelEndpointTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		channelType int
+		model       string
+		want        []constant.EndpointType
+	}{
+		{"openai", constant.ChannelTypeOpenAI, "gpt-image-2", []constant.EndpointType{constant.EndpointTypeImageGeneration}},
+		{"newapi", constant.ChannelTypeNewAPI, "gpt-image-2", []constant.EndpointType{constant.EndpointTypeImageGeneration}},
+		{"sub2api", constant.ChannelTypeSub2API, "gpt-image-2", []constant.EndpointType{constant.EndpointTypeImageGeneration}},
+		{"azure", constant.ChannelTypeAzure, "gpt-image-1", []constant.EndpointType{constant.EndpointTypeImageGeneration}},
+		{"openrouter", constant.ChannelTypeOpenRouter, "flux-1", []constant.EndpointType{constant.EndpointTypeImageGeneration}},
+		{"gemini_native_image", constant.ChannelTypeGemini, "imagen-3.0-generate-002", []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeGemini}},
+		{"vertex_native_image", constant.ChannelTypeVertexAi, "imagen-4.0-generate-001", []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeGemini}},
+		{"gemini_multimodal", constant.ChannelTypeGemini, "gemini-3.1-flash-image", []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}},
+		{"newapi_text", constant.ChannelTypeNewAPI, "gpt-4o", []constant.EndpointType{
+			constant.EndpointTypeOpenAI,
+			constant.EndpointTypeOpenAIResponse,
+			constant.EndpointTypeOpenAIResponseCompact,
+			constant.EndpointTypeAnthropic,
+			constant.EndpointTypeGemini,
+			constant.EndpointTypeOpenAIAlphaSearch,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, GetEndpointTypesByChannelType(tc.channelType, tc.model))
+		})
+	}
+}

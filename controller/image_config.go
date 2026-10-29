@@ -98,6 +98,13 @@ func PreviewMediaRouting(c *gin.Context) {
 		return
 	}
 	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)
+	if input.ExecutionMode == "" {
+		input.ExecutionMode = "async"
+	}
+	if input.ExecutionMode != "async" && input.ExecutionMode != "sync" || input.ExecutionMode == "sync" && (input.MediaType != "image" || input.Platform == "mixed") {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview execution mode"))
+		return
+	}
 	if input.TokenID < 0 || input.TokenID == 0 && input.Group == "" || len(input.Group) > 64 || !service.ImageRoutingPlatform(input.Platform) || service.ValidateImageModelName(input.Model) != nil || input.MediaType != "image" && input.MediaType != "video" {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview request"))
 		return

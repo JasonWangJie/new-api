@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -977,8 +978,23 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 			return nil, service.NewImageReferenceFailure(referenceIndex, err)
 		}
 		if !bound && mode != "local" && !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
-			parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{FileUri: part.URL}})
-			continue
+			mimeType := ""
+			if parsed, err := url.Parse(part.URL); err == nil {
+				switch strings.ToLower(path.Ext(parsed.Path)) {
+				case ".jpg", ".jpeg":
+					mimeType = "image/jpeg"
+				case ".png":
+					mimeType = "image/png"
+				case ".webp":
+					mimeType = "image/webp"
+				case ".gif":
+					mimeType = "image/gif"
+				}
+			}
+			if mimeType != "" {
+				parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{FileUri: part.URL, MimeType: mimeType}})
+				continue
+			}
 		}
 		image, err := resolveAsyncImageReference(ctx, task.TokenId, part.URL, cfg)
 		if err != nil {
