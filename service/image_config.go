@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
@@ -321,6 +322,9 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 			for _, channel := range channels {
 				capability := ImageChannelCapability(channel, request.Model)
 				if capability.Provider != provider || !ImageCapabilitySupportsRequest(capability, request) {
+					continue
+				}
+				if channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility && !MixedImageChannelRequestSupported(channel, request) {
 					continue
 				}
 				supportsReferenceCount := imageChannelSupportsReferenceCount(channel, referenceCount)

@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/tidwall/gjson"
 )
+
+var tianyueImageAspectRatios = []string{"auto", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1"}
 
 // TianyueImageRequest uses the vendor's image contract for both generation and
 // reference-image editing. The vendor bills one image via duration=1; arbitrary
@@ -49,6 +52,9 @@ func TianyueImageRequest(request AsyncImageRequest, references []string) (map[st
 	}
 	if ratio == "" || ratio == "auto" {
 		ratio = "1:1"
+	}
+	if !slices.Contains(tianyueImageAspectRatios, ratio) {
+		return nil, errors.New("TianYue image aspect_ratio must be auto, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, or 1:1")
 	}
 	fields := map[string]any{"model": request.Model, "prompt": request.Prompt, "duration": 1, "aspect_ratio": ratio}
 	resolution := AsyncImageRoutingResolution(request)
@@ -153,25 +159,36 @@ func NormalizeTianyueImageTask(body []byte, baseURL string) ([]byte, error) {
 	return common.Marshal(fields)
 }
 
-// IsRetryableTianyueImageTaskFailure permits the vendor's explicit temporary
+// ClassifyTianyueImageTaskFailure permits the vendor's explicit temporary
 // failure only for the accepted task being polled. The complete raw envelope
 // must remain free of output or contradictory diagnostics before normalization
 // drops fields that are not part of the host's status projection.
-func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
+func ClassifyTianyueImageTaskFailure(body []byte, taskID string) *AsyncImageFailure {
 	if taskID == "" {
-		return false
+		return nil
 	}
 	var envelope map[string]any
 	if common.Unmarshal(body, &envelope) != nil || envelope == nil {
-		return false
+		return nil
 	}
 	normalized, err := NormalizeTianyueImageTask(body, "")
-	if err != nil || gjson.GetBytes(normalized, "task_id").Str != taskID || gjson.GetBytes(normalized, "reason").Str != "生成失败，请稍后重试" {
-		return false
+	if err != nil || gjson.GetBytes(normalized, "task_id").Str != taskID {
+		return nil
+	}
+	reason := gjson.GetBytes(normalized, "reason").Str
+	failure := &AsyncImageFailure{Code: 606}
+	switch reason {
+	case "生成失败，请稍后重试":
+	case "无法下载参考图，请确认链接可直接访问，且未过期或要求登录":
+		failure.Code, failure.RetrySameChannel = 602, true
+	case "连接上游服务失败":
+		failure.RetrySameChannel = true
+	default:
+		return nil
 	}
 	status := gjson.GetBytes(normalized, "status").Str
 	if status != "FAILED" && status != "FAILURE" {
-		return false
+		return nil
 	}
 	task, wrapped := envelope["data"].(map[string]any)
 	if wrapped {
@@ -186,16 +203,51 @@ func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
 		nativeStatus, _ := native["status"].(string)
 		nativeTaskID, _ := native["task_id"].(string)
 		providerError, ok := native["error"].(map[string]any)
-		if !ok || !strings.EqualFold(nativeStatus, "failed") || !strings.HasPrefix(nativeTaskID, "task_") || len(nativeTaskID) > 191 || providerError["code"] != "task_failed" || providerError["message"] != "生成失败，请稍后重试" || native["message"] != "生成失败，请稍后重试" || native["fail_reason"] != "生成失败，请稍后重试" {
-			return false
+		if !ok || !strings.EqualFold(nativeStatus, "failed") || providerError["code"] != "task_failed" || providerError["message"] != reason {
+			return nil
+		}
+		if nativeTaskID == "" {
+			// Some connection failures close before the vendor receives an
+			// inner task ID. The outer accepted task must still match exactly.
+			if reason != "连接上游服务失败" || native["task_id"] != nil && native["task_id"] != "" {
+				return nil
+			}
+		} else if !strings.HasPrefix(nativeTaskID, "task_") || len(nativeTaskID) > 191 {
+			return nil
+		}
+		for _, field := range []string{"message", "fail_reason"} {
+			if native[field] != reason && (reason != "连接上游服务失败" || native[field] != nil && native[field] != "") {
+				return nil
+			}
+		}
+		if failure.Code == 602 {
+			// These two exact locations use "none" as a failed-task sentinel.
+			// Actual URLs and output in every other location remain barriers.
+			if native["url"] == "none" {
+				delete(native, "url")
+			}
+			if metadata, ok := native["metadata"].(map[string]any); ok && metadata["url"] == "none" {
+				delete(metadata, "url")
+			}
 		}
 		delete(task, "data")
 		delete(native, "status")
 		delete(native, "task_id")
 		delete(providerError, "code")
-		scopes = append(scopes, native)
+		scopes = append(scopes, native, providerError)
+		delete(native, "error")
 	}
 	for index, scope := range scopes {
+		// Failed gateway rows can copy their diagnostic into result_url.
+		// Only the exact known reason is a placeholder rather than an output.
+		if index == 1 && scope["result_url"] == reason {
+			delete(scope, "result_url")
+		}
+		for _, field := range []string{"message", "fail_reason"} {
+			if scope[field] == reason {
+				delete(scope, field)
+			}
+		}
 		for _, field := range []string{"task_id", "id"} {
 			if value, exists := scope[field]; exists {
 				// The outer gateway row has a numeric database ID in addition to
@@ -205,7 +257,7 @@ func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
 					continue
 				}
 				if value != nil && value != "" && value != taskID {
-					return false
+					return nil
 				}
 				delete(scope, field)
 			}
@@ -213,7 +265,7 @@ func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
 		if value, exists := scope["status"]; exists {
 			text, ok := value.(string)
 			if value != nil && (!ok || text != "" && !strings.EqualFold(text, "FAILED") && !strings.EqualFold(text, "FAILURE")) {
-				return false
+				return nil
 			}
 			delete(scope, "status")
 		}
@@ -225,10 +277,10 @@ func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
 	}
 	for _, scope := range scopes {
 		if !isImageGatewayFailureMetadata(scope, http.StatusInternalServerError, "", 0) {
-			return false
+			return nil
 		}
 	}
-	return true
+	return failure
 }
 
 // ValidateTianyueImageSubmission runs after administrator parameter overrides,
@@ -237,6 +289,9 @@ func IsRetryableTianyueImageTaskFailure(body []byte, taskID string) bool {
 func ValidateTianyueImageSubmission(body []byte, count int) error {
 	if count != 1 || gjson.GetBytes(body, "duration").Raw != "1" {
 		return errors.New("TianYue image requests require one image and duration=1")
+	}
+	if ratio := gjson.GetBytes(body, "aspect_ratio"); ratio.Type != gjson.String || !slices.Contains(tianyueImageAspectRatios, ratio.Str) {
+		return errors.New("TianYue image aspect_ratio must be auto, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, or 1:1")
 	}
 	if value := gjson.GetBytes(body, "images"); value.Exists() {
 		if !value.IsArray() {

@@ -376,7 +376,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				request.Native["images"] = data
 			}
 		}
-		if tianyue {
+		if tianyue && !accepted {
 			var err error
 			request.Native, err = service.TianyueImageRequest(request, submitImageURLs)
 			if err != nil {

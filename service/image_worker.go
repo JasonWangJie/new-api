@@ -809,6 +809,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.UpstreamTaskID = task.UpstreamTaskId
 				last.SynchronousRetryableResponse = submissionResponseRetry && failure.SynchronousRetryableResponse
 				last.SubmissionRejected = submissionResponseRetry && failure.SubmissionRejected
+				last.RetrySameChannel = failure.UpstreamTerminal && !failure.ExecutionUnknown && failure.RetrySameChannel && (failure.Code == 602 || failure.Code == 606)
 				last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal))
 				encoded, err := common.Marshal(attempts)
 				if err != nil {

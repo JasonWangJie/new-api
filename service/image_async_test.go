@@ -500,7 +500,12 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 		gemini                  bool
 		localTimeoutRetry       bool
 		alternateAvailable      bool
+		terminalLocalRetry      bool
 	}{
+		{name: "confirmed vendor reference failure retries original channel locally", terminalLocalRetry: true, sameChannel: true, alternateAvailable: true, channelMode: "passthrough_fallback_local"},
+		{name: "confirmed vendor reference failure selects another original channel key", terminalLocalRetry: true, sameChannel: true, alternateAvailable: true, otherKey: true, channelMode: "passthrough_fallback_local"},
+		{name: "confirmed vendor reference failure in mixed pool retries locally", terminalLocalRetry: true, mixed: true, sameChannel: true, alternateAvailable: true, channelMode: "passthrough_fallback_local"},
+		{name: "confirmed vendor reference failure respects passthrough mode", terminalLocalRetry: true, channelMode: "passthrough"},
 		{name: "channel timeout preference keeps the original channel with healthy alternatives", sameChannel: true, alternateAvailable: true, localTimeoutRetry: true},
 		{name: "channel timeout preference selects another original channel account", sameChannel: true, alternateAvailable: true, otherKey: true, localTimeoutRetry: true},
 		{name: "channel timeout preference does not affect unreachable references", localTimeoutRetry: true, failureMessage: "参考素材链接无法访问（域名/端口不可达）"},
@@ -587,6 +592,9 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 			task.DispatchedAt, task.UpstreamTaskId = time.Now().Unix(), "failed-reference-job"
 			fingerprint := ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a")
 			initialHistory := []ImageChannelAttempt{{ChannelId: task.ChannelId, KeyFingerprint: fingerprint, Dispatched: true, StartedAt: task.DispatchedAt, ReferenceMode: "passthrough", TransportUsed: "remote", RetryReferenceTimeoutLocally: tc.localTimeoutRetry}}
+			if tc.terminalLocalRetry {
+				initialHistory[0].ReferenceMode = tc.channelMode
+			}
 			if tc.gemini {
 				task.DispatchedAt, task.UpstreamTaskId, initialHistory = 0, "", nil
 			}
@@ -625,6 +633,10 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 					failure := ClassifyAsyncImageFailure(errors.New(message), http.StatusOK)
 					failure.Message = message
 					failure.InternalCode, failure.UpstreamTerminal = "upstream_job_failed", true
+					if tc.terminalLocalRetry {
+						failure.Code, failure.RetrySameChannel = 602, true
+						failure.Message = "无法下载参考图，请确认链接可直接访问，且未过期或要求登录"
+					}
 					return nil, model.AsyncImageBill{}, failure
 				}
 				assert.Equal(t, target.Id, channel.Id)
@@ -688,6 +700,13 @@ func TestAsyncImageReferenceDownloadFailureSelectsTransportForChannelRetry(t *te
 				assert.Equal(t, "failed-reference-job", history[len(history)-2].UpstreamTaskID)
 			}
 			assert.Equal(t, tc.sameChannel, history[len(history)-1].ReferenceFallback)
+			if tc.terminalLocalRetry && tc.sameChannel {
+				last := &history[len(history)-1]
+				last.FinishedAt, last.Code, last.ReferenceFailure, last.RetrySameChannel = time.Now().Unix(), 602, true, true
+				routing := ImageAccountAttemptRouting(history, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+				assert.Zero(t, routing.PinChannel, "a failed local fallback must not pin another local retry")
+				assert.Equal(t, target.Id, routing.AvoidChannel)
+			}
 			assert.Equal(t, tc.localTimeoutRetry && tc.sameChannel, history[len(history)-1].RetryReferenceTimeoutLocally)
 			if tc.sameChannel {
 				assert.Equal(t, "local", history[len(history)-1].ReferenceMode)
@@ -725,6 +744,9 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 		cancel      bool
 	}{
 		{name: "gateway failure switches channel", status: 502, body: gatewayError},
+		{name: "service timeout response switches channel and settles once", status: 502, body: `{"error":{"code":"bad_response_body","type":"new_api_error","message":"service timeout, please try again later."}}`, success: true},
+		{name: "service timeout response waits for only account", status: 502, body: `{"error":{"code":"bad_response_body","message":"service timeout, please try again later."}}`, onlyAccount: true},
+		{name: "service error refusal switches channel and settles once", status: 400, body: `{"error":{"code":"invalid_request","type":"new_api_error","message":"service error, please try again later."}}`, success: true},
 		{name: "gateway failure waits for only account", status: 502, body: gatewayError, onlyAccount: true},
 		{name: "quota rejection switches channel", status: 503, body: quotaError},
 		{name: "quota rejection waits for only account", status: 503, body: quotaError, onlyAccount: true},
@@ -1872,6 +1894,11 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		expired      bool
 		synchronous  bool
 	}{
+		{name: "terminal connection failure reuses its hold", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, RetrySameChannel: true}, billStatus: "reserved", wantStatus: model.ImageTaskQueued, wantBill: "reserved"},
+		{name: "terminal connection failure cannot reuse a refunded hold", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, RetrySameChannel: true}, billStatus: "refunded", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "terminal connection retry cannot replace output", resultEvent: "output_received", failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, RetrySameChannel: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "terminal connection retry obeys total budget", noRetries: true, failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, RetrySameChannel: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
+		{name: "terminal connection retry obeys deadline", expired: true, failure: AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, RetrySameChannel: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "explicit native creation refusal reuses the hold", synchronous: true, mixed: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskQueued, wantBill: "reserved"},
 		{name: "native creation refusal cannot reuse a refunded hold", synchronous: true, mixed: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "refunded", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "native creation refusal obeys total retry budget", synchronous: true, mixed: true, noRetries: true, failure: AsyncImageFailure{Code: 606, HTTPStatus: 500, SubmissionRejected: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
@@ -2384,6 +2411,67 @@ func TestAsyncImageWorkerSingleAccountTransientRetriesRemainBounded(t *testing.T
 	}
 	assert.Equal(t, cfg.TransientRetries+1, calls)
 	assert.Equal(t, cfg.TransientRetries, task.RetryCount)
+}
+
+func TestAsyncImageWorkerTerminalConnectionRetryStaysOnChannel(t *testing.T) {
+	db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+	asyncImageWorkerQuotaCacheFixture(t, task)
+	cfg.TransientRetries, cfg.CircuitBreaker = 2, false
+	require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+	channelID, startedAt := task.ChannelId, task.StartedAt
+	fingerprint := ImageIdentityHash("image-account", strconv.Itoa(channelID), "upstream-key-a")
+	submissions, polls := 0, 0
+	ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, _ AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+		assert.Equal(t, channelID, channel.Id, "healthy alternate channels must not receive this retry")
+		if current.UpstreamTaskId != "" {
+			polls++
+			assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
+			return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", Message: "连接上游服务失败", HTTPStatus: http.StatusOK, UpstreamTerminal: true, RetrySameChannel: true}
+		}
+		submissions++
+		require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+		require.NoError(t, beforeInvoke())
+		require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("upstream_task_id", "connection-job-"+strconv.Itoa(submissions)).Error)
+		return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+	}
+	var err error
+	for attempt := range cfg.TransientRetries + 1 {
+		require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+		require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+		require.NotEmpty(t, task.UpstreamTaskId)
+		require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+		task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+		require.NoError(t, err)
+		require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+		require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+		assert.Equal(t, startedAt, task.StartedAt)
+		var user model.User
+		var bill model.AsyncImageBill
+		require.NoError(t, db.First(&user, task.UserId).Error)
+		require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+		if attempt == cfg.TransientRetries {
+			assert.Equal(t, model.ImageTaskFailed, task.Status)
+			assert.Equal(t, "refunded", bill.Status)
+			assert.Equal(t, 1000, user.Quota)
+			break
+		}
+		require.Equal(t, model.ImageTaskQueued, task.Status)
+		assert.Equal(t, "reserved", bill.Status)
+		assert.Equal(t, 900, user.Quota, "retries retain one reservation")
+		require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+		task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+		require.NoError(t, err)
+		require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+		require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+		assert.Equal(t, attempt+1, submissions, "cooldown must wait on the original channel")
+		assert.Equal(t, attempt+1, task.RetryCount, "cooldown does not spend generation retries")
+		require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(fingerprint)).Err())
+		require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+		task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, cfg.TransientRetries+1, submissions)
+	assert.Equal(t, cfg.TransientRetries+1, polls)
 }
 
 func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
@@ -3291,6 +3379,7 @@ func TestAsyncImageChannelReferenceCapacityRouting(t *testing.T) {
 }
 
 func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
+	const timeoutError = `{"error":{"code":"bad_response_body","type":"new_api_error","message":"service timeout, please try again later."}}`
 	const gatewayError = `{"error":{"code":"upstream_request_failed","type":"new_api_error","message":"The upstream image service could not complete the image request. Please retry shortly."}}`
 	const quotaError = `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"The selected upstream image service has no available quota. Please retry shortly."}}`
 	for _, tc := range []struct {
@@ -3299,6 +3388,19 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 		readError, retryable bool
 	}{
 		{name: "complete gateway failure", body: gatewayError, status: 502, retryable: true},
+		{name: "complete service timeout response", body: timeoutError, status: 502, retryable: true},
+		{name: "service timeout requires actual gateway status", body: timeoutError, status: 504},
+		{name: "other response parsing failures stay blocked", body: strings.Replace(timeoutError, "service timeout, please try again later.", "response could not be parsed", 1), status: 502},
+		{name: "transport failures stay blocked", body: strings.Replace(timeoutError, "bad_response_body", "do_request_failed", 1), status: 502},
+		{name: "service timeout with receipt stays blocked", body: strings.TrimSuffix(timeoutError, "}") + `,"metadata":{"operation_id":"accepted-operation"}}`, status: 502},
+		{name: "service timeout with output stays blocked", body: strings.TrimSuffix(timeoutError, "}") + `,"data":[{"url":"https://result.example/image.png"}]}`, status: 502},
+		{name: "service timeout with unknown execution stays blocked", body: strings.TrimSuffix(timeoutError, "}") + `,"metadata":{"reason":"execution_unknown"}}`, status: 502},
+		{name: "service timeout with authentication rejection stays blocked", body: strings.Replace(timeoutError, "new_api_error", "authentication_error", 1), status: 502},
+		{name: "service timeout with invalid parameters stays blocked", body: strings.TrimSuffix(timeoutError, "}") + `,"metadata":{"reason":"invalid input parameters"}}`, status: 502},
+		{name: "service timeout with policy rejection stays blocked", body: strings.TrimSuffix(timeoutError, "}") + `,"metadata":{"reason":"content_policy_violation"}}`, status: 502},
+		{name: "service timeout must finish reading", body: timeoutError, status: 502, readError: true},
+		{name: "service timeout cannot be truncated", body: timeoutError + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), status: 502},
+		{name: "service timeout needs valid JSON", body: timeoutError[:len(timeoutError)-1], status: 502},
 		{name: "explicit quota rejection", body: quotaError, status: 503, retryable: true},
 		{name: "known quota code accepts translated diagnostic and advice", body: `{"error":{"code":"upstream_quota_unavailable","type":"new_api_error","message":"上游额度暂不可用，请切换供应商或稍后重试"},"retryable":true,"retry_after_seconds":5,"region":"region-a"}`, status: 503, retryable: true},
 		{name: "quota categories are case insensitive equivalents", body: `{"error":{"code":"QUOTA_EXHAUSTED","type":"INSUFFICIENT_QUOTA","message":"The upstream quota has been exhausted."},"metadata":{"code":"quota-unavailable","status":"503","type":"insufficient_balance"}}`, status: 503, retryable: true},
@@ -3386,6 +3488,7 @@ func TestAsyncImageSynchronousGatewayResponseClassification(t *testing.T) {
 }
 
 func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testing.T) {
+	const serviceError = `{"error":{"code":"invalid_request","type":"new_api_error","message":"service error, please try again later."}}`
 	const creationError = `{"error":{"type":"new_api_error","message":"上游创建任务失败，状态码:502"}}`
 	const capacityError = `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"排队等待可用账户槽位超时，当前并发已满"}}`
 	const processingError = `{"error":{"message":"请求处理失败，请提供请求 ID 联系支持"}}`
@@ -3401,6 +3504,18 @@ func TestAsyncImageSubmissionRejectionAndReferenceTimeoutClassification(t *testi
 	}{
 		{name: "Gemini concurrency refusal switches account", status: 400, body: capacityError, code: 603, rejected: true, gemini: true},
 		{name: "request processing refusal switches account", status: 400, body: processingError, code: 606, rejected: true},
+		{name: "generic invalid request service error switches account", status: 400, body: serviceError, code: 606, rejected: true},
+		{name: "Gemini generic service error switches account", status: 400, body: serviceError, code: 606, rejected: true, gemini: true},
+		{name: "service error with receipt stays terminal", status: 400, body: strings.TrimSuffix(serviceError, "}") + `,"metadata":{"task_id":"accepted-job"}}`, code: 604},
+		{name: "service error with output stays terminal", status: 400, body: strings.TrimSuffix(serviceError, "}") + `,"data":[{"url":"https://result.example/image.png"}]}`, code: 604},
+		{name: "service error with unknown execution stays blocked", status: 400, body: strings.TrimSuffix(serviceError, "}") + `,"metadata":{"reason":"execution_unknown"}}`, code: 604},
+		{name: "service error with input rejection stays terminal", status: 400, body: strings.TrimSuffix(serviceError, "}") + `,"metadata":{"reason":"invalid input parameters"}}`, code: 604},
+		{name: "service error with authentication type stays terminal", status: 400, body: strings.Replace(serviceError, "new_api_error", "authentication_error", 1), code: 604},
+		{name: "service error with policy rejection stays terminal", status: 400, body: strings.TrimSuffix(serviceError, "}") + `,"metadata":{"reason":"content_policy_violation"}}`, code: 604},
+		{name: "service error requires exact diagnostic", status: 400, body: strings.Replace(serviceError, "service error, please try again later.", "If service error, please try again later.", 1), code: 604},
+		{name: "service error must finish reading", status: 400, body: serviceError, code: 610, readError: true},
+		{name: "service error cannot be truncated", status: 400, body: serviceError + strings.Repeat(" ", asyncImageProviderErrorBodyLimit), code: 604},
+		{name: "service error needs valid JSON", status: 400, body: serviceError[:len(serviceError)-1], code: 610},
 		{name: "English concurrent slots refusal", status: 400, body: `{"error":{"code":"400","type":"invalid_request_error","message":"Concurrent execution slots are full. Retry later."}}`, code: 603, rejected: true},
 		{name: "resource pool exhausted refusal", status: 400, body: `{"error":{"message":"Upstream resource pool exhausted"}}`, code: 603, rejected: true},
 		{name: "English request processing refusal", status: 400, body: `{"error":{"message":"Request processing failed. Provide the request ID to support."}}`, code: 606, rejected: true},

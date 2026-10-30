@@ -119,9 +119,13 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const { t } = useTranslation()
   const [tokenId, setTokenId] = useState('')
   const [modelId, setModelId] = useState('')
-  const [prompt, setPrompt] = useState(
-    () => sessionStorage.getItem(`new-api:image-prompt:${userId}`) || ''
-  )
+  const [prompt, setPrompt] = useState(() => {
+    try {
+      return sessionStorage.getItem(`new-api:image-prompt:${userId}`) || ''
+    } catch {
+      return ''
+    }
+  })
   const [parts, setParts] = useState<ReferencePart[]>([
     { id: 'reference-urls', type: 'image_urls', value: '' },
   ])

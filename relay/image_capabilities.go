@@ -256,6 +256,23 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 			}
 		}
 	}
+	if ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility {
+		if probe.GetBody == nil {
+			return fmt.Errorf("TianYue image submit body is unavailable")
+		}
+		body, err := probe.GetBody()
+		if err != nil {
+			return err
+		}
+		encoded, err := io.ReadAll(io.LimitReader(body, (64<<20)+1))
+		_ = body.Close()
+		if err != nil || len(encoded) > 64<<20 {
+			return fmt.Errorf("TianYue image submit body exceeds the byte limit")
+		}
+		if err := service.ValidateTianyueImageSubmission(encoded, request.Count); err != nil {
+			return err
+		}
+	}
 	if err := service.ValidateMixedImageSubmitCount(probe, request.Count); err != nil {
 		return err
 	}

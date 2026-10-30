@@ -159,6 +159,48 @@ func TestTabtabImageModelContracts(t *testing.T) {
 		_, err := service.NormalizeTabtabImageTask([]byte(body), "https://api.example", "accepted")
 		require.Error(t, err, "a failure with output evidence must continue querying the accepted job")
 	}
+	const failedMetadata = `{"code":"OK","message":"success","data":{"id":"accepted","usage_record_id":"accepted","request_id":"MTASK_metadata","model":"seedream-5-pro","model_code":"seedream-5-pro","status":"failed","charged_points":0,"results":[],"error_code":"UPSTREAM_UNAVAILABLE","error_message":"generate failed","generation_time_ms":33029,"provider_request_id":"3c7705ed-76ba-4b7c-a1d2-471d624810ed","created_at":"2026-10-29T05:22:01.76606Z","updated_at":"2026-10-29T05:22:34.82783Z"},"request_id":"REQ_metadata"}`
+	for _, tc := range []struct {
+		name, body, requestID string
+		invalid               bool
+	}{
+		{name: "failed task metadata", body: failedMetadata, requestID: "3c7705ed-76ba-4b7c-a1d2-471d624810ed"},
+		{name: "failed task falls back to data request ID", body: strings.Replace(failedMetadata, `"provider_request_id":"3c7705ed-76ba-4b7c-a1d2-471d624810ed",`, "", 1), requestID: "MTASK_metadata"},
+		{name: "failed task falls back to envelope request ID", body: strings.NewReplacer(`"provider_request_id":"3c7705ed-76ba-4b7c-a1d2-471d624810ed",`, "", `"request_id":"MTASK_metadata",`, "").Replace(failedMetadata), requestID: "REQ_metadata"},
+		{name: "failed task metadata cannot change accepted ID", body: strings.Replace(failedMetadata, `"usage_record_id":"accepted"`, `"usage_record_id":"another-task"`, 1), invalid: true},
+		{name: "failed task metadata cannot contradict model", body: strings.Replace(failedMetadata, `"model_code":"seedream-5-pro"`, `"model_code":"another-model"`, 1), invalid: true},
+		{name: "failed task rejects invalid timestamp", body: strings.Replace(failedMetadata, "2026-10-29T05:22:01.76606Z", "not-a-timestamp", 1), invalid: true},
+		{name: "failed task rejects nonstring metadata", body: strings.Replace(failedMetadata, `"created_at":"2026-10-29T05:22:01.76606Z"`, `"created_at":123`, 1), invalid: true},
+		{name: "failed task rejects oversized request ID", body: strings.Replace(failedMetadata, "3c7705ed-76ba-4b7c-a1d2-471d624810ed", strings.Repeat("r", 192), 1), invalid: true},
+		{name: "failed task rejects request ID whitespace boundary", body: strings.Replace(failedMetadata, "3c7705ed-76ba-4b7c-a1d2-471d624810ed", " provider-request", 1), invalid: true},
+		{name: "failed task rejects request ID control character", body: strings.Replace(failedMetadata, "3c7705ed-76ba-4b7c-a1d2-471d624810ed", `provider\nrequest`, 1), invalid: true},
+		{name: "failed task metadata cannot hide output", body: strings.Replace(failedMetadata, `"charged_points":0`, `"charged_points":0,"output":{"url":"https://cdn.example/image.png"}`, 1), invalid: true},
+		{name: "failed task rejects duplicate metadata", body: strings.Replace(failedMetadata, `"usage_record_id":"accepted"`, `"usage_record_id":"another-task","usage_record_id":"accepted"`, 1), invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := service.NormalizeTabtabImageTask([]byte(tc.body), "https://api.example", "accepted")
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			var projected struct {
+				TaskID    string   `json:"task_id"`
+				Status    string   `json:"status"`
+				Reason    string   `json:"reason"`
+				ErrorCode string   `json:"error_code"`
+				RequestID string   `json:"request_id"`
+				URLs      []string `json:"urls"`
+			}
+			require.NoError(t, common.Unmarshal(body, &projected))
+			assert.Equal(t, "accepted", projected.TaskID)
+			assert.Equal(t, "failed", projected.Status)
+			assert.Equal(t, "generate failed", projected.Reason)
+			assert.Equal(t, "UPSTREAM_UNAVAILABLE", projected.ErrorCode)
+			assert.Equal(t, tc.requestID, projected.RequestID)
+			assert.Empty(t, projected.URLs)
+		})
+	}
 	assert.NotContains(t, service.SanitizeAsyncImageDiagnostic("provider failed with sk_test-secret-value", 200), "sk_test-secret-value")
 	policy := service.ImageModelCapability{Resolutions: []string{"1K", "4K"}, Qualities: []string{"high", "xhigh"}, Formats: []string{"png", "gif"}, Backgrounds: []string{"opaque", "unsupported"}, MaxOutputImages: 5}
 	projected, supported := service.TabtabWorkbenchImageCapability("gpt-image-2", policy)
@@ -241,8 +283,11 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 		mask, failure, rejected bool
 		override                string
 		httpReceiptConflict     bool
+		failureBody             string
+		wantRequestID           string
 	}{
 		{name: "relative result"}, {name: "image edit and mask", mask: true}, {name: "terminal failure", failure: true}, {name: "explicit rejection", rejected: true}, {name: "override bypass", override: `{"args":{"n":128}}`}, {name: "HTTP refusal with receipt", httpReceiptConflict: true},
+		{name: "terminal failure with provider metadata", failure: true, failureBody: `{"code":"OK","message":"success","data":{"id":"USG_test","usage_record_id":"USG_test","request_id":"MTASK_accepted","model":"gpt-image-2","model_code":"gpt-image-2","status":"failed","charged_points":0,"results":[],"error_code":"UPSTREAM_UNAVAILABLE","error_message":"generate failed","generation_time_ms":33029,"provider_request_id":"3c7705ed-76ba-4b7c-a1d2-471d624810ed","created_at":"2026-10-29T05:22:01.76606Z","updated_at":"2026-10-29T05:22:34.82783Z"},"request_id":"REQ_poll"}`, wantRequestID: "3c7705ed-76ba-4b7c-a1d2-471d624810ed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			creates, polls, downloads := 0, 0, 0
@@ -280,6 +325,10 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 					assert.Equal(t, http.MethodGet, r.Method)
 					assert.Equal(t, "USG_test", r.URL.Query().Get("id"))
 					if tc.failure {
+						if tc.failureBody != "" {
+							_, _ = w.Write([]byte(tc.failureBody))
+							return
+						}
 						_, _ = w.Write([]byte(`{"code":"OK","data":{"id":"USG_test","status":"failed","error_code":"UPSTREAM_UNAVAILABLE","error_message":"Generation failed"}}`))
 						return
 					}
@@ -344,7 +393,20 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 				var failure *service.AsyncImageFailure
 				require.ErrorAs(t, err, &failure)
 				assert.True(t, failure.UpstreamTerminal)
-				assert.Equal(t, "Generation failed", failure.Message)
+				assert.Equal(t, 610, failure.Code, "provider diagnostics must not change retry classification")
+				assert.Equal(t, "UPSTREAM_UNAVAILABLE", failure.ProviderCode)
+				assert.Equal(t, tc.wantRequestID, failure.UpstreamRequestID)
+				message := "UPSTREAM_UNAVAILABLE: Generation failed"
+				if tc.failureBody != "" {
+					message = "UPSTREAM_UNAVAILABLE: generate failed"
+				}
+				assert.Equal(t, message, failure.Message)
+				assert.False(t, failure.SubmissionRejected, "an accepted failed task is not a new submission rejection")
+				hold, err := model.GetAsyncImageReservation(t.Context(), task)
+				require.NoError(t, err)
+				require.NotNil(t, hold)
+				assert.Equal(t, "reserved", hold.Status, "the worker owns terminal refund; the relay must retain the original hold")
+				assert.Equal(t, 5000, hold.ReservedQuota)
 				assert.Zero(t, downloads)
 				return
 			}
@@ -742,6 +804,7 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name, upstream    string
 		referenceURL      string
+		aspectRatio, size string
 		count, references int
 		channelType       int
 		override          string
@@ -754,6 +817,7 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 		tianyue           bool
 		usagePaths        map[string]string
 		customProfile     bool
+		submitBody        map[string]any
 	}{
 		{name: "pro_single", upstream: "doubao-seedream-5-0-pro-260628", count: 1},
 		{name: "ark_explicit_nonstreaming", upstream: "doubao-seedream-5-0-pro-260628", count: 1, native: map[string]common.RawMessage{"stream": common.RawMessage(`false`)}},
@@ -772,6 +836,14 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 		{name: "openai_empty_mask_override_rejected", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, references: 1, mask: true, override: `{"operations":[{"path":"mask","mode":"set","value":""}]}`, wantError: "mask"},
 		{name: "openai_passthrough_skips_override", upstream: "gpt-image-1", channelType: constant.ChannelTypeOpenAI, count: 1, passThrough: true, override: `{"operations":[{"path":"n","mode":"set","value":2}]}`},
 		{name: "tianyue_mask_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, mask: true, tianyue: true, wantError: "mask"},
+		{name: "tianyue_wide_ratio_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, aspectRatio: "21:9", tianyue: true, wantError: "aspect_ratio"},
+		{name: "tianyue_nonstandard_ratio_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, aspectRatio: "5:4", tianyue: true, wantError: "aspect_ratio"},
+		{name: "tianyue_landscape_ratio_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, aspectRatio: "16:9", tianyue: true},
+		{name: "tianyue_size_ratio_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, size: "2100x900", tianyue: true, wantError: "aspect_ratio"},
+		{name: "tianyue_size_ratio_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, size: "1600x900", tianyue: true},
+		{name: "tianyue_override_ratio_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, tianyue: true, override: `{"operations":[{"path":"aspect_ratio","mode":"set","value":"21:9"}]}`, wantError: "aspect_ratio"},
+		{name: "tianyue_template_ratio_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, tianyue: true, submitBody: map[string]any{"model": "{upstream_model}", "duration": 1, "aspect_ratio": "21:9"}, wantError: "aspect_ratio"},
+		{name: "ordinary_newapi_wide_ratio_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, aspectRatio: "21:9", native: map[string]common.RawMessage{"aspect_ratio": common.RawMessage(`"21:9"`)}},
 		{name: "tianyue_uploaded_local_reference_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: dataReference, tianyue: true},
 		{name: "tianyue_gateway_reference_supported", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 1, references: 1, referenceURL: "https://gateway.example/api/image-objects/imo_owned/content", tianyue: true},
 		{name: "tianyue_local_reference_batch_rejected", upstream: "seedream-5-pro-1K", channelType: constant.ChannelTypeNewAPI, count: 2, references: 1, referenceURL: dataReference, tianyue: true, wantError: "require n=1"},
@@ -808,12 +880,17 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 				ch.ParamOverride = &tc.override
 			}
 			ch.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough, TianyueMediaCompatibility: tc.tianyue})
-			if tc.customProfile {
+			if tc.customProfile || tc.submitBody != nil {
 				profile := service.TianyueAsyncImageProfile(tc.upstream)
 				profile.Poll.Response.UsagePaths = tc.usagePaths
+				profile.Submit.Request.Body = tc.submitBody
 				ch.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &dto.UpstreamAsyncConfig{Profiles: []dto.UpstreamAsyncProfile{*profile}}})
 			}
 			request := service.AsyncImageRequest{Model: "public-alias", Count: tc.count, Prompt: "draw", Size: "1024x1024", Native: tc.native}
+			request.AspectRatio = tc.aspectRatio
+			if tc.size != "" {
+				request.Size = tc.size
+			}
 			if tc.tokenPrice {
 				request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{QuotaToPreConsume: 1000}, Tiered: &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ExprString: `tier("tokens", p * 2 + c * 8)`}}
 			}
@@ -841,6 +918,81 @@ func TestMixedImageChannelValidatesNativeLimitsBeforeSelection(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestTianyueImageRatioRoutesCompatibleChannel(t *testing.T) {
+	previousDB, previousType, previousRedis := model.DB, common.MainDatabaseType(), common.RDB
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "tianyue-ratio-routing.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_job_test") || strings.Contains(dsn, "/new_api_image_job_test"))
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, common.RDB = db, nil
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageChannelPool{}, &model.Option{}}
+	t.Cleanup(func() {
+		model.DB, common.RDB = previousDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		assert.NoError(t, db.Migrator().DropTable(entities...))
+		connection, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(entities...))
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.CircuitBreaker, cfg.AccountCooldownSeconds = false, 0
+	require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+	primary := model.Channel{Type: constant.ChannelTypeNewAPI, Key: "tianyue-ratio-primary", Status: common.ChannelStatusEnabled, Models: "public-alias", Group: "ratio-group", Priority: common.GetPointer(int64(10))}
+	primary.SetSetting(dto.ChannelSettings{TianyueMediaCompatibility: true})
+	alternate := model.Channel{Type: constant.ChannelTypeNewAPI, Key: "tianyue-ratio-alternate", Status: common.ChannelStatusEnabled, Models: "public-alias", Group: "ratio-group", Priority: common.GetPointer(int64(0))}
+	require.NoError(t, db.Create(&primary).Error)
+	require.NoError(t, db.Create(&alternate).Error)
+	for _, channel := range []model.Channel{primary, alternate} {
+		require.NoError(t, db.Create(&model.Ability{Group: channel.Group, Model: "public-alias", ChannelId: channel.Id, Enabled: true}).Error)
+	}
+	mixedPolicy := model.ImageGroupPolicy{Group: "ratio-group", Platform: "mixed", AsyncEnabled: true, PoolMode: "model"}
+	bindingKey := service.ImagePoolBindingKey(mixedPolicy, "public-alias", "1K")
+	for _, channel := range []model.Channel{primary, alternate} {
+		weight := 0
+		if channel.Id == primary.Id {
+			weight = 100
+		}
+		require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: bindingKey, Group: mixedPolicy.Group, Platform: mixedPolicy.Platform, Mode: mixedPolicy.PoolMode, Model: "public-alias", ChannelId: channel.Id, Priority: weight}).Error)
+	}
+	for _, tc := range []struct {
+		name, ratio string
+		mixed       bool
+		wantChannel int
+	}{
+		{name: "mixed wide ratio keeps original input", ratio: "21:9", mixed: true, wantChannel: alternate.Id},
+		{name: "provider pinned wide ratio keeps original input", ratio: "21:9", wantChannel: alternate.Id},
+		{name: "mixed supported ratio retains preferred channel", ratio: "16:9", mixed: true, wantChannel: primary.Id},
+		{name: "provider pinned supported ratio retains preferred channel", ratio: "16:9", wantChannel: primary.Id},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := service.AsyncImageRequest{Model: "public-alias", Platform: "openai", Provider: "newapi", Dialect: "async", Kind: "text_to_image", Prompt: "draw", Count: 1, Size: "1024x1024", Resolution: "1K", AspectRatio: tc.ratio, Native: map[string]common.RawMessage{"aspect_ratio": common.RawMessage(strconv.Quote(tc.ratio))}}
+			policy := model.ImageGroupPolicy{Group: "ratio-group", Platform: "openai", AsyncEnabled: true, PoolMode: "model", AsyncProvider: "newapi"}
+			if tc.mixed {
+				policy = mixedPolicy
+				request.Provider = ""
+				request.MixedRouting = &service.ImageMixedRouting{Group: policy.Group, BindingKey: bindingKey, PoolMode: policy.PoolMode}
+			}
+			original, err := common.Marshal(request)
+			require.NoError(t, err)
+			selected, _, err := service.PickImageChannel(t.Context(), policy, request, service.ImageAccountRouting{})
+			require.NoError(t, err)
+			require.NotNil(t, selected)
+			assert.Equal(t, tc.wantChannel, selected.Id)
+			after, err := common.Marshal(request)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(original), string(after), "channel selection must preserve the requested ratio and native parameters")
 		})
 	}
 }
@@ -1295,11 +1447,18 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "reference_fetch_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadRequest, failureCode: 602, providerCode: "image_fetch_failed", responseMessage: "image_url fetch failed for https://example.com/private.png?token=secret-url; authorization=Bearer secret-bearer api_key=secret-key"},
 		{name: "upstream_service_diagnostics", path: "/v1/images/edits_async", referenceField: "images", status: http.StatusBadGateway, failureCode: 606, providerCode: "overloaded", responseMessage: "upstream image worker unavailable"},
 		{name: "synchronous_gateway_failure_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "The upstream image service could not complete the image request. Please retry shortly."},
+		{name: "synchronous_service_timeout_response_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "bad_response_body", responseMessage: "service timeout, please try again later."},
+		{name: "asynchronous_service_timeout_response_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 608, providerCode: "bad_response_body", responseMessage: "service timeout, please try again later.", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
+		{name: "service_timeout_response_with_receipt_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 608, providerCode: "bad_response_body", responseMessage: "service timeout, please try again later.", responseJSON: `{"error":{"code":"bad_response_body","type":"invalid_request_error","message":"service timeout, please try again later.","metadata":{"task_id":"accepted-job"}}}`},
+		{name: "service_timeout_response_with_output_stays_unknown", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 502, failureCode: 608, providerCode: "bad_response_body", responseMessage: "service timeout, please try again later.", responseJSON: `{"error":{"code":"bad_response_body","type":"invalid_request_error","message":"service timeout, please try again later."},"data":[{"url":"https://result.example/image.png"}]}`},
 		{name: "synchronous_gateway_failure_with_metadata_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"success":false,"code":502,"status":"error","data":null,"error":{"code":"upstream_request_failed","type":"new_api_error","message":"image worker unavailable","metadata":{"trace_id":"provider-trace","retryable":true}}}`},
 		{name: "synchronous_gateway_error_type_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 502, failureCode: 606, providerCode: "upstream_request_failed", responseMessage: "image worker unavailable", responseJSON: `{"error":{"type":"upstream_request_failed","message":"image worker unavailable"}}`},
 		{name: "synchronous_quota_rejection_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 503, failureCode: 606, providerCode: "upstream_quota_unavailable", responseMessage: "The selected upstream image service has no available quota. Please retry shortly."},
 		{name: "synchronous_capacity_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 400, failureCode: 603, providerCode: "400", responseMessage: "排队等待可用账户槽位超时，当前并发已满"},
 		{name: "synchronous_processing_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 400, failureCode: 606, responseMessage: "请求处理失败，请提供请求 ID 联系支持"},
+		{name: "synchronous_service_error_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 400, failureCode: 606, providerCode: "invalid_request", responseMessage: "service error, please try again later."},
+		{name: "asynchronous_service_error_creation_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, submissionRejected: true, status: 400, failureCode: 606, providerCode: "invalid_request", responseMessage: "service error, please try again later.", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
+		{name: "service_error_refusal_with_input_conflict_does_not_retry", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 400, failureCode: 604, providerCode: "invalid_request", responseMessage: "service error, please try again later.", responseJSON: `{"error":{"code":"invalid_request","type":"invalid_request_error","message":"service error, please try again later.","param":"n"}}`},
 		{name: "asynchronous_capacity_creation_refusal_retries", path: "/v1/images/edits_async", referenceField: "images", newapi: true, submissionRejected: true, status: 400, failureCode: 603, responseMessage: "Account slots unavailable", templateBody: map[string]any{"model": "{upstream_model}", "n": "{request.n}"}, expectedTemplate: `{"model":"gpt-image-2","n":1}`},
 		{name: "capacity_refusal_with_receipt_does_not_retry", path: "/v1/images/edits_async", referenceField: "images", newapi: true, status: 400, failureCode: 610, responseMessage: "Upstream capacity is full", responseJSON: `{"error":{"type":"invalid_request_error","message":"Upstream capacity is full","metadata":{"task_id":"accepted-job"}}}`},
 		{name: "synchronous_quota_semantics_and_metadata_retry", path: "/v1/images/edits_async", referenceField: "images", newapi: true, synchronousRetry: true, status: 503, failureCode: 606, providerCode: "quota_exhausted", responseMessage: "额度已经用尽，请稍后再试", responseJSON: `{"status_code":503,"retryable":true,"documentation_url":"https://docs.example/errors#quota","error":{"code":"quota_exhausted","type":"insufficient_quota","message":"额度已经用尽，请稍后再试","metadata":{"source":{"code":"insufficient_credits","http_status":503}}}}`},
@@ -1855,9 +2014,15 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 	var bitmap bytes.Buffer
 	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
 	const temporaryTianyueFailure = `{"code":"success","message":"","data":{"id":1104911,"task_id":"tianyue-job","status":"FAILURE","fail_reason":"生成失败，请稍后重试","progress":"100%","data":{"error":{"code":"task_failed","message":"生成失败，请稍后重试"},"object":"video","status":"failed","message":"生成失败，请稍后重试","task_id":"task_inner-failed-operation","metadata":{},"progress":100,"fail_reason":"生成失败，请稍后重试"}}}`
+	const referenceFailureMessage = "无法下载参考图，请确认链接可直接访问，且未过期或要求登录"
+	const connectionFailureMessage = "连接上游服务失败"
+	const referenceTianyueFailure = `{"code":"success","message":"","data":{"id":1129573,"task_id":"tianyue-job","status":"FAILURE","fail_reason":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录","result_url":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录","properties":{"input":"","upstream_model_name":"seedream-5-pro-2K","origin_model_name":"seedream-5-pro-2K"},"data":{"url":"none","error":{"code":"task_failed","message":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录"},"model":"TY-video-model","object":"video","status":"failed","message":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录","task_id":"task_inner-failed-operation","metadata":{"url":"none"},"progress":100,"fail_reason":"无法下载参考图，请确认链接可直接访问，且未过期或要求登录"}}}`
+	const connectionTianyueFailure = `{"code":"success","message":"","data":{"id":1129372,"task_id":"tianyue-job","status":"FAILURE","fail_reason":"连接上游服务失败","result_url":"连接上游服务失败","data":{"error":{"code":"task_failed","message":"连接上游服务失败"},"detail":"502, message='retryable http 502', url='https://provider.example/generate'","object":"video","status":"failed"}}}`
 	for _, tc := range []struct {
 		name                       string
 		model, resolution          string
+		ratio                      string
+		resumeOnly                 bool
 		reference, multipart, mask bool
 		disabled, badOverride      bool
 		badTemplate, customProfile bool
@@ -1865,10 +2030,13 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		creationFailure            bool
 		pollFailure                string
 		failureCode                int
+		failureMessage             string
+		sameChannelRetry           bool
 		disconnect, failed         bool
 	}{
 		{name: "asynchronous_text_1k"},
 		{name: "asynchronous_text_2k", model: "seedream-5-pro-2K", resolution: "2K"},
+		{name: "historical_wide_ratio_resumes_poll_only", ratio: "21:9", resumeOnly: true},
 		{name: "provider_request_failure", providerErrorCode: "do_request_failed"},
 		{name: "provider_response_read_failure", providerErrorCode: "read_response_body_failed"},
 		{name: "provider_bad_response", providerErrorCode: "bad_response"},
@@ -1882,6 +2050,23 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 		{name: "asynchronous_yb_receipt_and_poll", reference: true, model: "gpt-image-2-yb"},
 		{name: "asynchronous_failure", failed: true},
 		{name: "asynchronous_temporary_failure", pollFailure: temporaryTianyueFailure, failureCode: 606},
+		{name: "reference_download_same_channel", pollFailure: referenceTianyueFailure, failureCode: 602, failureMessage: referenceFailureMessage, sameChannelRetry: true},
+		{name: "reference_download_wrong_outer_task", pollFailure: strings.Replace(referenceTianyueFailure, `"task_id":"tianyue-job"`, `"task_id":"another-job"`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_native_still_running", pollFailure: strings.Replace(referenceTianyueFailure, `"status":"failed"`, `"status":"running"`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_actual_result_url", pollFailure: strings.Replace(referenceTianyueFailure, `"result_url":"`+referenceFailureMessage+`"`, `"result_url":"https://result.example/image.png"`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_actual_native_url", pollFailure: strings.Replace(referenceTianyueFailure, `"url":"none"`, `"url":"https://result.example/image.png"`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_actual_metadata_url", pollFailure: strings.Replace(referenceTianyueFailure, `"metadata":{"url":"none"}`, `"metadata":{"url":"https://result.example/image.png"}`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_unknown_nested_receipt", pollFailure: strings.Replace(referenceTianyueFailure, `"metadata":{"url":"none"}`, `"metadata":{"url":"none","task_id":"other-accepted-job"}`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_policy_diagnostic", pollFailure: strings.Replace(referenceTianyueFailure, `"metadata":{"url":"none"}`, `"metadata":{"url":"none","error":{"type":"content_policy_violation"}}`, 1), failureMessage: referenceFailureMessage},
+		{name: "reference_download_unknown_native_code", pollFailure: strings.Replace(referenceTianyueFailure, `"code":"task_failed"`, `"code":"invalid_argument"`, 1), failureMessage: referenceFailureMessage},
+		{name: "connection_failure_retries_same_channel", pollFailure: connectionTianyueFailure, failureCode: 606, failureMessage: connectionFailureMessage, sameChannelRetry: true},
+		{name: "connection_failure_wrong_outer_task", pollFailure: strings.Replace(connectionTianyueFailure, `"task_id":"tianyue-job"`, `"task_id":"another-job"`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_native_still_running", pollFailure: strings.Replace(connectionTianyueFailure, `"status":"failed"`, `"status":"running"`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_unknown_native_code", pollFailure: strings.Replace(connectionTianyueFailure, `"code":"task_failed"`, `"code":"invalid_argument"`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_native_result", pollFailure: strings.Replace(connectionTianyueFailure, `"object":"video"`, `"object":"video","url":"https://result.example/image.png"`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_accepted_receipt", pollFailure: strings.Replace(connectionTianyueFailure, `"object":"video"`, `"object":"video","metadata":{"task_id":"other-accepted-job"}`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_authentication_diagnostic", pollFailure: strings.Replace(connectionTianyueFailure, `"object":"video"`, `"object":"video","metadata":{"error":{"type":"authentication_error"}}`, 1), failureMessage: connectionFailureMessage},
+		{name: "connection_failure_non_string_task_id", pollFailure: strings.Replace(connectionTianyueFailure, `"object":"video"`, `"object":"video","task_id":123`, 1), failureMessage: connectionFailureMessage},
 		{name: "temporary_failure_wrong_outer_task", pollFailure: strings.Replace(temporaryTianyueFailure, `"task_id":"tianyue-job"`, `"task_id":"another-job"`, 1)},
 		{name: "temporary_failure_inner_still_running", pollFailure: strings.Replace(temporaryTianyueFailure, `"status":"failed"`, `"status":"running"`, 1)},
 		{name: "temporary_failure_inner_different_error", pollFailure: strings.Replace(temporaryTianyueFailure, `"code":"task_failed"`, `"code":"invalid_argument"`, 1)},
@@ -2000,6 +2185,12 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 				channel.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &custom})
 			}
 			request := service.AsyncImageRequest{Platform: "openai", Provider: "newapi", Dialect: "async", Model: "image-alias", Prompt: "test picture", Count: 1, Kind: "text_to_image", Size: "1024x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async", Native: map[string]common.RawMessage{"model": common.RawMessage(`"image-alias"`), "prompt": common.RawMessage(`"test picture"`), "n": common.RawMessage(`1`), "size": common.RawMessage(`"1024x1024"`)}}
+			if tc.ratio != "" {
+				request.AspectRatio, request.Size = tc.ratio, "2384x1024"
+				request.Native["aspect_ratio"], err = common.Marshal(tc.ratio)
+				require.NoError(t, err)
+				request.Native["size"] = common.RawMessage(`"2384x1024"`)
+			}
 			if tc.resolution != "" {
 				request.Resolution = tc.resolution
 			}
@@ -2028,6 +2219,33 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 			beforeInvoke := func() error {
 				dispatches++
 				return model.MarkAsyncImageDispatched(t.Context(), task, channel.Id)
+			}
+			if tc.resumeOnly {
+				// Seed a historical accepted receipt without issuing a generation.
+				require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 5000, model.ImageFundingSelection{Source: "wallet"}))
+				require.NoError(t, model.MarkAsyncImageDispatched(t.Context(), task, channel.Id))
+				require.NoError(t, recordAsyncImageUpstreamJob(t.Context(), &task, "tianyue-job"))
+				var pending *service.AsyncImagePending
+				_, _, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+				require.ErrorAs(t, err, &pending)
+				require.Len(t, received, 1)
+				polled := <-received
+				assert.Equal(t, http.MethodGet, polled.method)
+				assert.Equal(t, "/v1/video/generations/tianyue-job", polled.path)
+				output, bill, err := ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
+				require.NoError(t, err)
+				require.NotNil(t, output)
+				require.Len(t, output.Images, 1)
+				assert.Equal(t, bitmap.Bytes(), output.Images[0].Data)
+				assert.Equal(t, 5000, bill.Quota)
+				require.Len(t, received, 2)
+				for _, path := range []string{"/v1/video/generations/tianyue-job", "/image.png"} {
+					polled := <-received
+					assert.Equal(t, http.MethodGet, polled.method)
+					assert.Equal(t, path, polled.path)
+				}
+				assert.Zero(t, dispatches, "historical wide-ratio tasks must only poll and download the accepted result")
+				return
 			}
 			_, _, err = ExecuteAsyncImage(t.Context(), task, request, channel, service.DefaultImageRuntimeConfig(), beforeInvoke)
 			require.Error(t, err)
@@ -2136,7 +2354,12 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 						wantCode = 610
 					}
 					assert.Equal(t, wantCode, failure.Code)
-					assert.Equal(t, "生成失败，请稍后重试", failure.Message)
+					wantMessage := tc.failureMessage
+					if wantMessage == "" {
+						wantMessage = "生成失败，请稍后重试"
+					}
+					assert.Equal(t, wantMessage, failure.Message)
+					assert.Equal(t, tc.sameChannelRetry, failure.RetrySameChannel)
 				} else {
 					assert.Equal(t, "Image generation rejected", failure.Message)
 				}
@@ -2658,7 +2881,7 @@ func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
 	channel.SetSetting(dto.ChannelSettings{TianyueMediaCompatibility: true})
 	request := service.AsyncImageRequest{
 		Platform: "openai", Provider: "newapi", Dialect: "async", Model: "seedream-5-pro", Prompt: "test picture", Count: 1,
-		Kind: "text_to_image", Size: "1024x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async",
+		Kind: "text_to_image", AspectRatio: "21:9", Size: "2384x1024", Resolution: "1K", SourcePath: "/v1/images/generations_async",
 		Native:  map[string]common.RawMessage{"model": common.RawMessage(`"seedream-5-pro"`), "prompt": common.RawMessage(`"test picture"`), "n": common.RawMessage(`1`)},
 		Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
 	}

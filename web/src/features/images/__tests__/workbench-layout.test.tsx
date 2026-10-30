@@ -140,6 +140,39 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
+test('keeps the prompt editable when session storage is blocked', async () => {
+  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+    throw new DOMException('Session storage is blocked', 'SecurityError')
+  })
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+
+  const prompt = screen.getByRole('textbox', { name: 'Prompt' })
+  await user.type(prompt, 'Draw a quiet lake')
+
+  expect(prompt).toHaveValue('Draw a quiet lake')
+})
+
+test('restores the prompt saved in session storage', () => {
+  sessionStorage.setItem(
+    'new-api:image-prompt:101',
+    'Keep the saved composition'
+  )
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+
+  expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue(
+    'Keep the saved composition'
+  )
+})
+
 test('resumes an image task after reopening the workbench for its owner', async () => {
   sessionStorage.setItem('new-api:image-task:101', 'image_in_progress')
   imageApiMocks.getImageTask.mockResolvedValue({

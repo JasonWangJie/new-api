@@ -57,6 +57,7 @@ type AsyncImageFailure struct {
 	RetryAfter                   time.Duration
 	ExecutionUnknown             bool
 	UpstreamTerminal             bool `json:"-"`
+	RetrySameChannel             bool `json:"-"`
 	RetryableHTTPResponse        bool `json:"-"`
 	SynchronousRetryableResponse bool `json:"-"`
 	SubmissionRejected           bool `json:"-"`
@@ -501,8 +502,20 @@ func isRetryableImageGatewayResponse(failure *AsyncImageFailure, decoded any) bo
 	providerCode = strings.ToLower(strings.TrimSpace(providerCode))
 	switch failure.HTTPStatus {
 	case http.StatusBadGateway:
-		if failure.Code != 606 || providerCode != "upstream_request_failed" {
+		if failure.Code != 606 {
 			return false
+		}
+		if providerCode != "upstream_request_failed" {
+			message, _ := providerError["message"].(string)
+			if providerCode != "bad_response_body" || !strings.EqualFold(strings.TrimSpace(message), "service timeout, please try again later.") {
+				return false
+			}
+			// Only this exact diagnostic is exempt from the general timeout
+			// barrier. Inspect every other field of the complete response.
+			checkedError := maps.Clone(providerError)
+			checkedError["message"] = ""
+			envelope = maps.Clone(envelope)
+			envelope["error"] = checkedError
 		}
 	case http.StatusServiceUnavailable:
 		if failure.Code != 603 && failure.Code != 606 && failure.Code != 610 || !isImageQuotaUnavailable(providerCode) && !isImageQuotaUnavailable(asyncImageErrorMessage(providerError, 0)) {

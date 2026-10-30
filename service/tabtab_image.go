@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -450,15 +452,20 @@ func NormalizeTabtabImageTask(body []byte, baseURL, taskID string) ([]byte, erro
 		Message   string `json:"message"`
 		RequestID string `json:"request_id"`
 		Data      struct {
-			ID               string  `json:"id"`
-			RequestID        string  `json:"request_id"`
-			Model            string  `json:"model"`
-			ChargedPoints    float64 `json:"charged_points"`
-			GenerationTimeMS float64 `json:"generation_time_ms"`
-			Status           string  `json:"status"`
-			ErrorCode        string  `json:"error_code"`
-			ErrorMessage     string  `json:"error_message"`
-			Results          []struct {
+			ID                string  `json:"id"`
+			UsageRecordID     string  `json:"usage_record_id"`
+			RequestID         string  `json:"request_id"`
+			ProviderRequestID string  `json:"provider_request_id"`
+			Model             string  `json:"model"`
+			ModelCode         string  `json:"model_code"`
+			CreatedAt         string  `json:"created_at"`
+			UpdatedAt         string  `json:"updated_at"`
+			ChargedPoints     float64 `json:"charged_points"`
+			GenerationTimeMS  float64 `json:"generation_time_ms"`
+			Status            string  `json:"status"`
+			ErrorCode         string  `json:"error_code"`
+			ErrorMessage      string  `json:"error_message"`
+			Results           []struct {
 				URL      string `json:"url"`
 				MIMEType string `json:"mime_type"`
 			} `json:"results"`
@@ -498,6 +505,19 @@ func NormalizeTabtabImageTask(body []byte, baseURL, taskID string) ([]byte, erro
 		return nil, errors.New("TabTab non-success task contains contradictory output")
 	}
 	if envelope.Data.Status == "failed" {
+		if envelope.Data.UsageRecordID != "" && envelope.Data.UsageRecordID != envelope.Data.ID || envelope.Data.ModelCode != "" && envelope.Data.ModelCode != envelope.Data.Model {
+			return nil, errors.New("TabTab failed task metadata conflicts with its identity or model")
+		}
+		if requestID := envelope.Data.ProviderRequestID; len(requestID) > asyncImageProviderRequestIDLimit || strings.TrimSpace(requestID) != requestID || strings.ContainsFunc(requestID, unicode.IsControl) {
+			return nil, errors.New("TabTab provider request ID is invalid")
+		}
+		for _, value := range []string{envelope.Data.CreatedAt, envelope.Data.UpdatedAt} {
+			if value != "" {
+				if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+					return nil, errors.New("TabTab failed task timestamp is invalid")
+				}
+			}
+		}
 		var root map[string]common.RawMessage
 		_ = common.Unmarshal(body, &root)
 		for name := range root {
@@ -512,7 +532,7 @@ func NormalizeTabtabImageTask(body []byte, baseURL, taskID string) ([]byte, erro
 			return nil, errors.New("invalid TabTab failed task response")
 		}
 		for name := range raw.Data {
-			if !slices.Contains([]string{"id", "request_id", "model", "status", "charged_points", "results", "generation_time_ms", "error_code", "error_message"}, name) {
+			if !slices.Contains([]string{"id", "usage_record_id", "request_id", "provider_request_id", "model", "model_code", "created_at", "updated_at", "status", "charged_points", "results", "generation_time_ms", "error_code", "error_message"}, name) {
 				return nil, errors.New("TabTab failed task contains unrecognized execution evidence")
 			}
 		}
@@ -544,5 +564,16 @@ func NormalizeTabtabImageTask(body []byte, baseURL, taskID string) ([]byte, erro
 	if reason == "" {
 		reason = envelope.Data.ErrorCode
 	}
-	return common.Marshal(map[string]any{"task_id": envelope.Data.ID, "status": envelope.Data.Status, "reason": reason, "urls": urls})
+	requestID := envelope.Data.ProviderRequestID
+	if requestID == "" {
+		requestID = envelope.Data.RequestID
+	}
+	if requestID == "" {
+		requestID = envelope.RequestID
+	}
+	return common.Marshal(map[string]any{
+		"task_id": envelope.Data.ID, "status": envelope.Data.Status, "reason": reason, "urls": urls,
+		"error_code": SanitizeAsyncImageDiagnostic(envelope.Data.ErrorCode, asyncImageProviderCodeLimit),
+		"request_id": SanitizeAsyncImageDiagnostic(requestID, asyncImageProviderRequestIDLimit),
+	})
 }

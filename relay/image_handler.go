@@ -216,7 +216,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
 		}
-		if c.GetBool("async_image_execution") && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
+		if c.GetBool("async_image_execution") && c.GetString("async_image_resume_task") == "" && info.ChannelType == constant.ChannelTypeNewAPI && info.ChannelSetting.TianyueMediaCompatibility {
 			if err := service.ValidateTianyueImageSubmission(jsonData, imageCount); err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
@@ -389,7 +389,14 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 						// this connection. Keep ambiguous submissions reserved while
 						// retaining the provider's HTTP response for reconciliation.
 						switch types.ErrorCode(failure.ProviderCode) {
-						case types.ErrorCodeDoRequestFailed, types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponse, types.ErrorCodeBadResponseBody, types.ErrorCodeEmptyResponse:
+						case types.ErrorCodeBadResponseBody:
+							// A complete, validated synchronous service-timeout envelope
+							// follows the bounded gateway response retry policy.
+							if failure.SynchronousRetryableResponse {
+								break
+							}
+							fallthrough
+						case types.ErrorCodeDoRequestFailed, types.ErrorCodeReadResponseBodyFailed, types.ErrorCodeBadResponse, types.ErrorCodeEmptyResponse:
 							failure.Code, failure.InternalCode = 608, "execution_unknown"
 							failure.ExecutionUnknown = true
 						}

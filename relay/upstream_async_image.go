@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -88,10 +89,19 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 			message = "Upstream image task failed"
 		}
 		failure := service.ClassifyAsyncImageFailure(errors.New(message), 0)
-		if failure.Code == 610 && c.GetBool(contextKeyTianyueImageProfile) && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices && service.IsRetryableTianyueImageTaskFailure(rawBody, resumeTaskID) {
-			failure.Code = 606
+		if failure.Code == 610 && c.GetBool(contextKeyTianyueImageProfile) && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			if confirmed := service.ClassifyTianyueImageTaskFailure(rawBody, resumeTaskID); confirmed != nil {
+				failure.Code, failure.RetrySameChannel = confirmed.Code, confirmed.RetrySameChannel
+			}
 		}
 		failure.Message = message
+		if info != nil && info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeTabTab {
+			failure.ProviderCode = gjson.GetBytes(body, "error_code").Str
+			failure.UpstreamRequestID = gjson.GetBytes(body, "request_id").Str
+			if failure.ProviderCode != "" && failure.ProviderCode != message {
+				failure.Message = failure.ProviderCode + ": " + message
+			}
+		}
 		failure.InternalCode = "upstream_job_failed"
 		failure.UpstreamTerminal = true
 		return nil, types.NewError(failure, types.ErrorCodeBadResponse)
