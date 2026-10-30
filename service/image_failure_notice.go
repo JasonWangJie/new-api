@@ -103,7 +103,6 @@ var (
 	imageContentPolicyNoticePattern  = regexp.MustCompile(`(?i)^(?:the request violates content policies\b|we['’]re so sorry, but the (?:image we created|prompt) may violate our content policies\.)`)
 	imageOutputCountNoticePattern    = regexp.MustCompile(`^upstream must return between 1 and [0-9]{1,4} complete images$`)
 	imageDimensionNoticePattern      = regexp.MustCompile(`(?i)^(?:the requested image size is invalid\.\s*)?width and height must both be divisible by 16\.?$`)
-	imageYouTubeNoticePattern        = regexp.MustCompile(`(?i)^(?:provider api error:\s*)?only a specific youtube video url is supported(?: \(request id: [a-z0-9_-]{1,128}\))?\.?$`)
 )
 
 // SummaryText keeps API summaries readable for clients that do not implement
@@ -321,8 +320,11 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) (notice ImageFailureNotic
 		case task.PublicErrorCode != 601 && imageDimensionNoticePattern.MatchString(message):
 			notice.Summary = "Image width and height must both be multiples of 16"
 			specificAdvice = "Adjust both image dimensions to multiples of 16 before submitting again."
-		case task.PublicErrorCode != 601 && imageYouTubeNoticePattern.MatchString(message):
-			notice.Summary = "The upstream only supports a specific YouTube video URL format"
+		case task.PublicErrorCode != 601 && imageReferenceTransportConstraint(message) != "":
+			notice.Summary = "Upstream rejected image input or parameters"
+			if imageReferenceTransportConstraint(message) == "youtube_url" {
+				notice.Summary = "The upstream only supports a specific YouTube video URL format"
+			}
 			specificAdvice = "Check the supported reference link format with the service provider, or use a model that accepts your reference material."
 		case task.PublicErrorCode != 601 && (lowered == "this model does not support thinking level" || message == "模型不支持 thinking level" || message == "AI Studio 请求参数无效: 模型不支持 thinking level" || message == "AI Studio 请求参数无效：模型不支持 thinking level"):
 			notice.Summary = "The selected model does not support the requested thinking level"

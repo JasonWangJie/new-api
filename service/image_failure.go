@@ -37,13 +37,25 @@ var (
 	imageQuotaUnavailablePattern         = regexp.MustCompile(`\b(?:quotas?|balances?|credits?|capacity)(?:\s+(?:is|are|was|were|currently|temporarily|now|has|been|completely|fully|already|remaining|available)){0,4}\s+(?:unavailable|exhausted|insufficient|depleted|exceeded|empty|not\s+available)\b|` +
 		`\b(?:insufficient|exhausted|unavailable|depleted|no(?:\s+available|\s+remaining)?|not\s+enough|out\s+of|(?:run|ran)\s+out\s+of)\s+(?:(?:upstream|provider|account|image|generation|available|remaining)\s+){0,3}(?:quotas?|balances?|credits?|capacity)\b|` +
 		`(?:额度|配额|余额|积分|点数|容量)(?:已经|已被|当前|目前|暂时|可用|剩余|全部|基本|均|已|暂){0,3}(?:不足|不够|耗尽|用尽|用完|不可用)|(?:没有|暂无|无)(?:足够的?|可用的?|剩余的?)?(?:上游|供应商|账户)?(?:额度|配额|余额|积分|点数|容量)`)
-	imageQuotaNegationPattern            = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no longer)\s+(?:currently\s+|temporarily\s+|fully\s+|been\s+)?(?:unavailable|exhausted|insufficient|depleted|exceeded)\b|(?:并非|并不|不是|未出现|未发生|如果|假如|若)(?:由于|因为)?(?:额度|配额|余额|积分|点数|容量)`)
-	imageSubmissionURLPattern            = regexp.MustCompile(`(?i)\bhttps?://[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
-	imageSubmissionTracePattern          = regexp.MustCompile(`(?i)(?:\b(?:request|trace|span|correlation)[ _-]?id|请求\s*id)\s*[:=：]\s*[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
-	imageCapacitySubjectPattern          = regexp.MustCompile(`并发|槽位|账户池|账号池|资源池|资源(?:已经|当前|可用|剩余|全部|已|暂时){0,3}(?:耗尽|用尽|不足|不可用)|\b(?:concurrency|concurrent|capacity|slots?|account[ _-]+pools?|resource[ _-]+pools?)\b|\bresources?(?:[ _-]+(?:is|are|has|have|been|currently|completely)){0,4}[ _-]+(?:exhausted|unavailable)\b`)
-	imageCapacityFailurePattern          = regexp.MustCompile(`已满|满载|耗尽|用尽|不足|不可用|超时|\b(?:full|saturated|exhausted|unavailable|timeout|timed[ _-]+out|no[ _-]+available|none[ _-]+available)\b`)
-	imageRequestProcessingFailurePattern = regexp.MustCompile(`(?:请求|操作)(?:处理|执行)(?:失败|出错)|\b(?:request[ _-]+processing[ _-]+(?:failed|failure)|(?:failed|unable|could[ _-]+not)[ _-]+to[ _-]+process[ _-]+(?:the[ _-]+)?request|could[ _-]+not[ _-]+process[ _-]+(?:the[ _-]+)?request)\b`)
-	imageSubmissionNegationPattern       = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no[ _-]+longer)[ _-]+(?:(?:currently|temporarily|fully|been|ever|yet)[ _-]+){0,3}(?:full|exhausted|unavailable|saturated|failed|failing)\b|\bno[ _-]+request[ _-]+processing[ _-]+failure\b|并非|并不|不是|未出现|未发生|没有发生|没有(?:请求|操作)(?:处理|执行)(?:失败|出错)|如果|假如|若`)
+	imageQuotaNegationPattern                 = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no longer)\s+(?:currently\s+|temporarily\s+|fully\s+|been\s+)?(?:unavailable|exhausted|insufficient|depleted|exceeded)\b|(?:并非|并不|不是|未出现|未发生|如果|假如|若)(?:由于|因为)?(?:额度|配额|余额|积分|点数|容量)`)
+	imageSubmissionURLPattern                 = regexp.MustCompile(`(?i)\bhttps?://[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
+	imageSubmissionTracePattern               = regexp.MustCompile(`(?i)(?:\b(?:request|trace|span|correlation)[ _-]?id|请求\s*id)\s*[:=：]\s*[^\s\p{Han}<>"'(),;，。；！？、（）【】《》]+`)
+	imageCapacitySubjectPattern               = regexp.MustCompile(`并发|槽位|账户池|账号池|资源池|资源(?:已经|当前|可用|剩余|全部|已|暂时){0,3}(?:耗尽|用尽|不足|不可用)|\b(?:concurrency|concurrent|capacity|slots?|account[ _-]+pools?|resource[ _-]+pools?)\b|\bresources?(?:[ _-]+(?:is|are|has|have|been|currently|completely)){0,4}[ _-]+(?:exhausted|unavailable)\b`)
+	imageCapacityFailurePattern               = regexp.MustCompile(`已满|满载|耗尽|用尽|不足|不可用|超时|\b(?:full|saturated|exhausted|unavailable|timeout|timed[ _-]+out|no[ _-]+available|none[ _-]+available)\b`)
+	imageRequestProcessingFailurePattern      = regexp.MustCompile(`(?:请求|操作)(?:处理|执行)(?:失败|出错)|\b(?:request[ _-]+processing[ _-]+(?:failed|failure)|(?:failed|unable|could[ _-]+not)[ _-]+to[ _-]+process[ _-]+(?:the[ _-]+)?request|could[ _-]+not[ _-]+process[ _-]+(?:the[ _-]+)?request)\b`)
+	imageSubmissionNegationPattern            = regexp.MustCompile(`\b(?:if|unless)\b|\b(?:not|never|no[ _-]+longer)[ _-]+(?:(?:currently|temporarily|fully|been|ever|yet)[ _-]+){0,3}(?:full|exhausted|unavailable|saturated|failed|failing)\b|\bno[ _-]+request[ _-]+processing[ _-]+failure\b|并非|并不|不是|未出现|未发生|没有发生|没有(?:请求|操作)(?:处理|执行)(?:失败|出错)|如果|假如|若`)
+	imageReferenceTransportSubjectPattern     = regexp.MustCompile(`\b(?:file\s*data|file\s*uri|remote(?:\s+(?:file|image|reference))?\s*(?:uri|url)s?)\b|远程\s*(?:图片|图像|参考图|文件)?\s*(?:链接|地址|uri|url)|文件数据`)
+	imageReferenceTransportTargetPattern      = regexp.MustCompile(`\byoutube\b|\b(?:gateway\s+)?file\s*ids?\b|网关(?:上传)?文件\s*(?:id|标识)`)
+	imageReferenceTransportRequirementPattern = regexp.MustCompile(`\b(?:requires?|required|needs?|(?:must|has\s+to|have\s+to)\s+(?:use|provide|be)|(?:only|exclusively)\s+(?:accepts?|supports?|allows?)|(?:accepts?|supports?|allows?)\s+(?:only|exclusively)|(?:limited|restricted)\s+to)\b|\bonly\b.{0,100}\b(?:supported|accepted|allowed)\b|(?:仅|只)(?:能)?(?:支持|接受|允许|使用)|(?:需要|要求|必须)(?:使用|提供)?|仅限|只限|限定为|限于|限制为`)
+	imageReferenceHTTPURLPattern              = regexp.MustCompile(`\bhttps?(?:\s*\(s\))?\b|\b(?:public|external|arbitrary|ordinary)\s+(?:(?:image|reference)\s+)?urls?\b|(?:公网|外部|普通|任意)(?:图片|图像|参考图)?(?:链接|地址|url)`)
+	imageReferenceTransportRejectionPattern   = regexp.MustCompile(`\b(?:does\s+not|doesn't|cannot|can't|will\s+not|won't)\s+(?:accept|support|use|handle)\b|\bnot\s+(?:supported|allowed|accepted)\b|\b(?:unsupported|rejected|rejects?|disallowed)\b|不支持|不接受|无法(?:支持|接受|使用)|禁止`)
+	imageReferenceTransportNegationPattern    = regexp.MustCompile(`\b(?:if|unless|examples?|sample|hypothetical|moderation|censor(?:ed|ship)?|copyright|policy)\b|\b(?:not|no\s+longer)\s+(?:only|required|unsupported|rejected|limited|restricted)\b|\b(?:does\s+not|doesn't)\s+require\b|\b(?:actually|now)\s+supports?\b|\b(?:prompt|input)\s+(?:contains?|says?)\b|\bquoted\s+(?:error|text|message)\b|并非|不是|不再要求|无需|不要求|已经支持|已支持|如果|假如|示例|例如|引用|提示词包含|审核|违规|不合规|安全|鉴权|认证|授权|无权限|密钥`)
+	imageReferenceInputRejectionPattern       = regexp.MustCompile(`\b(?:invalid|unsupported|missing|malformed|incompatible|corrupt(?:ed)?|damaged|empty|undecodable|too\s+(?:many|large|long))\s+(?:(?:the|input|image|reference)\s+){0,3}(?:prompt|parameters?|dimensions?|resolution|size|format|mime(?:\s+type)?|mask|file\s*id|image\s+data)\b|` +
+		`\b(?:requires?|needs?)\s+(?:(?:a|the|valid|specific|correct|input)\s+){0,3}(?:prompt|parameters?|dimensions?|resolution|size|format|mime(?:\s+type)?|mask)\b|` +
+		`\b(?:prompt|parameters?|dimensions?|resolution|size|format|mime(?:\s+type)?|mask|image\s+count|image\s+data)\b.{0,60}\b(?:invalid|unsupported|not\s+supported|missing|required|exceeds?|exceeded|corrupt(?:ed)?|damaged|too\s+(?:many|large|long))\b|` +
+		`\bfile\s*id\b.{0,30}\b(?:invalid|malformed|expired|not\s+found)\b|\b(?:missing|empty|no)\s+(?:(?:reference|input)\s+)?images?\b|\b(?:invalid|malformed|corrupt(?:ed)?|damaged)\s+(?:(?:reference|input)\s+)?images?\b|` +
+		`\b(?:decode|decoding|parse|parsing)\s+(?:failed|failure|error)\b|\b(?:cannot|could\s+not|unable\s+to)\s+(?:decode|parse)\b|` +
+		`(?:提示词|参数|尺寸|分辨率|格式|掩码|图片数量|参考图数量|图像数据|文件标识).{0,12}(?:错误|无效|不支持|超限|过大|过多|缺失|损坏)|(?:解码|解析)(?:失败|错误)|缺少(?:参考图|输入图片)|未提供(?:参考图|输入图片)`)
 )
 
 type AsyncImageFailure struct {
@@ -299,10 +311,36 @@ func imageAccountCompatibilityCode(status int, providerCode, message string) str
 	if isImageRouteCompatibilityRejection(status, providerCode, message) {
 		return "upstream_image_route_incompatible"
 	}
-	if status == http.StatusBadRequest && isGenericImageInputRejectionCode(providerCode) && (imageYouTubeNoticePattern.MatchString(strings.TrimSpace(message)) || imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(message))) {
+	if status == http.StatusBadRequest && isGenericImageInputRejectionCode(providerCode) && (imageReferenceTransportConstraint(message) != "" || imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(message))) {
 		return "upstream_image_reference_incompatible"
 	}
 	return ""
+}
+
+// imageReferenceTransportConstraint identifies a transport capability refusal,
+// rather than a missing image, malformed input, or a quoted validation example.
+// URLs and correlation IDs are opaque and cannot supply the matching words.
+func imageReferenceTransportConstraint(message string) string {
+	message = imageSubmissionURLPattern.ReplaceAllString(message, " [url] ")
+	message = imageSubmissionTracePattern.ReplaceAllString(message, " [trace] ")
+	message = strings.ToLower(strings.Join(strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(message)), " "))
+	if imageReferenceTransportNegationPattern.MatchString(message) || imageReferenceInputRejectionPattern.MatchString(message) || !isImageReferenceRejectionEnvelope(message, 0, false) {
+		return ""
+	}
+	constraint := ""
+	for clause := range strings.FieldsFuncSeq(message, func(character rune) bool { return strings.ContainsRune(".!?;,\n\r。！？；，", character) }) {
+		if imageReferenceTransportSubjectPattern.MatchString(clause) {
+			if imageReferenceTransportTargetPattern.MatchString(clause) && imageReferenceTransportRequirementPattern.MatchString(clause) || imageReferenceHTTPURLPattern.MatchString(clause) && imageReferenceTransportRejectionPattern.MatchString(clause) {
+				return "file_data"
+			}
+		}
+		// The legacy YouTube-only refusal can recover by sending local image
+		// data. A fileData-specific contract instead needs another channel.
+		if strings.Contains(clause, "youtube") && imageReferenceTransportRequirementPattern.MatchString(clause) && (strings.Contains(clause, "only") || strings.Contains(clause, "仅") || strings.Contains(clause, "只")) && (strings.Contains(clause, "url") || strings.Contains(clause, "reference") || strings.Contains(clause, "link") || strings.Contains(clause, "链接") || strings.Contains(clause, "地址")) {
+			constraint = "youtube_url"
+		}
+	}
+	return constraint
 }
 
 func isGenericImageInputRejectionCode(code string) bool {
@@ -315,7 +353,7 @@ func isGenericImageInputRejectionCode(code string) bool {
 
 // isImageReferenceRejectionEnvelope rejects contradictory execution evidence,
 // including nested receipts, without restricting harmless provider metadata.
-func isImageReferenceRejectionEnvelope(value any, depth int) bool {
+func isImageReferenceRejectionEnvelope(value any, depth int, transportConstraint bool) bool {
 	if depth > 12 {
 		return false
 	}
@@ -370,17 +408,26 @@ func isImageReferenceRejectionEnvelope(value any, depth int) bool {
 				}
 				continue
 			}
-			if !isImageReferenceRejectionEnvelope(child, depth+1) {
+			if !isImageReferenceRejectionEnvelope(child, depth+1, transportConstraint) {
 				return false
 			}
 		}
 	case []any:
 		for _, child := range value {
-			if !isImageReferenceRejectionEnvelope(child, depth+1) {
+			if !isImageReferenceRejectionEnvelope(child, depth+1, transportConstraint) {
 				return false
 			}
 		}
 	case string:
+		if transportConstraint {
+			diagnostic := imageSubmissionURLPattern.ReplaceAllString(value, " [url] ")
+			diagnostic = imageSubmissionTracePattern.ReplaceAllString(diagnostic, " [trace] ")
+			diagnostic = strings.ToLower(strings.NewReplacer("_", " ", "-", " ").Replace(diagnostic))
+			if imageReferenceTransportNegationPattern.MatchString(diagnostic) || imageReferenceInputRejectionPattern.MatchString(diagnostic) {
+				return false
+			}
+			value = diagnostic
+		}
 		if ClassifyAsyncImageFailure(errors.New(value), http.StatusBadRequest).Code == 601 {
 			return false
 		}
@@ -789,7 +836,7 @@ func imageAttemptCompatibilityCode(attempt ImageChannelAttempt) string {
 	if !attempt.Dispatched || attempt.FinishedAt <= 0 || attempt.UpstreamTaskID != "" || attempt.Code == 601 {
 		return ""
 	}
-	if attempt.ReferenceFailure && attempt.TransportUsed == "remote" && attempt.Code == 603 && imageYouTubeNoticePattern.MatchString(attempt.ErrorMessage) {
+	if attempt.ReferenceFailure && attempt.TransportUsed == "remote" && attempt.Code == 603 && imageReferenceTransportConstraint(attempt.ErrorMessage) == "youtube_url" {
 		// The URL transport was rejected, not the account's ability to use
 		// this model. Allow one local attempt on the same credential.
 		return ""
@@ -885,16 +932,17 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 	failure := ClassifyAsyncImageFailure(errors.New(classificationSignals), mappedStatus.StatusCode)
 	compatibilityCode := imageAccountCompatibilityCode(status, classificationCode, providerMessage)
 	sizeRejection := imageReferenceSizeRejectionPattern.MatchString(providerMessage)
-	youTubeRejection := imageYouTubeNoticePattern.MatchString(providerMessage)
+	transportConstraint := imageReferenceTransportConstraint(providerMessage)
+	transportRejection := transportConstraint != ""
 	referenceTypeAllowed := isGenericImageInputRejectionCode(providerError.Type)
-	if failure.Code == 602 || sizeRejection || youTubeRejection {
+	if failure.Code == 602 || sizeRejection || transportRejection {
 		// Gateways may wrap an explicit reference rejection in their own
 		// diagnostic type. The complete envelope still has to prove rejection.
 		switch strings.ToLower(strings.TrimSpace(providerError.Type)) {
 		case "upstream_error", "api_error", "new_api_error", "one_api_error", "bad_request", "bad_request_error", "bad_response_status_code":
 			referenceTypeAllowed = true
 		case "openai_error":
-			referenceTypeAllowed = failure.Code == 602 || youTubeRejection
+			referenceTypeAllowed = failure.Code == 602 || transportRejection
 		}
 	}
 	fields, object := decoded.(map[string]any)
@@ -916,9 +964,9 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 		}
 	}
 	explicitReferenceFetch := imageExplicitReferenceFetchPattern.MatchString(providerMessage)
-	verifiedReferenceRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && referenceCodeAllowed && referenceTypeAllowed && isGenericImageInputRejectionCode(providerStatus) && (failure.Code != 602 || explicitReferenceFetch) && isImageReferenceRejectionEnvelope(referenceEnvelope, 0)
-	unverifiedReferenceDiagnostic := !verifiedReferenceRejection && (failure.Code == 602 || status == http.StatusBadRequest && youTubeRejection)
-	if (youTubeRejection || sizeRejection) && !verifiedReferenceRejection {
+	verifiedReferenceRejection := status == http.StatusBadRequest && readErr == nil && !bodyTruncated && decodeErr == nil && object && referenceCodeAllowed && referenceTypeAllowed && isGenericImageInputRejectionCode(providerStatus) && (failure.Code != 602 || explicitReferenceFetch) && isImageReferenceRejectionEnvelope(referenceEnvelope, 0, transportRejection)
+	unverifiedReferenceDiagnostic := !verifiedReferenceRejection && (failure.Code == 602 || status == http.StatusBadRequest && transportRejection)
+	if (transportRejection || sizeRejection) && !verifiedReferenceRejection {
 		compatibilityCode = ""
 	}
 	if failure.Code == 602 && !verifiedReferenceRejection {
@@ -977,7 +1025,7 @@ func classifyAsyncImageHTTPFailure(ctx context.Context, response *http.Response,
 		failure.Code, failure.InternalCode = 610, "upstream_failed"
 		failure.RetryableHTTPResponse, failure.SubmissionRejected = false, false
 	}
-	failure.ReferenceRejectionVerified = verifiedReferenceRejection && (failure.Code == 602 || failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && youTubeRejection)
+	failure.ReferenceRejectionVerified = verifiedReferenceRejection && (failure.Code == 602 || failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && transportRejection)
 	return failure
 }
 
@@ -991,7 +1039,7 @@ func ShouldFallbackGeminiReferenceTransport(failure *AsyncImageFailure) bool {
 	if failure.Code == 602 && failure.ReferenceRejectionVerified {
 		return true
 	}
-	if failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && failure.ReferenceRejectionVerified && imageYouTubeNoticePattern.MatchString(failure.Message) {
+	if failure.Code == 603 && failure.InternalCode == "upstream_image_reference_incompatible" && failure.ReferenceRejectionVerified && imageReferenceTransportConstraint(failure.Message) == "youtube_url" {
 		return true
 	}
 	return false

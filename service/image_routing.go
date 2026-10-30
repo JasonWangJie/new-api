@@ -1198,7 +1198,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	routing := ImageAccountRouting{}
 	effectiveRetries := retries
 	for _, attempt := range attempts {
-		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 602 || attempt.Code == 610 || attempt.Code == 613 || attempt.Code == 603 && attempt.TransportUsed == "remote" && imageYouTubeNoticePattern.MatchString(attempt.ErrorMessage)) {
+		if attempt.ReferenceFailure && attempt.ReferenceMode == "passthrough_fallback_local" && (attempt.Code == 601 || attempt.Code == 602 || attempt.Code == 610 || attempt.Code == 613 || attempt.Code == 603 && attempt.TransportUsed == "remote" && imageReferenceTransportConstraint(attempt.ErrorMessage) == "youtube_url") {
 			effectiveRetries = max(effectiveRetries, 1)
 			break
 		}
@@ -1257,6 +1257,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	lastCompatibilityCode := imageAttemptCompatibilityCode(lastAttempt)
 	lastIncompatible := lastCompatibilityCode != ""
 	lastReferenceSizeRejection := lastAttempt.Code == 603 && lastAttempt.HTTPStatus == http.StatusBadRequest && lastCompatibilityCode == "upstream_image_reference_incompatible" && imageReferenceSizeRejectionPattern.MatchString(strings.TrimSpace(lastAttempt.ErrorMessage))
+	lastReferenceTransportRejection := lastCompatibilityCode == "upstream_image_reference_incompatible" && imageReferenceTransportConstraint(lastAttempt.ErrorMessage) == "file_data"
 	if lastAttempt.Dispatched && lastAttempt.FinishedAt > 0 && lastAttempt.RetrySameChannel && lastAttempt.Code == 606 {
 		// A verified terminal connection failure retries within its original
 		// channel, while retaining credential exclusions and cooldowns.
@@ -1293,7 +1294,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
-		if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection {
+		if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection || lastReferenceTransportRejection {
 			routing.AvoidChannel = lastAttempt.ChannelId
 		}
 		if platform == "gemini" && lastChannel != 0 && channelSwitches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {
@@ -1327,7 +1328,7 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	if lastAttempt.FinishedAt > 0 && (lastAttempt.Code == 605 || lastAttempt.Code == 606 || lastAttempt.HTTPStatus == 429) {
 		routing.Avoid = last
 	}
-	if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection {
+	if lastReferenceFetchFailure || lastSubmissionResponse || lastReferenceSizeRejection || lastReferenceTransportRejection {
 		routing.Avoid, routing.AvoidChannel = last, lastAttempt.ChannelId
 	}
 	if platform == "gemini" && last != "" && switches >= maxSwitches && !lastTimedOut && !lastReferenceFetchFailure {

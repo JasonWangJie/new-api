@@ -1616,6 +1616,7 @@ func TestAsyncImageFailureNoticeReadableHistoricalDiagnostics(t *testing.T) {
 		{name: "dimension multiple", code: "upstream_job_failed", publicCode: 610, message: "The requested image size is invalid. Width and height must both be divisible by 16.", summary: "图片宽度和高度都必须是 16 的整数倍", advice: "16 的整数倍"},
 		{name: "unsupported reference source", code: "upstream_failed", publicCode: 610, message: "Provider API error: Only a specific YouTube video URL is supported (request id: 20261021090758101641609AE8GcbCM)", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
 		{name: "reference compatibility retains its actual cause", code: "upstream_image_reference_incompatible", publicCode: 603, message: "Provider API error: Only a specific YouTube video URL is supported", summary: "上游只支持指定格式的 YouTube 视频链接", advice: "链接格式"},
+		{name: "fileData restriction explains reference format without assuming YouTube only", code: "upstream_image_reference_incompatible", publicCode: 603, message: "fileData requires a user YouTube reference or a gateway file_id", summary: "上游拒绝了图片输入或参数", advice: "链接格式"},
 		{name: "exhausted reference accounts do not assume a link format without history", code: "image_reference_accounts_exhausted", publicCode: 603, message: "No other eligible image account supports the reference input", summary: "图片处理容量暂时不可用", advice: "核查请求格式"},
 		{name: "unsupported thinking level", code: "upstream_failed", publicCode: 610, message: "AI Studio 请求参数无效: 模型不支持 thinking level", summary: "当前模型不支持请求中的思考级别参数", advice: "思考级别参数"},
 		{name: "no usable output or invalid count is not assumed to exceed maximum", code: "output_parse_failed", publicCode: 609, storageFailed: true, message: "upstream must return between 1 and 128 complete images", summary: "上游未返回符合要求的完整图片结果", advice: "没有可用图片或数量不符合要求"},
@@ -2482,6 +2483,7 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		mode       string
 		reference  bool
 		byteLimit  bool
+		fileData   bool
 		errorType  string
 		spareKey   bool
 		wantCalls  int
@@ -2489,6 +2491,14 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 		wantError  string
 		wantReason string
 	}{
+		{name: "Gemini fileData constraint switches channel", reference: true, fileData: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini fileData constraint prefers another channel over spare key", reference: true, fileData: true, spareKey: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini fileData constraint excludes copied credentials", mode: "copied credential", reference: true, fileData: true, wantCalls: 2, wantRetry: 1},
+		{name: "Gemini fileData constraint has no compatible candidate", mode: "no alternate", reference: true, fileData: true, wantCalls: 1, wantRetry: 1, wantError: "image_reference_accounts_exhausted", wantReason: "no_compatible_account"},
+		{name: "Gemini fileData constraint obeys capacity budget", mode: "no capacity retry", reference: true, fileData: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "compatibility_retry_budget_exhausted"},
+		{name: "Gemini fileData constraint obeys total budget", mode: "no total retry", reference: true, fileData: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "total_retry_budget_exhausted"},
+		{name: "Gemini fileData constraint obeys switch budget", mode: "no account switch", reference: true, fileData: true, wantCalls: 1, wantRetry: 1, wantError: "account_switches_exhausted", wantReason: "account_switch_limit"},
+		{name: "Gemini fileData constraint cannot replace unknown execution", mode: "unknown", reference: true, fileData: true, wantCalls: 1, wantError: "upstream_image_reference_incompatible", wantReason: "execution_unknown"},
 		{name: "explicit rejection then compatible success", wantCalls: 2, wantRetry: 1},
 		{name: "copied credential cannot become an alternative", mode: "copied credential", wantCalls: 2, wantRetry: 1},
 		{name: "no compatible account remains", mode: "no alternate", wantCalls: 1, wantRetry: 1, wantError: "image_compatible_accounts_exhausted", wantReason: "no_compatible_account"},
@@ -2578,6 +2588,9 @@ func TestAsyncImageWorkerCompatibilityFailover(t *testing.T) {
 			}
 			if tc.byteLimit {
 				message = "reference image exceeds limit: 20 MB limit exceeded"
+			}
+			if tc.fileData {
+				message = "Provider API error: fileData requires a user YouTube reference or a gateway file_id (request id: changing-provider-id)"
 			}
 			switch tc.mode {
 			case "invalid dimensions":
@@ -3654,6 +3667,27 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 		{name: "provider wrapper must be fully read", body: `{"error":{"code":400,"type":"openai_error","message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "400", message: "Only a specific YouTube", readError: true},
 		{name: "reference compatibility without provider code", body: `{"error":{"message":"Only a specific YouTube video URL is supported"}}`, expectedCode: 603, message: "Only a specific YouTube", internalCode: "upstream_image_reference_incompatible", fallback: true},
 		{name: "reference compatibility is case insensitive", body: `{"error":{"code":"400","message":"ONLY A SPECIFIC YOUTUBE VIDEO URL IS SUPPORTED"}}`, expectedCode: 603, providerCode: "400", message: "YOUTUBE", internalCode: "upstream_image_reference_incompatible", fallback: true},
+		{name: "fileData requirement with changing request ID", body: `{"error":{"code":400,"type":"openai_error","message":"Provider API error: fileData requires a user YouTube reference or a gateway file_id (request id: another-request-42)"}}`, expectedCode: 603, providerCode: "400", message: "fileData requires", internalCode: "upstream_image_reference_incompatible"},
+		{name: "fileData constraint reworded", body: `{"error":{"code":400,"message":"Gateway rejected input: FILE_DATA only accepts a gateway file ID or YouTube URL."}}`, expectedCode: 603, providerCode: "400", message: "only accepts", internalCode: "upstream_image_reference_incompatible"},
+		{name: "fileData postfix requirement", body: `{"error":{"code":400,"message":"fileData: a gateway file_id is required"}}`, expectedCode: 603, providerCode: "400", message: "is required", internalCode: "upstream_image_reference_incompatible"},
+		{name: "Chinese remote URI requirement", body: `{"error":{"code":400,"message":"远程 URI 仅限 YouTube 视频或网关文件 ID"}}`, expectedCode: 603, providerCode: "400", message: "仅限", internalCode: "upstream_image_reference_incompatible"},
+		{name: "fileData rejects remote HTTP links", body: `{"error":{"code":400,"message":"Remote HTTP URLs are not supported in fileData; use inlineData instead."}}`, expectedCode: 603, providerCode: "400", message: "not supported", internalCode: "upstream_image_reference_incompatible"},
+		{name: "Chinese fileData transport restriction", body: `{"error":{"code":400,"message":"fileData 仅支持 YouTube 链接或网关 file_id，请更换参考图传输方式"}}`, expectedCode: 603, providerCode: "400", message: "仅支持", internalCode: "upstream_image_reference_incompatible"},
+		{name: "YouTube constraint reworded preserves local fallback", body: `{"error":{"code":400,"message":"This provider supports only YouTube video links."}}`, expectedCode: 603, providerCode: "400", message: "supports only", internalCode: "upstream_image_reference_incompatible", fallback: true},
+		{name: "negated fileData requirement remains terminal", body: `{"error":{"code":400,"message":"fileData does not require a gateway file_id or a YouTube reference"}}`, expectedCode: 610, providerCode: "400", message: "does not require"},
+		{name: "conditional fileData advice remains terminal", body: `{"error":{"code":400,"message":"If fileData requires a YouTube reference or a gateway file_id, try a different input"}}`, expectedCode: 610, providerCode: "400", message: "If fileData"},
+		{name: "quoted fileData request text remains terminal", body: `{"error":{"code":400,"message":"Invalid input: prompt contains fileData requires a user YouTube reference or a gateway file_id"}}`, expectedCode: 610, providerCode: "400", message: "prompt contains"},
+		{name: "fileData constraint cannot hide accepted receipt", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id"},"metadata":{"task_id":"already-accepted"}}`, expectedCode: 610, providerCode: "400", message: "fileData requires"},
+		{name: "fileData constraint cannot hide output", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id"},"data":[{"url":"https://result.example/image.png"}]}`, expectedCode: 610, providerCode: "400", message: "fileData requires"},
+		{name: "fileData constraint cannot authorize read failure", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id"}}`, expectedCode: 610, providerCode: "400", message: "fileData requires", readError: true},
+		{name: "fileData constraint cannot authorize truncated response", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id"}}`, expectedCode: 610, providerCode: "400", message: "fileData requires", truncated: true},
+		{name: "fileData constraint retains safety precedence", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id; safety review did not pass"}}`, expectedCode: 601, providerCode: "400", message: "safety review"},
+		{name: "fileData moderation rejection cannot switch", body: `{"error":{"code":400,"message":"fileData requires a YouTube reference or gateway file_id; moderation rejected"}}`, expectedCode: 610, providerCode: "400", message: "moderation rejected"},
+		{name: "fileData nested review contradiction cannot switch", body: `{"error":{"code":400,"message":"fileData requires a YouTube reference or gateway file_id"},"metadata":{"reason":"审核未通过"}}`, expectedCode: 610, providerCode: "400", message: "fileData requires"},
+		{name: "fileData ordinary parameter rejection cannot switch", body: `{"error":{"code":400,"message":"fileData requires a YouTube reference or gateway file_id; prompt parameter is invalid"}}`, expectedCode: 610, providerCode: "400", message: "parameter is invalid"},
+		{name: "fileData credential rejection cannot switch", body: `{"error":{"code":403,"message":"fileData requires a user YouTube reference or a gateway file_id"}}`, expectedCode: 610, providerCode: "403", message: "fileData requires", httpStatus: http.StatusForbidden},
+		{name: "fileData unknown acceptance cannot switch", body: `{"error":{"code":400,"message":"fileData requires a user YouTube reference or a gateway file_id; execution status unknown"}}`, expectedCode: 610, providerCode: "400", message: "execution status unknown"},
+		{name: "fileData corrupt image remains terminal", body: `{"error":{"code":400,"message":"Invalid image container in fileData; requires a user YouTube reference or a gateway file_id"}}`, expectedCode: 610, providerCode: "400", message: "Invalid image"},
 		{name: "generic YouTube input error remains terminal", body: `{"error":{"code":400,"message":"The supplied YouTube video URL is invalid"}}`, expectedCode: 610, providerCode: "400", message: "YouTube video URL is invalid"},
 		{name: "quoted request text is not a reference rejection", body: `{"error":{"code":400,"message":"Invalid input: prompt contains Only a specific YouTube video URL is supported"}}`, expectedCode: 610, providerCode: "400", message: "prompt contains"},
 		{name: "reference compatibility cannot override safety", body: `{"error":{"code":400,"message":"Only a specific YouTube video URL is supported; safety review did not pass"}}`, expectedCode: 601, providerCode: "400", message: "safety review"},
