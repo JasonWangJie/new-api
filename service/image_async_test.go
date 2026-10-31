@@ -147,6 +147,180 @@ func asyncImageWorkerQuotaCacheFixture(t *testing.T, task model.AsyncImageTask) 
 	require.NoError(t, common.RDB.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "Id", token.Id, "RemainQuota", token.RemainQuota, "UsedQuota", token.UsedQuota).Err())
 }
 
+func TestTabtabReferenceDownloadRejection(t *testing.T) {
+	const message = `"message":"reference media could not be downloaded: HTTP 404"`
+	const details = `"details":{"field":"images","index":0,"url":"https://diagnostic.example/failed.png"}`
+	const refusal = `{"code":"VALIDATION_FAILED",` + message + `,` + details + `,"request_id":"REQ_reference"}`
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		readError  bool
+		verified   bool
+	}{
+		{name: "documented input details", body: refusal, status: 400, verified: true},
+		{name: "without details", body: `{"code":"VALIDATION_FAILED",` + message + `}`, status: 400, verified: true},
+		{name: "empty data", body: strings.TrimSuffix(refusal, "}") + `,"data":{}}`, status: 400, verified: true},
+		{name: "case insensitive diagnostic", body: strings.Replace(refusal, "reference media could not be downloaded", "REFERENCE MEDIA COULD NOT BE DOWNLOADED", 1), status: 400, verified: true},
+		{name: "unknown code", body: strings.Replace(refusal, "VALIDATION_FAILED", "UPSTREAM_TIMEOUT", 1), status: 400},
+		{name: "wrong status", body: refusal, status: 503},
+		{name: "accepted receipt", body: strings.TrimSuffix(refusal, "}") + `,"data":{"id":"accepted-job","status":"processing"}}`, status: 400},
+		{name: "output evidence", body: strings.TrimSuffix(refusal, "}") + `,"url":"https://output.example/result.png"}`, status: 400},
+		{name: "receipt state in diagnostic", body: strings.Replace(refusal, "HTTP 404", "task_id=accepted-job, status=processing", 1), status: 400},
+		{name: "receipt state without details", body: `{"code":"VALIDATION_FAILED","message":"reference media could not be downloaded; task_id=accepted-job, status=processing"}`, status: 400},
+		{name: "opaque task ID in diagnostic", body: strings.Replace(refusal, "HTTP 404", "task_id=job123", 1), status: 400},
+		{name: "output URL in diagnostic", body: strings.Replace(refusal, "HTTP 404", "result_url=https://output.example/final.png", 1), status: 400},
+		{name: "active diagnostic cannot hide task ID", body: strings.Replace(refusal, "reference media could not be downloaded: HTTP 404", "reference media download failed; task_id=job123; download failed", 1), status: 400},
+		{name: "active diagnostic cannot hide output", body: strings.Replace(refusal, "reference media could not be downloaded: HTTP 404", "reference media download failed; result_url=https://output.example/failed; download failed", 1), status: 400},
+		{name: "unknown details", body: strings.Replace(refusal, `"index":0`, `"index":0,"task_id":"accepted-job"`, 1), status: 400},
+		{name: "duplicate details field", body: strings.Replace(refusal, `"field":"images"`, `"field":"results","field":"images"`, 1), status: 400},
+		{name: "duplicate root details", body: strings.TrimSuffix(refusal, "}") + `,"details":{"field":"images","index":0,"url":"https://diagnostic.example/other.png"}}`, status: 400},
+		{name: "output field is not input", body: strings.Replace(refusal, `"field":"images"`, `"field":"results"`, 1), status: 400},
+		{name: "invalid index", body: strings.Replace(refusal, `"index":0`, `"index":-1`, 1), status: 400},
+		{name: "null index", body: strings.Replace(refusal, `"index":0`, `"index":null`, 1), status: 400},
+		{name: "non URL detail", body: strings.Replace(refusal, "https://diagnostic.example/failed.png", "data:image/png;base64,unexpected", 1), status: 400},
+		{name: "permanent invalid input", body: strings.Replace(refusal, "reference media could not be downloaded: HTTP 404", "reference media size is invalid", 1), status: 400},
+		{name: "policy contradiction", body: strings.Replace(refusal, "HTTP 404", "content_policy_violation", 1), status: 400},
+		{name: "truncated envelope", body: strings.TrimSuffix(refusal, "}"), status: 400},
+		{name: "read failed after complete JSON", body: refusal, status: 400, readError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reader io.Reader = strings.NewReader(tc.body)
+			if tc.readError {
+				reader = io.MultiReader(reader, iotest.ErrReader(io.ErrUnexpectedEOF))
+			}
+			failure := ClassifyTabtabImageHTTPFailure(t.Context(), &http.Response{StatusCode: tc.status, Body: io.NopCloser(reader)}, "")
+			require.NotNil(t, failure)
+			assert.Equal(t, tc.verified, failure.ReferenceRejectionVerified)
+			assert.Equal(t, tc.verified, failure.SubmissionRejected)
+			assert.Equal(t, tc.verified, failure.RetrySameChannel)
+			assert.Equal(t, !tc.verified, failure.ExecutionUnknown)
+			if tc.verified {
+				assert.Equal(t, 602, failure.Code)
+				assert.Equal(t, "VALIDATION_FAILED", failure.ProviderCode)
+				assert.False(t, failure.UpstreamTerminal, "a refused submission is not an accepted job's terminal result")
+			} else {
+				assert.Equal(t, 608, failure.Code)
+			}
+		})
+	}
+}
+
+func TestTabtabReferenceDownloadLocalRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, transport string
+		priorReferenceRetry   bool
+		totalBudgetSpent      bool
+		noReferences          bool
+		outputReceived        bool
+		localRejected         bool
+		wantRetry             bool
+	}{
+		{name: "remote input retries original channel", transport: "remote", wantRetry: true},
+		{name: "mixed input retries original channel", transport: "mixed", wantRetry: true},
+		{name: "second refusal stops", transport: "remote", wantRetry: true, localRejected: true},
+		{name: "unknown transmitted input", transport: "unknown"},
+		{name: "passthrough only", mode: "passthrough", transport: "remote"},
+		{name: "already local", mode: "local", transport: "local", priorReferenceRetry: true},
+		{name: "reference budget spent", transport: "remote", priorReferenceRetry: true},
+		{name: "total budget spent", transport: "remote", totalBudgetSpent: true},
+		{name: "no reference inputs", transport: "remote", noReferences: true},
+		{name: "output already received", transport: "remote", outputReceived: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			if tc.wantRetry && !tc.localRejected {
+				outputEntities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+				require.NoError(t, db.AutoMigrate(outputEntities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(outputEntities...)) })
+			}
+			mode := tc.mode
+			if mode == "" {
+				mode = "passthrough_fallback_local"
+			}
+			var original model.Channel
+			require.NoError(t, db.First(&original, task.ChannelId).Error)
+			original.SetSetting(dto.ChannelSettings{ImageReferenceTransportMode: mode})
+			require.NoError(t, db.Model(&original).Update("setting", original.Setting).Error)
+			request.Kind = "image_to_image"
+			request.Parts = []AsyncImageInputPart{{Type: "image_url", URL: "https://original.example/reference.png"}}
+			if tc.noReferences {
+				request.Kind, request.Parts = "text_to_image", nil
+			}
+			payload, err := common.Marshal(request)
+			require.NoError(t, err)
+			task.RequestCipher, err = EncryptImagePayload(payload, "task:"+task.TaskId)
+			require.NoError(t, err)
+			if tc.priorReferenceRetry {
+				task.ReferenceRetryCount = 1
+			}
+			if tc.totalBudgetSpent {
+				task.RetryCount = cfg.TotalRetries
+			}
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "reference_retry_count": task.ReferenceRetryCount, "retry_count": task.RetryCount}).Error)
+			if tc.outputReceived {
+				require.NoError(t, db.Create(&model.AsyncImageEvent{TaskId: task.TaskId, EventKey: "existing-output", EventType: "output_received", CreatedAt: time.Now().Unix()}).Error)
+			}
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+			calls := 0
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, config ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Equal(t, original.Id, channel.Id)
+				assert.Equal(t, request.Parts, outbound.Parts, "recovery must retain original inputs, not the diagnostic URL")
+				assert.Equal(t, request.Billing, outbound.Billing)
+				require.NotNil(t, outbound.ReferenceTransportUsed)
+				*outbound.ReferenceTransportUsed = tc.transport
+				if calls == 2 {
+					assert.Equal(t, "local", ImageChannelReferenceTransport(*channel, outbound.Platform, current.ReferenceRetryCount, config))
+					*outbound.ReferenceTransportUsed = "local"
+				}
+				require.NoError(t, beforeInvoke())
+				if calls == 1 || tc.localRejected {
+					failure := ClassifyTabtabImageHTTPFailure(ctx, &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"code":"VALIDATION_FAILED","message":"reference media could not be downloaded","details":{"field":"images","index":0,"url":"https://diagnostic.example/failed.png"}}`))}, "")
+					return nil, model.AsyncImageBill{}, failure
+				}
+				return &AsyncImageOutput{Images: []ImageBytes{asyncImageBytesFixture(t)}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "tabtab-reference-final", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+			}
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, 1, calls)
+			if !tc.wantRetry {
+				assert.Equal(t, model.ImageTaskFailed, task.Status)
+				assert.Zero(t, task.NextAttemptAt)
+				return
+			}
+			require.Equal(t, model.ImageTaskQueued, task.Status)
+			assert.Equal(t, 1, task.ReferenceRetryCount)
+			assert.Equal(t, 1, task.RetryCount)
+			var history []ImageChannelAttempt
+			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
+			require.Len(t, history, 1)
+			assert.True(t, history[0].SubmissionRejected)
+			assert.True(t, history[0].RetrySameChannel)
+			assert.True(t, history[0].ReferenceFailure)
+			assert.Equal(t, original.Id, ImageAccountAttemptRouting(history, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches).PinChannel)
+			require.NoError(t, db.Model(&alternate).Update("priority", 1000).Error)
+			require.NoError(t, common.RDB.Del(t.Context(), ImageAccountCooldownKey(history[0].KeyFingerprint)).Err())
+			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "tabtab-local-worker", cfg.WorkerLease)
+			require.NoError(t, err)
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, 2, calls)
+			assert.Equal(t, 1, task.ReferenceRetryCount)
+			if tc.localRejected {
+				assert.Equal(t, model.ImageTaskFailed, task.Status)
+				assert.Zero(t, task.NextAttemptAt)
+			} else {
+				assert.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+			}
+			var bill model.AsyncImageBill
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, 100, bill.ReservedQuota, "local recovery must reuse the original reservation")
+		})
+	}
+}
+
 func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
 	db, _, _, cfg, _ := asyncImageWorkerFixture(t)
 	encoded, err := common.Marshal(cfg)

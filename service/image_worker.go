@@ -803,7 +803,8 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			}
 		}
 	}
-	submissionResponseRetry := (failure.SynchronousRetryableResponse || failure.SubmissionRejected) && !failure.ExecutionUnknown && (failure.Code == 603 || failure.Code == 606) && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
+	referenceRecovery := failure.Code == 602 && failure.SubmissionRejected && failure.ReferenceRejectionVerified && failure.RetrySameChannel && !failure.ExecutionUnknown
+	submissionResponseRetry := (failure.SynchronousRetryableResponse || failure.SubmissionRejected) && !failure.ExecutionUnknown && (failure.Code == 603 || failure.Code == 606 || referenceRecovery) && task.UpstreamTaskId == "" && !acceptedOutput && task.ImageCount == 0 && task.ResultCount == 0
 	if mixedRouting && !acceptedOutput && task.UpstreamTaskId == "" && task.DispatchedAt > 0 && !failure.UpstreamTerminal && !submissionResponseRetry && (failure.HTTPStatus < 400 || failure.HTTPStatus == http.StatusRequestTimeout || failure.HTTPStatus >= 500) {
 		// A transport interruption or server error cannot prove non-acceptance.
 		// Keep the hold and require reconciliation instead of crossing providers.
@@ -836,6 +837,9 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 			// Selection and capacity failures can occur before a new attempt is
 			// recorded. Never overwrite an earlier completed account failure.
 			if last.FinishedAt == 0 && last.ChannelId == task.ChannelId {
+				if referenceRecovery && submissionResponseRetry && task.DispatchedAt > 0 && last.Dispatched && replayRequest != nil && replayRequest.ReferenceImageCount() > 0 && task.ReferenceRetryCount == 0 && !last.ReferenceFallback && last.ReferenceMode == "passthrough_fallback_local" && (last.TransportUsed == "remote" || last.TransportUsed == "mixed") {
+					failure.ReferenceTransportFallback = true
+				}
 				// Freeze this policy with the selected attempt. Enabling it later
 				// must never authorize replay of an older uncertain dispatch.
 				mixedTimeoutRetry = last.Dispatched && last.RetryOnTimeout
@@ -853,7 +857,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.UpstreamTaskID = task.UpstreamTaskId
 				last.SynchronousRetryableResponse = submissionResponseRetry && failure.SynchronousRetryableResponse
 				last.SubmissionRejected = submissionResponseRetry && failure.SubmissionRejected
-				last.RetrySameChannel = failure.UpstreamTerminal && !failure.ExecutionUnknown && failure.RetrySameChannel && (failure.Code == 602 || failure.Code == 606)
+				last.RetrySameChannel = (failure.UpstreamTerminal || referenceRecovery && submissionResponseRetry) && !failure.ExecutionUnknown && failure.RetrySameChannel && (failure.Code == 602 || failure.Code == 606)
 				last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal))
 				encoded, err := common.Marshal(attempts)
 				if err != nil {
@@ -1024,6 +1028,11 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 					return err
 				}
 			}
+		}
+		if referenceRecovery {
+			// A verified input download refusal permits one local recovery, not
+			// another remote submission or a subsequent rotation through the pool.
+			resubmit = resubmit && failure.ReferenceTransportFallback
 		}
 		count, maximum, base, maxDelay, key := 0, 0, 0, 0, ""
 		pollRetry := task.UpstreamTaskId != "" && !failure.UpstreamTerminal && (failure.Code == 605 || failure.Code == 606)

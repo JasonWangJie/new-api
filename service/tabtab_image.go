@@ -409,6 +409,13 @@ func ClassifyTabtabImageHTTPFailure(ctx context.Context, response *http.Response
 	}
 	expectedStatus := map[string]int{"AUTH_INVALID_TOKEN": 401, "FORBIDDEN": 403, "VALIDATION_FAILED": 400, "POINTS_NOT_ENOUGH": 402, "RATE_LIMITED": 429, "MODEL_UNAVAILABLE": 503, "FILE_TYPE_NOT_ALLOWED": 400}
 	valid = valid && expectedStatus[code] == response.StatusCode
+	var message string
+	_ = common.Unmarshal(fields["message"], &message)
+	diagnostic, referenceDownload := strings.CutPrefix(strings.ToLower(strings.TrimSpace(message)), "reference media could not be downloaded")
+	referenceDownload = referenceDownload && code == "VALIDATION_FAILED" && response.StatusCode == http.StatusBadRequest && imageExplicitReferenceFetchPattern.MatchString(strings.TrimSpace(message)) && ClassifyAsyncImageFailure(errors.New(message), response.StatusCode).Code == 602
+	if referenceDownload {
+		valid = valid && isImageReferenceRejectionEnvelope(message, 0, false) && isImageGatewayFailureDiagnostic(diagnostic, false)
+	}
 	seen := make(map[string]bool)
 	gjson.ParseBytes(body).ForEach(func(key, _ gjson.Result) bool {
 		if seen[key.Str] {
@@ -429,6 +436,31 @@ func ClassifyTabtabImageHTTPFailure(ctx context.Context, response *http.Response
 			if common.Unmarshal(raw, &object) != nil || len(object) != 0 {
 				valid = false
 			}
+		case "details":
+			// TabTab reports the failed input here. It is diagnostic metadata,
+			// never a replacement download target or evidence of a created task.
+			var details map[string]common.RawMessage
+			if !referenceDownload || common.Unmarshal(raw, &details) != nil || len(details) != 3 {
+				valid = false
+				continue
+			}
+			var field, inputURL string
+			var index *int
+			if common.Unmarshal(details["field"], &field) != nil || field != "images" || common.Unmarshal(details["index"], &index) != nil || index == nil || *index < 0 || *index >= 128 || common.Unmarshal(details["url"], &inputURL) != nil || len(inputURL) > 8192 {
+				valid = false
+			}
+			parsed, err := url.Parse(inputURL)
+			if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.ContainsFunc(inputURL, unicode.IsControl) {
+				valid = false
+			}
+			seenDetails := make(map[string]bool)
+			gjson.ParseBytes(raw).ForEach(func(key, _ gjson.Result) bool {
+				if seenDetails[key.Str] || !slices.Contains([]string{"field", "index", "url"}, key.Str) {
+					valid = false
+				}
+				seenDetails[key.Str] = true
+				return true
+			})
 		default:
 			valid = false
 		}
@@ -437,6 +469,10 @@ func ClassifyTabtabImageHTTPFailure(ctx context.Context, response *http.Response
 		failure.ProviderCode = code
 		failure.SubmissionRejected = true
 		failure.RetryableHTTPResponse = response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusServiceUnavailable
+		if referenceDownload {
+			failure.Code, failure.InternalCode = 602, "upstream_failed"
+			failure.ReferenceRejectionVerified, failure.RetrySameChannel = true, true
+		}
 		return failure
 	}
 	failure.Code, failure.InternalCode, failure.ExecutionUnknown = 608, "execution_unknown", true
