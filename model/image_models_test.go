@@ -760,6 +760,62 @@ func TestAsyncImageQueuedDeadlineRecovery(t *testing.T) {
 	}
 }
 
+func TestAsyncImageDeadlineGraceRecoveryDoesNotStarve(t *testing.T) {
+	db, task, _ := imageDatabaseFixture(t)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+	now := time.Now().Unix()
+	task.Status, task.StartedAt = ImageTaskQueued, now-120
+	task.LeaseToken, task.LeaseExpiresAt, task.DispatchedAt = "", 0, 0
+	task.UpstreamTaskId = ""
+	task.Attempts = fmt.Sprintf(`[{"dispatched":true,"retry_on_timeout":true,"finished_at":%d,"upstream_task_id":"old-accepted-job","deadline_retry_until":%d}]`, now-1, now+60)
+	require.NoError(t, db.Save(&task).Error)
+	later := task
+	later.Id, later.TaskId, later.Attempts = 0, "later-expired-image", ""
+	require.NoError(t, db.Create(&later).Error)
+	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60, 24))
+	require.NoError(t, db.Where("task_id = ?", later.TaskId).Take(&later).Error)
+	assert.Equal(t, ImageTaskExpired, later.Status, "a grace window must not hide later expired tasks behind the recovery batch limit")
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Equal(t, ImageTaskQueued, task.Status)
+	assert.Equal(t, now-120, task.StartedAt)
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+
+	// A live lease still owns its deadline policy; the sweeper cannot steal it.
+	task.Status, task.LeaseToken, task.LeaseExpiresAt = ImageTaskInvoking, "live-deadline-worker", now+60
+	task.UpstreamTaskId, task.Attempts = "old-accepted-job", `[{"retry_on_timeout":true}]`
+	require.NoError(t, db.Save(&task).Error)
+	version := task.Version
+	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60, 24))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Equal(t, "live-deadline-worker", task.LeaseToken)
+	assert.Equal(t, version, task.Version)
+
+	// An expired lease delegates to the worker; it never creates a new hold.
+	require.NoError(t, db.Model(&task).Update("lease_expires_at", now-1).Error)
+	require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 60, 24))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Equal(t, ImageTaskInvoking, task.Status)
+	assert.Empty(t, task.LeaseToken)
+	assert.Equal(t, "old-accepted-job", task.UpstreamTaskId)
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+
+	// An exhausted grace still has an unconfirmed original job, even before
+	// the replacement dispatch. Retain the hold instead of expiring/refunding.
+	task.Status, task.UpstreamTaskId = ImageTaskQueued, ""
+	task.Attempts = fmt.Sprintf(`[{"dispatched":true,"retry_on_timeout":true,"finished_at":%d,"upstream_task_id":"old-accepted-job","deadline_retry_until":%d}]`, now-10, now-1)
+	require.NoError(t, db.Save(&task).Error)
+	for range 2 {
+		// Increasing the live normal timeout cannot reopen the fixed grace.
+		require.NoError(t, RecoverAsyncImageTasks(t.Context(), 1, 600, 24))
+	}
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Equal(t, ImageTaskExecutionUnknown, task.Status)
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+	var refunds int64
+	require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+	assert.Zero(t, refunds)
+}
+
 func TestAsyncImageReservationRefundRecoveryDoesNotStarve(t *testing.T) {
 	db, task, _ := imageDatabaseFixture(t)
 	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))

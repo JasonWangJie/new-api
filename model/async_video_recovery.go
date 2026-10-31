@@ -14,8 +14,9 @@ import (
 var ErrTaskAttemptConflict = errors.New("task attempt generation was superseded")
 
 // ScheduleAsyncVideoReferenceRecovery fences the failed native operation and
-// queues one local-reference recovery without releasing or repeating its hold.
-func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job AsyncMediaJob, reason string) (bool, error) {
+// queues one recovery without releasing or repeating its hold. Capacity failures
+// reuse the original inputs; reference fetch failures first prepare local inputs.
+func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job AsyncMediaJob, reason string, localReferences bool) (bool, error) {
 	if task.ID <= 0 || job.ID <= 0 || task.TaskID == "" || task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.PrivateData.TokenId != job.TokenId || strings.TrimSpace(reason) == "" {
 		return false, ErrImageConflict
 	}
@@ -55,7 +56,11 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		if result.RowsAffected != 1 {
 			return ErrTaskAttemptConflict
 		}
-		jobChanges := map[string]any{"attempt_generation": generation, "reference_retry_count": 1, "reference_recovery_stage": "prepare", "status": "queued", "storage_status": "pending", "dispatched_at": 0, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": now, "error_message": ""}
+		stage, nextAttempt := "prepare", now
+		if !localReferences {
+			stage, nextAttempt = "submit", now+5
+		}
+		jobChanges := map[string]any{"attempt_generation": generation, "reference_retry_count": 1, "reference_recovery_stage": stage, "status": "queued", "storage_status": "pending", "dispatched_at": 0, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": nextAttempt, "error_message": ""}
 		result = tx.Model(&AsyncMediaJob{}).Where("id = ? AND attempt_generation = ? AND reference_retry_count = ? AND status = ? AND billing_status = ?", currentJob.ID, job.AttemptGeneration, 0, "submitted", "reserved").Updates(jobChanges)
 		if result.Error != nil {
 			return result.Error

@@ -405,6 +405,7 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 	// These are fixed, sanitized diagnostic fixtures from already-refunded
 	// operations. Tests create new local rows; historical tasks are never replayed.
 	const accessFailure = "Network Error, Generation Failed. 可能是您提供的素材存储链接无法被我们的服务访问，或受到访问限制，导致素材读取失败。请切换到我们的素材存储后再提交，具体使用方法请参阅文档。我们的素材仅存储 2 小时，并针对常见访问限制做了适配，可有效减少此类问题。"
+	const busyFailure = "系统繁忙，请稍后重试"
 	fixtures := []struct{ taskID, nativeID, reason string }{
 		{"task_FwV2DiYrdzCducOB6afosCUjmfAPDBZu", "task_cbOfBRgeOKfwVr55TqUlglRzj6wGujFQ", "（图片1、图片2、图片3）素材下载超时，请联系管理员处理"},
 		{"task_PTZmKMXaTwOZUeGry9Fhe4FL3CFKaVgH", "task_Tx94WYxNNea4pAMZD93i0AzCFZNlVGNd", "（图片1）素材下载超时，请联系管理员处理"},
@@ -413,6 +414,7 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 		{"task_RaD05eH47s8QouGKYpUewxrg0twZ3kQc", "task_7D0cVrqLjXIKXRgD5RCVL9CL4yUxpWai", accessFailure},
 		{"task_iaBKWpln9O4V1LzqDywTbhQtAsZlrGLc", "task_WAORtCnyJnTbwEgTxj4UMfrNcJTcEogQ", accessFailure},
 		{"task_CPV3DGDT8swevT3l4V1aBGLmLc6J5PUP", "task_5RS8MpltthtFophnFWiYIKnCNCEzpXvG", accessFailure},
+		{"task_w5DlX8LzaeJBl8gu8asT1Viayd10GbS7", "busy-native-id", busyFailure},
 	}
 	type recoveryCase struct {
 		outcome string
@@ -420,6 +422,7 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 	}
 	for _, funding := range []string{"wallet", "subscription"} {
 		cases := []recoveryCase{{"success", 0}, {"second_failure", 1}, {"download_failure", 2}, {"refund_failure", 0}, {"submission_unknown", 0}, {"explicit_rejection", 0}}
+		cases = append(cases, recoveryCase{"success", 7}, recoveryCase{"second_failure", 7}, recoveryCase{"submission_unknown", 7}, recoveryCase{"explicit_rejection", 7})
 		if funding == "wallet" {
 			cases = append(cases, recoveryCase{"success", 3}, recoveryCase{"download_failure", 5})
 		} else {
@@ -427,6 +430,7 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 		}
 		for _, test := range cases {
 			outcome, fixture := test.outcome, fixtures[test.fixture]
+			busy := fixture.reason == busyFailure
 			t.Run(funding+"/"+outcome+"/"+fixture.taskID, func(t *testing.T) {
 				setupMeasuredTaskBillingDB(t)
 				asyncImageKeyFixture(t)
@@ -467,6 +471,10 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 				stale := *task
 				job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: ImageIdentityHash(task.TaskID), UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: "test-model", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: 100, CreatedAt: now, ExpiresAt: now + 6*86400}
 				canonical := map[string]any{"model": "test-model", "prompt": "图片1 and 视频1 unchanged", "duration": 5, "references": []any{map[string]any{"type": "image", "role": "reference", "source": "https://source.example/image.png"}, map[string]any{"type": "video", "role": "reference", "source": "asset://preserved"}}}
+				if busy {
+					delete(canonical, "references")
+					canonical["prompt"] = "A video without reference media"
+				}
 				channel := model.Channel{Id: 1, Key: "sk-test", Status: common.ChannelStatusEnabled}
 				request := AsyncVideoRequest{Channel: channel, Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: "test"}}}
 				require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, canonical, job.ExpiresAt))
@@ -532,6 +540,13 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 						{"singular_video", `{"status":"failed","video":"data:video/mp4;base64,AAAA"}`, fixture.reason, 200},
 						{"base64_output", `{"status":"failed","bytesBase64Encoded":"AAAA"}`, fixture.reason, 200},
 						{"result_url", `{"status":"failed","metadata":{"url":"https://output.example/video.mp4"}}`, fixture.reason, 200},
+						{"busy_with_authentication_failure", `{"status":"failed","error":{"message":"系统繁忙；鉴权失败"}}`, "系统繁忙；鉴权失败", 200},
+						{"busy_with_moderation_failure", `{"status":"failed","error":{"message":"系统繁忙；内容安全审核未通过"}}`, "系统繁忙；内容安全审核未通过", 200},
+						{"busy_with_parameter_failure", `{"status":"failed","error":{"message":"server busy; invalid parameter"}}`, "server busy; invalid parameter", 200},
+						{"busy_with_output", `{"status":"failed","metadata":{"url":"系统繁忙，请稍后重试"},"video_url":"https://output.example/video.mp4"}`, busyFailure, 200},
+						{"service_is_not_busy", `{"status":"failed","metadata":{"url":"The service is not busy; rendering failed"}}`, "The service is not busy; rendering failed", 200},
+						{"service_is_not_overloaded", `{"status":"failed","metadata":{"url":"The service is not overloaded; rendering failed"}}`, "The service is not overloaded; rendering failed", 200},
+						{"chinese_service_is_not_busy", `{"status":"failed","metadata":{"url":"系统并不繁忙，生成失败"}}`, "系统并不繁忙，生成失败", 200},
 					} {
 						t.Run(unsafe.name, func(t *testing.T) {
 							scheduled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: unsafe.reason}, unsafe.status, []byte(unsafe.body))
@@ -574,6 +589,10 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 							{"reference_url_contains_processing_words", "Reference image https://source.example/generated_video/corrupted-reference.png download timed out"},
 							{"reference_failure_without_error_details", "Reference image download failed with no error details"},
 							{"reference_timeout_without_error_code", "Reference image download timed out with no error code"},
+							{"first_reference_local_timeout", "reference 1 (image): local reference media download failed after 3 attempts: temporary reference media download failure: timeout"},
+							{"second_reference_local_timeout", "reference 2 (image): local reference media download failed after 5 attempts: temporary reference media download failure: timeout"},
+							{"third_reference_local_connection_failure", "reference 3 (video): local reference media download failed: connection failure"},
+							{"last_reference_local_timeout", "reference 64 (audio): local reference media download timed out"},
 						} {
 							t.Run(variant.name, func(t *testing.T) {
 								body, err := common.Marshal(map[string]any{"id": fixture.nativeID, "status": "failed", "metadata": map[string]any{"url": variant.reason}})
@@ -581,6 +600,17 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 								handled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: variant.reason}, 200, body)
 								require.NoError(t, err)
 								assert.True(t, handled, "recognized reference failures wait for the existing receipt projection before scheduling")
+							})
+						}
+					}
+					if busy {
+						for _, reason := range []string{"上游系统繁忙，请稍后再试（请求 abc123）", "服务器繁忙，请重试", "服务繁忙", "The SERVICE is BUSY, please retry later", "Generation service temporarily unavailable; retry later", "Server overloaded, please try again"} {
+							t.Run(reason, func(t *testing.T) {
+								body, err := common.Marshal(map[string]any{"id": fixture.nativeID, "status": "failed", "metadata": map[string]any{"url": reason}})
+								require.NoError(t, err)
+								handled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: reason}, 200, body)
+								require.NoError(t, err)
+								assert.True(t, handled, "busy wording variations preserve the existing reservation while its receipt projection completes")
 							})
 						}
 					}
@@ -593,7 +623,16 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 				poller := &scriptedPollingAdaptor{body: response, parse: &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: fixture.reason}}
 				require.NoError(t, updateVideoSingleTask(t.Context(), poller, &channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
 				require.NoError(t, model.DB.First(&job, job.ID).Error)
-				require.Equal(t, "prepare", job.ReferenceRecoveryStage)
+				stage := "prepare"
+				if busy {
+					stage = "submit"
+					assert.GreaterOrEqual(t, job.NextAttemptAt, now+5, "a busy provider must receive a bounded retry delay")
+					claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 120)
+					require.NoError(t, err)
+					assert.False(t, claimed, "the retry must not run before its delay elapses")
+					require.NoError(t, model.DB.Model(&job).Update("next_attempt_at", 0).Error)
+				}
+				require.Equal(t, stage, job.ReferenceRecoveryStage)
 				require.EqualValues(t, 1, job.AttemptGeneration)
 				require.NoError(t, model.DB.First(task, task.ID).Error)
 				assert.EqualValues(t, model.TaskStatusQueued, task.Status)
@@ -608,11 +647,13 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 				won, err := SettleTaskBillingOnComplete(t.Context(), nil, &stale, model.TaskStatusInProgress, relaycommon.FailTaskInfo(fixture.reason))
 				require.NoError(t, err)
 				assert.False(t, won)
-				image := asyncImageBytesFixture(t)
 				inputPath := filepath.Join(cfg.LocalPath, "cached.png")
-				require.NoError(t, os.WriteFile(inputPath, image.Data, 0600))
-				_, err = model.SaveMediaInputObject(t.Context(), model.MediaInputObject{ObjectId: "minput_cached", TaskId: job.TaskId, Slot: "0", Kind: "image", SourceHash: ImageIdentityHash("https://source.example/image.png"), UserId: 1, TokenId: 1, RootPath: cfg.LocalPath, ObjectKey: "cached.png", MimeType: "image/png", ByteSize: int64(len(image.Data)), Checksum: fmt.Sprintf("%x", sha256.Sum256(image.Data)), Status: "active", CreatedAt: now, ExpiresAt: request.ReferenceURLExpiresAt})
-				require.NoError(t, err)
+				image := asyncImageBytesFixture(t)
+				if !busy {
+					require.NoError(t, os.WriteFile(inputPath, image.Data, 0600))
+					_, err = model.SaveMediaInputObject(t.Context(), model.MediaInputObject{ObjectId: "minput_cached", TaskId: job.TaskId, Slot: "0", Kind: "image", SourceHash: ImageIdentityHash("https://source.example/image.png"), UserId: 1, TokenId: 1, RootPath: cfg.LocalPath, ObjectKey: "cached.png", MimeType: "image/png", ByteSize: int64(len(image.Data)), Checksum: fmt.Sprintf("%x", sha256.Sum256(image.Data)), Status: "active", CreatedAt: now, ExpiresAt: request.ReferenceURLExpiresAt})
+					require.NoError(t, err)
+				}
 				if outcome == "download_failure" || outcome == "refund_failure" {
 					require.NoError(t, os.Remove(inputPath))
 				}
@@ -627,10 +668,14 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 					submissions++
 					var changed map[string]any
 					require.NoError(t, common.Unmarshal(prepared.Body, &changed))
-					refs := changed["references"].([]any)
-					assert.Contains(t, refs[0].(map[string]any)["source"], "/api/media-inputs/minput_cached/content?")
-					assert.Equal(t, "asset://preserved", refs[1].(map[string]any)["source"])
-					refs[0].(map[string]any)["source"] = "https://source.example/image.png"
+					if !busy {
+						refs := changed["references"].([]any)
+						assert.Contains(t, refs[0].(map[string]any)["source"], "/api/media-inputs/minput_cached/content?")
+						assert.Equal(t, "asset://preserved", refs[1].(map[string]any)["source"])
+						refs[0].(map[string]any)["source"] = "https://source.example/image.png"
+					} else {
+						assert.Empty(t, prepared.ReferenceInputs)
+					}
 					original, err := common.Marshal(canonical)
 					require.NoError(t, err)
 					actual, err := common.Marshal(changed)
@@ -647,7 +692,11 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 					require.True(t, won)
 					return err
 				}
-				for attempt := range 2 {
+				phases := 2
+				if busy {
+					phases = 1
+				}
+				for attempt := range phases {
 					require.NoError(t, model.DB.First(&job, job.ID).Error)
 					if job.Status == "failed" || job.Status == "execution_unknown" {
 						break

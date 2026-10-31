@@ -182,15 +182,13 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 	// one deadline and byte budget even when an interrupted body is discarded.
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
 	defer cancel()
+	attemptTimeout := cfg.DownloadTimeout
+	if input.Kind == "image" {
+		attemptTimeout = min(attemptTimeout, imageCfg.DownloadTimeout)
+	}
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", err)
-		}
-		attemptTimeout := cfg.DownloadTimeout
-		if input.Kind == "image" {
-			// A slow source gets more time on each safe GET while all attempts
-			// still share the original media download and task deadlines.
-			attemptTimeout = min(attemptTimeout, imageCfg.DownloadTimeout*(1<<(attempt-1)))
 		}
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Duration(attemptTimeout)*time.Second)
 		object, err := downloadMediaInputAttempt(attemptCtx, job, input, cfg, imageCfg, expiresAt, remaining, client)
@@ -201,7 +199,7 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 		if ctx.Err() != nil {
 			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", ctx.Err())
 		}
-		if attempt == 3 || !errors.Is(err, errMediaInputDownloadTransient) {
+		if attempt == 5 || !errors.Is(err, errMediaInputDownloadTransient) {
 			return model.MediaInputObject{}, fmt.Errorf("local reference media download failed after %d attempts: %w", attempt, err)
 		}
 		delay := time.Duration(attempt) * time.Second
@@ -218,6 +216,11 @@ func downloadMediaInput(ctx context.Context, job model.AsyncMediaJob, input Asyn
 			timer.Stop()
 			return model.MediaInputObject{}, fmt.Errorf("local reference media download stopped: %w", ctx.Err())
 		case <-timer.C:
+		}
+		if input.Kind == "image" {
+			// Let slower sources recover beyond the original three GETs. The
+			// shared download deadline still caps the entire five-attempt batch.
+			attemptTimeout += min(attemptTimeout, cfg.DownloadTimeout-attemptTimeout)
 		}
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	gatewaydto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -729,7 +730,14 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				if active.Quota != retryTask.Quota || active.PrivateData.UpstreamTaskID != "" || !active.PrivateData.DurableBilling {
 					return errors.New("video reference recovery reservation changed")
 				}
-				return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), "local_download")
+				referenceMode := ""
+				if details := request.RequestDetails(); details != nil && len(details.ReferenceMedia) > 0 {
+					referenceMode = "original"
+				}
+				if slices.ContainsFunc(request.ReferenceInputs, func(input service.AsyncVideoReferenceInput) bool { return input.ObjectId != "" }) {
+					referenceMode = "local_download"
+				}
+				return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
 			})
 			result, taskErr := relay.RelayTaskSubmit(c, info)
 			if taskErr != nil {
@@ -766,7 +774,9 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			}
 			return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved"}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
 		})
-		_, taskErr := executeTaskSubmissionWith(c, info, relay.RelayTaskSubmit)
+		_, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
+			return retryAsyncVideoSubmission(c, info, relay.RelayTaskSubmit)
+		})
 		if taskErr != nil {
 			cause := taskErr.Error
 			if cause == nil {
@@ -794,6 +804,35 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		return errors.New("video request authorization or protocol validation failed")
 	}
 	return nil
+}
+
+// retryAsyncVideoSubmission shares one billing session, account and body across
+// at most two submissions. The relay alone can classify a complete supplier
+// error as eligible; generic transport failures never grant a replay.
+func retryAsyncVideoSubmission(c *gin.Context, info *relaycommon.RelayInfo, submit taskSubmitAttempt) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
+	c.Set("async_media_retryable_submission_rejection", false)
+	result, taskErr := submit(c, info)
+	if taskErr == nil || taskErr.NoRetry || !c.GetBool("async_media_retryable_submission_rejection") {
+		return result, taskErr
+	}
+	logger.LogWarn(c, fmt.Sprintf("Async video submission retry task=%s reason=%s; at most one replay on the original account", info.PublicTaskID, c.GetString("async_media_submission_retry_reason")))
+	timer := time.NewTimer(time.Second)
+	select {
+	case <-c.Request.Context().Done():
+		timer.Stop()
+		return nil, service.TaskErrorWrapperLocal(c.Request.Context().Err(), "request_cancelled", http.StatusRequestTimeout)
+	case <-timer.C:
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "read_request_body_failed", http.StatusBadRequest)
+	}
+	if _, err = storage.Seek(0, io.SeekStart); err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "read_request_body_failed", http.StatusBadRequest)
+	}
+	c.Request.Body = io.NopCloser(storage)
+	c.Set("async_media_retryable_submission_rejection", false)
+	return submit(c, info)
 }
 
 func validateMediaToken(ctx context.Context, token model.Token, ipAddress string) error {

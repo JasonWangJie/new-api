@@ -161,6 +161,8 @@ func TestMediaInputDownloadRetries(t *testing.T) {
 	}{
 		{name: "timeout then success", failure: context.DeadlineExceeded, failures: 1, calls: 2, success: true},
 		{name: "image timeout budgets increase", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}},
+		{name: "image recovers on fourth attempt", failure: fmt.Errorf("a newly worded provider timeout: %w", context.DeadlineExceeded), failures: 3, calls: 4, success: true, attemptSeconds: []int{30, 60, 120, 240}},
+		{name: "image recovers on fifth attempt", failure: &net.DNSError{Err: "different transient source failure", Name: "private.example", IsTimeout: true}, failures: 4, calls: 5, success: true, attemptSeconds: []int{30, 60, 120, 240, 480}},
 		{name: "image timeout respects media budget", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}, mediaTimeout: 45},
 		{name: "image timeout respects parent deadline", failure: context.DeadlineExceeded, failures: 2, calls: 3, success: true, attemptSeconds: []int{30, 60, 120}, parentTimeout: 45},
 		{name: "wrapped timeout with different diagnostic", failure: fmt.Errorf("the remote service did not answer: %w", context.DeadlineExceeded), failures: 1, calls: 2, success: true},
@@ -169,15 +171,15 @@ func TestMediaInputDownloadRetries(t *testing.T) {
 		{name: "bad gateway then success", status: 502, failures: 1, calls: 2, success: true},
 		{name: "rate limited then success", status: 429, failures: 1, calls: 2, success: true},
 		{name: "interrupted body then success", partial: true, failures: 1, calls: 2, success: true},
-		{name: "exhausted timeout", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts"},
+		{name: "exhausted timeout", failure: context.DeadlineExceeded, failures: 5, calls: 5, reason: "after 5 attempts"},
 		{name: "missing source", status: 404, failures: 3, calls: 1, reason: "HTTP 404"},
 		{name: "bad request is terminal", status: 400, failures: 3, calls: 1, reason: "HTTP 400"},
 		{name: "authentication is terminal", status: 401, failures: 3, calls: 1, reason: "HTTP 401"},
 		{name: "forbidden source", status: 403, failures: 3, calls: 1, reason: "HTTP 403"},
 		{name: "expired source is terminal", status: 410, failures: 3, calls: 1, reason: "HTTP 410"},
 		{name: "invalid image is terminal", invalid: true, calls: 1, reason: "reference image"},
-		{name: "video timeout budget is unchanged", kind: "video", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts", attemptSeconds: []int{900, 900, 900}},
-		{name: "audio timeout budget is unchanged", kind: "audio", failure: context.DeadlineExceeded, failures: 3, calls: 3, reason: "after 3 attempts", attemptSeconds: []int{900, 900, 900}},
+		{name: "video timeout budget is unchanged", kind: "video", failure: context.DeadlineExceeded, failures: 5, calls: 5, reason: "after 5 attempts", attemptSeconds: []int{900, 900, 900, 900, 900}},
+		{name: "audio timeout budget is unchanged", kind: "audio", failure: context.DeadlineExceeded, failures: 5, calls: 5, reason: "after 5 attempts", attemptSeconds: []int{900, 900, 900, 900, 900}},
 		{name: "unsupported source server", status: 501, failures: 3, calls: 1, reason: "HTTP 501"},
 		{name: "security rejection", failure: errors.New("reference resolved to a non-public address"), failures: 3, calls: 1, reason: "request or read failed"},
 		{name: "retry after exceeds budget", status: 429, failures: 3, calls: 1, retryAfter: true, reason: "remaining deadline"},
@@ -272,9 +274,11 @@ func TestMediaInputDownloadRetries(t *testing.T) {
 				require.ErrorContains(t, err, tc.reason)
 				assert.NotContains(t, err.Error(), "token=private")
 				assert.NotContains(t, err.Error(), "public.example")
-				notice := VideoTaskFailureNotice("reference 1 (image): " + err.Error())
-				assert.Contains(t, notice.Summary, "本站下载参考素材失败")
-				assert.Contains(t, notice.Suggestion, "原渠道")
+				for _, index := range []int{1, 2, 3, 64} {
+					notice := VideoTaskFailureNotice(fmt.Sprintf("reference %d (%s): %s", index, input.Kind, err))
+					assert.Contains(t, notice.Summary, "本站下载参考素材失败", "reference index %d", index)
+					assert.Contains(t, notice.Suggestion, "原渠道", "reference index %d", index)
+				}
 				if tc.cancel {
 					assert.ErrorIs(t, err, context.Canceled)
 				}

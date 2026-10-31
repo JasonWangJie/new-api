@@ -122,10 +122,11 @@ func DeferAsyncImageSubmission(ctx context.Context, task model.AsyncImageTask, c
 		return model.ErrImageConflict
 	}
 	now := time.Now().Unix()
-	if task.StartedAt > 0 && now >= task.StartedAt+int64(cfg.ExecutionTimeout) {
+	deadline := model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout)
+	if task.StartedAt > 0 && now >= deadline {
 		return failAsyncImageInvocation(ctx, task, &AsyncImageFailure{Code: 608, InternalCode: "execution_deadline", Message: "Image execution deadline expired"}, cfg)
 	}
-	decision := ImageRetryDecision{Version: 1, Stage: "routing", Action: "wait_account_cooldown", Reason: reason, Rule: reason, TotalUsed: task.RetryCount, TotalLimit: cfg.TotalRetries, NextAttemptAt: now + int64(max(1, delay)), Deadline: task.StartedAt + int64(cfg.ExecutionTimeout), RecordedAt: now}
+	decision := ImageRetryDecision{Version: 1, Stage: "routing", Action: "wait_account_cooldown", Reason: reason, Rule: reason, TotalUsed: task.RetryCount, TotalLimit: cfg.TotalRetries, NextAttemptAt: now + int64(max(1, delay)), Deadline: deadline, RecordedAt: now}
 	if task.StartedAt > 0 {
 		decision.NextAttemptAt = min(decision.NextAttemptAt, decision.Deadline)
 	}

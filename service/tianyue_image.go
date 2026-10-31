@@ -363,7 +363,7 @@ func TianyueImageReferenceURL(task model.AsyncImageTask, index int, cfg ImageRun
 	}
 	deadline := time.Now().Unix() + int64(min(cfg.SignedURLExpiry, cfg.ExecutionTimeout))
 	if task.StartedAt > 0 {
-		deadline = min(deadline, task.StartedAt+int64(cfg.ExecutionTimeout))
+		deadline = min(deadline, model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout))
 	}
 	if deadline <= time.Now().Unix() || index < 0 || task.TaskId == "" {
 		return "", errors.New("image reference is unavailable")

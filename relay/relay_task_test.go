@@ -775,6 +775,85 @@ export function extractUsageOnSubmit(){return {seconds:99};}
 	}
 }
 
+func TestAsyncVideoSubmissionRetryRequiresCompleteSupplierError(t *testing.T) {
+	service.InitHttpClient()
+	const generic = "生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。"
+	const source = `
+export const meta={apiVersion:1,key:"drama",name:"Drama",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",body:{model:ctx.upstreamModel},action:"text_to_video"};}
+export function parseSubmitResponse(ctx,response){if(!response.body.id)throw new Error("task id missing");return {taskId:response.body.id,taskData:response.body};}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+`
+	for _, tc := range []struct {
+		name, body                          string
+		status                              int
+		wantRetry, truncated, otherProvider bool
+	}{
+		{name: "generic possible causes", body: `{"error":{"message":"` + generic + `","type":"new_api_error","code":null}}`, status: 422, wantRetry: true},
+		{name: "plain generic rejection", body: generic, status: 422, wantRetry: true},
+		{name: "punctuation and wording", body: `{"message":"生成失败；请检查参考图2是否可以公网访问；确认参数是否允许；是否涉及版权问题"}`, status: 422, wantRetry: true},
+		{name: "busy rejection", body: `{"message":"服务器当前繁忙，请稍后再试"}`, status: 503, wantRetry: true},
+		{name: "unknown result", body: `{"error":{"message":"task submission state is unknown","type":"upstream_error"}}`, status: 502, wantRetry: true},
+		{name: "plain unknown result", body: `Task submission result is UNKNOWN`, status: 502, wantRetry: true},
+		{name: "unknown variant", body: `{"message":"Upstream: TASK_SUBMISSION_RESULT remains UNKNOWN (request 987)"}`, status: 502, wantRetry: true},
+		{name: "unknown Chinese", body: `{"error":"上游任务提交结果尚未确认，请稍后查询"}`, status: 502, wantRetry: true},
+		{name: "unknown other status", body: `{"message":"task submission state is unknown"}`, status: 500},
+		{name: "generic bad gateway", body: `{"message":"bad gateway"}`, status: 502},
+		{name: "unknown with accepted evidence", body: `{"message":"submission result unknown but task accepted"}`, status: 502},
+		{name: "negative unknown", body: `{"message":"task submission state is not unknown"}`, status: 502},
+		{name: "specific parameter failure", body: `{"message":"参数无效；` + generic + `"}`, status: 422},
+		{name: "specific moderation", body: `{"message":"审核拒绝；` + generic + `"}`, status: 422},
+		{name: "moderation in tentative clause", body: `{"message":"生成失败，请检查素材是否公网可达且审核未通过，是否参数允许，是否侵犯版权"}`, status: 422},
+		{name: "negated busy", body: `{"message":"The server is not busy"}`, status: 503},
+		{name: "negated overloaded", body: `{"message":"The system is not overloaded"}`, status: 503},
+		{name: "negated Chinese busy", body: `{"message":"系统并非繁忙"}`, status: 503},
+		{name: "plain receipt", body: `task submission state unknown; task_id=task_accepted123`, status: 502},
+		{name: "structured diagnostic receipt", body: `{"message":"task submission state unknown; task_id=task_accepted123"}`, status: 502},
+		{name: "HTML unknown", body: `<html>task submission state unknown</html>`, status: 502},
+		{name: "structured moderation", body: `{"error":{"code":"content_policy_violation","message":"` + generic + `"}}`, status: 422},
+		{name: "accepted receipt", body: `{"id":"accepted-id","message":"` + generic + `"}`, status: 422},
+		{name: "unparsed receipt", body: `{"task_id":"accepted-id","message":"` + generic + `"}`, status: 422},
+		{name: "nested output", body: `{"message":"task submission state is unknown","data":{"output":{"url":"https://cdn.example/video.mp4"}}}`, status: 502},
+		{name: "positive status", body: `{"message":"` + generic + `","status":"pending"}`, status: 422},
+		{name: "positive flag", body: `{"message":"` + generic + `","success":true}`, status: 422},
+		{name: "diagnostic output URL", body: `{"message":"task submission result unknown https://cdn.example/video.mp4"}`, status: 502},
+		{name: "malformed envelope", body: `{"message":"task submission state is unknown"`, status: 502},
+		{name: "truncated envelope", body: `{"message":"task submission state is unknown"}`, status: 502, truncated: true},
+		{name: "other provider", body: `{"message":"task submission state is unknown"}`, status: 502, otherProvider: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if tc.truncated {
+					w.Header().Set("Content-Length", fmt.Sprint(len(tc.body)+1))
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer upstream.Close()
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			pluginSource := source
+			if tc.otherProvider {
+				pluginSource = strings.Replace(source, `key:"drama"`, `key:"other"`, 1)
+			}
+			pinMappingOrderPlugin(t, c, pluginSource)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			c.Set("async_media_execution", true)
+			c.Set("async_media_billing", service.MediaBillingSnapshot{Price: types.PriceData{Quota: 123, FreeModel: true}})
+			c.Set("async_media_retryable_submission_rejection", true)
+			_, taskErr := RelayTaskSubmit(c, info)
+			if tc.name != "accepted receipt" {
+				require.NotNil(t, taskErr)
+			}
+			assert.Equal(t, tc.wantRetry, c.GetBool("async_media_retryable_submission_rejection"))
+			if tc.wantRetry && tc.status == 502 {
+				assert.Equal(t, "submission_unknown_duplicate_risk_accepted", c.GetString("async_media_submission_retry_reason"))
+			}
+		})
+	}
+}
+
 func TestMeasuredVideoPrechargeRequiresSecondsContract(t *testing.T) {
 	schema := map[string]pluginruntime.UsageFieldSchema{"seconds": {Type: "number", Unit: "second"}}
 	snapshot := &billingexpr.BillingSnapshot{

@@ -42,6 +42,8 @@ var (
 	videoReferenceFailedPattern         = regexp.MustCompile(`失败|超时|无法|不能|未能|不可|不通|受限|限制|受阻|拒绝|禁止|过期|错误|\b(?:fail(?:ed|ure|ing)?|error|timeout|timed?[ _-]*out|unable|cannot|can['’]?t|couldn['’]t|could[ _-]+not|not[ _-]+(?:publicly[ _-]+)?accessible|unreachable|inaccessible|restricted|restrictions?|blocked|forbidden|denied|expired)\b`)
 	videoReferenceFetchSucceededPattern = regexp.MustCompile(`成功(?:下载|读取|读入|访问|拉取|获取|加载|抓取)|(?:下载|读取|读入|访问|拉取|获取|加载|抓取)(?:已经|已)?成功|(?:没有|并未|未|不)(?:发生)?(?:下载|读取|读入|访问|拉取|获取|加载|抓取)?(?:失败|超时|过期|受限)|不受(?:到)?(?:访问)?限制|\b(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)[ _-]+(?:successfully|succeeded)\b|\bsuccessfully[ _-]+(?:download(?:ed|ing)?|fetch(?:ed|ing)?|read|access(?:ed|ing)?|load(?:ed|ing)?)\b|\bno[ _-]+(?:failures?|errors?|timeouts?)[ _-]+(?:occurred|happened|(?:was|were)[ _-]+reported)\b|\b(?:not|never|didn['’]t|doesn['’]t)[ _-]+(?:fail(?:ed)?|timeout|timed?[ _-]*out|expired|restricted|blocked|unreachable|inaccessible)\b`)
 	videoReferenceOtherFailurePattern   = regexp.MustCompile(`参数|尺寸|宽高|分辨率|时长|不支持|格式|解码|损坏|損壞|审核|违规|不合规|安全|版权|鉴权|认证|凭证|登录|登錄|限流|余额|额度|成片|输出|生成结果|生成产物|\b(?:invalid|unsupported|decod(?:e|ed|ing|er)|corrupt(?:ed|ion)?|parameters?|aspect[ _-]?ratio|dimensions?|resolution|width|height|duration|safety|censor(?:ship)?|moderation|policy|copyright|violation|auth(?:entication|orization)?|unauthenticated|unauthorized|credentials?|login|log[ _-]+in|api[ _-]?key|access[ _-]?token|rate[ _-]?limit|quota|outputs?|results?|generated[ _-]+(?:video|media))\b`)
+	videoBusyPattern                    = regexp.MustCompile(`(?:系统|服务(?:器)?|上游)(?:当前|暂时|正在|目前)?(?:非常|过于)?(?:繁忙|忙碌|忙)|\b(?:(?:server|system|service)(?: is)?(?: currently| temporarily)? busy|overloaded|service(?: is)?(?: temporarily)? unavailable|temporarily unavailable)\b`)
+	videoBusyNegatedPattern             = regexp.MustCompile(`(?:并不|并未|没有|不是|并非|不|未)(?:处于|出现|发生|存在)?(?:系统|服务(?:器)?|上游)?(?:当前|暂时)?(?:繁忙|忙碌|忙|不可用)|\b(?:not|never|no|isn['’]?t|aren['’]?t)\b[^.;。；]{0,48}\b(?:busy|overloaded|unavailable)\b`)
 )
 
 func isAsyncVideoReferenceDownloadFailure(reason string) bool {
@@ -75,6 +77,17 @@ func isAsyncVideoReferenceDownloadFailure(reason string) bool {
 	return false
 }
 
+// isAsyncVideoBusyFailure recognizes a temporary capacity failure, while
+// excluding permanent failures even when they also suggest trying again.
+func isAsyncVideoBusyFailure(reason string) bool {
+	reason = videoReferenceURLPattern.ReplaceAllString(reason, " [url] ")
+	reason = strings.ToLower(strings.Join(strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(reason)), " "))
+	if videoReferenceOtherFailurePattern.MatchString(reason) || videoReferenceFetchSucceededPattern.MatchString(reason) || videoBusyNegatedPattern.MatchString(reason) {
+		return false
+	}
+	return videoBusyPattern.MatchString(reason)
+}
+
 // FreezeAsyncVideoReferenceRecovery is called only for a validated Drama
 // request before its first dispatch. It captures the canonical reference order.
 func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any, expiresAt int64) error {
@@ -86,7 +99,7 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 		return nil
 	}
 	references, ok := body["references"].([]any)
-	if !ok || len(references) == 0 || len(references) > 64 {
+	if body["references"] != nil && !ok || len(references) > 64 {
 		return nil
 	}
 	now := time.Now().Unix()
@@ -111,7 +124,6 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 	}
 	counts := make(map[string]int)
 	inputs := make([]AsyncVideoReferenceInput, len(references))
-	external := false
 	for index, value := range references {
 		reference, ok := value.(map[string]any)
 		if !ok {
@@ -125,10 +137,6 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 		}
 		counts[kind]++
 		inputs[index] = AsyncVideoReferenceInput{Index: index, Kind: kind, Role: role, Source: source, Path: "/references/" + strconv.Itoa(index) + "/source", KindIndex: counts[kind]}
-		external = external || strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://")
-	}
-	if !external {
-		return nil
 	}
 	encoded, err := common.Marshal(body)
 	if err != nil {
@@ -143,7 +151,11 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 // TryAsyncVideoReferenceRecovery runs before the terminal billing transition.
 // A transport or ambiguous polling failure must never reach this decision.
 func TryAsyncVideoReferenceRecovery(ctx context.Context, task model.Task, result *relaycommon.TaskInfo, httpStatus int, response []byte) (bool, error) {
-	if !task.PrivateData.AsyncMedia || task.Platform != "drama" || task.AttemptGeneration != 0 || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != "" || !isAsyncVideoReferenceDownloadFailure(result.Reason) {
+	if !task.PrivateData.AsyncMedia || task.Platform != "drama" || task.AttemptGeneration != 0 || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != "" {
+		return false, nil
+	}
+	localReferences := isAsyncVideoReferenceDownloadFailure(result.Reason)
+	if !localReferences && !isAsyncVideoBusyFailure(result.Reason) {
 		return false, nil
 	}
 	var snapshot map[string]any
@@ -170,7 +182,7 @@ func TryAsyncVideoReferenceRecovery(ctx context.Context, task model.Task, result
 		return false, nil
 	}
 	var request AsyncVideoRequest
-	if common.Unmarshal(plain, &request) != nil || request.ReferenceRecoveryVersion != 1 || len(request.ReferenceInputs) == 0 || len(request.Body) == 0 || request.ReferenceRecoveryDeadline <= time.Now().Unix() || request.ReferenceURLExpiresAt <= time.Now().Unix() || request.Channel.Id != task.ChannelId || request.Channel.Key == "" {
+	if common.Unmarshal(plain, &request) != nil || request.ReferenceRecoveryVersion != 1 || localReferences && len(request.ReferenceInputs) == 0 || len(request.Body) == 0 || request.ReferenceRecoveryDeadline <= time.Now().Unix() || request.ReferenceURLExpiresAt <= time.Now().Unix() || request.Channel.Id != task.ChannelId || request.Channel.Key == "" {
 		return false, nil
 	}
 	if task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && task.Quota > 0 && job.AttemptGeneration == task.AttemptGeneration &&
@@ -180,7 +192,7 @@ func TryAsyncVideoReferenceRecovery(ctx context.Context, task model.Task, result
 		// lease recovery) finish instead of refunding this recoverable failure.
 		return true, nil
 	}
-	return model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, SanitizeAsyncImageText(result.Reason, common.LocalLogContentLimit))
+	return model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, SanitizeAsyncImageText(result.Reason, common.LocalLogContentLimit), localReferences)
 }
 
 func videoReferenceOutputEvidence(value any, diagnostic string, depth int) bool {

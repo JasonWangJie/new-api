@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -236,6 +237,8 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 // 构建/发送/解析上游请求 → 提交后计费调整(AdjustBillingOnSubmit)。
 // 共享控制器编排负责未落库退款、最终额度预留、落库和结算。
 func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
+	c.Set("async_media_retryable_submission_rejection", false)
+	c.Set("async_media_submission_retry_reason", "")
 	info.InitChannelMeta(c)
 
 	// 1. 确定 platform → 创建适配器 → 验证请求
@@ -562,6 +565,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				message = "upstream task submission failed"
 			}
 			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), "fail_to_fetch_task", resp.StatusCode)
+			if c.GetBool("async_media_execution") && platform == "drama" && !hasAsyncProfile && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
+				c.Set("async_media_retryable_submission_rejection", true)
+				reason := "explicit_rejection"
+				if resp.StatusCode == http.StatusBadGateway {
+					reason = "submission_unknown_duplicate_risk_accepted"
+				}
+				c.Set("async_media_submission_retry_reason", reason)
+			}
 			return nil, failure
 		}
 		// Preserve the reservation and poll the known operation. Neither an
@@ -625,6 +636,153 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		UpstreamAsync:         asyncProfile,
 		UpstreamAsyncResponse: upstreamAsyncResponse,
 	}, nil
+}
+
+var (
+	videoSubmissionAcceptedPattern      = regexp.MustCompile(`已受理|已接收|已提交|已开始|\b(?:accepted|queued|pending|processing|in[ _-]?progress|submitted|started)\b`)
+	videoSubmissionPermanentPattern     = regexp.MustCompile(`审核|违规|不合规|鉴权|认证|凭证|余额不足|额度不足|不支持|无效|不合法|超出|被拒绝|\b(?:invalid|unsupported|unauthorized|unauthenticated|forbidden|moderation|censor|safety|violation|denied|insufficient|quota)\b`)
+	videoSubmissionHardFailurePattern   = regexp.MustCompile(`审核|违规|不合规|鉴权|认证|凭证|余额不足|额度不足|\b(?:unauthorized|unauthenticated|forbidden|moderation|censor|safety|violation|denied|insufficient|quota|api[ _-]?key|access[ _-]?token)\b`)
+	videoSubmissionNegatedBusyPattern   = regexp.MustCompile(`(?:不|未|并非|不是|没有)(?:再|处于)?(?:繁忙|拥挤)|\b(?:not|never|no[ ]+longer|isn['’]?t|wasn['’]?t)[ ]+(?:currently[ ]+|temporarily[ ]+)?(?:busy|overloaded)\b`)
+	videoSubmissionPlainEvidencePattern = regexp.MustCompile(`(?i)\b(?:task|job|operation|video)[ _-]*(?:id|identifier)[ ]*[:=]|\btask_[a-z0-9]+|\b(?:output|base64|artifact)\b|data:`)
+)
+
+// isRetryableAsyncVideoSubmissionRejection requires a complete explicit error
+// envelope, without receipts or output. A missing task id alone is not proof
+// that the supplier rejected the operation.
+func isRetryableAsyncVideoSubmissionRejection(status int, body []byte) bool {
+	if status != http.StatusUnprocessableEntity && status != http.StatusTooManyRequests && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
+		return false
+	}
+	var envelope map[string]any
+	if common.Unmarshal(body, &envelope) != nil {
+		// Some Drama deployments return a short plain-text diagnostic. It must
+		// be complete and cannot carry JSON/HTML, receipt or output evidence.
+		plain := strings.TrimSpace(string(body))
+		if len(plain) == 0 || len(plain) > 4096 || strings.ContainsAny(plain, "{}[]<>\"`") {
+			return false
+		}
+		envelope = map[string]any{"message": plain}
+	}
+	if len(envelope) == 0 {
+		return false
+	}
+	stack := []map[string]any{envelope}
+	var diagnostics []string
+	for visited := 0; len(stack) > 0; visited++ {
+		if visited >= 16 {
+			return false
+		}
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for field, value := range current {
+			name := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(field))
+			switch name {
+			case "error", "data":
+				if value == nil {
+					continue
+				}
+				if object, ok := value.(map[string]any); ok {
+					stack = append(stack, object)
+					continue
+				}
+				if name != "error" {
+					return false
+				}
+				fallthrough
+			case "message", "reason", "detail", "errormessage":
+				text, ok := value.(string)
+				if !ok {
+					return false
+				}
+				diagnostics = append(diagnostics, text)
+			case "code", "type", "object":
+				if value == nil {
+					continue
+				}
+				switch code := value.(type) {
+				case float64:
+					if code != 0 && code != float64(status) {
+						return false
+					}
+				case string:
+					code = strings.ToLower(strings.TrimSpace(code))
+					if code != strconv.Itoa(status) && !slices.Contains([]string{"", "0", "error", "new_api_error", "server_error", "upstream_error", "generation_failed", "video_generation_failed", "fail_to_fetch_task", "system_busy", "service_unavailable", "rate_limit_exceeded", "submission_unknown", "task_submission_unknown"}, code) {
+						return false
+					}
+				default:
+					return false
+				}
+			case "status":
+				state, ok := value.(string)
+				if !ok || !slices.Contains([]string{"error", "failed", "failure", "rejected"}, strings.ToLower(strings.TrimSpace(state))) {
+					return false
+				}
+			case "success":
+				if success, ok := value.(bool); !ok || success {
+					return false
+				}
+			case "requestid", "traceid":
+				if _, ok := value.(string); !ok {
+					return false
+				}
+			case "param":
+				if value != nil && value != "" {
+					return false
+				}
+			default:
+				// Unknown fields can contain accepted task identifiers or output.
+				return false
+			}
+		}
+	}
+	diagnostic := strings.ToLower(strings.Join(diagnostics, " "))
+	evidence := strings.NewReplacer("task_submission_state", "task submission state", "task_submission_status", "task submission status", "task_submission_result", "task submission result").Replace(diagnostic)
+	if videoSubmissionPlainEvidencePattern.MatchString(evidence) {
+		return false
+	}
+	diagnostic = strings.NewReplacer("_", " ", "-", " ").Replace(strings.ToLower(diagnostic))
+	diagnostic = strings.Join(strings.Fields(diagnostic), " ")
+	if diagnostic == "" || strings.Contains(diagnostic, "://") || videoSubmissionAcceptedPattern.MatchString(diagnostic) || videoSubmissionHardFailurePattern.MatchString(diagnostic) {
+		return false
+	}
+	if status == http.StatusBadGateway {
+		// The administrator explicitly accepts duplicate-generation risk for
+		// this supplier's unknown submission result. Only this complete error
+		// envelope gets one bounded replay; transport ambiguity stays excluded.
+		english := (strings.Contains(diagnostic, "submission") || strings.Contains(diagnostic, "submit")) &&
+			(strings.Contains(diagnostic, "state") || strings.Contains(diagnostic, "status") || strings.Contains(diagnostic, "result")) &&
+			(strings.Contains(diagnostic, "unknown") || strings.Contains(diagnostic, "unconfirmed")) && !strings.Contains(diagnostic, "not unknown")
+		chinese := strings.Contains(diagnostic, "提交") && (strings.Contains(diagnostic, "状态") || strings.Contains(diagnostic, "结果")) &&
+			(strings.Contains(diagnostic, "未知") || strings.Contains(diagnostic, "未确认") || strings.Contains(diagnostic, "无法确认"))
+		return (english || chinese) && !videoSubmissionPermanentPattern.MatchString(diagnostic)
+	}
+	if strings.Contains(diagnostic, "unknown") || strings.Contains(diagnostic, "未知") || strings.Contains(diagnostic, "unconfirmed") {
+		return false
+	}
+	busy := strings.Contains(diagnostic, "繁忙") || strings.Contains(diagnostic, "拥挤") || strings.Contains(diagnostic, "busy") || strings.Contains(diagnostic, "overloaded")
+	if busy {
+		return !videoSubmissionPermanentPattern.MatchString(diagnostic) && !videoSubmissionNegatedBusyPattern.MatchString(diagnostic)
+	}
+	if status != http.StatusUnprocessableEntity || !strings.Contains(diagnostic, "生成失败") {
+		return false
+	}
+	// Drama's generic rejection lists possible causes, rather than confirming
+	// a parameter or copyright violation. Match the subjects and uncertainty in
+	// each clause so punctuation, reference numbers and wording may vary.
+	material, parameter, copyright := false, false, false
+	for _, clause := range strings.FieldsFunc(diagnostic, func(char rune) bool { return strings.ContainsRune("，,。.;；!?！？\n", char) }) {
+		tentative := strings.Contains(clause, "是否") || strings.Contains(clause, "检查") || strings.Contains(clause, "可能") || strings.Contains(clause, "确认")
+		if tentative {
+			material = material || strings.Contains(clause, "素材") || strings.Contains(clause, "公网") || strings.Contains(clause, "参考")
+			parameter = parameter || strings.Contains(clause, "参数")
+			copyright = copyright || strings.Contains(clause, "版权")
+			continue
+		}
+		if videoSubmissionPermanentPattern.MatchString(clause) || strings.Contains(clause, "版权") || strings.Contains(clause, "参数") {
+			return false
+		}
+	}
+	return material && parameter && copyright
 }
 
 // validateMeasuredVideoPrecharge checks that the frozen task price reserves

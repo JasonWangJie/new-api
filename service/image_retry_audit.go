@@ -15,9 +15,12 @@ type ImageRetryDecision = model.ImageRetryDecision
 // displayed decision cannot disagree with retry budgets or execution barriers.
 func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig, updates map[string]any) ImageRetryDecision {
 	decision := ImageRetryDecision{Version: 1, Stage: "submit", Action: "stop", Reason: "unknown_error", Rule: failure.InternalCode, TotalUsed: task.RetryCount, TotalLimit: cfg.TotalRetries, RecordedAt: time.Now().Unix()}
-	if task.StartedAt > 0 {
-		decision.Deadline = task.StartedAt + int64(cfg.ExecutionTimeout)
+	deadlineTask := task
+	if history, ok := updates["attempts"].(string); ok {
+		deadlineTask.Attempts = history
 	}
+	decision.Deadline = model.AsyncImageExecutionDeadline(deadlineTask, cfg.ExecutionTimeout)
+	deadlineFailover := failure.InternalCode == "execution_deadline" && updates["status"] == model.ImageTaskQueued && decision.Deadline > model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout)
 	if task.DispatchedAt == 0 {
 		decision.Stage = "prepare"
 	}
@@ -54,7 +57,7 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 			decision.Reason = "transient_retry_budget_exhausted"
 		}
 	}
-	if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId == "" && (failure.InternalCode == "upstream_transport_timeout" || failure.InternalCode == "timeout_accounts_exhausted") {
+	if task.UpstreamSucceededAt == 0 && (deadlineFailover || task.UpstreamTaskId == "" && (failure.InternalCode == "upstream_transport_timeout" || failure.InternalCode == "timeout_accounts_exhausted")) {
 		decision.Budget, decision.Used, decision.Limit = "timeout", 0, cfg.TimeoutRetries
 		var attempts []ImageChannelAttempt
 		history := task.Attempts
@@ -63,7 +66,7 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 		}
 		if common.UnmarshalJsonStr(history, &attempts) == nil {
 			for _, attempt := range attempts {
-				if attempt.Decision != nil && attempt.Decision.Budget == "timeout" && attempt.Decision.Action == "switch_account" {
+				if attempt.Decision != nil && attempt.Decision.Budget == "timeout" && (attempt.Decision.Action == "switch_account" || attempt.Decision.Action == "switch_channel") {
 					decision.Used++
 				}
 			}
@@ -101,6 +104,9 @@ func ImageFailureRetryDecision(task model.AsyncImageTask, failure *AsyncImageFai
 		decision.Action, decision.Reason = "retry_submission", "temporary_failure"
 		if decision.Budget == "timeout" {
 			decision.Action = "switch_account"
+			if deadlineFailover {
+				decision.Reason = "execution_deadline"
+			}
 		} else if task.UpstreamSucceededAt > 0 {
 			decision.Action = "resume_output"
 			if failure.InternalCode == "billing_usage_missing" && task.UpstreamTaskId != "" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -376,6 +377,77 @@ func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testi
 	require.NoError(t, database.Model(&model.Task{}).Where("task_id = ?", "task_public").Count(&count).Error)
 	assert.Equal(t, int64(1), count)
 	assert.False(t, c.Writer.Written())
+}
+
+func TestAsyncVideoSubmissionRetryKeepsOneBillingLifecycle(t *testing.T) {
+	oldLogConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldLogConsume })
+	for _, tc := range []struct {
+		name                            string
+		retry, noRetry, success, cancel bool
+		calls                           int
+	}{
+		{name: "replay succeeds", retry: true, success: true, calls: 2},
+		{name: "replay fails and refunds once", retry: true, calls: 2},
+		{name: "unclassified failure", calls: 1},
+		{name: "no retry protection", retry: true, noRetry: true, calls: 1},
+		{name: "cancel before replay", retry: true, cancel: true, calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			database := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, database.AutoMigrate(&model.AsyncMediaJob{}))
+			billing := &taskSubmissionTestBilling{events: &events}
+			c := taskSubmissionTestContext()
+			c.Set("async_media_execution", true)
+			ctx, cancel := context.WithCancel(c.Request.Context())
+			defer cancel()
+			c.Request = c.Request.WithContext(ctx)
+			info := taskSubmissionRelayInfo(billing)
+			originalChannel := info.LockedChannel
+			calls := 0
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, current *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				return retryAsyncVideoSubmission(c, current, func(c *gin.Context, attempt *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					calls++
+					assert.Same(t, info, attempt)
+					assert.Same(t, billing, attempt.Billing, "the existing reservation survives the replay")
+					assert.Same(t, originalChannel, attempt.LockedChannel)
+					body, err := io.ReadAll(c.Request.Body)
+					require.NoError(t, err)
+					assert.Equal(t, `{}`, string(body), "rewind the identical original request before replay")
+					if calls == 2 && tc.success {
+						return &relay.TaskSubmitResult{UpstreamTaskID: "accepted-id", Platform: "drama", Quota: 123}, nil
+					}
+					c.Set("async_media_retryable_submission_rejection", tc.retry)
+					c.Set("async_media_submission_retry_reason", "submission_unknown_duplicate_risk_accepted")
+					if tc.cancel {
+						cancel()
+					}
+					failure := service.TaskErrorWrapper(errors.New("task submission state is unknown"), "fail_to_fetch_task", 502)
+					failure.NoRetry = tc.noRetry
+					return nil, failure
+				})
+			})
+			assert.Equal(t, tc.calls, calls, "submission and replay share one budget")
+			var taskCount int64
+			require.NoError(t, database.Model(&model.Task{}).Count(&taskCount).Error)
+			if tc.success {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+				assert.EqualValues(t, 1, taskCount)
+				assert.Zero(t, billing.refunds)
+				assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+				assert.Equal(t, 123, outcome.Task.Quota)
+			} else {
+				require.NotNil(t, taskErr)
+				assert.Nil(t, outcome)
+				assert.Zero(t, taskCount)
+				assert.Equal(t, 1, billing.refunds)
+				assert.Equal(t, []string{"refund"}, events)
+			}
+		})
+	}
 }
 
 func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {

@@ -2941,6 +2941,235 @@ func TestAsyncImageWorkerTimeoutPreservesExecutionBarriers(t *testing.T) {
 	}
 }
 
+func TestAsyncImageWorkerAcceptedDeadlineFailover(t *testing.T) {
+	for _, mode := range []string{"replacement completes", "replacement deadline expires", "replacement transport timeout", "replacement terminal failure", "task retention caps grace", "frozen policy disabled", "timeout budget disabled", "total budget disabled", "grace already elapsed", "output already received", "completion already checkpointed", "reservation missing", "request cipher missing", "request cipher corrupt", "request JSON malformed", "old frozen channel missing"} {
+		t.Run(mode, func(t *testing.T) {
+			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			if mode != "reservation missing" {
+				require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+			}
+			now := time.Now().Unix()
+			task.StartedAt = now - int64(cfg.ExecutionTimeout) - 5
+			if mode == "grace already elapsed" {
+				task.StartedAt -= int64(cfg.AttemptTimeout)
+			}
+			task.DispatchedAt, task.UpstreamTaskId = task.StartedAt+1, "original-provider-job"
+			originalChannel, originalStartedAt := task.ChannelId, task.StartedAt
+			history := []ImageChannelAttempt{{ChannelId: originalChannel, KeyFingerprint: ImageIdentityHash("image-account", strconv.Itoa(originalChannel), "upstream-key-a"), CredentialFingerprint: ImageIdentityHash("image-credential", "upstream-key-a"), StartedAt: task.DispatchedAt, Dispatched: true, RetryOnTimeout: mode != "frozen policy disabled", UpstreamTaskID: task.UpstreamTaskId}}
+			encoded, err := common.Marshal(history)
+			require.NoError(t, err)
+			task.Attempts = string(encoded)
+			if mode == "task retention caps grace" {
+				task.ExpiresAt = now + 30
+			}
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"started_at": task.StartedAt, "dispatched_at": task.DispatchedAt, "upstream_task_id": task.UpstreamTaskId, "attempts": task.Attempts, "expires_at": task.ExpiresAt}).Error)
+			stale := task
+			switch mode {
+			case "timeout budget disabled":
+				cfg.TimeoutRetries = 0
+			case "total budget disabled":
+				cfg.TotalRetries = 0
+			case "output already received":
+				require.NoError(t, db.Create(&model.AsyncImageEvent{TaskId: task.TaskId, EventKey: "old-output", EventType: "upstream_result_received", CreatedAt: now}).Error)
+			case "completion already checkpointed":
+				require.NoError(t, PersistAsyncImageCompletion(t.Context(), &task, request, AsyncImageCompletion{Body: []byte(`{"data":[]}`), Usage: &dto.Usage{}, Billing: *request.Billing}))
+			case "request cipher missing":
+				require.NoError(t, db.Model(&task).Update("request_cipher", nil).Error)
+			case "request cipher corrupt":
+				require.NoError(t, db.Model(&task).Update("request_cipher", []byte("corrupt request ciphertext")).Error)
+			case "request JSON malformed":
+				cipher, err := EncryptImagePayload([]byte(`{"model":`), "task:"+task.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&task).Update("request_cipher", cipher).Error)
+			case "old frozen channel missing":
+				require.NoError(t, db.Model(&task).Update("selected_channel_cipher", nil).Error)
+			}
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			calls := 0
+			ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				if mode == "completion already checkpointed" {
+					require.NotNil(t, outbound.Completion)
+					assert.Equal(t, originalChannel, channel.Id)
+					assert.Equal(t, "original-provider-job", current.UpstreamTaskId)
+					assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
+					return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "result_download_failed", Message: "retry local result download"}
+				}
+				return nil, model.AsyncImageBill{}, errors.New("the expired original job must not submit or poll again")
+			}
+			delegated := mode == "reservation missing" || strings.HasPrefix(mode, "request ") || mode == "old frozen channel missing"
+			if delegated {
+				require.NoError(t, db.Model(&task).Update("lease_expires_at", now-1).Error)
+				for range 2 {
+					require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+				}
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				require.Equal(t, model.ImageTaskInvoking, task.Status, "recovery delegates the accepted deadline to the worker policy")
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "delegated-deadline", cfg.WorkerLease)
+				require.NoError(t, err)
+			}
+			invokeErr := invokeAsyncImageTask(t.Context(), &task, cfg)
+			require.NoError(t, invokeErr)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			if mode == "completion already checkpointed" {
+				assert.Equal(t, 1, calls)
+				assert.Equal(t, model.ImageTaskInvoking, task.Status)
+				assert.Zero(t, task.RetryCount, "checkpointed output only resumes local processing")
+				assert.Equal(t, 1, task.StorageRetryCount)
+				assert.Equal(t, originalChannel, task.ChannelId)
+				assert.Equal(t, "original-provider-job", task.UpstreamTaskId)
+				return
+			}
+			if mode == "reservation missing" {
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+				assert.Zero(t, task.RetryCount)
+				assert.Zero(t, calls)
+				require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status, "an unavailable hold must not create a recovery loop")
+				return
+			}
+			assert.Zero(t, calls)
+			var bill model.AsyncImageBill
+			var user model.User
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			assert.Equal(t, "reserved", bill.Status)
+			assert.Equal(t, 900, user.Quota, "deadline recovery retains the original reservation")
+			assert.Equal(t, originalStartedAt, task.StartedAt)
+			retry := mode == "replacement completes" || mode == "replacement deadline expires" || mode == "replacement transport timeout" || mode == "replacement terminal failure" || mode == "task retention caps grace" || mode == "old frozen channel missing"
+			if !retry {
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+				assert.Zero(t, task.RetryCount)
+				assert.Equal(t, "original-provider-job", task.UpstreamTaskId)
+				if delegated {
+					for range 2 {
+						require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+					}
+					require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+					assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status, "an unreplayable request cannot cycle back into the queue")
+					_, err := model.ClaimAsyncImageTask(t.Context(), task.TaskId, "forbidden-recovery-loop", cfg.WorkerLease)
+					assert.ErrorIs(t, err, model.ErrImageConflict)
+					assert.Zero(t, calls)
+				}
+				return
+			}
+			require.Equal(t, model.ImageTaskQueued, task.Status)
+			assert.Equal(t, 1, task.RetryCount)
+			assert.Empty(t, task.UpstreamTaskId)
+			assert.Zero(t, task.ChannelId)
+			assert.Zero(t, task.DispatchedAt)
+			assert.Empty(t, task.SelectedChannelCipher)
+			assert.Equal(t, stale.RequestCipher, task.RequestCipher)
+			grace := originalStartedAt + int64(cfg.ExecutionTimeout+cfg.AttemptTimeout)
+			if task.ExpiresAt > 0 {
+				grace = min(grace, task.ExpiresAt)
+			}
+			var decision ImageRetryDecision
+			require.NoError(t, common.UnmarshalJsonStr(task.RetryDecision, &decision))
+			assert.Equal(t, "switch_account", decision.Action)
+			assert.Equal(t, grace, decision.Deadline, "the extra attempt has a fixed absolute deadline")
+			require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
+			require.Len(t, history, 1)
+			assert.Equal(t, "original-provider-job", history[0].UpstreamTaskID)
+			assert.True(t, history[0].TimedOut)
+			assert.Positive(t, history[0].FinishedAt)
+			assert.ErrorIs(t, model.ScheduleAsyncImagePoll(t.Context(), stale, now+10, "upstream_pending", ""), model.ErrImageConflict)
+			assert.Error(t, model.RecordAsyncImageUpstreamResult(t.Context(), stale, []string{"https://old.example/result.png"}), "a late old poll cannot publish output into the replacement")
+			// Neither a spare key on the original channel nor a copy of its
+			// credential on another channel is a valid failover destination.
+			var primary model.Channel
+			require.NoError(t, db.First(&primary, originalChannel).Error)
+			primary.Key, primary.ChannelInfo.IsMultiKey = "upstream-key-a\nspare-old-channel-key", true
+			require.NoError(t, db.Model(&primary).Updates(map[string]any{"key": primary.Key, "channel_info": primary.ChannelInfo}).Error)
+			priority := int64(90)
+			copyChannel := model.Channel{Key: "upstream-key-a", Type: 1, Status: common.ChannelStatusEnabled, Group: task.Group, Models: request.Model, Priority: &priority}
+			require.NoError(t, db.Create(&copyChannel).Error)
+			require.NoError(t, db.Create(&model.Ability{Group: task.Group, Model: request.Model, ChannelId: copyChannel.Id, Enabled: true}).Error)
+			entities := []any{&model.AsyncImageStagingObject{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.AsyncImageResult{}, &model.AsyncImageUsageProjection{}}
+			if mode == "replacement completes" {
+				require.NoError(t, db.AutoMigrate(entities...))
+				t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(entities...)) })
+			}
+			submissions, polls := 0, 0
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, beforeInvoke func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				assert.Equal(t, alternate.Id, channel.Id)
+				assert.Equal(t, alternate.Key, channel.Key)
+				assert.Equal(t, request.Billing, outbound.Billing)
+				deadline, bounded := ctx.Deadline()
+				require.True(t, bounded)
+				assert.LessOrEqual(t, deadline.UnixNano(), time.Unix(grace, 0).UnixNano(), "the fixed deadline must also bound fractional seconds")
+				if current.UpstreamTaskId == "" {
+					submissions++
+					require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+					require.NoError(t, beforeInvoke())
+					if mode == "replacement transport timeout" {
+						return nil, model.AsyncImageBill{}, context.DeadlineExceeded
+					}
+					require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("upstream_task_id", "replacement-provider-job").Error)
+					return nil, model.AsyncImageBill{}, &AsyncImagePending{}
+				}
+				polls++
+				assert.Equal(t, "replacement-provider-job", current.UpstreamTaskId)
+				assert.ErrorIs(t, beforeInvoke(), model.ErrImageConflict)
+				if mode == "replacement terminal failure" {
+					return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "upstream_job_failed", UpstreamTerminal: true, Message: "replacement generation failed"}
+				}
+				image := asyncImageBytesFixture(t)
+				return &AsyncImageOutput{Images: []ImageBytes{image}}, model.AsyncImageBill{TaskId: current.TaskId, UserId: current.UserId, TokenId: current.TokenId, ChannelId: channel.Id, FundingSource: "wallet", Quota: 80, Fingerprint: "deadline-replacement-bill", BillingRequestId: "async-image:" + current.TaskId, LogPayload: "{}"}, nil
+			}
+			require.NoError(t, db.Model(&task).Update("next_attempt_at", now).Error)
+			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "deadline-replacement", cfg.WorkerLease)
+			require.NoError(t, err)
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, 1, submissions)
+			if mode == "replacement deadline expires" {
+				require.NoError(t, common.UnmarshalJsonStr(task.Attempts, &history))
+				history[0].DeadlineRetryUntil = time.Now().Unix() - 1
+				encoded, err := common.Marshal(history)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&task).Update("attempts", string(encoded)).Error)
+			}
+			if mode == "replacement completes" || mode == "replacement deadline expires" || mode == "replacement terminal failure" {
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()).Error)
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "replacement-poll", cfg.WorkerLease)
+				require.NoError(t, err)
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			}
+			assert.Equal(t, originalStartedAt, task.StartedAt)
+			assert.Equal(t, 1, task.RetryCount, "the deadline grants only one replacement generation")
+			if mode == "replacement completes" {
+				assert.Equal(t, 1, polls)
+				require.Equal(t, model.ImageTaskUpstreamSucceeded, task.Status)
+				require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+				for range 2 {
+					require.NoError(t, model.ApplyAsyncImageBill(t.Context(), task.TaskId, "deadline-replacement-bill"))
+				}
+			} else if mode == "replacement deadline expires" || mode == "replacement transport timeout" || mode == "replacement terminal failure" {
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+				wantPolls := 0
+				if mode == "replacement terminal failure" {
+					wantPolls = 1
+				}
+				assert.Equal(t, wantPolls, polls)
+				_, err := model.ClaimAsyncImageTask(t.Context(), task.TaskId, "forbidden-third-attempt", cfg.WorkerLease)
+				assert.ErrorIs(t, err, model.ErrImageConflict)
+			}
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			wantBill, wantQuota := "reserved", 900
+			if mode == "replacement completes" {
+				wantBill, wantQuota = "applied", 920
+			}
+			assert.Equal(t, wantBill, bill.Status)
+			assert.Equal(t, wantQuota, user.Quota, "one hold is settled once or retained for unknown execution")
+		})
+	}
+}
+
 func TestAsyncImageTimeoutPolicyRecovery(t *testing.T) {
 	for _, tc := range []struct {
 		name                          string
@@ -2951,7 +3180,7 @@ func TestAsyncImageTimeoutPolicyRecovery(t *testing.T) {
 		{name: "legacy timeout remains unknown", deadline: true, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "lost lease stays unknown", policy: true, wantStatus: model.ImageTaskExecutionUnknown},
 		{name: "known job keeps polling", policy: true, job: true, wantStatus: model.ImageTaskInvoking},
-		{name: "known job deadline remains unknown", policy: true, job: true, deadline: true, wantStatus: model.ImageTaskExecutionUnknown},
+		{name: "known job deadline queues the policy decision", policy: true, job: true, deadline: true, wantStatus: model.ImageTaskInvoking},
 		{name: "saved completion keeps its hold", policy: true, output: true, deadline: true, wantStatus: model.ImageTaskInvoking},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

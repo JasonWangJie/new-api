@@ -490,7 +490,7 @@ func TestAsyncMediaAuditAtomicTransitions(t *testing.T) {
 func TestAsyncVideoReferenceRecoveryPreservesHoldAndFencesOldAttempt(t *testing.T) {
 	db, task, job := asyncVideoRecoveryFixture(t)
 	original := task
-	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference image could not be downloaded")
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference image could not be downloaded", true)
 	require.NoError(t, err)
 	require.True(t, won)
 	require.NoError(t, db.First(&task, task.ID).Error)
@@ -597,7 +597,7 @@ func TestAsyncVideoReferenceRecoveryRejectsUnsafeTransitions(t *testing.T) {
 			}
 			require.NoError(t, db.Save(&task).Error)
 			require.NoError(t, db.Save(&job).Error)
-			won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+			won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed", true)
 			require.NoError(t, err)
 			assert.False(t, won)
 			var currentTask Task
@@ -618,7 +618,7 @@ func TestAsyncVideoReferenceSubmissionReceiptRemainsPrivate(t *testing.T) {
 	db, task, job := asyncVideoRecoveryFixture(t)
 	task.PrivateData.UpstreamAsync = &dto.UpstreamAsyncProfile{}
 	require.NoError(t, db.Model(&task).Update("private_data", task.PrivateData).Error)
-	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed", true)
 	require.NoError(t, err)
 	require.True(t, won)
 	require.NoError(t, db.First(&task, task.ID).Error)
@@ -642,7 +642,7 @@ func TestAsyncVideoReferenceSubmissionReceiptRemainsPrivate(t *testing.T) {
 
 func TestAsyncVideoReferenceRecoveryUnknownRetainsHold(t *testing.T) {
 	db, task, job := asyncVideoRecoveryFixture(t)
-	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed")
+	won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, "reference download failed", true)
 	require.NoError(t, err)
 	require.True(t, won)
 	require.NoError(t, db.First(&task, task.ID).Error)

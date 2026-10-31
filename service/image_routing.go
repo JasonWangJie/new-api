@@ -865,6 +865,7 @@ type ImageAccountRouting struct {
 	WaitForCooldown         bool
 	TimedOutAccounts        []string
 	TimedOutCredentials     []string
+	DeadlineChannels        []int
 	IncompatibleAccounts    []string
 	IncompatibleCredentials []string
 	IncompatibleChannels    []int
@@ -873,7 +874,7 @@ type ImageAccountRouting struct {
 
 // Account identity survives key reordering and never exposes a usable key.
 func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []ImageAccount {
-	if routing.PinChannel != 0 && routing.PinChannel != channel.Id || slices.Contains(routing.ExcludedChannels, channel.Id) || slices.Contains(routing.IncompatibleChannels, channel.Id) {
+	if routing.PinChannel != 0 && routing.PinChannel != channel.Id || slices.Contains(routing.ExcludedChannels, channel.Id) || slices.Contains(routing.IncompatibleChannels, channel.Id) || slices.Contains(routing.DeadlineChannels, channel.Id) {
 		return nil
 	}
 	keys := []string{channel.Key}
@@ -939,7 +940,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 			return false
 		}
 		withoutTimeouts := routing
-		withoutTimeouts.TimedOutAccounts, withoutTimeouts.TimedOutCredentials = nil, nil
+		withoutTimeouts.TimedOutAccounts, withoutTimeouts.TimedOutCredentials, withoutTimeouts.DeadlineChannels = nil, nil, nil
 		timeoutExcluded = timeoutExcluded || len(ImageChannelAccounts(channel, withoutTimeouts)) > 0
 		return true
 	})
@@ -1172,6 +1173,7 @@ type ImageChannelAttempt struct {
 	FinishedAt                   int64               `json:"finished_at,omitempty"`
 	Dispatched                   bool                `json:"dispatched"`
 	TimedOut                     bool                `json:"timed_out,omitempty"`
+	DeadlineRetryUntil           int64               `json:"deadline_retry_until,omitempty"`
 	RetryOnTimeout               bool                `json:"retry_on_timeout,omitempty"`
 	RetryReferenceTimeoutLocally bool                `json:"retry_reference_timeout_locally,omitempty"`
 	SynchronousRetryableResponse bool                `json:"synchronous_retryable_response,omitempty"`
@@ -1211,6 +1213,9 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 	for _, attempt := range attempts {
 		if !attempt.Dispatched {
 			continue
+		}
+		if attempt.DeadlineRetryUntil > 0 && !slices.Contains(routing.DeadlineChannels, attempt.ChannelId) {
+			routing.DeadlineChannels = append(routing.DeadlineChannels, attempt.ChannelId)
 		}
 		if attempt.TimedOut && attempt.FinishedAt > 0 {
 			if attempt.KeyFingerprint != "" && !slices.Contains(routing.TimedOutAccounts, attempt.KeyFingerprint) {
