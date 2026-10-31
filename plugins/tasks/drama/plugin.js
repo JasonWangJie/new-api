@@ -77,7 +77,7 @@ export const meta = {
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.5",
+  version: "1.1.6",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
@@ -96,11 +96,12 @@ export const meta = {
       schema = {
         requests: { type: "number", unit: "count", unitLabel: { en: "video", zh: "条" }, description: { en: "Video generation unit price", zh: "视频生成单价" } },
         resolution,
+        video_input: VIDEO_INPUT_SCHEMA,
       };
     } else if (config.series === "legacy") {
       schema = { seconds: SECONDS_SCHEMA, resolution, video_input: VIDEO_INPUT_SCHEMA };
     } else if (["A", "H3"].includes(config.series)) {
-      schema = { seconds: SECONDS_SCHEMA, resolution };
+      schema = { seconds: SECONDS_SCHEMA, resolution, video_input: VIDEO_INPUT_SCHEMA };
     }
     const profile = { models: [model], schema };
     if (Object.hasOwn(schema, "tokens")) {
@@ -345,11 +346,11 @@ export function extractUsage(ctx) {
   const config = modelConfig(model);
   const prepared = normalizeRequest(ctx.requestBody, model, ctx.action);
   const resolution = prepared.body.resolution;
-  if (config.series === "E") return { requests: 1, resolution };
-  const seconds = prepared.action === "edit_video" ? config.max : prepared.body.seconds;
-  if (config.series === "A" || config.series === "H3") return { seconds, resolution };
   const videoInput = prepared.references.some((reference) => reference.type === "video");
-  const facts = { seconds, resolution, video_input: videoInput ? "video" : "none" };
+  const videoInputFact = videoInput ? "video" : "none";
+  if (config.series === "E") return { requests: 1, resolution, video_input: videoInputFact };
+  const seconds = prepared.action === "edit_video" ? config.max : prepared.body.seconds;
+  const facts = { seconds, resolution, video_input: videoInputFact };
   if (config.series === "F" || config.series === "G") {
     // Ark-style pixel/time estimate for pre-consume only. The gateway's
     // actual total_tokens replaces it at completion, including reference videos.

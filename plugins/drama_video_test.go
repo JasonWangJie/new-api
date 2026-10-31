@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -37,6 +38,11 @@ func loadDramaVideoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	t.Helper()
 	source, err := builtinplugins.Source("drama")
 	require.NoError(t, err)
+	if path := os.Getenv("NEWAPI_DRAMA_PLUGIN_SOURCE"); path != "" {
+		contents, err := os.ReadFile(path)
+		require.NoError(t, err)
+		source = string(contents)
+	}
 	plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: "drama"})
 	require.NoError(t, err)
 	return plugin
@@ -59,10 +65,14 @@ func decodeDramaVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, modelN
 
 func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
+	aResolution := "4k"
+	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
+		aResolution = "1080p"
+	}
 	for _, tc := range []struct {
 		model, resolution, path string
 	}{
-		{"seedance2.0-A", "4k", "/v1/videos"},
+		{"seedance2.0-A", aResolution, "/v1/videos"},
 		{"seedance2.5-A", "720p", "/v1/videos"},
 		{"minimax-h3", "1080p", "/v1/videos"},
 		{"seedance2.0-E-720p", "720p", "/v1/video/generations"},
@@ -103,7 +113,11 @@ func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 			assert.Equal(t, "POST", descriptor["method"])
 			assert.Equal(t, "Bearer upstream-test-key", descriptor["headers"].(map[string]any)["Authorization"])
 			body := descriptor["body"].(map[string]any)
-			assert.Equal(t, tc.model, body["model"])
+			upstreamModel := tc.model
+			if tc.model == "seedance2.0-Mini-E" && slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
+				upstreamModel = "seedance2.0-mini-E"
+			}
+			assert.Equal(t, upstreamModel, body["model"])
 			assert.Equal(t, tc.resolution, body["resolution"])
 			assert.EqualValues(t, 5, body["seconds"])
 			value, err = plugin.Engine.Call(t.Context(), "buildQueryRequest", map[string]any{
@@ -143,14 +157,19 @@ func TestDramaVideoPricingRowsPreserveGenerationLimits(t *testing.T) {
 			if modelName == "seedance2.0-F" {
 				expected = append(expected, "720px")
 			}
+			if modelName == "minimax-h3-2k" {
+				expected = append(expected, "2k")
+			}
 			assert.Equal(t, expected, schema["resolution"].Enum,
 				"all video models retain four editable price rows and any provider-specific resolution")
 			for _, resolution := range schema["resolution"].Enum {
 				_, err := decodeDramaVideoRequest(t, plugin, modelName, "create", map[string]any{
-					"prompt": "waves at sunset", "seconds": 5, "resolution": resolution,
+					"prompt": "waves at sunset", "seconds": profile.Modes[0].Duration.Default, "resolution": resolution,
 				})
 				if slices.Contains(profile.Modes[0].Resolutions, resolution) {
 					require.NoError(t, err)
+				} else if modelName == "minimax-h3-2k" {
+					require.ErrorContains(t, err, "requires resolution 2k")
 				} else {
 					require.ErrorContains(t, err, "resolution is not supported")
 				}
@@ -161,12 +180,16 @@ func TestDramaVideoPricingRowsPreserveGenerationLimits(t *testing.T) {
 
 func TestDramaVideoSecondBilledProfiles(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
+	aResolutions := []string{"480p", "720p", "1080p", "4k"}
+	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
+		aResolutions = aResolutions[:3]
+	}
 	for _, tc := range []struct {
 		model       string
 		maxSeconds  int
 		resolutions []string
 	}{
-		{"seedance2.0-A", 15, []string{"480p", "720p", "1080p", "4k"}},
+		{"seedance2.0-A", 15, aResolutions},
 		{"seedance2.5-A", 30, []string{"480p", "720p"}},
 		{"minimax-h3", 15, []string{"480p", "720p", "1080p"}},
 	} {
@@ -183,14 +206,15 @@ func TestDramaVideoSecondBilledProfiles(t *testing.T) {
 			assert.Equal(t, tc.maxSeconds, profile.Modes[0].Duration.Max)
 			assert.Equal(t, tc.resolutions, profile.Modes[0].Resolutions)
 			schema, _ := plugin.Meta.UsageForModel(tc.model)
-			assert.Len(t, schema, 2)
+			assert.Len(t, schema, 3)
 			assert.Contains(t, schema, "seconds")
 			value, err := plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"model": tc.model, "requestBody": request, "usagePurpose": "facts"})
 			require.NoError(t, err)
 			facts := value.(map[string]any)
-			assert.Len(t, facts, 2)
+			assert.Len(t, facts, 3)
 			assert.EqualValues(t, 4, facts["seconds"])
 			assert.Equal(t, "480p", facts["resolution"])
+			assert.Equal(t, "none", facts["video_input"])
 			for _, operation := range []string{"edit", "extend"} {
 				_, err = decodeDramaVideoRequest(t, plugin, tc.model, operation, map[string]any{"prompt": "sunrise"})
 				require.ErrorContains(t, err, "editing and extension require")
@@ -198,6 +222,80 @@ func TestDramaVideoSecondBilledProfiles(t *testing.T) {
 			for _, invalid := range []any{3, tc.maxSeconds + 1, -1, true, "18446744073686646784"} {
 				_, err = decodeDramaVideoRequest(t, plugin, tc.model, "create", map[string]any{"prompt": "sunrise", "seconds": invalid})
 				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestDramaVideoReferencePricingFacts(t *testing.T) {
+	plugin := loadDramaVideoPlugin(t)
+	models := []string{"seedance2.0-A", "seedance2.5-A", "minimax-h3", "seedance2.0-E", "seedance2.0-fast-E", "seedance2.0-Mini-E", "seedance2.5-E"}
+	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
+		models = append(models, "minimax-h3-2k")
+	}
+	for _, modelName := range models {
+		t.Run(modelName, func(t *testing.T) {
+			schema, _ := plugin.Meta.UsageForModel(modelName)
+			assert.Len(t, schema, 3)
+			assert.Equal(t, []string{"none", "video"}, schema["video_input"].Enum)
+			quantity, unit := "seconds", "second"
+			if strings.HasSuffix(modelName, "-E") || modelName == "minimax-h3-2k" {
+				quantity, unit = "requests", "count"
+			}
+			assert.Equal(t, unit, schema[quantity].Unit)
+			video := map[string]any{"type": "video", "role": "reference", "source": "https://cdn.example/media"}
+			videoAlias := any("https://cdn.example/media")
+			if modelName == "minimax-h3-2k" {
+				video["duration_seconds"] = 2
+				videoAlias = map[string]any{"url": "https://cdn.example/media", "duration_seconds": 2}
+			}
+			for _, tc := range []struct {
+				name, want string
+				request    map[string]any
+			}{
+				{"no references", "none", map[string]any{"prompt": "waves"}},
+				{"image URL with video extension", "none", map[string]any{"prompt": "@图1", "reference_images": []any{"https://cdn.example/image.mp4"}}},
+				{"audio only", "none", map[string]any{"prompt": "@音频1", "reference_audios": []any{"https://cdn.example/sound.mp3"}}},
+				{"typed video without file extension", "video", map[string]any{"prompt": "@视频1", "references": []any{video}}},
+				{"mixed typed references", "video", map[string]any{"prompt": "@图1 @音频1 @视频1", "references": []any{map[string]any{"type": "image", "role": "reference", "source": "https://cdn.example/image.png"}, map[string]any{"type": "audio", "role": "reference", "source": "https://cdn.example/sound.mp3"}, video}}},
+				{"reference_videos", "video", map[string]any{"prompt": "@视频1", "reference_videos": []any{videoAlias}}},
+				{"videos", "video", map[string]any{"prompt": "@视频1", "videos": []any{videoAlias}}},
+				{"video_urls", "video", map[string]any{"prompt": "@视频1", "video_urls": []any{videoAlias}}},
+				{"referenceVideos", "video", map[string]any{"prompt": "@视频1", "referenceVideos": []any{videoAlias}}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					intent, err := decodeDramaVideoRequest(t, plugin, modelName, "create", tc.request)
+					require.NoError(t, err)
+					info := &relaycommon.RelayInfo{OriginModelName: modelName, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: modelName}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: intent["action"].(string)}}
+					adaptor := pluginadaptor.New(plugin)
+					adaptor.Init(info)
+					ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+					ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{}`))
+					ctx.Set("task_request", intent["requestBody"])
+					facts, err := adaptor.ExtractUsageFactsValidated(ctx, info)
+					require.NoError(t, err)
+					assert.Len(t, facts, 3)
+					assert.Equal(t, tc.want, facts["video_input"])
+					if quantity == "requests" {
+						assert.EqualValues(t, 1, facts[quantity])
+						assert.NotContains(t, facts, "seconds")
+					} else {
+						assert.EqualValues(t, 4, facts[quantity])
+					}
+					ratios, err := adaptor.EstimateBillingValidated(ctx, info)
+					require.NoError(t, err)
+					assert.Empty(t, ratios, "reference pricing remains inside the expression")
+				})
+			}
+			for _, forged := range []map[string]any{
+				{"prompt": "waves", "video_input": "video"},
+				{"prompt": "@视频1", "video_input": "none", "reference_videos": []any{videoAlias}},
+				{"prompt": "waves", "metadata": map[string]any{"video_input": "video"}},
+			} {
+				_, err := decodeDramaVideoRequest(t, plugin, modelName, "create", forged)
+				require.ErrorContains(t, err, "not supported")
+				_, err = plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"model": modelName, "requestBody": forged, "usagePurpose": "facts"})
+				require.ErrorContains(t, err, "not supported")
 			}
 		})
 	}
@@ -578,21 +676,45 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 	assert.True(t, lastFrame.Credentialless)
 	assert.Empty(t, lastFrame.Headers)
 
-	for _, tc := range []struct {
-		model, expression string
-		request           map[string]any
-		response          map[string]any
-		wantQuota         int
-	}{
-		{"seedance2.0-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed"}, 200000},
-		{"seedance2.5-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "6"}, 300000},
-		{"minimax-h3", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000},
-		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 5}, map[string]any{"status": "completed"}, 250000},
-		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed"}, 250000},
-		{"seedance2.5-F", `u("video_input") == "video" ? tier("tokens", u("tokens") * 10 / 1000000) : tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "8"}, 400000},
-		{"seedance2.5-F", `u("video_input") == "video" ? tier("tokens", u("tokens") * 10 / 1000000) : tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "metadata": map[string]any{"usage": map[string]any{"total_tokens": 600037}}}, 3000185},
-		{"seedance2.5-G", `tier("tokens", u("tokens") * 10 / 1000000)`, map[string]any{"prompt": "a cat", "seconds": 5}, map[string]any{"status": "completed", "usage": map[string]any{"total_tokens": 432900}}, 2164500},
-	} {
+	const secondReferenceExpr = `u("video_input") == "video" ? tier("with_video", u("seconds") * 0.2) : tier("without_video", u("seconds") * 0.1)`
+	const requestReferenceExpr = `u("video_input") == "video" ? tier("with_video", u("requests") * 1) : tier("without_video", u("requests") * 0.5)`
+	type billingCase struct {
+		model, expression       string
+		request, response       map[string]any
+		wantQuota, wantPreQuota int
+		oldSnapshot             bool
+	}
+	cases := []billingCase{
+		{"seedance2.0-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed"}, 200000, 200000, false},
+		{"seedance2.5-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "6"}, 300000, 400000, false},
+		{"minimax-h3", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000, 400000, false},
+		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 5}, map[string]any{"status": "completed"}, 250000, 250000, false},
+		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed"}, 250000, 250000, false},
+		{"seedance2.5-F", `u("video_input") == "video" ? tier("tokens", u("tokens") * 10 / 1000000) : tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": "8"}, 400000, 400000, false},
+		{"seedance2.5-F", `u("video_input") == "video" ? tier("tokens", u("tokens") * 10 / 1000000) : tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "metadata": map[string]any{"usage": map[string]any{"total_tokens": 600037}}}, 3000185, 4104000, false},
+		{"seedance2.5-G", `tier("tokens", u("tokens") * 10 / 1000000)`, map[string]any{"prompt": "a cat", "seconds": 5}, map[string]any{"status": "completed", "usage": map[string]any{"total_tokens": 432900}}, 2164500, 540000, false},
+		{"seedance2.0-A", secondReferenceExpr, map[string]any{"prompt": "@视频1", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "seconds": 6, "video_input": "none"}, 600000, 800000, false},
+		{"seedance2.5-A", secondReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "seconds": 6}, 300000, 400000, false},
+		{"seedance2.5-A", secondReferenceExpr, map[string]any{"prompt": "@视频1", "seconds": 8, "referenceVideos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "seconds": 6}, 600000, 800000, false},
+		{"minimax-h3", secondReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000, 400000, false},
+		{"minimax-h3", secondReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "duration": 6.5}, 650000, 800000, false},
+		{"seedance2.0-E", requestReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed", "seconds": 100}, 250000, 250000, false},
+		{"seedance2.0-E", requestReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 15, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "seconds": 100, "video_input": "none"}, 500000, 500000, false},
+		{"seedance2.5-E", requestReferenceExpr, map[string]any{"prompt": "a cat", "seconds": 4, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed"}, 500000, 500000, false},
+		{"seedance2.0-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "@视频1", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "seconds": 6}, 300000, 400000, false},
+		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed"}, 250000, 250000, false},
+		{"seedance2.0-A", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "@视频1", "seconds": 8, "reference_videos": []any{"https://cdn.example/motion.mp4"}}, map[string]any{"status": "completed", "seconds": 6}, 300000, 400000, true},
+		{"minimax-h3", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000, 400000, true},
+		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed"}, 250000, 250000, true},
+	}
+	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
+		cases = append(cases,
+			billingCase{"minimax-h3-2k", requestReferenceExpr, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed", "seconds": 15}, 250000, 250000, false},
+			billingCase{"minimax-h3-2k", requestReferenceExpr, map[string]any{"prompt": "a cat", "reference_videos": []any{map[string]any{"url": "https://cdn.example/motion.mp4", "duration_seconds": 2}}}, map[string]any{"status": "completed", "seconds": 100, "video_input": "none"}, 500000, 500000, false},
+			billingCase{"minimax-h3-2k", `tier("video", u("requests") * 3)`, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed"}, 1500000, 1500000, true},
+		)
+	}
+	for _, tc := range cases {
 		t.Run(tc.model, func(t *testing.T) {
 			intent, err := decodeDramaVideoRequest(t, plugin, tc.model, "create", tc.request)
 			require.NoError(t, err)
@@ -602,17 +724,32 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 			require.NoError(t, err)
 			var estimate map[string]any
 			require.NoError(t, common.Unmarshal(encoded, &estimate))
-			snapshot := &billingexpr.BillingSnapshot{ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), ExprVersion: 1, TaskUsageBilling: true, GroupRatio: 1, QuotaPerUnit: 500000, UsageFacts: estimate}
-			value, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", map[string]any{"model": tc.model, "state": estimate}, map[string]any{}, tc.response)
+			if tc.oldSnapshot {
+				delete(estimate, "video_input")
+			}
+			cost, trace, err := billingexpr.RunExprWithRequest(tc.expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: estimate})
 			require.NoError(t, err)
-			encoded, err = common.Marshal(value)
+			preQuota, clamp := common.QuotaRoundChecked(cost * 500000)
+			assert.Equal(t, tc.wantPreQuota, preQuota)
+			assert.Nil(t, clamp)
+			snapshot := &billingexpr.BillingSnapshot{ExprString: tc.expression, ExprHash: billingexpr.ExprHashString(tc.expression), ExprVersion: 1, TaskUsageBilling: true, GroupRatio: 1, QuotaPerUnit: 500000, UsageFacts: estimate, EstimatedTier: trace.MatchedTier, EstimatedQuotaAfterGroup: preQuota}
+			state, err := common.Marshal(estimate)
 			require.NoError(t, err)
-			var actual map[string]any
-			require.NoError(t, common.Unmarshal(encoded, &actual))
-			settled, _, err := service.EvaluateTaskCompletionUsage(snapshot, actual)
+			body, err := common.Marshal(tc.response)
+			require.NoError(t, err)
+			completion := &relaycommon.TaskInfo{}
+			require.NoError(t, adaptor.ApplyCompletionUsage(&model.Task{Properties: model.Properties{OriginModelName: tc.model}, PrivateData: model.TaskPrivateData{PluginState: state}}, nil, body, completion))
+			assert.NotContains(t, completion.UsageFacts, "video_input", "completion must retain the frozen reference classification")
+			settled, usage, err := service.EvaluateTaskCompletionUsage(snapshot, completion.UsageFacts)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantQuota, settled.ActualQuotaAfterGroup)
+			assert.Equal(t, trace.MatchedTier, settled.MatchedTier)
 			assert.Nil(t, settled.Clamp)
+			if tc.oldSnapshot {
+				assert.NotContains(t, usage, "video_input", "old task facts do not require a backfill")
+			} else {
+				assert.Equal(t, estimate["video_input"], usage["video_input"])
+			}
 		})
 	}
 }

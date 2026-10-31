@@ -23,6 +23,7 @@ import { useState } from 'react'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { getTaskPricingDisplayTiers } from '@/features/pricing/lib/task-matrix-display'
+import type { BillingUsageSchema } from '@/features/pricing/types'
 
 import { TaskUsagePricingEditor } from '../task-usage-pricing-editor'
 
@@ -140,6 +141,7 @@ it('shows localized enum choices while preserving raw values in generated billin
 function TaskPricingDraft(props: {
   expression: string
   onChange: (next: string) => void
+  usageSchema?: BillingUsageSchema
 }) {
   const [billingExpr, setBillingExpr] = useState(props.expression)
   const [requestRuleExpr, setRequestRuleExpr] = useState(
@@ -149,14 +151,16 @@ function TaskPricingDraft(props: {
     <TaskUsagePricingEditor
       billingExpr={billingExpr}
       requestRuleExpr={requestRuleExpr}
-      usageSchema={{
-        seconds: {
-          type: 'number',
-          unit: 'second',
-          description: 'Seconds price',
-        },
-        mode: { enum: ['std', 'pro'] },
-      }}
+      usageSchema={
+        props.usageSchema ?? {
+          seconds: {
+            type: 'number',
+            unit: 'second',
+            description: 'Seconds price',
+          },
+          mode: { enum: ['std', 'pro'] },
+        }
+      }
       onBillingExprChange={(next) => {
         setBillingExpr(next)
         props.onChange(next)
@@ -165,6 +169,73 @@ function TaskPricingDraft(props: {
     />
   )
 }
+
+it('keeps inherited video-reference prices while browsing or cancelling and changes only an explicitly edited price', async () => {
+  const onChange = vi.fn()
+  const expression =
+    'u("resolution") == "480p" ? tier("480p", u("seconds") * 0.4) : tier("720p", u("seconds") * 0.8)'
+  render(
+    <TaskPricingDraft
+      expression={expression}
+      onChange={onChange}
+      usageSchema={{
+        seconds: {
+          type: 'number',
+          unit: 'second',
+          description: 'Video generation unit price',
+        },
+        resolution: { enum: ['480p', '720p'], description: 'Resolution' },
+        video_input: {
+          enum: ['none', 'video'],
+          description: 'Reference video input',
+          enumLabels: {
+            none: 'No reference video',
+            video: 'With reference video',
+          },
+        },
+      }}
+    />
+  )
+  const ordinaryPrice = screen.getByRole('textbox', {
+    name: 'Video generation unit price: Resolution: 720p · No reference video',
+  })
+  const referencePrice = screen.getByRole('textbox', {
+    name: 'Video generation unit price: Resolution: 720p · With reference video',
+  })
+  expect(ordinaryPrice).toHaveValue('0.8')
+  expect(referencePrice).toHaveValue('0.8')
+  expect(onChange).not.toHaveBeenCalled()
+
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('combobox', { name: 'Reference video input' })
+  )
+  await user.click(screen.getByRole('option', { name: 'With reference video' }))
+  expect(onChange).not.toHaveBeenCalled()
+  await user.clear(referencePrice)
+  await user.type(referencePrice, '1.2')
+  expect(referencePrice).toHaveValue('1.2')
+  expect(ordinaryPrice).toHaveValue('0.8')
+  const editedExpression = onChange.mock.lastCall?.[0]
+  expect(editedExpression).toContain('u("video_input")')
+
+  onChange.mockClear()
+  await user.click(screen.getByRole('combobox', { name: 'Editor mode' }))
+  await user.click(screen.getByRole('option', { name: 'Expression editor' }))
+  const raw = screen.getByRole('textbox', {
+    name: 'Billing expression',
+  }) as HTMLTextAreaElement
+  expect(raw.value).toContain(editedExpression)
+  await user.click(screen.getByRole('combobox', { name: 'Editor mode' }))
+  await user.click(screen.getByRole('option', { name: 'Visual editor' }))
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Cancel',
+    })
+  )
+  expect(raw.value).toContain(editedExpression)
+  expect(onChange).not.toHaveBeenCalled()
+})
 
 it('clears every price in one resolution row and lets an administrator publish it again', async () => {
   const onChange = vi.fn()

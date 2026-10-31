@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
 
-import { describe, test } from 'vitest'
+import { describe, expect, test } from 'vitest'
 
 import { parseTaskTiersFromExpr } from '../lib/billing-expr'
 import { evaluateBillingExpression } from '../lib/billing-expression/runtime'
@@ -536,6 +536,71 @@ test('expands Seedance video-input pricing over all resolutions with equal charg
     }
   }
 })
+
+test.each([
+  { field: 'seconds', unit: 'second', quantity: 5 },
+  { field: 'requests', unit: 'count', quantity: 1 },
+] as const)(
+  'preserves existing $field prices when adding reference-video conditions and editing one combination',
+  ({ field, unit, quantity }) => {
+    const schema: BillingUsageSchema = {
+      [field]: { type: 'number', unit },
+      resolution: { enum: ['480p', '720p', '4k'] },
+      video_input: { enum: ['none', 'video'] },
+    }
+    const expression = `u("resolution") == "480p" ? tier("480p", u("${field}") * 0.4) : u("resolution") == "720p" ? tier("720p", u("${field}") * 0.8) : tier("4k", u("${field}") * 0)`
+    const matrix = tryParseTaskMatrixConfig(expression, schema)
+    assert.ok(matrix)
+    expect(matrix.rows.map((row) => row.unitPrices[field])).toEqual([
+      0.4, 0.4, 0.8, 0.8, 0, 0,
+    ])
+
+    const generated = generateTaskExprFromConfig(
+      { tiers: taskMatrixToTiers(matrix, schema) },
+      schema
+    )
+    expect(tryParseTaskMatrixConfig(generated, schema)).toEqual(matrix)
+    for (const row of matrix.rows) {
+      const usage = { ...row.combination, seconds: 5, requests: 1 }
+      for (const candidate of [expression, generated]) {
+        const result = evaluateBillingExpression(candidate, { usage })
+        assert.ok(result.status === 'success')
+        expect(result.cost).toBe(row.unitPrices[field] * quantity)
+      }
+    }
+
+    const edited: TaskMatrixConfig = {
+      rows: matrix.rows.map((row) =>
+        row.combination.resolution === '720p' &&
+        row.combination.video_input === 'video'
+          ? { ...row, unitPrices: { [field]: 1.2 } }
+          : row
+      ),
+    }
+    const editedTiers = taskMatrixToTiers(edited, schema)
+    const editedExpression = generateTaskExprFromConfig(
+      { tiers: editedTiers },
+      schema
+    )
+    const parsed = tryParseTaskMatrixConfig(editedExpression, schema)
+    expect(parsed).toEqual(edited)
+    expect(parsed?.rows.map((row) => row.unitPrices[field])).toEqual([
+      0.4, 0.4, 0.8, 1.2, 0, 0,
+    ])
+    for (const row of edited.rows) {
+      const usage = { ...row.combination, seconds: 5, requests: 1 }
+      const result = evaluateBillingExpression(editedExpression, { usage })
+      assert.ok(result.status === 'success')
+      const preview = evaluateTaskVisualConfig(
+        { tiers: editedTiers },
+        usage,
+        schema
+      )
+      expect(result.cost).toBe(row.unitPrices[field] * quantity)
+      expect(preview?.total).toBe(result.cost)
+    }
+  }
+)
 
 test('matches specific and shared conditions in their original order', () => {
   const expression =
