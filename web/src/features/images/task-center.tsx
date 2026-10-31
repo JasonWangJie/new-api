@@ -83,6 +83,7 @@ import {
   imageTaskProgress,
   imageTaskUpstreamProgress,
   imageTaskCanResume,
+  imageTaskVideoReconciliation,
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
 
@@ -158,6 +159,7 @@ function TaskCenterSession({
     action: 'resume' | 'terminate' | 'batch-terminate'
     confirmUpstreamChecked?: boolean
     confirmQuotaReconciled?: boolean
+    checkExistingVideo?: boolean
   } | null>(null)
   const [busy, setBusy] = useState(false)
   const params = new URLSearchParams({
@@ -448,13 +450,18 @@ function TaskCenterSession({
                   setOperation({
                     ids: [row.original.id],
                     action: 'resume',
+                    checkExistingVideo: Boolean(
+                      imageTaskVideoReconciliation(row.original)
+                    ),
                     confirmQuotaReconciled:
                       admin &&
                       row.original.error_code === 'billing_quota_uncertain',
                   })
                 }
               >
-                {t('Resume')}
+                {imageTaskVideoReconciliation(row.original)
+                  ? t('Check existing video task')
+                  : t('Resume')}
               </Button>
             )}
             {(canManage || (!admin && row.original.media_type === 'video')) &&
@@ -613,12 +620,22 @@ function TaskCenterSession({
     confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.')} ${confirmationDescription}`
   }
   if (operation?.action === 'resume') {
-    confirmationDescription = t(
-      'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
-    )
+    confirmationDescription = operation.checkExistingVideo
+      ? t(
+          'Check the existing upstream video task again. Reserved quota is retained and no new generation will be submitted.'
+        )
+      : t(
+          'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
+        )
     if (operation.confirmQuotaReconciled) {
       confirmationDescription = `${t('Ask an administrator to reconcile the quota reservation before trying again.')} ${confirmationDescription}`
     }
+  }
+  let confirmationTitle = t('Terminate media tasks')
+  if (operation?.action === 'resume') {
+    confirmationTitle = operation.checkExistingVideo
+      ? t('Check existing video task')
+      : t('Resume media post-processing')
   }
   function applyFilters(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -1099,13 +1116,15 @@ function TaskCenterSession({
               onManage={(
                 action,
                 confirmUpstreamChecked,
-                confirmQuotaReconciled
+                confirmQuotaReconciled,
+                checkExistingVideo
               ) =>
                 setOperation({
                   ids: [detail],
                   action,
                   confirmUpstreamChecked,
                   confirmQuotaReconciled,
+                  checkExistingVideo,
                 })
               }
             />
@@ -1115,11 +1134,7 @@ function TaskCenterSession({
             onOpenChange={(open) => {
               if (!open && !busy) setOperation(null)
             }}
-            title={t(
-              operation?.action === 'resume'
-                ? 'Resume media post-processing'
-                : 'Terminate media tasks'
-            )}
+            title={confirmationTitle}
             desc={confirmationDescription}
             destructive={operation?.action !== 'resume'}
             isLoading={busy}

@@ -30,7 +30,7 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 			return err
 		}
 		now := time.Now().Unix()
-		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
+		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.PrivateData.VideoReconciliation != nil || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
 			currentJob.AttemptGeneration != job.AttemptGeneration || currentJob.AttemptGeneration != current.AttemptGeneration || currentJob.ReferenceRetryCount != 0 || currentJob.Status != "submitted" || currentJob.BillingStatus != "reserved" || currentJob.RefundLogPayload != "" || currentJob.OutputObjectKey != "" || currentJob.ExpiresAt <= now ||
 			current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId || current.Platform != "drama" || currentJob.Provider != "drama" || len(currentJob.RequestCipher) == 0 ||
 			current.Quota <= 0 || current.Quota != currentJob.Quota || !current.PrivateData.AsyncMedia || !current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || current.PrivateData.UpstreamTaskID == "" || current.PrivateData.ResultURL != "" ||

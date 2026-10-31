@@ -36,6 +36,125 @@ var imageQueuePop = redis.NewScript(`local item=redis.call('ZRANGE',KEYS[1],0,0,
 var imageInvocationAcquire = redis.NewScript(`redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',ARGV[1]); if redis.call('ZCARD',KEYS[1]) >= tonumber(ARGV[3]) then return 0 end; redis.call('ZADD',KEYS[1],ARGV[2],ARGV[4]); redis.call('EXPIRE',KEYS[1],ARGV[5]); return 1`)
 var imageInvocationRenew = redis.NewScript(`for _, key in ipairs(KEYS) do if not redis.call('ZSCORE',key,ARGV[1]) then return 0 end end; for _, key in ipairs(KEYS) do redis.call('ZADD',key,'XX',ARGV[2],ARGV[1]); redis.call('EXPIRE',key,ARGV[3]) end; return 1`)
 
+// AsyncImageWorkerStatus describes this process, including workers that are
+// finishing their current task after a concurrency reduction.
+type AsyncImageWorkerStatus struct {
+	Running                 bool `json:"running"`
+	WorkerConcurrency       int  `json:"worker_concurrency"`
+	ActiveWorkers           int  `json:"active_workers"`
+	RecoveryIntervalSeconds int  `json:"recovery_interval_seconds"`
+}
+
+type asyncImageWorker struct {
+	retire   chan struct{}
+	draining bool
+}
+
+type asyncImageWorkerPool struct {
+	ctx             context.Context
+	mu              sync.Mutex
+	workers         map[*asyncImageWorker]struct{}
+	recoverySeconds int
+	recoveryUpdates chan int
+	wg              sync.WaitGroup
+}
+
+var asyncImageWorkerPools struct {
+	sync.RWMutex
+	pools []*asyncImageWorkerPool
+}
+
+// GetAsyncImageWorkerStatus reports the most recently started live pool. Each
+// start owns its registration, so stopping an older pool cannot erase a newer
+// pool's status. Normal application startup creates one pool per process.
+func GetAsyncImageWorkerStatus() AsyncImageWorkerStatus {
+	asyncImageWorkerPools.RLock()
+	defer asyncImageWorkerPools.RUnlock()
+	for i := len(asyncImageWorkerPools.pools) - 1; i >= 0; i-- {
+		pool := asyncImageWorkerPools.pools[i]
+		if pool.ctx.Err() != nil {
+			continue
+		}
+		pool.mu.Lock()
+		status := AsyncImageWorkerStatus{Running: true, ActiveWorkers: len(pool.workers), RecoveryIntervalSeconds: pool.recoverySeconds}
+		for worker := range pool.workers {
+			if !worker.draining {
+				status.WorkerConcurrency++
+			}
+		}
+		pool.mu.Unlock()
+		return status
+	}
+	return AsyncImageWorkerStatus{}
+}
+
+func (pool *asyncImageWorkerPool) resizeWorkers(target int, run func(context.Context, <-chan struct{})) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	available := 0
+	for worker := range pool.workers {
+		if !worker.draining {
+			available++
+		}
+	}
+	for worker := range pool.workers {
+		if available <= target {
+			break
+		}
+		if !worker.draining {
+			worker.draining = true
+			close(worker.retire)
+			available--
+		}
+	}
+	for available < target && pool.ctx.Err() == nil {
+		worker := &asyncImageWorker{retire: make(chan struct{})}
+		pool.workers[worker] = struct{}{}
+		available++
+		pool.wg.Go(func() {
+			defer func() {
+				if recover() != nil {
+					common.SysError("image worker stopped after an unexpected failure")
+				}
+				pool.mu.Lock()
+				delete(pool.workers, worker)
+				pool.mu.Unlock()
+			}()
+			run(pool.ctx, worker.retire)
+		})
+	}
+}
+
+func (pool *asyncImageWorkerPool) supervise(load func(context.Context) (ImageRuntimeConfig, error), run func(context.Context, <-chan struct{})) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	failing := false
+	for {
+		select {
+		case <-pool.ctx.Done():
+			return
+		case <-ticker.C:
+			cfg, err := load(pool.ctx)
+			if err != nil {
+				if !failing && pool.ctx.Err() == nil {
+					common.SysError("image worker configuration refresh unavailable; retaining applied settings")
+				}
+				failing = true
+				continue
+			}
+			failing = false
+			pool.resizeWorkers(cfg.Workers, run)
+			// Keep only the latest interval while recovery or storage work is
+			// running. The recovery loop reports it only after adopting it.
+			select {
+			case <-pool.recoveryUpdates:
+			default:
+			}
+			pool.recoveryUpdates <- cfg.RecoveryInterval
+		}
+	}
+}
+
 func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 	ctx, cancel := context.WithCancel(parent)
 	if !common.RedisEnabled || common.RDB == nil || ExecuteAsyncImageFunc == nil {
@@ -46,18 +165,18 @@ func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 		common.SysError("image workers configuration unavailable")
 		return cancel
 	}
-	var workers sync.WaitGroup
-	for range cfg.Workers {
-		workers.Go(func() {
-			defer func() {
-				if recover() != nil {
-					common.SysError("image worker stopped after an unexpected failure")
-				}
-			}()
-			asyncImageWorkerLoop(ctx)
-		})
-	}
-	workers.Go(func() {
+	pool := &asyncImageWorkerPool{ctx: ctx, workers: make(map[*asyncImageWorker]struct{}), recoverySeconds: cfg.RecoveryInterval, recoveryUpdates: make(chan int, 1)}
+	pool.resizeWorkers(cfg.Workers, asyncImageWorkerLoop)
+	pool.wg.Go(func() {
+		defer func() {
+			if recover() != nil {
+				common.SysError("image worker supervisor stopped after an unexpected failure")
+				cancel()
+			}
+		}()
+		pool.supervise(GetImageRuntimeConfig, asyncImageWorkerLoop)
+	})
+	pool.wg.Go(func() {
 		defer func() {
 			if recover() != nil {
 				common.SysError("image outbox dispatcher stopped after an unexpected failure")
@@ -65,18 +184,41 @@ func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 		}()
 		asyncImageOutboxLoop(ctx)
 	})
-	workers.Go(func() {
+	pool.wg.Go(func() {
 		defer func() {
 			if recover() != nil {
 				common.SysError("image recovery stopped after an unexpected failure")
 			}
 		}()
-		asyncImageRecoveryLoop(ctx, cfg.RecoveryInterval)
+		pool.recoveryLoop(cfg.RecoveryInterval, func() {
+			if err := RebuildAsyncImageQueue(ctx); err != nil && ctx.Err() == nil {
+				common.SysError("image recovery is waiting for database or Redis availability")
+			}
+			if current, err := GetImageRuntimeConfig(ctx); err == nil {
+				if err := MaintainImageStorage(ctx, current); err != nil && ctx.Err() == nil {
+					common.SysError("image storage maintenance is waiting for database or storage availability")
+				}
+			}
+		})
 	})
+	asyncImageWorkerPools.Lock()
+	asyncImageWorkerPools.pools = append(asyncImageWorkerPools.pools, pool)
+	asyncImageWorkerPools.Unlock()
+	done := make(chan struct{})
+	go func() {
+		pool.wg.Wait()
+		asyncImageWorkerPools.Lock()
+		for i, registered := range asyncImageWorkerPools.pools {
+			if registered == pool {
+				asyncImageWorkerPools.pools = append(asyncImageWorkerPools.pools[:i], asyncImageWorkerPools.pools[i+1:]...)
+				break
+			}
+		}
+		asyncImageWorkerPools.Unlock()
+		close(done)
+	}()
 	return func() {
 		cancel()
-		done := make(chan struct{})
-		go func() { workers.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
@@ -106,14 +248,28 @@ func asyncImageOutboxLoop(ctx context.Context) {
 	}
 }
 
-func asyncImageWorkerLoop(ctx context.Context) {
+func asyncImageWorkerLoop(ctx context.Context, retire <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
+		// Retirement is independent of the task context: lowering concurrency
+		// must not interrupt an upstream submission or a billing operation.
+		select {
+		case <-retire:
+			return
+		default:
+		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-retire:
+			return
 		case <-ticker.C:
+			select {
+			case <-retire:
+				return
+			default:
+			}
 			id, err := imageQueuePop.Run(ctx, common.RDB, []string{ImageRedisKey("queue")}, time.Now().Unix()).Text()
 			if err != nil || id == "" {
 				continue
@@ -125,22 +281,27 @@ func asyncImageWorkerLoop(ctx context.Context) {
 	}
 }
 
-func asyncImageRecoveryLoop(ctx context.Context, interval int) {
+func (pool *asyncImageWorkerPool) recoveryLoop(interval int, recoverTasks func()) {
+	pool.mu.Lock()
+	pool.recoverySeconds = interval
+	pool.mu.Unlock()
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
+	recoverTasks()
 	for {
-		if err := RebuildAsyncImageQueue(ctx); err != nil && ctx.Err() == nil {
-			common.SysError("image recovery is waiting for database or Redis availability")
-		}
-		if cfg, err := GetImageRuntimeConfig(ctx); err == nil {
-			if err := MaintainImageStorage(ctx, cfg); err != nil && ctx.Err() == nil {
-				common.SysError("image storage maintenance is waiting for database or storage availability")
-			}
-		}
 		select {
-		case <-ctx.Done():
+		case <-pool.ctx.Done():
 			return
+		case updated := <-pool.recoveryUpdates:
+			if updated != interval {
+				interval = updated
+				ticker.Reset(time.Duration(interval) * time.Second)
+				pool.mu.Lock()
+				pool.recoverySeconds = interval
+				pool.mu.Unlock()
+			}
 		case <-ticker.C:
+			recoverTasks()
 		}
 	}
 }

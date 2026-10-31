@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,10 @@ type BatchTaskPollingAdaptor interface {
 	FetchMode() string
 	FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error)
 	ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error)
+}
+
+type BatchTaskContextPollingAdaptor interface {
+	FetchBatchTasksContext(context.Context, string, string, []*model.Task, string) (*http.Response, error)
 }
 
 const (
@@ -126,6 +131,12 @@ func sweepTimedOutTasks(ctx context.Context) {
 		if task.PrivateData.AsyncMedia && task.AttemptGeneration > 0 && task.PrivateData.UpstreamTaskID == "" {
 			// Preparation owns the original deadline. An unconfirmed replacement
 			// submission retains its hold until explicit upstream reconciliation.
+			continue
+		}
+		if task.PrivateData.AsyncMedia {
+			if err := reconcileAsyncVideoTask(ctx, task, task.Snapshot(), "task_timeout", 0); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("preserve timed-out video task %s: %v", task.TaskID, err))
+			}
 			continue
 		}
 		if task.PrivateData.Key == "" {
@@ -224,6 +235,13 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 	summary.UnfinishedTasks = len(allTasks)
 	platformTask := make(map[constant.TaskPlatform][]*model.Task)
 	for _, t := range allTasks {
+		ready, readyErr := asyncVideoPollReady(ctx, t)
+		if readyErr != nil {
+			logger.LogError(ctx, fmt.Sprintf("check video reconciliation %s: %v", t.TaskID, readyErr))
+		}
+		if !ready || readyErr != nil {
+			continue
+		}
 		platformTask[t.Platform] = append(platformTask[t.Platform], t)
 	}
 
@@ -247,6 +265,12 @@ func RunTaskPollingOnce(ctx context.Context, report func(processed, total int)) 
 		for _, task := range tasks {
 			upstreamID := task.GetUpstreamTaskID()
 			if upstreamID == "" {
+				if task.PrivateData.AsyncMedia {
+					if err := reconcileAsyncVideoTask(ctx, task, task.Snapshot(), "upstream_id_missing", 0); err != nil {
+						logger.LogError(ctx, fmt.Sprintf("preserve video task %s without upstream ID: %v", task.TaskID, err))
+					}
+					continue
+				}
 				if task.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(task) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, task); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", task.TaskID, accountingErr))
@@ -372,6 +396,12 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if t.PrivateData.AsyncMedia {
+					if reconcileErr := reconcileAsyncVideoTask(ctx, t, t.Snapshot(), "channel_unavailable", 0); reconcileErr != nil {
+						logger.LogError(ctx, reconcileErr.Error())
+					}
+					continue
+				}
 				if t.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(t) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
@@ -426,6 +456,20 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	readyTasks := make([]*model.Task, 0, len(tasks))
+	for _, task := range tasks {
+		ready, err := asyncVideoPollReady(ctx, task)
+		if err != nil {
+			return err
+		}
+		if ready {
+			readyTasks = append(readyTasks, task)
+		}
+	}
+	tasks = readyTasks
+	if len(tasks) == 0 {
+		return nil
+	}
 	baseURL := ch.GetBaseURL()
 	if baseURL == "" {
 		baseURL = constant.GetChannelBaseURL(ch.Type)
@@ -437,7 +481,24 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		ChannelSetting:       ch.GetSetting(),
 		ChannelOtherSettings: ch.GetOtherSettings(),
 	}})
-	resp, err := adaptor.FetchBatchTasks(baseURL, key, tasks, ch.GetSetting().Proxy)
+	var resp *http.Response
+	var err error
+	asyncMedia := slices.ContainsFunc(tasks, func(task *model.Task) bool { return task.PrivateData.AsyncMedia })
+	if asyncMedia {
+		cfg, configErr := GetMediaRuntimeConfig(ctx)
+		if configErr != nil {
+			return configErr
+		}
+		poller, ok := adaptor.(BatchTaskContextPollingAdaptor)
+		if !ok {
+			return errors.New("video provider does not support bounded batch polling")
+		}
+		pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
+		defer cancel()
+		resp, err = poller.FetchBatchTasksContext(pollContext, baseURL, key, tasks, ch.GetSetting().Proxy)
+	} else {
+		resp, err = adaptor.FetchBatchTasks(baseURL, key, tasks, ch.GetSetting().Proxy)
+	}
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassTransport, 0, err.Error())
@@ -450,7 +511,17 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 	}
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
-		return failTasksFromPoll(ctx, adaptor, tasks, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
+		for _, task := range tasks {
+			if task.PrivateData.AsyncMedia {
+				err = recordPollFailure(ctx, adaptor, task, task.Snapshot(), pollClassNotFound, resp.StatusCode, "")
+			} else {
+				err = failTaskFromPoll(ctx, adaptor, task, task.Status, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	case pollClassAuth:
 		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d http=%d", ch.Id, resp.StatusCode))
 		return recordPollFailureForTasks(ctx, adaptor, tasks, pollClassAuth, resp.StatusCode, "")
@@ -467,7 +538,7 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		}
 		responseItem := responseItems[task.GetUpstreamTaskID()]
 		if responseItem == nil {
-			if err := recordPollFailure(ctx, adaptor, task, task.Status, pollClassUnrecognized, resp.StatusCode, "batch response omitted the requested task"); err != nil {
+			if err := recordPollFailure(ctx, adaptor, task, task.Snapshot(), pollClassUnrecognized, resp.StatusCode, "batch response omitted the requested task"); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("record missing batch task %s: %v", task.TaskID, err))
 			}
 			continue
@@ -476,32 +547,37 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		httpClass := classifyPollHTTP(resp.StatusCode)
 		parsedStatus := model.TaskStatus(responseItem.TaskInfo.Status)
 		if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
-			if err := recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, responseItem.TaskInfo.Reason); err != nil {
+			if err := recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, responseItem.TaskInfo.Reason); err != nil {
 				common.SysLog("UpdateSunoTask task error: " + err.Error())
 			}
 			continue
 		}
-		if httpClass == pollClassOtherClient && isNonTerminalPollStatus(parsedStatus) {
-			if err := recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, responseItem.TaskInfo.Reason); err != nil {
+		if httpClass == pollClassOtherClient && (task.PrivateData.AsyncMedia || isNonTerminalPollStatus(parsedStatus)) {
+			if err := recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, responseItem.TaskInfo.Reason); err != nil {
 				common.SysLog("UpdateSunoTask task error: " + err.Error())
 			}
 			continue
 		}
 		if isNonTerminalPollStatus(parsedStatus) {
 			task.PrivateData.PollFailures = 0
+			if err := advanceVideoReconciliationPoll(ctx, task); err != nil {
+				return err
+			}
 		}
 		if len(responseItem.TaskInfo.PluginState) > 0 {
 			task.PrivateData.PluginState = responseItem.TaskInfo.PluginState
 		}
 		task.Status = lo.If(parsedStatus != "", parsedStatus).Else(task.Status)
-		task.FailReason = lo.If(responseItem.TaskInfo.Reason != "", responseItem.TaskInfo.Reason).Else(task.FailReason)
+		if !task.PrivateData.AsyncMedia || parsedStatus == model.TaskStatusFailure {
+			task.FailReason = lo.If(responseItem.TaskInfo.Reason != "", responseItem.TaskInfo.Reason).Else(task.FailReason)
+		}
 		task.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(task.SubmitTime)
 		task.StartTime = lo.If(responseItem.StartTime != 0, responseItem.StartTime).Else(task.StartTime)
 		task.FinishTime = lo.If(responseItem.FinishTime != 0, responseItem.FinishTime).Else(task.FinishTime)
 		if responseItem.TaskInfo.Progress != "" {
 			task.Progress = responseItem.TaskInfo.Progress
 		}
-		if responseItem.TaskInfo.Reason != "" || task.Status == model.TaskStatusFailure {
+		if (!task.PrivateData.AsyncMedia && responseItem.TaskInfo.Reason != "") || task.Status == model.TaskStatusFailure {
 			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
 			task.Status = model.TaskStatusFailure
 			task.Progress = "100%"
@@ -540,12 +616,17 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
 		if terminalTransition {
+			if task.PrivateData.AsyncMedia {
+				task.PrivateData.VideoTerminalConfirmed = true
+				task.PrivateData.VideoReconciliation = nil
+				task.PrivateData.PollFailures = 0
+			}
 			if _, err := SettleTaskBillingOnComplete(ctx, adaptor, task, snap.Status, &responseItem.TaskInfo); err != nil {
 				logger.LogError(ctx, fmt.Sprintf("settle batch task %s: %v", task.TaskID, err))
 			}
 			continue
 		}
-		won, updateErr := task.UpdateWithStatus(snap.Status)
+		won, updateErr := task.UpdatePollingState(ctx, snap)
 		if updateErr != nil {
 			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
 			continue
@@ -605,7 +686,7 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 			if task := taskM[upstreamID]; task != nil && task.PrivateData.AsyncMedia {
 				frozen, freezeErr := FrozenAsyncMediaChannel(ctx, task)
 				if freezeErr != nil {
-					return freezeErr
+					continue
 				}
 				if frozen != nil {
 					cacheGetChannel, err = frozen, nil
@@ -619,6 +700,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
+				if t.PrivateData.AsyncMedia {
+					if reconcileErr := reconcileAsyncVideoTask(ctx, t, t.Snapshot(), "channel_unavailable", 0); reconcileErr != nil {
+						logger.LogError(ctx, reconcileErr.Error())
+					}
+					continue
+				}
 				if t.PrivateData.DurableBilling || taskUsesMeasuredVideoBilling(t) {
 					if accountingErr := ensureMeasuredTaskSubmitAccounting(ctx, t); accountingErr != nil {
 						logger.LogError(ctx, fmt.Sprintf("record task %s submission accounting: %v", t.TaskID, accountingErr))
@@ -699,8 +786,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		// the host. They need neither an upstream poll nor channel decryption.
 		return nil
 	}
+	ready, readyErr := asyncVideoPollReady(ctx, task)
+	if readyErr != nil || !ready {
+		return readyErr
+	}
 	frozen, frozenErr := FrozenAsyncMediaChannel(ctx, task)
 	if frozenErr != nil {
+		if task.PrivateData.AsyncMedia {
+			return recordPollFailure(ctx, adaptor, task, task.Snapshot(), "channel_unavailable", 0, "")
+		}
 		return frozenErr
 	}
 	if frozen != nil {
@@ -714,6 +808,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	key, keyErr := taskPollingCredential(task, ch)
 	if keyErr != nil {
+		if task.PrivateData.AsyncMedia {
+			return recordPollFailure(ctx, adaptor, task, task.Snapshot(), "credential_unavailable", 0, "")
+		}
 		return keyErr
 	}
 	if err := ensureMeasuredTaskSubmitAccounting(ctx, task); err != nil {
@@ -738,7 +835,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			if configErr != nil {
 				return configErr
 			}
-			pollContext, cancel = context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
+			pollContext, cancel = context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
 			defer cancel()
 			responseLimit = min(maxUpstreamAsyncResponseBytes, cfg.MaxFileBytes*4+(1<<20))
 		}
@@ -753,7 +850,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if configErr != nil {
 			return configErr
 		}
-		pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.DownloadTimeout)*time.Second)
+		pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
 		defer cancel()
 		poller, ok := adaptor.(TaskContextPollingAdaptor)
 		if !ok {
@@ -765,15 +862,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		resp, err = adaptor.FetchTask(baseURL, key, task, proxy)
 	}
 	if err != nil {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, 0, err.Error())
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassTransport, 0, err.Error())
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, responseLimit+1))
 	if err != nil {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransport, resp.StatusCode, err.Error())
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassTransport, resp.StatusCode, err.Error())
 	}
 	if int64(len(responseBody)) > responseLimit {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "video result metadata byte limit exceeded")
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, "video result metadata byte limit exceeded")
 	}
 
 	if !task.PrivateData.AsyncMedia {
@@ -782,12 +879,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	switch classifyPollHTTP(resp.StatusCode) {
 	case pollClassNotFound:
+		if task.PrivateData.AsyncMedia {
+			return recordPollFailure(ctx, adaptor, task, snap, pollClassNotFound, resp.StatusCode, "")
+		}
 		return failTaskFromPoll(ctx, adaptor, task, snap.Status, fmt.Sprintf("upstream task not found (HTTP %d)", resp.StatusCode))
 	case pollClassAuth:
 		logger.LogWarn(ctx, fmt.Sprintf("task poll auth failure channel_id=%d task=%s http=%d", ch.Id, task.TaskID, resp.StatusCode))
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassAuth, resp.StatusCode, "")
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassAuth, resp.StatusCode, "")
 	case pollClassTransient:
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransient, resp.StatusCode, "")
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassTransient, resp.StatusCode, "")
 	}
 
 	measuredVideo := taskUsesMeasuredVideoBilling(task)
@@ -796,7 +896,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task.PrivateData.UpstreamAsync != nil {
 		parsed, parseErr := ParseUpstreamAsyncPollResponse(task.PrivateData.UpstreamAsync, responseBody)
 		if parseErr != nil {
-			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, parseErr.Error())
+			return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, parseErr.Error())
 		}
 		taskResult = &relaycommon.TaskInfo{Status: string(parsed.Status), Progress: parsed.Progress, Reason: parsed.Reason}
 		if len(parsed.URLs) > 0 {
@@ -833,7 +933,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			taskResult.Reason = t.FailReason
 			task.Data = t.Data
 		} else if taskResult, err = adaptor.ParseTaskResult(task, resp, responseBody); err != nil {
-			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, err.Error())
+			return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, err.Error())
 		}
 	}
 
@@ -842,7 +942,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	parsedStatus := model.TaskStatus(taskResult.Status)
-	if parsedStatus == model.TaskStatusFailure {
+	if task.PrivateData.AsyncMedia && classifyPollHTTP(resp.StatusCode) != pollClassOK {
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, "")
+	}
+	if parsedStatus == model.TaskStatusFailure && task.PrivateData.VideoReconciliation == nil {
 		scheduled, recoveryErr := TryAsyncVideoReferenceRecovery(ctx, *task, taskResult, resp.StatusCode, responseBody)
 		if recoveryErr != nil {
 			return recoveryErr
@@ -856,11 +959,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if measuredVideo && parsedStatus == model.TaskStatusSuccess {
 		billingContext := task.PrivateData.BillingContext
 		if actualSeconds == nil || billingContext == nil || billingContext.TieredSnapshot == nil {
-			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video billing facts are unavailable")
+			return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, "measured video billing facts are unavailable")
 		}
 		limit, ok := billingContext.TieredSnapshot.UsageFacts["seconds"].(float64)
 		if !ok || limit <= 0 {
-			return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video precharge limit is unavailable")
+			return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, "measured video precharge limit is unavailable")
 		}
 		if *actualSeconds > limit {
 			logger.LogWarn(ctx, fmt.Sprintf("task %s measured video seconds %.6f exceed reserved limit %.6f", task.TaskID, *actualSeconds, limit))
@@ -871,7 +974,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		} else {
 			result, _, billingErr := EvaluateTaskCompletionUsage(billingContext.TieredSnapshot, taskResult.UsageFacts)
 			if billingErr != nil {
-				return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassHookError, resp.StatusCode, "measured video expression could not be evaluated")
+				return recordPollFailure(ctx, adaptor, task, snap, pollClassHookError, resp.StatusCode, "measured video expression could not be evaluated")
 			}
 			measuredActualQuota, measuredClamp = result.ActualQuotaAfterGroup, result.Clamp
 			if measuredClamp != nil || measuredActualQuota > task.Quota {
@@ -894,10 +997,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		unrecognizedDetail = unrecognizedPollDetail(taskResult.Reason, responseBody)
 	}
 	if parsedStatus == model.TaskStatusUnknown || parsedStatus == "" || !knownPollStatus(parsedStatus) {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
 	}
 	if classifyPollHTTP(resp.StatusCode) == pollClassOtherClient && isNonTerminalPollStatus(parsedStatus) {
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
+		return recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, unrecognizedDetail)
 	}
 
 	if task.PrivateData.UpstreamAsync != nil {
@@ -911,6 +1014,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 	if isNonTerminalPollStatus(parsedStatus) {
 		task.PrivateData.PollFailures = 0
+		if err := advanceVideoReconciliationPoll(ctx, task); err != nil {
+			return err
+		}
 	}
 
 	now := time.Now().Unix()
@@ -973,6 +1079,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && task.PrivateData.AsyncMedia {
 		task.PrivateData.VideoTerminalConfirmed = resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+		task.PrivateData.VideoReconciliation = nil
+		task.PrivateData.PollFailures = 0
 	}
 	if measuredVideo && isDone {
 		won, settleErr := SettleMeasuredVideoTask(ctx, task, snap.Status, measuredActualQuota, taskResult.UsageFacts, measuredClamp)
@@ -989,7 +1097,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return err
 	}
 	if !snap.Equal(task.Snapshot()) {
-		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
+		if _, err := task.UpdatePollingState(ctx, snap); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update task %s: %s", task.TaskID, err.Error()))
 		}
 	} else {
@@ -1108,7 +1216,10 @@ func unrecognizedPollDetail(reason string, body []byte) string {
 	return reason + "; body=" + redacted
 }
 
-func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, class string, statusCode int, detail string) error {
+func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, before model.TaskPollingSnapshot, class string, statusCode int, detail string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	task.PrivateData.PollFailures++
 	if class == pollClassUnrecognized || class == pollClassHookError {
 		// The redacted body is intentionally not persisted to Task.Data on these
@@ -1116,14 +1227,102 @@ func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *mo
 		// plugin could not interpret.
 		logger.LogWarn(ctx, fmt.Sprintf("task %s poll %s (failures=%d, http=%d): %s", task.TaskID, class, task.PrivateData.PollFailures, statusCode, detail))
 	}
+	if task.PrivateData.AsyncMedia {
+		return reconcileAsyncVideoTask(ctx, task, before, class, statusCode)
+	}
 	// TASK_POLL_MAX_FAILURES <= 0 disables the consecutive-failure cutoff, matching
 	// TASK_TIMEOUT_MINUTES semantics; the 24h sweep remains the only backstop.
 	if constant.TaskPollMaxFailures > 0 && task.PrivateData.PollFailures >= constant.TaskPollMaxFailures {
-		return failTaskFromPoll(ctx, adaptor, task, fromStatus, pollFailureReason(class, statusCode, detail))
+		return failTaskFromPoll(ctx, adaptor, task, before.Status, pollFailureReason(class, statusCode, detail))
 	}
-	if _, err := task.UpdateWithStatus(fromStatus); err != nil {
+	if _, err := task.UpdatePollingState(ctx, before); err != nil {
 		return err
 	}
+	return nil
+}
+
+// Query failures are not evidence that generation failed. Keep the original
+// operation and reservation through one frozen, bounded reconciliation window.
+func reconcileAsyncVideoTask(ctx context.Context, task *model.Task, before model.TaskPollingSnapshot, class string, statusCode int) error {
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return nil
+	}
+	now := time.Now().Unix()
+	state := model.VideoTaskReconciliation{}
+	if task.PrivateData.VideoReconciliation != nil {
+		state = *task.PrivateData.VideoReconciliation
+		if state.ManualRequired {
+			return nil
+		}
+		if class == "task_timeout" && now < state.DeadlineAt {
+			return nil // The outer sweep must not postpone the next query.
+		}
+	}
+	cfg, err := GetMediaRuntimeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if state.StartedAt == 0 {
+		state.StartedAt, state.DeadlineAt = now, now+int64(cfg.ReconciliationTimeout)*60
+	}
+	state.Revision++
+	state.Reason = pollFailureReason(class, statusCode, "")
+	if now >= state.DeadlineAt {
+		state.ManualRequired, state.NextPollAt = true, 0
+	} else if class == "task_timeout" {
+		state.NextPollAt = 0
+	} else {
+		state.NextPollAt = min(state.DeadlineAt, now+int64(cfg.ReconciliationPollInterval))
+	}
+	task.PrivateData.VideoReconciliation = &state
+	_, err = task.UpdatePollingState(ctx, before)
+	return err
+}
+
+// asyncVideoPollReady is shared by the normal pass and direct/batch poll entry
+// points, so neither can bypass a paused or expired reconciliation window.
+func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
+	if task == nil || task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return false, nil
+	}
+	state := task.PrivateData.VideoReconciliation
+	if !task.PrivateData.AsyncMedia || state == nil {
+		return true, nil
+	}
+	if state.ManualRequired {
+		return false, nil
+	}
+	now := time.Now().Unix()
+	if now >= state.DeadlineAt {
+		before := task.Snapshot()
+		updated := *state
+		updated.ManualRequired, updated.NextPollAt = true, 0
+		updated.Revision++
+		task.PrivateData.VideoReconciliation = &updated
+		_, err := task.UpdatePollingState(ctx, before)
+		return false, err
+	}
+	return now >= state.NextPollAt, nil
+}
+
+// A valid pending result restores observability but does not extend the frozen
+// window: only a confirmed terminal result or explicit operator resume ends it.
+func advanceVideoReconciliationPoll(ctx context.Context, task *model.Task) error {
+	if !task.PrivateData.AsyncMedia || task.PrivateData.VideoReconciliation == nil {
+		return nil
+	}
+	cfg, err := GetMediaRuntimeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	state := *task.PrivateData.VideoReconciliation
+	state.Revision++
+	now := time.Now().Unix()
+	state.NextPollAt = min(state.DeadlineAt, now+int64(cfg.ReconciliationPollInterval))
+	if now >= state.DeadlineAt {
+		state.ManualRequired, state.NextPollAt = true, 0
+	}
+	task.PrivateData.VideoReconciliation = &state
 	return nil
 }
 
@@ -1133,7 +1332,7 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 		if task == nil {
 			continue
 		}
-		if err := recordPollFailure(ctx, adaptor, task, task.Status, class, statusCode, detail); err != nil && firstErr == nil {
+		if err := recordPollFailure(ctx, adaptor, task, task.Snapshot(), class, statusCode, detail); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1165,17 +1364,4 @@ func ensureMeasuredTaskSubmitAccounting(ctx context.Context, task *model.Task) e
 	}
 	_, err := model.RecordMeasuredTaskSubmitAccounting(ctx, task)
 	return err
-}
-
-func failTasksFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, tasks []*model.Task, reason string) error {
-	var firstErr error
-	for _, task := range tasks {
-		if task == nil {
-			continue
-		}
-		if err := failTaskFromPoll(ctx, adaptor, task, task.Status, reason); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }

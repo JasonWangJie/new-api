@@ -219,7 +219,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 				dialector = postgres.Open(dsn)
 				versionQuery = "SELECT VERSION()"
 			default:
-				dialector = sqlite.Open(filepath.Join(t.TempDir(), "image-config.db"))
+				dialector = sqlite.Open(filepath.Join(t.TempDir(), "image-config.db") + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)")
 			}
 
 			db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -227,7 +227,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			if engine == "sqlite" {
 				connection, err := db.DB()
 				require.NoError(t, err)
-				connection.SetMaxOpenConns(1)
+				connection.SetMaxOpenConns(4)
 			}
 			previousDB := model.DB
 			previousType := common.MainDatabaseType()
@@ -248,7 +248,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					return dto.ImageCapability{}
 				}
 			}
-			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}, &model.User{}, &model.Token{}}
+			entities := []any{&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}, &model.User{}, &model.Token{}, &model.ImageStorageProfile{}}
 			t.Cleanup(func() {
 				model.DB = previousDB
 				common.SetMainDatabaseType(previousType)
@@ -320,7 +320,76 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			var saved model.ImageChannelPool
 			require.NoError(t, db.Where("channel_id = ?", 11).Take(&saved).Error)
 			assert.Equal(t, 7, saved.Priority)
+			t.Run("runtime configuration revisions", func(t *testing.T) { verifyMediaConfigurationRevisions(t, db) })
 			t.Run("routing preview", func(t *testing.T) { verifyMediaRoutingPreview(t, db, redisServer) })
+			t.Run("pool weight API preserves legacy input and rejects conflicting aliases", func(t *testing.T) {
+				const group = "pool-weight-contract"
+				require.NoError(t, db.Create(&model.Ability{Group: group, Model: "image-alpha", ChannelId: 11, Enabled: true}).Error)
+				key := service.ImagePoolBindingKey(model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "resolution"}, "", "2K")
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Ability{}).Error)
+				})
+				for _, tc := range []struct {
+					name    string
+					channel gin.H
+					weight  int
+					invalid bool
+				}{
+					{name: "weight only", channel: gin.H{"id": 11, "weight": 17}, weight: 17},
+					{name: "explicit zero", channel: gin.H{"id": 11, "weight": 0}, weight: 0},
+					{name: "legacy priority", channel: gin.H{"id": 11, "priority": 7}, weight: 7},
+					{name: "matching aliases", channel: gin.H{"id": 11, "weight": 9, "priority": 9}, weight: 9},
+					{name: "zero aliases", channel: gin.H{"id": 11, "weight": 0, "priority": 0}, weight: 0},
+					{name: "omitted weight keeps legacy default", channel: gin.H{"id": 11}, weight: 0},
+					{name: "conflicting explicit zero", channel: gin.H{"id": 11, "weight": 0, "priority": 7}, invalid: true},
+					{name: "conflicting positive weight", channel: gin.H{"id": 11, "weight": 7, "priority": 0}, invalid: true},
+					{name: "negative weight", channel: gin.H{"id": 11, "weight": -1}, invalid: true},
+					{name: "oversized weight", channel: gin.H{"id": 11, "weight": 1000001}, invalid: true},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						var before []model.ImageChannelPool
+						require.NoError(t, db.Where("binding_key = ?", key).Order("id").Find(&before).Error)
+						expectedIDs := make([]int, len(before))
+						for i := range before {
+							expectedIDs[i] = before[i].Id
+						}
+						body, err := common.Marshal(gin.H{
+							"group": group, "platform": "openai", "mode": "resolution", "resolution": "2K",
+							"expected_ids": expectedIDs, "channels": []gin.H{tc.channel},
+						})
+						require.NoError(t, err)
+						recorder := httptest.NewRecorder()
+						context, _ := gin.CreateTestContext(recorder)
+						context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+						SaveImageChannelPool(context)
+						var after []model.ImageChannelPool
+						require.NoError(t, db.Where("binding_key = ?", key).Order("id").Find(&after).Error)
+						if tc.invalid {
+							assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+							assert.Equal(t, before, after, "invalid aliases must not change the stored binding or revision")
+							return
+						}
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						require.Len(t, after, 1)
+						assert.Equal(t, tc.weight, after[0].Priority)
+						var response struct {
+							Data []struct {
+								ChannelID int  `json:"channel_id"`
+								Weight    *int `json:"weight"`
+								Priority  *int `json:"priority"`
+							} `json:"data"`
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						require.Len(t, response.Data, 1)
+						require.NotNil(t, response.Data[0].Weight)
+						require.NotNil(t, response.Data[0].Priority)
+						assert.Equal(t, 11, response.Data[0].ChannelID)
+						assert.Equal(t, tc.weight, *response.Data[0].Weight)
+						assert.Equal(t, tc.weight, *response.Data[0].Priority)
+					})
+				}
+			})
 
 			t.Run("pool compare and swap covers concurrent creation and editing", func(t *testing.T) {
 				const group = "pool-without-policy"
@@ -392,6 +461,46 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 				context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
 				SaveImageChannelPool(context)
 				assert.Equal(t, http.StatusOK, recorder.Code)
+			})
+
+			t.Run("pool deletion competes with saving the same revision", func(t *testing.T) {
+				const group = "pool-save-delete"
+				require.NoError(t, db.Create(&model.Ability{Group: group, Model: "image-alpha", ChannelId: 11, Enabled: true}).Error)
+				key := service.ImagePoolBindingKey(model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "resolution"}, "", "2K")
+				pool := model.ImageChannelPool{BindingKey: key, Group: group, Platform: "openai", Mode: "resolution", Resolution: "2K", ChannelId: 11, Priority: 1}
+				require.NoError(t, db.Create(&pool).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+					assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Ability{}).Error)
+				})
+				body, err := common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "2K", "expected_ids": []int{pool.Id}, "channels": []gin.H{{"id": 11, "weight": 8}}})
+				require.NoError(t, err)
+				responses := make([]*httptest.ResponseRecorder, 2)
+				start := make(chan struct{})
+				var workers sync.WaitGroup
+				for index, handler := range []gin.HandlerFunc{SaveImageChannelPool, DeleteImageChannelPool} {
+					workers.Go(func() {
+						<-start
+						recorder := httptest.NewRecorder()
+						context, _ := gin.CreateTestContext(recorder)
+						context.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+						context.Params = gin.Params{{Key: "binding_key", Value: key}}
+						handler(context)
+						responses[index] = recorder
+					})
+				}
+				close(start)
+				workers.Wait()
+				require.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, []int{responses[0].Code, responses[1].Code}, "%s / %s", responses[0].Body.String(), responses[1].Body.String())
+				var rows []model.ImageChannelPool
+				require.NoError(t, db.Where("binding_key = ?", key).Find(&rows).Error)
+				if responses[0].Code == http.StatusOK {
+					require.Len(t, rows, 1)
+					assert.Equal(t, 11, rows[0].ChannelId)
+					assert.Equal(t, 8, rows[0].Priority)
+				} else {
+					assert.Empty(t, rows)
+				}
 			})
 
 			invalidBody, err := common.Marshal(gin.H{
@@ -724,6 +833,17 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Find(&pools).Error)
 			assert.Len(t, policies, 2, "denied, invalid and stale requests retain policies")
 			assert.Len(t, pools, 4, "denied and invalid requests retain every pool row")
+			var poolIDs []int
+			require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", saved.BindingKey).Order("id").Pluck("id", &poolIDs).Error)
+			poolBody := gin.H{"expected_ids": poolIDs}
+			assert.Equal(t, http.StatusPreconditionRequired, deleteRequest("/pool/"+saved.BindingKey, nil, common.RoleRootUser).Code)
+			for _, invalidIDs := range [][]int{{}, {-1}, {poolIDs[0], poolIDs[0]}} {
+				assert.Equal(t, http.StatusBadRequest, deleteRequest("/pool/"+saved.BindingKey, gin.H{"expected_ids": invalidIDs}, common.RoleRootUser).Code)
+			}
+			assert.Equal(t, http.StatusConflict, deleteRequest("/pool/"+saved.BindingKey, gin.H{"expected_ids": []int{poolIDs[0]}}, common.RoleRootUser).Code)
+			var unchangedIDs []int
+			require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", saved.BindingKey).Order("id").Pluck("id", &unchangedIDs).Error)
+			assert.Equal(t, poolIDs, unchangedIDs)
 
 			recorder := deleteRequest("/policy", policyBody, common.RoleRootUser)
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
@@ -738,7 +858,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			assert.Empty(t, models)
 			assert.Equal(t, http.StatusNotFound, deleteRequest("/policy", policyBody, common.RoleRootUser).Code)
 
-			recorder = deleteRequest("/pool/"+saved.BindingKey, nil, common.RoleRootUser)
+			recorder = deleteRequest("/pool/"+saved.BindingKey, poolBody, common.RoleRootUser)
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			require.NoError(t, db.Order("id").Find(&pools).Error)
 			require.Len(t, pools, 2, "all channel rows of the selected binding are removed")
@@ -748,12 +868,12 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, candidates, 2, "missing binding restores eligible group channels")
 			assert.ElementsMatch(t, []int{11, 14}, []int{candidates[0].Id, candidates[1].Id})
-			assert.Equal(t, http.StatusNotFound, deleteRequest("/pool/"+saved.BindingKey, nil, common.RoleRootUser).Code)
+			assert.Equal(t, http.StatusConflict, deleteRequest("/pool/"+saved.BindingKey, poolBody, common.RoleRootUser).Code)
 
 			candidates, err = service.ImageCandidateChannels(t.Context(), model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "hidden-model", "")
 			require.NoError(t, err)
 			assert.Empty(t, candidates, "an explicit empty binding remains closed until deleted")
-			recorder = deleteRequest("/pool/"+closedKey, nil, common.RoleRootUser)
+			recorder = deleteRequest("/pool/"+closedKey, gin.H{"expected_ids": []int{pools[0].Id}}, common.RoleRootUser)
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			candidates, err = service.ImageCandidateChannels(t.Context(), model.ImageGroupPolicy{Group: "default", Platform: "openai", PoolMode: "model"}, "hidden-model", "")
 			require.NoError(t, err)
@@ -762,6 +882,173 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Find(&pools).Error)
 			require.Len(t, pools, 1)
 			assert.Equal(t, otherKey, pools[0].BindingKey)
+		})
+	}
+}
+
+func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, kind := range []string{"image", "video"} {
+		t.Run(kind, func(t *testing.T) {
+			key := "image_runtime_config"
+			var defaults any = service.DefaultImageRuntimeConfig()
+			update, get := UpdateImageRuntime, GetImageConfiguration
+			if kind == "video" {
+				key, defaults, update, get = "media_runtime_config", service.DefaultMediaRuntimeConfig(), UpdateMediaConfiguration, GetMediaConfiguration
+			}
+			t.Cleanup(func() { assert.NoError(t, db.Where(map[string]any{"key": key}).Delete(&model.Option{}).Error) })
+			encoded, err := common.Marshal(defaults)
+			require.NoError(t, err)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(encoded, &body))
+			delete(body, "revision")
+			if kind == "video" {
+				delete(body, "reconciliation_timeout_minutes")
+				delete(body, "reconciliation_poll_interval_seconds")
+			}
+			request := func(handler gin.HandlerFunc, method string, value any) *httptest.ResponseRecorder {
+				data, err := common.Marshal(value)
+				require.NoError(t, err)
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(method, "/", bytes.NewReader(data))
+				handler(ctx)
+				return recorder
+			}
+			readRevision := func() int64 {
+				recorder := request(get, http.MethodGet, nil)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var response struct {
+					Data struct {
+						Revision                   *int64 `json:"revision"`
+						ReconciliationTimeout      int    `json:"reconciliation_timeout_minutes"`
+						ReconciliationPollInterval int    `json:"reconciliation_poll_interval_seconds"`
+						Runtime                    struct {
+							Revision *int64 `json:"revision"`
+						} `json:"runtime"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				revision := response.Data.Revision
+				if kind == "image" {
+					revision = response.Data.Runtime.Revision
+				} else {
+					assert.Equal(t, 1440, response.Data.ReconciliationTimeout)
+					assert.Equal(t, 60, response.Data.ReconciliationPollInterval)
+				}
+				require.NotNil(t, revision)
+				return *revision
+			}
+			for _, legacy := range []bool{false, true} {
+				t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+					require.NoError(t, db.Where(map[string]any{"key": key}).Delete(&model.Option{}).Error)
+					delete(body, "revision")
+					if legacy {
+						data, err := common.Marshal(body)
+						require.NoError(t, err)
+						require.NoError(t, db.Create(&model.Option{Key: key, Value: string(data)}).Error)
+					}
+					if db.Dialector.Name() == "mysql" {
+						accented := strings.Replace(key, "i", "í", 1)
+						recorder := request(UpdateOption, http.MethodPut, gin.H{"key": accented, "value": "{}"})
+						assert.Contains(t, recorder.Body.String(), `"success":false`, "collation-equivalent keys cannot bypass versioned settings")
+						var count int64
+						require.NoError(t, db.Model(&model.Option{}).Where(map[string]any{"key": key}).Count(&count).Error)
+						if legacy {
+							assert.EqualValues(t, 1, count)
+						} else {
+							assert.Zero(t, count, "rejected first creation must roll back its alias row")
+						}
+					}
+					assert.Zero(t, readRevision())
+					assert.Equal(t, http.StatusPreconditionRequired, request(update, http.MethodPut, body).Code)
+					body["revision"] = nil
+					assert.Equal(t, http.StatusPreconditionRequired, request(update, http.MethodPut, body).Code)
+					for _, invalid := range []any{-1, 0.5, 9007199254740992} {
+						body["revision"] = invalid
+						assert.Equal(t, http.StatusBadRequest, request(update, http.MethodPut, body).Code)
+					}
+					body["revision"] = 0
+					payload, err := common.Marshal(body)
+					require.NoError(t, err)
+					// Both transactions must own a connection before their first write.
+					// In particular, SQLite must not pass by using a single connection.
+					arrived := make(chan struct{}, 2)
+					release := make(chan struct{})
+					const callback = "test:concurrent-runtime-config-writers"
+					require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+						if option, ok := tx.Statement.Dest.(*model.Option); ok && option.Key == key {
+							arrived <- struct{}{}
+							<-release
+						}
+					}))
+					statuses := make(chan int, 2)
+					var writers sync.WaitGroup
+					for range 2 {
+						writers.Go(func() {
+							recorder := httptest.NewRecorder()
+							ctx, _ := gin.CreateTestContext(recorder)
+							ctx.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
+							update(ctx)
+							statuses <- recorder.Code
+						})
+					}
+					<-arrived
+					<-arrived
+					close(release)
+					writers.Wait()
+					require.NoError(t, db.Callback().Create().Remove(callback))
+					assert.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, []int{<-statuses, <-statuses})
+					assert.EqualValues(t, 1, readRevision())
+					assert.Equal(t, http.StatusConflict, request(update, http.MethodPut, body).Code)
+					body["revision"] = 1
+					recorder := request(update, http.MethodPut, body)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Revision int64 `json:"revision"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					assert.EqualValues(t, 2, response.Data.Revision, "identical content still advances its revision")
+					assert.EqualValues(t, 2, readRevision())
+					if kind == "image" {
+						require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), service.DefaultImageRuntimeConfig()))
+					} else {
+						require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), service.DefaultMediaRuntimeConfig()))
+					}
+					assert.EqualValues(t, 3, readRevision(), "trusted internal writers advance the stored version")
+					if kind == "video" {
+						body["revision"] = 3
+						for _, field := range []string{"reconciliation_timeout_minutes", "reconciliation_poll_interval_seconds"} {
+							body[field] = 0
+							assert.Equal(t, http.StatusBadRequest, request(update, http.MethodPut, body).Code, "explicit zero must not be replaced by the legacy default")
+							delete(body, field)
+						}
+						assert.EqualValues(t, 3, readRevision())
+					}
+					var before model.Option
+					require.NoError(t, db.Where(map[string]any{"key": key}).Take(&before).Error)
+					for _, genericKey := range []string{key, strings.ToUpper(key), key + " "} {
+						recorder = request(UpdateOption, http.MethodPut, gin.H{"key": genericKey, "value": "{}"})
+						assert.Contains(t, recorder.Body.String(), `"success":false`)
+						var after model.Option
+						require.NoError(t, db.Where(map[string]any{"key": key}).Take(&after).Error)
+						assert.Equal(t, before, after, "generic options cannot bypass revision checks")
+					}
+					body["revision"] = int64(9007199254740990)
+					payload, err = common.Marshal(body)
+					require.NoError(t, err)
+					require.NoError(t, db.Model(&model.Option{}).Where(map[string]any{"key": key}).Update("value", string(payload)).Error)
+					require.Equal(t, http.StatusOK, request(update, http.MethodPut, body).Code)
+					assert.EqualValues(t, 9007199254740991, readRevision())
+					body["revision"] = int64(9007199254740991)
+					assert.Equal(t, http.StatusBadRequest, request(update, http.MethodPut, body).Code)
+					body["revision"] = 0
+					assert.Equal(t, http.StatusConflict, request(update, http.MethodPut, body).Code, "stale versions still conflict at the revision ceiling")
+					assert.EqualValues(t, 9007199254740991, readRevision(), "revision must never overflow the JavaScript-safe boundary")
+				})
+			}
 		})
 	}
 }

@@ -80,7 +80,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
     Object.fromEntries(
       props.binding?.channels.map((row) => [
         row.channel_id,
-        Math.max(0, row.priority),
+        Math.max(0, row.weight ?? row.priority),
       ]) || []
     )
   )
@@ -188,7 +188,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         resolution: mode === 'model' ? '' : resolution,
         channels: channelIds.map((id) => ({
           id,
-          priority: weights[id] ?? 0,
+          weight: weights[id] ?? 0,
         })),
       })
     },

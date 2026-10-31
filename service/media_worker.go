@@ -241,14 +241,29 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			}
 		}
 	}()
-	if job.ExpiresAt <= time.Now().Unix() {
-		updates["status"], updates["storage_status"], updates["request_cipher"], updates["next_attempt_at"] = "expired", "expired", nil, 0
-		return nil
-	}
 	var task model.Task
 	err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
+	}
+	if job.ExpiresAt <= time.Now().Unix() {
+		if err == nil && task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation == nil && task.PrivateData.UpstreamTaskID != "" && task.Quota > 0 && task.Status != model.TaskStatusFailure && task.Status != model.TaskStatusSuccess && job.BillingStatus != "refunded" && job.BillingStatus != "not_billable" {
+			if err := reconcileAsyncVideoTask(ctx, &task, task.Snapshot(), "retention_expired", 0); err != nil {
+				return err
+			}
+			// The task transaction also changes the job projection. Keep this
+			// lease's current status so its deferred release cannot undo that write.
+			if err := model.DB.WithContext(ctx).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Take(&job).Error; err != nil {
+				return err
+			}
+			if err := model.DB.WithContext(ctx).First(&task, task.ID).Error; err != nil {
+				return err
+			}
+		}
+		if err != nil || !task.PrivateData.AsyncMedia || task.PrivateData.VideoReconciliation == nil || task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusSuccess {
+			updates["status"], updates["storage_status"], updates["request_cipher"], updates["next_attempt_at"] = "expired", "expired", nil, 0
+			return nil
+		}
 	}
 	if err == nil {
 		retentionJob := job
@@ -258,6 +273,10 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			retentionJob.Status = "failed"
 		}
 		updates["status"], updates["quota"], updates["request_cipher"] = "submitted", task.Quota, retainAsyncVideoRequestDetails(retentionJob)
+		if task.PrivateData.VideoReconciliation != nil && task.Status != model.TaskStatusFailure && task.Status != model.TaskStatusSuccess {
+			updates["status"] = "reconciling"
+			updates["request_cipher"] = job.RequestCipher
+		}
 		if job.BillingStatus != "failed" {
 			updates["billing_status"] = "reserved"
 			if task.Status == model.TaskStatusSuccess {
@@ -317,7 +336,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		updates["storage_status"], updates["status"], updates["error_message"], updates["next_attempt_at"] = "succeeded", "succeeded", "", 0
 		return nil
 	}
-	if job.Status == "submitted" || job.DispatchedAt > 0 || job.BillingStatus == "reserving" || job.BillingStatus == "reserved" {
+	if job.Status == "submitted" || job.Status == "reconciling" || job.DispatchedAt > 0 || job.BillingStatus == "reserving" || job.BillingStatus == "reserved" {
 		reason := "Upstream submission could not be confirmed; the video operation will not be repeated"
 		if detail := VideoTaskFailureNotice(job.ErrorMessage).Detail; detail != "" {
 			if strings.Contains(detail, reason) {

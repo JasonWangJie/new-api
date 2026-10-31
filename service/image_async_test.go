@@ -352,6 +352,7 @@ func TestAsyncImageTimeoutRuntimeConfigCompatibility(t *testing.T) {
 	disabled.MixedTimeoutRetryEnabled = false
 	disabled.TimeoutRetries = 0
 	require.NoError(t, SaveImageRuntimeConfig(t.Context(), disabled))
+	disabled.Revision++
 	loaded, err = GetImageRuntimeConfig(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, disabled, loaded, "an explicit zero must disable timeout account switching")
@@ -2086,6 +2087,7 @@ func TestAsyncImageWorkerTerminalFailuresPreserveReplayBoundaries(t *testing.T) 
 		{name: "consecutive poll errors do not prove a failed generation", failure: AsyncImageFailure{Code: 605, InternalCode: "upstream_failed"}, billStatus: "reserved", wantStatus: model.ImageTaskInvoking, wantBill: "reserved", pollFailures: 10},
 		{name: "poll deadline retains the accepted hold", failure: AsyncImageFailure{Code: 608, InternalCode: "execution_deadline"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "unrecoverable query rejection requires reconciliation", failure: AsyncImageFailure{Code: 610, HTTPStatus: http.StatusForbidden}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
+		{name: "unconfirmed reference diagnostic cannot schedule another submission", synchronous: true, failure: AsyncImageFailure{Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", Message: "Only a specific YouTube video URL is supported"}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
 		{name: "unknown execution retains its hold", failure: AsyncImageFailure{Code: 608, ExecutionUnknown: true}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "compatibility rejection cannot replace an accepted job", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}, billStatus: "reserved", wantStatus: model.ImageTaskExecutionUnknown, wantBill: "reserved"},
 		{name: "terminal accepted compatibility failure cannot resubmit", failure: AsyncImageFailure{Code: 603, InternalCode: "upstream_image_route_incompatible", HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTerminal: true}, billStatus: "reserved", wantStatus: model.ImageTaskFailed, wantBill: "refunded"},
@@ -3610,8 +3612,10 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 	transientA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 606}
 	rateLimitedB := ImageChannelAttempt{ChannelId: 20, KeyFingerprint: "account-b", Dispatched: true, FinishedAt: 1, Code: 605}
 	incompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}
-	referenceIncompatibleA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "Provider API error: Only a specific YouTube video URL is supported (request id: old-attempt)"}
-	referenceSizeA := referenceIncompatibleA
+	// Historical 610 diagnostics do not retain proof that the complete response
+	// rejected execution; reading them back must not authorize account failover.
+	unconfirmedReferenceA := ImageChannelAttempt{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: "Provider API error: Only a specific YouTube video URL is supported (request id: old-attempt)"}
+	referenceSizeA := unconfirmedReferenceA
 	referenceSizeA.Code, referenceSizeA.ErrorMessage = 603, "reference image exceeds limit: 20 MB limit exceeded"
 	for _, tc := range []struct {
 		name        string
@@ -3634,7 +3638,7 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		{name: "legacy size rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai", want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
 		{name: "accepted jobs cannot authorize size failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported", UpstreamTaskID: "accepted-job"}}, platform: "openai"},
 		{name: "unfinished rejection cannot exclude an account", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, HTTPStatus: http.StatusUnprocessableEntity, ProviderCode: "image_size_not_supported"}}, platform: "openai"},
-		{name: "historical reference rejection excludes its credential", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "historical unconfirmed reference diagnostic cannot exclude its credential", history: []ImageChannelAttempt{unconfirmedReferenceA}, platform: "gemini", maxSwitches: 1},
 		{name: "confirmed reference size rejection prefers another channel", history: []ImageChannelAttempt{referenceSizeA}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{Avoid: "account-a", AvoidChannel: 10, IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
 		{name: "reference size channel preference obeys switch budget", history: []ImageChannelAttempt{referenceSizeA}, platform: "gemini", want: ImageAccountRouting{Avoid: "account-a", AvoidChannel: 10, IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
 		{name: "legacy confirmed reference size rejection prefers another channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{AvoidChannel: 10, IncompatibleChannels: []int{10}}},
@@ -3642,15 +3646,19 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 		{name: "undispatched reference size rejection cannot prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
 		{name: "accepted reference size rejection cannot prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 603, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
 		{name: "unconfirmed reference size category cannot exclude accounts or prefer another channel", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a", Dispatched: true, FinishedAt: 1, Code: 604, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ErrorMessage: referenceSizeA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
-		{name: "Gemini zero switches stops reference failover", history: []ImageChannelAttempt{referenceIncompatibleA}, platform: "gemini", want: ImageAccountRouting{IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}, Stop: true}},
-		{name: "legacy reference rejection excludes its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1, want: ImageAccountRouting{IncompatibleChannels: []int{10}}},
-		{name: "accepted jobs cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
-		{name: "safety category cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 601, HTTPStatus: http.StatusBadRequest, ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
-		{name: "historical safety status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderStatus: "SAFETY", ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
-		{name: "historical authentication status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ProviderStatus: "UNAUTHENTICATED", ErrorMessage: referenceIncompatibleA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "Gemini zero switches does not upgrade an unconfirmed reference diagnostic", history: []ImageChannelAttempt{unconfirmedReferenceA}, platform: "gemini", want: ImageAccountRouting{Pin: "account-a"}},
+		{name: "legacy unconfirmed reference diagnostic cannot exclude its channel", history: []ImageChannelAttempt{{ChannelId: 10, Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ErrorMessage: unconfirmedReferenceA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "accepted jobs cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, HTTPStatus: http.StatusBadRequest, ErrorMessage: unconfirmedReferenceA.ErrorMessage, UpstreamTaskID: "accepted-job"}}, platform: "gemini", maxSwitches: 1},
+		{name: "safety category cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 601, HTTPStatus: http.StatusBadRequest, ErrorMessage: unconfirmedReferenceA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "historical safety status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderStatus: "SAFETY", ErrorMessage: unconfirmedReferenceA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
+		{name: "historical authentication status cannot authorize reference failover", history: []ImageChannelAttempt{{ChannelId: 10, KeyFingerprint: "account-a", Dispatched: true, FinishedAt: 1, Code: 610, HTTPStatus: http.StatusBadRequest, ProviderCode: "400", ProviderStatus: "UNAUTHENTICATED", ErrorMessage: unconfirmedReferenceA.ErrorMessage}}, platform: "gemini", maxSwitches: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, ImageAccountAttemptRouting(tc.history, 2, tc.platform, tc.maxSwitches))
+			encoded, err := common.Marshal(tc.history)
+			require.NoError(t, err)
+			var restored []ImageChannelAttempt
+			require.NoError(t, common.Unmarshal(encoded, &restored))
+			assert.Equal(t, tc.want, ImageAccountAttemptRouting(restored, 2, tc.platform, tc.maxSwitches))
 		})
 	}
 	accountChannel := model.Channel{Id: 10, Key: "key-a\nkey-b", ChannelInfo: model.ChannelInfo{IsMultiKey: true}}
@@ -4243,19 +4251,47 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			assert.False(t, failure.UpstreamTerminal, "an HTTP error alone does not prove a persisted upstream job is terminal")
 		})
 	}
-	receiptFailure := ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{
-		StatusCode: http.StatusBadRequest,
-		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"Only a specific YouTube video URL is supported"},"task_id":"accepted-job"}`)),
-	})
-	require.Equal(t, 610, receiptFailure.Code)
-	assert.Empty(t, imageAttemptCompatibilityCode(ImageChannelAttempt{
-		Dispatched:   true,
-		FinishedAt:   1,
-		Code:         receiptFailure.Code,
-		HTTPStatus:   receiptFailure.HTTPStatus,
-		ErrorMessage: receiptFailure.Message,
-		ProviderCode: receiptFailure.ProviderCode,
-	}))
+	// Persisted summaries omit the full response envelope and read outcome.
+	// The verified classification must survive serialization: matching text
+	// alone cannot upgrade an ambiguous response into permission to fail over.
+	for _, tc := range []struct {
+		name      string
+		receipt   bool
+		readError bool
+		truncated bool
+		code      int
+		want      ImageAccountRouting
+	}{
+		{name: "persisted verified rejection retains channel failover", code: 603, want: ImageAccountRouting{Avoid: "account-a", AvoidChannel: 10, IncompatibleAccounts: []string{"account-a"}, IncompatibleCredentials: []string{"credential-a"}}},
+		{name: "persisted accepted receipt cannot authorize channel failover", receipt: true, code: 610},
+		{name: "persisted interrupted response cannot authorize channel failover", readError: true, code: 610},
+		{name: "persisted truncated response cannot authorize channel failover", truncated: true, code: 610},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := `{"error":{"code":400,"message":"fileData requires a gateway file_id"}}`
+			if tc.receipt {
+				payload = `{"error":{"code":400,"message":"fileData requires a gateway file_id"},"task_id":"accepted-job"}`
+			}
+			var body io.Reader = strings.NewReader(payload)
+			if tc.readError {
+				body = io.MultiReader(body, iotest.ErrReader(errors.New("response interrupted")))
+			}
+			if tc.truncated {
+				body = io.MultiReader(body, strings.NewReader(strings.Repeat(" ", asyncImageProviderErrorBodyLimit+1)))
+			}
+			failure := ClassifyGeminiAsyncImageHTTPFailure(t.Context(), &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(body)})
+			require.Equal(t, tc.code, failure.Code)
+			encoded, err := common.Marshal([]ImageChannelAttempt{{
+				ChannelId: 10, KeyFingerprint: "account-a", CredentialFingerprint: "credential-a",
+				Dispatched: true, FinishedAt: 1, Code: failure.Code, HTTPStatus: failure.HTTPStatus,
+				ErrorMessage: failure.Message, ProviderCode: failure.ProviderCode, ProviderStatus: failure.ProviderStatus,
+			}})
+			require.NoError(t, err)
+			var restored []ImageChannelAttempt
+			require.NoError(t, common.Unmarshal(encoded, &restored))
+			assert.Equal(t, tc.want, ImageAccountAttemptRouting(restored, 2, "gemini", 1))
+		})
+	}
 	for _, tc := range []struct {
 		name         string
 		status       int

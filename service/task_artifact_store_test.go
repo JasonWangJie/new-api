@@ -318,7 +318,7 @@ func (a *scriptedPollingAdaptor) FetchTaskContext(ctx context.Context, base, key
 	return a.FetchTask(base, key, task, proxy)
 }
 
-func TestAsyncMediaPollingWithoutFrozenJobUsesMissingChannelFailure(t *testing.T) {
+func TestAsyncMediaPollingWithoutFrozenJobPreservesUnconfirmedTask(t *testing.T) {
 	setupMeasuredTaskBillingDB(t)
 	previousCache, previousFactory := common.MemoryCacheEnabled, GetTaskAdaptorFunc
 	common.MemoryCacheEnabled = false
@@ -330,10 +330,10 @@ func TestAsyncMediaPollingWithoutFrozenJobUsesMissingChannelFailure(t *testing.T
 	t.Cleanup(func() {
 		common.MemoryCacheEnabled, GetTaskAdaptorFunc = previousCache, previousFactory
 	})
-	require.NoError(t, model.DB.AutoMigrate(&model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Option{}))
 	seedUser(t, 1, 1000)
 	seedToken(t, 1, 1, "missing-channel-token", 1000)
-	task := &model.Task{TaskID: "public-missing-job", UserId: 1, ChannelId: 99999, Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: 1, UpstreamTaskID: "native-missing-job"}}
+	task := &model.Task{TaskID: "public-missing-job", UserId: 1, ChannelId: 99999, Quota: 400, Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: 1, UpstreamTaskID: "native-missing-job"}}
 	require.NoError(t, model.DB.Create(task).Error)
 	var pollErr error
 	require.NotPanics(t, func() {
@@ -342,9 +342,11 @@ func TestAsyncMediaPollingWithoutFrozenJobUsesMissingChannelFailure(t *testing.T
 	require.ErrorContains(t, pollErr, "CacheGetChannel failed")
 	assert.Zero(t, adaptorCalls, "missing local metadata must never start an upstream call")
 	require.NoError(t, model.DB.First(task, task.ID).Error)
-	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
-	assert.Contains(t, task.FailReason, "Failed to get channel info")
-	assert.Zero(t, task.Quota)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), task.Status)
+	require.NotNil(t, task.PrivateData.VideoReconciliation)
+	assert.Contains(t, task.PrivateData.VideoReconciliation.Reason, "channel_unavailable")
+	assert.Empty(t, task.FailReason)
+	assert.Equal(t, 400, task.Quota)
 	var owner model.User
 	var token model.Token
 	require.NoError(t, model.DB.First(&owner, 1).Error)

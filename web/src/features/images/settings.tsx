@@ -51,10 +51,14 @@ import { Textarea } from '@/components/ui/textarea'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
 import { SettingsSwitchField } from '@/features/system-settings/components/settings-form-layout'
 import { hasPermission } from '@/lib/admin-permissions'
-import { handleServerError } from '@/lib/handle-server-error'
+import {
+  handleServerError,
+  markServerErrorHandled,
+} from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
+import { ConfigurationConflict } from './components/configuration-conflict'
 import { ImageGroupSelect } from './components/image-group-select'
 import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
 import {
@@ -62,7 +66,9 @@ import {
   type ImagePoolBinding,
 } from './components/image-pool-editor'
 import { ImageRoutingPreview } from './components/image-routing-preview'
+import { ImageRuntimeStatus } from './components/image-runtime-status'
 import { ImageSelect } from './components/image-select'
+import { isConfigurationConflict } from './lib/configuration-conflict'
 import {
   imageLabel,
   imagePlatformLabel,
@@ -146,6 +152,11 @@ type RuntimeFieldReference = {
 }
 
 const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
+  {
+    key: 'revision',
+    description:
+      'Saved configuration version used to prevent conflicting changes.',
+  },
   {
     key: 'failed_request_retention_hours',
     description:
@@ -418,6 +429,7 @@ export function ImageSettings() {
   const user = useAuthStore((state) => state.auth.user)
   const allowed = hasPermission(user, 'image_config', 'read')
   const configuration = useQuery({
+    refetchOnWindowFocus: false,
     queryKey: ['image-configuration', user?.id],
     queryFn: ({ signal }) =>
       imageRequest<ImageConfiguration>(
@@ -460,11 +472,14 @@ export function ImageSettings() {
         </TabsList>
       </Tabs>
       {tab === 'runtime' && (
-        <ImageRuntimeForm
-          key={JSON.stringify(config.runtime)}
-          initial={config.runtime}
-          onSuccess={() => configuration.refetch()}
-        />
+        <div className='space-y-4'>
+          <ImageRuntimeStatus />
+          <ImageRuntimeForm
+            key={JSON.stringify(config.runtime)}
+            initial={config.runtime}
+            onSuccess={() => configuration.refetch()}
+          />
+        </div>
       )}{' '}
       {tab === 'storage' && (
         <ImageStorageForm
@@ -509,6 +524,7 @@ export function ImageRuntimeForm({
   }))
   const [advanced, setAdvanced] = useState('')
   const [busy, setBusy] = useState(false)
+  const [saveError, setSaveError] = useState<unknown>(null)
   const advancedValues = useMemo(() => {
     if (!advanced) return values
     try {
@@ -527,13 +543,22 @@ export function ImageRuntimeForm({
       const cfg = advanced
         ? (JSON.parse(advanced) as ImageConfiguration['runtime'])
         : values
-      await imageRequest('/api/option/images/runtime', 'PUT', cfg)
+      const saved = await imageRequest<ImageConfiguration['runtime']>(
+        '/api/option/images/runtime',
+        'PUT',
+        { ...cfg, revision: values.revision }
+      )
+      if (saved) {
+        setValues(saved)
+        setAdvanced('')
+      }
+      setSaveError(null)
       await onSuccess()
       toast.success(t('Saved'))
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
+      setSaveError(error)
+      if (isConfigurationConflict(error)) markServerErrorHandled(error)
+      else handleServerError(error, t('Image request failed'))
     } finally {
       setBusy(false)
     }
@@ -707,6 +732,16 @@ export function ImageRuntimeForm({
             </Accordion>
           </div>
         )}
+        <ConfigurationConflict
+          error={saveError}
+          onReload={async () => {
+            const latest =
+              await imageRequest<ImageConfiguration>('/api/option/images')
+            setValues(latest.runtime)
+            setAdvanced('')
+            setSaveError(null)
+          }}
+        />
         <div>
           <Button type='submit' disabled={busy}>
             {t('Save')}
@@ -1086,8 +1121,10 @@ function ImagePolicyForm({
             </Label>
           </div>
         </div>
-        <p className='text-sm text-muted-foreground'>
-          {t('This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.')}
+        <p className='text-muted-foreground text-sm'>
+          {t(
+            'This allows background task submissions. Synchronous image APIs still use compatible channels in this policy and pool; this switch does not enable synchronous support for an asynchronous-only upstream.'
+          )}
         </p>
         <div className='flex flex-wrap items-center justify-between gap-2'>
           <Label htmlFor='image-model-catalog'>{t('Model capabilities')}</Label>
@@ -1115,8 +1152,7 @@ function ImagePolicyForm({
             {
               id: 'mode',
               header: t('Background task APIs'),
-              cell: (item) =>
-                t(item.async_enabled ? 'Enabled' : 'Disabled'),
+              cell: (item) => t(item.async_enabled ? 'Enabled' : 'Disabled'),
             },
             {
               id: 'edit',
@@ -1197,16 +1233,15 @@ export function ImagePoolForm({
   const user = useAuthStore((state) => state.auth.user)
   const canManage = hasPermission(user, 'image_config', 'manage')
   const queryClient = useQueryClient()
-  const [deleting, setDeleting] = useState<
-    ImageConfiguration['pools'][number] | null
-  >(null)
+  const [deleting, setDeleting] = useState<ImagePoolBinding | null>(null)
   const [editing, setEditing] = useState<ImagePoolBinding | null>()
   const [expanded, setExpanded] = useState<string[]>([])
   const deletion = useMutation({
-    mutationFn: (binding: ImageConfiguration['pools'][number]) =>
+    mutationFn: (binding: ImagePoolBinding) =>
       imageRequest(
         `/api/option/images/pool/${encodeURIComponent(binding.binding_key)}`,
-        'DELETE'
+        'DELETE',
+        { expected_ids: binding.rowIds }
       ),
     onSuccess: async () => {
       setDeleting(null)
@@ -1298,7 +1333,10 @@ export function ImagePoolForm({
       header: t('Channel'),
       cell: (binding) =>
         binding.channels
-          .map((row) => `${row.channel_id} (${Math.max(0, row.priority)})`)
+          .map(
+            (row) =>
+              `${row.channel_id} (${Math.max(0, row.weight ?? row.priority)})`
+          )
           .join(', ') || t('Disabled'),
     },
     {

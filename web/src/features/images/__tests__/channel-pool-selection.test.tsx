@@ -70,6 +70,7 @@ function renderPool(
     resolution: string
     channel_id: number
     priority: number
+    weight?: number
   }> = []
 ) {
   useAuthStore.getState().auth.setUser({
@@ -375,7 +376,8 @@ test('deleting a resolution binding in a shared partition targets its binding ke
   await waitFor(() =>
     expect(imageRequest).toHaveBeenCalledWith(
       '/api/option/images/pool/image-beta-2k',
-      'DELETE'
+      'DELETE',
+      { expected_ids: [22] }
     )
   )
   expect(imageRequest).not.toHaveBeenCalledWith(
@@ -438,9 +440,19 @@ test('switching platform replaces the selectable models and channels', async () 
   ).toBeVisible()
 })
 
-test.each([7, -3])(
-  'editing a pool restores its channels and normalizes saved weight %s before saving',
-  async (savedWeight) => {
+test.each([
+  { name: 'weight', priority: 7, weight: 17, expected: 17 },
+  { name: 'explicit zero weight', priority: 7, weight: 0, expected: 0 },
+  { name: 'legacy priority', priority: 7, weight: undefined, expected: 7 },
+  {
+    name: 'legacy negative priority',
+    priority: -3,
+    weight: undefined,
+    expected: 0,
+  },
+])(
+  'editing a pool restores $name and saves the explicit weight field',
+  async (saved) => {
     vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
       if (method === 'GET' && url.includes('platform=openai')) {
         return openAIOptions
@@ -464,7 +476,8 @@ test.each([7, -3])(
         model: 'image-beta',
         resolution: '',
         channel_id: 22,
-        priority: savedWeight,
+        priority: saved.priority,
+        weight: saved.weight,
       },
     ])
 
@@ -484,7 +497,7 @@ test.each([7, -3])(
     ).toHaveTextContent('gemini')
     expect(screen.getByText('#22 · Gemini account')).toBeVisible()
     const weight = screen.getByRole('spinbutton', { name: 'Weight 22' })
-    expect(weight).toHaveValue(Math.max(0, savedWeight))
+    expect(weight).toHaveValue(saved.expected)
     expect(weight).toHaveAttribute('min', '0')
     expect(weight).toHaveAccessibleDescription(
       'Pool weights share traffic proportionally. All zero means equal traffic; otherwise, zero-weight channels are excluded.'
@@ -505,7 +518,7 @@ test.each([7, -3])(
           mode: 'model',
           model: 'image-beta',
           resolution: '',
-          channels: [{ id: 22, priority: 9 }],
+          channels: [{ id: 22, weight: 9 }],
         }
       )
     )
@@ -681,7 +694,7 @@ test('copying a binding into another group replaces choices and preserves the so
         mode: 'model',
         model: 'image-alpha',
         resolution: '',
-        channels: [{ id: 11, priority: 0 }],
+        channels: [{ id: 11, weight: 0 }],
       }
     )
   )
@@ -707,7 +720,7 @@ test('reopening a closed binding submits the original placeholder row ID for con
       'PUT',
       expect.objectContaining({
         expected_ids: [50],
-        channels: [{ id: 22, priority: 0 }],
+        channels: [{ id: 22, weight: 0 }],
       })
     )
   )
@@ -745,7 +758,7 @@ test('copying a pool to mixed scheduling preserves channels and weights without 
         mode: 'model',
         model: 'image-beta',
         resolution: '',
-        channels: [{ id: 22, priority: 7 }],
+        channels: [{ id: 22, weight: 7 }],
       }
     )
   )

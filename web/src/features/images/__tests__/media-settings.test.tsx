@@ -30,6 +30,7 @@ vi.mock('../api', () => ({ imageRequest: vi.fn() }))
 
 const clients: QueryClient[] = []
 const mediaSettings = {
+  revision: 0,
   video_async_enabled: false,
   local_path: 'data/media',
   retention_days: 90,
@@ -40,8 +41,57 @@ const mediaSettings = {
   submit_concurrency: 2,
   status_concurrency: 8,
   submit_timeout_seconds: 120,
+  poll_timeout_seconds: 30,
+  reconciliation_timeout_minutes: 1440,
+  reconciliation_poll_interval_seconds: 60,
   storage_retry_attempts: 5,
 }
+
+test('preserves the video draft on a version conflict until saved settings are reloaded', async () => {
+  const conflict = Object.assign(new Error('stale configuration'), {
+    isAxiosError: true,
+    response: { status: 409 },
+  })
+  vi.mocked(imageRequest)
+    .mockResolvedValueOnce(mediaSettings)
+    .mockRejectedValueOnce(conflict)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <MediaSettingsCard />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  const timeout = await screen.findByRole('spinbutton', {
+    name: 'Video upstream polling timeout (seconds)',
+  })
+  await user.clear(timeout)
+  await user.type(timeout, '45')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Your edits have been kept.'
+  )
+  expect(timeout).toHaveValue(45)
+  vi.mocked(imageRequest).mockResolvedValueOnce({
+    ...mediaSettings,
+    revision: 4,
+    poll_timeout_seconds: 60,
+  })
+  await user.click(
+    screen.getByRole('button', { name: 'Reload saved settings' })
+  )
+  await waitFor(() =>
+    expect(
+      screen.getByRole('spinbutton', {
+        name: 'Video upstream polling timeout (seconds)',
+      })
+    ).toHaveValue(60)
+  )
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
 
 afterEach(() => {
   for (const client of clients) client.clear()
@@ -71,17 +121,32 @@ test('shows success feedback after media settings are saved', async () => {
     name: 'Video submit concurrency',
   })
   const statusConcurrency = screen.getByRole('spinbutton', {
-    name: 'Video status concurrency',
+    name: 'Video local status sync concurrency',
   })
   const submitTimeout = screen.getByRole('spinbutton', {
     name: 'Video submit timeout (seconds)',
   })
+  const pollTimeout = screen.getByRole('spinbutton', {
+    name: 'Video upstream polling timeout (seconds)',
+  })
+  expect(pollTimeout).toHaveValue(30)
+  expect(pollTimeout).toHaveAttribute('min', '1')
+  expect(pollTimeout).toHaveAttribute('max', '300')
   await user.clear(submitConcurrency)
   await user.type(submitConcurrency, '3')
   await user.clear(statusConcurrency)
   await user.type(statusConcurrency, '9')
   await user.clear(submitTimeout)
   await user.type(submitTimeout, '140')
+  await user.clear(pollTimeout)
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  expect(pollTimeout).toBeInvalid()
+  expect(imageRequest).not.toHaveBeenCalledWith(
+    '/api/option/images/media',
+    'PUT',
+    expect.anything()
+  )
+  await user.type(pollTimeout, '45')
   await user.click(screen.getByRole('button', { name: 'Save' }))
 
   await waitFor(() =>
@@ -94,11 +159,36 @@ test('shows success feedback after media settings are saved', async () => {
         submit_concurrency: 3,
         status_concurrency: 9,
         submit_timeout_seconds: 140,
+        poll_timeout_seconds: 45,
       }
     )
   )
   expect(success).toHaveBeenCalledWith('Saved')
   expect(onSuccess).toHaveBeenCalledOnce()
+})
+
+test('uses a 30 second polling timeout when older settings omit it', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({
+    ...mediaSettings,
+    poll_timeout_seconds: undefined,
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <MediaSettingsCard />
+    </QueryClientProvider>
+  )
+  expect(
+    await screen.findByRole('spinbutton', {
+      name: 'Video upstream polling timeout (seconds)',
+    })
+  ).toHaveValue(30)
+  expect(
+    screen.getByRole('spinbutton', { name: 'Video download timeout (seconds)' })
+  ).toHaveValue(900)
 })
 
 test('shows readiness and imports copy-ready xAI and Seedance video policies', async () => {

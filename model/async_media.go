@@ -78,12 +78,12 @@ func GetDueAsyncMediaJobs(ctx context.Context, now int64, limit int) ([]AsyncMed
 // its own queue, so a blocked download cannot hide later submissions.
 func GetDueAsyncMediaJobsForPhase(ctx context.Context, now int64, limit int, phase string) ([]AsyncMediaJob, error) {
 	var jobs []AsyncMediaJob
-	query := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted"}, now, now)
+	query := DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"queued", "submitting", "submitted", "reconciling"}, now, now)
 	switch phase {
 	case "submit":
 		query = query.Where("status IN ? AND COALESCE(reference_recovery_stage, '') <> ?", []string{"queued", "submitting"}, "prepare")
 	case "status":
-		query = query.Where("status = ? AND storage_status NOT IN ?", "submitted", []string{"ready", "saving", "failed"})
+		query = query.Where("status = ? OR (status = ? AND storage_status NOT IN ?)", "reconciling", "submitted", []string{"ready", "saving", "failed"})
 	case "download":
 		query = query.Where("((status = ? AND reference_recovery_stage = ?) OR (status = ? AND storage_status IN ?))", "queued", "prepare", "submitted", []string{"ready", "saving", "failed"})
 	case "":
@@ -133,7 +133,7 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 
 func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int) (bool, error) {
 	now := time.Now().Unix()
-	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted"}).
+	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted", "reconciling"}).
 		Where("status = ? AND storage_status = ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", job.Status, job.StorageStatus, job.AttemptGeneration, job.ReferenceRecoveryStage).
 		Updates(map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds)})
 	if result.Error != nil || result.RowsAffected == 0 {
@@ -145,6 +145,11 @@ func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, s
 
 func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any) error {
 	query := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration)
+	if job.Status != "reconciling" {
+		// A status/submit worker that read before reconciliation began must not
+		// erase its projection or expire the retained credential envelope.
+		query = query.Where("status <> ?", "reconciling")
+	}
 	return ChangeAsyncMediaJob(query, updates, "")
 }
 

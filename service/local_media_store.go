@@ -244,19 +244,32 @@ func VerifyMediaObjectAccess(object model.MediaArtifactObject, expires, access s
 func CleanupMediaObjects(ctx context.Context) error {
 	var jobs []model.AsyncMediaJob
 	now := time.Now().Unix()
-	if err := model.DB.WithContext(ctx).
+	pendingTasks := model.DB.Model(&model.Task{}).Select("1").
+		Where("task_id = media_cleanup.task_id AND user_id = media_cleanup.user_id AND attempt_generation = media_cleanup.attempt_generation").
+		Where("status NOT IN ?", []string{model.TaskStatusSuccess, model.TaskStatusFailure})
+	reservedTasks := pendingTasks.Session(&gorm.Session{}).Where("quota > ?", 0)
+	if err := model.DB.WithContext(ctx).Table(model.DB.NamingStrategy.TableName("AsyncMediaJob")+" AS media_cleanup").
 		Where("expires_at <= ? AND lease_expires_at <= ? AND (status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, "expired").
 		Where("COALESCE(reference_recovery_stage, '') <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL", "refund").
+		Where("reference_recovery_stage = ? OR billing_status IN ? OR ((status <> ? OR NOT EXISTS (?)) AND (status <> ? OR NOT EXISTS (?)))", "refund", []string{"refunded", "not_billable"}, "reconciling", pendingTasks, "submitted", reservedTasks).
 		Limit(100).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for _, job := range jobs {
+		// Expire private payloads without removing a pending refund from its
+		// queue. Financial completion does not require a live replay envelope.
+		if err := model.ExpireAsyncMediaJob(ctx, job, now); err != nil {
+			if errors.Is(err, model.ErrImageConflict) {
+				continue
+			}
+			return err
+		}
 		if err := RemoveAsyncMediaOutput(job); err != nil {
 			return err
 		}
-		// Expire private payloads without removing a pending refund from its
-		// queue. Financial completion does not require a live replay envelope.
-		if err := model.ExpireAsyncMediaJob(ctx, job, now); err != nil && !errors.Is(err, model.ErrImageConflict) {
+		if err := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+			Where("id = ? AND attempt_generation = ? AND storage_status = ? AND output_object_key = ?", job.ID, job.AttemptGeneration, "expired", job.OutputObjectKey).
+			Updates(map[string]any{"output_root_path": "", "output_object_key": ""}).Error; err != nil {
 			return err
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -951,6 +952,7 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 }
 
 type scriptedPollingAdaptor struct {
+	fetchCalls int
 	statusCode int
 	body       []byte
 	fetchErr   error
@@ -960,6 +962,7 @@ type scriptedPollingAdaptor struct {
 
 func (a *scriptedPollingAdaptor) Init(*relaycommon.RelayInfo) {}
 func (a *scriptedPollingAdaptor) FetchTask(string, string, *model.Task, string) (*http.Response, error) {
+	a.fetchCalls++
 	if a.fetchErr != nil {
 		return nil, a.fetchErr
 	}
@@ -1005,11 +1008,168 @@ func (a *scriptedBatchPollingAdaptor) FetchMode() string { return "batch" }
 func (a *scriptedBatchPollingAdaptor) FetchBatchTasks(string, string, []*model.Task, string) (*http.Response, error) {
 	return a.FetchTask("", "", nil, "")
 }
+func (a *scriptedBatchPollingAdaptor) FetchBatchTasksContext(ctx context.Context, base, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return a.FetchBatchTasks(base, key, tasks, proxy)
+}
 func (a *scriptedBatchPollingAdaptor) ParseBatchResult([]*model.Task, *http.Response, []byte) (map[string]*BatchTaskResult, error) {
 	if a.parseErr != nil {
 		return nil, a.parseErr
 	}
 	return a.results, nil
+}
+
+func TestMediaPollingTimeoutConfiguration(t *testing.T) {
+	setupTaskPollingDatabase(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}))
+	t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(&model.Option{})) })
+	legacy := `{"local_path":"data/media","retention_days":90,"signed_url_expiry_seconds":3600,"max_file_bytes":1073741824,"download_timeout_seconds":900,"download_concurrency":2,"storage_retry_attempts":5}`
+	option := model.Option{Key: "media_runtime_config", Value: legacy}
+	require.NoError(t, model.DB.Create(&option).Error)
+	cfg, err := GetMediaRuntimeConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 30, cfg.PollTimeout, "pre-upgrade settings use the independent polling default")
+	assert.Equal(t, 1440, cfg.ReconciliationTimeout)
+	assert.Equal(t, 60, cfg.ReconciliationPollInterval)
+	assert.Equal(t, 900, cfg.DownloadTimeout)
+	for _, timeout := range []int{0, -1, 301, 1, 300} {
+		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
+			cfg.PollTimeout = timeout
+			err := SaveMediaRuntimeConfig(t.Context(), cfg)
+			if timeout < 1 || timeout > 300 {
+				require.Error(t, err)
+				// Explicit invalid persisted values must not silently use a default.
+				encoded, marshalErr := common.Marshal(cfg)
+				require.NoError(t, marshalErr)
+				require.NoError(t, model.DB.Model(&model.Option{}).Where(map[string]any{"key": option.Key}).Update("value", string(encoded)).Error)
+				_, err = GetMediaRuntimeConfig(t.Context())
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			loaded, err := GetMediaRuntimeConfig(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, timeout, loaded.PollTimeout)
+			assert.Equal(t, 900, loaded.DownloadTimeout)
+		})
+	}
+	for _, tc := range []struct {
+		name             string
+		window, interval int
+		valid            bool
+	}{
+		{name: "zero window", window: 0, interval: 60},
+		{name: "oversized window", window: 10081, interval: 60},
+		{name: "zero interval", window: 1440, interval: 0},
+		{name: "short interval", window: 1440, interval: 4},
+		{name: "oversized interval", window: 1440, interval: 3601},
+		{name: "minimum reconciliation limits", window: 1, interval: 5, valid: true},
+		{name: "maximum reconciliation limits", window: 10080, interval: 3600, valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := DefaultMediaRuntimeConfig()
+			candidate.ReconciliationTimeout, candidate.ReconciliationPollInterval = tc.window, tc.interval
+			err := SaveMediaRuntimeConfig(t.Context(), candidate)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				encoded, err := common.Marshal(candidate)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&model.Option{}).Where(map[string]any{"key": option.Key}).Update("value", string(encoded)).Error)
+			}
+			loaded, err := GetMediaRuntimeConfig(t.Context())
+			if tc.valid {
+				require.NoError(t, err)
+				assert.Equal(t, tc.window, loaded.ReconciliationTimeout)
+				assert.Equal(t, tc.interval, loaded.ReconciliationPollInterval)
+			} else {
+				require.Error(t, err, "explicit invalid fields never use legacy defaults")
+			}
+		})
+	}
+}
+
+type boundedVideoPollingAdaptor struct {
+	scriptedBatchPollingAdaptor
+	fetch func(context.Context) (*http.Response, error)
+}
+
+func (a *boundedVideoPollingAdaptor) FetchTaskContext(ctx context.Context, _, _ string, _ *model.Task, _ string) (*http.Response, error) {
+	return a.fetch(ctx)
+}
+
+func (a *boundedVideoPollingAdaptor) FetchBatchTasksContext(ctx context.Context, _, _ string, _ []*model.Task, _ string) (*http.Response, error) {
+	return a.fetch(ctx)
+}
+
+type stalledVideoPollBody struct{ ctx context.Context }
+
+func (body stalledVideoPollBody) Read([]byte) (int, error) {
+	<-body.ctx.Done()
+	return 0, body.ctx.Err()
+}
+
+func (stalledVideoPollBody) Close() error { return nil }
+
+func TestAsyncVideoPollTimeoutIncludesResponseBodyAndPreservesDownloadBudget(t *testing.T) {
+	for _, mode := range []string{"plugin", "override", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// Driver watchers must share the bubble with request contexts;
+				// opening a MySQL connection outside it crosses synctest channels.
+				setupTaskPollingDatabase(t)
+				entities := []any{&model.Option{}, &model.AsyncMediaJob{}}
+				require.NoError(t, model.DB.AutoMigrate(entities...))
+				t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(entities...)) })
+				cfg := DefaultMediaRuntimeConfig()
+				cfg.PollTimeout, cfg.DownloadTimeout = 45, 900
+				require.NoError(t, SaveMediaRuntimeConfig(t.Context(), cfg))
+				seedTaskPollingChannel(t, 1, true)
+				channel, err := model.GetChannelById(1, true)
+				require.NoError(t, err)
+				task := seedPollingTask(t, 1, "poll-timeout", "upstream-timeout")
+				task.PrivateData.AsyncMedia = true
+				if mode == "override" {
+					task.PrivateData.UpstreamAsync = upstreamAsyncTestProfile(t, "video")
+				}
+				require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+				previousClient, previousFailureLimit := httpClient, constant.TaskPollMaxFailures
+				constant.TaskPollMaxFailures = 20
+				t.Cleanup(func() { httpClient, constant.TaskPollMaxFailures = previousClient, previousFailureLimit })
+				// The upstream transport is fake; database connections remain real.
+				// Time advances when the response body blocks, without real sleeps.
+				started := time.Now()
+				parent, cancel := context.WithTimeout(t.Context(), time.Duration(cfg.DownloadTimeout)*time.Second)
+				defer cancel()
+				var requestContext context.Context
+				adaptor := &boundedVideoPollingAdaptor{fetch: func(ctx context.Context) (*http.Response, error) {
+					requestContext = ctx
+					deadline, ok := ctx.Deadline()
+					require.True(t, ok)
+					assert.Equal(t, started.Add(45*time.Second), deadline)
+					return &http.Response{StatusCode: http.StatusOK, Body: stalledVideoPollBody{ctx: ctx}}, nil
+				}}
+				httpClient = &http.Client{Transport: mediaInputRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return adaptor.fetch(request.Context())
+				})}
+				if mode == "batch" {
+					require.NoError(t, updateBatchTaskGroup(parent, adaptor, channel, channel.Key, []*model.Task{task}))
+				} else {
+					require.NoError(t, updateVideoSingleTask(parent, adaptor, channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+				}
+				require.NotNil(t, requestContext)
+				assert.ErrorIs(t, requestContext.Err(), context.DeadlineExceeded)
+				assert.NoError(t, parent.Err(), "poll expiry must leave the download budget available")
+				var stored model.Task
+				require.NoError(t, model.DB.First(&stored, task.ID).Error)
+				assert.EqualValues(t, model.TaskStatusInProgress, stored.Status)
+				assert.Equal(t, 1, stored.PrivateData.PollFailures)
+			})
+		})
+	}
 }
 
 func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
@@ -1041,12 +1201,11 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			wantConfirmed: true,
 		},
 		{
-			name:          "404 fails immediately and refunds",
+			name:          "404 preserves reservation for reconciliation",
 			statusCode:    http.StatusNotFound,
-			wantStatus:    model.TaskStatusFailure,
-			wantRefund:    true,
-			wantReason:    "upstream task not found (HTTP 404)",
-			wantUnchanged: false,
+			wantStatus:    model.TaskStatusInProgress,
+			wantFailures:  1,
+			wantUnchanged: true,
 		},
 		{
 			name:          "401 increments without changing status",
@@ -1056,14 +1215,13 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			wantUnchanged: true,
 		},
 		{
-			name:          "429 reaches threshold and refunds",
+			name:          "429 threshold retains reservation",
 			statusCode:    http.StatusTooManyRequests,
 			priorFailures: 2,
 			maxFailures:   3,
-			wantStatus:    model.TaskStatusFailure,
+			wantStatus:    model.TaskStatusInProgress,
 			wantFailures:  3,
-			wantRefund:    true,
-			wantReason:    "poll failed: transient (HTTP 429)",
+			wantUnchanged: true,
 		},
 		{
 			name:          "UNKNOWN increments",
@@ -1241,6 +1399,409 @@ func TestUpdateBatchTasksPollClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func setupVideoReconciliationTask(t *testing.T) (*model.Task, *model.Channel) {
+	t.Helper()
+	setupMeasuredTaskBillingDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}))
+	require.NoError(t, model.DB.Where(map[string]any{"key": "media_runtime_config"}).Delete(&model.Option{}).Error)
+	t.Cleanup(func() {
+		assert.NoError(t, model.DB.Where(map[string]any{"key": "media_runtime_config"}).Delete(&model.Option{}).Error)
+	})
+	const userID, tokenID, channelID = 683, 683, 683
+	seedUser(t, userID, 10000)
+	seedToken(t, tokenID, userID, "reconcile-token", 7000)
+	seedTaskPollingChannel(t, channelID, true)
+	channel, err := model.GetChannelById(channelID, true)
+	require.NoError(t, err)
+	task := makeTask(userID, channelID, 4000, tokenID, BillingSourceWallet, 0)
+	task.TaskID, task.SubmitTime = "task_reconciliation", time.Now().Unix()
+	task.PrivateData.AsyncMedia, task.PrivateData.UpstreamTaskID, task.PrivateData.Key = true, "native-reconciliation", channel.Key
+	require.NoError(t, model.DB.Create(task).Error)
+	return task, channel
+}
+
+func TestAsyncVideoReconciliationPreservesReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		fetchErr   error
+		status     string
+		batch      bool
+	}{
+		{name: "transport", fetchErr: io.ErrUnexpectedEOF},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests},
+		{name: "server failure", statusCode: http.StatusServiceUnavailable},
+		{name: "unknown", status: model.TaskStatusUnknown},
+		{name: "not found", statusCode: http.StatusNotFound},
+		{name: "gone", statusCode: http.StatusGone},
+		{name: "non-success HTTP cannot confirm failure", statusCode: http.StatusBadRequest, status: model.TaskStatusFailure},
+		{name: "batch not found", statusCode: http.StatusNotFound, batch: true},
+		{name: "batch unknown", status: model.TaskStatusUnknown, batch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task, channel := setupVideoReconciliationTask(t)
+			previous := constant.TaskPollMaxFailures
+			constant.TaskPollMaxFailures = 1
+			t.Cleanup(func() { constant.TaskPollMaxFailures = previous })
+			adaptor := &scriptedBatchPollingAdaptor{
+				scriptedPollingAdaptor: scriptedPollingAdaptor{statusCode: tc.statusCode, fetchErr: tc.fetchErr, parse: &relaycommon.TaskInfo{Status: tc.status}},
+				results:                map[string]*BatchTaskResult{task.GetUpstreamTaskID(): {TaskInfo: relaycommon.TaskInfo{Status: tc.status}}},
+			}
+			poll := func(current *model.Task) error {
+				if tc.batch {
+					return updateBatchTaskGroup(t.Context(), adaptor, channel, channel.Key, []*model.Task{current})
+				}
+				return updateVideoSingleTask(t.Context(), adaptor, channel, current.TaskID, map[string]*model.Task{current.TaskID: current})
+			}
+			require.NoError(t, poll(task))
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			require.NotNil(t, stored.PrivateData.VideoReconciliation)
+			assert.False(t, stored.PrivateData.VideoReconciliation.ManualRequired)
+			assert.Equal(t, int64(86400), stored.PrivateData.VideoReconciliation.DeadlineAt-stored.PrivateData.VideoReconciliation.StartedAt)
+			assert.Equal(t, 1, stored.PrivateData.PollFailures)
+			assert.EqualValues(t, model.TaskStatusInProgress, stored.Status)
+			assert.Zero(t, stored.FinishTime)
+			assert.Equal(t, 4000, stored.Quota)
+			assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+			assert.Equal(t, 7000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+			assert.Zero(t, countLogs(t))
+			// A fresh database read models restart: it must honor the persisted
+			// next query time rather than immediately spend another poll attempt.
+			require.NoError(t, poll(&stored))
+			assert.Equal(t, 1, adaptor.fetchCalls)
+		})
+	}
+}
+
+func TestAsyncVideoReconciliationResumeAndSettlement(t *testing.T) {
+	for _, terminal := range []string{model.TaskStatusSuccess, model.TaskStatusFailure} {
+		for _, batch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/batch=%v", terminal, batch), func(t *testing.T) {
+				task, channel := setupVideoReconciliationTask(t)
+				task.Platform = "drama"
+				require.NoError(t, task.Update())
+				adaptor := &scriptedBatchPollingAdaptor{scriptedPollingAdaptor: scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusUnknown}}, results: map[string]*BatchTaskResult{task.GetUpstreamTaskID(): {TaskInfo: relaycommon.TaskInfo{Status: model.TaskStatusUnknown}}}}
+				poll := func(current *model.Task) error {
+					if batch {
+						return updateBatchTaskGroup(t.Context(), adaptor, channel, channel.Key, []*model.Task{current})
+					}
+					return updateVideoSingleTask(t.Context(), adaptor, channel, current.TaskID, map[string]*model.Task{current.TaskID: current})
+				}
+				require.NoError(t, poll(task))
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				deadline := task.PrivateData.VideoReconciliation.DeadlineAt
+				task.PrivateData.VideoReconciliation.NextPollAt = 0
+				require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+				adaptor.parse = &relaycommon.TaskInfo{Status: model.TaskStatusInProgress, Reason: "still generating"}
+				adaptor.results[task.GetUpstreamTaskID()].TaskInfo = *adaptor.parse
+				require.NoError(t, poll(task))
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				assert.Equal(t, deadline, task.PrivateData.VideoReconciliation.DeadlineAt, "pending does not renew the window")
+				assert.EqualValues(t, model.TaskStatusInProgress, task.Status, "nonterminal reason text is not authoritative failure")
+				assert.Zero(t, task.PrivateData.PollFailures)
+				task.PrivateData.VideoReconciliation.DeadlineAt = time.Now().Unix() - 1
+				require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+				calls := adaptor.fetchCalls
+				require.NoError(t, poll(task))
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				require.True(t, task.PrivateData.VideoReconciliation.ManualRequired)
+				assert.Equal(t, calls, adaptor.fetchCalls, "expired windows stop automatic queries")
+				assert.Equal(t, 4000, task.Quota)
+				assert.Zero(t, countLogs(t))
+				stale := *task
+				before := stale.Snapshot()
+				resumed, won, err := model.ResumeAsyncVideoReconciliation(t.Context(), task.TaskID, task.UserId, 60)
+				require.NoError(t, err)
+				require.True(t, won)
+				assert.Equal(t, int64(60), resumed.PrivateData.VideoReconciliation.DeadlineAt-resumed.PrivateData.VideoReconciliation.StartedAt)
+				assert.Equal(t, task.PrivateData.UpstreamTaskID, resumed.PrivateData.UpstreamTaskID)
+				assert.Equal(t, task.AttemptGeneration, resumed.AttemptGeneration)
+				stale.PrivateData.PollFailures = 999
+				won, err = stale.UpdatePollingState(t.Context(), before)
+				require.NoError(t, err)
+				assert.False(t, won, "an old poll cannot undo operator resume")
+				adaptor.parse = &relaycommon.TaskInfo{Status: terminal, Url: "https://cdn.example/result.mp4"}
+				if terminal == model.TaskStatusFailure {
+					adaptor.parse.Url = ""
+					adaptor.parse.Reason = "reference video download failed"
+					adaptor.body = []byte(`{"status":"failed","id":"native-reconciliation"}`)
+				}
+				adaptor.results[task.GetUpstreamTaskID()].TaskInfo = *adaptor.parse
+				late := *resumed
+				require.NoError(t, poll(resumed))
+				logs := countLogs(t)
+				require.NoError(t, poll(&late))
+				assert.Equal(t, logs, countLogs(t), "duplicate terminal replies do not settle twice")
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				assert.EqualValues(t, terminal, task.Status)
+				assert.Nil(t, task.PrivateData.VideoReconciliation)
+				assert.True(t, task.PrivateData.VideoTerminalConfirmed)
+				assert.Equal(t, int64(0), task.AttemptGeneration, "reconciliation never generates another video")
+				assert.Equal(t, "native-reconciliation", task.PrivateData.UpstreamTaskID)
+				if terminal == model.TaskStatusFailure {
+					assert.Zero(t, task.Quota)
+					assert.Equal(t, 14000, getUserQuota(t, task.UserId))
+					assert.Equal(t, 11000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+				} else {
+					assert.Equal(t, 4000, task.Quota)
+					assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+				}
+				_, won, err = model.ResumeAsyncVideoReconciliation(t.Context(), task.TaskID, task.UserId, 60)
+				require.NoError(t, err)
+				assert.False(t, won, "terminal tasks cannot be resumed")
+				if !batch {
+					require.NoError(t, model.DB.AutoMigrate(&model.MediaInputObject{}))
+					job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: task.UserId, ChannelId: task.ChannelId, TokenId: task.PrivateData.TokenId, Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", Quota: 4000, ExpiresAt: time.Now().Unix() + 3600}
+					require.NoError(t, model.DB.Create(&job).Error)
+					jobs, err := model.GetDueAsyncMediaJobsForPhase(t.Context(), time.Now().Unix(), 10, "status")
+					require.NoError(t, err)
+					require.Len(t, jobs, 1)
+					claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "terminal-sync", 30)
+					require.NoError(t, err)
+					require.True(t, claimed)
+					require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, DefaultMediaRuntimeConfig()))
+					require.NoError(t, model.DB.First(&job, job.ID).Error)
+					if terminal == model.TaskStatusSuccess {
+						assert.Equal(t, "submitted", job.Status)
+						assert.Equal(t, "ready", job.StorageStatus)
+						jobs, err = model.GetDueAsyncMediaJobsForPhase(t.Context(), time.Now().Unix(), 10, "download")
+						require.NoError(t, err)
+						assert.Len(t, jobs, 1, "completed reconciliation moves into the download pool")
+					} else {
+						assert.Equal(t, "failed", job.Status)
+						assert.Equal(t, "refunded", job.BillingStatus)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAsyncVideoReconciliationConcurrentPollingPreservesAccounting(t *testing.T) {
+	task, _ := setupVideoReconciliationTask(t)
+	var first, second model.Task
+	require.NoError(t, model.DB.First(&first, task.ID).Error)
+	require.NoError(t, model.DB.First(&second, task.ID).Error)
+	before := first.Snapshot()
+	first.PrivateData.PollFailures, second.PrivateData.PollFailures = 1, 2
+	// Accounting confirmation does not change the upstream polling state.
+	task.PrivateData.SubmitAccountingRecorded = true
+	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	type outcome struct {
+		won bool
+		err error
+	}
+	results := make(chan outcome, 2)
+	start := make(chan struct{})
+	for _, contender := range []*model.Task{&first, &second} {
+		go func() {
+			<-start
+			won, err := contender.UpdatePollingState(t.Context(), before)
+			results <- outcome{won, err}
+		}()
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		result := <-results
+		require.NoError(t, result.err)
+		if result.won {
+			winners++
+		}
+	}
+	assert.Equal(t, 1, winners)
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.True(t, task.PrivateData.SubmitAccountingRecorded)
+	assert.Equal(t, 4000, task.Quota)
+	// A confirmed failure query can have started before another poll entered
+	// reconciliation. The recovery transaction must re-check the locked row.
+	task.Platform, task.PrivateData.DurableBilling = "drama", true
+	require.NoError(t, task.Update())
+	stale := *task
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: task.UserId, ChannelId: task.ChannelId, TokenId: task.PrivateData.TokenId, Provider: "drama", Status: "submitted", BillingStatus: "reserved", Quota: task.Quota, RequestCipher: []byte("request"), ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.NoError(t, reconcileAsyncVideoTask(t.Context(), task, task.Snapshot(), pollClassTransport, 0))
+	require.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "expired", "channel_cipher": nil}), model.ErrImageConflict, "a pre-reconciliation lease cannot erase the new projection")
+	won, err := model.ScheduleAsyncVideoReferenceRecovery(t.Context(), stale, job, "reference video download failed", true)
+	require.NoError(t, err)
+	assert.False(t, won, "an old response cannot start generation after reconciliation begins")
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.Zero(t, task.AttemptGeneration)
+	assert.Equal(t, "native-reconciliation", task.PrivateData.UpstreamTaskID)
+}
+
+func TestAsyncVideoReconciliationMissingChannelRetainsHold(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprint(batch), func(t *testing.T) {
+			task, channel := setupVideoReconciliationTask(t)
+			require.NoError(t, model.DB.Delete(channel).Error)
+			tasks := map[string]*model.Task{task.TaskID: task}
+			if batch {
+				_ = updateBatchTasks(t.Context(), &scriptedBatchPollingAdaptor{}, channel.Id, []string{task.TaskID}, tasks)
+			} else {
+				_ = updateVideoTasks(t.Context(), task.Platform, channel.Id, []string{task.TaskID}, tasks)
+			}
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			require.NotNil(t, task.PrivateData.VideoReconciliation)
+			assert.Contains(t, task.PrivateData.VideoReconciliation.Reason, "channel_unavailable")
+			assert.EqualValues(t, model.TaskStatusInProgress, task.Status)
+			assert.Equal(t, 4000, task.Quota)
+			assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+			assert.Zero(t, countLogs(t))
+		})
+	}
+}
+
+func TestAsyncVideoReconciliationLateTerminalAfterPause(t *testing.T) {
+	task, channel := setupVideoReconciliationTask(t)
+	now := time.Now().Unix()
+	task.PrivateData.VideoReconciliation = &model.VideoTaskReconciliation{StartedAt: now - 30, DeadlineAt: now + 60, Revision: 1}
+	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	adaptor := &boundedVideoPollingAdaptor{fetch: func(context.Context) (*http.Response, error) {
+		var paused model.Task
+		require.NoError(t, model.DB.First(&paused, task.ID).Error)
+		paused.PrivateData.VideoReconciliation.DeadlineAt = now - 1
+		require.NoError(t, model.DB.Model(&paused).Update("private_data", paused.PrivateData).Error)
+		ready, err := asyncVideoPollReady(t.Context(), &paused)
+		require.NoError(t, err)
+		require.False(t, ready)
+		require.True(t, paused.PrivateData.VideoReconciliation.ManualRequired)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+	}}
+	adaptor.parse = &relaycommon.TaskInfo{Status: model.TaskStatusSuccess, Url: "https://cdn.example/result.mp4"}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, task.Status)
+	assert.Nil(t, task.PrivateData.VideoReconciliation)
+	assert.Equal(t, 4000, task.Quota)
+}
+
+func TestAsyncVideoReconciliationTimeoutAndRetention(t *testing.T) {
+	task, _ := setupVideoReconciliationTask(t)
+	previous := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previous })
+	task.SubmitTime = time.Now().Unix() - 120
+	require.NoError(t, task.Update())
+	sweepTimedOutTasks(t.Context())
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	require.NotNil(t, task.PrivateData.VideoReconciliation)
+	deadline := task.PrivateData.VideoReconciliation.DeadlineAt
+	sweepTimedOutTasks(t.Context())
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.Equal(t, deadline, task.PrivateData.VideoReconciliation.DeadlineAt)
+	assert.Zero(t, task.PrivateData.VideoReconciliation.NextPollAt, "sweep leaves the first reconciliation query eligible")
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: task.TaskID, UserId: task.UserId, ChannelId: task.ChannelId, TokenId: task.PrivateData.TokenId, IdentityHash: "reconciliation-retention", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: task.Quota, CreatedAt: now - 3600, ExpiresAt: now - 1, LeaseToken: "retention-lease", LeaseExpiresAt: now + 30, RequestCipher: []byte("keep-request"), ChannelCipher: []byte("keep-channel")}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, DefaultMediaRuntimeConfig()))
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, "reconciling", job.Status)
+	assert.Equal(t, "reserved", job.BillingStatus)
+	assert.Equal(t, []byte("keep-request"), job.RequestCipher)
+	assert.Equal(t, []byte("keep-channel"), job.ChannelCipher)
+	require.ErrorIs(t, model.ExpireAsyncMediaJob(t.Context(), job, now), model.ErrImageConflict)
+	task.PrivateData.VideoReconciliation.DeadlineAt = now - 1
+	require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+	sweepTimedOutTasks(t.Context())
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	assert.True(t, task.PrivateData.VideoReconciliation.ManualRequired)
+	assert.Equal(t, 4000, task.Quota)
+	assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+	assert.Zero(t, countLogs(t))
+	// Recover an already expired pre-upgrade job without changing artifact TTL
+	// or submitting the same generation again.
+	require.NoError(t, model.DB.Model(&job).Update("status", "expired").Error)
+	_, won, err := model.ResumeAsyncVideoReconciliation(t.Context(), task.TaskID, task.UserId, 60)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, "reconciling", job.Status)
+	assert.Equal(t, now-1, job.ExpiresAt)
+	assert.Equal(t, "native-reconciliation", task.GetUpstreamTaskID())
+}
+
+func TestAsyncVideoReconciliationCleanupRetainsPendingAndRetriesFiles(t *testing.T) {
+	task, _ := setupVideoReconciliationTask(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.MediaArtifactObject{}))
+	now := time.Now().Unix()
+	root := t.TempDir()
+	pendingPath := filepath.Join(root, "pending.bin")
+	require.NoError(t, os.WriteFile(pendingPath, []byte("pending output"), 0600))
+	var pendingJobs []model.AsyncMediaJob
+	// One full cleanup page of unresolved operations must not hide a later
+	// terminal job. These records exercise the actual 100-row cleanup bound.
+	for i := range 100 {
+		pending := *task
+		pending.ID, pending.TaskID = 0, fmt.Sprintf("cleanup-pending-%d", i)
+		pending.PrivateData.VideoReconciliation = &model.VideoTaskReconciliation{StartedAt: now - 60, DeadlineAt: now, ManualRequired: true, Revision: 1}
+		require.NoError(t, model.DB.Create(&pending).Error)
+		job := model.AsyncMediaJob{TaskId: pending.TaskID, IdentityHash: pending.TaskID, UserId: task.UserId, Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", ExpiresAt: now - 1, RequestCipher: []byte("keep-request"), ChannelCipher: []byte("keep-channel")}
+		if i == 0 {
+			job.OutputRootPath, job.OutputObjectKey = root, "pending.bin"
+		}
+		pendingJobs = append(pendingJobs, job)
+	}
+	require.NoError(t, model.DB.Create(&pendingJobs).Error)
+	finished := *task
+	finished.ID, finished.TaskID, finished.Status = 0, "cleanup-finished", model.TaskStatusSuccess
+	require.NoError(t, model.DB.Create(&finished).Error)
+	blockedPath := filepath.Join(root, "blocked")
+	require.NoError(t, os.Mkdir(blockedPath, 0700))
+	childPath := filepath.Join(blockedPath, "child")
+	require.NoError(t, os.WriteFile(childPath, []byte("busy"), 0600))
+	job := model.AsyncMediaJob{TaskId: finished.TaskID, IdentityHash: finished.TaskID, UserId: task.UserId, Status: "succeeded", StorageStatus: "succeeded", BillingStatus: "settled", ExpiresAt: now - 1, RequestCipher: []byte("expire-request"), ChannelCipher: []byte("expire-channel"), OutputRootPath: root, OutputObjectKey: "blocked"}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.Error(t, CleanupMediaObjects(t.Context()), "a nonempty directory deterministically prevents output removal")
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, "expired", job.Status)
+	assert.Empty(t, job.RequestCipher)
+	assert.Empty(t, job.ChannelCipher)
+	assert.Equal(t, "blocked", job.OutputObjectKey, "failed filesystem cleanup retains a retry pointer")
+	require.NoError(t, os.Remove(childPath))
+	require.NoError(t, CleanupMediaObjects(t.Context()))
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Empty(t, job.OutputObjectKey)
+	assert.Empty(t, job.OutputRootPath)
+	_, err := os.Stat(blockedPath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(pendingPath)
+	require.NoError(t, err, "cleanup must not remove output before its task eligibility check")
+	var kept model.AsyncMediaJob
+	require.NoError(t, model.DB.First(&kept, pendingJobs[0].ID).Error)
+	assert.Equal(t, "reconciling", kept.Status)
+	assert.Equal(t, []byte("keep-channel"), kept.ChannelCipher)
+}
+
+func TestAsyncVideoReconciliationAcceptedTaskExpiry(t *testing.T) {
+	task, _ := setupVideoReconciliationTask(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.MediaArtifactObject{}))
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: task.UserId, ChannelId: task.ChannelId, TokenId: task.PrivateData.TokenId, Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", Quota: task.Quota, ExpiresAt: now - 1, RequestCipher: []byte("keep-request"), ChannelCipher: []byte("keep-channel")}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.Nil(t, task.PrivateData.VideoReconciliation)
+	// Cleanup may run before the status worker first observes retention expiry.
+	require.ErrorIs(t, model.ExpireAsyncMediaJob(t.Context(), job, now), model.ErrImageConflict)
+	require.NoError(t, CleanupMediaObjects(t.Context()))
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, []byte("keep-channel"), job.ChannelCipher)
+	claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "expired-accepted", 30)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, DefaultMediaRuntimeConfig()))
+	require.NoError(t, model.DB.First(task, task.ID).Error)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	require.NotNil(t, task.PrivateData.VideoReconciliation)
+	assert.Contains(t, task.PrivateData.VideoReconciliation.Reason, "retention_expired")
+	assert.Equal(t, "reconciling", job.Status)
+	assert.Empty(t, job.LeaseToken, "the worker releases its lease after its own status projection changes")
+	assert.Equal(t, []byte("keep-request"), job.RequestCipher)
+	assert.Equal(t, []byte("keep-channel"), job.ChannelCipher)
+	assert.Equal(t, 4000, task.Quota)
+	assert.Zero(t, countLogs(t))
 }
 
 func TestPendingTaskAtFullProgressRemainsPollableAndTimesOutOnce(t *testing.T) {

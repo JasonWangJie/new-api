@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -101,6 +102,120 @@ func allowPrivateTaskMediaTest(t *testing.T) {
 	system_setting.GetFetchSetting().AllowedPorts = []string{"1-65535"}
 	t.Cleanup(func() { *system_setting.GetFetchSetting() = originalFetchSetting })
 	service.InitHttpClient()
+}
+
+func TestAsyncVideoReconciliationManagementRetainsReservation(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	now := time.Now().Unix()
+	task.Status, task.Progress, task.FinishTime, task.Quota = model.TaskStatusInProgress, "40%", 0, 120
+	task.PrivateData = model.TaskPrivateData{AsyncMedia: true, UpstreamTaskID: "existing-video", VideoReconciliation: &model.VideoTaskReconciliation{
+		StartedAt: now - 7200, DeadlineAt: now - 3600, ManualRequired: true, Reason: "transport_error", Revision: 1,
+	}}
+	require.NoError(t, model.DB.Save(task).Error)
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "reconciliation-management", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Provider: "drama", Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", ExpiresAt: now - 1, CreatedAt: now - 7200}
+	require.NoError(t, model.DB.Create(&job).Error)
+	require.NoError(t, model.DB.AutoMigrate(&model.AsyncImageTask{}))
+	require.NoError(t, model.DB.Where("1 = 1").Delete(&model.AsyncImageTask{}).Error)
+	for _, filter := range []string{"status=invoking", "stage=generating"} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/admin/media-tasks?media_type=video&start_date=2000-01-01&end_date=2099-01-01&"+filter, nil)
+		ListMediaTasks(c, true)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		var response struct {
+			Data struct {
+				Total int `json:"total"`
+				Stats struct {
+					Processing int `json:"processing"`
+					Failed     int `json:"failed"`
+				} `json:"stats"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		assert.Equal(t, 1, response.Data.Total, "awaiting reconciliation remains discoverable after media retention expires")
+		assert.Equal(t, 1, response.Data.Stats.Processing)
+		assert.Zero(t, response.Data.Stats.Failed)
+	}
+	for _, admin := range []bool{false, true} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		view, _, err := videoJobView(c, job, admin)
+		require.NoError(t, err)
+		assert.Equal(t, "invoking", view["status"])
+		assert.Equal(t, "reserved", view["billing_status"])
+		assert.Equal(t, 120, view["quota"])
+		assert.Equal(t, admin, view["can_resume"])
+		assert.Equal(t, false, view["can_terminate"])
+		assert.NotNil(t, view["video_reconciliation"])
+	}
+	for _, provider := range []string{"drama", "grok"} {
+		for _, expired := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/queued/expired=%v", provider, expired), func(t *testing.T) {
+				require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusQueued).Error)
+				job.Provider, job.ExpiresAt = provider, now+3600
+				if expired {
+					job.ExpiresAt = now - 1
+				}
+				require.NoError(t, model.DB.Save(&job).Error)
+				status, stage := "invoking", "generating"
+				if provider == "drama" {
+					status, stage = "queued", "queued"
+				}
+				for _, filter := range []string{"status=" + status, "stage=" + stage} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Request = httptest.NewRequest(http.MethodGet, "/api/admin/media-tasks?media_type=video&start_date=2000-01-01&end_date=2099-01-01&"+filter, nil)
+					ListMediaTasks(c, true)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Total int `json:"total"`
+							Items []struct {
+								Status string `json:"status"`
+							} `json:"items"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					require.Equal(t, 1, response.Data.Total, recorder.Body.String())
+					require.Len(t, response.Data.Items, 1)
+					assert.Equal(t, status, response.Data.Items[0].Status)
+				}
+			})
+		}
+	}
+	require.NoError(t, model.DB.Model(task).Update("status", model.TaskStatusInProgress).Error)
+	job.Provider, job.ExpiresAt = "drama", now-1
+	require.NoError(t, model.DB.Save(&job).Error)
+	for _, item := range []struct {
+		name   string
+		admin  bool
+		status int
+	}{
+		{"owner cannot reopen reconciliation", false, http.StatusConflict},
+		{"administrator resumes existing query", true, http.StatusOK},
+		{"repeated resume cannot reopen active window", true, http.StatusConflict},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("id", task.UserId)
+			c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+task.TaskID+"/resume", nil)
+			ManageMediaTask(c, item.admin, "resume")
+			assert.Equal(t, item.status, recorder.Code, recorder.Body.String())
+		})
+	}
+	var stored model.Task
+	require.NoError(t, model.DB.Where("id = ?", task.ID).Take(&stored).Error)
+	assert.Equal(t, task.Quota, stored.Quota)
+	assert.Equal(t, task.Status, stored.Status)
+	assert.Equal(t, task.AttemptGeneration, stored.AttemptGeneration)
+	assert.Equal(t, "existing-video", stored.PrivateData.UpstreamTaskID)
+	require.NotNil(t, stored.PrivateData.VideoReconciliation)
+	assert.False(t, stored.PrivateData.VideoReconciliation.ManualRequired)
+	assert.EqualValues(t, 2, stored.PrivateData.VideoReconciliation.Revision)
+	assert.EqualValues(t, 1440*60, stored.PrivateData.VideoReconciliation.DeadlineAt-stored.PrivateData.VideoReconciliation.StartedAt)
 }
 
 func TestGetTaskDoesNotProjectArtifacts(t *testing.T) {

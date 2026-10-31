@@ -128,6 +128,14 @@ export type ImageTask = {
   error_retryable?: boolean
   error_stage?: string
   retry_decision?: ImageRetryDecision
+  video_reconciliation?: {
+    started_at: number
+    deadline_at: number
+    next_poll_at: number
+    manual_required: boolean
+    reason: string
+    revision: number
+  }
   retained_request_available?: boolean
   request_retain_until?: number
   media_type?: 'image' | 'video'
@@ -379,7 +387,9 @@ export type ImageChannelPool = {
   model: string
   resolution: string
   channel_id: number
-  /** Relative pool weight; the API retains its legacy field name. */
+  /** Relative pool weight; optional while reading older server responses. */
+  weight?: number
+  /** Legacy alias for weight, retained for API compatibility. */
   priority: number
 }
 export type VideoReadiness = {

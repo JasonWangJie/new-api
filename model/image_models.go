@@ -60,6 +60,16 @@ type ImageChannelPool struct {
 	Priority   int    `json:"priority"`
 }
 
+// MarshalJSON exposes the pool's relative weight while retaining the legacy
+// priority field and database column for existing clients and stored bindings.
+func (pool ImageChannelPool) MarshalJSON() ([]byte, error) {
+	type poolFields ImageChannelPool
+	return common.Marshal(struct {
+		poolFields
+		Weight int `json:"weight"`
+	}{poolFields: poolFields(pool), Weight: max(0, pool.Priority)})
+}
+
 // ImageRetryDecision records policy facts without provider payloads or account identities.
 type ImageRetryDecision struct {
 	Version       int    `json:"version"`

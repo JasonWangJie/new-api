@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"maps"
 	"strconv"
 	"strings"
@@ -257,6 +258,12 @@ func UpdateOptionsBulk(values map[string]string) error {
 		return nil
 	}
 	for key := range values {
+		key = strings.TrimSpace(key)
+		if strings.EqualFold(key, "image_runtime_config") || strings.EqualFold(key, "media_runtime_config") {
+			return errors.New("Media runtime configuration must be updated through its versioned settings endpoint")
+		}
+	}
+	for key := range values {
 		if IsPasskeyDomainOption(key) {
 			_, err := UpdatePasskeyDomainOptions(values, false, "")
 			return err
@@ -276,6 +283,15 @@ func UpdateOptionsBulk(values map[string]string) error {
 			option := Option{Key: k}
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
+			}
+			// Use the database's key comparison so case/accent-insensitive
+			// collations cannot bypass protection, even on first creation.
+			var versionedCount int64
+			if err := tx.Model(&Option{}).Where(map[string]any{"key": []string{"image_runtime_config", "media_runtime_config"}}).Where(&Option{Key: option.Key}).Count(&versionedCount).Error; err != nil {
+				return err
+			}
+			if versionedCount > 0 {
+				return errors.New("Media runtime configuration must be updated through its versioned settings endpoint")
 			}
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {

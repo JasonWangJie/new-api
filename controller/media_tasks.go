@@ -88,7 +88,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if status == "execution_unknown" {
 		status = "failed"
 	}
-	if status == "submitting" || status == "submitted" {
+	if status == "submitting" || status == "submitted" || status == "reconciling" {
 		status = "invoking"
 		progress = 10
 	}
@@ -190,6 +190,19 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	}
 	if job.Provider == "drama" && job.ExpiresAt <= now {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
+	}
+	if err == nil && job.Status == "reconciling" && task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation != nil && task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		view["status"], view["stage"], view["finished_at"] = "invoking", "generating", int64(0)
+		if job.Provider == "drama" && slices.Contains([]model.TaskStatus{model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued}, task.Status) {
+			view["status"], view["stage"] = "queued", "queued"
+		}
+		view["can_terminate"] = false
+		if reconciliation := task.PrivateData.VideoReconciliation; reconciliation != nil {
+			view["video_reconciliation"] = reconciliation
+			view["can_resume"] = admin && reconciliation.ManualRequired && ownerErr == nil
+			view["next_attempt_at"] = reconciliation.NextPollAt
+			view["error_message"] = ""
+		}
 	}
 	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && (errors.Is(err, gorm.ErrRecordNotFound) || job.ReferenceRecoveryStage == "unknown") {
 		view["error_code"], view["error_retryable"] = "execution_unknown", false
@@ -370,15 +383,29 @@ func GetMediaConfiguration(c *gin.Context) {
 }
 
 func UpdateMediaConfiguration(c *gin.Context) {
-	var cfg service.MediaRuntimeConfig
-	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &cfg); err != nil {
+	defaults := service.DefaultMediaRuntimeConfig()
+	input := struct {
+		service.MediaRuntimeConfig
+		Revision *int64 `json:"revision"`
+	}{MediaRuntimeConfig: service.MediaRuntimeConfig{PollTimeout: defaults.PollTimeout, ReconciliationTimeout: defaults.ReconciliationTimeout, ReconciliationPollInterval: defaults.ReconciliationPollInterval}}
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if err := service.SaveMediaRuntimeConfig(c.Request.Context(), cfg); err != nil {
-		imageManagementError(c, 400, err)
+	if input.Revision == nil {
+		imageManagementError(c, http.StatusPreconditionRequired, errors.New("Configuration revision is required. Reload it before saving"))
 		return
 	}
+	cfg := input.MediaRuntimeConfig
+	if err := service.SaveMediaRuntimeConfig(c.Request.Context(), cfg, *input.Revision); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, model.ErrOptionRevisionConflict) {
+			status = http.StatusConflict
+		}
+		imageManagementError(c, status, err)
+		return
+	}
+	cfg.Revision = *input.Revision + 1
 	imageManagementData(c, cfg)
 }
 
@@ -599,6 +626,32 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		imageManagementData(c, gin.H{"task_id": task.TaskId})
 		return
 	}
+	if action == "resume" && admin {
+		var task model.Task
+		err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id")).Take(&task).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Media task is unavailable"))
+			return
+		}
+		if err == nil && task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation != nil && task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+			cfg, err := service.GetMediaRuntimeConfig(c.Request.Context())
+			if err != nil {
+				imageManagementError(c, http.StatusServiceUnavailable, errors.New("Media configuration is unavailable"))
+				return
+			}
+			_, resumed, err := model.ResumeAsyncVideoReconciliation(c.Request.Context(), task.TaskID, task.UserId, int64(cfg.ReconciliationTimeout)*60)
+			if err != nil {
+				imageManagementError(c, http.StatusServiceUnavailable, errors.New("Media task could not resume polling"))
+				return
+			}
+			if !resumed {
+				imageManagementError(c, http.StatusConflict, errors.New("Media task no longer requires manual reconciliation"))
+				return
+			}
+			imageManagementData(c, gin.H{"task_id": task.TaskID})
+			return
+		}
+	}
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ? AND lease_expires_at <= ?", c.Param("task_id"), time.Now().Unix())
 	if admin {
 		query = query.Where("expires_at > ? OR (status = ? AND reference_retry_count = ? AND reference_recovery_stage = ?)", time.Now().Unix(), "execution_unknown", 1, "unknown")
@@ -788,6 +841,12 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	// Drama's upstream queue. Use the same public state for filtering and stats.
 	now := time.Now().Unix()
 	dramaStatus := gorm.Expr(`CASE
+		WHEN status = 'reconciling' AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
+			AND tasks.user_id = async_media_jobs.user_id
+			AND tasks.status IN ('NOT_START','SUBMITTED','QUEUED')) THEN 'queued'
+		WHEN status = 'reconciling' AND EXISTS(SELECT 1 FROM tasks
+			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
+			AND tasks.status NOT IN ('SUCCESS','FAILURE')) THEN 'invoking'
 		WHEN expires_at <= ? THEN 'expired'
 		WHEN storage_status = 'succeeded' AND NOT EXISTS(SELECT 1 FROM media_artifact_objects
 			WHERE media_artifact_objects.task_id = async_media_jobs.task_id
@@ -802,11 +861,11 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		WHEN status = 'execution_unknown' THEN 'failed'
 		WHEN storage_status = 'failed' THEN 'storage_failed'
 		WHEN storage_status IN ('ready','saving') THEN 'uploading'
-		WHEN status IN ('submitting','submitted') AND storage_status = 'pending'
+		WHEN status IN ('submitting','submitted','reconciling') AND storage_status = 'pending'
 			AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
 				AND tasks.user_id = async_media_jobs.user_id
 				AND tasks.status IN ('NOT_START','SUBMITTED','QUEUED')) THEN 'queued'
-		WHEN status IN ('submitting','submitted') THEN 'invoking'
+		WHEN status IN ('submitting','submitted','reconciling') THEN 'invoking'
 		ELSE status END`, now, now)
 	if status := c.Query("status"); status != "" {
 		legacyStatus := model.DB.Where("status = ?", status)
@@ -814,7 +873,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		case "failed":
 			legacyStatus = model.DB.Where("status IN ? OR EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?)", []string{"failed", "execution_unknown"}, model.TaskStatusFailure)
 		case "invoking":
-			legacyStatus = model.DB.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted"}, "pending")
+			legacyStatus = model.DB.Where("status IN ? AND storage_status = ?", []string{"submitting", "submitted", "reconciling"}, "pending")
 		case "uploading":
 			legacyStatus = model.DB.Where("storage_status IN ?", []string{"ready", "saving"})
 		case "storage_failed":
@@ -875,7 +934,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		case "queued":
 			legacyStage = model.DB.Where("status = ?", "queued")
 		case "generating":
-			legacyStage = model.DB.Where("status IN ? AND storage_status = ? AND NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status IN ?)", []string{"submitting", "submitted"}, "pending", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure})
+			legacyStage = model.DB.Where("status IN ? AND storage_status = ? AND NOT EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status IN ?)", []string{"submitting", "submitted", "reconciling"}, "pending", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure})
 		case "saving":
 			legacyStage = model.DB.Where("storage_status IN ? OR (storage_status = ? AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", []string{"ready", "saving", "failed"}, "pending", model.TaskStatusSuccess)
 		case "completed":
@@ -886,7 +945,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		videos = videos.Where(model.DB.Where("provider = ? AND (?) IN ?", "drama", dramaStatus, selected).
 			Or(model.DB.Where("provider IS NULL OR provider <> ?", "drama").Where(legacyStage)))
 	}
-	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status IN ('ready','saving') THEN 'uploading' WHEN status = 'execution_unknown' THEN 'failed' WHEN status IN ('submitting','submitted') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
+	videoProjection := "task_id, created_at, CASE WHEN provider = 'drama' THEN (?) WHEN storage_status = 'failed' THEN 'storage_failed' WHEN storage_status IN ('ready','saving') THEN 'uploading' WHEN status = 'execution_unknown' THEN 'failed' WHEN status IN ('submitting','submitted','reconciling') AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'SUCCESS') THEN 'upstream_succeeded' WHEN status IN ('submitting','submitted','reconciling') THEN 'invoking' ELSE status END AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
 	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, dramaStatus))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
 	var total int64

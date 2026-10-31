@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -147,9 +148,22 @@ type TaskPrivateData struct {
 	// only replaced when a hook explicitly returns state.
 	PluginState json.RawMessage `json:"plugin_state,omitempty"`
 	// PollFailures counts consecutive unrecognized or transient poll outcomes.
-	PollFailures           int                `json:"poll_failures,omitempty"`
-	VideoAttempts          []VideoTaskAttempt `json:"video_attempts,omitempty"`
-	VideoTerminalConfirmed bool               `json:"video_terminal_confirmed,omitempty"`
+	PollFailures           int                      `json:"poll_failures,omitempty"`
+	VideoAttempts          []VideoTaskAttempt       `json:"video_attempts,omitempty"`
+	VideoTerminalConfirmed bool                     `json:"video_terminal_confirmed,omitempty"`
+	VideoReconciliation    *VideoTaskReconciliation `json:"video_reconciliation,omitempty"`
+}
+
+// VideoTaskReconciliation preserves an uncertain upstream operation and its
+// reservation. The deadline is frozen until an operator explicitly resumes
+// queries; resuming never creates another upstream operation.
+type VideoTaskReconciliation struct {
+	StartedAt      int64  `json:"started_at"`
+	DeadlineAt     int64  `json:"deadline_at"`
+	NextPollAt     int64  `json:"next_poll_at"`
+	ManualRequired bool   `json:"manual_required"`
+	Reason         string `json:"reason"`
+	Revision       int64  `json:"revision"`
 }
 
 // VideoTaskAttempt keeps the failed native operation separate from a later
@@ -232,7 +246,7 @@ func (p TaskPrivateData) Value() (driver.Value, error) {
 	if !p.AsyncMedia && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.UpstreamAsync == nil && len(p.UpstreamAsyncResponse) == 0 && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
-		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 && len(p.VideoAttempts) == 0 && !p.VideoTerminalConfirmed {
+		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 && len(p.VideoAttempts) == 0 && !p.VideoTerminalConfirmed && p.VideoReconciliation == nil {
 		return nil, nil
 	}
 	// 同 Properties.Value:string 避免 PG simple protocol 的 bytea 编码。
@@ -522,6 +536,7 @@ func (Task *Task) InsertWithContext(ctx context.Context) error {
 
 type taskSnapshot struct {
 	AttemptGeneration      int64
+	UpstreamTaskID         string
 	VideoTerminalConfirmed bool
 	Status                 TaskStatus
 	Progress               string
@@ -532,10 +547,16 @@ type taskSnapshot struct {
 	Data                   json.RawMessage
 	PluginState            json.RawMessage
 	PollFailures           int
+	HasVideoReconciliation bool
+	VideoReconciliation    VideoTaskReconciliation
 }
 
+// TaskPollingSnapshot is the expected persisted state for a poll update.
+type TaskPollingSnapshot = taskSnapshot
+
 func (s taskSnapshot) Equal(other taskSnapshot) bool {
-	return s.AttemptGeneration == other.AttemptGeneration && s.VideoTerminalConfirmed == other.VideoTerminalConfirmed && s.Status == other.Status &&
+	return s.AttemptGeneration == other.AttemptGeneration && s.UpstreamTaskID == other.UpstreamTaskID && s.VideoTerminalConfirmed == other.VideoTerminalConfirmed && s.Status == other.Status &&
+		s.HasVideoReconciliation == other.HasVideoReconciliation && s.VideoReconciliation == other.VideoReconciliation &&
 		s.Progress == other.Progress &&
 		s.StartTime == other.StartTime &&
 		s.FinishTime == other.FinishTime &&
@@ -547,8 +568,9 @@ func (s taskSnapshot) Equal(other taskSnapshot) bool {
 }
 
 func (t *Task) Snapshot() taskSnapshot {
-	return taskSnapshot{
+	snapshot := taskSnapshot{
 		AttemptGeneration:      t.AttemptGeneration,
+		UpstreamTaskID:         t.PrivateData.UpstreamTaskID,
 		VideoTerminalConfirmed: t.PrivateData.VideoTerminalConfirmed,
 		Status:                 t.Status,
 		Progress:               t.Progress,
@@ -560,6 +582,84 @@ func (t *Task) Snapshot() taskSnapshot {
 		PluginState:            t.PrivateData.PluginState,
 		PollFailures:           t.PrivateData.PollFailures,
 	}
+	if t.PrivateData.VideoReconciliation != nil {
+		snapshot.HasVideoReconciliation = true
+		snapshot.VideoReconciliation = *t.PrivateData.VideoReconciliation
+	}
+	return snapshot
+}
+
+// UpdatePollingState rejects stale same-status responses as well as terminal
+// transitions. The row lock also serializes an operator's reconciliation resume.
+func (t *Task) UpdatePollingState(ctx context.Context, before TaskPollingSnapshot) (bool, error) {
+	if !t.PrivateData.AsyncMedia {
+		return t.UpdateWithStatus(before.Status)
+	}
+	if t.Status == TaskStatusSuccess || t.Status == TaskStatusFailure {
+		return false, errors.New("terminal polling updates require task settlement")
+	}
+	won := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current Task
+		if err := lockForUpdate(tx).Where("id = ?", t.ID).Take(&current).Error; err != nil {
+			return err
+		}
+		if !current.Snapshot().Equal(before) {
+			return nil
+		}
+		// Submission accounting may have been confirmed since the query began.
+		// Merge only poll-owned fields; never overwrite quota or billing state.
+		privateData := current.PrivateData
+		privateData.ResultURL = t.PrivateData.ResultURL
+		privateData.UpstreamAsyncResponse = t.PrivateData.UpstreamAsyncResponse
+		privateData.PluginState = t.PrivateData.PluginState
+		privateData.PollFailures = t.PrivateData.PollFailures
+		privateData.VideoTerminalConfirmed = t.PrivateData.VideoTerminalConfirmed
+		privateData.VideoReconciliation = t.PrivateData.VideoReconciliation
+		result := tx.Model(t).Where("id = ? AND status = ? AND attempt_generation = ?", t.ID, before.Status, before.AttemptGeneration).Updates(map[string]any{
+			"status": t.Status, "progress": t.Progress, "submit_time": t.SubmitTime,
+			"start_time": t.StartTime, "finish_time": t.FinishTime, "fail_reason": t.FailReason,
+			"data": t.Data, "private_data": privateData,
+		})
+		won = result.RowsAffected > 0
+		if won {
+			t.PrivateData, t.Quota = privateData, current.Quota
+		}
+		if result.Error != nil || !won || privateData.VideoReconciliation == nil {
+			return result.Error
+		}
+		return tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", t.TaskID, t.UserId, t.AttemptGeneration, []string{"queued", "submitting", "submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "next_attempt_at": 0}).Error
+	})
+	return won, err
+}
+
+// ResumeAsyncVideoReconciliation opens another bounded query window for an
+// existing operation. False means the task is no longer awaiting manual review.
+func ResumeAsyncVideoReconciliation(ctx context.Context, taskID string, userID int, windowSeconds int64) (*Task, bool, error) {
+	if windowSeconds < 60 || windowSeconds > 10080*60 {
+		return nil, false, errors.New("invalid video reconciliation window")
+	}
+	var task Task
+	won := false
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", taskID, userID).Take(&task).Error; err != nil {
+			return err
+		}
+		state := task.PrivateData.VideoReconciliation
+		if !task.PrivateData.AsyncMedia || task.Status == TaskStatusSuccess || task.Status == TaskStatusFailure || task.PrivateData.UpstreamTaskID == "" || state == nil || !state.ManualRequired {
+			return nil
+		}
+		now := time.Now().Unix()
+		task.PrivateData.VideoReconciliation = &VideoTaskReconciliation{StartedAt: now, DeadlineAt: now + windowSeconds, Revision: state.Revision + 1, Reason: state.Reason}
+		task.PrivateData.PollFailures = 0
+		result := tx.Model(&task).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, task.Status, task.AttemptGeneration).Update("private_data", task.PrivateData)
+		won = result.RowsAffected > 0
+		if result.Error != nil || !won {
+			return result.Error
+		}
+		return tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", task.TaskID, task.UserId, task.AttemptGeneration, []string{"submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "storage_status": "pending", "next_attempt_at": 0}).Error
+	})
+	return &task, won, err
 }
 
 func (Task *Task) Update() error {

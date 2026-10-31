@@ -597,6 +597,10 @@ func (a *TaskAdaptor) GetChannelName() string { return a.plugin.Meta.Name }
 func (a *TaskAdaptor) FetchMode() string      { return a.plugin.Meta.FetchMode }
 
 func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
+	return a.FetchBatchTasksContext(context.Background(), baseURL, key, tasks, proxy)
+}
+
+func (a *TaskAdaptor) FetchBatchTasksContext(requestContext context.Context, baseURL, key string, tasks []*model.Task, proxy string) (*http.Response, error) {
 	taskContexts := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
 		taskCtx, err := a.queryContext(task, key, baseURL, proxy)
@@ -609,11 +613,11 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "buildBatchQueryRequest", ctx, taskContexts)
+	value, err := a.plugin.Engine.Call(requestContext, "buildBatchQueryRequest", ctx, taskContexts)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, proxy, value)
+	return a.doFetchDescriptorContext(requestContext, baseURL, proxy, value)
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
@@ -630,10 +634,6 @@ func (a *TaskAdaptor) FetchTaskContext(requestContext context.Context, baseURL, 
 		return nil, err
 	}
 	return a.doFetchDescriptorContext(requestContext, baseURL, proxy, value)
-}
-
-func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http.Response, error) {
-	return a.doFetchDescriptorContext(context.Background(), baseURL, proxy, value)
 }
 
 func (a *TaskAdaptor) doFetchDescriptorContext(ctx context.Context, baseURL, proxy string, value any) (*http.Response, error) {

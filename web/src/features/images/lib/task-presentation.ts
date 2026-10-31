@@ -47,11 +47,29 @@ export function imageTaskCanResume(
   admin: boolean,
   canManage: boolean
 ): boolean {
+  const reconciliation = imageTaskVideoReconciliation(task)
+  if (reconciliation) {
+    return (
+      task.can_resume && admin && canManage && reconciliation.manual_required
+    )
+  }
   return (
     task.can_resume &&
     (canManage || !admin) &&
     (admin || task.error_code !== 'billing_quota_uncertain')
   )
+}
+
+export function imageTaskVideoReconciliation(
+  task: ImageTask
+): ImageTask['video_reconciliation'] | undefined {
+  if (
+    task.media_type === 'video' &&
+    ['queued', 'invoking', 'processing'].includes(task.status)
+  ) {
+    return task.video_reconciliation
+  }
+  return undefined
 }
 
 export function imageTaskProgress(task: ImageTask): number | null {
@@ -83,8 +101,26 @@ export function imageTaskIssue(task: ImageTask): {
   stage: string
   pendingAction?: 'retry' | 'wait'
   nextAttemptAt: number
+  reconciliation?: ImageTask['video_reconciliation']
 } | null {
   if (task.status === 'succeeded') return null
+  const reconciliation = imageTaskVideoReconciliation(task)
+  if (reconciliation) {
+    return {
+      summary: reconciliation.manual_required
+        ? 'Video task requires administrator review'
+        : 'Checking the existing video task',
+      suggestion: reconciliation.manual_required
+        ? 'An administrator must check the existing upstream video task. Reserved quota is retained and no new generation will be submitted.'
+        : 'The existing upstream video task is being checked. Reserved quota is retained and no new generation will be submitted.',
+      stage: 'poll',
+      pendingAction: 'wait',
+      nextAttemptAt: reconciliation.manual_required
+        ? 0
+        : reconciliation.next_poll_at,
+      reconciliation,
+    }
+  }
   const decision = task.retry_decision
   const active = ['queued', 'invoking', 'processing'].includes(task.status)
   // A successful poll can retain a previous diagnostic while the accepted job runs.

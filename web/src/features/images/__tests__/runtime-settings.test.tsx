@@ -30,6 +30,7 @@ afterEach(() => {
 })
 
 const runtime = {
+  revision: 0,
   async_enabled: true,
   mixed_timeout_retry_enabled: false,
   failed_request_retention_hours: 24,
@@ -90,6 +91,48 @@ const runtime = {
   library_import_per_minute: 20,
   library_submission_per_minute: 10,
 }
+
+test('keeps an image configuration draft on conflict and reloads only when requested', async () => {
+  const conflict = Object.assign(new Error('stale configuration'), {
+    isAxiosError: true,
+    response: { status: 409 },
+  })
+  vi.mocked(imageRequest)
+    .mockRejectedValueOnce(conflict)
+    .mockResolvedValueOnce({
+      runtime: { ...runtime, revision: 2, worker_concurrency: 8 },
+    })
+  const onSuccess = vi.fn()
+  render(<ImageRuntimeForm initial={runtime} onSuccess={onSuccess} />)
+  const user = userEvent.setup()
+  const workers = screen.getByRole('spinbutton', { name: 'Workers' })
+  await user.clear(workers)
+  await user.type(workers, '6')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Settings changed since you opened this form. Your edits have been kept. Reload saved settings before editing again.'
+  )
+  expect(workers).toHaveValue(6)
+  expect(onSuccess).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('button', { name: 'Reload saved settings' })
+  )
+  await waitFor(() => expect(workers).toHaveValue(8))
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  vi.mocked(imageRequest).mockResolvedValueOnce({
+    ...runtime,
+    revision: 3,
+    worker_concurrency: 8,
+  })
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenLastCalledWith(
+      '/api/option/images/runtime',
+      'PUT',
+      { ...runtime, revision: 2, worker_concurrency: 8 }
+    )
+  )
+})
 
 test('edits the global reference-image limit in the normal runtime form', async () => {
   vi.mocked(imageRequest).mockResolvedValue(undefined)

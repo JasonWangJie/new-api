@@ -26,10 +26,14 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
+import { markServerErrorHandled } from '@/lib/handle-server-error'
 
 import { imageRequest } from './api'
+import { ConfigurationConflict } from './components/configuration-conflict'
+import { isConfigurationConflict } from './lib/configuration-conflict'
 
 type MediaSettings = {
+  revision: number
   video_async_enabled: boolean
   local_path: string
   retention_days: number
@@ -40,6 +44,9 @@ type MediaSettings = {
   submit_concurrency: number
   status_concurrency: number
   submit_timeout_seconds: number
+  poll_timeout_seconds: number
+  reconciliation_timeout_minutes: number
+  reconciliation_poll_interval_seconds: number
   storage_retry_attempts: number
 }
 
@@ -49,6 +56,7 @@ export function MediaSettingsCard(
   } = {}
 ) {
   const settings = useQuery({
+    refetchOnWindowFocus: false,
     queryKey: ['media-settings'],
     queryFn: () => imageRequest<MediaSettings>('/api/option/images/media'),
   })
@@ -79,18 +87,30 @@ function MediaSettingsForm(props: {
     submit_concurrency: props.initial.submit_concurrency || 2,
     status_concurrency: props.initial.status_concurrency || 8,
     submit_timeout_seconds: props.initial.submit_timeout_seconds || 120,
+    poll_timeout_seconds: props.initial.poll_timeout_seconds ?? 30,
+    reconciliation_timeout_minutes:
+      props.initial.reconciliation_timeout_minutes ?? 1440,
+    reconciliation_poll_interval_seconds:
+      props.initial.reconciliation_poll_interval_seconds ?? 60,
   }))
   const save = useMutation({
-    mutationFn: () => imageRequest('/api/option/images/media', 'PUT', values),
-    onSuccess: async () => {
+    mutationFn: () =>
+      imageRequest<MediaSettings>('/api/option/images/media', 'PUT', values),
+    onSuccess: async (saved) => {
+      setValues(saved)
       toast.success(t('Saved'))
       void queryClient.invalidateQueries({ queryKey: ['media-settings'] })
       await props.onSuccess?.()
     },
+    onError: (error) => markServerErrorHandled(error),
   })
   const fields: {
-    key: keyof Omit<MediaSettings, 'video_async_enabled' | 'local_path'>
+    key: keyof Omit<
+      MediaSettings,
+      'video_async_enabled' | 'local_path' | 'revision'
+    >
     label: string
+    min?: number
     max?: number
   }[] = [
     { key: 'retention_days', label: 'Video retention (days)' },
@@ -106,13 +126,33 @@ function MediaSettingsForm(props: {
       max: 32,
     },
     { key: 'submit_concurrency', label: 'Video submit concurrency', max: 32 },
-    { key: 'status_concurrency', label: 'Video status concurrency', max: 64 },
+    {
+      key: 'status_concurrency',
+      label: 'Video local status sync concurrency',
+      max: 64,
+    },
     {
       key: 'submit_timeout_seconds',
       label: 'Video submit timeout (seconds)',
       max: 86400,
     },
+    {
+      key: 'poll_timeout_seconds',
+      label: 'Video upstream polling timeout (seconds)',
+      max: 300,
+    },
     { key: 'storage_retry_attempts', label: 'Storage retries' },
+    {
+      key: 'reconciliation_timeout_minutes',
+      label: 'Automatic video reconciliation window (minutes)',
+      max: 10080,
+    },
+    {
+      key: 'reconciliation_poll_interval_seconds',
+      label: 'Video reconciliation polling interval (seconds)',
+      min: 5,
+      max: 3600,
+    },
   ]
   return (
     <SettingsCard
@@ -163,7 +203,9 @@ function MediaSettingsForm(props: {
               <Input
                 id={`video-${field.key}`}
                 type='number'
-                min={field.key === 'storage_retry_attempts' ? 0 : 1}
+                min={
+                  field.min ?? (field.key === 'storage_retry_attempts' ? 0 : 1)
+                }
                 max={field.max}
                 value={values[field.key]}
                 onChange={(event) =>
@@ -179,7 +221,17 @@ function MediaSettingsForm(props: {
         <Button type='submit' disabled={save.isPending}>
           {t('Save')}
         </Button>
-        {save.error && (
+        <ConfigurationConflict
+          error={save.error}
+          onReload={async () => {
+            const latest = await imageRequest<MediaSettings>(
+              '/api/option/images/media'
+            )
+            setValues(latest)
+            save.reset()
+          }}
+        />
+        {save.error && !isConfigurationConflict(save.error) && (
           <p role='alert' className='text-destructive text-sm'>
             {save.error.message}
           </p>

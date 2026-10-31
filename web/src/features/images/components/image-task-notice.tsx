@@ -59,7 +59,7 @@ export function ImageTaskNotice(props: {
         {t(imageLabel(issue.summary), issue.summaryParams || {})}
       </AlertTitle>
       <AlertDescription className='space-y-2 text-xs leading-5'>
-        {diagnostic && (
+        {diagnostic && !issue.reconciliation && (
           <div className='space-y-1'>
             {props.diagnostics && (
               <div className='font-medium'>{t('Failure reason')}</div>
@@ -86,7 +86,33 @@ export function ImageTaskNotice(props: {
             <dt>{t('Billing status')}:</dt>
             <dd>{t(imageLabel(props.task.billing_status))}</dd>
           </div>
-          {issue.pendingAction && (
+          {issue.reconciliation && (
+            <>
+              {issue.reconciliation.started_at > 0 && (
+                <div>
+                  <dt>{t('Status checking started')}:</dt>
+                  <dd>
+                    {formatTimestampToDate(issue.reconciliation.started_at)}
+                  </dd>
+                </div>
+              )}
+              {issue.reconciliation.deadline_at > 0 && (
+                <div>
+                  <dt>{t('Automatic checking until')}:</dt>
+                  <dd>
+                    {formatTimestampToDate(issue.reconciliation.deadline_at)}
+                  </dd>
+                </div>
+              )}
+              {issue.nextAttemptAt > 0 && (
+                <div>
+                  <dt>{t('Next status check')}</dt>
+                  <dd>{formatTimestampToDate(issue.nextAttemptAt)}</dd>
+                </div>
+              )}
+            </>
+          )}
+          {issue.pendingAction && !issue.reconciliation && (
             <>
               <div>
                 <dt>{t('Total retries')}</dt>

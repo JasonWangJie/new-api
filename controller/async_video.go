@@ -925,9 +925,15 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 		if base == "" {
 			base = constant.GetChannelBaseURL(channel.Type)
 		}
+		cfg, err := service.GetMediaRuntimeConfig(ctx)
+		if err != nil {
+			return err
+		}
+		pollContext, cancelPoll := context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
+		defer cancelPoll()
 		var response *http.Response
 		if task.PrivateData.UpstreamAsync != nil {
-			response, err = service.PollUpstreamAsync(ctx, base, channel.GetSetting().Proxy, task.PrivateData.UpstreamAsync, service.UpstreamAsyncTemplateContext{
+			response, err = service.PollUpstreamAsync(pollContext, base, channel.GetSetting().Proxy, task.PrivateData.UpstreamAsync, service.UpstreamAsyncTemplateContext{
 				TaskID: task.GetUpstreamTaskID(), Model: task.Properties.OriginModelName,
 				UpstreamModel: task.Properties.UpstreamModelName, APIKey: key,
 			})
@@ -936,7 +942,7 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 			if !ok {
 				return errors.New("video provider does not support bounded content polling")
 			}
-			response, err = poller.FetchTaskContext(ctx, base, key, task, channel.GetSetting().Proxy)
+			response, err = poller.FetchTaskContext(pollContext, base, key, task, channel.GetSetting().Proxy)
 		}
 		if err != nil {
 			return err
@@ -945,12 +951,9 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 			return errors.New("completed video result is unavailable")
 		}
 		defer response.Body.Close()
-		cfg, err := service.GetMediaRuntimeConfig(ctx)
-		if err != nil {
-			return err
-		}
 		limit := cfg.MaxFileBytes*4 + (1 << 20)
 		body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+		cancelPoll()
 		if err != nil {
 			return err
 		}

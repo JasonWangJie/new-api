@@ -55,6 +55,7 @@ import {
   imageTaskSpecifications,
   imageTaskIssue,
   imageTaskCanResume,
+  imageTaskVideoReconciliation,
   imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
 import type { ImageRetryDecision, ImageTask } from '../types'
@@ -239,7 +240,8 @@ export function ImageTaskDetails(props: {
   onManage: (
     action: 'resume' | 'terminate',
     confirmUpstreamChecked?: boolean,
-    confirmQuotaReconciled?: boolean
+    confirmQuotaReconciled?: boolean,
+    checkExistingVideo?: boolean
   ) => void
 }) {
   const { t } = useTranslation()
@@ -331,6 +333,9 @@ export function ImageTaskDetails(props: {
       : ''
   const attempts = props.admin ? data?.attempt_history || [] : []
   const issue = data ? imageTaskIssue(data) : null
+  const videoReconciliation = data
+    ? imageTaskVideoReconciliation(data)
+    : undefined
   const upstreamProgress = data ? imageTaskUpstreamProgress(data) : null
   const canResume = Boolean(
     data && imageTaskCanResume(data, props.admin, props.canManage)
@@ -387,14 +392,20 @@ export function ImageTaskDetails(props: {
                       size='sm'
                       variant='outline'
                       onClick={() => {
-                        if (data.error_code === 'billing_quota_uncertain') {
+                        if (videoReconciliation) {
+                          props.onManage('resume', undefined, undefined, true)
+                        } else if (
+                          data.error_code === 'billing_quota_uncertain'
+                        ) {
                           props.onManage('resume', undefined, true)
                         } else {
                           props.onManage('resume')
                         }
                       }}
                     >
-                      {t('Resume')}
+                      {videoReconciliation
+                        ? t('Check existing video task')
+                        : t('Resume')}
                     </Button>
                   )}
                   {canTerminate && (
@@ -936,7 +947,15 @@ export function ImageTaskDetails(props: {
                   void task.refetch()
                 }}
                 onRefreshUpstream={
-                  canResume ? () => props.onManage('resume') : undefined
+                  canResume
+                    ? () => {
+                        if (videoReconciliation) {
+                          props.onManage('resume', undefined, undefined, true)
+                        } else {
+                          props.onManage('resume')
+                        }
+                      }
+                    : undefined
                 }
               />
             )}

@@ -147,17 +147,43 @@ func PreviewMediaRouting(c *gin.Context) {
 	imageManagementData(c, preview)
 }
 
+func GetImageRuntimeStatus(c *gin.Context) {
+	cfg, err := service.GetImageRuntimeConfig(c.Request.Context())
+	if err != nil {
+		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image runtime status is unavailable"))
+		return
+	}
+	imageManagementData(c, gin.H{
+		"node":       common.NodeName,
+		"configured": gin.H{"worker_concurrency": cfg.Workers, "recovery_interval_seconds": cfg.RecoveryInterval},
+		"effective":  service.GetAsyncImageWorkerStatus(),
+	})
+}
+
 func UpdateImageRuntime(c *gin.Context) {
 	defaults := service.DefaultImageRuntimeConfig()
-	cfg := service.ImageRuntimeConfig{FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds, TimeoutRetries: defaults.TimeoutRetries, TimeoutRetryBase: defaults.TimeoutRetryBase, TimeoutRetryMax: defaults.TimeoutRetryMax}
-	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &cfg); err != nil {
+	input := struct {
+		service.ImageRuntimeConfig
+		Revision *int64 `json:"revision"`
+	}{ImageRuntimeConfig: service.ImageRuntimeConfig{FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds, TimeoutRetries: defaults.TimeoutRetries, TimeoutRetryBase: defaults.TimeoutRetryBase, TimeoutRetryMax: defaults.TimeoutRetryMax}}
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
 		return
 	}
-	if err := service.SaveImageRuntimeConfig(c.Request.Context(), cfg); err != nil {
-		imageManagementError(c, 400, err)
+	if input.Revision == nil {
+		imageManagementError(c, http.StatusPreconditionRequired, errors.New("Configuration revision is required. Reload it before saving"))
 		return
 	}
+	cfg := input.ImageRuntimeConfig
+	if err := service.SaveImageRuntimeConfig(c.Request.Context(), cfg, *input.Revision); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, model.ErrOptionRevisionConflict) {
+			status = http.StatusConflict
+		}
+		imageManagementError(c, status, err)
+		return
+	}
+	cfg.Revision = *input.Revision + 1
 	imageManagementData(c, cfg)
 }
 
@@ -317,8 +343,9 @@ func SaveImageChannelPool(c *gin.Context) {
 		Resolution  string `json:"resolution"`
 		ExpectedIDs []int  `json:"expected_ids"`
 		Channels    []struct {
-			Id       int `json:"id"`
-			Priority int `json:"priority"`
+			Id       int  `json:"id"`
+			Weight   *int `json:"weight"`
+			Priority *int `json:"priority"`
 		} `json:"channels"`
 	}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
@@ -358,12 +385,22 @@ func SaveImageChannelPool(c *gin.Context) {
 	seen := make(map[int]bool)
 	rows := make([]model.ImageChannelPool, 0, len(input.Channels))
 	for _, channel := range input.Channels {
-		if channel.Id < 1 || seen[channel.Id] || channel.Priority < 0 || channel.Priority > 1000000 {
+		if channel.Weight != nil && channel.Priority != nil && *channel.Weight != *channel.Priority {
+			imageManagementError(c, 400, errors.New("Pool weight and legacy priority must match when both are provided"))
+			return
+		}
+		weight := 0
+		if channel.Weight != nil {
+			weight = *channel.Weight
+		} else if channel.Priority != nil {
+			weight = *channel.Priority
+		}
+		if channel.Id < 1 || seen[channel.Id] || weight < 0 || weight > 1000000 {
 			imageManagementError(c, 400, errors.New("Invalid or duplicate pool channel"))
 			return
 		}
 		seen[channel.Id] = true
-		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution, ChannelId: channel.Id, Priority: channel.Priority})
+		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution, ChannelId: channel.Id, Priority: weight})
 	}
 	if input.Platform == "mixed" {
 		ids := make([]int, 0, len(input.Channels))
@@ -467,14 +504,60 @@ func DeleteImageChannelPool(c *gin.Context) {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image channel pool binding"))
 		return
 	}
-	// A binding includes every channel row, or the explicit closed placeholder.
-	result := model.DB.WithContext(c.Request.Context()).Where("binding_key = ?", key).Delete(&model.ImageChannelPool{})
-	if result.Error != nil {
-		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image channel pool could not be deleted"))
+	var input struct {
+		ExpectedIDs []int `json:"expected_ids"`
+	}
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<16), &input); err != nil {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image pool revision"))
 		return
 	}
-	if result.RowsAffected == 0 {
-		imageManagementError(c, http.StatusNotFound, errors.New("Image channel pool binding was not found"))
+	if input.ExpectedIDs == nil {
+		imageManagementError(c, http.StatusPreconditionRequired, errors.New("Pool revision is required. Reload it before deleting"))
+		return
+	}
+	if len(input.ExpectedIDs) == 0 {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image pool revision"))
+		return
+	}
+	slices.Sort(input.ExpectedIDs)
+	for i, id := range input.ExpectedIDs {
+		if id < 1 || i > 0 && id == input.ExpectedIDs[i-1] {
+			imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image pool revision"))
+			return
+		}
+	}
+	err := model.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		// Serialize deletion with SaveImageChannelPool, including a concurrent
+		// replacement of a previously closed binding.
+		guard := model.ImageChannelPool{BindingKey: key, ChannelId: -1}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "binding_key"}, {Name: "channel_id"}},
+			DoUpdates: clause.Assignments(map[string]any{"priority": 0}),
+		}).Create(&guard).Error; err != nil {
+			return err
+		}
+		var currentIDs []int
+		if err := tx.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id >= ?", key, 0).Order("id").Pluck("id", &currentIDs).Error; err != nil {
+			return err
+		}
+		if !slices.Equal(currentIDs, input.ExpectedIDs) {
+			return model.ErrImageConflict
+		}
+		result := tx.Where("binding_key = ? AND id IN ?", key, currentIDs).Delete(&model.ImageChannelPool{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(currentIDs)) {
+			return model.ErrImageConflict
+		}
+		return tx.Where("binding_key = ? AND channel_id = ?", key, -1).Delete(&model.ImageChannelPool{}).Error
+	})
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, model.ErrImageConflict) {
+			status = http.StatusConflict
+		}
+		imageManagementError(c, status, err)
 		return
 	}
 	imageManagementData(c, nil)

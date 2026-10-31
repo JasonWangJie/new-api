@@ -16,10 +16,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type ImageRuntimeConfig struct {
+	Revision                    int64  `json:"revision"`
 	AsyncEnabled                bool   `json:"async_enabled"`
 	AutoArchive                 bool   `json:"auto_archive_to_library"`
 	Workers                     int    `json:"worker_concurrency"`
@@ -105,6 +105,9 @@ func GetImageRuntimeConfig(ctx context.Context) (ImageRuntimeConfig, error) {
 }
 
 func (cfg ImageRuntimeConfig) Validate() error {
+	if cfg.Revision < 0 || cfg.Revision > model.MaxOptionRevision {
+		return model.ErrOptionRevisionInvalid
+	}
 	if cfg.FailedRequestRetentionHours < 0 || cfg.FailedRequestRetentionHours > 168 || cfg.AccountCooldownSeconds < 0 || cfg.AccountCooldownSeconds > 3600 || cfg.SupplierRetryCapacity < 0 || cfg.SupplierRetryCapacity > 1000 || cfg.SupplierRetryWindowSeconds < 1 || cfg.SupplierRetryWindowSeconds > 3600 {
 		return errors.New("invalid image request retention or retry control limits")
 	}
@@ -149,7 +152,7 @@ func (cfg ImageRuntimeConfig) Validate() error {
 	return nil
 }
 
-func SaveImageRuntimeConfig(ctx context.Context, cfg ImageRuntimeConfig) error {
+func SaveImageRuntimeConfig(ctx context.Context, cfg ImageRuntimeConfig, expectedRevision ...int64) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -157,7 +160,12 @@ func SaveImageRuntimeConfig(ctx context.Context, cfg ImageRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	return model.DB.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value"})}).Create(&model.Option{Key: "image_runtime_config", Value: string(data)}).Error
+	var expected *int64
+	if len(expectedRevision) > 0 {
+		expected = &expectedRevision[0]
+	}
+	_, err = model.SaveVersionedOption(ctx, "image_runtime_config", string(data), expected)
+	return err
 }
 
 type ImageModelCapability struct {

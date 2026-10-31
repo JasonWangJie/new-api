@@ -100,6 +100,7 @@ function renderSettings(
       },
     ],
     pools: [11, 12].map((channelId) => ({
+      id: channelId + 100,
       binding_key: bindingKey,
       group: groups?.pool ?? 'default',
       platform: 'gemini',
@@ -254,7 +255,7 @@ test.each(cases)(
     expect(requests[0]).toEqual(
       tab === 'Image policies'
         ? [url, 'DELETE', { group: 'default', platform: 'gemini', version: 3 }]
-        : [url, 'DELETE']
+        : [url, 'DELETE', { expected_ids: [111, 112] }]
     )
     finish()
     await waitFor(() =>

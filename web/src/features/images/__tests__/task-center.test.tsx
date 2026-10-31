@@ -38,6 +38,7 @@ import ru from '@/i18n/locales/ru.json'
 import viLocale from '@/i18n/locales/vi.json'
 import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
+import { formatTimestampToDate } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -54,6 +55,7 @@ import { ImageResults } from '../components/image-results'
 import { ImageTaskDetails } from '../components/image-task-details'
 import { ImageTaskNotice } from '../components/image-task-notice'
 import {
+  imageTaskCanResume,
   imageTaskIssue,
   imageTaskProgress,
   imageTaskSuccessRate,
@@ -1224,6 +1226,172 @@ test('local routing dependency waits show readable decision and stage labels in 
     screen.queryByText('routing_controls_unavailable')
   ).not.toBeInTheDocument()
 })
+
+test.each([false, true])(
+  'video reconciliation distinguishes automatic checks from administrator review (manual=%s)',
+  (manual) => {
+    const checking = {
+      ...task,
+      media_type: 'video' as const,
+      status: 'processing',
+      billing_status: 'reserved',
+      video_reconciliation: {
+        started_at: 1789600100,
+        deadline_at: 1789601000,
+        next_poll_at: manual ? 0 : 1789600200,
+        manual_required: manual,
+        reason: 'upstream_status_unconfirmed',
+        revision: 1,
+      },
+    }
+    render(<ImageTaskNotice task={checking} diagnostics />)
+    const notice = screen.getByRole('status')
+    expect(notice).toHaveTextContent(
+      manual
+        ? 'Video task requires administrator review'
+        : 'Checking the existing video task'
+    )
+    expect(notice).toHaveTextContent(
+      'Reserved quota is retained and no new generation will be submitted.'
+    )
+    expect(notice).toHaveTextContent(formatTimestampToDate(1789600100))
+    expect(notice).toHaveTextContent(formatTimestampToDate(1789601000))
+    expect(within(notice).queryByText('Total retries')).not.toBeInTheDocument()
+    expect(within(notice).queryByText('Next retry')).not.toBeInTheDocument()
+    if (manual) {
+      expect(
+        within(notice).queryByText('Next status check')
+      ).not.toBeInTheDocument()
+    } else {
+      expect(notice).toHaveTextContent(formatTimestampToDate(1789600200))
+      expect(within(notice).getByText('Next status check')).toBeVisible()
+    }
+  }
+)
+
+test.each([
+  {
+    admin: false,
+    canManage: true,
+    manual: true,
+    resumable: true,
+    allowed: false,
+  },
+  {
+    admin: true,
+    canManage: false,
+    manual: true,
+    resumable: true,
+    allowed: false,
+  },
+  {
+    admin: true,
+    canManage: true,
+    manual: false,
+    resumable: true,
+    allowed: false,
+  },
+  {
+    admin: true,
+    canManage: true,
+    manual: true,
+    resumable: false,
+    allowed: false,
+  },
+  {
+    admin: true,
+    canManage: true,
+    manual: true,
+    resumable: true,
+    allowed: true,
+  },
+])(
+  'video reconciliation recovery requires administrator management and a manual check: %j',
+  ({ admin, canManage, manual, resumable, allowed }) => {
+    const checking = {
+      ...task,
+      media_type: 'video' as const,
+      status: 'processing',
+      can_resume: resumable,
+      video_reconciliation: {
+        started_at: 1789600100,
+        deadline_at: 1789601000,
+        next_poll_at: 0,
+        manual_required: manual,
+        reason: 'upstream_status_unconfirmed',
+        revision: 1,
+      },
+    }
+    expect(imageTaskCanResume(checking, admin, canManage)).toBe(allowed)
+  }
+)
+
+test.each(['list', 'details', 'upstream-result'])(
+  'video reconciliation recovery confirms checking the existing job from %s',
+  async (source) => {
+    const checking = {
+      ...task,
+      media_type: 'video' as const,
+      status: 'processing',
+      billing_status: 'reserved',
+      can_resume: true,
+      video_reconciliation: {
+        started_at: 1789600100,
+        deadline_at: 1789601000,
+        next_poll_at: 0,
+        manual_required: true,
+        reason: 'upstream_status_unconfirmed',
+        revision: 1,
+      },
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [checking],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: checking,
+      results:
+        source === 'upstream-result'
+          ? [{ ...detail.results[0], source: 'upstream' }]
+          : [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    if (source !== 'list') {
+      await user.click(screen.getByRole('button', { name: task.id }))
+      await screen.findByRole('dialog', { name: 'Media task details' })
+    }
+    await user.click(
+      await screen.findByRole('button', {
+        name:
+          source === 'upstream-result'
+            ? 'Refresh link'
+            : 'Check existing video task',
+      })
+    )
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Check existing video task',
+    })
+    expect(confirmation).toHaveTextContent(
+      'Check the existing upstream video task again. Reserved quota is retained and no new generation will be submitted.'
+    )
+    expect(imageRequest).not.toHaveBeenCalled()
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        `/api/admin/media-tasks/${task.id}/resume`,
+        'POST',
+        {}
+      )
+    )
+  }
+)
 
 test.each([false, true])(
   'quota uncertainty prevents ordinary user recovery in lists and details (mobile=%s)',

@@ -71,13 +71,27 @@ func ChangeAsyncMediaJob(query *gorm.DB, updates map[string]any, eventType strin
 }
 
 func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) error {
-	changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil, "output_root_path": "", "output_object_key": ""}
+	// Keep output pointers until the caller confirms file deletion, so a failed
+	// filesystem cleanup remains discoverable on the next sweep.
+	changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil}
 	if job.ReferenceRecoveryStage != "refund" {
 		changes["status"] = "expired"
 	}
-	query := DB.WithContext(ctx).Model(&AsyncMediaJob{}).
-		Where("id = ? AND expires_at <= ? AND lease_expires_at <= ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", job.ID, now, now, job.AttemptGeneration, job.ReferenceRecoveryStage)
-	return ChangeAsyncMediaJob(query, changes, "")
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Match settlement's task-before-job lock order. Retention expiry must
+		// not destroy credentials needed to reconcile an accepted operation.
+		var task Task
+		err := lockForUpdate(tx).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", job.TaskId, job.UserId, job.AttemptGeneration).Take(&task).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil && task.PrivateData.AsyncMedia && (task.PrivateData.VideoReconciliation != nil || task.PrivateData.UpstreamTaskID != "" && task.Quota > 0) && task.Status != TaskStatusSuccess && task.Status != TaskStatusFailure && job.ReferenceRecoveryStage != "refund" && job.BillingStatus != "refunded" && job.BillingStatus != "not_billable" {
+			return ErrImageConflict
+		}
+		query := tx.Model(&AsyncMediaJob{}).
+			Where("id = ? AND expires_at <= ? AND lease_expires_at <= ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ? AND billing_status = ?", job.ID, now, now, job.AttemptGeneration, job.ReferenceRecoveryStage, job.BillingStatus)
+		return ChangeAsyncMediaJob(query, changes, "")
+	})
 }
 
 func recordAsyncMediaEventTx(tx *gorm.DB, job AsyncMediaJob, eventType, discriminator string, keyIndex *int, referenceMode string) error {
