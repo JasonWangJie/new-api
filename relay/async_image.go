@@ -1033,6 +1033,10 @@ func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string,
 		}
 		for _, candidate := range response.Candidates {
 			for _, part := range candidate.Content.Parts {
+				// Thought images are intermediate outputs, not final billable images.
+				if part.Thought {
+					continue
+				}
 				if part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "image/") {
 					references = append(references, "data:"+part.InlineData.MimeType+";base64,"+part.InlineData.Data)
 				}

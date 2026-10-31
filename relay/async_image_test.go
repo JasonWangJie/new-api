@@ -1201,6 +1201,56 @@ func TestAsyncImageFailureDiagnosticsAndTransportBarrier(t *testing.T) {
 	}
 }
 
+func TestExtractAsyncImageOutputsGeminiThoughts(t *testing.T) {
+	var small, final bytes.Buffer
+	require.NoError(t, png.Encode(&small, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	require.NoError(t, png.Encode(&final, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	smallImage := dto.GeminiPart{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString(small.Bytes())}}
+	finalImage := dto.GeminiPart{ThoughtSignature: common.RawMessage(`"final-image-signature"`), InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString(final.Bytes())}}
+	thoughtImage := smallImage
+	thoughtImage.Thought = true
+	invalidThought := dto.GeminiPart{Thought: true, InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: "not an image"}}
+	thoughts := make([]dto.GeminiPart, dto.MaxImageN+1)
+	finals := make([]dto.GeminiPart, dto.MaxImageN+1)
+	for i := range thoughts {
+		thoughts[i], finals[i] = invalidThought, finalImage
+	}
+	for _, tc := range []struct {
+		name       string
+		candidates [][]dto.GeminiPart
+		wantSizes  [][2]int
+		wantError  bool
+	}{
+		{name: "thought_before_signed_final", candidates: [][]dto.GeminiPart{{thoughtImage, finalImage}}, wantSizes: [][2]int{{2, 3}}},
+		{name: "invalid_thought_after_final", candidates: [][]dto.GeminiPart{{finalImage, invalidThought}}, wantSizes: [][2]int{{2, 3}}},
+		{name: "finals_across_candidates_keep_order_and_sizes", candidates: [][]dto.GeminiPart{{smallImage, thoughtImage}, {invalidThought, finalImage}}, wantSizes: [][2]int{{1, 1}, {2, 3}}},
+		{name: "thoughts_only", candidates: [][]dto.GeminiPart{{thoughtImage, invalidThought}}, wantError: true},
+		{name: "thoughts_do_not_count_toward_output_limit", candidates: [][]dto.GeminiPart{append(thoughts, finalImage)}, wantSizes: [][2]int{{2, 3}}},
+		{name: "final_output_limit_still_enforced", candidates: [][]dto.GeminiPart{finals}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := dto.GeminiChatResponse{Candidates: make([]dto.GeminiChatCandidate, len(tc.candidates))}
+			for i, parts := range tc.candidates {
+				response.Candidates[i].Content.Parts = parts
+			}
+			body, err := common.Marshal(response)
+			require.NoError(t, err)
+			images, err := ExtractAsyncImageOutputs(t.Context(), body, "gemini", service.DefaultImageRuntimeConfig())
+			if tc.wantError {
+				require.ErrorContains(t, err, "complete images")
+				assert.Empty(t, images)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, images, len(tc.wantSizes))
+			for i, size := range tc.wantSizes {
+				assert.Equal(t, size[0], images[i].Width)
+				assert.Equal(t, size[1], images[i].Height)
+			}
+		})
+	}
+}
+
 func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.T) {
 	previousDB, previousCount, previousRedis := model.DB, constant.CountToken, common.RedisEnabled
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "completion-recovery.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -1237,13 +1287,20 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			channelType := constant.ChannelTypeOpenAI
 			if tc.platform == "gemini" {
 				channelType = constant.ChannelTypeGemini
-				response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}}}}}}}
+				response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{
+					{Thought: true, InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
+					{ThoughtSignature: common.RawMessage(`"final-image-signature"`), InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
+				}}}}}
 			}
 			body, err := common.Marshal(response)
 			require.NoError(t, err)
 			completion := &service.AsyncImageCompletion{
-				Body: body, Usage: &dto.Usage{}, BillingBody: []byte(`{"n":1}`), UpstreamModel: "frozen-upstream", BillingModel: "frozen-billing",
+				Body: body, Usage: &dto.Usage{PromptTokens: 400, CompletionTokens: 4923, TotalTokens: 5323, CompletionTokenDetails: dto.OutputTokenDetails{ReasoningTokens: 2545}}, BillingBody: []byte(`{"n":1}`), UpstreamModel: "frozen-upstream", BillingModel: "frozen-billing",
 				Billing: service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}},
+			}
+			if tc.platform == "gemini" {
+				expression := `tier("image", fixed(0.01)) * image_count`
+				completion.Billing.Tiered = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: 1}
 			}
 			request := service.AsyncImageRequest{
 				Platform: tc.platform, Model: "accepted-image", Count: 1, Kind: "image_to_image", Completion: completion,
@@ -1276,6 +1333,18 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			var log model.Log
 			require.NoError(t, common.UnmarshalJsonStr(bill.LogPayload, &log))
 			assert.Equal(t, completion.BillingModel, log.ModelName)
+			assert.Equal(t, 400, log.PromptTokens)
+			assert.Equal(t, 4923, log.CompletionTokens)
+			var other struct {
+				ImageCount     int              `json:"image_count"`
+				Specifications []map[string]any `json:"image_billing_specifications"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+			assert.Equal(t, 1, other.ImageCount)
+			assert.Len(t, other.Specifications, 1)
+			var usage dto.Usage
+			require.NoError(t, common.UnmarshalJsonStr(bill.Usage, &usage))
+			assert.Equal(t, *completion.Usage, usage, "filtering thought images must preserve upstream token usage")
 			if tc.resolutionMapping {
 				assert.Equal(t, request.Model, log.ModelName, "resolution aliases must not replace the public billing model")
 			}
@@ -1293,7 +1362,10 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			response := map[string]any{
-				"candidates":    []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: tc.imageData}}}}}},
+				"candidates": []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{
+					{Thought: true, InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
+					{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: tc.imageData}},
+				}}}},
 				"usageMetadata": map[string]int{"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
 				"metadata":      "",
 			}
