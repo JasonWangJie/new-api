@@ -1005,14 +1005,18 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 	ctx["baseUrl"] = a.info.ChannelBaseUrl
 	ctx["clientRequest"] = jsonValue(clientRequest)
 	proxy := a.info.ChannelSetting.Proxy
-	auth, err := resolveAuth(a.plugin.Meta.Auth, a.info.ApiKey, proxy)
+	key := a.info.ApiKey
+	if task.PrivateData.Key != "" {
+		key = task.PrivateData.Key
+	}
+	auth, err := resolveAuth(a.plugin.Meta.Auth, key, proxy)
 	if err != nil {
 		return nil, err
 	}
 	ctx["auth"] = auth
 	ctx["authHeader"] = auth["authHeader"]
 	if a.plugin.Meta.Auth.Type == "" || a.plugin.Meta.Auth.Type == "none" || a.plugin.Meta.Auth.Type == "api_key" {
-		ctx["apiKey"] = a.info.ApiKey
+		ctx["apiKey"] = key
 	}
 	value, err := a.plugin.Engine.Call(context.Background(), "buildContentRequest", ctx)
 	if err != nil {

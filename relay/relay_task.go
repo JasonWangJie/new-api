@@ -252,10 +252,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		code, message := TaskPlatformUnavailableError(platform)
 		return nil, service.TaskErrorWrapperLocal(errors.New(message), code, http.StatusBadRequest)
 	}
-	// NLDW can retain a charge while submission is uncertain. Only durable
+	// These providers can retain a charge while submission is uncertain. Only durable
 	// media jobs reconcile polling failures and timeouts without refunding.
-	if platform == "nldw" && !c.GetBool("async_media_prepare") && !c.GetBool("async_media_execution") {
-		return nil, service.TaskErrorWrapperLocal(errors.New("NLDW video requires /v1/videos/generations_async; use the video workbench or submit with provider nldw"), "async_video_required", http.StatusBadRequest)
+	if service.VideoSubmissionRequiresReconciliation(string(platform)) && !c.GetBool("async_media_prepare") && !c.GetBool("async_media_execution") {
+		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("%s video requires /v1/videos/generations_async; use the video workbench or submit with provider %s", platform, platform), "async_video_required", http.StatusBadRequest)
 	}
 	// buildSubmitRequest runs during validation and the unreleased plugin
 	// contract exposes this host-generated id to that hook.

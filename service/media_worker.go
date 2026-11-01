@@ -214,7 +214,7 @@ func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.
 func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg MediaRuntimeConfig) error {
 	if job.Status == "failed" || job.Status == "expired" || job.Status == "execution_unknown" {
 		if job.Status == "execution_unknown" {
-			if job.ReferenceRecoveryStage == "unknown" || job.Provider == "nldw" && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
+			if job.ReferenceRecoveryStage == "unknown" || VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
 				return nil
 			}
 			return model.UpdateAsyncMediaJob(parent, job, map[string]any{"status": "failed", "next_attempt_at": 0})
@@ -395,7 +395,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			billingStatus = "unknown"
 		}
 		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "failed", billingStatus, VideoTaskFailureReason(reason), 0
-		if job.Provider == "nldw" && job.DispatchedAt > 0 && billingStatus == "unknown" {
+		if VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && billingStatus == "unknown" {
 			updates["status"] = "execution_unknown"
 		}
 		return nil
@@ -441,7 +441,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		}
 	}
 	if current.DispatchedAt > 0 && updates["billing_status"] == "unknown" {
-		if current.Provider == "nldw" {
+		if VideoSubmissionRequiresReconciliation(current.Provider) {
 			updates["status"] = "execution_unknown"
 		}
 		reason = "Upstream submission could not be confirmed; the video operation will not be repeated\n" + reason

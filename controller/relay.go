@@ -482,11 +482,11 @@ func executeTaskSubmissionWith(
 	stage := "start"
 	defer func() {
 		if !durable && relayInfo.Billing != nil {
-			if c.GetBool("async_media_nldw_dispatched") && !c.GetBool("async_media_submission_rejected") {
+			if c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
 				// The persisted media dispatch barrier owns this reservation even
 				// when a receipt is lost or its Task row cannot be saved. Refund
 				// requires confirmed rejection, not a local timeout or parse error.
-				logger.LogWarn(c, fmt.Sprintf("NLDW video submission requires reconciliation; retaining reservation task=%s stage=%s", relayInfo.PublicTaskID, stage))
+				logger.LogWarn(c, fmt.Sprintf("video submission requires reconciliation; retaining reservation task=%s stage=%s", relayInfo.PublicTaskID, stage))
 				return
 			}
 			diagnostics.refund(stage)

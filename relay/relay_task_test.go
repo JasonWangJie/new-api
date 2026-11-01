@@ -295,6 +295,39 @@ func newTaskSubmitContext(t *testing.T, originalModel, mapping string) (*gin.Con
 	return c, &relaycommon.RelayInfo{TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
 }
 
+func TestRelayTaskSubmitRequiresDurableVideoAdmission(t *testing.T) {
+	for _, provider := range []string{"nldw", "yuxibox", "ordinary-video"} {
+		for _, admission := range []string{"", "async_media_prepare", "async_media_execution"} {
+			t.Run(provider+"/"+admission, func(t *testing.T) {
+				source := fmt.Sprintf(`
+export const meta = {apiVersion:1,key:%q,name:"Admission fixture",version:"1.0.0",author:{name:"Test"},models:["admission-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(){throw new Error("submission validation reached");}
+export function parseSubmitResponse(){return {taskId:"unused"};}
+export function buildQueryRequest(){return {url:"https://provider.example/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+`, provider)
+				c, info := newTaskSubmitContext(t, "admission-model", "")
+				pinMappingOrderPlugin(t, c, source)
+				info.OriginModelName = "admission-model"
+				if admission != "" {
+					c.Set(admission, true)
+				}
+				result, taskErr := RelayTaskSubmit(c, info)
+				require.NotNil(t, taskErr)
+				assert.Nil(t, result)
+				assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
+				if provider != "ordinary-video" && admission == "" {
+					assert.Equal(t, "async_video_required", taskErr.Code)
+					assert.Contains(t, taskErr.Message, "/v1/videos/generations_async")
+					return
+				}
+				assert.Equal(t, "plugin_request_invalid", taskErr.Code)
+				assert.Contains(t, taskErr.Message, "submission validation reached")
+			})
+		}
+	}
+}
+
 func TestRelayTaskSubmitMapsBeforeValidateWhenOriginSet(t *testing.T) {
 	const mapping = `{"alias-model":"mid-model","mid-model":"declared-model"}`
 

@@ -21,6 +21,12 @@ import (
 var ErrVideoRetryDeferred = errors.New("video recovery decision must be checked again")
 var ErrVideoCompatibleChannelsUnavailable = errors.New("no compatible video channel is available")
 
+// VideoSubmissionRequiresReconciliation preserves reservations for providers
+// whose submission failures may leave a billable operation running upstream.
+func VideoSubmissionRequiresReconciliation(provider string) bool {
+	return provider == "nldw" || provider == "yuxibox"
+}
+
 // PlanInitialVideoFailure is shared by live submission and sample previews.
 // Only the captured legacy protocol evidence can grant its existing exception.
 func PlanInitialVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {

@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
@@ -102,6 +106,21 @@ func allowPrivateTaskMediaTest(t *testing.T) {
 	system_setting.GetFetchSetting().AllowedPorts = []string{"1-65535"}
 	t.Cleanup(func() { *system_setting.GetFetchSetting() = originalFetchSetting })
 	service.InitHttpClient()
+}
+
+func taskMediaMP4Fixture() []byte {
+	box := func(kind string, payload []byte) []byte {
+		result := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(result, uint32(len(result)))
+		copy(result[4:8], kind)
+		copy(result[8:], payload)
+		return result
+	}
+	handler := make([]byte, 25)
+	copy(handler[8:12], "vide")
+	video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
+	video = append(video, box("moov", box("trak", box("mdia", box("hdlr", handler))))...)
+	return append(video, box("mdat", []byte("video-sample"))...)
 }
 
 func TestAsyncVideoReconciliationManagementRetainsReservation(t *testing.T) {
@@ -710,6 +729,192 @@ func TestProxyTaskMediaAllowsOnlyCredentiallessCrossOriginRedirect(t *testing.T)
 	assert.Equal(t, "bytes=0-3", destinationRange)
 }
 
+func TestProxyTaskMediaYuxiboxPublicHTTPSRedirect(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	task.Platform = "yuxibox"
+	previousCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
+	const origin = "https://8.8.8.8"
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Update("base_url", origin).Error)
+	previousFetch := *system_setting.GetFetchSetting()
+	t.Cleanup(func() { *system_setting.GetFetchSetting() = previousFetch })
+	*system_setting.GetFetchSetting() = system_setting.FetchSetting{
+		EnableSSRFProtection: true, ApplyIPFilterForDomain: true, AllowedPorts: []string{"443"},
+	}
+	service.InitHttpClient()
+
+	var target string
+	var receivedSource, receivedDestination http.Header
+	var persistedVideo []byte
+	var requestMethods []string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMethods = append(requestMethods, r.Method)
+		if r.URL.Path == "/provider/content" || r.URL.Path == "/v1/videos/upstream-h3/content" {
+			receivedSource = r.Header.Clone()
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "https://1.1.1.1/result", http.StatusFound)
+			return
+		}
+		receivedDestination = r.Header.Clone()
+		w.Header().Set("Content-Type", "video/mp4")
+		if r.URL.Path == "/persisted.mp4" {
+			w.Header().Set("Content-Length", fmt.Sprint(len(persistedVideo)))
+			_, _ = w.Write(persistedVideo)
+			return
+		}
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 0-3/10")
+		w.WriteHeader(http.StatusPartialContent)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte("data"))
+		}
+	}))
+	defer upstream.Close()
+	// Keep public HTTPS URLs and run the real redirect policy, but route test
+	// connections to the local TLS fixture without external network requests.
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	require.NotEmpty(t, upstream.Certificate().DNSNames)
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = upstream.Certificate().DNSNames[0]
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", upstream.Listener.Addr().String())
+	}
+	protected := service.GetSSRFProtectedHTTPClient()
+	previousTransport := protected.Transport
+	relayClient := service.GetHttpClient()
+	previousRelayTransport := relayClient.Transport
+	protected.Transport = transport
+	relayClient.Transport = transport
+	t.Cleanup(func() {
+		protected.Transport = previousTransport
+		relayClient.Transport = previousRelayTransport
+		transport.CloseIdleConnections()
+	})
+
+	for _, sample := range []struct {
+		name, method, target, insecureSetting, initialURL string
+		rejected                                          bool
+	}{
+		{name: "GET preserves range without secrets", method: http.MethodGet, target: "https://1.1.1.1/result"},
+		{name: "HEAD preserves range without secrets", method: http.MethodHead, target: "https://1.1.1.1/result"},
+		{name: "same CDN redirect does not restore secrets", method: http.MethodGet, target: "https://1.1.1.1/redirect"},
+		{name: "HTTP rejected", method: http.MethodGet, target: "http://1.1.1.1/result", rejected: true},
+		{name: "private target rejected", method: http.MethodGet, target: "https://127.0.0.1/result", rejected: true},
+		{name: "SSRF disabled rejected", method: http.MethodGet, target: "https://1.1.1.1/result", insecureSetting: "disabled", rejected: true},
+		{name: "private fetch enabled rejected", method: http.MethodGet, target: "https://1.1.1.1/result", insecureSetting: "private", rejected: true},
+		{name: "DNS protection disabled rejected", method: http.MethodGet, target: "https://1.1.1.1/result", insecureSetting: "dns", rejected: true},
+		{name: "initial cross-origin URL rejected", method: http.MethodGet, initialURL: "https://1.1.1.1/provider/content", rejected: true},
+		{name: "initial HTTP URL rejected", method: http.MethodGet, initialURL: "http://8.8.8.8/provider/content", rejected: true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			fetchSetting := system_setting.GetFetchSetting()
+			fetchSetting.EnableSSRFProtection = sample.insecureSetting != "disabled"
+			fetchSetting.AllowPrivateIp = sample.insecureSetting == "private"
+			fetchSetting.ApplyIPFilterForDomain = sample.insecureSetting != "dns"
+			target, receivedSource, receivedDestination = sample.target, nil, nil
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(sample.method, "/content", nil)
+			c.Request.Header.Set("Range", "bytes=0-3")
+			c.Request.Header.Set("If-Range", "etag-fixture")
+			c.Request.Header.Set("Authorization", "Bearer client-secret")
+			initialURL := origin + "/provider/content"
+			if sample.initialURL != "" {
+				initialURL = sample.initialURL
+			}
+			err := proxyTaskMedia(c, task, &relaychannel.TaskContentRequest{
+				URL: initialURL, Method: sample.method,
+				Headers: map[string]string{"Authorization": "Bearer provider-secret", "X-Provider-Key": "private", "Cookie": "session=secret"},
+			})
+			if sample.initialURL != "" {
+				assert.ErrorIs(t, err, errTaskMediaRequestRejected)
+				assert.Nil(t, receivedSource, "initial URL rejection must happen before sending credentials")
+				return
+			}
+			require.NotNil(t, receivedSource, "initial request failed: %v", err)
+			assert.Equal(t, "Bearer provider-secret", receivedSource.Get("Authorization"))
+			if sample.rejected {
+				assert.ErrorIs(t, err, errTaskMediaRequestRejected)
+				assert.Nil(t, receivedDestination, "rejected targets must not receive a request")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusPartialContent, recorder.Code)
+			assert.Equal(t, "bytes 0-3/10", recorder.Header().Get("Content-Range"))
+			assert.Equal(t, "4", recorder.Header().Get("Content-Length"))
+			if sample.method == http.MethodHead {
+				assert.Empty(t, recorder.Body.String())
+			} else {
+				assert.Equal(t, "data", recorder.Body.String())
+			}
+			assert.Equal(t, "bytes=0-3", receivedDestination.Get("Range"))
+			assert.Equal(t, "etag-fixture", receivedDestination.Get("If-Range"))
+			for _, name := range []string{"Authorization", "X-Provider-Key", "Cookie"} {
+				assert.Empty(t, receivedDestination.Get(name), name+" must not cross origins")
+			}
+		})
+	}
+	t.Run("H3 content redirect persists a validated video", func(t *testing.T) {
+		previousRegistry := pluginruntime.DefaultRegistry
+		pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+		t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+		source, err := builtinplugins.Source("yuxibox")
+		require.NoError(t, err)
+		plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "yuxibox"})
+		require.NoError(t, err)
+		t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "yuxibox-storage")
+		t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "yuxibox-storage:"+base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))))
+		cfg := service.DefaultMediaRuntimeConfig()
+		cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
+		require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+		setting := `{"task_plugin_key":"yuxibox"}`
+		baseURL := origin
+		frozen := model.Channel{Id: task.ChannelId, Type: constant.ChannelTypeTaskPlugin, Key: "channel-key", BaseURL: &baseURL, Setting: &setting}
+		channelBytes, err := common.Marshal(frozen)
+		require.NoError(t, err)
+		channelCipher, err := service.EncryptImagePayload(channelBytes, "media-channel:"+task.TaskID)
+		require.NoError(t, err)
+		job := model.AsyncMediaJob{
+			TaskId: task.TaskID, IdentityHash: "yuxibox-h3-storage", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId,
+			Provider: "yuxibox", Model: "minimax-h3-15s", Status: "submitted", StorageStatus: "saving", BillingStatus: "settled",
+			ChannelCipher: channelCipher, LeaseToken: "yuxibox-storage-lease", ExpiresAt: time.Now().Unix() + 3600,
+		}
+		require.NoError(t, model.DB.Create(&job).Error)
+		task.PrivateData = model.TaskPrivateData{
+			AsyncMedia: true, UpstreamTaskID: "upstream-h3", Key: "original-key",
+			Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "yuxibox", Version: plugin.Meta.Version, APIVersion: 1}},
+		}
+		task.Properties.OriginModelName, task.Properties.UpstreamModelName = "minimax-h3-15s", "minimax-h3-15s"
+		task.Data = []byte(`{"id":"upstream-h3","status":"completed"}`)
+		require.NoError(t, model.DB.Save(task).Error)
+		captured, err := service.CaptureAsyncMediaOutput(t.Context(), task)
+		require.NoError(t, err)
+		require.True(t, captured)
+		require.NoError(t, model.DB.First(&job, job.ID).Error)
+		require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"key": "rotated-key", "base_url": "https://9.9.9.9"}).Error)
+		target, persistedVideo = "https://1.1.1.1/persisted.mp4", taskMediaMP4Fixture()
+		receivedSource, receivedDestination, requestMethods = nil, nil, nil
+		require.NoError(t, PersistAsyncVideo(t.Context(), job, task))
+		assert.Equal(t, []string{http.MethodGet, http.MethodGet}, requestMethods, "storage uses the original content endpoint and CDN without another generation or poll")
+		assert.Equal(t, "Bearer original-key", receivedSource.Get("Authorization"))
+		assert.Empty(t, receivedDestination.Get("Authorization"), "the public CDN must not receive the channel credential")
+		ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		assert.EqualValues(t, len(persistedVideo), ref.Size)
+		assert.Equal(t, "video/mp4", ref.MimeType)
+		stored, err := os.ReadFile(filepath.Join(ref.Bucket, ref.ObjectKey))
+		require.NoError(t, err)
+		assert.Equal(t, persistedVideo, stored)
+		require.NoError(t, model.DB.First(&job, job.ID).Error)
+		assert.JSONEq(t, `["video"]`, job.ArtifactKeys)
+	})
+}
+
 func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	task := setupGenericTaskTest(t)
 	connection, err := model.DB.DB()
@@ -723,18 +928,7 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
 	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
 
-	box := func(kind string, payload []byte) []byte {
-		result := make([]byte, 8+len(payload))
-		binary.BigEndian.PutUint32(result, uint32(len(result)))
-		copy(result[4:8], kind)
-		copy(result[8:], payload)
-		return result
-	}
-	handler := make([]byte, 25)
-	copy(handler[8:12], "vide")
-	video := box("ftyp", []byte("isom\x00\x00\x00\x00"))
-	video = append(video, box("moov", box("trak", box("mdia", box("hdlr", handler))))...)
-	video = append(video, box("mdat", []byte("video-sample"))...)
+	video := taskMediaMP4Fixture()
 
 	var upstream *httptest.Server
 	polls, freshDownloads, staleDownloads := 0, 0, 0

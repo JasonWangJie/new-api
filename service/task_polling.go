@@ -942,9 +942,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			taskResult.UsageFacts["seconds"] = *actualSeconds
 		}
 	} else {
-		// try parse as New API response format
+		// Yuxibox must validate native task identity and terminal evidence in
+		// its driver; the legacy proxy envelope must not bypass that contract.
 		var responseItems taskdto.TaskResponse[model.Task]
-		if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+		if task.Platform != "yuxibox" && common.Unmarshal(responseBody, &responseItems) == nil && responseItems.IsSuccess() {
 			logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
 			t := responseItems.Data
 			taskResult.TaskID = t.TaskID

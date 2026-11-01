@@ -880,10 +880,10 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 	typedRejection := false
 	for changes := 0; changes < 32; {
 		if !evaluateOnly {
-			if job.Provider == "nldw" {
+			if service.VideoSubmissionRequiresReconciliation(job.Provider) {
 				// A prior confirmed rejection may allow another attempt. Only a
 				// successful dispatch barrier for this attempt can retain its hold.
-				c.Set("async_media_nldw_dispatched", false)
+				c.Set("async_media_reconciliation_dispatched", false)
 			}
 			result, taskErr = submit(c, info)
 			typedRejection = taskErr == nil && result != nil && result.Immediate != nil && result.Immediate.Status == model.TaskStatusFailure && result.UpstreamTaskID == "" && result.Immediate.TaskID == "" && result.Immediate.Url == "" && result.Immediate.RemoteUrl == ""
@@ -896,7 +896,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 				taskErr = service.TaskErrorWrapper(errors.New(result.Immediate.Reason), "upstream_rejected", http.StatusOK)
 			}
 		}
-		if taskErr != nil && c.GetBool("async_media_nldw_dispatched") && !c.GetBool("async_media_submission_rejected") {
+		if taskErr != nil && c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
 			// An idempotency key does not prove the upstream refused the job.
 			// Keep the original reservation for reconciliation and never submit
 			// again merely because its receipt could not be read or persisted.
@@ -1156,8 +1156,8 @@ func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycomm
 	if err := model.DispatchAsyncMediaJob(ctx, *job, updates, slices.Index(retry.liveChannel.GetKeys(), request.Channel.Key), referenceMode, retry.event); err != nil {
 		return err
 	}
-	if job.Provider == "nldw" {
-		c.Set("async_media_nldw_dispatched", true)
+	if service.VideoSubmissionRequiresReconciliation(job.Provider) {
+		c.Set("async_media_reconciliation_dispatched", true)
 	}
 	job.ChannelId, job.RequestCipher, job.ChannelCipher = request.Channel.Id, cipher, channelCipher
 	request.InitialRetryState = &nextState

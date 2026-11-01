@@ -276,6 +276,16 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 			message: "Artifact channel is unavailable", err: err,
 		}
 	}
+	publicHTTPSOnly := task.Platform == "yuxibox"
+	if publicHTTPSOnly {
+		baseURL, parseErr := url.Parse(channel.GetBaseURL())
+		if parseErr != nil || parsedURL.Scheme != "https" || !sameTaskMediaOrigin(baseURL, parsedURL) {
+			return &taskMediaProxyError{
+				status: http.StatusBadGateway, code: "artifact_request_rejected",
+				message: "Artifact content must use the channel HTTPS origin", err: errTaskMediaRequestRejected,
+			}
+		}
+	}
 	proxy := strings.TrimSpace(channel.GetSetting().Proxy)
 	if err := validateTaskMediaURL(rawURL, proxy); err != nil {
 		return &taskMediaProxyError{
@@ -316,7 +326,8 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 		req.Header.Set(name, value)
 	}
 
-	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless, task.PrivateData.UpstreamAsync != nil && !descriptor.Credentialless, parsedURL)
+	allowPublicRedirect := (task.PrivateData.UpstreamAsync != nil || publicHTTPSOnly) && !descriptor.Credentialless
+	client = taskMediaRedirectClient(client, proxy, c, clientHeaders, descriptor.Credentialless, allowPublicRedirect, publicHTTPSOnly, parsedURL)
 	clientWithoutBodyTimeout := *client
 	clientWithoutBodyTimeout.Timeout = 0
 	resp, err := doTaskMediaRequest(&clientWithoutBodyTimeout, req, taskMediaResponseHeaderTimeout)
@@ -491,7 +502,7 @@ func (transport taskMediaRedirectTransport) RoundTrip(request *http.Request) (*h
 	return transport.public.RoundTrip(request)
 }
 
-func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, clientHeaders map[string]string, credentialless, allowPublicRedirect bool, origin *url.URL) *http.Client {
+func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, clientHeaders map[string]string, credentialless, allowPublicRedirect, publicHTTPSOnly bool, origin *url.URL) *http.Client {
 	cloned := *base
 	if allowPublicRedirect {
 		protected := service.GetSSRFProtectedHTTPClient()
@@ -513,13 +524,27 @@ func taskMediaRedirectClient(base *http.Client, proxy string, c *gin.Context, cl
 			req.URL.Host == "" || req.URL.User != nil || req.URL.Fragment != "" {
 			return fmt.Errorf("%w: invalid redirect URL", errTaskMediaRequestRejected)
 		}
+		if publicHTTPSOnly {
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("%w: HTTPS redirect required", errTaskMediaRequestRejected)
+			}
+			if !sameTaskMediaOrigin(origin, req.URL) {
+				// The public transport uses the global fetch policy. Refuse this
+				// opt-in when that policy cannot enforce public DNS/IP targets.
+				fetchSetting := system_setting.GetFetchSetting()
+				if !fetchSetting.EnableSSRFProtection || fetchSetting.AllowPrivateIp || !fetchSetting.ApplyIPFilterForDomain {
+					return fmt.Errorf("%w: public redirect requires strict SSRF protection", errTaskMediaRequestRejected)
+				}
+			}
+		}
 		if err := validateTaskMediaURL(req.URL.String(), proxy); err != nil {
 			return fmt.Errorf("%w: %v", errTaskMediaRequestRejected, err)
 		}
 		if isSelfTaskMediaURL(c, req.URL) {
 			return fmt.Errorf("%w: proxy loop", errTaskMediaRequestRejected)
 		}
-		if len(via) > 0 && !sameTaskMediaOrigin(via[len(via)-1].URL, req.URL) {
+		crossOrigin := len(via) > 0 && !sameTaskMediaOrigin(via[len(via)-1].URL, req.URL)
+		if crossOrigin || publicHTTPSOnly && !sameTaskMediaOrigin(origin, req.URL) {
 			if !credentialless && !allowPublicRedirect {
 				return fmt.Errorf("%w: credentialed cross-origin redirect", errTaskMediaRequestRejected)
 			}
