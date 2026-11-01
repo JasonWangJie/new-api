@@ -27,11 +27,22 @@ const REQUEST_FIELDS = new Set([
 ]);
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/reference_images/*", "kind": "image"},
+    {"path": "/image_urls/*", "kind": "image"},
+    {"path": "/reference_videos/*", "kind": "video"},
+    {"path": "/video_urls/*", "kind": "video"},
+    {"path": "/reference_audios/*", "kind": "audio"},
+    {"path": "/audio_urls/*", "kind": "audio"},
+  ],
   apiVersion: 1,
   key: "tianyue",
   name: "Tianyue Video",
   icon: "text:TY",
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.tianyue.xyz",
   website: "https://ai.tianyue.xyz/docs/tianyue-api.html#video-create",

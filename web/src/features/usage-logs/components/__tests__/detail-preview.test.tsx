@@ -337,6 +337,42 @@ test('task log prices select the executing provider’s schema', () => {
   expect(preview).toHaveTextContent('images · images $0.25/image')
 })
 
+test.each([
+  {
+    videoInput: 'video',
+    expected: '720p · seconds $1.125/second · Additional charge $1.5/request',
+  },
+  { videoInput: 'none', expected: '720p · seconds $0/second' },
+  { videoInput: undefined, expected: 'Dynamic Pricing · No matching results' },
+])(
+  'task log reference-video multiplier uses frozen input fact $videoInput',
+  ({ videoInput, expected }) => {
+    client.setQueryData(['pricing'], {
+      data: [
+        {
+          model_name: 'wan2.5-i2v-preview',
+          billing_usage_schema: {
+            seconds: { type: 'number', unit: 'second' },
+            resolution: { enum: ['480p', '720p'] },
+            video_input: { enum: ['none', 'video'] },
+          },
+        },
+      ],
+      vendors: [],
+    })
+    const expression =
+      '(u("resolution") == "480p" ? tier("480p", 0.5 + u("seconds") * 0.5) : tier("720p", 1 + u("seconds") * 0.75)) * (u("video_input") == "video" ? 1.5 : 0)'
+    const preview = renderPreview({
+      is_task: true,
+      billing_mode: 'tiered_expr',
+      expr_b64: Buffer.from(expression).toString('base64'),
+      matched_tier: '720p',
+      ...(videoInput ? { usage_facts: { video_input: videoInput } } : {}),
+    })
+    expect(preview.textContent).toBe(expected)
+  }
+)
+
 test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s shows an explicit unavailable summary',
   (scenario) => {

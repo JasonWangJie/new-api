@@ -609,6 +609,15 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	if billingChannelID := c.GetInt("async_media_initial_billing_channel_id"); billingChannelID > 0 {
+		task.PrivateData.BillingChannelID = billingChannelID
+	}
+	if value, exists := c.Get("async_media_initial_retry_request"); exists {
+		if request, ok := value.(*service.AsyncVideoRequest); ok {
+			task.PrivateData.MediaRetryState = request.InitialRetryState
+			task.PrivateData.MediaRetryDecision = request.PendingDecision
+		}
+	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.UpstreamAsync = result.UpstreamAsync

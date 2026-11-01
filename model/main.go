@@ -339,6 +339,7 @@ func migrateDB() error {
 
 	err := DB.AutoMigrate(
 		&AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaArtifactObject{}, &MediaInputObject{},
+		&MediaRetryPolicyVersion{}, &MediaRetryEvent{},
 		&Channel{},
 		&Token{},
 		&CanvasGrant{},
@@ -383,6 +384,9 @@ func migrateDB() error {
 		return err
 	}
 	if err := MigrateImageModels(DB); err != nil {
+		return err
+	}
+	if err := InitializeMediaRetryPolicy(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

@@ -24,6 +24,7 @@ import {
 } from './billing-expr'
 import {
   getTaskEnumFields,
+  splitTaskVideoInputPricing,
   taskMatrixRowLabel,
   tryParseTaskMatrixConfig,
 } from './task-expr'
@@ -44,14 +45,25 @@ export function getTaskMatrixDisplayTiers(
   const matrix = tryParseTaskMatrixConfig(expression, schema)
   if (!matrix) return null
 
-  return matrix.rows.map((row) => ({
-    label: taskMatrixRowLabel(row.combination),
-    conditions: Object.entries(row.combination)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([field, value]) => ({ field, value })),
-    constant: row.constant,
-    unitPrices: { ...row.unitPrices },
-  }))
+  return matrix.rows.map((row) => {
+    const multiplier =
+      row.combination.video_input === 'video'
+        ? (matrix.videoInputMultipliers?.video ?? 1)
+        : (matrix.videoInputMultipliers?.none ?? 1)
+    return {
+      label: taskMatrixRowLabel(row.combination),
+      conditions: Object.entries(row.combination)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([field, value]) => ({ field, value })),
+      constant: row.constant * multiplier,
+      unitPrices: Object.fromEntries(
+        Object.entries(row.unitPrices).map(([field, price]) => [
+          field,
+          price * multiplier,
+        ])
+      ),
+    }
+  })
 }
 
 /** Display explicit conditions for a fallback only when its complement is unique.
@@ -62,6 +74,20 @@ export function getTaskPricingDisplayTiers(
   schema: BillingUsageSchema | null | undefined,
   publishedPricesOnly = false
 ): ParsedTaskTier[] {
+  if (schema && expression) {
+    const pricing = splitTaskVideoInputPricing(expression, schema)
+    if (pricing?.videoInputMultipliers) {
+      const effectiveTiers = getTaskMatrixDisplayTiers(expression, schema) ?? []
+      if (!publishedPricesOnly || !schema.resolution?.enum?.length) {
+        return effectiveTiers
+      }
+      return effectiveTiers.filter(
+        (tier) =>
+          tier.constant > 0 ||
+          Object.values(tier.unitPrices).some((price) => price > 0)
+      )
+    }
+  }
   const tiers = parseTaskTiersFromExpr(
     expression || '',
     schema,

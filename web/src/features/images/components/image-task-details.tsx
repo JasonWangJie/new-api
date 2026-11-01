@@ -58,6 +58,9 @@ import {
   imageTaskVideoReconciliation,
   imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
+import { CreateRetryRuleFromError } from '../retry-policy/create-from-error'
+import { ACTION_LABELS } from '../retry-policy/policy'
+import type { RetryAction } from '../retry-policy/types'
 import type { ImageRetryDecision, ImageTask } from '../types'
 import {
   ImagePlatformBadge,
@@ -118,6 +121,29 @@ function RetryDecisionFields({ decision }: { decision: ImageRetryDecision }) {
   return (
     <TaskDetailFields
       items={[
+        ...(decision.policy
+          ? [
+              {
+                label: t('Matched rule'),
+                value: decision.policy.rule_id || t('Built-in policy'),
+              },
+              { label: t('Version'), value: String(decision.policy.revision) },
+              {
+                label: t('Requested action'),
+                value: t(
+                  ACTION_LABELS[
+                    decision.policy.requested_action as RetryAction
+                  ] ??
+                    decision.policy.requested_action ??
+                    '—'
+                ),
+              },
+              {
+                label: t('Blocking reason'),
+                value: decision.policy.blocked_reason || '—',
+              },
+            ]
+          : []),
         { label: t('Retry decision'), value: t(imageLabel(decision.action)) },
         { label: t('Decision reason'), value: t(imageLabel(decision.reason)) },
         {
@@ -551,6 +577,51 @@ export function ImageTaskDetails(props: {
               </div>
             )}
           </section>
+          {props.admin && data.error_message && (
+            <CreateRetryRuleFromError
+              source={{
+                task_id: data.task_id,
+                fact: {
+                  media_type: data.media_type || 'image',
+                  provider: data.provider || data.platform,
+                  model: data.model,
+                  channel_id: data.channel_id,
+                  stage: data.error_stage || data.stage || 'submit',
+                  error_code: data.error_code,
+                  message: data.error_message,
+                },
+              }}
+            />
+          )}
+          {data.media_retry_decision && !data.retry_decision?.policy && (
+            <DetailSection title={t('Retry decision')}>
+              <TaskDetailFields
+                items={[
+                  {
+                    label: t('Matched rule'),
+                    value:
+                      data.media_retry_decision.rule_id || t('Built-in policy'),
+                  },
+                  {
+                    label: t('Version'),
+                    value: String(data.media_retry_decision.revision),
+                  },
+                  {
+                    label: t('Actual action'),
+                    value: t(
+                      ACTION_LABELS[
+                        data.media_retry_decision.action as RetryAction
+                      ] ?? data.media_retry_decision.action
+                    ),
+                  },
+                  {
+                    label: t('Blocking reason'),
+                    value: data.media_retry_decision.blocked_reason || '—',
+                  },
+                ]}
+              />
+            </DetailSection>
+          )}
           {data.retry_decision && (
             <DetailSection
               title={t('Retry decision')}
@@ -884,6 +955,23 @@ export function ImageTaskDetails(props: {
                               <p className='whitespace-pre-wrap'>
                                 {attempt.error_message || '—'}
                               </p>
+                              {attempt.error_message && (
+                                <CreateRetryRuleFromError
+                                  source={{
+                                    fact: {
+                                      media_type: data.media_type || 'image',
+                                      provider: data.provider || data.platform,
+                                      model: data.model,
+                                      channel_id: attempt.channel_id,
+                                      stage:
+                                        attempt.retry_decision?.stage ||
+                                        'submit',
+                                      http_status: attempt.http_status,
+                                      message: attempt.error_message,
+                                    },
+                                  }}
+                                />
+                              )}
                             </div>
                           ),
                         },

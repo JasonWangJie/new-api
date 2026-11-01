@@ -1,4 +1,9 @@
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "sora",
   name: "Sora",
@@ -7,7 +12,7 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.0.4",
+  version: "1.0.5",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],

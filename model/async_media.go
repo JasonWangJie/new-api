@@ -155,7 +155,7 @@ func UpdateAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[str
 
 // DispatchAsyncMediaJob records the selected live account slot only when the
 // current lease actually crosses the provider-dispatch barrier.
-func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any, keyIndex int, referenceMode string) error {
+func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[string]any, keyIndex int, referenceMode string, retryEvents ...*MediaRetryEvent) error {
 	if keyIndex < -1 || referenceMode != "" && referenceMode != "original" && referenceMode != "local_download" {
 		return ErrImageConflict
 	}
@@ -178,7 +178,42 @@ func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[s
 		if err := tx.Where("id = ?", job.ID).Take(&after).Error; err != nil {
 			return err
 		}
-		return recordAsyncMediaTransitionTx(tx, before, after, slot, referenceMode)
+		if err := recordAsyncMediaTransitionTx(tx, before, after, slot, referenceMode); err != nil {
+			return err
+		}
+		for _, event := range retryEvents {
+			if event == nil {
+				continue
+			}
+			if err := RecordMediaRetryEventTx(tx, event); err != nil {
+				return err
+			}
+			if err := tx.Model(&MediaRetryEvent{}).Where("event_key = ?", event.EventKey).Update("executed", true).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RecordAsyncVideoSubmissionPreparation retains a completed local preparation
+// failure and its action budget without claiming another provider submission.
+func RecordAsyncVideoSubmissionPreparation(ctx context.Context, job AsyncMediaJob, requestCipher []byte, event *MediaRetryEvent) error {
+	if len(requestCipher) == 0 || event == nil || event.TaskID != job.TaskId {
+		return ErrImageConflict
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		updated := tx.Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ? AND status <> ?", job.ID, job.LeaseToken, job.AttemptGeneration, "reconciling").Update("request_cipher", requestCipher)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrImageConflict
+		}
+		if err := RecordMediaRetryEventTx(tx, event); err != nil {
+			return err
+		}
+		return tx.Model(&MediaRetryEvent{}).Where("event_key = ?", event.EventKey).Update("executed", true).Error
 	})
 }
 

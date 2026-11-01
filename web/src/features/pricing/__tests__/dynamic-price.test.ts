@@ -55,6 +55,33 @@ const summaryOptions = {
 }
 
 describe('expression price summaries', () => {
+  test('summarizes effective reference-video prices and examples instead of unscaled base prices', () => {
+    const model = pricingModel({
+      billing_mode: 'tiered_expr',
+      billing_expr:
+        '(u("resolution") == "720p" ? tier("720p", u("seconds") * 2) : tier("1080p", u("seconds") * 4)) * (u("video_input") == "video" ? 1.5 : 1)',
+      billing_usage_schema: {
+        seconds: { type: 'number', unit: 'second' },
+        resolution: { enum: ['720p', '1080p'] },
+        video_input: { enum: ['none', 'video'] },
+      },
+      billing_usage_examples: [
+        {
+          label: 'reference video',
+          facts: { seconds: 5, resolution: '1080p', video_input: 'video' },
+        },
+      ],
+    })
+    const summary = getDynamicPricingSummary(model, { tokenUnit: 'M' })
+    expect(summary?.isSpecialExpression).toBe(false)
+    expect(summary?.tiers).toHaveLength(4)
+    expect(summary?.primaryEntries[0]?.minValue).toBe(2)
+    expect(summary?.primaryEntries[0]?.maxValue).toBe(6)
+    expect(getCardExamplePrice(model, { tokenUnit: 'M' })?.formatted).toBe(
+      '$30'
+    )
+  })
+
   test('keeps request prices unchanged by token units and separates mixed billing units', () => {
     const model = pricingModel({
       billing_mode: 'tiered_expr',

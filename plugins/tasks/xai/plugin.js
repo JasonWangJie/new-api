@@ -52,6 +52,24 @@ const MODE_FRAMES_15 = {
 };
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/image/url", "kind": "image"},
+    {"path": "/input_reference/url", "kind": "image"},
+    {"path": "/images/*/url", "kind": "image"},
+    {"path": "/last_frame", "kind": "image"},
+    {"path": "/last_frame/url", "kind": "image"},
+    {"path": "/reference_images/*", "kind": "image"},
+    {"path": "/reference_images/*/url", "kind": "image"},
+    {"path": "/keyframes/*/image", "kind": "image"},
+    {"path": "/keyframes/*/image/url", "kind": "image"},
+    {"path": "/video", "kind": "video"},
+    {"path": "/video/url", "kind": "video"},
+    {"path": "/reference_images", "kind": "image"},
+    {"path": "/reference_images/url", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "xai",
   name: "xAI Video",
@@ -60,7 +78,7 @@ export const meta = {
     en: "xAI Grok video generation with text, image, references, and pinned frames",
     zh: "xAI Grok 视频生成，支持文本、图片、参考素材和首尾帧",
   },
-  version: "1.1.3",
+  version: "1.1.4",
   author: { name: "QuantumNous", url: "https://x.ai" },
   baseUrl: "https://api.x.ai",
   channelTypes: [48],

@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/go-redis/redis/v8"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -415,6 +417,28 @@ func RunAsyncImageTask(parent context.Context, id string) (runError error) {
 			return err
 		}
 	}
+	if task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed {
+		checkpoint, _, err := refreshImageRetryDecision(ctx, &task, cfg)
+		if err != nil {
+			if !errors.Is(err, errImageRetryPolicyUnavailable) {
+				return err
+			}
+			// Existing output still needs durable storage and settlement even
+			// when the editable retry policy cannot be read or compiled.
+			checkpoint.Pending = false
+		}
+		if checkpoint.Pending && (checkpoint.Decision.Action == mediaretry.ManualReview || checkpoint.Decision.Action == mediaretry.Stop) {
+			return commitImagePolicyDecision(ctx, task, &AsyncImageFailure{Message: checkpoint.Fact.Message}, cfg, checkpoint, map[string]any{})
+		}
+		if checkpoint.Pending && checkpoint.RecordedAt+int64(checkpoint.Decision.DelaySeconds) > time.Now().Unix() {
+			return model.TransitionImageTask(ctx, task, map[string]any{"lease_token": "", "lease_expires_at": 0, "next_attempt_at": checkpoint.RecordedAt + int64(checkpoint.Decision.DelaySeconds)}, "retry_policy_wait", "", "postprocess")
+		}
+		if checkpoint.Pending || checkpoint.BuiltinPending {
+			if err := model.StartImageRetryPolicyAction(ctx, task); err != nil {
+				return err
+			}
+		}
+	}
 	if err := model.DB.WithContext(ctx).Where("task_id = ?", id).Take(&task).Error; err != nil {
 		return err
 	}
@@ -480,6 +504,44 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, Message: "Persisted request is invalid"}, cfg)
 	}
 	acceptedOutput = acceptedOutput || request.Completion != nil
+	if err := BootstrapPendingImageRetry(ctx, task, request, cfg); err != nil {
+		return err
+	}
+	checkpoint, replayFailure, err := refreshImageRetryDecision(ctx, task, cfg)
+	if err != nil {
+		if !errors.Is(err, errImageRetryPolicyUnavailable) || !knownUpstreamTask && !acceptedOutput {
+			return err
+		}
+		// Query/recover the frozen upstream operation; never allow this
+		// availability fallback to reach a generation dispatch callback.
+		checkpoint.Pending = false
+	}
+	if replayFailure {
+		failure := &AsyncImageFailure{Code: checkpoint.FailureCode, InternalCode: checkpoint.FailureInternalCode, Message: checkpoint.Fact.Message, HTTPStatus: checkpoint.Fact.HTTPStatus, ProviderCode: checkpoint.Fact.ErrorCode, ExecutionUnknown: checkpoint.Fact.Unknown, UpstreamTerminal: checkpoint.Fact.Terminal}
+		source := *task
+		source.ChannelId, source.DispatchedAt, source.UpstreamTaskId = checkpoint.Fact.ChannelID, checkpoint.SourceDispatchedAt, checkpoint.SourceUpstreamTaskID
+		return failAsyncImageInvocation(ctx, source, failure, cfg)
+	}
+	if task.RetryCount > 0 && !checkpoint.Pending && !knownUpstreamTask && !acceptedOutput && (checkpoint.FailureInternalCode == "upstream_transport_timeout" || checkpoint.FailureInternalCode == "execution_deadline") {
+		policy, err := GetMediaRetryPolicy(ctx)
+		if err != nil {
+			return err
+		}
+		platform := request.PolicyPlatform
+		if platform == "" {
+			platform = request.Platform
+		}
+		if !policy.LegacyTimeoutEnabled || !slices.Contains(policy.LegacyTimeoutScopeKeys, ImageIdentityHash(task.Group, platform)) {
+			checkpoint.Decision = mediaretry.Decision{Revision: policy.Revision, Action: mediaretry.ManualReview, BlockedReason: "legacy_timeout_disabled"}
+			return commitImagePolicyDecision(ctx, *task, &AsyncImageFailure{Message: checkpoint.Fact.Message}, cfg, checkpoint, map[string]any{})
+		}
+	}
+	if checkpoint.Pending && !mediaretry.IsResubmission(checkpoint.Decision.Action) && !knownUpstreamTask && !acceptedOutput {
+		return commitImagePolicyDecision(ctx, *task, &AsyncImageFailure{Message: checkpoint.Fact.Message}, cfg, checkpoint, map[string]any{})
+	}
+	if checkpoint.Pending && checkpoint.RecordedAt+int64(checkpoint.Decision.DelaySeconds) > time.Now().Unix() {
+		return model.TransitionImageTask(ctx, *task, map[string]any{"status": model.ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": checkpoint.RecordedAt + int64(checkpoint.Decision.DelaySeconds)}, "retry_policy_wait", "", "execute")
+	}
 	if knownUpstreamTask && !acceptedOutput && task.StartedAt > 0 && time.Now().Unix() >= model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout) {
 		// Expired accepted jobs must reach the bounded policy decision even if
 		// their reservation or frozen channel can no longer be restored.
@@ -543,6 +605,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "eligibility_changed", Message: "Image eligibility or platform group changed before execution"}, cfg)
 		}
 		routing := ImageAccountAttemptRouting(attempts, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+		routing = ImagePolicyRouting(routing, checkpoint)
 		if routing.Stop {
 			failure := &AsyncImageFailure{Code: 603, InternalCode: "account_switches_exhausted", Message: "Image account switching budget is exhausted"}
 			for _, attempt := range attempts {
@@ -678,6 +741,14 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			}
 			break
 		}
+		if checkpoint.Pending && mediaretry.IsResubmission(checkpoint.Decision.Action) {
+			settings := channel.GetSetting()
+			settings.ImageReferenceTransportMode = "passthrough"
+			if checkpoint.Decision.Action == mediaretry.LocalSameChannel || checkpoint.Decision.Action == mediaretry.LocalOtherChannel {
+				settings.ImageReferenceTransportMode = "local"
+			}
+			channel.SetSetting(settings)
+		}
 		encodedChannel, err := common.Marshal(channel)
 		if err != nil {
 			return err
@@ -718,6 +789,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			}()
 		}
 		selection := ImageRetryDecision{Version: 1, Stage: "submit", Action: "initial_submission", Reason: "eligible_account", Rule: "account_selection", TotalUsed: task.RetryCount, TotalLimit: cfg.TotalRetries, RecordedAt: now, Deadline: model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout)}
+		if checkpoint.Pending {
+			selection.Policy = &checkpoint.Decision
+		}
 		if len(attempts) > 0 {
 			last := attempts[len(attempts)-1]
 			selection.Action = "same_account_retry"
@@ -738,7 +812,16 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if err != nil {
 			return failAsyncImageInvocation(ctx, *task, &AsyncImageFailure{Code: 604, InternalCode: "invalid_model_mapping", Message: "Image channel model mapping is invalid"}, cfg)
 		}
-		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled, RetryReferenceTimeoutLocally: channel.GetSetting().ImageReferenceTimeoutRetrySameChannel, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
+		livePolicy, err := GetMediaRetryPolicy(ctx)
+		if err != nil {
+			return err
+		}
+		policyPlatform := request.PolicyPlatform
+		if policyPlatform == "" {
+			policyPlatform = request.Platform
+		}
+		legacyTimeout := livePolicy.LegacyTimeoutEnabled && slices.Contains(livePolicy.LegacyTimeoutScopeKeys, ImageIdentityHash(task.Group, policyPlatform)) && (request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled)
+		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: legacyTimeout, RetryReferenceTimeoutLocally: channel.GetSetting().ImageReferenceTimeoutRetrySameChannel, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
 			return err
@@ -776,6 +859,22 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		defer cancel()
 	}
 	request.PostprocessContext = ctx
+	if checkpoint.Pending && !mediaretry.IsResubmission(checkpoint.Decision.Action) || checkpoint.BuiltinPending && (knownUpstreamTask || acceptedOutput) {
+		if checkpoint.Decision.Action == mediaretry.ManualReview || checkpoint.Decision.Action == mediaretry.Stop {
+			return commitImagePolicyDecision(ctx, *task, &AsyncImageFailure{Message: checkpoint.Fact.Message}, cfg, checkpoint, map[string]any{})
+		}
+		if err := model.StartImageRetryPolicyAction(ctx, *task); err != nil {
+			return err
+		}
+		if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
+			return err
+		}
+	}
+	if !knownUpstreamTask && !acceptedOutput && (request.LocalReferencesRequested || checkpoint.Pending && (checkpoint.Decision.Action == mediaretry.LocalSameChannel || checkpoint.Decision.Action == mediaretry.LocalOtherChannel)) {
+		if err := PrepareAsyncImageLocalReferences(attemptCtx, task, &request, cfg); err != nil {
+			return failAsyncImageInvocation(context.WithoutCancel(ctx), *task, ClassifyAsyncImageFailure(err, 0), cfg)
+		}
+	}
 	transportUsed := ""
 	request.ReferenceTransportUsed = &transportUsed
 	beforeInvoke := func() error {
@@ -784,6 +883,35 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		}
 		if attemptCtx.Err() != nil {
 			return attemptCtx.Err()
+		}
+		freshConfig, err := GetImageRuntimeConfig(attemptCtx)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errImageRetryPolicyChanged, err)
+		}
+		if err := validateAsyncImageDispatch(attemptCtx, *task, request, *channel, account, freshConfig); err != nil {
+			return fmt.Errorf("%w: %v", errImageRetryPolicyChanged, err)
+		}
+		checkpoint.State.Now, checkpoint.State.TotalLimit = time.Now().Unix(), freshConfig.TotalRetries
+		if task.RetryCount > 0 {
+			policy, err := GetMediaRetryPolicy(attemptCtx)
+			if err != nil {
+				return fmt.Errorf("%w: %v", errImageRetryPolicyChanged, err)
+			}
+			if policy.PauseResubmissions {
+				return errImageRetryPolicyChanged
+			}
+			if !checkpoint.Pending && (checkpoint.FailureInternalCode == "upstream_transport_timeout" || checkpoint.FailureInternalCode == "execution_deadline") && !policy.LegacyTimeoutEnabled {
+				return errImageRetryPolicyChanged
+			}
+			if checkpoint.Pending || checkpoint.BuiltinPending {
+				current, err := EvaluateMediaRetry(attemptCtx, checkpoint.Fact, checkpoint.State)
+				if err != nil {
+					return fmt.Errorf("%w: %v", errImageRetryPolicyChanged, err)
+				}
+				if checkpoint.BuiltinPending && current.Matched || checkpoint.Pending && (!current.Matched || current.Revision != checkpoint.Decision.Revision || current.Action != checkpoint.Decision.Action) {
+					return errImageRetryPolicyChanged
+				}
+			}
 		}
 		if len(attempts) > 0 {
 			attempts[len(attempts)-1].TransportUsed = transportUsed
@@ -804,6 +932,9 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return reloadErr
 	}
 	if err != nil {
+		if errors.Is(err, errImageRetryPolicyChanged) {
+			return model.TransitionImageTask(context.WithoutCancel(ctx), *task, map[string]any{"status": model.ImageTaskQueued, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": time.Now().Unix() + 1}, "retry_policy_changed", "", "execute")
+		}
 		var pending *AsyncImagePending
 		if errors.As(err, &pending) {
 			if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
@@ -943,6 +1074,16 @@ func hasAsyncImageOutput(ctx context.Context, task model.AsyncImageTask) (bool, 
 }
 
 func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig) error {
+	plan, err := buildImageFailurePlan(ctx, task, failure, cfg, nil)
+	if err != nil {
+		return err
+	}
+	return model.TransitionImageTask(ctx, task, plan.Updates, plan.EventType, plan.EventMessage, plan.OutboxKind, plan.Event)
+}
+
+// buildImageFailurePlan performs no writes, dispatches, downloads or quota changes.
+// A policy override is used only by the administrator's draft preview.
+func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig, policyOverride *mediaretry.Policy) (imageFailurePlan, error) {
 	failure.Message = SanitizeAsyncImageDiagnostic(failure.Message, asyncImageProviderMessageLimit)
 	failure.ProviderCode = limitAsyncImageProviderDiagnostic(failure.ProviderCode, asyncImageProviderCodeLimit)
 	failure.ProviderStatus = limitAsyncImageProviderDiagnostic(failure.ProviderStatus, asyncImageProviderCodeLimit)
@@ -982,7 +1123,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	compatibilityFailure := failure.InternalCode == "upstream_image_route_incompatible" || failure.InternalCode == "upstream_image_reference_incompatible" || failure.InternalCode == "upstream_image_submission_rejected"
 	if task.Attempts != "" {
 		if err := common.UnmarshalJsonStr(task.Attempts, &attempts); err != nil {
-			return err
+			return imageFailurePlan{}, err
 		}
 		for _, attempt := range attempts {
 			deadlineRetryUsed = deadlineRetryUsed || attempt.DeadlineRetryUntil > 0
@@ -1022,13 +1163,71 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.ReferenceFailure = last.Dispatched && (failure.ReferenceTransportFallback || failure.Code == 602 && (failure.InternalCode == "upstream_failed" || failure.UpstreamTerminal))
 				encoded, err := common.Marshal(attempts)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				updates["attempts"] = string(encoded)
 			}
 		}
 	}
 	deadlineFailover := false
+	policyCheckpoint, policyErr := ImageRetryFailureContext(task, failure, replayRequest, cfg)
+	if policyErr != nil {
+		return imageFailurePlan{}, policyErr
+	}
+	if policyCheckpoint.State.TotalUsed < task.RetryCount {
+		// Release only an unsent generation reservation. The step-use update
+		// and any next-step reservation commit in the same task transaction.
+		task.RetryCount = policyCheckpoint.State.TotalUsed
+		updates["retry_count"] = task.RetryCount
+	}
+	livePolicy := mediaretry.Policy{}
+	if policyOverride == nil {
+		livePolicy, policyErr = GetMediaRetryPolicy(ctx)
+	} else {
+		livePolicy = *policyOverride
+	}
+	if policyErr == nil {
+		policyCheckpoint.Decision, policyErr = evaluateMediaRetryPolicy(livePolicy, policyCheckpoint.Fact, policyCheckpoint.State)
+	}
+	if policyErr != nil {
+		if !policyCheckpoint.Fact.HasOutput && !(policyCheckpoint.Fact.HasUpstreamTask && !policyCheckpoint.Fact.Terminal) {
+			return imageFailurePlan{}, policyErr
+		}
+		// Preserve the existing query/postprocessing budgets while policy
+		// configuration is unavailable. No legacy resend exception is granted.
+		policyCheckpoint.Decision, livePolicy = mediaretry.Decision{}, mediaretry.Policy{}
+	}
+	if !policyCheckpoint.Decision.Matched && livePolicy.PauseResubmissions && !policyCheckpoint.Fact.HasOutput && (!policyCheckpoint.Fact.HasUpstreamTask || policyCheckpoint.Fact.Terminal) {
+		policyCheckpoint.Decision.Action, policyCheckpoint.Decision.BlockedReason = mediaretry.ManualReview, "resubmissions_paused"
+		if policyCheckpoint.Fact.Deadline > 0 && policyCheckpoint.State.Now >= policyCheckpoint.Fact.Deadline {
+			policyCheckpoint.Decision.BlockedReason = "execution_deadline_reached"
+		}
+	}
+	if policyCheckpoint.Decision.Matched || policyCheckpoint.Decision.BlockedReason != "" {
+		return buildImagePolicyDecision(ctx, task, failure, cfg, policyCheckpoint, updates)
+	}
+	policyPlatform := task.Platform
+	if replayRequest != nil && replayRequest.PolicyPlatform != "" {
+		policyPlatform = replayRequest.PolicyPlatform
+	}
+	legacyAllowed := livePolicy.LegacyTimeoutEnabled && slices.Contains(livePolicy.LegacyTimeoutScopeKeys, ImageIdentityHash(task.Group, policyPlatform))
+	if !legacyAllowed {
+		mixedTimeoutRetry, timeoutAttempt = false, false
+	}
+	if legacyAllowed && (timeoutAttempt || failure.InternalCode == "execution_deadline") {
+		if limit, ok := livePolicy.LegacyTimeoutConfig["upstream_timeout_max_retries"]; ok {
+			cfg.TimeoutRetries = min(cfg.TimeoutRetries, limit)
+		}
+		if limit, ok := livePolicy.LegacyTimeoutConfig["total_max_retries"]; ok {
+			cfg.TotalRetries = min(cfg.TotalRetries, limit)
+		}
+		if limit, ok := livePolicy.LegacyTimeoutConfig["execution_timeout_seconds"]; ok {
+			cfg.ExecutionTimeout = min(cfg.ExecutionTimeout, limit)
+		}
+		if limit, ok := livePolicy.LegacyTimeoutConfig["account_attempt_timeout_seconds"]; ok {
+			cfg.AttemptTimeout = min(cfg.AttemptTimeout, limit)
+		}
+	}
 	now := time.Now().Unix()
 	originalDeadline := task.StartedAt + int64(cfg.ExecutionTimeout)
 	if failure.InternalCode == "execution_deadline" && !deadlineRetryUsed && task.StartedAt > 0 && now >= originalDeadline && task.DispatchedAt > 0 && task.UpstreamTaskId != "" && task.LeaseToken != "" && task.LeaseExpiresAt > now &&
@@ -1041,11 +1240,11 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		if deadline > now {
 			received, err := hasAsyncImageOutput(ctx, task)
 			if err != nil {
-				return err
+				return imageFailurePlan{}, err
 			}
 			reservation, err := model.GetAsyncImageReservation(ctx, task)
 			if err != nil {
-				return err
+				return imageFailurePlan{}, err
 			}
 			if !received && reservation != nil && reservation.Status == "reserved" {
 				// The expired operation may still finish upstream. Keep its receipt
@@ -1056,7 +1255,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				last.UpstreamTaskID = task.UpstreamTaskId
 				encoded, err := common.Marshal(attempts)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				updates["attempts"] = string(encoded)
 				delay := ImageRetryDelay(cfg.TimeoutRetryBase, cfg.TimeoutRetryMax, timeoutRetries, cfg.RetryJitter, 0, cfg.RetryAfterMax)
@@ -1075,7 +1274,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	if mixedRouting && timeoutAttempt && mixedTimeoutRetry {
 		received, err := hasAsyncImageOutput(ctx, task)
 		if err != nil {
-			return err
+			return imageFailurePlan{}, err
 		}
 		mixedTimeoutRetry = !received
 	}
@@ -1101,20 +1300,20 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				// success milestone so this can never cross the submit barrier.
 				data, err := DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				var request AsyncImageRequest
 				if err := common.Unmarshal(data, &request); err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				request.Completion = nil
 				data, err = common.Marshal(request)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				cipher, err := EncryptImagePayload(data, "task:"+task.TaskId)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 				updates["request_cipher"] = cipher
 			}
@@ -1141,7 +1340,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		deadline := model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout)
 		reservation, err := model.GetAsyncImageReservation(ctx, task)
 		if err != nil {
-			return err
+			return imageFailurePlan{}, err
 		}
 		if reservation == nil || reservation.Status != "reserved" {
 			status = model.ImageTaskExecutionUnknown
@@ -1186,7 +1385,7 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 				var err error
 				resubmit, err = canRetryAsyncImageSubmission(ctx, task, cfg)
 				if err != nil {
-					return err
+					return imageFailurePlan{}, err
 				}
 			}
 		}
@@ -1257,19 +1456,19 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 	decision := ImageFailureRetryDecision(task, failure, cfg, updates)
 	encodedDecision, err := common.Marshal(decision)
 	if err != nil {
-		return err
+		return imageFailurePlan{}, err
 	}
 	updates["retry_decision"] = string(encodedDecision)
 	if encodedAttempts, ok := updates["attempts"].(string); ok {
 		var history []ImageChannelAttempt
 		if err := common.UnmarshalJsonStr(encodedAttempts, &history); err != nil {
-			return err
+			return imageFailurePlan{}, err
 		}
 		if len(history) > 0 {
 			history[len(history)-1].Decision = &decision
 			encoded, err := common.Marshal(history)
 			if err != nil {
-				return err
+				return imageFailurePlan{}, err
 			}
 			updates["attempts"] = string(encoded)
 		}
@@ -1278,7 +1477,23 @@ func failAsyncImageInvocation(ctx context.Context, task model.AsyncImageTask, fa
 		updates["request_cipher"] = task.RequestCipher
 		updates["request_retain_until"] = time.Now().Unix() + int64(cfg.FailedRequestRetentionHours)*3600
 	}
-	return model.TransitionImageTask(ctx, task, updates, "invocation_failed", failure.Message, kind)
+	policyCheckpoint.Decision.Action = decision.Action
+	policyCheckpoint.BuiltinPending = kind != ""
+	if retries, ok := updates["retry_count"].(int); ok && retries > task.RetryCount {
+		policyCheckpoint.ReservedRetry = true
+	}
+	checkpointJSON, err := common.Marshal(policyCheckpoint)
+	if err != nil {
+		return imageFailurePlan{}, err
+	}
+	updates["retry_policy_state"] = string(checkpointJSON)
+	policyCheckpoint.Decision.Category = policyCheckpoint.Fact.Category
+	policyCheckpoint.Decision.RequestedAction = decision.Action
+	event, err := model.NewMediaRetryEvent(task.TaskId, task.Version, policyCheckpoint.Fact, policyCheckpoint.Decision, policyCheckpoint.State)
+	if err != nil {
+		return imageFailurePlan{}, err
+	}
+	return imageFailurePlan{Updates: updates, Event: event, EventType: "invocation_failed", EventMessage: failure.Message, OutboxKind: kind, Audit: decision, Decision: policyCheckpoint.Decision}, nil
 }
 
 func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg ImageRuntimeConfig) error {
@@ -1345,8 +1560,16 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 }
 
 func scheduleImagePostprocessRetry(ctx context.Context, task model.AsyncImageTask, cfg ImageRuntimeConfig, cause error, storage bool) error {
+	plan, err := buildImagePostprocessPlan(ctx, task, cfg, cause, storage, nil, "")
+	if err != nil {
+		return err
+	}
+	return model.TransitionImageTask(ctx, task, plan.Updates, plan.EventType, plan.EventMessage, plan.OutboxKind, plan.Event)
+}
+
+func buildImagePostprocessPlan(ctx context.Context, task model.AsyncImageTask, cfg ImageRuntimeConfig, cause error, storage bool, policyOverride *mediaretry.Policy, recordedMessage string) (imageFailurePlan, error) {
 	if errors.Is(cause, model.ErrImageConflict) {
-		return cause
+		return imageFailurePlan{}, cause
 	}
 	status, key, count, limit := model.ImageTaskBillingFailed, "billing_retry_count", task.BillingRetryCount, cfg.BillingRetries
 	if storage {
@@ -1373,11 +1596,58 @@ func scheduleImagePostprocessRetry(ctx context.Context, task model.AsyncImageTas
 	}
 	encoded, err := common.Marshal(decision)
 	if err != nil {
-		return err
+		return imageFailurePlan{}, err
 	}
 	message := fmt.Sprintf("%s: confirmation is unavailable; existing images are retained", status)
 	if diagnostic := SanitizeAsyncImageDiagnostic(cause.Error(), asyncImageProviderMessageLimit); diagnostic != "" {
 		message = status + ": " + diagnostic
 	}
-	return model.TransitionImageTask(ctx, task, map[string]any{"status": status, key: count + 1, "next_attempt_at": next, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "public_error_code": 609, "error_code": errorCode, "error_message": message}, "postprocessing_failed", "", kind)
+	// Samples already contain the normalized phase prefix. Reuse that exact
+	// diagnostic so anchored expressions match identically during preview.
+	if recordedMessage != "" {
+		message = recordedMessage
+	}
+	failure := &AsyncImageFailure{Code: 609, InternalCode: errorCode, Message: message}
+	checkpoint, err := ImageRetryFailureContext(task, failure, nil, cfg)
+	if err != nil {
+		return imageFailurePlan{}, err
+	}
+	checkpoint.Fact.HasOutput, checkpoint.Fact.Stage, checkpoint.Fact.Category = true, stage, budget
+	if storage {
+		checkpoint.Fact.Stage = "download"
+	}
+	checkpoint.Fact.ImageEvidence.Postprocess, checkpoint.Fact.ImageEvidence.QuotaUncertain = true, quotaUncertain
+	if policyOverride == nil {
+		checkpoint.Decision, err = EvaluateMediaRetry(ctx, checkpoint.Fact, checkpoint.State)
+	} else {
+		checkpoint.Decision, err = evaluateMediaRetryPolicy(*policyOverride, checkpoint.Fact, checkpoint.State)
+	}
+	if err != nil {
+		// This path already has successful output and cannot submit generation.
+		// Keep its bounded built-in storage/billing recovery available.
+		checkpoint.Decision = mediaretry.Decision{}
+	}
+	if checkpoint.Decision.Matched {
+		if quotaUncertain {
+			checkpoint.Decision.Action, checkpoint.Decision.BlockedReason = mediaretry.ManualReview, "quota_confirmation_unknown"
+		}
+		return buildImagePolicyDecision(ctx, task, failure, cfg, checkpoint, map[string]any{"public_error_code": 609, "error_code": errorCode, "error_message": message})
+	}
+	checkpoint.Decision.Action, checkpoint.Decision.Category = mediaretry.ManualReview, budget
+	if next > 0 {
+		checkpoint.Decision.Action = mediaretry.ResumeBilling
+		if storage {
+			checkpoint.Decision.Action = mediaretry.ResumeDownload
+		}
+	}
+	checkpoint.BuiltinPending = next > 0
+	checkpointJSON, err := common.Marshal(checkpoint)
+	if err != nil {
+		return imageFailurePlan{}, err
+	}
+	event, err := model.NewMediaRetryEvent(task.TaskId, task.Version, checkpoint.Fact, checkpoint.Decision, checkpoint.State)
+	if err != nil {
+		return imageFailurePlan{}, err
+	}
+	return imageFailurePlan{Updates: map[string]any{"status": status, key: count + 1, "next_attempt_at": next, "retry_decision": string(encoded), "retry_policy_state": string(checkpointJSON), "lease_token": "", "lease_expires_at": 0, "public_error_code": 609, "error_code": errorCode, "error_message": message}, Event: event, EventType: "postprocessing_failed", OutboxKind: kind, Audit: decision, Decision: checkpoint.Decision}, nil
 }

@@ -17,11 +17,25 @@ const USAGE_SCHEMA = {
 };
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/reference_images/*", "kind": "image"},
+    {"path": "/image_urls/*", "kind": "image"},
+    {"path": "/referenceImages/*", "kind": "image"},
+    {"path": "/reference_audios/*", "kind": "audio"},
+    {"path": "/audios/*", "kind": "audio"},
+    {"path": "/audio_urls/*", "kind": "audio"},
+    {"path": "/referenceAudios/*", "kind": "audio"},
+    {"path": "/references/*/source", "kind": "media"},
+    {"path": "/metadata/reference_audio/*", "kind": "audio"},
+  ],
   apiVersion: 1,
   key: "yali",
   name: "Yali Video",
   icon: "text:YL",
-  version: "1.0.3",
+  version: "1.0.4",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.yaliai.com",
   website: "https://api.yaliai.com/video-api.md",

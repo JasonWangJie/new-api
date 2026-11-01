@@ -57,11 +57,13 @@ import {
   getTaskEnumCombinations,
   getTaskEnumFields,
   getTaskNumberFields,
+  supportsTaskVideoInputMultipliers,
   taskMatrixToTiers,
   tryParseTaskMatrixConfig,
   tryParseTaskVisualConfig,
   type TaskMatrixRow,
   type TaskVisualConfig,
+  type TaskVideoInputMultipliers,
 } from '@/features/pricing/lib/task-expr'
 import {
   taskPriceLabel,
@@ -77,6 +79,7 @@ import type {
 import { formatPricingNumber } from './pricing-format'
 import { RequestSimulation } from './request-simulation'
 import { TaskPricingMatrix } from './task-pricing-matrix'
+import { TaskVideoMultiplierFields } from './task-video-multiplier-fields'
 
 type TaskUsagePricingEditorProps = {
   currency?: PricingCurrency
@@ -137,7 +140,11 @@ function TaskBillingPreview(props: TaskBillingPreviewProps) {
     formulaParts.length > 0
       ? formulaParts.join(' + ')
       : formatPricingAmount(0, props.currency)
-  const formula = `${formulaLeft} = ${formatPricingAmount(result?.total ?? 0, props.currency)}`
+  const multipliedFormula =
+    result?.multiplier !== undefined && result.multiplier !== 1
+      ? `(${formulaLeft}) × ${formatPricingNumber(result.multiplier)}`
+      : formulaLeft
+  const formula = `${multipliedFormula} = ${formatPricingAmount(result?.total ?? 0, props.currency)}`
 
   return (
     <div className='bg-muted/30 flex flex-col gap-3 rounded-md border p-3'>
@@ -293,6 +300,13 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     )
     return (parsed ?? createDefaultTaskMatrixConfig(props.usageSchema)).rows
   })
+  const [videoInputMultipliers, setVideoInputMultipliers] = useState<
+    TaskVideoInputMultipliers | undefined
+  >(
+    () =>
+      tryParseTaskMatrixConfig(props.billingExpr, props.usageSchema)
+        ?.videoInputMultipliers
+  )
   const [confirmVisualSwitch, setConfirmVisualSwitch] = useState(false)
   const [rawExpr, setRawExpr] = useState(() =>
     combineBillingExpr(props.billingExpr, props.requestRuleExpr)
@@ -322,10 +336,12 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   let matchedRowIndex: number | null = null
   if (editorMode === 'visual') {
     const generatedExpression = generateTaskExprFromConfig(
-      { tiers: visualTiers },
+      { tiers: visualTiers, videoInputMultipliers },
       props.usageSchema
     )
-    if (generatedExpression) previewConfig = { tiers: visualTiers }
+    if (generatedExpression) {
+      previewConfig = { tiers: visualTiers, videoInputMultipliers }
+    }
     const nextMatchedRowIndex = combinations.findIndex((combination) =>
       Object.entries(combination).every(
         ([field, value]) => previewSample[field] === value
@@ -343,16 +359,25 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
     previewRequestRuleExpr = split.requestRuleExpr
   }
 
-  const publishRows = (nextRows: TaskMatrixRow[]) => {
+  const publishRows = (
+    nextRows: TaskMatrixRow[],
+    multipliers = videoInputMultipliers
+  ) => {
     setMatrixRows(nextRows)
     props.onBillingExprChange(
       generateTaskExprFromConfig(
         {
           tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema),
+          videoInputMultipliers: multipliers,
         },
         props.usageSchema
       )
     )
+  }
+
+  const handleVideoMultipliersChange = (next: TaskVideoInputMultipliers) => {
+    setVideoInputMultipliers(next)
+    publishRows(matrixRows, next)
   }
 
   const handleRowChange = (index: number, next: TaskMatrixRow) => {
@@ -411,9 +436,13 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       rawMatrix ?? createDefaultTaskMatrixConfig(props.usageSchema)
     ).rows
     setMatrixRows(nextRows)
+    setVideoInputMultipliers(rawMatrix?.videoInputMultipliers)
     props.onBillingExprChange(
       generateTaskExprFromConfig(
-        { tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema) },
+        {
+          tiers: taskMatrixToTiers({ rows: nextRows }, props.usageSchema),
+          videoInputMultipliers: rawMatrix?.videoInputMultipliers,
+        },
         props.usageSchema
       )
     )
@@ -493,8 +522,17 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       <div className='bg-muted/30 space-y-3 rounded-md border p-3'>
         {editorMode === 'visual' ? (
           <>
+            {supportsTaskVideoInputMultipliers(props.usageSchema) ? (
+              <TaskVideoMultiplierFields
+                value={videoInputMultipliers ?? { none: 1, video: 1 }}
+                onChange={handleVideoMultipliersChange}
+              />
+            ) : null}
             {enumFields.length > 0 ? (
               <div className='flex flex-col gap-3'>
+                {supportsTaskVideoInputMultipliers(props.usageSchema) ? (
+                  <h4 className='text-sm font-medium'>{t('Base prices')}</h4>
+                ) : null}
                 <p className='text-muted-foreground text-xs'>
                   {t(
                     'Set prices for each set of conditions below. Cost = usage × unit price + additional charge. Token prices are per million tokens.'
@@ -715,7 +753,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
             ? rawExpr
             : combineBillingExpr(
                 generateTaskExprFromConfig(
-                  { tiers: visualTiers },
+                  { tiers: visualTiers, videoInputMultipliers },
                   props.usageSchema
                 ),
                 props.requestRuleExpr

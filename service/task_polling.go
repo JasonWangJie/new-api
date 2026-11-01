@@ -18,6 +18,7 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
@@ -495,6 +496,17 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 		}
 		pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
 		defer cancel()
+		for _, task := range tasks {
+			if task.PrivateData.VideoReconciliation != nil {
+				decision, err := videoPollingDecision(ctx, task, task.PrivateData.VideoReconciliation.Reason, 0, true)
+				if err != nil {
+					return err
+				}
+				if decision.Matched && decision.Action != mediaretry.PollSameJob {
+					return nil
+				}
+			}
+		}
 		resp, err = poller.FetchBatchTasksContext(pollContext, baseURL, key, tasks, ch.GetSetting().Proxy)
 	} else {
 		resp, err = adaptor.FetchBatchTasks(baseURL, key, tasks, ch.GetSetting().Proxy)
@@ -823,6 +835,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		ChannelSetting:       ch.GetSetting(),
 		ChannelOtherSettings: ch.GetOtherSettings(),
 	}})
+	if task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation != nil {
+		decision, err := videoPollingDecision(ctx, task, task.PrivateData.VideoReconciliation.Reason, 0, true)
+		if err != nil {
+			return err
+		}
+		if decision.Matched && decision.Action != mediaretry.PollSameJob {
+			return nil
+		}
+	}
 	snap := task.Snapshot()
 	var resp *http.Response
 	var err error
@@ -1274,6 +1295,17 @@ func reconcileAsyncVideoTask(ctx context.Context, task *model.Task, before model
 	} else {
 		state.NextPollAt = min(state.DeadlineAt, now+int64(cfg.ReconciliationPollInterval))
 	}
+	decision, policyErr := videoPollingDecision(ctx, task, state.Reason, statusCode, false)
+	if policyErr != nil {
+		return policyErr
+	}
+	if decision.Matched {
+		if decision.Action == mediaretry.PollSameJob && !state.ManualRequired {
+			state.NextPollAt = min(state.DeadlineAt, now+int64(max(1, decision.DelaySeconds)))
+		} else if decision.Action != mediaretry.PollSameJob {
+			state.ManualRequired, state.NextPollAt = true, 0
+		}
+	}
 	task.PrivateData.VideoReconciliation = &state
 	_, err = task.UpdatePollingState(ctx, before)
 	return err
@@ -1284,6 +1316,21 @@ func reconcileAsyncVideoTask(ctx context.Context, task *model.Task, before model
 func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
 	if task == nil || task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		return false, nil
+	}
+	if task.PrivateData.AsyncMedia && task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.Stage == "billing" && task.PrivateData.MediaRetryFact.ErrorCode == "video_billing_failed" && task.PrivateData.MediaRetryFact.HasOutput {
+		fact := *task.PrivateData.MediaRetryFact
+		state := mediaretry.State{Now: time.Now().Unix(), TotalLimit: 16}
+		if task.PrivateData.MediaRetryState != nil {
+			state = *task.PrivateData.MediaRetryState
+			state.Now = time.Now().Unix()
+		}
+		decision, err := evaluateVideoRetry(ctx, fact, &state)
+		if err != nil {
+			return false, err
+		}
+		if decision.Matched && (decision.Action != mediaretry.ResumeBilling || state.Now < task.PrivateData.MediaRetryFailedAt+int64(decision.DelaySeconds)) {
+			return false, nil
+		}
 	}
 	state := task.PrivateData.VideoReconciliation
 	if !task.PrivateData.AsyncMedia || state == nil {
@@ -1302,7 +1349,23 @@ func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
 		_, err := task.UpdatePollingState(ctx, before)
 		return false, err
 	}
-	return now >= state.NextPollAt, nil
+	if now < state.NextPollAt {
+		return false, nil
+	}
+	decision, err := videoPollingDecision(ctx, task, state.Reason, 0, false)
+	if err != nil {
+		return false, err
+	}
+	if decision.Matched && decision.Action != mediaretry.PollSameJob {
+		before := task.Snapshot()
+		updated := *state
+		updated.ManualRequired, updated.NextPollAt = true, 0
+		updated.Revision++
+		task.PrivateData.VideoReconciliation = &updated
+		_, err := task.UpdatePollingState(ctx, before)
+		return false, err
+	}
+	return true, nil
 }
 
 // A valid pending result restores observability but does not extend the frozen

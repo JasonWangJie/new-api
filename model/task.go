@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
@@ -131,6 +132,13 @@ type TaskPrivateData struct {
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	// BillingChannelID remains the channel credited by submission accounting,
+	// even when a later attempt executes on another compatible channel.
+	BillingChannelID   int                  `json:"billing_channel_id,omitempty"`
+	MediaRetryFact     *mediaretry.Fact     `json:"media_retry_fact,omitempty"`
+	MediaRetryFailedAt int64                `json:"media_retry_failed_at,omitempty"`
+	MediaRetryState    *mediaretry.State    `json:"media_retry_state,omitempty"`
+	MediaRetryDecision *mediaretry.Decision `json:"media_retry_decision,omitempty"`
 	// SubmitAccountingRecorded fences measured video settlement until the
 	// submission's usage counters have been persisted in the main database.
 	SubmitAccountingRecorded bool `json:"submit_accounting_recorded,omitempty"`
@@ -169,12 +177,23 @@ type VideoTaskReconciliation struct {
 // VideoTaskAttempt keeps the failed native operation separate from a later
 // submission. Diagnostics are sanitized by the caller before persistence.
 type VideoTaskAttempt struct {
-	Generation     int64  `json:"generation"`
-	UpstreamTaskID string `json:"upstream_task_id"`
-	Status         string `json:"status"`
-	Reason         string `json:"reason"`
-	StartedAt      int64  `json:"started_at"`
-	FinishedAt     int64  `json:"finished_at"`
+	Generation     int64                `json:"generation"`
+	ChannelID      int                  `json:"channel_id,omitempty"`
+	Decision       *mediaretry.Decision `json:"retry_decision,omitempty"`
+	UpstreamTaskID string               `json:"upstream_task_id"`
+	Status         string               `json:"status"`
+	Reason         string               `json:"reason"`
+	StartedAt      int64                `json:"started_at"`
+	FinishedAt     int64                `json:"finished_at"`
+}
+
+// BillingChannelID identifies the immutable submission accounting owner.
+// Legacy tasks that never switched channels need no backfill.
+func (t *Task) BillingChannelID() int {
+	if t.PrivateData.BillingChannelID > 0 {
+		return t.PrivateData.BillingChannelID
+	}
+	return t.ChannelId
 }
 
 type TaskExecutionSnapshot struct {
@@ -245,7 +264,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if !p.AsyncMedia && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.UpstreamAsync == nil && len(p.UpstreamAsyncResponse) == 0 && p.BillingSource == "" && p.SubscriptionId == 0 &&
-		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
+		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && p.BillingChannelID == 0 && p.MediaRetryFact == nil && p.MediaRetryFailedAt == 0 && p.MediaRetryState == nil && p.MediaRetryDecision == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 && len(p.VideoAttempts) == 0 && !p.VideoTerminalConfirmed && p.VideoReconciliation == nil {
 		return nil, nil
 	}

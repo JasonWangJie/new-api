@@ -144,8 +144,12 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	var task model.Task
 	err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err == nil {
+		if admin {
+			view["billing_channel_id"] = task.BillingChannelID()
+			view["media_retry_decision"] = task.PrivateData.MediaRetryDecision
+		}
 		if job.Status == "execution_unknown" {
-			view["can_terminate"] = admin && job.ReferenceRecoveryStage == "unknown" && task.AttemptGeneration == job.AttemptGeneration && task.Status == model.TaskStatusUnknown && job.LeaseExpiresAt <= now
+			view["can_terminate"] = admin && (job.ReferenceRecoveryStage == "unknown" || job.ReferenceRecoveryStage == "manual") && task.AttemptGeneration == job.AttemptGeneration && task.Status == model.TaskStatusUnknown && job.LeaseExpiresAt <= now
 		}
 		view["can_resume"] = task.Status == model.TaskStatusSuccess && job.ExpiresAt > time.Now().Unix() && job.LeaseExpiresAt <= time.Now().Unix() &&
 			(job.Status == "submitted" && job.StorageStatus == "failed" || job.Status == "succeeded" && job.StorageStatus == "upstream")
@@ -555,6 +559,9 @@ func videoTaskAudit(c *gin.Context, job model.AsyncMediaJob, view gin.H, admin b
 			return nil, err
 		}
 		for _, previous := range native.PrivateData.VideoAttempts {
+			if position, exists := positions[previous.Generation]; exists && admin {
+				attempts[position]["media_retry_decision"] = previous.Decision
+			}
 			if position, exists := positions[previous.Generation]; exists && strings.TrimSpace(previous.Reason) != "" {
 				attempts[position]["error_message"] = service.VideoTaskFailureReason(previous.Reason)
 			}
@@ -714,7 +721,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 				reason += "\n" + detail
 			}
 			updates["error_message"] = service.VideoTaskFailureReason(reason)
-			if job.ReferenceRetryCount == 1 && job.ReferenceRecoveryStage == "unknown" {
+			if job.ReferenceRetryCount >= 1 && (job.ReferenceRecoveryStage == "unknown" || job.ReferenceRecoveryStage == "manual") {
 				var task model.Task
 				if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", job.TaskId, job.UserId, job.AttemptGeneration).Take(&task).Error; err != nil || !task.PrivateData.DurableBilling || task.PrivateData.UpstreamTaskID != "" {
 					imageManagementError(c, http.StatusConflict, errors.New("Media task reservation requires reconciliation"))
@@ -732,7 +739,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 					return
 				}
 				reconciledTask = &task
-				query = query.Where("id = ? AND attempt_generation = ? AND reference_recovery_stage = ? AND status = ?", job.ID, job.AttemptGeneration, "unknown", "execution_unknown")
+				query = query.Where("id = ? AND attempt_generation = ? AND reference_recovery_stage = ? AND status = ?", job.ID, job.AttemptGeneration, job.ReferenceRecoveryStage, "execution_unknown")
 				updates["billing_status"], updates["quota"], updates["reference_recovery_stage"] = "refunded", 0, "complete"
 			} else {
 				query = query.Where("status = ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id)", "execution_unknown")

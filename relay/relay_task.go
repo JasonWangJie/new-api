@@ -238,6 +238,7 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 // 共享控制器编排负责未落库退款、最终额度预留、落库和结算。
 func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
 	c.Set("async_media_retryable_submission_rejection", false)
+	c.Set("async_media_submission_rejected", false)
 	c.Set("async_media_submission_retry_reason", "")
 	info.InitChannelMeta(c)
 
@@ -435,7 +436,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	referenceRetry := false
 	if value, exists := c.Get("async_media_reference_retry_task"); exists {
 		task, valid := value.(model.Task)
-		if !valid || !c.GetBool("async_media_execution") || task.Platform != "drama" || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.AttemptGeneration != 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || task.Quota <= 0 || task.Quota != info.PriceData.Quota || task.UserId != info.UserId || task.ChannelId != info.ChannelId || info.TaskRelayInfo == nil || task.TaskID != info.TaskRelayInfo.PublicTaskID {
+		if !valid || !c.GetBool("async_media_execution") || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.AttemptGeneration < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || task.Quota <= 0 || task.Quota != info.PriceData.Quota || task.UserId != info.UserId || task.ChannelId != info.ChannelId || info.TaskRelayInfo == nil || task.TaskID != info.TaskRelayInfo.PublicTaskID {
 			return nil, service.TaskErrorWrapperLocal(errors.New("video recovery requires its original durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
 		referenceRetry = true
@@ -565,13 +566,18 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				message = "upstream task submission failed"
 			}
 			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), "fail_to_fetch_task", resp.StatusCode)
+			if c.GetBool("async_media_execution") && isConfirmedAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
+				c.Set("async_media_submission_rejected", true)
+				c.Set("async_media_submission_retry_reason", message)
+			}
 			if c.GetBool("async_media_execution") && platform == "drama" && !hasAsyncProfile && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
 				c.Set("async_media_retryable_submission_rejection", true)
 				reason := "explicit_rejection"
 				if resp.StatusCode == http.StatusBadGateway {
 					reason = "submission_unknown_duplicate_risk_accepted"
+					c.Set("async_media_submission_retry_reason", reason)
 				}
-				c.Set("async_media_submission_retry_reason", reason)
+				c.Set("async_media_legacy_submission_retry_reason", reason)
 			}
 			return nil, failure
 		}
@@ -650,7 +656,23 @@ var (
 // envelope, without receipts or output. A missing task id alone is not proof
 // that the supplier rejected the operation.
 func isRetryableAsyncVideoSubmissionRejection(status int, body []byte) bool {
-	if status != http.StatusUnprocessableEntity && status != http.StatusTooManyRequests && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
+	return classifyAsyncVideoSubmissionRejection(status, body, true)
+}
+
+// Rules may handle new explicit rejection diagnostics, but never infer a safe
+// replay from an absent receipt, a transport failure or an ambiguous server error.
+func isConfirmedAsyncVideoSubmissionRejection(status int, body []byte) bool {
+	if status == http.StatusServiceUnavailable {
+		return isRetryableAsyncVideoSubmissionRejection(status, body)
+	}
+	return classifyAsyncVideoSubmissionRejection(status, body, false)
+}
+
+func classifyAsyncVideoSubmissionRejection(status int, body []byte, legacy bool) bool {
+	if legacy && status != http.StatusUnprocessableEntity && status != http.StatusTooManyRequests && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
+		return false
+	}
+	if !legacy && (status < 400 || status >= 500 || status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly) {
 		return false
 	}
 	var envelope map[string]any
@@ -706,7 +728,12 @@ func isRetryableAsyncVideoSubmissionRejection(status int, body []byte) bool {
 					}
 				case string:
 					code = strings.ToLower(strings.TrimSpace(code))
-					if code != strconv.Itoa(status) && !slices.Contains([]string{"", "0", "error", "new_api_error", "server_error", "upstream_error", "generation_failed", "video_generation_failed", "fail_to_fetch_task", "system_busy", "service_unavailable", "rate_limit_exceeded", "submission_unknown", "task_submission_unknown"}, code) {
+					if !legacy {
+						if len(code) > 128 || strings.ContainsAny(code, " \t\r\n:/\\@") {
+							return false
+						}
+						diagnostics = append(diagnostics, code)
+					} else if code != strconv.Itoa(status) && !slices.Contains([]string{"", "0", "error", "new_api_error", "server_error", "upstream_error", "generation_failed", "video_generation_failed", "fail_to_fetch_task", "system_busy", "service_unavailable", "rate_limit_exceeded", "submission_unknown", "task_submission_unknown"}, code) {
 						return false
 					}
 				default:
@@ -742,8 +769,11 @@ func isRetryableAsyncVideoSubmissionRejection(status int, body []byte) bool {
 	}
 	diagnostic = strings.NewReplacer("_", " ", "-", " ").Replace(strings.ToLower(diagnostic))
 	diagnostic = strings.Join(strings.Fields(diagnostic), " ")
-	if diagnostic == "" || strings.Contains(diagnostic, "://") || videoSubmissionAcceptedPattern.MatchString(diagnostic) || videoSubmissionHardFailurePattern.MatchString(diagnostic) {
+	if diagnostic == "" || strings.Contains(diagnostic, "://") || videoSubmissionAcceptedPattern.MatchString(diagnostic) || legacy && videoSubmissionHardFailurePattern.MatchString(diagnostic) {
 		return false
+	}
+	if !legacy {
+		return !strings.Contains(diagnostic, "unknown") && !strings.Contains(diagnostic, "未知") && !strings.Contains(diagnostic, "unconfirmed") && !strings.Contains(diagnostic, "无法确认") && !strings.Contains(diagnostic, "未确认")
 	}
 	if status == http.StatusBadGateway {
 		// The administrator explicitly accepts duplicate-generation risk for

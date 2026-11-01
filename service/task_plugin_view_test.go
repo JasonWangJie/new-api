@@ -15,6 +15,11 @@ import (
 )
 
 func TestBuildTaskPluginViewRestoresLegacyDramaFailureReason(t *testing.T) {
+	// This fixture exercises the historical Drama fallback without a registered
+	// video protocol. Registered video providers are covered separately below.
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
 	const placeholder = "Video generation failed"
 	const dimensions = "Error while downloading image, error: expected the width to be at most 6000px, but received a 6060x3476px image instead"
 	for _, tc := range []struct {

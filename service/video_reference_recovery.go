@@ -12,7 +12,10 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"gorm.io/gorm"
 )
 
 // AsyncVideoReferenceInput identifies a slot in the canonical request. Display
@@ -88,11 +91,14 @@ func isAsyncVideoBusyFailure(reason string) bool {
 	return videoBusyPattern.MatchString(reason)
 }
 
-// FreezeAsyncVideoReferenceRecovery is called only for a validated Drama
-// request before its first dispatch. It captures the canonical reference order.
+// FreezeAsyncVideoReferenceRecovery freezes replay inputs after validation and
+// before the first dispatch. Existing Drama requests retain canonical slots.
 func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any, expiresAt int64) error {
-	if request == nil || request.Execution == nil || request.Execution.TaskPlugin == nil || request.Execution.TaskPlugin.Key != "drama" {
+	if request == nil || request.Execution == nil || request.Execution.TaskPlugin == nil {
 		return nil
+	}
+	if request.Execution.TaskPlugin.Key != "drama" {
+		return freezeVideoRetryInputs(request, expiresAt)
 	}
 	body, ok := canonical.(map[string]any)
 	if !ok {
@@ -143,56 +149,391 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 		return err
 	}
 	request.Body, request.ContentType = encoded, "application/json"
+	request.OriginalBody = append([]byte(nil), encoded...)
 	request.ReferenceInputs, request.ReferenceRecoveryVersion = inputs, 1
 	request.ReferenceRecoveryDeadline, request.ReferenceURLExpiresAt = deadline, urlExpiresAt
 	return nil
 }
 
+func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
+	plugin, found := jsplugin.DefaultRegistry.Get(request.Execution.TaskPlugin.Key)
+	if !found || constant.TaskTimeoutMinutes <= 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	request.ReferenceRecoveryVersion = 2
+	request.ReferenceRecoveryDeadline = min(now+int64(constant.TaskTimeoutMinutes)*60, expiresAt)
+	request.ReferenceURLExpiresAt = min(request.ReferenceRecoveryDeadline+259200+3600, expiresAt, now+7*86400)
+	request.OriginalBody = append([]byte(nil), request.Body...)
+	if !strings.HasPrefix(strings.ToLower(request.ContentType), "application/json") {
+		return nil
+	}
+	var body map[string]any
+	if err := common.Unmarshal(request.Body, &body); err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	counts := make(map[string]int)
+	for _, selector := range plugin.Meta.VideoRetryInputs {
+		slots := []videoRetrySlot{{Value: body}}
+		for part := range strings.SplitSeq(strings.TrimPrefix(selector.Path, "/"), "/") {
+			var next []videoRetrySlot
+			for _, slot := range slots {
+				switch value := slot.Value.(type) {
+				case map[string]any:
+					if child, ok := value[part]; ok {
+						next = append(next, videoRetrySlot{Path: slot.Path + "/" + part, Value: child, Parent: value})
+					}
+				case []any:
+					if part == "*" {
+						for i, child := range value {
+							next = append(next, videoRetrySlot{Path: slot.Path + "/" + strconv.Itoa(i), Value: child})
+						}
+					}
+				}
+			}
+			slots = next
+		}
+		for _, slot := range slots {
+			source, ok := slot.Value.(string)
+			if !ok || seen[slot.Path] || !(strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://")) {
+				continue
+			}
+			kind := selector.Kind
+			role, _ := slot.Parent["role"].(string)
+			if kind == "media" {
+				kind, _ = slot.Parent["type"].(string)
+				switch kind {
+				case "first_frame", "last_frame", "reference_image":
+					kind = "image"
+				case "first_clip", "reference_video":
+					kind = "video"
+				case "driving_audio", "reference_audio":
+					kind = "audio"
+				}
+			}
+			if kind != "image" && kind != "video" && kind != "audio" {
+				request.ReferenceLocalizationUnsupported = true
+				continue
+			}
+			if len(request.ReferenceInputs) >= 64 {
+				return errors.New("video retry references exceed the supported limit")
+			}
+			seen[slot.Path] = true
+			counts[kind]++
+			request.ReferenceInputs = append(request.ReferenceInputs, AsyncVideoReferenceInput{Index: len(request.ReferenceInputs), Kind: kind, Role: role, Source: source, Path: slot.Path, KindIndex: counts[kind]})
+		}
+	}
+	return nil
+}
+
+type videoRetrySlot struct {
+	Path   string
+	Value  any
+	Parent map[string]any
+}
+
+// videoRetryReferenceValue resolves an exact frozen input slot. Unlike a JSON
+// patch it cannot create keys, grow arrays, or alter any other request content.
+func videoRetryReferenceValue(body map[string]any, path string, replacement *string) (string, error) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	var current any = body
+	for index, part := range parts {
+		last := index == len(parts)-1
+		switch value := current.(type) {
+		case map[string]any:
+			child, ok := value[part]
+			if !ok {
+				return "", ErrMediaInputUnavailable
+			}
+			if last {
+				source, ok := child.(string)
+				if !ok {
+					return "", ErrMediaInputUnavailable
+				}
+				if replacement != nil {
+					value[part] = *replacement
+				}
+				return source, nil
+			}
+			current = child
+		case []any:
+			i, err := strconv.Atoi(part)
+			if err != nil || i < 0 || i >= len(value) {
+				return "", ErrMediaInputUnavailable
+			}
+			if last {
+				source, ok := value[i].(string)
+				if !ok {
+					return "", ErrMediaInputUnavailable
+				}
+				if replacement != nil {
+					value[i] = *replacement
+				}
+				return source, nil
+			}
+			current = value[i]
+		default:
+			return "", ErrMediaInputUnavailable
+		}
+	}
+	return "", ErrMediaInputUnavailable
+}
+
 // TryAsyncVideoReferenceRecovery runs before the terminal billing transition.
 // A transport or ambiguous polling failure must never reach this decision.
 func TryAsyncVideoReferenceRecovery(ctx context.Context, task model.Task, result *relaycommon.TaskInfo, httpStatus int, response []byte) (bool, error) {
-	if !task.PrivateData.AsyncMedia || task.Platform != "drama" || task.AttemptGeneration != 0 || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != "" {
+	if !task.PrivateData.AsyncMedia || task.PrivateData.UpstreamTaskID == "" || result == nil || result.Status != string(model.TaskStatusFailure) || httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices {
 		return false, nil
 	}
-	localReferences := isAsyncVideoReferenceDownloadFailure(result.Reason)
-	if !localReferences && !isAsyncVideoBusyFailure(result.Reason) {
-		return false, nil
+	if fact := task.PrivateData.MediaRetryFact; fact != nil && fact.HasOutput {
+		return true, errors.New("video output was already confirmed; reconcile the original result and billing instead of regenerating or refunding")
 	}
-	var snapshot map[string]any
-	if common.Unmarshal(response, &snapshot) != nil || snapshot == nil || snapshot["status"] != "failed" || videoReferenceOutputEvidence(snapshot, result.Reason, 0) {
-		return false, nil
-	}
-	if result.TaskID != "" && result.TaskID != task.PrivateData.UpstreamTaskID {
-		return false, nil
-	}
-	for _, field := range []string{"id", "task_id", "taskId"} {
-		if identity, exists := snapshot[field]; exists && identity != task.PrivateData.UpstreamTaskID {
-			return false, nil
-		}
-	}
+	_, recovered, err := tryConfiguredVideoRecovery(ctx, task, result, httpStatus, response)
+	return recovered, err
+}
+
+func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *relaycommon.TaskInfo, httpStatus int, response []byte) (bool, bool, error) {
 	var job model.AsyncMediaJob
 	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&job).Error; err != nil {
-		return false, err
-	}
-	if job.ReferenceRetryCount != 0 || job.BillingStatus != "reserved" || len(job.RequestCipher) == 0 {
-		return false, nil
-	}
-	plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
-	if err != nil {
-		return false, nil
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, false, nil
+		}
+		return false, false, err
 	}
 	var request AsyncVideoRequest
-	if common.Unmarshal(plain, &request) != nil || request.ReferenceRecoveryVersion != 1 || localReferences && len(request.ReferenceInputs) == 0 || len(request.Body) == 0 || request.ReferenceRecoveryDeadline <= time.Now().Unix() || request.ReferenceURLExpiresAt <= time.Now().Unix() || request.Channel.Id != task.ChannelId || request.Channel.Key == "" {
-		return false, nil
+	plain, decryptErr := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+	requestErr := decryptErr
+	if requestErr == nil {
+		requestErr = common.Unmarshal(plain, &request)
 	}
-	if task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && task.Quota > 0 && job.AttemptGeneration == task.AttemptGeneration &&
-		(job.Status == "submitting" || job.Status == "queued" || job.Status == "submitted" && job.Quota != task.Quota) {
-		// A receipt can become pollable just before the submission worker
-		// publishes its final quota/status projection. Let that worker (or its
-		// lease recovery) finish instead of refunding this recoverable failure.
-		return true, nil
+	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "terminal", HTTPStatus: httpStatus, ErrorCode: "upstream_failed", Message: result.Reason, Accepted: true, Terminal: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
+	fact.Category = "unclassified"
+	if isAsyncVideoReferenceDownloadFailure(fact.Message) {
+		fact.Category = "reference_download"
+	} else if isAsyncVideoBusyFailure(fact.Message) {
+		fact.Category = "capacity"
 	}
-	return model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, SanitizeAsyncImageText(result.Reason, common.LocalLogContentLimit), localReferences)
+	output, conflict := videoRecoveryResponseEvidence(response, task.PrivateData.UpstreamTaskID, result.Reason)
+	fact.HasOutput = output || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != ""
+	fact.Unknown = conflict || fact.HasOutput || result.TaskID != "" && result.TaskID != task.PrivateData.UpstreamTaskID
+	if fact.Unknown {
+		fact.Terminal, fact.Stage, fact.ErrorCode = false, "poll", "upstream_result_conflicting"
+		fact.VideoEvidence = &mediaretry.VideoFailureEvidence{TerminalResponseConflict: true}
+	}
+	if requestErr != nil && !fact.Unknown {
+		if decryptErr != nil {
+			return false, false, nil
+		}
+		return false, false, requestErr
+	}
+	if task.Platform == "drama" && task.AttemptGeneration == 0 && job.ReferenceRetryCount == 0 && !fact.Unknown {
+		var snapshot map[string]any
+		if common.Unmarshal(response, &snapshot) == nil && snapshot != nil && snapshot["status"] == "failed" && !videoReferenceOutputEvidence(snapshot, result.Reason, 0) {
+			fact.VideoEvidence = &mediaretry.VideoFailureEvidence{LegacyReferenceEligible: isAsyncVideoReferenceDownloadFailure(result.Reason), LegacyBusyEligible: isAsyncVideoBusyFailure(result.Reason)}
+		}
+	}
+	fact = NormalizeMediaRetryFact(fact)
+	state := videoRetryState(task, job)
+	policy, err := GetMediaRetryPolicy(ctx)
+	if err != nil {
+		return true, false, err
+	}
+	cfg, err := GetImageRuntimeConfig(ctx)
+	if err != nil {
+		return true, false, err
+	}
+	state.TotalLimit = min(state.TotalLimit, cfg.TotalRetries)
+	decision, err := PlanTerminalVideoFailure(policy, fact, state)
+	if err != nil {
+		return true, false, err
+	}
+	if fact.Unknown {
+		// A failure envelope containing output, an accepted status, or another
+		// native identity cannot prove that this generation failed. Retain its
+		// receipt and financial hold independently of editable matching rules.
+		if err := model.RecordAsyncVideoRetryDecision(ctx, task, job, fact, decision, state, false); err != nil {
+			return true, true, err
+		}
+		cfg, err := GetMediaRuntimeConfig(ctx)
+		if err != nil {
+			return true, true, err
+		}
+		before := task.Snapshot()
+		reconciliation := model.VideoTaskReconciliation{}
+		if task.PrivateData.VideoReconciliation != nil {
+			reconciliation = *task.PrivateData.VideoReconciliation
+		}
+		now := time.Now().Unix()
+		if reconciliation.StartedAt == 0 {
+			reconciliation.StartedAt, reconciliation.DeadlineAt = now, now+int64(cfg.ReconciliationTimeout)*60
+		}
+		reconciliation.Revision++
+		reconciliation.Reason = "Upstream failure conflicts with output, status, or task identity; reconcile the original operation"
+		reconciliation.ManualRequired = reconciliation.ManualRequired || decision.Action != mediaretry.PollSameJob || now >= reconciliation.DeadlineAt
+		reconciliation.NextPollAt = 0
+		if !reconciliation.ManualRequired {
+			reconciliation.NextPollAt = min(reconciliation.DeadlineAt, now+int64(max(cfg.ReconciliationPollInterval, decision.DelaySeconds)))
+		}
+		task.PrivateData.MediaRetryFact, task.PrivateData.MediaRetryDecision, task.PrivateData.VideoReconciliation = &fact, &decision, &reconciliation
+		_, err = task.UpdatePollingState(ctx, before)
+		return true, true, err
+	}
+	if !decision.Matched {
+		if err := model.RecordAsyncVideoRetryDecision(ctx, task, job, fact, decision, state, false); err != nil {
+			return true, false, err
+		}
+		return false, false, nil
+	}
+	if !mediaretry.IsResubmission(decision.Action) {
+		if err := model.RecordAsyncVideoRetryDecision(ctx, task, job, fact, decision, state, false); err != nil {
+			return true, false, err
+		}
+		if decision.BlockedReason == "resubmissions_paused" {
+			return true, true, nil
+		}
+		if decision.Action == mediaretry.ManualReview || decision.Action == mediaretry.PollSameJob {
+			before := task.Snapshot()
+			task.PrivateData.MediaRetryDecision = &decision
+			task.PrivateData.VideoReconciliation = &model.VideoTaskReconciliation{StartedAt: time.Now().Unix(), DeadlineAt: time.Now().Unix(), ManualRequired: true, Reason: fact.Message, Revision: 1}
+			_, err := task.UpdatePollingState(ctx, before)
+			return true, true, err
+		}
+		return true, false, nil
+	}
+	if job.BillingStatus == "reserved" && job.AttemptGeneration == task.AttemptGeneration &&
+		(job.Status == "submitting" || job.Status == "queued" || job.Status == "submitted" && (job.Quota != task.Quota || !task.PrivateData.SubmitAccountingRecorded || !task.PrivateData.DurableBilling)) {
+		// A visible native receipt may precede the original submit worker's
+		// accounting projection. Keep that worker's hold until it is complete.
+		return true, true, nil
+	}
+	blockedReason := ""
+	switch {
+	case request.ReferenceRecoveryVersion == 0 || len(request.Body) == 0:
+		blockedReason = "request_replay_unavailable"
+	case request.ReferenceRecoveryDeadline <= time.Now().Unix():
+		blockedReason = "execution_deadline_reached"
+	case job.BillingStatus != "reserved" || task.Quota <= 0:
+		blockedReason = "reservation_unavailable"
+	case !task.PrivateData.SubmitAccountingRecorded || !task.PrivateData.DurableBilling:
+		blockedReason = "submission_accounting_unavailable"
+	case task.PrivateData.UpstreamTaskID == "":
+		blockedReason = "upstream_task_unavailable"
+	}
+	if blockedReason != "" {
+		decision.Action, decision.BlockedReason = mediaretry.Stop, blockedReason
+		if err := model.RecordAsyncVideoRetryDecision(ctx, task, job, fact, decision, state, false); err != nil {
+			return true, false, err
+		}
+		return true, false, nil
+	}
+	request.RetryFact, request.PendingDecision = &fact, &decision
+	request.RetryFailedAt = time.Now().Unix()
+	if len(request.OriginalBody) > 0 {
+		request.Body = append([]byte(nil), request.OriginalBody...)
+		request.LocalReferencesReady = false
+	}
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return true, false, err
+	}
+	cipher, err := EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	if err != nil {
+		return true, false, err
+	}
+	local := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
+	won, err := model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, fact.Message, local, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: state, RequestCipher: cipher})
+	return true, won, err
+}
+
+func videoRetryState(task model.Task, job model.AsyncMediaJob) mediaretry.State {
+	used := job.ReferenceRetryCount
+	if job.ReferenceRecoveryStage == "prepare" || job.ReferenceRecoveryStage == "submit" {
+		used = max(used-1, 0)
+	}
+	state := mediaretry.State{TotalUsed: used, TotalLimit: 16, Now: time.Now().Unix()}
+	if task.PrivateData.MediaRetryState != nil {
+		state = *task.PrivateData.MediaRetryState
+		state.Now = time.Now().Unix()
+	}
+	return state
+}
+
+// videoRecoveryResponseEvidence checks protocol evidence, not error keywords.
+// Input echoes are excluded so a reference URL is never mistaken for an output.
+func videoRecoveryResponseEvidence(response []byte, upstreamID, diagnostic string) (bool, bool) {
+	var root map[string]any
+	if len(response) > 2<<20 || common.Unmarshal(response, &root) != nil || root == nil {
+		return false, true
+	}
+	type node struct {
+		value any
+		depth int
+	}
+	pending := []node{{value: root}}
+	output, conflict := false, false
+	for visited := 0; len(pending) > 0; visited++ {
+		if visited >= 256 {
+			return output, true
+		}
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if current.depth > 16 {
+			return output, true
+		}
+		switch value := current.value.(type) {
+		case []any:
+			for _, child := range value {
+				pending = append(pending, node{child, current.depth + 1})
+			}
+		case map[string]any:
+			for field, child := range value {
+				name := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(field))
+				switch name {
+				case "prompt", "input", "request", "references", "parameters", "inputimage", "inputreference":
+					continue
+				}
+				if current.depth == 0 && (name == "id" || name == "taskid" || name == "requestid") {
+					if id, ok := child.(string); !ok || id != upstreamID {
+						conflict = true
+					}
+				}
+				if name == "success" || name == "succeeded" || name == "completed" {
+					if yes, ok := child.(bool); ok && yes {
+						conflict = true
+					}
+				}
+				if name == "status" || name == "state" {
+					if status, ok := child.(string); ok {
+						switch strings.ToLower(strings.TrimSpace(status)) {
+						case "success", "succeeded", "completed", "done", "accepted", "queued", "pending", "processing", "in_progress", "in-progress", "submitted", "running":
+							conflict = true
+						}
+					}
+				}
+				switch name {
+				case "url", "remoteurl", "videourl", "lastframeurl", "outputurl":
+					if text, ok := child.(string); ok && (strings.HasPrefix(strings.TrimSpace(text), "https://") || strings.HasPrefix(strings.TrimSpace(text), "http://") || strings.HasPrefix(strings.TrimSpace(text), "data:")) && strings.TrimSpace(text) != strings.TrimSpace(diagnostic) {
+						output = true
+					}
+				case "result", "results", "output", "outputs", "artifacts", "video", "videos", "image", "images", "audio", "audios", "file", "files", "b64json", "b64video", "bytesbase64encoded", "base64", "lastframe":
+					switch content := child.(type) {
+					case nil:
+					case string:
+						output = output || strings.TrimSpace(content) != ""
+					case []any:
+						output = output || len(content) > 0
+					case map[string]any:
+						output = output || len(content) > 0
+					default:
+						output = true
+					}
+				}
+				pending = append(pending, node{child, current.depth + 1})
+			}
+		}
+	}
+	return output, conflict
 }
 
 func videoReferenceOutputEvidence(value any, diagnostic string, depth int) bool {
@@ -323,9 +664,62 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			err = common.Unmarshal(plain, &request)
 		}
 	}
-	if err == nil && (request.ReferenceRecoveryVersion != 1 || request.ReferenceRecoveryDeadline <= time.Now().Unix()) {
+	if err == nil && ((request.ReferenceRecoveryVersion != 1 && request.ReferenceRecoveryVersion != 2) || request.ReferenceRecoveryDeadline <= time.Now().Unix()) {
 		err = errors.New("video reference recovery deadline expired")
 	}
+	if err == nil {
+		RestoreVideoRetryFact(task, job, &request)
+		decision, policyErr := RecheckVideoRecoveryPolicy(parent, job, task, request)
+		if errors.Is(policyErr, ErrVideoRetryDeferred) {
+			updates["next_attempt_at"] = time.Now().Unix() + 3
+			return policyErr
+		}
+		err = policyErr
+		if decision != nil && request.RetryFact != nil {
+			if recordErr := model.RecordAsyncVideoRetryDecision(parent, task, job, *request.RetryFact, *decision, videoRetryState(task, job), false); recordErr != nil {
+				updates["next_attempt_at"] = time.Now().Unix() + 3
+				return recordErr
+			}
+			if decision.Action == mediaretry.ManualReview || decision.Action == mediaretry.PollSameJob {
+				reason := "Video recovery requires manual review"
+				if decision.BlockedReason != "" {
+					reason += ": " + decision.BlockedReason
+				}
+				if holdErr := model.HoldAsyncVideoRecovery(parent, job, task, reason); holdErr != nil {
+					return holdErr
+				}
+				updates["status"], updates["reference_recovery_stage"] = "execution_unknown", "manual"
+				return nil
+			}
+		}
+		if err == nil && decision != nil {
+			request.PendingDecision = decision
+			if due := request.RetryFailedAt + int64(decision.DelaySeconds); request.RetryFailedAt > 0 && due > time.Now().Unix() {
+				updates["next_attempt_at"] = due
+				return nil
+			}
+			wantsLocal := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
+			prepared := request.LocalReferencesReady
+			if wantsLocal && job.ReferenceRecoveryStage == "submit" && !prepared {
+				// A changed action re-enters the download pool rather than using
+				// a submission slot for potentially slow input downloads.
+				updates["reference_recovery_stage"], updates["next_attempt_at"] = "prepare", time.Now().Unix()
+				return nil
+			}
+			if !wantsLocal {
+				if len(request.OriginalBody) > 0 {
+					request.Body = append([]byte(nil), request.OriginalBody...)
+					request.LocalReferencesReady = false
+				}
+				if job.ReferenceRecoveryStage == "prepare" {
+					job.ReferenceRecoveryStage = "submit"
+					updates["reference_recovery_stage"] = "submit"
+					err = model.UpdateAsyncMediaJob(parent, job, map[string]any{"reference_recovery_stage": "submit"})
+				}
+			}
+		}
+	}
+	preparationAttempted := false
 	if err == nil && job.ReferenceRecoveryStage == "prepare" {
 		deadline := time.Unix(request.ReferenceRecoveryDeadline, 0)
 		if downloadDeadline := time.Now().Add(time.Duration(cfg.DownloadTimeout) * time.Second); downloadDeadline.Before(deadline) {
@@ -333,6 +727,7 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 		}
 		ctx, cancel := context.WithDeadline(parent, deadline)
 		defer cancel()
+		preparationAttempted = true
 		request, err = PrepareAsyncVideoLocalReferences(ctx, job, request)
 		if err == nil {
 			encoded, encodeErr := common.Marshal(request)
@@ -353,6 +748,62 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			}
 		}
 	}
+	if err != nil && preparationAttempted && request.PendingDecision != nil && request.RetryFact != nil {
+		// Failed local preparation used the action even though it sent no
+		// generation request. Consume it once before advancing the chain.
+		decision := *request.PendingDecision
+		state := videoRetryState(task, job)
+		if recordErr := model.RecordAsyncVideoRetryDecision(parent, task, job, *request.RetryFact, decision, state, true, true); recordErr != nil {
+			updates["next_attempt_at"] = time.Now().Unix() + 3
+			return recordErr
+		}
+		if readErr := model.DB.WithContext(parent).First(&task, task.ID).Error; readErr != nil {
+			return readErr
+		}
+		nextState := videoRetryState(task, job)
+		decision, decisionErr := evaluateVideoRetry(parent, *request.RetryFact, &nextState)
+		if decisionErr != nil {
+			updates["next_attempt_at"] = time.Now().Unix() + 3
+			return decisionErr
+		}
+		if mediaretry.IsResubmission(decision.Action) || decision.BlockedReason == "resubmissions_paused" {
+			request.PendingDecision, request.RetryFailedAt = &decision, time.Now().Unix()
+			if len(request.OriginalBody) > 0 {
+				request.Body = append([]byte(nil), request.OriginalBody...)
+				request.LocalReferencesReady = false
+			}
+			encoded, encodeErr := common.Marshal(request)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			cipher, encodeErr := EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			local := decision.RequestedAction == mediaretry.LocalSameChannel || decision.RequestedAction == mediaretry.LocalOtherChannel
+			won, scheduleErr := model.ScheduleAsyncVideoReferenceRecovery(parent, task, job, VideoTaskFailureReason(err.Error()), local, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: *request.RetryFact, State: videoRetryState(task, job), PreparationFailed: true, RequestCipher: cipher})
+			if scheduleErr != nil {
+				return scheduleErr
+			}
+			if won {
+				return nil
+			}
+		}
+		if decision.Action == mediaretry.ManualReview || decision.Action == mediaretry.PollSameJob {
+			if holdErr := model.HoldAsyncVideoRecovery(parent, job, task, "Local reference preparation requires manual review"); holdErr != nil {
+				return holdErr
+			}
+			updates["status"], updates["reference_recovery_stage"] = "execution_unknown", "manual"
+			return nil
+		}
+	}
+	if err == nil && request.PendingDecision != nil {
+		err = SelectVideoRecoveryChannel(parent, &job, &task, &request)
+		if err != nil {
+			updates["next_attempt_at"], updates["error_message"] = time.Now().Unix()+3, VideoTaskFailureReason(err.Error())
+			return err
+		}
+	}
 	if err == nil {
 		if SubmitAsyncVideoReferenceRetryFunc == nil {
 			err = errors.New("video reference recovery submission is unavailable")
@@ -369,6 +820,10 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 	if current.AttemptGeneration != job.AttemptGeneration {
 		return model.ErrImageConflict
 	}
+	if errors.Is(err, ErrVideoRetryDeferred) && current.DispatchedAt == 0 {
+		updates["next_attempt_at"] = time.Now().Unix() + 3
+		return err
+	}
 	if current.ReferenceRecoveryStage == "waiting" {
 		updates["status"], updates["reference_recovery_stage"] = "submitted", "waiting"
 		return nil
@@ -382,6 +837,19 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			}
 			_, markErr := model.MarkAsyncVideoReferenceSubmissionUnknown(context.WithoutCancel(parent), job, task, reason)
 			return errors.Join(err, markErr)
+		}
+		// An explicit parsed rejection can continue the configured chain. The
+		// old dispatch remains fenced until the next generation is committed.
+		if readErr := model.DB.WithContext(parent).First(&task, task.ID).Error; readErr != nil {
+			return readErr
+		}
+		recovered, recoveryErr := tryRejectedVideoRecovery(parent, task, current, request, rejected.Reason)
+		if recoveryErr != nil {
+			updates["next_attempt_at"] = time.Now().Unix() + 3
+			return recoveryErr
+		}
+		if recovered {
+			return nil
 		}
 	}
 	if err == nil {
@@ -410,4 +878,44 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 	job.Status = "failed"
 	updates["request_cipher"] = retainAsyncVideoRequestDetails(job)
 	return err
+}
+
+func tryRejectedVideoRecovery(ctx context.Context, task model.Task, job model.AsyncMediaJob, request AsyncVideoRequest, reason string) (bool, error) {
+	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_rejected", Message: VideoTaskFailureReason(reason), Terminal: true, HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
+	fact.Category = "unclassified"
+	if isAsyncVideoReferenceDownloadFailure(fact.Message) {
+		fact.Category = "reference_download"
+	} else if isAsyncVideoBusyFailure(fact.Message) {
+		fact.Category = "capacity"
+	}
+	fact = NormalizeMediaRetryFact(fact)
+	state := videoRetryState(task, job)
+	decision, err := evaluateVideoRetry(ctx, fact, &state)
+	if err != nil {
+		return false, err
+	}
+	if !decision.Matched || !mediaretry.IsResubmission(decision.Action) && decision.BlockedReason != "resubmissions_paused" {
+		if err := model.RecordAsyncVideoRetryDecision(ctx, task, job, fact, decision, state, false); err != nil {
+			return false, err
+		}
+		if decision.Action == mediaretry.ManualReview || decision.Action == mediaretry.PollSameJob {
+			return true, model.HoldAsyncVideoRecovery(ctx, job, task, "Video recovery requires manual review: "+decision.BlockedReason, true)
+		}
+		return false, nil
+	}
+	request.RetryFact, request.PendingDecision, request.RetryFailedAt = &fact, &decision, time.Now().Unix()
+	if len(request.OriginalBody) > 0 {
+		request.Body = append([]byte(nil), request.OriginalBody...)
+		request.LocalReferencesReady = false
+	}
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return false, err
+	}
+	cipher, err := EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	if err != nil {
+		return false, err
+	}
+	local := decision.RequestedAction == mediaretry.LocalSameChannel || decision.RequestedAction == mediaretry.LocalOtherChannel
+	return model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, fact.Message, local, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: state, RejectedSubmission: true, RequestCipher: cipher})
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
@@ -38,6 +39,93 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestMediaRetryPolicyAPI(t *testing.T) {
+	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
+	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	previousDB, previousLogDB, previousType := model.DB, model.LOG_DB, common.MainDatabaseType()
+	previousRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	model.DB, model.LOG_DB = db, db
+	common.SetMainDatabaseType(common.DatabaseType(dialect))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetMainDatabaseType(previousType)
+		common.RedisEnabled = previousRedis
+		connection, _ := db.DB()
+		_ = connection.Close()
+	})
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.User{}, &model.AuditLog{}, &model.Log{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "retry-admin", Role: common.RoleRootUser, Status: common.UserStatusEnabled}).Error)
+	request := func(method, path string, body any, role int) *httptest.ResponseRecorder {
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		router := gin.New()
+		router.Use(func(c *gin.Context) { c.Set("id", 1); c.Set("role", role) })
+		router.GET("/policy", middleware.RequirePermission(authz.ImageConfigRead), GetMediaRetryPolicy)
+		router.PUT("/policy", middleware.RequirePermission(authz.ImageConfigManage), UpdateMediaRetryPolicy)
+		router.POST("/preview", middleware.RequirePermission(authz.ImageConfigRead), PreviewMediaRetryPolicy)
+		router.POST("/rollback", middleware.RequirePermission(authz.ImageConfigManage), RollbackMediaRetryPolicy)
+		router.GET("/samples/:event_id/events", middleware.RequirePermission(authz.ImageConfigRead), ListMediaRetrySampleEvents)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(method, path, bytes.NewReader(encoded)))
+		return recorder
+	}
+	policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "busy", Name: "Busy", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"busy"}}, Steps: []mediaretry.Step{{ID: "same", Action: mediaretry.SameChannel, MaxAttempts: 2}}}}}
+	assert.Equal(t, http.StatusForbidden, request(http.MethodPut, "/policy", policy, common.RoleCommonUser).Code)
+	assert.Equal(t, http.StatusForbidden, request(http.MethodPost, "/preview", gin.H{"policy": policy}, common.RoleCommonUser).Code)
+	assert.Equal(t, http.StatusPreconditionRequired, request(http.MethodPut, "/policy", gin.H{"rules": policy.Rules}, common.RoleRootUser).Code)
+	saved := request(http.MethodPut, "/policy", policy, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, saved.Code, saved.Body.String())
+	assert.Equal(t, http.StatusConflict, request(http.MethodPut, "/policy", policy, common.RoleRootUser).Code)
+	invalid := policy
+	invalid.Rules = []mediaretry.Rule{{ID: "bad", Name: "Bad", Match: mediaretry.Match{Regex: "["}, Steps: policy.Rules[0].Steps}}
+	assert.Equal(t, http.StatusBadRequest, request(http.MethodPut, "/policy", invalid, common.RoleRootUser).Code)
+	preview := request(http.MethodPost, "/preview", gin.H{"policy": policy, "fact": mediaretry.Fact{Message: "busy"}}, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, preview.Code, preview.Body.String())
+	var response struct {
+		Data struct {
+			Mode     string              `json:"mode"`
+			Decision mediaretry.Decision `json:"decision"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &response))
+	assert.Equal(t, "text_only", response.Data.Mode)
+	assert.Equal(t, mediaretry.SameChannel, response.Data.Decision.Action)
+	redacted := request(http.MethodPost, "/preview", gin.H{"policy": policy, "fact": mediaretry.Fact{Message: `{"error":{"message":"busy"},"request":{"prompt":"private-prompt-canary","api_key":"private-key-canary"}}`}}, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, redacted.Code)
+	assert.NotContains(t, redacted.Body.String(), "private-prompt-canary")
+	assert.NotContains(t, redacted.Body.String(), "private-key-canary")
+	var count int64
+	require.NoError(t, db.Model(&model.MediaRetryEvent{}).Count(&count).Error)
+	assert.Zero(t, count, "simulation must not write execution events")
+	event, err := model.NewMediaRetryEvent("video-sample", 1, mediaretry.Fact{MediaType: "video", Message: "busy", Unknown: true, HasUpstreamTask: true}, mediaretry.Decision{}, mediaretry.State{TotalLimit: 2, Now: 100})
+	require.NoError(t, err)
+	require.NoError(t, model.RecordMediaRetryEventTx(db, event))
+	persisted, err := model.GetLatestMediaRetryEvent(t.Context(), "video-sample")
+	require.NoError(t, err)
+	detailPath := "/samples/" + persisted.Fingerprint + "/events"
+	assert.Equal(t, http.StatusForbidden, request(http.MethodGet, detailPath, nil, common.RoleCommonUser).Code)
+	details := request(http.MethodGet, detailPath, nil, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, details.Code, details.Body.String())
+	assert.Contains(t, details.Body.String(), "video-sample")
+	assert.NotContains(t, details.Body.String(), "fact_json")
+	assert.NotContains(t, details.Body.String(), "state_json")
+	filtered := request(http.MethodGet, detailPath+"?start_timestamp=1&end_timestamp=1", nil, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, filtered.Code)
+	assert.Contains(t, filtered.Body.String(), `"total":0`)
+	preview = request(http.MethodPost, "/preview", gin.H{"event_id": persisted.ID, "fact": mediaretry.Fact{Unknown: false}}, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, preview.Code, preview.Body.String())
+	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &response))
+	assert.Equal(t, "sample", response.Data.Mode)
+	assert.Equal(t, mediaretry.PollSameJob, response.Data.Decision.Action, "saved sample facts override caller facts")
+	rollback := request(http.MethodPost, "/rollback", gin.H{"revision": 1, "target_revision": 0}, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, rollback.Code, rollback.Body.String())
+	current, err := model.GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), current.Revision)
+	assert.Empty(t, current.Rules)
+}
 
 func TestTabtabWorkbenchCapabilitiesDatabaseMatrix(t *testing.T) {
 	for _, engine := range []string{"sqlite", "mysql", "postgres"} {

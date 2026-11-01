@@ -1,4 +1,9 @@
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "vertex-ai",
   name: "Google Veo (Vertex AI)",
@@ -7,7 +12,7 @@ export const meta = {
     en: "Google Veo video generation on Vertex AI (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Vertex AI 版本",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   channelTypes: [41],
   author: { name: "QuantumNous" },
   models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],

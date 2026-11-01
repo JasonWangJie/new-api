@@ -1,4 +1,10 @@
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/metadata/images/*", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "vidu",
   name: "Vidu",
@@ -7,7 +13,7 @@ export const meta = {
     en: "Shengshu Vidu video generation (text-to-video, image-to-video, first-and-last-frame, and reference-to-video)",
     zh: "生数 Vidu 视频生成（文生视频、图生视频、首尾帧、参考生视频）",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   author: { name: "QuantumNous" },
   channelTypes: [52],
   models: ["viduq2", "viduq1", "vidu2.0", "vidu1.5"],

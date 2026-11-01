@@ -25,7 +25,14 @@ import {
   parseTaskTiersFromExpr,
   splitBillingExprAndRequestRules,
 } from './billing-expr'
+import {
+  readTaskVideoInputMultiplier,
+  type TaskVideoInputMultipliers,
+} from './billing-expression/display'
+import { compileBillingExpression } from './billing-expression/parser'
 import { evaluateBillingExpression } from './billing-expression/runtime'
+
+export type { TaskVideoInputMultipliers } from './billing-expression/display'
 
 export const TASK_TOKEN_PRICE_SCALE = 1_000_000
 
@@ -43,6 +50,7 @@ export type TaskVisualTier = {
 
 export type TaskVisualConfig = {
   tiers: TaskVisualTier[]
+  videoInputMultipliers?: TaskVideoInputMultipliers
 }
 
 export type TaskMatrixRow = {
@@ -53,11 +61,13 @@ export type TaskMatrixRow = {
 
 export type TaskMatrixConfig = {
   rows: TaskMatrixRow[]
+  videoInputMultipliers?: TaskVideoInputMultipliers
 }
 
 export type TaskPreviewResult = {
   tier: TaskVisualTier
   total: number
+  multiplier?: number
   parts: {
     kind: 'constant' | 'usage'
     field?: string
@@ -65,6 +75,47 @@ export type TaskPreviewResult = {
     quantity?: number
     unitPrice?: number
   }[]
+}
+
+export function supportsTaskVideoInputMultipliers(
+  schema: BillingUsageSchema | null | undefined
+): boolean {
+  const values = schema?.video_input?.enum
+  return (
+    values?.length === 2 && values.includes('none') && values.includes('video')
+  )
+}
+
+function validTaskVideoInputMultipliers(
+  multipliers: TaskVideoInputMultipliers,
+  schema?: BillingUsageSchema
+): boolean {
+  return (
+    supportsTaskVideoInputMultipliers(schema) &&
+    Number.isFinite(multipliers.none) &&
+    multipliers.none >= 0 &&
+    Number.isFinite(multipliers.video) &&
+    multipliers.video >= 0
+  )
+}
+
+export function splitTaskVideoInputPricing(
+  expression: string,
+  schema: BillingUsageSchema
+): {
+  billingExpr: string
+  videoInputMultipliers?: TaskVideoInputMultipliers
+} | null {
+  const { billingExpr } = splitBillingExprAndRequestRules(expression)
+  const compiled = compileBillingExpression(billingExpr)
+  if (compiled.status !== 'ready') return null
+  const factor = readTaskVideoInputMultiplier(compiled.ast)
+  if (!factor) return { billingExpr }
+  if (!supportsTaskVideoInputMultipliers(schema)) return null
+  return {
+    billingExpr: compiled.source.slice(factor.base.start, factor.base.end),
+    videoInputMultipliers: factor.multipliers,
+  }
 }
 
 export function getTaskNumberFields(
@@ -193,9 +244,11 @@ export function tryParseTaskMatrixConfig(
   schema: BillingUsageSchema
 ): TaskMatrixConfig | null {
   if (!expression) return null
+  const split = splitTaskVideoInputPricing(expression, schema)
+  if (!split) return null
   // Older expressions can retain branches for capabilities the model no longer
   // advertises. Project their first-match prices onto the current enum values.
-  const tiers = parseTaskTiersFromExpr(expression, schema, false, true)
+  const tiers = parseTaskTiersFromExpr(split.billingExpr, schema, false, true)
   if (tiers.length === 0) return null
 
   const numberFields = getTaskNumberFields(schema)
@@ -225,7 +278,12 @@ export function tryParseTaskMatrixConfig(
       ),
     }
   })
-  return { rows }
+  return {
+    rows,
+    ...(split.videoInputMultipliers
+      ? { videoInputMultipliers: split.videoInputMultipliers }
+      : {}),
+  }
 }
 
 export function evaluateTaskVisualConfig(
@@ -235,6 +293,16 @@ export function evaluateTaskVisualConfig(
 ): TaskPreviewResult | null {
   const fallback = config.tiers.at(-1)
   if (!fallback) return null
+  let multiplier: number | undefined
+  if (config.videoInputMultipliers) {
+    if (!validTaskVideoInputMultipliers(config.videoInputMultipliers, schema)) {
+      return null
+    }
+    if (sample.video_input !== 'none' && sample.video_input !== 'video') {
+      return null
+    }
+    multiplier = config.videoInputMultipliers[sample.video_input]
+  }
 
   let matchedTier = fallback
   for (const tier of config.tiers.slice(0, -1)) {
@@ -280,12 +348,20 @@ export function evaluateTaskVisualConfig(
     const scale = schema?.[part.field]?.unit === 'token' ? ' / 1000000' : ''
     terms.push(`u(${JSON.stringify(part.field)}) * ${part.unitPrice}${scale}`)
   }
+  const baseExpression = `tier(${JSON.stringify(matchedTier.label)}, ${terms.join(' + ')})`
   const result = evaluateBillingExpression(
-    `tier(${JSON.stringify(matchedTier.label)}, ${terms.join(' + ')})`,
+    multiplier === undefined
+      ? baseExpression
+      : `(${baseExpression}) * ${multiplier}`,
     { usage: normalizedUsage }
   )
   if (result.status !== 'success') return null
-  return { tier: matchedTier, total: result.cost, parts }
+  return {
+    tier: matchedTier,
+    total: result.cost,
+    parts,
+    ...(multiplier === undefined ? {} : { multiplier }),
+  }
 }
 
 export function evaluateTaskUsageExamples(
@@ -322,6 +398,9 @@ export function normalizeTaskVisualConfig(
   )
 
   return {
+    ...(config.videoInputMultipliers
+      ? { videoInputMultipliers: { ...config.videoInputMultipliers } }
+      : {}),
     tiers: config.tiers.map((tier, index) => {
       const unitPrices = Object.fromEntries(
         [...numberFields].map((field) => {
@@ -383,10 +462,13 @@ export function generateTaskExprFromConfig(
 ): string {
   const numberFields = getTaskNumberFields(schema)
   if (numberFields.length === 0) return ''
-  const normalized = normalizeTaskVisualConfig(config, schema)
-  if (normalized.tiers.length === 1) {
-    return generateTaskTierCall(normalized.tiers[0], numberFields)
+  if (
+    config?.videoInputMultipliers &&
+    !validTaskVideoInputMultipliers(config.videoInputMultipliers, schema)
+  ) {
+    return ''
   }
+  const normalized = normalizeTaskVisualConfig(config, schema)
 
   const parts: string[] = []
   for (let index = 0; index < normalized.tiers.length; index += 1) {
@@ -400,7 +482,12 @@ export function generateTaskExprFromConfig(
     if (!condition) return ''
     parts.push(`${condition} ? ${call}`)
   }
-  return parts.join(' : ')
+  const expression = parts.join(' : ')
+  const multipliers = normalized.videoInputMultipliers
+  if (!multipliers || (multipliers.none === 1 && multipliers.video === 1)) {
+    return expression
+  }
+  return `(${expression}) * (u("video_input") == "video" ? ${multipliers.video} : ${multipliers.none})`
 }
 
 export function tryParseTaskVisualConfig(
@@ -408,10 +495,15 @@ export function tryParseTaskVisualConfig(
   schema: BillingUsageSchema
 ): TaskVisualConfig | null {
   if (!expression) return null
-  const tiers = parseTaskTiersFromExpr(expression, schema)
+  const split = splitTaskVideoInputPricing(expression, schema)
+  if (!split) return null
+  const tiers = parseTaskTiersFromExpr(split.billingExpr, schema)
   if (tiers.length === 0) return null
   return normalizeTaskVisualConfig(
     {
+      ...(split.videoInputMultipliers
+        ? { videoInputMultipliers: split.videoInputMultipliers }
+        : {}),
       tiers: tiers.map((tier) => ({
         label: tier.label,
         conditions: tier.conditions,

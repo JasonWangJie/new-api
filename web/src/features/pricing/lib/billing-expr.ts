@@ -31,6 +31,7 @@ import type { BillingUsageSchema } from '../types'
 import {
   readTokenTierChain,
   readTaskTierChain,
+  readTaskVideoInputMultiplier,
   readTimeTokenPricing,
   type TokenTier,
 } from './billing-expression/display'
@@ -632,12 +633,22 @@ export function splitBillingExprAndRequestRules(expr: string): {
   const quantityParts = baseParts.filter(
     (part) => unwrapOuterParens(part) === 'image_count'
   )
-  if (ruleParts.length === 0 || baseParts.length - quantityParts.length !== 1) {
+  const combinedBase = baseParts.join(' * ')
+  const compiledBase = compileBillingExpression(combinedBase)
+  const hasTaskVideoFactor =
+    compiledBase.status === 'ready' &&
+    readTaskVideoInputMultiplier(compiledBase.ast) !== null
+  if (
+    ruleParts.length === 0 ||
+    (baseParts.length - quantityParts.length !== 1 && !hasTaskVideoFactor)
+  ) {
     return { billingExpr: trimmed, requestRuleExpr: '' }
   }
 
   return {
-    billingExpr: baseParts.map(unwrapOuterParens).join(' * '),
+    billingExpr: hasTaskVideoFactor
+      ? combinedBase
+      : baseParts.map(unwrapOuterParens).join(' * '),
     requestRuleExpr: ruleParts.join(' * '),
   }
 }

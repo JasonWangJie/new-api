@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -27,19 +28,27 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
-	Body                      []byte
-	ContentType               string
-	ClientIP                  string
-	Operation                 string
-	Channel                   model.Channel
-	Execution                 *model.TaskExecutionSnapshot
-	Billing                   MediaBillingSnapshot
-	PluginHash                string
-	Details                   *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
-	ReferenceInputs           []AsyncVideoReferenceInput `json:"reference_inputs,omitempty"`
-	ReferenceRecoveryVersion  int                        `json:"reference_recovery_version,omitempty"`
-	ReferenceRecoveryDeadline int64                      `json:"reference_recovery_deadline,omitempty"`
-	ReferenceURLExpiresAt     int64                      `json:"reference_url_expires_at,omitempty"`
+	Body                             []byte
+	ContentType                      string
+	ClientIP                         string
+	Operation                        string
+	Channel                          model.Channel
+	Execution                        *model.TaskExecutionSnapshot
+	Billing                          MediaBillingSnapshot
+	InitialBillingChannelID          int                  `json:"initial_billing_channel_id,omitempty"`
+	InitialRetryState                *mediaretry.State    `json:"initial_retry_state,omitempty"`
+	RetryFailedAt                    int64                `json:"retry_failed_at,omitempty"`
+	RetryFact                        *mediaretry.Fact     `json:"retry_fact,omitempty"`
+	PendingDecision                  *mediaretry.Decision `json:"pending_retry_decision,omitempty"`
+	ReferenceLocalizationUnsupported bool                 `json:"reference_localization_unsupported,omitempty"`
+	LocalReferencesReady             bool                 `json:"local_references_ready,omitempty"`
+	OriginalBody                     []byte               `json:"original_body,omitempty"`
+	PluginHash                       string
+	Details                          *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
+	ReferenceInputs                  []AsyncVideoReferenceInput `json:"reference_inputs,omitempty"`
+	ReferenceRecoveryVersion         int                        `json:"reference_recovery_version,omitempty"`
+	ReferenceRecoveryDeadline        int64                      `json:"reference_recovery_deadline,omitempty"`
+	ReferenceURLExpiresAt            int64                      `json:"reference_url_expires_at,omitempty"`
 }
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
@@ -54,6 +63,10 @@ func recordAsyncVideoSubmissionRefund(c *gin.Context, info *relaycommon.RelayInf
 		return
 	}
 	taskID := info.TaskRelayInfo.PublicTaskID
+	billingChannelID := c.GetInt("async_media_initial_billing_channel_id")
+	if billingChannelID <= 0 {
+		billingChannelID = info.ChannelId
+	}
 	updates := map[string]any{"billing_status": "refunded", "quota": 0}
 	var refund *model.RecordTaskBillingLogParams
 	if refundErr != nil {
@@ -72,7 +85,7 @@ func recordAsyncVideoSubmissionRefund(c *gin.Context, info *relaycommon.RelayInf
 		}
 		attachQuotaSaturation(c, info, other)
 		refund = &model.RecordTaskBillingLogParams{
-			UserId: info.UserId, LogType: model.LogTypeRefund, ChannelId: info.ChannelId,
+			UserId: info.UserId, LogType: model.LogTypeRefund, ChannelId: billingChannelID,
 			ModelName: info.OriginModelName, Quota: quota, TokenId: info.TokenId,
 			Group: info.UsingGroup, Other: other, RequestId: c.GetString(common.RequestIdKey),
 		}
@@ -93,6 +106,7 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 	go func() {
 		timer := time.NewTicker(3 * time.Second)
 		defer timer.Stop()
+		nextRetryEventCleanup := time.Time{}
 		for {
 			select {
 			case <-ctx.Done():
@@ -115,6 +129,15 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			}
 			if err := CleanupMediaInputs(ctx, time.Now().Unix()); err != nil {
 				common.SysError("media input cleanup: " + err.Error())
+			}
+			if now := time.Now(); !now.Before(nextRetryEventCleanup) {
+				cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
+				cleanupErr := model.PruneMediaRetryEvents(cleanupCtx, now.Add(-90*24*time.Hour).Unix(), 1000)
+				cleanupCancel()
+				nextRetryEventCleanup = now.Add(time.Minute)
+				if cleanupErr != nil {
+					common.SysError("media recovery event cleanup: " + cleanupErr.Error())
+				}
 			}
 			if _, err := DispatchAsyncMediaJobs(ctx, cfg); err != nil {
 				common.SysError("media queue: " + err.Error())
@@ -307,11 +330,33 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		if err := model.DB.WithContext(ctx).Where("id = ? AND lease_token = ?", job.ID, job.LeaseToken).Take(&job).Error; err != nil {
 			return err
 		}
+		if job.StorageRetries > 0 && task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.Stage == "download" {
+			decision, policyErr := VideoPostprocessDecision(ctx, job, &task, "download", "", true)
+			if policyErr != nil {
+				return policyErr
+			}
+			if decision.Matched && (decision.Action != mediaretry.ResumeDownload || job.StorageRetries > cfg.StorageRetries) {
+				updates["storage_status"], updates["next_attempt_at"] = "failed", int64(1<<62)
+				return nil
+			}
+		}
 		if err := model.UpdateAsyncMediaJob(ctx, job, map[string]any{"storage_status": "saving"}); err != nil {
 			return err
 		}
 		previousResultURL := task.PrivateData.ResultURL
 		if err := PersistAsyncVideoFunc(ctx, job, &task); err != nil {
+			decision, policyErr := VideoPostprocessDecision(context.WithoutCancel(ctx), job, &task, "download", VideoTaskFailureReason(err.Error()), false)
+			if policyErr != nil {
+				return policyErr
+			}
+			if decision.Matched {
+				updates["storage_status"], updates["storage_retries"], updates["error_message"] = "failed", job.StorageRetries+1, "Generated video could not be saved locally"
+				updates["next_attempt_at"] = int64(1 << 62)
+				if decision.Action == mediaretry.ResumeDownload && job.StorageRetries < cfg.StorageRetries {
+					updates["next_attempt_at"] = time.Now().Unix() + int64(max(1, decision.DelaySeconds))
+				}
+				return err
+			}
 			var storageErr *os.PathError
 			fallbackAllowed := errors.Is(err, ErrAsyncMediaDownloadTransport) || errors.As(err, &storageErr)
 			if fallbackAllowed && job.StorageRetries >= cfg.StorageRetries && PublicUpstreamAsyncVideoResultURL(&task) != "" {

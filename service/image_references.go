@@ -99,6 +99,100 @@ func ResolveImageReference(ctx context.Context, tokenId int, raw string, cfg Ima
 	return image, false, err
 }
 
+// ResolveAsyncImageInputPart always prefers a persisted local copy. Revoked SC
+// aliases and expired copies fail closed; they never fall back to a remote URL.
+func ResolveAsyncImageInputPart(ctx context.Context, tokenID int, part AsyncImageInputPart, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	if part.LocalURL == "" {
+		image, _, err := ResolveImageReference(ctx, tokenID, part.URL, cfg)
+		return image, err
+	}
+	if part.LocalExpiresAt <= time.Now().Unix() || !strings.HasPrefix(part.LocalURL, "data:image/") {
+		return ImageBytes{}, newImageValidationError("local reference has expired or is unavailable")
+	}
+	bound, err := IsBoundImageReference(ctx, tokenID, part.URL)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	if part.LocalBound && !bound {
+		return ImageBytes{}, newImageValidationError("SC input alias is unavailable")
+	}
+	return DownloadImageReference(ctx, part.LocalURL, cfg)
+}
+
+// PrepareAsyncImageLocalReferences persists each completed slot in the existing
+// encrypted request envelope. An interrupted preparation reuses those slots on
+// the next attempt, including after a channel change or process restart.
+func PrepareAsyncImageLocalReferences(ctx context.Context, task *model.AsyncImageTask, request *AsyncImageRequest, cfg ImageRuntimeConfig) error {
+	if task == nil || request == nil || task.DispatchedAt != 0 || task.UpstreamTaskId != "" || task.UpstreamSucceededAt > 0 || task.ImageCount > 0 || task.ResultCount > 0 || request.Completion != nil {
+		return model.ErrImageConflict
+	}
+	deadline := model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout)
+	if task.ExpiresAt > 0 && (deadline == 0 || task.ExpiresAt < deadline) {
+		deadline = task.ExpiresAt
+	}
+	if deadline <= time.Now().Unix() {
+		return newImageValidationError("local reference preparation exceeds task deadline")
+	}
+	if !request.LocalReferencesRequested {
+		request.LocalReferencesRequested = true
+		if err := checkpointAsyncImageReferences(ctx, task, request, cfg); err != nil {
+			request.LocalReferencesRequested = false
+			return err
+		}
+	}
+	referenceIndex := 0
+	for index := range request.Parts {
+		if deadline <= time.Now().Unix() {
+			return newImageValidationError("local reference preparation exceeds task deadline")
+		}
+		part := request.Parts[index]
+		if part.Type != "image_url" && part.Type != "mask" {
+			continue
+		}
+		referenceIndex++
+		if referenceIndex > cfg.MaxReferences+1 {
+			return newImageValidationError("too many reference images")
+		}
+		if part.LocalURL != "" || strings.HasPrefix(strings.ToLower(part.URL), "data:") {
+			if _, err := ResolveAsyncImageInputPart(ctx, task.TokenId, part, cfg); err != nil {
+				return NewImageReferenceFailure(referenceIndex, err)
+			}
+			continue
+		}
+		image, bound, err := ResolveImageReference(ctx, task.TokenId, part.URL, cfg)
+		if err != nil {
+			return NewImageReferenceFailure(referenceIndex, err)
+		}
+		request.Parts[index].LocalURL = image.DataURL()
+		request.Parts[index].LocalExpiresAt = deadline
+		request.Parts[index].LocalBound = bound
+		if err := checkpointAsyncImageReferences(ctx, task, request, cfg); err != nil {
+			request.Parts[index] = part
+			return err
+		}
+	}
+	return nil
+}
+
+// checkpointAsyncImageReferences uses the normal encrypted request lifecycle,
+// including terminal retention and successful-task cleanup, without a new store.
+func checkpointAsyncImageReferences(ctx context.Context, task *model.AsyncImageTask, request *AsyncImageRequest, cfg ImageRuntimeConfig) error {
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return err
+	}
+	maxBody := int64(cfg.MaxReferences+1)*cfg.DownloadMaxBytes/3*4 + 1<<20
+	maxBody = min(maxBody, int64(common.GetEnvOrDefault("ASYNC_MEDIA_TOKEN_PENDING_BYTES", 128<<20)), 64<<20-65536)
+	if int64(len(encoded)) > maxBody {
+		return newImageValidationError("local reference request byte limit exceeded")
+	}
+	cipher, err := EncryptImagePayload(encoded, "task:"+task.TaskId)
+	if err != nil {
+		return err
+	}
+	return model.SaveAsyncImageLocalReferences(ctx, task, cipher)
+}
+
 func ResolveImageReferenceTransportMode(configured string, referenceRetryCount int) string {
 	if configured == "passthrough_fallback_local" && referenceRetryCount > 0 {
 		return "local"

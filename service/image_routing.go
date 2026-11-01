@@ -855,6 +855,7 @@ type ImageAccount struct {
 var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the request")
 
 type ImageAccountRouting struct {
+	AllowedChannels         []int
 	Pin                     string
 	Excluded                []string
 	Avoid                   string
@@ -874,6 +875,9 @@ type ImageAccountRouting struct {
 
 // Account identity survives key reordering and never exposes a usable key.
 func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []ImageAccount {
+	if len(routing.AllowedChannels) > 0 && !slices.Contains(routing.AllowedChannels, channel.Id) {
+		return nil
+	}
 	if routing.PinChannel != 0 && routing.PinChannel != channel.Id || slices.Contains(routing.ExcludedChannels, channel.Id) || slices.Contains(routing.IncompatibleChannels, channel.Id) || slices.Contains(routing.DeadlineChannels, channel.Id) {
 		return nil
 	}
@@ -908,19 +912,19 @@ func ImageChannelAccounts(channel model.Channel, routing ImageAccountRouting) []
 	return accounts
 }
 
-func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, request AsyncImageRequest, routing ImageAccountRouting) (*model.Channel, ImageAccount, error) {
+func eligibleImageChannels(ctx context.Context, policy model.ImageGroupPolicy, request AsyncImageRequest, routing ImageAccountRouting) ([]model.Channel, ImageAccountRouting, error) {
 	if policy.Platform == "mixed" && (request.MixedRouting == nil || request.Provider != "") {
-		return nil, ImageAccount{}, errors.New("mixed image selection requires providerless admitted routing state")
+		return nil, ImageAccountRouting{}, errors.New("mixed image selection requires providerless admitted routing state")
 	}
 	if request.MixedRouting != nil && (policy.Platform != "mixed" || policy.Group != request.MixedRouting.Group || ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(request)) != request.MixedRouting.BindingKey) {
-		return nil, ImageAccount{}, errors.New("mixed image routing identity changed before selection")
+		return nil, ImageAccountRouting{}, errors.New("mixed image routing identity changed before selection")
 	}
 	if request.Provider == "" && request.MixedRouting == nil {
 		request.Provider = policy.AsyncProvider
 	}
 	channels, err := ImageCandidateChannels(ctx, policy, request.Model, AsyncImageRoutingResolution(request))
 	if err != nil {
-		return nil, ImageAccount{}, err
+		return nil, ImageAccountRouting{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
 		capability := ImageChannelCapability(channel, request.Model)
@@ -945,24 +949,24 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		return true
 	})
 	if len(channels) == 0 && timeoutExcluded {
-		return nil, ImageAccount{}, ErrImageTimeoutAccountsExhausted
+		return nil, ImageAccountRouting{}, ErrImageTimeoutAccountsExhausted
 	}
 	if len(channels) == 0 && (len(routing.IncompatibleAccounts) > 0 || len(routing.IncompatibleCredentials) > 0 || len(routing.IncompatibleChannels) > 0) {
-		return nil, ImageAccount{}, ErrImageCompatibleAccountsExhausted
+		return nil, ImageAccountRouting{}, ErrImageCompatibleAccountsExhausted
 	}
 	cfg, err := GetImageRuntimeConfig(ctx)
 	if err != nil {
-		return nil, ImageAccount{}, err
+		return nil, ImageAccountRouting{}, err
 	}
 	if (cfg.CircuitBreaker || cfg.AccountCooldownSeconds > 0) && common.RDB == nil {
-		return nil, ImageAccount{}, ErrImageLocalControlsUnavailable
+		return nil, ImageAccountRouting{}, ErrImageLocalControlsUnavailable
 	}
 	if cfg.CircuitBreaker {
 		available := channels[:0]
 		for _, channel := range channels {
 			allowed, err := ImageCircuitAllows(ctx, "async", channel.Id, cfg)
 			if err != nil {
-				return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
+				return nil, ImageAccountRouting{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 			}
 			if allowed {
 				available = append(available, channel)
@@ -971,7 +975,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		channels = available
 	}
 	if len(channels) == 0 {
-		return nil, ImageAccount{}, errors.New("no eligible image account in the selected pool")
+		return nil, ImageAccountRouting{}, errors.New("no eligible image account in the selected pool")
 	}
 	// Prefer a channel with room before applying priority and weight. The worker
 	// still acquires its slot atomically, so this snapshot never authorizes a
@@ -985,7 +989,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 			return nil
 		})
 		if err != nil {
-			return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
+			return nil, ImageAccountRouting{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 		}
 		available := make([]model.Channel, 0, len(channels))
 		for i, channel := range channels {
@@ -999,7 +1003,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 			}
 		}
 		if len(available) == 0 {
-			return nil, ImageAccount{}, ErrImageLocalCapacityBusy
+			return nil, ImageAccountRouting{}, ErrImageLocalCapacityBusy
 		}
 		channels = available
 	}
@@ -1014,7 +1018,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 		}
 		states, err := common.RDB.MGet(ctx, cooldownKeys...).Result()
 		if err != nil {
-			return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
+			return nil, ImageAccountRouting{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 		}
 		routing.Cooling = make(map[string]bool, len(fingerprints))
 		allCooling := true
@@ -1031,7 +1035,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 				return nil
 			})
 			if err != nil {
-				return nil, ImageAccount{}, errors.Join(ErrImageLocalControlsUnavailable, err)
+				return nil, ImageAccountRouting{}, errors.Join(ErrImageLocalControlsUnavailable, err)
 			}
 			// Only accounts passing eligibility, breaker and capacity checks
 			// enter this fallback. Keep all other exclusions intact.
@@ -1050,7 +1054,7 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 				}
 			}
 			if routing.WaitForCooldown && earliest > 0 {
-				return nil, ImageAccount{}, &ImageAccountCooling{DelaySeconds: int(min(earliest/time.Second+1, time.Duration(max(1, cfg.AccountCooldownSeconds))))}
+				return nil, ImageAccountRouting{}, &ImageAccountCooling{DelaySeconds: int(min(earliest/time.Second+1, time.Duration(max(1, cfg.AccountCooldownSeconds))))}
 			}
 			routing.Cooling[fingerprints[selected]] = false
 		}
@@ -1095,6 +1099,14 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	slices.SortFunc(channels, func(a, b model.Channel) int { return cmp.Compare(b.GetPriority(), a.GetPriority()) })
 	priority := channels[0].GetPriority()
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool { return channel.GetPriority() != priority })
+	return channels, routing, nil
+}
+
+func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, request AsyncImageRequest, routing ImageAccountRouting) (*model.Channel, ImageAccount, error) {
+	channels, routing, err := eligibleImageChannels(ctx, policy, request, routing)
+	if err != nil {
+		return nil, ImageAccount{}, err
+	}
 	weights := make([]int, len(channels))
 	for i := range channels {
 		weights[i] = channels[i].GetWeight()

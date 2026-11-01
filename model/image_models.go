@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"gorm.io/gorm"
 )
 
@@ -72,19 +73,37 @@ func (pool ImageChannelPool) MarshalJSON() ([]byte, error) {
 
 // ImageRetryDecision records policy facts without provider payloads or account identities.
 type ImageRetryDecision struct {
-	Version       int    `json:"version"`
-	Stage         string `json:"stage"`
-	Action        string `json:"action"`
-	Reason        string `json:"reason"`
-	Rule          string `json:"rule"`
-	Budget        string `json:"budget,omitempty"`
-	Used          int    `json:"used"`
-	Limit         int    `json:"limit"`
-	TotalUsed     int    `json:"total_used"`
-	TotalLimit    int    `json:"total_limit"`
-	NextAttemptAt int64  `json:"next_attempt_at,omitempty"`
-	Deadline      int64  `json:"deadline,omitempty"`
-	RecordedAt    int64  `json:"recorded_at"`
+	Policy        *mediaretry.Decision `json:"policy,omitempty"`
+	Version       int                  `json:"version"`
+	Stage         string               `json:"stage"`
+	Action        string               `json:"action"`
+	Reason        string               `json:"reason"`
+	Rule          string               `json:"rule"`
+	Budget        string               `json:"budget,omitempty"`
+	Used          int                  `json:"used"`
+	Limit         int                  `json:"limit"`
+	TotalUsed     int                  `json:"total_used"`
+	TotalLimit    int                  `json:"total_limit"`
+	NextAttemptAt int64                `json:"next_attempt_at,omitempty"`
+	Deadline      int64                `json:"deadline,omitempty"`
+	RecordedAt    int64                `json:"recorded_at"`
+}
+
+// ImageRetryPolicyState survives normal polling and policy edits. Pending facts
+// are re-evaluated immediately before a replacement attempt is dispatched.
+type ImageRetryPolicyState struct {
+	ReservedRetry        bool                `json:"reserved_retry"`
+	RecordedAt           int64               `json:"recorded_at"`
+	FailureAttempt       int64               `json:"failure_attempt"`
+	SourceDispatchedAt   int64               `json:"source_dispatched_at"`
+	SourceUpstreamTaskID string              `json:"source_upstream_task_id,omitempty"`
+	FailureCode          int                 `json:"failure_code"`
+	FailureInternalCode  string              `json:"failure_internal_code"`
+	State                mediaretry.State    `json:"state"`
+	Fact                 mediaretry.Fact     `json:"fact"`
+	Decision             mediaretry.Decision `json:"decision"`
+	Pending              bool                `json:"pending"`
+	BuiltinPending       bool                `json:"builtin_pending"`
 }
 
 func (task AsyncImageTask) FailedRequestRetainedAt(now int64) bool {
@@ -92,6 +111,7 @@ func (task AsyncImageTask) FailedRequestRetainedAt(now int64) bool {
 }
 
 type AsyncImageTask struct {
+	RetryPolicyState      string `json:"-" gorm:"size:1048576"`
 	Provider              string `json:"provider,omitempty" gorm:"size:32"`
 	ExecutionProtocol     string `json:"protocol,omitempty" gorm:"size:32"`
 	UpstreamTaskId        string `json:"-" gorm:"size:191"`
@@ -466,14 +486,28 @@ type ImageModerationEvent struct {
 }
 
 func MigrateImageModels(db *gorm.DB) error {
+	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}); err != nil {
+		return err
+	}
 	return db.AutoMigrate(&ImageGroupPolicy{}, &TokenImagePlatformMapping{}, &ImageChannelPool{}, &AsyncImageTask{}, &AsyncImageIdempotency{}, &AsyncImageEvent{}, &ImageOutbox{}, &AsyncImageStagingObject{}, &ImageStorageProfile{}, &ImageStorageObject{}, &ImageUploadIntent{}, &AsyncImageResult{}, &AsyncImageBill{}, &AsyncImageUsageProjection{}, &ImageInputAdmission{}, &ImageUploadAdmissionTicket{}, &ImageInputObject{}, &ImageInputAlias{}, &ImageInputTaskReference{}, &ImageLibraryItem{}, &ImagePublication{}, &ImageSubmissionRequest{}, &ImageReport{}, &ImageCleanupJob{}, &ImageModerationEvent{})
 }
 
 // TransitionImageTask owns the state CAS and its event/outbox transaction.
 // External I/O must happen before or after this transaction, never inside it.
-func TransitionImageTask(ctx context.Context, task AsyncImageTask, updates map[string]any, eventType, message, outboxKind string) error {
+func TransitionImageTask(ctx context.Context, task AsyncImageTask, updates map[string]any, eventType, message, outboxKind string, retryEvents ...*MediaRetryEvent) error {
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return transitionImageTaskTx(tx, task, updates, eventType, message, outboxKind)
+		if err := transitionImageTaskTx(tx, task, updates, eventType, message, outboxKind); err != nil {
+			return err
+		}
+		for _, event := range retryEvents {
+			if err := RecordMediaRetryEventTx(tx, event); err != nil {
+				return err
+			}
+		}
+		if len(retryEvents) > 0 && (updates["status"] == ImageTaskFailed || updates["status"] == ImageTaskExpired) {
+			return MarkMediaRetryTaskOutcomeTx(tx, task.TaskId, "failed")
+		}
+		return nil
 	})
 	if err == nil && (updates["status"] == ImageTaskFailed || updates["status"] == ImageTaskExpired) {
 		return RefundAsyncImageReservation(context.WithoutCancel(ctx), task.TaskId)

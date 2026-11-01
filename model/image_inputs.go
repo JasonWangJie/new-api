@@ -18,6 +18,65 @@ var (
 	ErrImageUploadAliasLimit  = errors.New("async_image_upload_alias_limit")
 )
 
+// SaveAsyncImageLocalReferences checkpoints validated inputs before dispatch.
+// The same user lock as admission protects pending-byte quotas as an existing
+// request grows. A stale worker cannot replace a newer slot or sent request.
+func SaveAsyncImageLocalReferences(ctx context.Context, task *AsyncImageTask, cipher []byte) error {
+	if task == nil || len(cipher) == 0 || int64(len(cipher)) > 64<<20-65536 {
+		return ErrAsyncQueueFull
+	}
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Where("id = ?", task.UserId).Take(&user).Error; err != nil {
+			return err
+		}
+		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+			var packet int64
+			if err := tx.Raw("SELECT @@max_allowed_packet").Scan(&packet).Error; err != nil {
+				return err
+			}
+			if packet <= 65536 || int64(len(cipher)) > packet-65536 {
+				return ErrAsyncQueueFull
+			}
+		}
+		tokenLimit := int64(max(1, common.GetEnvOrDefault("ASYNC_MEDIA_TOKEN_PENDING_BYTES", 128<<20)))
+		userLimit := int64(max(1, common.GetEnvOrDefault("ASYNC_MEDIA_USER_PENDING_BYTES", 512<<20)))
+		var usage []struct {
+			TokenID int
+			Bytes   int64
+		}
+		if err := tx.Model(&AsyncImageTask{}).Select("token_id, COALESCE(SUM(LENGTH(request_cipher)), 0) AS bytes").
+			Where("user_id = ? AND task_id <> ? AND status NOT IN ?", task.UserId, task.TaskId, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Group("token_id").Scan(&usage).Error; err != nil {
+			return err
+		}
+		remaining := userLimit - int64(len(cipher))
+		if remaining < 0 || int64(len(cipher)) > tokenLimit {
+			return ErrAsyncQueueFull
+		}
+		for _, row := range usage {
+			remaining -= row.Bytes
+			if row.Bytes < 0 || remaining < 0 || row.TokenID == task.TokenId && row.Bytes > tokenLimit-int64(len(cipher)) {
+				return ErrAsyncQueueFull
+			}
+		}
+		now := time.Now().Unix()
+		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND user_id = ? AND token_id = ? AND version = ? AND lease_token = ? AND lease_expires_at > ? AND status = ? AND dispatched_at = 0 AND upstream_task_id = ? AND upstream_succeeded_at = 0 AND image_count = 0 AND result_count = 0", task.TaskId, task.UserId, task.TokenId, task.Version, task.LeaseToken, now, ImageTaskInvoking, "").
+			Updates(map[string]any{"request_cipher": cipher, "version": task.Version + 1, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrImageConflict
+		}
+		return nil
+	})
+	if err == nil {
+		task.RequestCipher = cipher
+		task.Version++
+	}
+	return err
+}
+
 func RecordImageUploadAttempt(ctx context.Context, tokenId, limit int) (string, error) {
 	ticket := ImageUploadAdmissionTicket{TicketId: common.GetUUID(), TokenId: tokenId, CreatedAt: time.Now().Unix()}
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

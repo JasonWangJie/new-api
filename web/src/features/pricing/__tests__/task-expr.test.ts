@@ -17,20 +17,29 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import assert from 'node:assert/strict'
-import { describe, test } from 'vitest'
+
+import { describe, expect, test } from 'vitest'
 
 import {
   combineBillingExpr,
   parseTaskTiersFromExpr,
   splitBillingExprAndRequestRules,
 } from '../lib/billing-expr'
+import { evaluateBillingExpression } from '../lib/billing-expression/runtime'
 import {
   evaluateTaskUsageExamples,
   evaluateTaskVisualConfig,
   generateTaskExprFromConfig,
+  supportsTaskVideoInputMultipliers,
+  taskMatrixToTiers,
+  tryParseTaskMatrixConfig,
   tryParseTaskVisualConfig,
   type TaskVisualConfig,
 } from '../lib/task-expr'
+import {
+  getTaskMatrixDisplayTiers,
+  getTaskPricingDisplayTiers,
+} from '../lib/task-matrix-display'
 import type { BillingUsageSchema } from '../types'
 
 const schema: BillingUsageSchema = {
@@ -38,6 +47,217 @@ const schema: BillingUsageSchema = {
   clips: { type: 'number', unit: 'count' },
   mode: { enum: ['std', 'pro'] },
 }
+
+const videoSchema: BillingUsageSchema = {
+  seconds: { type: 'number', unit: 'second' },
+  resolution: { enum: ['720p', '1080p'] },
+  video_input: { enum: ['none', 'video'] },
+}
+
+describe('model-wide reference-video multipliers', () => {
+  const baseExpression =
+    'u("resolution") == "720p" ? tier("720p", 2 + u("seconds") * 0.4) : tier("1080p", 3 + u("seconds") * 0.8)'
+
+  test('saves and reopens separate multipliers without changing resolution base prices', () => {
+    const base = tryParseTaskVisualConfig(baseExpression, videoSchema)
+    assert.ok(base)
+    const config = {
+      ...base,
+      videoInputMultipliers: { none: 1.2, video: 1.5 },
+    }
+    const expression = generateTaskExprFromConfig(config, videoSchema)
+    const reopened = tryParseTaskVisualConfig(expression, videoSchema)
+    expect(reopened).toEqual(config)
+    const matrix = tryParseTaskMatrixConfig(expression, videoSchema)
+    assert.ok(matrix)
+    expect(matrix?.videoInputMultipliers).toEqual(config.videoInputMultipliers)
+    expect(matrix?.rows.map((row) => row.unitPrices.seconds)).toEqual([
+      0.4, 0.4, 0.8, 0.8,
+    ])
+    expect(matrix?.rows.map((row) => row.constant)).toEqual([2, 2, 3, 3])
+    expect(
+      generateTaskExprFromConfig(
+        {
+          tiers: taskMatrixToTiers(matrix, videoSchema),
+          videoInputMultipliers: matrix.videoInputMultipliers,
+        },
+        videoSchema
+      )
+    ).not.toBe('')
+    for (const [resolution, video_input, total] of [
+      ['720p', 'none', 4.8],
+      ['720p', 'video', 6],
+      ['1080p', 'none', 8.4],
+      ['1080p', 'video', 10.5],
+    ] as const) {
+      const usage = { seconds: 5, resolution, video_input }
+      const preview = evaluateTaskVisualConfig(config, usage, videoSchema)
+      expect(preview?.total).toBeCloseTo(total)
+      expect(preview?.multiplier).toBe(
+        config.videoInputMultipliers[video_input]
+      )
+      const actual = evaluateBillingExpression(expression, { usage })
+      expect(actual.status).toBe('success')
+      if (actual.status === 'success') expect(actual.cost).toBe(preview?.total)
+    }
+  })
+
+  test('preserves existing input-specific base prices and separate request multipliers', () => {
+    const base = tryParseTaskVisualConfig(
+      'u("video_input") == "video" ? tier("video", u("seconds") * 0.8) : tier("none", u("seconds") * 0.4)',
+      videoSchema
+    )
+    assert.ok(base)
+    const expression = generateTaskExprFromConfig(
+      { ...base, videoInputMultipliers: { none: 1, video: 1.5 } },
+      videoSchema
+    )
+    const rules = '(header("x-priority") == "high" ? 2 : 1)'
+    const combined = combineBillingExpr(expression, rules)
+    const split = splitBillingExprAndRequestRules(combined)
+    expect(split.requestRuleExpr).toBe(rules)
+    const matrix = tryParseTaskMatrixConfig(split.billingExpr, videoSchema)
+    expect(matrix?.rows.map((row) => row.unitPrices.seconds)).toEqual([
+      0.4, 0.8, 0.4, 0.8,
+    ])
+    const reopened = tryParseTaskVisualConfig(split.billingExpr, videoSchema)
+    expect(reopened?.videoInputMultipliers).toEqual({ none: 1, video: 1.5 })
+    expect(
+      combineBillingExpr(
+        generateTaskExprFromConfig(reopened, videoSchema),
+        rules
+      )
+    ).toBe(combined)
+    const result = evaluateBillingExpression(combined, {
+      usage: { video_input: 'video', seconds: 5 },
+      request: { headers: { 'x-priority': 'high' } },
+    })
+    expect(result.status).toBe('success')
+    if (result.status === 'success') expect(result.cost).toBe(12)
+  })
+
+  test.each([
+    { field: 'requests', unit: 'count', quantity: 1, price: 4, total: 6 },
+    { field: 'tokens', unit: 'token', quantity: 1_500_000, price: 4, total: 9 },
+  ] as const)(
+    'applies a uniform multiplier to $unit prices and examples',
+    (sample) => {
+      const schema: BillingUsageSchema = {
+        [sample.field]: { type: 'number', unit: sample.unit },
+        video_input: { enum: ['none', 'video'] },
+      }
+      const config: TaskVisualConfig = {
+        tiers: [
+          {
+            label: 'base',
+            conditions: [],
+            constant: 0,
+            unitPrices: { [sample.field]: sample.price },
+          },
+        ],
+        videoInputMultipliers: { none: 1, video: 1.5 },
+      }
+      const facts = { video_input: 'video', [sample.field]: sample.quantity }
+      const expression = generateTaskExprFromConfig(config, schema)
+      expect(evaluateTaskVisualConfig(config, facts, schema)?.total).toBe(
+        sample.total
+      )
+      expect(
+        evaluateTaskUsageExamples(expression, schema, [
+          { label: 'example', facts },
+        ])
+      ).toEqual([{ label: 'example', total: sample.total }])
+    }
+  )
+
+  test('shows effective public prices and keeps a zero multiplier as free', () => {
+    const config = tryParseTaskVisualConfig(baseExpression, videoSchema)
+    assert.ok(config)
+    const expression = generateTaskExprFromConfig(
+      { ...config, videoInputMultipliers: { none: 0, video: 1.5 } },
+      videoSchema
+    )
+    const matrix = getTaskMatrixDisplayTiers(expression, videoSchema)
+    expect(matrix).toHaveLength(4)
+    for (const [index, price] of [0, 0.6, 0, 1.2].entries()) {
+      expect(matrix?.[index].unitPrices.seconds).toBeCloseTo(price)
+    }
+    expect(matrix?.map((tier) => tier.constant)).toEqual([0, 3, 0, 4.5])
+    const published = getTaskPricingDisplayTiers(expression, videoSchema, true)
+    expect(published).toHaveLength(2)
+    expect(
+      published.every((tier) =>
+        tier.conditions.some(
+          (condition) =>
+            condition.field === 'video_input' && condition.value === 'video'
+        )
+      )
+    ).toBe(true)
+    const parsed = tryParseTaskVisualConfig(expression, videoSchema)
+    assert.ok(parsed)
+    const free = evaluateTaskVisualConfig(
+      parsed,
+      { resolution: '720p', video_input: 'none', seconds: 5 },
+      videoSchema
+    )
+    expect(free?.total).toBe(0)
+    expect(free?.multiplier).toBe(0)
+  })
+
+  test('leaves the default expression unchanged and rejects unsupported or invalid factors', () => {
+    const base = tryParseTaskVisualConfig(baseExpression, videoSchema)
+    assert.ok(base)
+    expect(
+      generateTaskExprFromConfig(
+        { ...base, videoInputMultipliers: { none: 1, video: 1 } },
+        videoSchema
+      )
+    ).toBe(baseExpression)
+    expect(supportsTaskVideoInputMultipliers(videoSchema)).toBe(true)
+    expect(
+      supportsTaskVideoInputMultipliers({
+        ...videoSchema,
+        video_input: { enum: ['none', 'video', 'other'] },
+      })
+    ).toBe(false)
+    for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const config = {
+        ...base,
+        videoInputMultipliers: { none: 1, video: value },
+      }
+      expect(generateTaskExprFromConfig(config, videoSchema)).toBe('')
+      expect(
+        evaluateTaskVisualConfig(
+          config,
+          { resolution: '720p', seconds: 5, video_input: 'video' },
+          videoSchema
+        )
+      ).toBeNull()
+    }
+    const expression = `(${baseExpression}) * (u("video_input") == "video" ? 1.5 : 1)`
+    expect(
+      tryParseTaskVisualConfig(expression, {
+        seconds: videoSchema.seconds,
+        resolution: videoSchema.resolution,
+      })
+    ).toBeNull()
+    expect(
+      tryParseTaskMatrixConfig(
+        `(${baseExpression}) * (u("video_input") == "video" ? -1 : 1)`,
+        videoSchema
+      )
+    ).toBeNull()
+    expect(
+      tryParseTaskMatrixConfig(
+        `(${baseExpression}) * (u("video_input") == "video" ? 1e309 : 1)`,
+        videoSchema
+      )
+    ).toBeNull()
+    expect(
+      tryParseTaskMatrixConfig(`(${baseExpression}) * 2`, videoSchema)
+    ).toBeNull()
+  })
+})
 
 function assertConfigRoundTrip(config: TaskVisualConfig) {
   const expression = generateTaskExprFromConfig(config, schema)
@@ -305,7 +525,10 @@ describe('task visual pricing preview', () => {
       null
     )
     assert.deepEqual(
-      parseTaskTiersFromExpr('tier("base", u("tokens") * 0.0000098)', tokenSchema),
+      parseTaskTiersFromExpr(
+        'tier("base", u("tokens") * 0.0000098)',
+        tokenSchema
+      ),
       []
     )
   })

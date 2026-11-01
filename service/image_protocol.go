@@ -24,32 +24,38 @@ type AsyncImageInputPart struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 	URL  string `json:"url,omitempty"`
+	// Private normalized state, never parsed from client request fields. The
+	// original URL remains available for SC ownership and expiry checks.
+	LocalURL       string `json:"local_url,omitempty"`
+	LocalExpiresAt int64  `json:"local_expires_at,omitempty"`
+	LocalBound     bool   `json:"local_bound,omitempty"`
 }
 
 type AsyncImageRequest struct {
-	MixedRouting           *ImageMixedRouting           `json:"mixed_routing,omitempty"`
-	ReferenceTransportUsed *string                      `json:"-"`
-	Completion             *AsyncImageCompletion        `json:"completion,omitempty"`
-	PostprocessContext     context.Context              `json:"-"`
-	Reservation            *model.AsyncImageBill        `json:"-"`
-	Billing                *MediaBillingSnapshot        `json:"billing,omitempty"`
-	Provider               string                       `json:"provider,omitempty"`
-	PolicyPlatform         string                       `json:"policy_platform,omitempty"`
-	ClientIP               string                       `json:"client_ip,omitempty"`
-	Platform               string                       `json:"platform"`
-	Dialect                string                       `json:"dialect"`
-	SourcePath             string                       `json:"source_path"`
-	InputFormat            string                       `json:"input_format,omitempty"`
-	Model                  string                       `json:"model"`
-	Prompt                 string                       `json:"prompt"`
-	Kind                   string                       `json:"kind"`
-	Size                   string                       `json:"size,omitempty"`
-	Resolution             string                       `json:"resolution,omitempty"`
-	AspectRatio            string                       `json:"aspect_ratio,omitempty"`
-	ExplicitTier           bool                         `json:"explicit_tier"`
-	Count                  int                          `json:"count"`
-	Parts                  []AsyncImageInputPart        `json:"parts"`
-	Native                 map[string]common.RawMessage `json:"native,omitempty"`
+	LocalReferencesRequested bool                         `json:"local_references_requested,omitempty"`
+	MixedRouting             *ImageMixedRouting           `json:"mixed_routing,omitempty"`
+	ReferenceTransportUsed   *string                      `json:"-"`
+	Completion               *AsyncImageCompletion        `json:"completion,omitempty"`
+	PostprocessContext       context.Context              `json:"-"`
+	Reservation              *model.AsyncImageBill        `json:"-"`
+	Billing                  *MediaBillingSnapshot        `json:"billing,omitempty"`
+	Provider                 string                       `json:"provider,omitempty"`
+	PolicyPlatform           string                       `json:"policy_platform,omitempty"`
+	ClientIP                 string                       `json:"client_ip,omitempty"`
+	Platform                 string                       `json:"platform"`
+	Dialect                  string                       `json:"dialect"`
+	SourcePath               string                       `json:"source_path"`
+	InputFormat              string                       `json:"input_format,omitempty"`
+	Model                    string                       `json:"model"`
+	Prompt                   string                       `json:"prompt"`
+	Kind                     string                       `json:"kind"`
+	Size                     string                       `json:"size,omitempty"`
+	Resolution               string                       `json:"resolution,omitempty"`
+	AspectRatio              string                       `json:"aspect_ratio,omitempty"`
+	ExplicitTier             bool                         `json:"explicit_tier"`
+	Count                    int                          `json:"count"`
+	Parts                    []AsyncImageInputPart        `json:"parts"`
+	Native                   map[string]common.RawMessage `json:"native,omitempty"`
 }
 
 // ImageMixedRouting is written only by admission and stored inside the encrypted

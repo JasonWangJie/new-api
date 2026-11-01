@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -24,6 +26,283 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestMediaRetryPolicyPersistence(t *testing.T) {
+	db := imageTestDatabase(t, "media-retry-policy")
+	previousDB, previousType := DB, common.MainDatabaseType()
+	DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() { DB = previousDB; common.SetMainDatabaseType(previousType) })
+	// Start with a representative pre-feature option/policy database, then
+	// apply the new tables twice to cover upgrade and startup idempotency.
+	require.NoError(t, db.AutoMigrate(&Option{}, &ImageGroupPolicy{}, &Channel{}))
+	videoSetting := `{"task_plugin_key":"drama"}`
+	videoChannel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &videoSetting}
+	require.NoError(t, db.Create(&videoChannel).Error)
+	require.NoError(t, db.Create(&Option{Key: "image_runtime_config", Value: `{"total_max_retries":7,"execution_timeout_seconds":900,"mixed_timeout_retry_enabled":false}`}).Error)
+	require.NoError(t, db.Create(&Option{Key: "media_runtime_config", Value: `{"download_timeout_seconds":600}`}).Error)
+	require.NoError(t, db.Create(&ImageGroupPolicy{PolicyKey: "existing-openai", Group: "default", Platform: "openai", Enabled: true, AsyncEnabled: true}).Error)
+	require.NoError(t, db.Create(&ImageGroupPolicy{PolicyKey: "existing-mixed", Group: "default", Platform: "mixed", Enabled: true, AsyncEnabled: true}).Error)
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}))
+	}
+	require.NoError(t, InitializeMediaRetryPolicy(db))
+	initial, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.True(t, initial.LegacyTimeoutEnabled)
+	assert.Equal(t, []string{"existing-openai"}, initial.LegacyTimeoutScopeKeys)
+	assert.Equal(t, 7, initial.LegacyTimeoutConfig["total_max_retries"])
+	assert.Equal(t, 600, initial.LegacyTimeoutConfig["video_submission_timeout_seconds"])
+	assert.Equal(t, []int{videoChannel.Id}, initial.LegacyVideoChannelIDs)
+	newVideoChannel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Setting: &videoSetting}
+	require.NoError(t, db.Create(&newVideoChannel).Error)
+	require.NoError(t, db.Create(&ImageGroupPolicy{PolicyKey: "new-openai", Group: "new", Platform: "openai", Enabled: true, AsyncEnabled: true}).Error)
+	require.NoError(t, InitializeMediaRetryPolicy(db))
+	afterRestart, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, initial, afterRestart)
+
+	draft := initial
+	draft.PauseResubmissions = true
+	draft.LegacyTimeoutScopeKeys = []string{"forged-scope"}
+	draft.LegacyTimeoutConfig = map[string]int{"total_max_retries": 999}
+	draft.LegacyVideoChannelIDs = []int{newVideoChannel.Id}
+	draft.Rules = []mediaretry.Rule{{ID: "busy", Name: "Busy", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"busy"}}, Steps: []mediaretry.Step{{ID: "same", Action: mediaretry.SameChannel, MaxAttempts: 2}}}}
+	saved, err := SaveMediaRetryPolicy(t.Context(), draft, 0, 1, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), saved.Revision)
+	assert.Equal(t, initial.LegacyTimeoutScopeKeys, saved.LegacyTimeoutScopeKeys)
+	assert.Equal(t, initial.LegacyTimeoutConfig, saved.LegacyTimeoutConfig)
+	assert.Equal(t, initial.LegacyVideoChannelIDs, saved.LegacyVideoChannelIDs)
+	_, err = SaveMediaRetryPolicy(t.Context(), draft, 0, 2, nil)
+	require.ErrorIs(t, err, ErrOptionRevisionConflict)
+	_, total, err := ListMediaRetryPolicyVersions(t.Context(), 1, 20)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), total)
+	assert.Error(t, UpdateOption(MediaRetryPolicyOptionKey, `{}`))
+	assert.Error(t, UpdateOption("MEDIA_RETRY_POLICY", `{}`))
+
+	// A failing history write must not leave a new active configuration.
+	failure := errors.New("history unavailable")
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("retry-policy-history-failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "media_retry_policy_versions" {
+			tx.AddError(failure)
+		}
+	}))
+	_, err = SaveMediaRetryPolicy(t.Context(), saved, 1, 1, nil)
+	require.ErrorIs(t, err, failure)
+	require.NoError(t, db.Callback().Create().Remove("retry-policy-history-failure"))
+	current, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, saved, current)
+
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := SaveMediaRetryPolicy(t.Context(), saved, 1, 1, nil); results <- err }()
+	}
+	first, second := <-results, <-results
+	assert.True(t, first == nil && errors.Is(second, ErrOptionRevisionConflict) || second == nil && errors.Is(first, ErrOptionRevisionConflict), "exactly one concurrent writer must succeed: %v / %v", first, second)
+	baseline := int64(0)
+	rolledBack, err := SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{}, 2, 1, &baseline)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), rolledBack.Revision)
+	assert.Empty(t, rolledBack.Rules)
+	assert.False(t, rolledBack.PauseResubmissions)
+	require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}))
+	require.NoError(t, InitializeMediaRetryPolicy(db))
+	preserved, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, rolledBack, preserved)
+
+	fact := mediaretry.Fact{MediaType: "image", Provider: "openai", Stage: "submit", ErrorCode: "busy", Category: "upstream_transient", Message: "provider busy"}
+	decision := mediaretry.Decision{Matched: true, RuleID: "busy", StepID: "same", Revision: 1, Action: mediaretry.SameChannel}
+	state := mediaretry.State{TotalLimit: 7, Now: 100}
+	for _, taskID := range []string{"sample-one", "sample-two"} {
+		event, err := NewMediaRetryEvent(taskID, 1, fact, decision, state)
+		require.NoError(t, err)
+		require.NoError(t, db.Transaction(func(tx *gorm.DB) error { return RecordMediaRetryEventTx(tx, event) }))
+		require.NoError(t, db.Transaction(func(tx *gorm.DB) error { return RecordMediaRetryEventTx(tx, event) }))
+	}
+	require.NoError(t, MarkMediaRetryEventExecutedTx(db, "sample-one", decision))
+	require.NoError(t, MarkMediaRetryTaskOutcomeTx(db, "sample-one", "succeeded"))
+	changedDecision := decision
+	changedDecision.Revision++
+	changedEvent, err := NewMediaRetryEvent("sample-two", 1, fact, changedDecision, state)
+	require.NoError(t, err)
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error { return RecordMediaRetryEventTx(tx, changedEvent) }))
+	samples, total, err := ListMediaRetrySamples(t.Context(), MediaRetrySampleFilter{Category: "upstream_transient"}, 1, 20)
+	require.NoError(t, err)
+	require.Len(t, samples, 1)
+	assert.Equal(t, int64(1), total)
+	assert.Equal(t, int64(2), samples[0].Count, "re-evaluating the same failure after an edit does not invent another occurrence")
+	assert.Equal(t, int64(2), samples[0].TaskCount)
+	assert.Equal(t, int64(1), samples[0].ExecutedCount)
+	assert.Equal(t, int64(1), samples[0].SucceededTaskCount)
+	details, detailTotal, err := ListMediaRetrySampleEvents(t.Context(), samples[0].Fingerprint, MediaRetrySampleFilter{Category: "upstream_transient"}, 1, 2)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, detailTotal, "decision revisions remain individually inspectable")
+	require.Len(t, details, 2)
+	assert.Equal(t, "sample-two", details[0].TaskID)
+	assert.Equal(t, int64(2), details[0].Revision)
+	_, detailTotal, err = ListMediaRetrySampleEvents(t.Context(), samples[0].Fingerprint, MediaRetrySampleFilter{Stage: "not-this-stage"}, 1, 20)
+	require.NoError(t, err)
+	assert.Zero(t, detailTotal)
+	rolledEvent, err := NewMediaRetryEvent("rolled-back-event", 1, fact, decision)
+	require.NoError(t, err)
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := RecordMediaRetryEventTx(tx, rolledEvent); err != nil {
+			return err
+		}
+		return failure
+	})
+	require.ErrorIs(t, err, failure)
+	_, err = GetLatestMediaRetryEvent(t.Context(), "rolled-back-event")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.NoError(t, db.Model(&MediaRetryEvent{}).Where("task_id = ?", "sample-one").Update("created_at", int64(1)).Error)
+	require.NoError(t, PruneMediaRetryEvents(t.Context(), 2, 100))
+	_, err = GetLatestMediaRetryEvent(t.Context(), "sample-one")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	_, err = GetLatestMediaRetryEvent(t.Context(), "sample-two")
+	require.NoError(t, err)
+	_, err = GetMediaRetryPolicyVersion(t.Context(), 0)
+	require.NoError(t, err, "retention never removes policy history")
+}
+
+func TestMediaRetryPolicyFreshDatabase(t *testing.T) {
+	db := imageTestDatabase(t, "media-retry-fresh")
+	previousDB := DB
+	DB = db
+	t.Cleanup(func() { DB = previousDB })
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&Option{}, &ImageGroupPolicy{}, &Channel{}, &MediaRetryPolicyVersion{}, &MediaRetryEvent{}))
+		require.NoError(t, InitializeMediaRetryPolicy(db))
+	}
+	policy, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.False(t, policy.LegacyTimeoutEnabled)
+	assert.Empty(t, policy.LegacyTimeoutScopeKeys)
+	assert.Empty(t, policy.LegacyVideoChannelIDs)
+	assert.Equal(t, 120, policy.LegacyTimeoutConfig["video_submission_timeout_seconds"])
+	versions, total, err := ListMediaRetryPolicyVersions(t.Context(), 1, 20)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	require.Len(t, versions, 1)
+	assert.Zero(t, versions[0].Revision)
+}
+
+func TestMediaRetryPolicyLargeDocuments(t *testing.T) {
+	for _, legacyText := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_text_%t", legacyText), func(t *testing.T) {
+			db := imageTestDatabase(t, "media-retry-large")
+			previousDB, previousType := DB, common.MainDatabaseType()
+			DB = db
+			common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+			t.Cleanup(func() { DB = previousDB; common.SetMainDatabaseType(previousType) })
+			require.NoError(t, db.AutoMigrate(&Option{}, &ImageGroupPolicy{}, &Channel{}))
+			if legacyText {
+				// Reproduce the previous TEXT columns, including their existing
+				// records, before applying the wider production models.
+				require.NoError(t, db.Table("media_retry_policy_versions").AutoMigrate(&struct {
+					MediaRetryPolicyVersion
+					Config string `gorm:"type:text"`
+				}{}))
+				require.NoError(t, db.Table("media_retry_events").AutoMigrate(&struct {
+					MediaRetryEvent
+					StateJSON string `gorm:"type:text"`
+				}{}))
+				require.NoError(t, db.Table("async_image_tasks").AutoMigrate(&struct {
+					AsyncImageTask
+					RetryPolicyState string `gorm:"type:text"`
+				}{}))
+				for table, field := range map[string]string{"media_retry_policy_versions": "config", "media_retry_events": "state_json", "async_image_tasks": "retry_policy_state"} {
+					columns, err := db.Migrator().ColumnTypes(table)
+					require.NoError(t, err)
+					found := false
+					for _, column := range columns {
+						if column.Name() == field {
+							found = true
+							require.Equal(t, "text", strings.ToLower(column.DatabaseTypeName()), "upgrade fixture must use the old storage boundary")
+						}
+					}
+					require.True(t, found)
+				}
+				const baseline = `{"revision":0,"rules":[]}`
+				require.NoError(t, db.Create(&Option{Key: MediaRetryPolicyOptionKey, Value: baseline}).Error)
+				require.NoError(t, db.Create(&MediaRetryPolicyVersion{Revision: 0, Config: baseline}).Error)
+				require.NoError(t, db.Create(&AsyncImageTask{TaskId: "legacy-small-state", RetryPolicyState: `{"state":{"total_used":3}}`}).Error)
+				require.NoError(t, db.Create(&MediaRetryEvent{TaskID: "legacy-small-state", EventKey: "legacy-small-event", StateJSON: `{"total_used":3}`}).Error)
+			}
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &AsyncImageTask{}))
+				require.NoError(t, InitializeMediaRetryPolicy(db))
+			}
+			if legacyText {
+				var oldTask AsyncImageTask
+				require.NoError(t, db.Where("task_id = ?", "legacy-small-state").Take(&oldTask).Error)
+				assert.Equal(t, `{"state":{"total_used":3}}`, oldTask.RetryPolicyState)
+				oldEvent, err := GetLatestMediaRetryEvent(t.Context(), oldTask.TaskId)
+				require.NoError(t, err)
+				assert.Equal(t, `{"total_used":3}`, oldEvent.StateJSON)
+			}
+			policy, err := GetMediaRetryPolicy(t.Context())
+			require.NoError(t, err)
+			state := mediaretry.State{TotalUsed: 7, TotalLimit: 16, RuleUses: map[string]int{}, StepUses: map[string]int{}}
+			// A supported 200-rule, eight-step policy with stable 64-byte IDs
+			// exceeds MySQL TEXT for both its document and accumulated counters.
+			for i := range 200 {
+				rule := mediaretry.Rule{ID: fmt.Sprintf("rule-%03d-%s", i, strings.Repeat("r", 55)), Name: "Provider failure", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"busy"}}}
+				for step := range 8 {
+					id := fmt.Sprintf("step-%d-%s", step, strings.Repeat("s", 57))
+					rule.Steps = append(rule.Steps, mediaretry.Step{ID: id, Action: mediaretry.PollSameJob, MaxAttempts: 1})
+					state.StepUses[mediaretry.StepKey(rule.ID, id)] = 1
+				}
+				state.RuleUses[rule.ID] = 8
+				policy.Rules = append(policy.Rules, rule)
+			}
+			saved, err := SaveMediaRetryPolicy(t.Context(), policy, 0, 1, nil)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(saved)
+			require.NoError(t, err)
+			require.Greater(t, len(encoded), 65535)
+			require.Less(t, len(encoded), 1<<20)
+			checkpoint, err := common.Marshal(ImageRetryPolicyState{State: state})
+			require.NoError(t, err)
+			require.Greater(t, len(checkpoint), 65535)
+			task := AsyncImageTask{TaskId: "large-stable-counters", RetryPolicyState: string(checkpoint)}
+			require.NoError(t, db.Create(&task).Error)
+			event, err := NewMediaRetryEvent(task.TaskId, 1, mediaretry.Fact{MediaType: "image", Message: "busy"}, mediaretry.Decision{Revision: saved.Revision}, state)
+			require.NoError(t, err)
+			require.Greater(t, len(event.StateJSON), 65535)
+			require.NoError(t, RecordMediaRetryEventTx(db, event))
+			baseline, original := int64(0), saved.Revision
+			rolledBack, err := SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{}, saved.Revision, 1, &baseline)
+			require.NoError(t, err)
+			assert.Empty(t, rolledBack.Rules)
+			restored, err := SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{}, rolledBack.Revision, 1, &original)
+			require.NoError(t, err)
+			assert.Equal(t, saved.Rules, restored.Rules)
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &AsyncImageTask{}))
+				require.NoError(t, InitializeMediaRetryPolicy(db))
+				version, err := GetMediaRetryPolicyVersion(t.Context(), original)
+				require.NoError(t, err)
+				assert.Equal(t, string(encoded), version.Config)
+				current, err := GetMediaRetryPolicy(t.Context())
+				require.NoError(t, err)
+				assert.Equal(t, restored, current)
+				var persisted AsyncImageTask
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&persisted).Error)
+				assert.Equal(t, string(checkpoint), persisted.RetryPolicyState)
+				storedEvent, err := GetLatestMediaRetryEvent(t.Context(), task.TaskId)
+				require.NoError(t, err)
+				var counters mediaretry.State
+				require.NoError(t, common.UnmarshalJsonStr(storedEvent.StateJSON, &counters))
+				assert.Equal(t, state, counters, "migration must not truncate or reset stable usage counters")
+			}
+			t.Logf("policy bytes=%d, checkpoint bytes=%d, event state bytes=%d", len(encoded), len(checkpoint), len(event.StateJSON))
+		})
+	}
+}
 
 func imageTestDatabase(t *testing.T, name string) *gorm.DB {
 	t.Helper()

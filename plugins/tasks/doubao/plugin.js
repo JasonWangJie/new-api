@@ -63,6 +63,30 @@ function seedanceOperationMode(name, duration, resolutions, imageLimit, totalVid
 }
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/image/url", "kind": "image"},
+    {"path": "/input_reference/url", "kind": "image"},
+    {"path": "/images/*/url", "kind": "image"},
+    {"path": "/last_frame", "kind": "image"},
+    {"path": "/last_frame/url", "kind": "image"},
+    {"path": "/reference_images/*", "kind": "image"},
+    {"path": "/reference_images/*/url", "kind": "image"},
+    {"path": "/metadata/content/*/image_url/url", "kind": "image"},
+    {"path": "/content/*/image_url/url", "kind": "image"},
+    {"path": "/video", "kind": "video"},
+    {"path": "/video/url", "kind": "video"},
+    {"path": "/reference_videos/*", "kind": "video"},
+    {"path": "/reference_videos/*/url", "kind": "video"},
+    {"path": "/metadata/content/*/video_url/url", "kind": "video"},
+    {"path": "/content/*/video_url/url", "kind": "video"},
+    {"path": "/reference_audios/*", "kind": "audio"},
+    {"path": "/reference_audios/*/url", "kind": "audio"},
+    {"path": "/metadata/content/*/audio_url/url", "kind": "audio"},
+    {"path": "/content/*/audio_url/url", "kind": "audio"},
+  ],
   apiVersion: 1,
   key: "doubao",
   name: "Doubao Video",
@@ -71,7 +95,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.3.1",
+  version: "1.3.2",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [

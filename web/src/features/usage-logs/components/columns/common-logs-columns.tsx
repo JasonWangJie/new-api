@@ -45,6 +45,7 @@ import {
   getTaskUsagePriceUnitLabelKey,
 } from '@/features/pricing/lib/dynamic-price'
 import { pluginUsageSchema } from '@/features/pricing/lib/plugin-pricing'
+import { tryParseTaskVisualConfig } from '@/features/pricing/lib/task-expr'
 import { taskUsageUnitLabel } from '@/features/pricing/lib/task-price-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
@@ -179,11 +180,29 @@ function buildTypeDetailSegments(
   const isTieredExpr = other.billing_mode === 'tiered_expr'
   const tieredSummary = getTieredBillingSummary(other)
   if (isTieredExpr && other.is_task) {
-    const tiers = parseTaskTiersFromExpr(
-      decodeBillingExprB64(other.expr_b64),
-      usageSchema,
-      true
-    )
+    const expression = decodeBillingExprB64(other.expr_b64)
+    let tiers = parseTaskTiersFromExpr(expression, usageSchema, true)
+    const videoInput = other.usage_facts?.video_input
+    if (
+      tiers.length === 0 &&
+      usageSchema &&
+      (videoInput === 'none' || videoInput === 'video')
+    ) {
+      const config = tryParseTaskVisualConfig(expression, usageSchema)
+      if (config?.videoInputMultipliers) {
+        const multiplier = config.videoInputMultipliers[videoInput]
+        tiers = config.tiers.map((tier) => ({
+          ...tier,
+          constant: tier.constant * multiplier,
+          unitPrices: Object.fromEntries(
+            Object.entries(tier.unitPrices).map(([field, price]) => [
+              field,
+              price * multiplier,
+            ])
+          ),
+        }))
+      }
+    }
     const tier = tiers.find(
       (entry) =>
         Boolean(other.matched_tier) &&

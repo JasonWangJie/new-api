@@ -324,8 +324,8 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			if err != nil {
 				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
-			if bound || mode == "local" || strings.HasPrefix(strings.ToLower(reference), "data:") {
-				image, err := resolveAsyncImageReference(ctx, task.TokenId, reference, referenceCfg)
+			if bound || part.LocalURL != "" || mode == "local" || strings.HasPrefix(strings.ToLower(reference), "data:") {
+				image, err := resolveAsyncImageReference(ctx, task.TokenId, part, referenceCfg)
 				if err != nil {
 					return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 				}
@@ -486,7 +486,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				continue
 			}
 			referenceIndex++
-			image, err := resolveAsyncImageReference(ctx, task.TokenId, part.URL, referenceCfg)
+			image, err := resolveAsyncImageReference(ctx, task.TokenId, part, referenceCfg)
 			if err != nil {
 				return nil, model.AsyncImageBill{}, service.NewImageReferenceFailure(referenceIndex, err)
 			}
@@ -955,8 +955,8 @@ func recordAsyncImageUpstreamJob(ctx context.Context, task *model.AsyncImageTask
 
 // resolveAsyncImageReference applies the selected channel's effective input
 // limit while retaining the field index added by NewImageReferenceFailure.
-func resolveAsyncImageReference(ctx context.Context, tokenID int, reference string, cfg service.ImageRuntimeConfig) (service.ImageBytes, error) {
-	image, _, err := service.ResolveImageReference(ctx, tokenID, reference, cfg)
+func resolveAsyncImageReference(ctx context.Context, tokenID int, part service.AsyncImageInputPart, cfg service.ImageRuntimeConfig) (service.ImageBytes, error) {
+	image, err := service.ResolveAsyncImageInputPart(ctx, tokenID, part, cfg)
 	if err != nil && (strings.Contains(err.Error(), "byte limit exceeded") || err.Error() == "stored image exceeds read limit" || err.Error() == "invalid or oversized image data URI") {
 		return image, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_reference_image", Message: fmt.Sprintf("%s (reference image limit: %d bytes)", err.Error(), cfg.DownloadMaxBytes)}
 	}
@@ -977,7 +977,7 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 		if err != nil {
 			return nil, service.NewImageReferenceFailure(referenceIndex, err)
 		}
-		if !bound && mode != "local" && !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
+		if !bound && part.LocalURL == "" && mode != "local" && !strings.HasPrefix(strings.ToLower(part.URL), "data:") {
 			mimeType := ""
 			if parsed, err := url.Parse(part.URL); err == nil {
 				switch strings.ToLower(path.Ext(parsed.Path)) {
@@ -996,7 +996,7 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 				continue
 			}
 		}
-		image, err := resolveAsyncImageReference(ctx, task.TokenId, part.URL, cfg)
+		image, err := resolveAsyncImageReference(ctx, task.TokenId, part, cfg)
 		if err != nil {
 			return nil, service.NewImageReferenceFailure(referenceIndex, err)
 		}

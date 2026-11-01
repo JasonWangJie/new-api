@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -82,8 +83,12 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 	}
 	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
+	billingChannelID := info.ChannelId
+	if task != nil {
+		billingChannelID = task.BillingChannelID()
+	}
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
-		ChannelId: info.ChannelId,
+		ChannelId: billingChannelID,
 		ModelName: info.OriginModelName,
 		TokenName: tokenName,
 		Quota:     info.PriceData.Quota,
@@ -242,6 +247,17 @@ func taskModelName(task *model.Task) string {
 // emit another billing log. The caller must have validated the upstream duration
 // against the reserved limit before passing the actual charge.
 func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, actualQuota int, usageFacts map[string]any, clamp *common.QuotaClamp) (bool, error) {
+	if err := VideoBillingRetryBoundary(ctx, task, nil, true); err != nil {
+		return false, err
+	}
+	won, err := settleMeasuredVideoTask(ctx, task, fromStatus, actualQuota, usageFacts, clamp)
+	if err != nil {
+		err = errors.Join(err, VideoBillingRetryBoundary(context.WithoutCancel(ctx), task, err, false))
+	}
+	return won, err
+}
+
+func settleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, actualQuota int, usageFacts map[string]any, clamp *common.QuotaClamp) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("measured task is missing")
 	}
@@ -274,7 +290,7 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 				UserId:    task.UserId,
 				LogType:   model.LogTypeRefund,
 				Content:   "任务用量表达式结算",
-				ChannelId: task.ChannelId,
+				ChannelId: task.BillingChannelID(),
 				ModelName: taskModelName(task),
 				Quota:     refund,
 				TokenId:   task.PrivateData.TokenId,
@@ -304,7 +320,7 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 			UserId:    task.UserId,
 			LogType:   model.LogTypeRefund,
 			Content:   task.FailReason,
-			ChannelId: task.ChannelId,
+			ChannelId: task.BillingChannelID(),
 			ModelName: taskModelName(task),
 			Quota:     reservedQuota,
 			TokenId:   task.PrivateData.TokenId,
@@ -319,6 +335,17 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 // SettleTaskBillingOnComplete evaluates the frozen bill before publishing a
 // terminal result. Balance changes and the terminal CAS commit together.
 func SettleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, result *relaycommon.TaskInfo) (bool, error) {
+	if err := VideoBillingRetryBoundary(ctx, task, nil, true); err != nil {
+		return false, err
+	}
+	won, err := settleTaskBillingOnComplete(ctx, adaptor, task, fromStatus, result)
+	if err != nil {
+		err = errors.Join(err, VideoBillingRetryBoundary(context.WithoutCancel(ctx), task, err, false))
+	}
+	return won, err
+}
+
+func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, result *relaycommon.TaskInfo) (bool, error) {
 	actualQuota := task.Quota
 	var facts map[string]any
 	var tier string
@@ -368,7 +395,7 @@ func SettleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		}
 		attachQuotaSaturationToOther(other, clamp)
 		model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
-			UserId: task.UserId, LogType: logType, Content: "任务用量结算", ChannelId: task.ChannelId,
+			UserId: task.UserId, LogType: logType, Content: "任务用量结算", ChannelId: task.BillingChannelID(),
 			ModelName: taskModelName(task), Quota: logQuota, TokenId: task.PrivateData.TokenId,
 			Group: task.Group, Other: other, NodeName: task.PrivateData.NodeName,
 		})
@@ -402,7 +429,7 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 	} else if err == nil {
 		model.UpdateUserUsedQuota(task.UserId, -quota)
 	}
-	model.UpdateChannelUsedQuota(task.ChannelId, -quota)
+	model.UpdateChannelUsedQuota(task.BillingChannelID(), -quota)
 
 	// 4. 记录日志
 	other := taskBillingOther(task)
@@ -412,7 +439,7 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 		UserId:    task.UserId,
 		LogType:   model.LogTypeRefund,
 		Content:   "",
-		ChannelId: task.ChannelId,
+		ChannelId: task.BillingChannelID(),
 		ModelName: taskModelName(task),
 		Quota:     quota,
 		TokenId:   task.PrivateData.TokenId,
@@ -476,7 +503,7 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	} else if err == nil {
 		model.UpdateUserUsedQuota(task.UserId, quotaDelta)
 	}
-	model.UpdateChannelUsedQuota(task.ChannelId, quotaDelta)
+	model.UpdateChannelUsedQuota(task.BillingChannelID(), quotaDelta)
 
 	var logType int
 	var logQuota int
@@ -498,7 +525,7 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		UserId:    task.UserId,
 		LogType:   logType,
 		Content:   reason,
-		ChannelId: task.ChannelId,
+		ChannelId: task.BillingChannelID(),
 		ModelName: taskModelName(task),
 		Quota:     logQuota,
 		TokenId:   task.PrivateData.TokenId,

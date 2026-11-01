@@ -30,7 +30,7 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 		if current.PrivateData.SubmitAccountingRecorded {
 			return nil
 		}
-		if current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.Quota != task.Quota {
+		if current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.BillingChannelID() != task.BillingChannelID() || current.Quota != task.Quota {
 			return errors.New("measured task accounting inputs do not match persisted task")
 		}
 		subject, err := CanvasBillingSubject(tx, current.PrivateData.TokenId, task.UserId)
@@ -51,14 +51,14 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 		if userResult.RowsAffected != 1 {
 			return errors.New("measured task user accounting could not be applied")
 		}
-		channelResult := tx.Model(&Channel{}).Where("id = ?", task.ChannelId).
+		channelResult := tx.Model(&Channel{}).Where("id = ?", current.BillingChannelID()).
 			Update("used_quota", gorm.Expr("used_quota + ?", task.Quota))
 		if channelResult.Error != nil {
 			return channelResult.Error
 		}
 		if channelResult.RowsAffected != 1 && task.Quota != 0 {
 			var count int64
-			if err := tx.Model(&Channel{}).Where("id = ?", task.ChannelId).Count(&count).Error; err != nil {
+			if err := tx.Model(&Channel{}).Where("id = ?", current.BillingChannelID()).Count(&count).Error; err != nil {
 				return err
 			}
 			if count != 0 {
@@ -66,6 +66,9 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 			}
 		}
 		current.PrivateData.SubmitAccountingRecorded = true
+		if current.PrivateData.BillingChannelID == 0 {
+			current.PrivateData.BillingChannelID = current.ChannelId
+		}
 		if err := tx.Model(&Task{}).Where("id = ? AND attempt_generation = ?", task.ID, task.AttemptGeneration).Update("private_data", current.PrivateData).Error; err != nil {
 			return err
 		}
@@ -74,6 +77,9 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 	})
 	if err == nil {
 		task.PrivateData.SubmitAccountingRecorded = true
+		if task.PrivateData.BillingChannelID == 0 {
+			task.PrivateData.BillingChannelID = task.ChannelId
+		}
 	}
 	return recorded, err
 }
@@ -128,12 +134,20 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if current.Status != fromStatus || current.Quota != reservedQuota || current.AttemptGeneration != task.AttemptGeneration || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID {
 			return errMeasuredTaskCASLost
 		}
+		if current.PrivateData.AsyncMedia && current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput && task.Status == TaskStatusFailure {
+			return errors.New("confirmed video output requires billing reconciliation")
+		}
 		if current.PrivateData.DurableBilling && !current.PrivateData.SubmitAccountingRecorded {
 			return errors.New("task submission accounting is not yet recorded")
 		}
 		if current.UserId != task.UserId || current.ChannelId != task.ChannelId {
 			return errors.New("task settlement identity mismatch")
 		}
+		updated.PrivateData.BillingChannelID = current.BillingChannelID()
+		updated.PrivateData.MediaRetryFact = current.PrivateData.MediaRetryFact
+		updated.PrivateData.MediaRetryFailedAt = current.PrivateData.MediaRetryFailedAt
+		updated.PrivateData.MediaRetryState = current.PrivateData.MediaRetryState
+		updated.PrivateData.MediaRetryDecision = current.PrivateData.MediaRetryDecision
 		privateData := current.PrivateData
 		var subjectErr error
 		subject, subjectErr = CanvasBillingSubject(tx, privateData.TokenId, task.UserId)
@@ -226,7 +240,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			updated.PrivateData.UpstreamAsyncResponse = nil
 			delta = -reservedQuota
 		}
-		if current.AttemptGeneration > 0 && current.PrivateData.AsyncMedia && current.Platform == "drama" {
+		if current.AttemptGeneration > 0 && current.PrivateData.AsyncMedia {
 			updated.PrivateData.VideoAttempts = append([]VideoTaskAttempt(nil), current.PrivateData.VideoAttempts...)
 			attemptIndex := -1
 			for i := range updated.PrivateData.VideoAttempts {
@@ -240,7 +254,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 				if startedAt <= 0 {
 					startedAt = current.SubmitTime
 				}
-				updated.PrivateData.VideoAttempts = append(updated.PrivateData.VideoAttempts, VideoTaskAttempt{Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, StartedAt: startedAt})
+				updated.PrivateData.VideoAttempts = append(updated.PrivateData.VideoAttempts, VideoTaskAttempt{ChannelID: current.ChannelId, Decision: current.PrivateData.MediaRetryDecision, Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, StartedAt: startedAt})
 				attemptIndex = len(updated.PrivateData.VideoAttempts) - 1
 			}
 			attempt := &updated.PrivateData.VideoAttempts[attemptIndex]
@@ -297,7 +311,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 					return errors.New("task token refund could not be applied")
 				}
 			}
-			query := tx.Model(&Channel{}).Where("id = ?", task.ChannelId)
+			query := tx.Model(&Channel{}).Where("id = ?", current.BillingChannelID())
 			if current.PrivateData.SubmitAccountingRecorded && credit > 0 {
 				query = query.Where("used_quota >= ?", credit)
 			}
@@ -307,7 +321,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			}
 			if result.RowsAffected != 1 {
 				var count int64
-				if err := tx.Model(&Channel{}).Where("id = ?", task.ChannelId).Count(&count).Error; err != nil {
+				if err := tx.Model(&Channel{}).Where("id = ?", current.BillingChannelID()).Count(&count).Error; err != nil {
 					return err
 				}
 				if count != 0 {
@@ -324,6 +338,15 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		}
 		if err := recordAsyncMediaNativeTaskTx(tx, *task, false); err != nil {
 			return err
+		}
+		if current.PrivateData.MediaRetryState != nil || current.PrivateData.MediaRetryDecision != nil {
+			outcome := "failed"
+			if updated.Status == TaskStatusSuccess {
+				outcome = "succeeded"
+			}
+			if err := MarkMediaRetryTaskOutcomeTx(tx, current.TaskID, outcome); err != nil {
+				return err
+			}
 		}
 		transactionBodySucceeded = true
 		return nil

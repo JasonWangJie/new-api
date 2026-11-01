@@ -16,12 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import i18next from 'i18next'
 import { useState } from 'react'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { evaluateBillingExpression } from '@/features/pricing/lib/billing-expression/runtime'
 import { getTaskPricingDisplayTiers } from '@/features/pricing/lib/task-matrix-display'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 
@@ -169,6 +170,127 @@ function TaskPricingDraft(props: {
     />
   )
 }
+
+const videoMultiplierSchema: BillingUsageSchema = {
+  seconds: {
+    type: 'number',
+    unit: 'second',
+    description: 'Video generation unit price',
+  },
+  resolution: { enum: ['720p', '1080p'], description: 'Resolution' },
+  video_input: {
+    enum: ['none', 'video'],
+    description: 'Reference video input',
+    enumLabels: { none: 'No reference video', video: 'With reference video' },
+  },
+}
+
+it('applies one reference-video multiplier across resolutions and reopens it without changing base prices', async () => {
+  const onChange = vi.fn()
+  const view = render(
+    <TaskPricingDraft
+      expression='u("resolution") == "720p" ? tier("720p", 1 + u("seconds") * 0.2) : tier("1080p", 2 + u("seconds") * 0.4)'
+      usageSchema={videoMultiplierSchema}
+      onChange={onChange}
+    />
+  )
+  expect(
+    screen.getByRole('textbox', { name: 'Without reference video multiplier' })
+  ).toHaveValue('1')
+  const multiplier = screen.getByRole('textbox', {
+    name: 'With reference video multiplier',
+  })
+  expect(multiplier).toHaveValue('1')
+  expect(onChange).not.toHaveBeenCalled()
+  const user = userEvent.setup()
+  await user.clear(multiplier)
+  await user.type(multiplier, '1.5')
+  const expression = onChange.mock.lastCall?.[0] as string
+  for (const [resolution, video_input, expected] of [
+    ['720p', 'none', 2],
+    ['720p', 'video', 3],
+    ['1080p', 'video', 6],
+  ] as const) {
+    expect(
+      evaluateBillingExpression(expression, {
+        usage: { seconds: 5, resolution, video_input },
+      })
+    ).toMatchObject({ status: 'success', cost: expected })
+  }
+  expect(
+    screen.getByRole('textbox', {
+      name: 'Video generation unit price: Resolution: 720p · With reference video',
+    })
+  ).toHaveValue('0.2')
+  await user.click(
+    screen.getByRole('combobox', { name: 'Reference video input' })
+  )
+  await user.click(screen.getByRole('option', { name: 'With reference video' }))
+  expect(screen.getByText(/\) × 1\.5 = \$3/)).toBeVisible()
+  view.unmount()
+  render(
+    <TaskPricingDraft
+      expression={expression}
+      usageSchema={videoMultiplierSchema}
+      onChange={vi.fn()}
+    />
+  )
+  expect(
+    screen.getByRole('textbox', { name: 'With reference video multiplier' })
+  ).toHaveValue('1.5')
+  expect(
+    screen.getByRole('textbox', { name: 'Without reference video multiplier' })
+  ).toHaveValue('1')
+  expect(screen.getByRole('table')).toBeVisible()
+  await user.click(screen.getByRole('combobox', { name: 'Editor mode' }))
+  await user.click(screen.getByRole('option', { name: 'Expression editor' }))
+  expect(
+    (
+      screen.getByRole('textbox', {
+        name: 'Billing expression',
+      }) as HTMLTextAreaElement
+    ).value
+  ).toContain('header("x-priority")')
+})
+
+it('blocks invalid multiplier drafts and preserves an explicit zero multiplier', () => {
+  const onChange = vi.fn()
+  render(
+    <TaskPricingDraft
+      expression='tier("base", u("seconds") * 0.4)'
+      usageSchema={videoMultiplierSchema}
+      onChange={onChange}
+    />
+  )
+  const multiplier = screen.getByRole('textbox', {
+    name: 'With reference video multiplier',
+  })
+  for (const value of ['', '-1', 'Infinity', 'NaN']) {
+    fireEvent.change(multiplier, { target: { value } })
+    expect(multiplier).toHaveAttribute('aria-invalid', 'true')
+    expect(multiplier.closest('[data-billing-invalid="true"]')).not.toBeNull()
+    expect(
+      within(
+        multiplier.closest('[data-slot="field"]') as HTMLElement
+      ).getByRole('alert')
+    ).toHaveTextContent('Enter a finite multiplier of 0 or greater.')
+    expect(onChange).not.toHaveBeenCalled()
+  }
+  fireEvent.change(multiplier, { target: { value: '0' } })
+  expect(multiplier).not.toHaveAttribute('aria-invalid')
+  expect(multiplier).toHaveValue('0')
+  const expression = onChange.mock.lastCall?.[0] as string
+  expect(
+    evaluateBillingExpression(expression, {
+      usage: { seconds: 5, resolution: '720p', video_input: 'video' },
+    })
+  ).toMatchObject({ status: 'success', cost: 0 })
+  expect(
+    evaluateBillingExpression(expression, {
+      usage: { seconds: 5, resolution: '720p', video_input: 'none' },
+    })
+  ).toMatchObject({ status: 'success', cost: 2 })
+})
 
 it('keeps inherited video-reference prices while browsing or cancelling and changes only an explicitly edited price', async () => {
   const onChange = vi.fn()
@@ -421,6 +543,9 @@ it.each(['image', 'video'] as const)(
     ).toBeVisible()
     expect(
       screen.queryByRole('spinbutton', { name: `Usage · ${absentLabel}` })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('textbox', { name: 'With reference video multiplier' })
     ).not.toBeInTheDocument()
     if (kind === 'image') {
       expect(screen.getByText('$/image')).toBeVisible()

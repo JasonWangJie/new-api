@@ -73,11 +73,14 @@ function videoProfile(model, config) {
 }
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/references/*/source", "kind": "media"},
+  ],
   apiVersion: 1,
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.6",
+  version: "1.1.7",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",

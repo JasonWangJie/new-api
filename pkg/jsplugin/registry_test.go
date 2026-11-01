@@ -3,6 +3,8 @@ package jsplugin
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -1297,6 +1299,41 @@ func TestSubmitResponseTypesContract(t *testing.T) {
 			} else {
 				require.Error(t, err)
 			}
+		})
+	}
+}
+
+func TestVideoRetryInputManifestContract(t *testing.T) {
+	exports := `export const protocols={openai_video:{decodeRequest(){return {kind:"submit",model:"video",requestBody:{}}},render(){return {}}}};export function listArtifacts(){return [];}export function buildContentRequest(){return {url:"https://example.com/video"};}`
+	for _, tc := range []struct {
+		name, inputs string
+		valid        bool
+	}{
+		{"url slots", `[{path:"/images/*",kind:"image"},{path:"/metadata/content/*/video_url/url",kind:"video"}]`, true},
+		{"null", `null`, false}, {"not array", `{path:"/image",kind:"image"}`, false},
+		{"unknown field", `[{path:"/image",kind:"image",rewrite:true}]`, false},
+		{"duplicate", `[{path:"/image",kind:"image"},{path:"/image",kind:"video"}]`, false},
+		{"unsupported kind", `[{path:"/image",kind:"file"}]`, false},
+		{"partial wildcard", `[{path:"/image*",kind:"image"}]`, false},
+		{"escaping", `[{path:"/image~1secret",kind:"image"}]`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin, err := CompilePlugin(routingTestPluginSource("video-slots", 0, `["video"]`, `protocols:["openai_video"],videoRetryInputs:`+tc.inputs+`,`, exports), Options{})
+			if !tc.valid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, plugin.Meta.VideoRetryInputs, 2)
+		})
+	}
+	for _, key := range []string{"drama", "xai", "yali", "tabtab", "doubao", "hailuo", "kling", "alibaba", "jimeng", "google", "vertex-ai", "vidu", "sora", "tianyue"} {
+		t.Run(key, func(t *testing.T) {
+			source, err := os.ReadFile(filepath.Join("..", "..", "plugins", "tasks", key, "plugin.js"))
+			require.NoError(t, err)
+			plugin, err := CompilePlugin(string(source), Options{})
+			require.NoError(t, err)
+			require.NotEmpty(t, plugin.Meta.VideoRetryInputs)
 		})
 	}
 }

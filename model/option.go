@@ -259,7 +259,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 	}
 	for key := range values {
 		key = strings.TrimSpace(key)
-		if strings.EqualFold(key, "image_runtime_config") || strings.EqualFold(key, "media_runtime_config") {
+		if strings.EqualFold(key, "image_runtime_config") || strings.EqualFold(key, "media_runtime_config") || strings.EqualFold(key, MediaRetryPolicyOptionKey) {
 			return errors.New("Media runtime configuration must be updated through its versioned settings endpoint")
 		}
 	}
@@ -287,7 +287,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 			// Use the database's key comparison so case/accent-insensitive
 			// collations cannot bypass protection, even on first creation.
 			var versionedCount int64
-			if err := tx.Model(&Option{}).Where(map[string]any{"key": []string{"image_runtime_config", "media_runtime_config"}}).Where(&Option{Key: option.Key}).Count(&versionedCount).Error; err != nil {
+			if err := tx.Model(&Option{}).Where(map[string]any{"key": []string{"image_runtime_config", "media_runtime_config", MediaRetryPolicyOptionKey}}).Where(&Option{Key: option.Key}).Count(&versionedCount).Error; err != nil {
 				return err
 			}
 			if versionedCount > 0 {

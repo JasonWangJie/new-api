@@ -65,6 +65,23 @@ const WAN_VIDEO_USAGE_SCHEMA = {
 };
 
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/metadata/input/img_url", "kind": "image"},
+    {"path": "/metadata/input/image_url", "kind": "image"},
+    {"path": "/metadata/input/first_frame_url", "kind": "image"},
+    {"path": "/metadata/input/last_frame_url", "kind": "image"},
+    {"path": "/metadata/input/audio_url", "kind": "audio"},
+    {"path": "/img_url", "kind": "image"},
+    {"path": "/image_url", "kind": "image"},
+    {"path": "/first_frame_url", "kind": "image"},
+    {"path": "/last_frame_url", "kind": "image"},
+    {"path": "/audio_url", "kind": "audio"},
+    {"path": "/media/*/url", "kind": "media"},
+    {"path": "/metadata/input/media/*/url", "kind": "media"},
+  ],
   apiVersion: 1,
   key: "alibaba",
   name: "Alibaba Bailian",
@@ -73,7 +90,7 @@ export const meta = {
     en: "Alibaba Cloud Bailian Wanxiang image and video generation",
     zh: "阿里云百炼万相图片与视频生成",
   },
-  version: "1.3.0",
+  version: "1.3.1",
   author: { name: "QuantumNous" },
   channelTypes: [17],
   // Literal metadata also supports the dashboard's static script preview.

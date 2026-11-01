@@ -776,6 +776,21 @@ export function extractUsageOnSubmit(){return {seconds:99};}
 }
 
 func TestAsyncVideoSubmissionRetryRequiresCompleteSupplierError(t *testing.T) {
+	for _, sample := range []struct {
+		status   int
+		body     string
+		rejected bool
+	}{
+		{400, `{"error":{"code":"new_provider_error","message":"reference material unavailable"}}`, true},
+		{422, `{"error":{"code":"content_policy_violation","message":"review rejected"}}`, true},
+		{400, `{"message":"submission unknown"}`, false},
+		{400, `{"message":"material unavailable","task_id":"accepted-job"}`, false},
+		{502, `{"message":"task submission result unknown"}`, false},
+		{408, `{"message":"request timed out"}`, false},
+		{409, `{"message":"operation already exists"}`, false},
+	} {
+		assert.Equal(t, sample.rejected, isConfirmedAsyncVideoSubmissionRejection(sample.status, []byte(sample.body)), sample.body)
+	}
 	service.InitHttpClient()
 	const generic = "生成失败，检查上传素材是否公网可达，是否输入了被允许的参数，是否侵犯了版权保护。"
 	const source = `

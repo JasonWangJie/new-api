@@ -1,4 +1,10 @@
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/metadata/image_urls/*", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "jimeng",
   name: "Jimeng",
@@ -7,7 +13,7 @@ export const meta = {
     en: "Volcengine Jimeng video generation (text-to-video, image-to-video, and first-and-last-frame)",
     zh: "火山引擎即梦视频生成（文生视频、图生视频、首尾帧）",
   },
-  version: "1.0.2",
+  version: "1.0.3",
   author: { name: "QuantumNous" },
   channelTypes: [51],
   models: ["jimeng_vgfm_t2v_l20"],

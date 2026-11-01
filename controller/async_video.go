@@ -17,6 +17,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -26,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -570,7 +572,7 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 }
 
 func ExecuteAsyncVideoReferenceRetry(ctx context.Context, job model.AsyncMediaJob, task model.Task, request service.AsyncVideoRequest) error {
-	if task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.AttemptGeneration != job.AttemptGeneration || job.ReferenceRetryCount != 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 {
+	if task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.AttemptGeneration != job.AttemptGeneration || job.ReferenceRetryCount < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 {
 		return errors.New("video reference recovery reservation is unavailable")
 	}
 	return executeAsyncVideoAttempt(ctx, job, request, &task)
@@ -671,12 +673,12 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			executionErr = err
 			return
 		}
-		policy, catalog, err := service.ResolveImagePolicy(ctx, token, job.Provider)
-		capability, selected := service.VideoPolicyCapability(catalog, job.Model)
-		if err != nil || policy.Group != job.Group && policy.Group != "auto" || !service.GroupInUserUsableGroups(common.GetContextKeyString(c, constant.ContextKeyUserGroup), job.Group) || policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !selected) {
-			executionErr = errors.New("video provider permission changed")
+		policy, catalog, err := service.ResolveVideoRetryPolicy(ctx, token, job)
+		if err != nil {
+			executionErr = err
 			return
 		}
+		capability, _ := service.VideoPolicyCapability(catalog, job.Model)
 		bindingIndex := slices.IndexFunc(endpoint.Candidates, func(binding pluginruntime.ProtocolBinding) bool {
 			return binding.Plugin != nil && binding.Plugin.Meta.Key == job.Provider && binding.Protocol == "openai_video"
 		})
@@ -723,6 +725,13 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		if retryTask != nil {
 			c.Set("async_media_reference_retry_task", *retryTask)
 			c.Set("async_media_before_dispatch", func(info *relaycommon.RelayInfo) error {
+				var liveToken model.Token
+				if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&liveToken).Error; err != nil {
+					return err
+				}
+				if _, _, err := service.ResolveVideoRetryPolicy(ctx, liveToken, job); err != nil {
+					return err
+				}
 				var active model.Task
 				if err := model.DB.WithContext(ctx).Where("id = ? AND attempt_generation = ? AND status = ?", retryTask.ID, retryTask.AttemptGeneration, model.TaskStatusQueued).Take(&active).Error; err != nil {
 					return err
@@ -737,18 +746,31 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				if slices.ContainsFunc(request.ReferenceInputs, func(input service.AsyncVideoReferenceInput) bool { return input.ObjectId != "" }) {
 					referenceMode = "local_download"
 				}
-				return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"reference_recovery_stage": "dispatched", "dispatched_at": time.Now().Unix()}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
+				decision, policyErr := service.RecheckVideoRecoveryPolicy(ctx, job, *retryTask, request)
+				if policyErr != nil {
+					return policyErr
+				}
+				if decision != nil && request.PendingDecision != nil && (decision.Revision != request.PendingDecision.Revision || decision.RuleID != request.PendingDecision.RuleID || decision.StepID != request.PendingDecision.StepID || decision.Action != request.PendingDecision.Action) {
+					return service.ErrVideoRetryDeferred
+				}
+				return model.DispatchAsyncVideoRecovery(ctx, job, *retryTask, decision, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
 			})
 			result, taskErr := relay.RelayTaskSubmit(c, info)
 			if taskErr != nil {
-				executionErr = fmt.Errorf("video recovery submission failed (HTTP %d, code %s)", taskErr.StatusCode, taskErr.Code)
+				if c.GetBool("async_media_submission_rejected") {
+					executionErr = &service.AsyncVideoReferenceRejectedError{Reason: c.GetString("async_media_submission_retry_reason")}
+				} else if errors.Is(taskErr.Error, service.ErrVideoRetryDeferred) {
+					executionErr = service.ErrVideoRetryDeferred
+				} else {
+					executionErr = fmt.Errorf("video recovery submission failed (HTTP %d, code %s)", taskErr.StatusCode, taskErr.Code)
+				}
 				return
 			}
 			if result != nil && result.Immediate != nil && result.Immediate.Status == model.TaskStatusFailure && result.UpstreamTaskID == "" && result.Immediate.Url == "" && result.Immediate.RemoteUrl == "" {
 				executionErr = &service.AsyncVideoReferenceRejectedError{Reason: service.VideoTaskFailureReason(result.Immediate.Reason)}
 				return
 			}
-			if result == nil || result.UpstreamTaskID == "" || result.Immediate != nil {
+			if result == nil || result.UpstreamTaskID == "" || result.Immediate != nil && result.Immediate.Status != model.TaskStatusSuccess {
 				executionErr = errors.New("video recovery receipt could not be confirmed")
 				return
 			}
@@ -756,26 +778,58 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			if result.UpstreamAsync != nil {
 				data = result.UpstreamAsyncResponse
 			}
-			won, commitErr := model.CommitAsyncVideoReferenceSubmission(context.WithoutCancel(ctx), job, *retryTask, result.UpstreamTaskID, data, result.PluginState)
+			won, commitErr := model.CommitAsyncVideoReferenceSubmission(context.WithoutCancel(ctx), job, *retryTask, result.UpstreamTaskID, data, result.PluginState, result.Immediate != nil && result.Immediate.Status == model.TaskStatusSuccess)
 			if commitErr != nil {
 				executionErr = commitErr
 			} else if !won {
 				executionErr = model.ErrImageConflict
+			} else if result.Immediate != nil && result.Immediate.Status == model.TaskStatusSuccess {
+				var completed model.Task
+				if err := model.DB.WithContext(context.WithoutCancel(ctx)).First(&completed, retryTask.ID).Error; err != nil {
+					executionErr = err
+					return
+				}
+				completed.Status, completed.Progress, completed.FinishTime = model.TaskStatusSuccess, "100%", time.Now().Unix()
+				completed.PrivateData.VideoTerminalConfirmed = true
+				completed.PrivateData.ResultURL = result.Immediate.Url
+				if completed.PrivateData.ResultURL == "" {
+					completed.PrivateData.ResultURL = result.Immediate.RemoteUrl
+				}
+				if _, err := service.CaptureAsyncMediaOutput(ctx, &completed); err != nil {
+					executionErr = err
+					return
+				}
+				completed.Data = service.RedactAsyncMediaData(completed.Data)
+				completed.PrivateData.PluginState = service.RedactAsyncMediaData(completed.PrivateData.PluginState)
+				_, executionErr = service.SettleTaskBillingOnComplete(context.WithoutCancel(ctx), nil, &completed, model.TaskStatusSubmitted, result.Immediate)
 			}
 			return
 		}
+		if request.InitialBillingChannelID == 0 {
+			request.InitialBillingChannelID = job.ChannelId
+		}
+		initialRetry := &asyncVideoSubmissionRetry{job: &job, request: &request, liveChannel: &liveChannel, startedAt: time.Now().Unix()}
+		cfg, cfgErr := service.GetImageRuntimeConfig(ctx)
+		if cfgErr != nil {
+			executionErr = cfgErr
+			return
+		}
+		if request.InitialRetryState == nil {
+			request.InitialRetryState = &mediaretry.State{TotalLimit: cfg.TotalRetries}
+		}
+		c.Set("async_media_initial_billing_channel_id", request.InitialBillingChannelID)
+		c.Set("async_media_initial_retry_request", &request)
 		c.Set("async_media_before_billing", func() error {
+			if info.Billing != nil {
+				return nil
+			}
 			return model.UpdateAsyncMediaJob(ctx, job, map[string]any{"billing_status": "reserving"})
 		})
 		c.Set("async_media_before_dispatch", func(info *relaycommon.RelayInfo) error {
-			referenceMode := ""
-			if details := request.RequestDetails(); details != nil && len(details.ReferenceMedia) > 0 {
-				referenceMode = "original"
-			}
-			return model.DispatchAsyncMediaJob(ctx, job, map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved"}, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
+			return initialRetry.dispatch(c, info)
 		})
 		_, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
-			return retryAsyncVideoSubmission(c, info, relay.RelayTaskSubmit)
+			return retryAsyncVideoSubmission(c, info, relay.RelayTaskSubmit, initialRetry)
 		})
 		if taskErr != nil {
 			cause := taskErr.Error
@@ -806,10 +860,306 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 	return nil
 }
 
+type asyncVideoSubmissionRetry struct {
+	job         *model.AsyncMediaJob
+	request     *service.AsyncVideoRequest
+	liveChannel *model.Channel
+	legacyUsed  bool
+	startedAt   int64
+	event       *model.MediaRetryEvent
+}
+
+// submit keeps a single billing session until an accepted receipt is persisted.
+// Only actual dispatch consumes a step; configuration changes during a wait
+// return to the same error fact and evaluate the current revision again.
+func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon.RelayInfo, submit taskSubmitAttempt) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
+	request, job := retry.request, retry.job
+	var result *relay.TaskSubmitResult
+	var taskErr *gatewaydto.TaskError
+	evaluateOnly := false
+	typedRejection := false
+	for changes := 0; changes < 32; {
+		if !evaluateOnly {
+			result, taskErr = submit(c, info)
+			typedRejection = taskErr == nil && result != nil && result.Immediate != nil && result.Immediate.Status == model.TaskStatusFailure && result.UpstreamTaskID == "" && result.Immediate.TaskID == "" && result.Immediate.Url == "" && result.Immediate.RemoteUrl == ""
+			if typedRejection {
+				// Only a driver's explicit typed terminal rejection authorizes
+				// this branch. Missing IDs or HTTP 200 alone never prove refusal.
+				c.Set("async_media_submission_rejected", true)
+				c.Set("async_media_retryable_submission_rejection", false)
+				c.Set("async_media_submission_retry_reason", result.Immediate.Reason)
+				taskErr = service.TaskErrorWrapper(errors.New(result.Immediate.Reason), "upstream_rejected", http.StatusOK)
+			}
+		}
+		if taskErr == nil {
+			return result, nil
+		}
+		deferred := errors.Is(taskErr.Error, service.ErrVideoRetryDeferred)
+		if !deferred && !evaluateOnly {
+			if taskErr.NoRetry {
+				return result, taskErr
+			}
+			message := taskErr.Message
+			if reason := c.GetString("async_media_submission_retry_reason"); reason != "" {
+				message = reason
+			}
+			if info.ApiKey != "" {
+				message = strings.ReplaceAll(message, info.ApiKey, "[redacted]")
+			}
+			deadline := job.ExpiresAt
+			if end, ok := c.Request.Context().Deadline(); ok && (deadline == 0 || end.Unix() < deadline) {
+				deadline = end.Unix()
+			}
+			fact := service.NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: info.ChannelId, Stage: "submit", HTTPStatus: taskErr.StatusCode, ErrorCode: taskErr.Code, Message: message, Category: "unclassified", Unknown: !c.GetBool("async_media_submission_rejected"), Terminal: c.GetBool("async_media_submission_rejected"), HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: deadline})
+			fact.VideoEvidence = &mediaretry.VideoFailureEvidence{LegacySubmissionRejected: c.GetBool("async_media_retryable_submission_rejection"), SubmissionStartedAt: retry.startedAt, LegacySubmissionUsed: retry.legacyUsed}
+			if fact.Unknown {
+				fact.Category = "execution_unknown"
+			}
+			request.RetryFact = &fact
+		} else if deferred {
+			changes++
+		}
+		evaluateOnly = false
+		decision, err := retry.decision(c.Request.Context())
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_policy_unavailable", http.StatusServiceUnavailable)
+		}
+		state := *request.InitialRetryState
+		state.Now = time.Now().Unix()
+		actionAttempt := state.TotalUsed + 1
+		for _, used := range state.RuleUses {
+			actionAttempt += used
+		}
+		event, err := model.NewMediaRetryEvent(job.TaskId, int64(actionAttempt), *request.RetryFact, decision, state)
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_event_failed", http.StatusInternalServerError)
+		}
+		if err := model.RecordMediaRetryEventTx(model.DB.WithContext(c.Request.Context()), event); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_event_failed", http.StatusServiceUnavailable)
+		}
+		retry.event = event
+		if !mediaretry.IsResubmission(decision.Action) || decision.BlockedReason != "" {
+			if typedRejection {
+				return result, nil
+			}
+			return result, taskErr
+		}
+		request.PendingDecision = &decision
+		if decision.DelaySeconds > 0 {
+			timer := time.NewTimer(time.Duration(decision.DelaySeconds) * time.Second)
+			select {
+			case <-c.Request.Context().Done():
+				timer.Stop()
+				return nil, service.TaskErrorWrapperLocal(c.Request.Context().Err(), "request_cancelled", http.StatusRequestTimeout)
+			case <-timer.C:
+			}
+		}
+		// Check again before downloads/channel selection and once more at send.
+		live, err := retry.decision(c.Request.Context())
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_policy_unavailable", http.StatusServiceUnavailable)
+		}
+		if live.Revision != decision.Revision || live.Action != decision.Action || live.RuleID != decision.RuleID || live.StepID != decision.StepID {
+			changes++
+			evaluateOnly = true
+			continue
+		}
+		if decision.Matched {
+			candidate, err := service.PickVideoRetryChannel(c.Request.Context(), *job, *request, info.UpstreamModelName)
+			if err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
+			}
+			request.Channel = *candidate
+			*retry.liveChannel = model.Channel{}
+			if err := model.DB.WithContext(c.Request.Context()).Where("id = ?", candidate.Id).Take(retry.liveChannel).Error; err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
+			}
+		}
+		local := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
+		if len(request.OriginalBody) == 0 {
+			request.OriginalBody = append([]byte(nil), request.Body...)
+		}
+		request.Body = append([]byte(nil), request.OriginalBody...)
+		request.LocalReferencesReady = false
+		if local {
+			prepared, err := service.PrepareAsyncVideoLocalReferences(c.Request.Context(), *job, *request)
+			if err != nil {
+				// This action ran, but sent no generation. Retain its step usage
+				// so the next failure decision advances the configured chain.
+				next := mediaretry.Consume(*request.InitialRetryState, decision)
+				next.TotalUsed = request.InitialRetryState.TotalUsed
+				snapshot := *request
+				snapshot.InitialRetryState = &next
+				encoded, marshalErr := common.Marshal(snapshot)
+				if marshalErr != nil {
+					return nil, service.TaskErrorWrapperLocal(marshalErr, "media_retry_state_failed", http.StatusInternalServerError)
+				}
+				cipher, encryptErr := service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+				if encryptErr != nil {
+					return nil, service.TaskErrorWrapperLocal(encryptErr, "media_retry_state_failed", http.StatusInternalServerError)
+				}
+				if saveErr := model.RecordAsyncVideoSubmissionPreparation(c.Request.Context(), *job, cipher, event); saveErr != nil {
+					return nil, service.TaskErrorWrapperLocal(saveErr, "media_retry_state_failed", http.StatusServiceUnavailable)
+				}
+				request.InitialRetryState, job.RequestCipher = &next, cipher
+				taskErr = service.TaskErrorWrapperLocal(err, "media_retry_input_unavailable", http.StatusBadRequest)
+				evaluateOnly = true
+				continue
+			}
+			*request = prepared
+		}
+		if apiErr := middleware.SetupContextForSelectedChannel(c, &request.Channel, job.Model); apiErr != nil {
+			return nil, service.TaskErrorWrapperLocal(apiErr, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
+		}
+		info.LockedChannel = &request.Channel
+		common.CleanupBodyStorage(c)
+		storage, err := common.CreateBodyStorage(request.Body)
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "read_request_body_failed", http.StatusBadRequest)
+		}
+		c.Set(common.KeyBodyStorage, storage)
+		c.Request.Body, c.Request.ContentLength = io.NopCloser(storage), int64(len(request.Body))
+		if local || strings.HasPrefix(request.ContentType, "application/json") {
+			var body map[string]any
+			if err := common.Unmarshal(request.Body, &body); err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "read_request_body_failed", http.StatusBadRequest)
+			}
+			if value, ok := c.Get(pluginruntime.ContextKeyProtocolRequest); ok {
+				protocol, valid := value.(pluginruntime.ProtocolRequestContext)
+				if !valid {
+					return nil, service.TaskErrorWrapperLocal(errors.New("video protocol context is unavailable"), "plugin_request_invalid", http.StatusBadRequest)
+				}
+				protocol.Body = map[string]any{"kind": "json", "value": body}
+				protocol.RequestBody = body
+				c.Set(pluginruntime.ContextKeyProtocolRequest, protocol)
+			}
+		}
+	}
+	return result, taskErr
+}
+
+func (retry *asyncVideoSubmissionRetry) decision(ctx context.Context) (mediaretry.Decision, error) {
+	policy, err := service.GetMediaRetryPolicy(ctx)
+	if err != nil {
+		return mediaretry.Decision{}, err
+	}
+	state := *retry.request.InitialRetryState
+	state.Now = time.Now().Unix()
+	return service.PlanInitialVideoFailure(policy, *retry.request.RetryFact, state)
+}
+
+func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycommon.RelayInfo) error {
+	ctx := c.Request.Context()
+	request, job := retry.request, retry.job
+	nextState := *request.InitialRetryState
+	var token model.Token
+	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
+		return err
+	}
+	if _, _, err := service.ResolveVideoRetryPolicy(ctx, token, *job); err != nil {
+		return err
+	}
+	if request.PendingDecision != nil {
+		plugin, exists := pluginruntime.DefaultRegistry.Get(job.Provider)
+		if !exists || plugin.Engine.SourceFingerprint() != request.PluginHash {
+			return errors.New("video provider changed before submission")
+		}
+		if err := validateMediaToken(ctx, token, request.ClientIP); err != nil {
+			return err
+		}
+		if token.ModelLimitsEnabled && !token.GetModelLimitsMap()[job.Model] {
+			return errors.New("video model permission changed")
+		}
+		live, err := retry.decision(ctx)
+		if err != nil {
+			return err
+		}
+		pending := request.PendingDecision
+		if live.Revision != pending.Revision || live.RuleID != pending.RuleID || live.StepID != pending.StepID || live.Action != pending.Action {
+			return service.ErrVideoRetryDeferred
+		}
+		if !mediaretry.IsResubmission(live.Action) || live.BlockedReason != "" {
+			return errors.New("video submission recovery is no longer allowed")
+		}
+		// Recheck current pool membership and credentials for the already
+		// selected destination; do not silently pick a new account at send.
+		selected := live
+		selected.AllowedChannelIDs = []int{request.Channel.Id}
+		check := *request
+		check.PendingDecision = &selected
+		candidates, err := service.VideoRetryCandidateChannels(ctx, *job, check, info.UpstreamModelName)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return service.ErrVideoCompatibleChannelsUnavailable
+		}
+		*retry.liveChannel = model.Channel{}
+		if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", request.Channel.Id, common.ChannelStatusEnabled).Take(retry.liveChannel).Error; err != nil {
+			return err
+		}
+		keyIndex := slices.Index(retry.liveChannel.GetKeys(), request.Channel.Key)
+		if keyIndex < 0 || retry.liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != 0 && retry.liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusEnabled {
+			return errors.New("selected video account is unavailable")
+		}
+		nextState = mediaretry.Consume(nextState, live)
+		if !live.Matched {
+			nextState.TotalUsed++
+		}
+	}
+	// The encrypted request and execution count cross the same lease/CAS
+	// barrier as dispatch. A recovered uncertain send cannot restart the loop.
+	snapshot := *request
+	snapshot.InitialRetryState = &nextState
+	if request.PendingDecision != nil && !request.PendingDecision.Matched && request.RetryFact != nil && request.RetryFact.VideoEvidence != nil {
+		fact, evidence := *request.RetryFact, *request.RetryFact.VideoEvidence
+		evidence.LegacySubmissionUsed = true
+		fact.VideoEvidence = &evidence
+		snapshot.RetryFact = &fact
+	}
+	encoded, err := common.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	cipher, err := service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	if err != nil {
+		return err
+	}
+	channelData, err := common.Marshal(request.Channel)
+	if err != nil {
+		return err
+	}
+	channelCipher, err := service.EncryptImagePayload(channelData, "media-channel:"+job.TaskId)
+	if err != nil {
+		return err
+	}
+	referenceMode := ""
+	if details := request.RequestDetails(); details != nil && len(details.ReferenceMedia) > 0 {
+		referenceMode = "original"
+	}
+	if request.LocalReferencesReady {
+		referenceMode = "local_download"
+	}
+	updates := map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved", "channel_id": request.Channel.Id, "request_cipher": cipher, "channel_cipher": channelCipher}
+	if err := model.DispatchAsyncMediaJob(ctx, *job, updates, slices.Index(retry.liveChannel.GetKeys(), request.Channel.Key), referenceMode, retry.event); err != nil {
+		return err
+	}
+	job.ChannelId, job.RequestCipher, job.ChannelCipher = request.Channel.Id, cipher, channelCipher
+	request.InitialRetryState = &nextState
+	request.RetryFact = snapshot.RetryFact
+	if request.PendingDecision != nil && !request.PendingDecision.Matched {
+		retry.legacyUsed = true
+	}
+	return nil
+}
+
 // retryAsyncVideoSubmission shares one billing session, account and body across
 // at most two submissions. The relay alone can classify a complete supplier
 // error as eligible; generic transport failures never grant a replay.
-func retryAsyncVideoSubmission(c *gin.Context, info *relaycommon.RelayInfo, submit taskSubmitAttempt) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
+func retryAsyncVideoSubmission(c *gin.Context, info *relaycommon.RelayInfo, submit taskSubmitAttempt, policies ...*asyncVideoSubmissionRetry) (*relay.TaskSubmitResult, *gatewaydto.TaskError) {
+	if len(policies) > 0 && policies[0] != nil {
+		return policies[0].submit(c, info, submit)
+	}
 	c.Set("async_media_retryable_submission_rejection", false)
 	result, taskErr := submit(c, info)
 	if taskErr == nil || taskErr.NoRetry || !c.GetBool("async_media_retryable_submission_rejection") {

@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -20,10 +21,12 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	globalsetting "github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -2463,13 +2466,235 @@ func TestAsyncVideoRequestDetails(t *testing.T) {
 	}
 }
 
+func setupVideoRetryTestDatabase(t *testing.T, user *model.User, token *model.Token) *gorm.DB {
+	t.Helper()
+	db := model.DB
+	if dialect := os.Getenv("RETRY_POLICY_TEST_DIALECT"); dialect != "" && dialect != "sqlite" {
+		previousDB, previousLogDB := model.DB, model.LOG_DB
+		previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+		_, isolatedDSN := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+		t.Setenv("SQL_DSN", isolatedDSN)
+		require.NoError(t, model.InitDB())
+		db = model.DB
+		model.LOG_DB = db
+		common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+		t.Cleanup(func() {
+			connection, _ := db.DB()
+			_ = connection.Close()
+			model.DB, model.LOG_DB = previousDB, previousLogDB
+			common.SetDatabaseTypes(previousType, previousLogType)
+		})
+		require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+		require.NoError(t, db.Create(user).Error)
+		require.NoError(t, db.Create(token).Error)
+	}
+	return db
+}
+
+func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
+	const modelName = "seedance2.0-E-720p"
+	for _, tc := range []struct {
+		name, action                              string
+		localFailure, unknown, legacy, revokeAuto bool
+	}{
+		{name: "same", action: mediaretry.SameChannel}, {name: "other", action: mediaretry.OtherChannel}, {name: "local same", action: mediaretry.LocalSameChannel}, {name: "local other", action: mediaretry.LocalOtherChannel},
+		{name: "local failure advances step without generating", action: mediaretry.LocalSameChannel, localFailure: true},
+		{name: "custom unknown cannot resend", action: mediaretry.OtherChannel, unknown: true},
+		{name: "captured legacy unknown replays once", action: mediaretry.SameChannel, unknown: true, legacy: true},
+		{name: "revoked automatic group blocks replacement", action: mediaretry.OtherChannel, revokeAuto: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			action := tc.action
+			user, token := setupResponsesWSRequestTest(t)
+			db := setupVideoRetryTestDatabase(t, user, token)
+			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaInputObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+			if tc.revokeAuto {
+				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "auto_groups": `["default"]`}).Error)
+				groups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+				previousGroups := groups.ReadAll()
+				t.Cleanup(func() { groups.Clear(); groups.AddAll(previousGroups) })
+				groups.Set(user.Group, map[string]string{"+:auto": "automatic routing"})
+			}
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "initial-retry:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{4}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "initial-retry")
+			previousRegistry := jsplugin.DefaultRegistry
+			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+			t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+			source, err := builtinplugins.Source("drama")
+			require.NoError(t, err)
+			plugin, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "drama"})
+			require.NoError(t, err)
+			var calls atomic.Int32
+			var credentials []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				credentials = append(credentials, r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) == 1 {
+					if tc.revokeAuto {
+						assert.NoError(t, db.Model(token).Update("auto_groups", `["removed-group"]`).Error)
+					}
+					if tc.unknown {
+						w.WriteHeader(502)
+						_, _ = w.Write([]byte(`{"message":"task submission state is unknown"}`))
+						return
+					}
+					w.WriteHeader(400)
+					_, _ = w.Write([]byte(`{"error":{"code":"reference_not_available","message":"reference material unavailable"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"accepted-after-recovery","status":"queued"}`))
+			}))
+			t.Cleanup(upstream.Close)
+			setting := `{"task_plugin_key":"drama"}`
+			channels := []model.Channel{{Type: constant.ChannelTypeTaskPlugin, Key: "first-key", BaseURL: &upstream.URL, Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}, {Type: constant.ChannelTypeTaskPlugin, Key: "second-key", BaseURL: &upstream.URL, Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}}
+			require.NoError(t, db.Create(&channels).Error)
+			for _, channel := range channels {
+				require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: modelName, Enabled: true}).Error)
+			}
+			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "reference", Name: "Reference recovery", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"material unavailable"}}, Steps: []mediaretry.Step{{ID: "recover", Action: action, MaxAttempts: 1}}}}}
+			if tc.localFailure {
+				policy.Rules[0].Steps = append(policy.Rules[0].Steps, mediaretry.Step{ID: "fallback", Action: mediaretry.OtherChannel, MaxAttempts: 1})
+			}
+			if tc.unknown && !tc.legacy {
+				policy.Rules[0].Match.ContainsAny = []string{"unknown"}
+			}
+			if tc.legacy {
+				require.NoError(t, model.InitializeMediaRetryPolicy(db))
+				policy.LegacyTimeoutEnabled = true
+			}
+			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, 0, user.Id, nil)
+			require.NoError(t, err)
+			now := time.Now().Unix()
+			job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channels[0].Id, Provider: "drama", Model: modelName, Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: "initial-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
+			require.NoError(t, db.Create(&job).Error)
+			body := []byte(`{"model":"seedance2.0-E-720p","prompt":"retry ordered references","seconds":8,"resolution":"720p","references":[{"type":"image","role":"reference","source":"data:image/png;base64,AAAA"}]}`)
+			request := service.AsyncVideoRequest{Body: body, ContentType: "application/json", ClientIP: "203.0.113.10", Channel: channels[0], PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version, APIVersion: 1}}, Billing: service.MediaBillingSnapshot{Price: types.PriceData{Quota: 100, QuotaToPreConsume: 100}}, ReferenceRecoveryVersion: 1, ReferenceRecoveryDeadline: now + 120, ReferenceURLExpiresAt: now + 3600, ReferenceInputs: []service.AsyncVideoReferenceInput{{Index: 0, Path: "/references/0/source", Kind: "image", Role: "reference", Source: "data:image/png;base64,AAAA"}}}
+			if tc.localFailure {
+				request.ReferenceRecoveryDeadline = now - 1
+			}
+			err = ExecuteAsyncVideo(t.Context(), job, request)
+			if tc.revokeAuto {
+				require.ErrorContains(t, err, "automatic group permission changed")
+				assert.EqualValues(t, 1, calls.Load(), "revoked group must not receive a replacement request")
+				require.NoError(t, db.Take(user, user.Id).Error)
+				assert.Equal(t, 1000, user.Quota, "explicit refusal refunds the single reservation")
+				return
+			}
+			if tc.unknown && !tc.legacy {
+				require.Error(t, err)
+				assert.EqualValues(t, 1, calls.Load())
+				require.NoError(t, db.Take(user, user.Id).Error)
+				assert.Equal(t, 1000, user.Quota)
+				var event model.MediaRetryEvent
+				require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&event).Error)
+				assert.False(t, event.Executed)
+				assert.Equal(t, mediaretry.ManualReview, event.Action)
+				return
+			}
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, calls.Load())
+			expectedChannel := channels[0]
+			if action == mediaretry.OtherChannel || action == mediaretry.LocalOtherChannel || tc.localFailure {
+				expectedChannel = channels[1]
+			}
+			assert.Equal(t, []string{"Bearer first-key", "Bearer " + expectedChannel.Key}, credentials)
+			var task model.Task
+			require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+			assert.Equal(t, expectedChannel.Id, task.ChannelId)
+			assert.Equal(t, channels[0].Id, task.BillingChannelID())
+			require.NotNil(t, task.PrivateData.MediaRetryState)
+			assert.Equal(t, 1, task.PrivateData.MediaRetryState.TotalUsed)
+			if !tc.legacy {
+				assert.Equal(t, 1, task.PrivateData.MediaRetryState.StepUses["reference/recover"])
+			}
+			if tc.localFailure {
+				assert.Equal(t, 1, task.PrivateData.MediaRetryState.StepUses["reference/fallback"])
+			}
+			require.NoError(t, db.Take(user, user.Id).Error)
+			require.NoError(t, db.Take(token, token.Id).Error)
+			assert.Equal(t, 900, user.Quota)
+			assert.Equal(t, 100, user.UsedQuota)
+			assert.Equal(t, 100, token.UsedQuota)
+			assert.Zero(t, token.RemainQuota)
+			for i := range channels {
+				require.NoError(t, db.Take(&channels[i], channels[i].Id).Error)
+			}
+			assert.EqualValues(t, 100, channels[0].UsedQuota)
+			assert.Zero(t, channels[1].UsedQuota)
+			var events []model.MediaRetryEvent
+			require.NoError(t, db.Where("task_id = ?", job.TaskId).Find(&events).Error)
+			if tc.localFailure {
+				require.Len(t, events, 2)
+			} else {
+				require.Len(t, events, 1)
+			}
+			assert.True(t, events[0].Executed)
+			var savedJob model.AsyncMediaJob
+			require.NoError(t, db.Take(&savedJob, job.ID).Error)
+			plain, err := service.DecryptImagePayload(savedJob.RequestCipher, "media-request:"+job.TaskId)
+			require.NoError(t, err)
+			var saved service.AsyncVideoRequest
+			require.NoError(t, common.Unmarshal(plain, &saved))
+			assert.Equal(t, 1, saved.InitialRetryState.TotalUsed)
+			assert.Equal(t, channels[0].Id, saved.InitialBillingChannelID)
+			if tc.legacy {
+				require.NotNil(t, saved.RetryFact.VideoEvidence)
+				assert.True(t, saved.RetryFact.VideoEvidence.LegacySubmissionUsed)
+				var originalFact mediaretry.Fact
+				require.NoError(t, common.UnmarshalJsonStr(events[0].FactJSON, &originalFact))
+				require.NotNil(t, originalFact.VideoEvidence)
+				assert.False(t, originalFact.VideoEvidence.LegacySubmissionUsed)
+				livePolicy, err := model.GetMediaRetryPolicy(t.Context())
+				require.NoError(t, err)
+				preview, err := service.PreviewInitialVideoFailure(t.Context(), job.TaskId, originalFact, mediaretry.State{Now: time.Now().Unix(), TotalLimit: 16}, livePolicy)
+				require.NoError(t, err)
+				assert.Empty(t, preview.Action, "historical sample cannot restore a consumed legacy replay")
+			}
+			if tc.name == "other" {
+				liveState, err := service.CurrentMediaRetryPreviewState(t.Context(), job.TaskId, "video", mediaretry.State{TotalLimit: 16})
+				require.NoError(t, err)
+				assert.Equal(t, 1, liveState.TotalUsed)
+				assert.Equal(t, 1, liveState.StepUses["reference/recover"], "historical preview must retain current usage")
+				var fact mediaretry.Fact
+				require.NoError(t, common.UnmarshalJsonStr(events[0].FactJSON, &fact))
+				currentDecision, err := mediaretry.Evaluate(policy, fact, liveState)
+				require.NoError(t, err)
+				assert.True(t, currentDecision.Exhausted)
+				task.PrivateData.VideoTerminalConfirmed = true
+				require.NoError(t, db.Model(&task).Update("private_data", task.PrivateData).Error)
+				multi := model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}
+				require.NoError(t, db.Model(&channels[1]).Updates(map[string]any{"key": "second-key\nthird-key", "channel_info": multi}).Error)
+				const guard = "retry-preview-no-writes"
+				denyWrite := func(tx *gorm.DB) { tx.AddError(errors.New("preview must not mutate database state")) }
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register(guard, denyWrite))
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register(guard, denyWrite))
+				require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(guard, denyWrite))
+				t.Cleanup(func() {
+					assert.NoError(t, db.Callback().Create().Remove(guard))
+					assert.NoError(t, db.Callback().Update().Remove(guard))
+					assert.NoError(t, db.Callback().Delete().Remove(guard))
+				})
+				eligibility, err := service.PreviewVideoRetryEligibility(t.Context(), job.TaskId, fact, mediaretry.Decision{Matched: true, Action: mediaretry.OtherChannel})
+				require.NoError(t, err)
+				assert.True(t, eligibility.Eligible, eligibility.Reason)
+				assert.Equal(t, []int{channels[1].Id}, eligibility.CandidateChannelIDs, "same/other uses the selected failure's channel")
+			}
+		})
+	}
+}
+
 func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 	for _, tc := range []struct {
 		name, changed, wantError string
 	}{
 		{name: "exhausted token reuses its original reservation"},
+		{name: "immediate output settles the original reservation", changed: "immediate"},
 		{name: "submit adjustment retains the actual original reservation", changed: "adjusted hold"},
 		{name: "current user group restrictions apply", changed: "group", wantError: "group permission changed"},
+		{name: "automatic group revocation blocks terminal recovery", changed: "auto group", wantError: "automatic group permission changed"},
+		{name: "invalid automatic group state fails closed", changed: "invalid auto group", wantError: "automatic group permission is invalid"},
+		{name: "global automatic group revocation blocks terminal recovery", changed: "global auto group", wantError: "automatic group permission changed"},
 		{name: "disabled token cannot resubmit", changed: "disabled token", wantError: "Token is unavailable"},
 		{name: "expired token cannot resubmit", changed: "expired token", wantError: "Token is unavailable"},
 		{name: "disabled owner cannot resubmit", changed: "disabled owner", wantError: "owner is unavailable"},
@@ -2482,7 +2707,7 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
-			db := model.DB
+			db := setupVideoRetryTestDatabase(t, user, token)
 			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"group": "vip", "quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"group": "default", "status": common.TokenStatusExhausted, "remain_quota": 0, "used_quota": 100}).Error)
@@ -2491,10 +2716,16 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 			groups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
 			previousGroups := groups.ReadAll()
 			t.Cleanup(func() { groups.Clear(); groups.AddAll(previousGroups) })
-			groups.Set("vip", map[string]string{})
+			groups.Set("vip", map[string]string{"+:auto": "automatic routing"})
 
 			source, err := builtinplugins.Source("drama")
 			require.NoError(t, err)
+			if tc.changed == "immediate" {
+				source = strings.Replace(source, "return { taskId, taskData: body, state: extractUsage(ctx) };", `return { taskId, taskData: body, state: extractUsage(ctx), immediate: { taskId, status: "SUCCESS", progress: "100%", url: "https://cdn.example/video.mp4" } };`, 1)
+				cfg := service.DefaultMediaRuntimeConfig()
+				cfg.LocalPath = t.TempDir()
+				require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+			}
 			previousRegistry := jsplugin.DefaultRegistry
 			jsplugin.DefaultRegistry = jsplugin.NewRegistry()
 			t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
@@ -2535,6 +2766,15 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 				request.Billing.Price.Quota, request.Billing.Price.QuotaToPreConsume = 80, 80
 			case "group":
 				groups.Set("vip", map[string]string{"-:default": "restricted"})
+			case "auto group":
+				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "auto_groups": `["removed-group"]`}).Error)
+			case "invalid auto group":
+				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "auto_groups": `invalid`}).Error)
+			case "global auto group":
+				previous := globalsetting.AutoGroups2JsonString()
+				t.Cleanup(func() { require.NoError(t, globalsetting.UpdateAutoGroupsByJsonString(previous)) })
+				require.NoError(t, globalsetting.UpdateAutoGroupsByJsonString(`[]`))
+				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "auto_groups": ""}).Error)
 			case "disabled token":
 				require.NoError(t, db.Model(token).Update("status", common.TokenStatusDisabled).Error)
 			case "expired token":
@@ -2572,7 +2812,15 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 			assert.Equal(t, 100, storedTask.Quota)
 			if tc.wantError == "" {
 				assert.Equal(t, "replacement-native-job", storedTask.PrivateData.UpstreamTaskID)
-				assert.EqualValues(t, model.TaskStatusSubmitted, storedTask.Status)
+				if tc.changed == "immediate" {
+					assert.EqualValues(t, model.TaskStatusSuccess, storedTask.Status)
+					assert.Equal(t, "https://cdn.example/video.mp4", storedTask.PrivateData.ResultURL)
+					assert.True(t, storedTask.PrivateData.VideoTerminalConfirmed)
+					require.NoError(t, db.Take(&job, job.ID).Error)
+					assert.NotEmpty(t, job.OutputObjectKey, "immediate output survives later artifact storage retries")
+				} else {
+					assert.EqualValues(t, model.TaskStatusSubmitted, storedTask.Status)
+				}
 			}
 			var tasks, logs int64
 			require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", task.TaskID).Count(&tasks).Error)

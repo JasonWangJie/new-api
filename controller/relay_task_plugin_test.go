@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +17,11 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
@@ -446,6 +451,90 @@ func TestAsyncVideoSubmissionRetryKeepsOneBillingLifecycle(t *testing.T) {
 				assert.Equal(t, 1, billing.refunds)
 				assert.Equal(t, []string{"refund"}, events)
 			}
+		})
+	}
+}
+
+func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, status, receipt, output string
+		calls                                 int
+	}{
+		{"typed same", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 2},
+		{"typed other", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "", 2},
+		{"unknown without receipt", mediaretry.OtherChannel, string(model.TaskStatusUnknown), "", "", 1},
+		{"receipt is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "original-receipt", "", 1},
+		{"output is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "https://media.example/result.mp4", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldLogs := common.LogConsumeEnabled
+			common.LogConsumeEnabled = false
+			t.Cleanup(func() { common.LogConsumeEnabled = oldLogs })
+			events := []string{}
+			db := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Token{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "typed-retry:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "typed-retry")
+			previousRegistry := pluginruntime.DefaultRegistry
+			pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+			t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+			source, err := builtinplugins.Source("drama")
+			require.NoError(t, err)
+			plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "drama"})
+			require.NoError(t, err)
+			user := model.User{Id: 1, Username: "typed-user", Group: "default", Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{Id: 1, UserId: 1, Key: "typed-token", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+			require.NoError(t, db.Create(&token).Error)
+			setting := `{"task_plugin_key":"drama"}`
+			channels := []model.Channel{{Id: 1, Type: constant.ChannelTypeTaskPlugin, Key: "first", Models: "seedance2.0-E-720p", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}, {Id: 2, Type: constant.ChannelTypeTaskPlugin, Key: "second", Models: "seedance2.0-E-720p", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}}
+			require.NoError(t, db.Create(&channels).Error)
+			for _, channel := range channels {
+				require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Model: channel.Models, Group: "default", Enabled: true}).Error)
+			}
+			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "typed", Name: "Typed failure", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"typed rejection"}}, Steps: []mediaretry.Step{{ID: "retry", Action: tc.action, MaxAttempts: 1}}}}}
+			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, 0, 1, nil)
+			require.NoError(t, err)
+			now := time.Now().Unix()
+			job := model.AsyncMediaJob{TaskId: "task_public", IdentityHash: "typed", UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: channels[0].Models, Group: "default", Status: "queued", LeaseToken: "lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 120}
+			require.NoError(t, db.Create(&job).Error)
+			request := service.AsyncVideoRequest{Body: []byte(`{}`), ContentType: "application/json", Channel: channels[0], PluginHash: plugin.Engine.SourceFingerprint(), InitialRetryState: &mediaretry.State{TotalLimit: 3}}
+			retry := &asyncVideoSubmissionRetry{job: &job, request: &request, liveChannel: &channels[0], startedAt: now}
+			c := taskSubmissionTestContext()
+			defer common.CleanupBodyStorage(c)
+			require.Nil(t, middleware.SetupContextForSelectedChannel(c, &request.Channel, job.Model))
+			c.Set("async_media_initial_billing_channel_id", 1)
+			c.Set("async_media_initial_retry_request", &request)
+			billing := &taskSubmissionTestBilling{events: &events}
+			info := taskSubmissionRelayInfo(billing)
+			info.OriginModelName = job.Model
+			info.UpstreamModelName = job.Model
+			info.TokenId = 1
+			events = nil
+			calls := 0
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+				return retryAsyncVideoSubmission(c, info, func(c *gin.Context, attempt *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					assert.Same(t, billing, attempt.Billing)
+					attempt.InitChannelMeta(c)
+					require.NoError(t, retry.dispatch(c, attempt))
+					calls++
+					if calls == 1 {
+						quota := 123
+						if tc.status == string(model.TaskStatusFailure) {
+							quota = 0
+						}
+						return &relay.TaskSubmitResult{Platform: "drama", Quota: quota, UpstreamTaskID: tc.receipt, Immediate: &relaycommon.TaskInfo{Status: tc.status, Reason: "typed rejection", Url: tc.output}}, nil
+					}
+					return &relay.TaskSubmitResult{Platform: "drama", Quota: 123, UpstreamTaskID: "accepted-retry"}, nil
+				}, retry)
+			})
+			require.Nil(t, taskErr)
+			require.NotNil(t, outcome)
+			assert.Equal(t, tc.calls, calls)
+			assert.Zero(t, billing.refunds)
+			assert.Equal(t, 1, outcome.Task.BillingChannelID())
+			assert.Equal(t, tc.calls-1, request.InitialRetryState.TotalUsed)
+			assert.Equal(t, 1, strings.Count(strings.Join(events, ","), "settle"))
 		})
 	}
 }

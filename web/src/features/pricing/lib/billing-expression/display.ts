@@ -319,6 +319,48 @@ export type TaskTier = {
   unitPrices: Record<string, number>
 }
 
+export type TaskVideoInputMultipliers = { none: number; video: number }
+
+/** Recognize only the model-wide reference-video factor emitted by the editor. */
+export function readTaskVideoInputMultiplier(node: ExpressionNode): {
+  base: ExpressionNode
+  multipliers: TaskVideoInputMultipliers
+} | null {
+  if (
+    node.kind !== 'binary' ||
+    node.operator !== '*' ||
+    node.right.kind !== 'conditional'
+  ) {
+    return null
+  }
+  const factor = node.right
+  const condition = factor.condition
+  if (
+    condition.kind !== 'binary' ||
+    condition.operator !== '==' ||
+    condition.left.kind !== 'call' ||
+    condition.left.name !== 'u' ||
+    condition.left.args.length !== 1 ||
+    condition.left.args[0].kind !== 'literal' ||
+    condition.left.args[0].value !== 'video_input' ||
+    condition.right.kind !== 'literal' ||
+    condition.right.value !== 'video'
+  ) {
+    return null
+  }
+  const video = nonnegativePriceLiteral(factor.yes)
+  const none = nonnegativePriceLiteral(factor.no)
+  if (
+    video === null ||
+    none === null ||
+    !Number.isFinite(video) ||
+    !Number.isFinite(none)
+  ) {
+    return null
+  }
+  return { base: node.left, multipliers: { none, video } }
+}
+
 function taskConditions(
   node: ExpressionNode,
   schema: BillingUsageSchema,

@@ -51,7 +51,7 @@ var mediaInputDataURIPattern = regexp.MustCompile(`^data:[^;,]+;base64,[A-Za-z0-
 // slots. Download completion order never changes media order, roles or prompts.
 func PrepareAsyncVideoLocalReferences(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest) (AsyncVideoRequest, error) {
 	now := time.Now().Unix()
-	if request.ReferenceRecoveryVersion != 1 || len(request.ReferenceInputs) == 0 || len(request.ReferenceInputs) > 64 || request.ReferenceRecoveryDeadline <= now || request.ReferenceURLExpiresAt <= now || request.ReferenceURLExpiresAt > job.ExpiresAt || request.ReferenceURLExpiresAt > job.CreatedAt+7*86400 {
+	if (request.ReferenceRecoveryVersion != 1 && request.ReferenceRecoveryVersion != 2) || len(request.ReferenceInputs) == 0 || len(request.ReferenceInputs) > 64 || request.ReferenceRecoveryDeadline <= now || request.ReferenceURLExpiresAt <= now || request.ReferenceURLExpiresAt > job.ExpiresAt || request.ReferenceURLExpiresAt > job.CreatedAt+7*86400 {
 		return request, ErrMediaInputUnavailable
 	}
 	var body map[string]any
@@ -59,11 +59,18 @@ func PrepareAsyncVideoLocalReferences(ctx context.Context, job model.AsyncMediaJ
 		return request, err
 	}
 	references, ok := body["references"].([]any)
-	if !ok || len(references) != len(request.ReferenceInputs) {
+	if request.ReferenceRecoveryVersion == 1 && (!ok || len(references) != len(request.ReferenceInputs)) {
 		return request, ErrMediaInputUnavailable
 	}
 	request.ReferenceInputs = append([]AsyncVideoReferenceInput(nil), request.ReferenceInputs...)
 	for index, input := range request.ReferenceInputs {
+		if request.ReferenceRecoveryVersion == 2 {
+			source, err := videoRetryReferenceValue(body, input.Path, nil)
+			if err != nil || input.Index != index || source != input.Source {
+				return request, ErrMediaInputUnavailable
+			}
+			continue
+		}
 		reference, ok := references[index].(map[string]any)
 		if !ok || input.Index != index || reference["type"] != input.Kind || reference["role"] != input.Role || reference["source"] != input.Source || input.Path != "/references/"+strconv.Itoa(index)+"/source" {
 			return request, ErrMediaInputUnavailable
@@ -144,10 +151,17 @@ func PrepareAsyncVideoLocalReferences(ctx context.Context, job model.AsyncMediaJ
 		if err != nil {
 			return request, err
 		}
-		references[index].(map[string]any)["source"] = link
+		if request.ReferenceRecoveryVersion == 2 {
+			if _, err := videoRetryReferenceValue(body, request.ReferenceInputs[index].Path, &link); err != nil {
+				return request, err
+			}
+		} else {
+			references[index].(map[string]any)["source"] = link
+		}
 		request.ReferenceInputs[index].ObjectId = object.ObjectId
 	}
 	request.Body, err = common.Marshal(body)
+	request.LocalReferencesReady = err == nil
 	return request, err
 }
 

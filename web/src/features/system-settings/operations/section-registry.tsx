@@ -1,3 +1,4 @@
+import { RetryPolicyCenter } from '@/features/images/retry-policy'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -144,6 +145,11 @@ const OPERATIONS_SECTIONS = [
     ),
   },
   { id: 'images', titleKey: 'Media Settings', build: () => <ImageSettings /> },
+  {
+    id: 'retry-policy',
+    titleKey: 'Error and retry rules',
+    build: () => <RetryPolicyCenter />,
+  },
 ] as const
 
 export type OperationsSectionId = (typeof OPERATIONS_SECTIONS)[number]['id']

@@ -105,6 +105,7 @@ type Meta struct {
 	UsageSchema          map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
 	UsageExamples        []UsageExample              `json:"usageExamples,omitempty"`
 	UsageProfiles        []UsageProfile              `json:"usageProfiles,omitempty"`
+	VideoRetryInputs     []VideoRetryInput           `json:"videoRetryInputs,omitempty"`
 	VideoProfiles        []VideoProfile              `json:"videoProfiles,omitempty"`
 	Auth                 AuthMeta                    `json:"auth"`
 }
@@ -937,6 +938,7 @@ func cloneMeta(meta Meta) Meta {
 		profile.Schema = CloneUsageSchema(profile.Schema)
 		profile.Examples = CloneUsageExamples(profile.Examples)
 	}
+	meta.VideoRetryInputs = slices.Clone(meta.VideoRetryInputs)
 	meta.VideoProfiles = append([]VideoProfile(nil), meta.VideoProfiles...)
 	for profileIndex := range meta.VideoProfiles {
 		meta.VideoProfiles[profileIndex] = CloneVideoProfile(meta.VideoProfiles[profileIndex])
@@ -1061,7 +1063,7 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	for field := range object {
 		switch field {
-		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "videoProfiles", "auth", "endpoints", "submitPaths", "actions":
+		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "videoProfiles", "videoRetryInputs", "auth", "endpoints", "submitPaths", "actions":
 		default:
 			return Meta{}, &UnknownMetaFieldError{Field: field}
 		}
@@ -1184,6 +1186,27 @@ func decodeMeta(value any) (Meta, error) {
 		meta.UsageProfiles, err = decodeUsageProfiles(usageProfiles)
 		if err != nil {
 			return Meta{}, err
+		}
+	}
+	if inputs, exists := object["videoRetryInputs"]; exists {
+		data, encodeErr := common.Marshal(inputs)
+		if encodeErr != nil {
+			return Meta{}, encodeErr
+		}
+		var selectors []map[string]any
+		if err := common.Unmarshal(data, &selectors); err != nil || selectors == nil {
+			return Meta{}, fmt.Errorf("videoRetryInputs must be an array")
+		}
+		for _, selector := range selectors {
+			if len(selector) != 2 {
+				return Meta{}, fmt.Errorf("videoRetryInputs accepts only path and kind")
+			}
+			path, pathOK := selector["path"].(string)
+			kind, kindOK := selector["kind"].(string)
+			if !pathOK || !kindOK {
+				return Meta{}, fmt.Errorf("videoRetryInputs requires string path and kind")
+			}
+			meta.VideoRetryInputs = append(meta.VideoRetryInputs, VideoRetryInput{Path: path, Kind: kind})
 		}
 	}
 	if videoProfiles, exists := object["videoProfiles"]; exists {
@@ -1482,6 +1505,14 @@ func normalizeV1Meta(meta *Meta) error {
 		}
 		if err := validateUsageExamples(profile.Schema, profile.Examples); err != nil {
 			return fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+		}
+	}
+	if err := ValidateVideoRetryInputs(meta.VideoRetryInputs); err != nil {
+		return err
+	}
+	if len(meta.VideoRetryInputs) > 0 {
+		if _, ok := protocols["openai_video"]; !ok {
+			return fmt.Errorf("videoRetryInputs requires openai_video")
 		}
 	}
 	if err := validateVideoProfiles(meta, models, protocols); err != nil {

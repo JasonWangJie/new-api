@@ -264,6 +264,7 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 				for _, attempt := range histories[task.TaskId] {
 					attempt = service.SanitizeAsyncImageAttempt(attempt)
 					history = append(history, gin.H{
+						"channel_id":               attempt.ChannelId,
 						"channel_name":             channelNames[attempt.ChannelId],
 						"key_index":                attempt.KeyIndex,
 						"started_at":               attempt.StartedAt,
@@ -313,12 +314,19 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	}
 	var decision service.ImageRetryDecision
 	if common.UnmarshalJsonStr(task.RetryDecision, &decision) == nil && decision.Version == 1 {
+		if !admin {
+			decision.Policy = nil
+		}
 		data["retry_decision"] = decision
 	}
 	if task.FinishedAt > 0 {
 		data["duration_ms"] = max(0, task.FinishedAt-task.CreatedAt) * 1000
 	}
 	if admin {
+		var checkpoint model.ImageRetryPolicyState
+		if task.RetryPolicyState != "" && common.UnmarshalJsonStr(task.RetryPolicyState, &checkpoint) == nil {
+			data["media_retry_decision"] = checkpoint.Decision
+		}
 		data["retained_request_available"] = task.FailedRequestRetainedAt(time.Now().Unix())
 		data["request_retain_until"] = task.RequestRetainUntil
 		data["user_id"] = task.UserId

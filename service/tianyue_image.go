@@ -437,7 +437,7 @@ func ReadTianyueImageReference(ctx context.Context, taskID, index, expires, keyI
 	if err != nil {
 		return ImageBytes{}, unavailable
 	}
-	image, _, err := ResolveImageReference(ctx, task.TokenId, request.Parts[part].URL, cfg)
+	image, err := ResolveAsyncImageInputPart(ctx, task.TokenId, request.Parts[part], cfg)
 	if err != nil {
 		return ImageBytes{}, unavailable
 	}

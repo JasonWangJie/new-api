@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -360,7 +362,7 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 func asyncVideoRecoveryFixture(t *testing.T) (*gorm.DB, Task, AsyncMediaJob) {
 	t.Helper()
 	db, image, _ := imageDatabaseFixture(t)
-	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaRetryEvent{}, &MediaInputObject{}))
 	require.NoError(t, db.Model(&User{}).Where("id = ?", image.UserId).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 	require.NoError(t, db.Model(&Token{}).Where("id = ?", image.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
 	require.NoError(t, db.Model(&Channel{}).Where("id = ?", image.ChannelId).Update("used_quota", 100).Error)
@@ -757,4 +759,92 @@ func TestAsyncVideoReferenceRecoveryQueuePhases(t *testing.T) {
 	claimed, err = ClaimAsyncMediaJob(t.Context(), &preparing, "current-phase-lease", 30)
 	require.NoError(t, err)
 	assert.True(t, claimed)
+}
+
+func TestAsyncVideoConfiguredRecoveryKeepsOriginalBillingAcrossAttempts(t *testing.T) {
+	db, task, job := asyncVideoRecoveryFixture(t)
+	original := task
+	replacement := Channel{Name: "recovery-channel", Type: 1, Key: "other-key", Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&replacement).Error)
+	task.Platform = "xai"
+	job.Provider = "xai"
+	require.NoError(t, db.Save(&task).Error)
+	require.NoError(t, db.Save(&job).Error)
+	for attempt := range 2 {
+		fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "terminal", Message: "temporary overload", Accepted: true, Terminal: true, HasUpstreamTask: true}
+		decision := mediaretry.Decision{Matched: true, Revision: int64(attempt + 1), RuleID: "busy", StepID: "replace", Action: mediaretry.OtherChannel, RequestedAction: mediaretry.OtherChannel}
+		state := mediaretry.State{TotalLimit: 16}
+		if task.PrivateData.MediaRetryState != nil {
+			state = *task.PrivateData.MediaRetryState
+		}
+		won, err := ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, fact.Message, false, AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: state, RequestCipher: []byte("next-request")})
+		require.NoError(t, err)
+		require.True(t, won)
+		require.NoError(t, db.First(&task, task.ID).Error)
+		require.NoError(t, db.First(&job, job.ID).Error)
+		claimed, err := ClaimAsyncMediaJob(t.Context(), &job, fmt.Sprintf("lease-%d", attempt), 60)
+		require.NoError(t, err)
+		require.True(t, claimed)
+		selected := task
+		selected.ChannelId = replacement.Id
+		selected.PrivateData.Key = "other-key"
+		require.NoError(t, SelectAsyncVideoRecoveryChannel(t.Context(), job, task, selected, []byte("selected-request"), []byte("selected-channel")))
+		task = selected
+		job.ChannelId = replacement.Id
+		require.NoError(t, DispatchAsyncVideoRecovery(t.Context(), job, task, &decision, 0, "original"))
+		assert.ErrorIs(t, DispatchAsyncVideoRecovery(t.Context(), job, task, &decision, 0, "original"), ErrTaskAttemptConflict, "a committed dispatch cannot be repeated")
+		won, err = CommitAsyncVideoReferenceSubmission(t.Context(), job, task, fmt.Sprintf("replacement-%d", attempt), nil, nil)
+		require.NoError(t, err)
+		require.True(t, won)
+		require.NoError(t, db.First(&task, task.ID).Error)
+		require.NoError(t, db.First(&job, job.ID).Error)
+		assert.Equal(t, original.ChannelId, task.BillingChannelID())
+		require.NotNil(t, task.PrivateData.MediaRetryState)
+		assert.Equal(t, attempt+1, task.PrivateData.MediaRetryState.TotalUsed)
+		assert.Equal(t, attempt+1, task.PrivateData.MediaRetryState.StepUses["busy/replace"], "revision changes never reset step use")
+	}
+	stale := original
+	stale.Status = TaskStatusFailure
+	won, _, err := SettleTaskBilling(t.Context(), &stale, original.Status, 0, nil, "")
+	require.NoError(t, err)
+	assert.False(t, won)
+	outputFact := mediaretry.Fact{MediaType: "video", Stage: "billing", HasOutput: true}
+	task.PrivateData.MediaRetryFact = &outputFact
+	require.NoError(t, db.Model(&task).Update("private_data", task.PrivateData).Error)
+	unknownFact := mediaretry.Fact{MediaType: "video", Stage: "poll", Unknown: true, HasUpstreamTask: true}
+	require.NoError(t, RecordAsyncVideoRetryDecision(t.Context(), task, job, unknownFact, mediaretry.Decision{}, *task.PrivateData.MediaRetryState, false))
+	require.NoError(t, db.First(&task, task.ID).Error)
+	assert.True(t, task.PrivateData.MediaRetryFact.HasOutput, "later query errors cannot erase confirmed output")
+	conflictingFailure := task
+	conflictingFailure.Status = TaskStatusFailure
+	won, _, err = SettleTaskBilling(t.Context(), &conflictingFailure, task.Status, 0, nil, "")
+	require.ErrorContains(t, err, "confirmed video output")
+	assert.False(t, won)
+	from := task.Status
+	task.Status = TaskStatusSuccess
+	task.PrivateData.VideoTerminalConfirmed = true
+	won, held, err := SettleTaskBilling(t.Context(), &task, from, 80, nil, "")
+	require.NoError(t, err)
+	require.True(t, won)
+	assert.Equal(t, 100, held)
+	var originalChannel, replacementChannel Channel
+	require.NoError(t, db.First(&originalChannel, original.ChannelId).Error)
+	require.NoError(t, db.First(&replacementChannel, replacement.Id).Error)
+	assert.EqualValues(t, 80, originalChannel.UsedQuota)
+	assert.Zero(t, replacementChannel.UsedQuota)
+	var owner User
+	require.NoError(t, db.First(&owner, task.UserId).Error)
+	assert.Equal(t, 920, owner.Quota)
+	assert.Equal(t, 1, owner.RequestCount)
+	var events []MediaRetryEvent
+	require.NoError(t, db.Where("task_id = ?", task.TaskID).Find(&events).Error)
+	require.Len(t, events, 3)
+	for _, event := range events {
+		assert.Equal(t, event.Stage != "poll", event.Executed)
+		if event.Executed {
+			assert.Equal(t, "succeeded", event.Outcome)
+		} else {
+			assert.Empty(t, event.Outcome)
+		}
+	}
 }

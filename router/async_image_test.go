@@ -344,6 +344,8 @@ func TestAsyncTaskStats(t *testing.T) {
 	})
 
 	t.Run("daylight saving boundaries", func(t *testing.T) {
+		dstUser := model.User{Username: "stats_dst", Status: common.UserStatusEnabled}
+		require.NoError(t, model.DB.Create(&dstUser).Error)
 		zone, err := time.LoadLocation("America/New_York")
 		require.NoError(t, err)
 		for _, day := range []string{"2026-03-08", "2026-11-01"} {
@@ -352,10 +354,10 @@ func TestAsyncTaskStats(t *testing.T) {
 			end := start.AddDate(0, 0, 1)
 			for i, created := range []int64{start.Unix() - 1, start.Unix(), end.Unix() - 1, end.Unix()} {
 				id := day + "-" + strconv.Itoa(i)
-				require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: id, UserId: user.Id, Status: model.ImageTaskSucceeded, CreatedAt: created}).Error)
-				require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: user.Id, Status: "succeeded", CreatedAt: created}).Error)
+				require.NoError(t, model.DB.Create(&model.AsyncImageTask{TaskId: id, UserId: dstUser.Id, Status: model.ImageTaskSucceeded, CreatedAt: created}).Error)
+				require.NoError(t, model.DB.Create(&model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: dstUser.Id, Status: "succeeded", CreatedAt: created}).Error)
 			}
-			stats, err := model.GetAsyncTaskStats(t.Context(), user.Id, "media", start.Add(12*time.Hour))
+			stats, err := model.GetAsyncTaskStats(t.Context(), dstUser.Id, "media", start.Add(12*time.Hour))
 			require.NoError(t, err)
 			assert.Equal(t, model.AsyncTaskStats{TodayRequests: 4, SuccessCount: 4}, stats)
 		}

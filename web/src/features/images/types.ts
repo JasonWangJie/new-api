@@ -118,6 +118,7 @@ export type ImageCapabilities = {
   }[]
 }
 export type ImageTask = {
+  media_retry_decision?: import('./retry-policy/types').RetryDecision
   failure_code?: number
   error_summary?: string
   error_summary_key?: string
@@ -178,6 +179,7 @@ export type ImageTask = {
   request_parameters?: Record<string, unknown>
   reconciliation_status?: string
   attempt_history?: {
+    channel_id?: number
     channel_name: string
     key_index?: number | null
     status?:
@@ -210,6 +212,7 @@ export type ImageTask = {
   can_terminate: boolean
 }
 export type ImageRetryDecision = {
+  policy?: import('./retry-policy/types').RetryDecision
   version: number
   stage: string
   action: string

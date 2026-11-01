@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -236,6 +237,27 @@ func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelI
 	now := time.Now().Unix()
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{"channel_id": channelId, "dispatched_at": now, "progress": 20, "version": task.Version + 1, "updated_at": now}
+		var checkpoint ImageRetryPolicyState
+		recordExecution := false
+		if task.RetryPolicyState != "" {
+			if err := common.UnmarshalJsonStr(task.RetryPolicyState, &checkpoint); err != nil {
+				return err
+			}
+			recordExecution = checkpoint.BuiltinPending || checkpoint.Pending && mediaretry.IsResubmission(checkpoint.Decision.Action)
+			if recordExecution {
+				if checkpoint.Pending {
+					checkpoint.State = mediaretry.Consume(checkpoint.State, checkpoint.Decision)
+				}
+				checkpoint.Pending = false
+				checkpoint.BuiltinPending = false
+				checkpoint.ReservedRetry = false
+				encoded, err := common.Marshal(checkpoint)
+				if err != nil {
+					return err
+				}
+				updates["retry_policy_state"] = string(encoded)
+			}
+		}
 		if task.Attempts != "" {
 			updates["attempts"] = task.Attempts
 		}
@@ -246,7 +268,40 @@ func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelI
 		if result.RowsAffected != 1 {
 			return ErrImageConflict
 		}
+		if recordExecution {
+			if err := MarkMediaRetryEventExecutedTx(tx, task.TaskId, checkpoint.Decision); err != nil {
+				return err
+			}
+		}
 		return tx.Create(&AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: "upstream_dispatched", Status: ImageTaskInvoking, CreatedAt: now}).Error
+	})
+}
+
+// StartImageRetryPolicyAction records a poll/download/billing attempt at its
+// execution boundary without consuming a generation resubmission allowance.
+func StartImageRetryPolicyAction(ctx context.Context, task AsyncImageTask) error {
+	var checkpoint ImageRetryPolicyState
+	if task.RetryPolicyState == "" {
+		return nil
+	}
+	if err := common.UnmarshalJsonStr(task.RetryPolicyState, &checkpoint); err != nil {
+		return err
+	}
+	if !checkpoint.Pending && !checkpoint.BuiltinPending || mediaretry.IsResubmission(checkpoint.Decision.Action) {
+		return nil
+	}
+	checkpoint.State = mediaretry.Consume(checkpoint.State, checkpoint.Decision)
+	checkpoint.Pending = false
+	checkpoint.BuiltinPending = false
+	encoded, err := common.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := transitionImageTaskTx(tx, task, map[string]any{"retry_policy_state": string(encoded)}, "retry_policy_action_started", "", ""); err != nil {
+			return err
+		}
+		return MarkMediaRetryEventExecutedTx(tx, task.TaskId, checkpoint.Decision)
 	})
 }
 
@@ -313,6 +368,11 @@ func CompleteAsyncImageTask(ctx context.Context, task AsyncImageTask, autoArchiv
 		event := AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: "completed", Status: ImageTaskSucceeded, CreatedAt: now}
 		if err := tx.Create(&event).Error; err != nil {
 			return err
+		}
+		if task.RetryPolicyState != "" {
+			if err := MarkMediaRetryTaskOutcomeTx(tx, task.TaskId, "succeeded"); err != nil {
+				return err
+			}
 		}
 		if autoArchive && task.ResultSource != ImageResultSourceUpstream {
 			return tx.Create(&ImageOutbox{EventKey: event.EventKey, Kind: "library_archive", AggregateId: task.TaskId, Status: "pending", CreatedAt: now, NextAttemptAt: now}).Error

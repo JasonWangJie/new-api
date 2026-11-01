@@ -25,7 +25,9 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/mewkiz/flac"
@@ -597,4 +599,60 @@ func mediaInputWebMFixture(audio bool) []byte {
 	tracks := element([]byte{0x16, 0x54, 0xae, 0x6b}, element([]byte{0xae}, track))
 	cluster := element([]byte{0x1f, 0x43, 0xb6, 0x75}, element([]byte{0xa3}, []byte{0x81, 0, 0, 0x80, 0xf8, 0xff, 0xfe}))
 	return append(header, element([]byte{0x18, 0x53, 0x80, 0x67}, append(tracks, cluster...))...)
+}
+
+func TestMediaInputDeclaredSlotsPreserveBodyAndReuseDownloadedFiles(t *testing.T) {
+	job, cfg, imageCfg := mediaInputFixture(t)
+	oldRegistry, oldTimeout := jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	constant.TaskTimeoutMinutes = 60
+	t.Cleanup(func() { jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes = oldRegistry, oldTimeout })
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "doubao", "plugin.js"))
+	require.NoError(t, err)
+	plugin, err := jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	body := []byte(`{"model":"doubao-seedance-2-0","prompt":"keep https://source.example.com/first.png literally","image":{"url":"https://source.example.com/first.png"},"reference_videos":[{"url":"https://source.example.com/source.mp4"}],"reference_audios":["https://source.example.com/source.wav"],"metadata":{"unrelated":"https://source.example.com/private"},"seed":0}`)
+	request := AsyncVideoRequest{Body: body, ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key, Version: plugin.Meta.Version}}}
+	require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, job.ExpiresAt))
+	require.Equal(t, 2, request.ReferenceRecoveryVersion)
+	require.Len(t, request.ReferenceInputs, 3)
+	var remaining atomic.Int64
+	remaining.Store(cfg.MaxFileBytes)
+	downloads := 0
+	for _, input := range request.ReferenceInputs {
+		payload := asyncImageBytesFixture(t).Data
+		if input.Kind == "video" {
+			payload = mediaTestMP4()
+		} else if input.Kind == "audio" {
+			payload = mediaInputPCMFixture(false)
+		}
+		client := &http.Client{Transport: mediaInputRoundTripper(func(req *http.Request) (*http.Response, error) {
+			downloads++
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Request: req}, nil
+		})}
+		_, err := downloadMediaInput(t.Context(), job, input, cfg, imageCfg, request.ReferenceURLExpiresAt, &remaining, client)
+		require.NoError(t, err)
+	}
+	prepared, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+	require.NoError(t, err)
+	assert.True(t, prepared.LocalReferencesReady)
+	var result map[string]any
+	require.NoError(t, common.Unmarshal(prepared.Body, &result))
+	assert.Equal(t, "keep https://source.example.com/first.png literally", result["prompt"])
+	assert.EqualValues(t, 0, result["seed"])
+	assert.Equal(t, "https://source.example.com/private", result["metadata"].(map[string]any)["unrelated"])
+	for _, input := range request.ReferenceInputs {
+		value, err := videoRetryReferenceValue(result, input.Path, nil)
+		require.NoError(t, err)
+		assert.Contains(t, value, "/api/media-inputs/")
+		assert.NotEqual(t, input.Source, value)
+	}
+	reused, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(prepared.Body), string(reused.Body))
+	assert.Equal(t, 3, downloads)
+	tampered := request
+	tampered.Body = bytes.Replace(body, []byte("first.png"), []byte("changed.png"), -1)
+	_, err = PrepareAsyncVideoLocalReferences(t.Context(), job, tampered)
+	assert.ErrorIs(t, err, ErrMediaInputUnavailable)
 }

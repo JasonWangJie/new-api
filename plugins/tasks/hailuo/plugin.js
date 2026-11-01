@@ -1,4 +1,17 @@
 export const meta = {
+  videoRetryInputs: [
+    {"path": "/image", "kind": "image"},
+    {"path": "/input_reference", "kind": "image"},
+    {"path": "/images/*", "kind": "image"},
+    {"path": "/metadata/first_frame_image", "kind": "image"},
+    {"path": "/metadata/last_frame_image", "kind": "image"},
+    {"path": "/metadata/content/*/image_url/url", "kind": "image"},
+    {"path": "/content/*/image_url/url", "kind": "image"},
+    {"path": "/metadata/subject_reference/*/image", "kind": "image"},
+    {"path": "/metadata/content/*/video_url/url", "kind": "video"},
+    {"path": "/content/*/video_url/url", "kind": "video"},
+    {"path": "/metadata/subject_reference/*/image/*", "kind": "image"},
+  ],
   apiVersion: 1,
   key: "hailuo",
   name: "Hailuo Video",
@@ -7,7 +20,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, and MiniMax-H3 multimodal reference)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、MiniMax-H3 多模态参考生视频）",
   },
-  version: "1.1.3",
+  version: "1.1.4",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
