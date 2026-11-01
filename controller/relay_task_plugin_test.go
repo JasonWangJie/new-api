@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -535,6 +536,134 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			assert.Equal(t, 1, outcome.Task.BillingChannelID())
 			assert.Equal(t, tc.calls-1, request.InitialRetryState.TotalUsed)
 			assert.Equal(t, 1, strings.Count(strings.Join(events, ","), "settle"))
+		})
+	}
+}
+
+func TestNLDWSubmissionReservationReconciliationDatabase(t *testing.T) {
+	baseUser, baseToken := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, baseUser, baseToken)
+	// The shared cross-database fixture inserts this unused seed with an
+	// explicit ID. Remove it so PostgreSQL can generate the first test token.
+	require.NoError(t, db.Unscoped().Delete(baseToken).Error)
+	require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "nldw-submit:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "nldw-submit")
+	previousRegistry := pluginruntime.DefaultRegistry
+	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	source, err := builtinplugins.Source("nldw")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "nldw"})
+	require.NoError(t, err)
+	previousSubmit := service.SubmitAsyncVideoFunc
+	service.SubmitAsyncVideoFunc = ExecuteAsyncVideo
+	t.Cleanup(func() { service.SubmitAsyncVideoFunc = previousSubmit })
+	previousLogs, previousBatch := common.LogConsumeEnabled, common.BatchUpdateEnabled
+	common.LogConsumeEnabled, common.BatchUpdateEnabled = false, false
+	t.Cleanup(func() { common.LogConsumeEnabled, common.BatchUpdateEnabled = previousLogs, previousBatch })
+	for index, tc := range []struct {
+		name, body                           string
+		httpStatus                           int
+		lostReceipt, beforeSend, insertFails bool
+		wantCalls, wantWallet                int
+		wantStatus, wantBilling              string
+	}{
+		{name: "accepted", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "submitted", wantBilling: "reserved"},
+		{name: "receipt lost after acceptance", lostReceipt: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
+		{name: "receipt has no id", body: `{"status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
+		{name: "temporary upstream failure", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
+		{name: "explicit refusal", body: `{"error":{"code":"invalid_request","message":"unsupported prompt"}}`, httpStatus: 400, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+		{name: "dispatch barrier rejected", beforeSend: true, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+		{name: "accepted receipt cannot persist", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, insertFails: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := model.User{Username: fmt.Sprintf("nldw-submission-%d", index), AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
+			require.NoError(t, db.Create(&token).Error)
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				assert.Equal(t, "/v1/videos", r.URL.Path)
+				assert.Equal(t, "Bearer upstream-test-key", r.Header.Get("Authorization"))
+				assert.NotEmpty(t, r.Header.Get("Idempotency-Key"))
+				_, readErr := io.Copy(io.Discard, r.Body)
+				assert.NoError(t, readErr)
+				if tc.lostReceipt {
+					connection, _, hijackErr := w.(http.Hijacker).Hijack()
+					if assert.NoError(t, hijackErr) {
+						assert.NoError(t, connection.Close())
+					}
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.httpStatus)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(upstream.Close)
+			setting := `{"task_plugin_key":"nldw"}`
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "NLDW fixture", Key: "upstream-test-key", BaseURL: &upstream.URL, Models: "sd2.5pp", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: "sd2.5pp", Enabled: true}).Error)
+			now := time.Now().Unix()
+			job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: "nldw", Model: "sd2.5pp", Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: "nldw-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
+			request := service.AsyncVideoRequest{Body: []byte(`{"model":"sd2.5pp","prompt":"test generation","seconds":5,"resolution":"720p"}`), ContentType: "application/json", ClientIP: "203.0.113.10", Channel: channel, PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "nldw", Version: plugin.Meta.Version, APIVersion: 1}}, Billing: service.MediaBillingSnapshot{Price: types.PriceData{Quota: 100, QuotaToPreConsume: 100}}}
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			job.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&job).Error)
+			if tc.beforeSend {
+				const callback = "nldw-dispatch-rejected"
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+					updates, ok := tx.Statement.Dest.(map[string]any)
+					if ok && updates["dispatched_at"] != nil {
+						tx.AddError(errors.New("dispatch barrier rejected"))
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callback)) })
+			}
+			if tc.insertFails {
+				const callback = "nldw-task-insert-rejected"
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+					if _, ok := tx.Statement.Dest.(*model.Task); ok {
+						tx.AddError(errors.New("task persistence unavailable"))
+					}
+				}))
+				t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callback)) })
+			}
+			err = service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig())
+			if tc.name == "accepted" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			require.NoError(t, db.First(&job, job.ID).Error)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			assert.EqualValues(t, tc.wantCalls, calls.Load())
+			assert.Equal(t, tc.wantWallet, user.Quota)
+			assert.Equal(t, tc.wantWallet-900, token.RemainQuota)
+			assert.Equal(t, tc.wantStatus, job.Status)
+			assert.Equal(t, tc.wantBilling, job.BillingStatus)
+			if tc.wantBilling == "unknown" {
+				assert.Equal(t, 100, job.Quota)
+				assert.NotEmpty(t, job.ChannelCipher)
+				plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				var frozen service.AsyncVideoRequest
+				require.NoError(t, common.Unmarshal(plain, &frozen))
+				assert.Equal(t, request.Body, frozen.Body)
+				viewContext := taskSubmissionTestContext()
+				view, _, err := videoJobView(viewContext, job, true)
+				require.NoError(t, err)
+				assert.Equal(t, true, view["can_terminate"], "administrators can reconcile and end this retained operation")
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
+				require.NoError(t, db.First(&job, job.ID).Error)
+				assert.Equal(t, "execution_unknown", job.Status)
+				assert.EqualValues(t, 1, calls.Load(), "reprocessing unknown execution must not generate again")
+			}
 		})
 	}
 }
