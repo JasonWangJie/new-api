@@ -195,8 +195,9 @@ func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, au
 	return job, err
 }
 
-// ReconcileAgedAsyncMediaReservation preserves the existing administrator
-// recovery path for an unconfirmed replacement of a durably reserved task.
+// ReconcileAgedAsyncMediaReservation authorizes one refund only after the
+// administrator explicitly verifies the unknown upstream operation. Initial
+// and replacement submissions share the same durable accounting boundary.
 func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, error) {
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task Task
@@ -208,15 +209,35 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 			return err
 		}
 		policyStopped := current.ReferenceRecoveryStage == "policy_stopped_unknown"
-		if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" && !policyStopped || current.BillingStatus != "unknown" || !policyStopped && current.ReferenceRetryCount != 1 ||
-			current.AttemptGeneration != task.AttemptGeneration || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TokenId != task.PrivateData.TokenId ||
-			task.Status != TaskStatusFailure || task.Quota <= 0 || task.Quota != current.Quota || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || !policyStopped && task.PrivateData.UpstreamTaskID != "" {
+		unknownExecution := current.Status == "execution_unknown" && (current.ReferenceRecoveryStage == "unknown" || current.ReferenceRecoveryStage == "manual")
+		if unknownExecution {
+			if task.Status != TaskStatusUnknown || current.LeaseExpiresAt > time.Now().Unix() {
+				return ErrImageConflict
+			}
+		} else if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" && !policyStopped || !policyStopped && current.ReferenceRetryCount != 1 || task.Status != TaskStatusFailure || !policyStopped && task.PrivateData.UpstreamTaskID != "" {
 			return ErrImageConflict
 		}
-		if err := tx.Model(&Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, TaskStatusFailure, task.AttemptGeneration).Update("status", TaskStatusUnknown).Error; err != nil {
+		if current.BillingStatus != "unknown" && !(unknownExecution && current.BillingStatus == "reserved") ||
+			current.AttemptGeneration != job.AttemptGeneration || current.AttemptGeneration != task.AttemptGeneration || current.TaskId != job.TaskId || current.UserId != job.UserId || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TokenId != task.PrivateData.TokenId ||
+			!task.VideoRecoveryQuotaValid() || task.Quota != current.Quota || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded ||
+			task.PrivateData.ResultURL != "" || task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.HasOutput || current.OutputObjectKey != "" || current.ArtifactKeys != "" {
+			return ErrImageConflict
+		}
+		generation := task.AttemptGeneration
+		if unknownExecution {
+			if generation == math.MaxInt64 {
+				return ErrTaskAttemptConflict
+			}
+			generation++
+		}
+		if err := tx.Model(&Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, task.Status, task.AttemptGeneration).Updates(map[string]any{"status": TaskStatusUnknown, "attempt_generation": generation}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID).Updates(map[string]any{"billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0}).Error; err != nil {
+		changes := map[string]any{"status": "failed", "attempt_generation": generation, "billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0}
+		if unknownExecution {
+			changes["error_message"] = job.ErrorMessage
+		}
+		if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID).Updates(changes).Error; err != nil {
 			return err
 		}
 		if err := tx.Where("id = ?", current.ID).Take(&job).Error; err != nil {

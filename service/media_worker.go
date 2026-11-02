@@ -493,7 +493,7 @@ func FailOverdueAsyncMediaJobs(ctx context.Context, limit int) error {
 	now := time.Now().Unix()
 	var jobs []model.AsyncMediaJob
 	query := model.ExcludePendingSubmissionReconciliation(model.DB.WithContext(ctx)).
-		Where("created_at > 0 AND created_at <= ?", now-model.AsyncMediaMaxTaskAgeSeconds).
+		Where("created_at > 0 AND (created_at <= ? OR (status = ? AND reference_recovery_stage = ?))", now-model.AsyncMediaMaxTaskAgeSeconds, "failed", "age_limit_refund").
 		Where("NOT (status = ? AND EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status NOT IN ?))", "reconciling", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure}).
 		Where("COALESCE(lease_token, '') NOT LIKE ? OR COALESCE(lease_expires_at, 0) <= ?", asyncMediaAgeRetryLeasePrefix+"%", now).
 		Where("status NOT IN ? OR (status = ? AND reference_recovery_stage = ? AND next_attempt_at <= ?)", []string{"failed", "succeeded"}, "failed", "age_limit_refund", now).
@@ -583,5 +583,5 @@ func completeAsyncMediaAgeRefund(ctx context.Context, job model.AsyncMediaJob) e
 	}
 	query := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
 		Where("id = ? AND status = ? AND attempt_generation = ? AND reference_recovery_stage = ?", job.ID, "failed", job.AttemptGeneration, "age_limit_refund")
-	return model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": "refunded", "quota": 0, "reference_recovery_stage": "age_limit_complete", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0}, "")
+	return model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": "refunded", "quota": 0, "reference_recovery_stage": "age_limit_complete", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "channel_cipher": nil}, "")
 }

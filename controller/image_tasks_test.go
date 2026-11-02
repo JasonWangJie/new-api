@@ -3254,7 +3254,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
-			db := model.DB
+			db := setupVideoRetryTestDatabase(t, user, token)
 			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"remain_quota": 0, "used_quota": 100}).Error)
@@ -3288,7 +3288,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 				assert.EqualValues(t, model.TaskStatusFailure, storedTask.Status)
 				assert.Equal(t, "failed", storedJob.Status)
 				assert.Equal(t, "refunded", storedJob.BillingStatus)
-				assert.Equal(t, "complete", storedJob.ReferenceRecoveryStage)
+				assert.Equal(t, "age_limit_complete", storedJob.ReferenceRecoveryStage)
 				assert.Empty(t, storedJob.RequestCipher)
 				repeated := httptest.NewRecorder()
 				repeatContext, _ := gin.CreateTestContext(repeated)

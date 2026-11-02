@@ -29,7 +29,7 @@ export const meta = {
     en: "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本",
   },
-  version: "1.0.5",
+  version: "1.0.6",
   author: { name: "QuantumNous" },
   channelTypes: [24],
   models: [...MODELS_30, ...MODELS_31],
@@ -137,6 +137,12 @@ function aspectForSize(size) {
 }
 
 function imageInput(value, files) {
+  if (value && typeof value === "object" && !Array.isArray(value) && !value.__fileRef) {
+    for (const field of ["url", "image_url"]) {
+      if (Object.prototype.hasOwnProperty.call(value, field)) return imageInput(value[field], files);
+    }
+    return null;
+  }
   if (value && typeof value === "object" && !Array.isArray(value) && value.__fileRef) {
     let mime = value.mimeType || "";
     if (!mime && files) {
@@ -201,7 +207,9 @@ function converted(ctx) {
   const req = ctx.requestBody || {};
   const params = videoParameters(req, ctx.upstreamModel || ctx.model);
   const instance = { prompt: req.prompt };
-  const image = imageInput((req.images || [])[0] || req.image || req.input_reference, ctx.files);
+  const reference = (req.images || [])[0] ?? req.image ?? req.input_reference;
+  const image = imageInput(reference, ctx.files);
+  if (reference !== undefined && reference !== null && !image) throw new Error("input image must be a data URL or base64 value");
   if (image) instance.image = image;
   return { body: { instances: [instance], parameters: params }, action: image ? "image_to_video" : "text_to_video" };
 }
@@ -417,6 +425,9 @@ protocols.openai_video = {
     if (inputReferenceFile) {
       req.images = [{ __fileRef: inputReferenceFile.ref, encoding: "base64", maxBytes: 20971520 }];
     }
+    const reference = (req.images || [])[0] ?? req.image ?? req.input_reference;
+    if (reference !== undefined && reference !== null && !imageInput(reference, ctx.body.files))
+      throw new Error("input image must be a data URL or base64 value");
     return {
       kind: "submit",
       model: ctx.model,

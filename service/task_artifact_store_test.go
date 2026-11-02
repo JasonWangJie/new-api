@@ -1022,6 +1022,60 @@ func TestTerminalVideoBuiltInPlanRequiresRecordedEvidence(t *testing.T) {
 	}
 }
 
+func TestMixedVideoStopPausesPollingAndFencesStaleResults(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}))
+	t.Cleanup(func() {
+		assert.NoError(t, model.DB.Where("1 = 1").Delete(&model.Option{}).Error)
+		assert.NoError(t, model.DB.Where("1 = 1").Delete(&model.MediaRetryPolicyVersion{}).Error)
+	})
+	seedUser(t, 1, 900)
+	seedToken(t, 1, 1, "mixed-stop-token", 900)
+	seedChannel(t, 1)
+	seedChargedAccounting(t, 1, 1, 1, 100, 1)
+	task := makeTask(1, 1, 100, 1, "wallet", 0)
+	task.TaskID, task.Platform = "task-mixed-stop", "mixed-provider"
+	task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
+	task.PrivateData.UpstreamTaskID = "native-still-running"
+	task.PrivateData.CurrentAttempt = &model.VideoTaskAttempt{MixedVideo: true, ChannelID: 1, PluginKey: "mixed-provider"}
+	require.NoError(t, model.DB.Create(task).Error)
+	stale := *task
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: ImageIdentityHash(task.TaskID), UserId: 1, TokenId: 1, ChannelId: 1, Provider: "mixed-provider", Model: "test-model", Group: "default", Status: "submitted", BillingStatus: "reserved", Quota: 100, CreatedAt: now, ExpiresAt: now + 3600, DispatchedAt: now}
+	require.NoError(t, model.DB.Create(&job).Error)
+	policy, err := model.GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	policy.Rules = []mediaretry.Rule{{ID: "stop-unknown", Name: "Stop unknown", Enabled: true, OnExhausted: mediaretry.Stop, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"busy"}}, Steps: []mediaretry.Step{{ID: "stop", Action: mediaretry.Stop, MaxAttempts: 1}}}}
+	_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
+	require.NoError(t, err)
+	_, err = videoPollingDecision(t.Context(), task, "server busy", 503, false)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, "execution_unknown", job.Status)
+	assert.Equal(t, "unknown", job.BillingStatus)
+	assert.Equal(t, 100, task.Quota)
+	generation := task.AttemptGeneration
+	ready, err := asyncVideoPollReady(t.Context(), task)
+	require.NoError(t, err)
+	assert.False(t, ready, "Stop keeps the mixed operation paused for explicit reconciliation")
+	_, err = videoPollingDecision(t.Context(), task, "server busy", 503, false)
+	require.NoError(t, err)
+	assert.Equal(t, generation, task.AttemptGeneration, "a repeated stop does not create another generation")
+	fromStatus := stale.Status
+	stale.Status = model.TaskStatusSuccess
+	won, _, err := model.SettleTaskBilling(t.Context(), &stale, fromStatus, 100, nil, "")
+	require.NoError(t, err)
+	assert.False(t, won, "the stopped generation cannot publish a late upstream success")
+	require.NoError(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	assert.Equal(t, "failed", job.Status)
+	assert.Equal(t, "refunded", job.BillingStatus)
+	var owner model.User
+	require.NoError(t, model.DB.First(&owner, 1).Error)
+	assert.Equal(t, 1000, owner.Quota, "explicit reconciliation also handles a retained native task ID")
+	assert.Error(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
+}
+
 func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 	for _, tc := range []struct {
 		name, response, parsedURL            string

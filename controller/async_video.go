@@ -881,6 +881,7 @@ type asyncVideoSubmissionRetry struct {
 	legacyUsed  bool
 	startedAt   int64
 	event       *model.MediaRetryEvent
+	dispatched  bool
 }
 
 // submit keeps a single billing session until an accepted receipt is persisted.
@@ -894,6 +895,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 	typedRejection := false
 	for changes := 0; changes < 32; {
 		if !evaluateOnly {
+			retry.dispatched = false
 			if service.VideoSubmissionRequiresReconciliation(job.Provider, request.MixedRouting != nil) {
 				// A prior confirmed rejection may allow another attempt. Only a
 				// successful dispatch barrier for this attempt can retain its hold.
@@ -914,6 +916,12 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			return result, nil
 		}
 		deferred := errors.Is(taskErr.Error, service.ErrVideoRetryDeferred)
+		if !deferred && taskErr.LocalError && !retry.dispatched {
+			// A local validation or dispatch-barrier failure never reached the
+			// provider. Keep any earlier unknown attempts, but do not invent a
+			// new uncertain operation or consume an upstream retry for this one.
+			return result, taskErr
+		}
 		if !deferred && !evaluateOnly {
 			message := taskErr.Message
 			if reason := c.GetString("async_media_submission_retry_reason"); reason != "" {
@@ -926,7 +934,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			if end, ok := c.Request.Context().Deadline(); ok && (deadline == 0 || end.Unix() < deadline) {
 				deadline = end.Unix()
 			}
-			fact := service.NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: info.ChannelId, Stage: "submit", HTTPStatus: taskErr.StatusCode, ErrorCode: taskErr.Code, Message: message, Category: "unclassified", Unknown: !c.GetBool("async_media_submission_rejected"), Terminal: c.GetBool("async_media_submission_rejected"), HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: deadline})
+			fact := service.NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: info.ChannelId, Stage: "submit", HTTPStatus: taskErr.StatusCode, ErrorCode: taskErr.Code, Message: message, Category: "unclassified", Unknown: retry.dispatched && !c.GetBool("async_media_submission_rejected"), Terminal: c.GetBool("async_media_submission_rejected"), HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: deadline})
 			fact.VideoEvidence = &mediaretry.VideoFailureEvidence{LegacySubmissionRejected: c.GetBool("async_media_retryable_submission_rejection"), SubmissionStartedAt: retry.startedAt, LegacySubmissionUsed: retry.legacyUsed}
 			if fact.Unknown {
 				fact.Category = "execution_unknown"
@@ -979,7 +987,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		if taskErr.NoRetry && !decision.Matched {
 			return result, taskErr
 		}
-		if request.RetryFact.Unknown && !slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
+		if retry.dispatched && request.RetryFact.Unknown && !slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
 			return attempt.Generation == int64(state.TotalUsed) && attempt.ChannelID == request.RetryFact.ChannelID
 		}) {
 			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID, Decision: &decision, Generation: int64(state.TotalUsed), Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message, StartedAt: job.DispatchedAt, FinishedAt: time.Now().Unix()})
@@ -1227,6 +1235,7 @@ func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycomm
 	if err := model.DispatchAsyncMediaJob(ctx, *job, updates, slices.Index(retry.liveChannel.GetKeys(), request.Channel.Key), referenceMode, retry.event); err != nil {
 		return err
 	}
+	retry.dispatched = true
 	if service.VideoSubmissionRequiresReconciliation(job.Provider, request.MixedRouting != nil) {
 		c.Set("async_media_reconciliation_dispatched", true)
 	}

@@ -393,6 +393,14 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 			return candidate, err
 		}
 		if normalizedBody, ok := normalized.(map[string]any); ok {
+			if binding.Plugin.Meta.Key == "sora" {
+				// Sora's larger native sizes have no equivalent public resolution;
+				// generic pixel bucketing would incorrectly price them as 720p.
+				size, _ := normalizedBody["size"].(string)
+				if size != "1280x720" && size != "720x1280" {
+					return candidate, errors.New("Sora mixed routing requires a 1280x720 or 720x1280 output size")
+				}
+			}
 			if !maps.Equal(videoMediaInventory(body, view.Files), videoMediaInventory(normalizedBody, view.Files)) {
 				return candidate, errors.New("video decoder changed the input media identities or counts")
 			}

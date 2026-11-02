@@ -1,3 +1,11 @@
+const VIDEO_DIMENSIONS = {
+  duration: { values: [4, 8, 12], default: 4 },
+  resolutions: ["720p"],
+  defaultResolution: "720p",
+  aspectRatios: ["16:9", "9:16"],
+  defaultAspectRatio: "9:16",
+};
+
 export const meta = {
   videoRetryInputs: [
     {"path": "/image", "kind": "image"},
@@ -12,10 +20,19 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.0.6",
+  version: "1.0.7",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
+  // The historical native API also accepts 1024x1792 / 1792x1024 through
+  // explicit size. Neither is a public 1080p capability or a 720p alias.
+  videoProfiles: [{
+    models: ["sora-2", "sora-2-pro"],
+    modes: [
+      { name: "text_to_video", ...VIDEO_DIMENSIONS },
+      { name: "image_to_video", ...VIDEO_DIMENSIONS, inputs: [{ name: "image", kind: "image", sources: ["url", "data_uri", "file_id", "upload"], maxItems: 1, required: true }] },
+    ],
+  }],
   fetchMode: "per_task",
   usageSchema: {
     // Requested video duration in seconds.
@@ -89,9 +106,52 @@ function responsesVideoText(ctx) {
   return '<video controls src="' + escaped + '"></video>';
 }
 
-function requestValues(req, model) {
+function normalizeVideoRequest(req, model) {
   const values = Object.assign({}, req || {});
   values.model = model;
+  const durations = [values.seconds, values.duration].filter((value) => value !== undefined);
+  if (durations.length) {
+    const seconds = Number(durations[0]);
+    if (![4, 8, 12].includes(seconds)) throw new Error("seconds must be one of 4, 8, or 12");
+    if (durations.some((value) => Number(value) !== seconds)) throw new Error("seconds and duration must match");
+    values.seconds = seconds;
+    delete values.duration;
+  }
+  if (values.metadata !== undefined && (!values.metadata || typeof values.metadata !== "object" || Array.isArray(values.metadata)))
+    throw new Error("metadata must be an object");
+  const metadata = Object.assign({}, values.metadata || {});
+  let resolution, ratio, size = values.size;
+  for (const source of [values, metadata]) {
+    if (source.resolution !== undefined) {
+      if (typeof source.resolution !== "string" || source.resolution.toLowerCase() !== "720p")
+        throw new Error("Sora public resolution must be 720p; use an explicit native size for other dimensions");
+      resolution = "720p";
+      delete source.resolution;
+    }
+    for (const field of ["aspect_ratio", "aspectRatio", "ratio"]) {
+      if (source[field] === undefined) continue;
+      if (!["16:9", "9:16"].includes(source[field])) throw new Error("aspect_ratio must be 16:9 or 9:16");
+      if (ratio && ratio !== source[field]) throw new Error("video aspect ratio aliases must match");
+      ratio = source[field];
+      delete source[field];
+    }
+  }
+  if (metadata.size !== undefined) {
+    if (size !== undefined && size !== metadata.size) throw new Error("video size aliases must match");
+    size = metadata.size;
+    delete metadata.size;
+  }
+  if (resolution || ratio) {
+    if (size !== undefined) {
+      if (!["720x1280", "1280x720"].includes(size)) throw new Error("public video dimensions conflict with the native Sora size");
+      const nativeRatio = size === "1280x720" ? "16:9" : "9:16";
+      if (ratio && ratio !== nativeRatio) throw new Error("aspect_ratio conflicts with the native Sora size");
+    } else {
+      size = ratio === "16:9" ? "1280x720" : "720x1280";
+    }
+  }
+  if (size !== undefined) values.size = size;
+  if (values.metadata !== undefined) values.metadata = metadata;
   return values;
 }
 
@@ -102,11 +162,11 @@ export function buildSubmitRequest(ctx) {
   const headers = { Authorization: "Bearer " + ctx.apiKey };
   if (action === "remix") {
     headers["Content-Type"] = "application/json";
-    return { url: ctx.baseUrl + "/v1/videos/" + ctx.originTaskId + "/remix", method: "POST", headers, body: requestValues(req, ctx.upstreamModel), action };
+    return { url: ctx.baseUrl + "/v1/videos/" + ctx.originTaskId + "/remix", method: "POST", headers, body: normalizeVideoRequest(req, ctx.upstreamModel), action };
   }
   if ((ctx.files || []).length) {
     const parts = [];
-    const values = requestValues(req, ctx.upstreamModel);
+    const values = normalizeVideoRequest(req, ctx.upstreamModel);
     for (const key of Object.keys(values)) {
       if (values[key] !== undefined && values[key] !== null && typeof values[key] !== "object") parts.push({ name: key, value: values[key] });
     }
@@ -117,7 +177,7 @@ export function buildSubmitRequest(ctx) {
     return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, bodyType: "multipart", parts };
   }
   headers["Content-Type"] = "application/json";
-  return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, body: requestValues(req, ctx.upstreamModel) };
+  return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, body: normalizeVideoRequest(req, ctx.upstreamModel) };
 }
 
 export function parseSubmitResponse(ctx, resp) {
@@ -129,7 +189,7 @@ export function parseSubmitResponse(ctx, resp) {
 
 export function extractUsage(ctx) {
   const origin = ctx.action === "remix" && Array.isArray(ctx.originTasks) ? ctx.originTasks[0] : null;
-  const req = origin ? origin.data || {} : ctx.requestBody || {};
+  const req = origin ? origin.data || {} : normalizeVideoRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   let seconds = Number(req.seconds || req.duration || 4);
   if (!Number.isFinite(seconds) || seconds <= 0) seconds = 4;
   return { seconds: Math.min(seconds, 3600), size: req.size || "720x1280" };
@@ -204,7 +264,10 @@ export const protocols = {
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
       if (Object.prototype.hasOwnProperty.call(req, "metadata")) requestBody.metadata = req.metadata;
-      return { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
+      for (const field of ["resolution", "aspect_ratio", "aspectRatio", "ratio"]) {
+        if (Object.prototype.hasOwnProperty.call(req, field)) requestBody[field] = req[field];
+      }
+      return { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: normalizeVideoRequest(requestBody, model) };
     },
     renderEvents: function (ctx, task, previousState) {
       const status = String(task.status || "UNKNOWN").toUpperCase();
@@ -265,14 +328,11 @@ protocols.openai_video = {
     if (ctx.body.kind === "json") {
       if (!ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
       const req = ctx.body.value;
-      const seconds = req.seconds === undefined ? req.duration : req.seconds;
-      if (seconds !== undefined && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600))
-        throw new Error("seconds must be between 1 and 3600");
       return {
         kind: "submit",
         model: ctx.model,
         action: req.input_reference || req.image ? "image_to_video" : "text_to_video",
-        requestBody: Object.assign({}, req, { model: ctx.model }),
+        requestBody: normalizeVideoRequest(req, ctx.model),
       };
     }
     const first = function (name) {
@@ -301,16 +361,11 @@ protocols.openai_video = {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("metadata must be a JSON object string");
       req.metadata = parsed;
     }
-    if (req.seconds !== undefined) req.seconds = Number(req.seconds);
-    else if (req.duration !== undefined) req.seconds = Number(req.duration);
-    const seconds = req.seconds === undefined ? req.duration : req.seconds;
-    if (seconds !== undefined && (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0 || Number(seconds) > 3600))
-      throw new Error("seconds must be between 1 and 3600");
     return {
       kind: "submit",
       model: ctx.model,
       action: hasInputReferenceFile || req.input_reference || req.image ? "image_to_video" : "text_to_video",
-      requestBody: Object.assign({}, req, { model: ctx.model }),
+      requestBody: normalizeVideoRequest(req, ctx.model),
     };
   },
   render: function (ctx, task) {

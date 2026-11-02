@@ -231,6 +231,10 @@ func EndAsyncVideoPolicyExecution(ctx context.Context, task Task, job AsyncMedia
 		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration == math.MaxInt64 || queued.AttemptGeneration != task.AttemptGeneration || current.TaskID != queued.TaskId || current.UserId != queued.UserId || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput || queued.OutputObjectKey != "" || queued.ArtifactKeys != "" || queued.Status == "failed" || queued.Status == "succeeded" || queued.Status == "expired" {
 			return ErrTaskAttemptConflict
 		}
+		mixed := current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo
+		if mixed && queued.Status == "execution_unknown" && current.Status == TaskStatusUnknown && current.PrivateData.VideoReconciliation != nil && current.PrivateData.VideoReconciliation.ManualRequired {
+			return nil
+		}
 		if decision != nil {
 			event, err := NewMediaRetryEvent(current.TaskID, current.AttemptGeneration, fact, *decision, state)
 			if err != nil {
@@ -249,8 +253,9 @@ func EndAsyncVideoPolicyExecution(ctx context.Context, task Task, job AsyncMedia
 		now := time.Now().Unix()
 		generation := current.AttemptGeneration + 1
 		taskStatus, jobStatus, stage := TaskStatusFailure, "failed", "policy_stopped_unknown"
-		if current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo && queued.DispatchedAt > 0 && (fact.Unknown || fact.Accepted && !fact.Terminal) {
+		if mixed && queued.DispatchedAt > 0 && (fact.Unknown || fact.Accepted && !fact.Terminal) {
 			taskStatus, jobStatus, stage = TaskStatusUnknown, "execution_unknown", "unknown"
+			current.PrivateData.VideoReconciliation = &VideoTaskReconciliation{StartedAt: now, DeadlineAt: now, Revision: 1, Reason: fact.Message, ManualRequired: true}
 		}
 		if err := tx.Model(&current).Updates(map[string]any{"attempt_generation": generation, "status": taskStatus, "fail_reason": fact.Message, "progress": "100%", "finish_time": now, "updated_at": now, "private_data": current.PrivateData}).Error; err != nil {
 			return err

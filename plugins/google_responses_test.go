@@ -108,28 +108,51 @@ func TestGoogleVideoProfilesDefaultsAndWireParameters(t *testing.T) {
 			assert.Equal(t, tc.resolution, facts["resolution"])
 		})
 	}
-	t.Run("image reference and standard options survive conversion", func(t *testing.T) {
-		value, callErr := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-			"model": "cinema-public", "upstreamModel": "veo-3.1-generate-preview", "body": map[string]any{"kind": "json", "value": map[string]any{
-				"prompt": "animate this", "input_reference": "data:image/png;base64,aGVsbG8=", "seconds": 8, "resolution": "1080p", "aspect_ratio": "9:16",
-				"metadata": map[string]any{"seed": 42},
-			}},
+	for _, tc := range []struct {
+		name, field string
+		value       any
+	}{
+		{"string reference", "input_reference", "data:image/png;base64,aGVsbG8="},
+		{"structured image", "image", map[string]any{"url": "data:image/png;base64,aGVsbG8="}},
+		{"structured image list", "images", []any{map[string]any{"image_url": map[string]any{"url": "data:image/png;base64,aGVsbG8="}}}},
+	} {
+		t.Run(tc.name+" and standard options survive conversion", func(t *testing.T) {
+			value, callErr := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": "cinema-public", "upstreamModel": "veo-3.1-generate-preview", "body": map[string]any{"kind": "json", "value": map[string]any{
+					"prompt": "animate this", tc.field: tc.value, "seconds": 8, "resolution": "1080p", "aspect_ratio": "9:16",
+					"metadata": map[string]any{"seed": 42},
+				}},
+			})
+			require.NoError(t, callErr)
+			intent := value.(map[string]any)
+			assert.Equal(t, "image_to_video", intent["action"])
+			value, callErr = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
+				"model": "cinema-public", "upstreamModel": "veo-3.1-generate-preview", "requestBody": intent["requestBody"], "baseUrl": "https://google.example",
+			})
+			require.NoError(t, callErr)
+			assert.Equal(t, "image_to_video", value.(map[string]any)["action"])
+			body := value.(map[string]any)["body"].(map[string]any)
+			instance := body["instances"].([]any)[0].(map[string]any)
+			assert.Equal(t, "aGVsbG8=", instance["image"].(map[string]any)["inlineData"].(map[string]any)["data"])
+			params := body["parameters"].(map[string]any)
+			assert.EqualValues(t, 42, params["seed"])
+			assert.Equal(t, "1080p", params["resolution"])
+			assert.Equal(t, "9:16", params["aspectRatio"])
 		})
-		require.NoError(t, callErr)
-		intent := value.(map[string]any)
-		assert.Equal(t, "image_to_video", intent["action"])
-		value, callErr = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
-			"model": "cinema-public", "upstreamModel": "veo-3.1-generate-preview", "requestBody": intent["requestBody"], "baseUrl": "https://google.example",
+	}
+	for _, reference := range []any{
+		map[string]any{"url": "https://example.invalid/frame.png"},
+		map[string]any{"image_url": "data:image/png;base64,"},
+		map[string]any{"unsupported": "data:image/png;base64,aGVsbG8="},
+	} {
+		request := map[string]any{"prompt": "animate this", "image": reference}
+		_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+			"model": "veo-3.1-generate-preview", "body": map[string]any{"kind": "json", "value": request},
 		})
-		require.NoError(t, callErr)
-		body := value.(map[string]any)["body"].(map[string]any)
-		instance := body["instances"].([]any)[0].(map[string]any)
-		assert.Equal(t, "aGVsbG8=", instance["image"].(map[string]any)["inlineData"].(map[string]any)["data"])
-		params := body["parameters"].(map[string]any)
-		assert.EqualValues(t, 42, params["seed"])
-		assert.Equal(t, "1080p", params["resolution"])
-		assert.Equal(t, "9:16", params["aspectRatio"])
-	})
+		require.ErrorContains(t, err, "input image must be", "invalid images must fail admission instead of becoming text-only generation")
+		_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": "veo-3.1-generate-preview", "requestBody": request})
+		require.ErrorContains(t, err, "input image must be", "direct driver calls must preserve the same boundary")
+	}
 	for _, field := range []string{"image", "input_reference"} {
 		t.Run("native multipart "+field, func(t *testing.T) {
 			files := []map[string]any{{"field": field, "ref": "request_file:" + field + ":2", "mimeType": "image/png"}}

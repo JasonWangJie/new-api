@@ -1340,6 +1340,9 @@ func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
 	if !task.PrivateData.AsyncMedia || state == nil {
 		return true, nil
 	}
+	if state.ManualRequired && task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo {
+		return false, nil
+	}
 	generation := task.AttemptGeneration
 	decision, err := videoPollingDecision(ctx, task, state.Reason, 0, false, task.PrivateData.MediaRetryFact)
 	if err != nil {
