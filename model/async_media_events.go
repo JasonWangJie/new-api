@@ -70,7 +70,22 @@ func ChangeAsyncMediaJob(query *gorm.DB, updates map[string]any, eventType strin
 	})
 }
 
+// HasPendingSubmissionReconciliation preserves the evidence of a dispatched
+// operation whose acceptance and reserved funds still require manual review.
+func (job AsyncMediaJob) HasPendingSubmissionReconciliation() bool {
+	return (job.Provider == "nldw" || job.Provider == "yuxibox") && job.Status == "execution_unknown" && job.DispatchedAt > 0 && job.BillingStatus == "unknown"
+}
+
+// ExcludePendingSubmissionReconciliation filters before pagination so retained
+// unknown operations cannot starve cleanup of financially completed jobs.
+func ExcludePendingSubmissionReconciliation(query *gorm.DB) *gorm.DB {
+	return query.Where("NOT (COALESCE(provider, '') IN ? AND COALESCE(status, '') = ? AND COALESCE(dispatched_at, 0) > ? AND COALESCE(billing_status, '') = ?)", []string{"nldw", "yuxibox"}, "execution_unknown", 0, "unknown")
+}
+
 func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) error {
+	if job.HasPendingSubmissionReconciliation() {
+		return ErrImageConflict
+	}
 	// Keep output pointers until the caller confirms file deletion, so a failed
 	// filesystem cleanup remains discoverable on the next sweep.
 	changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil}
@@ -90,6 +105,7 @@ func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) erro
 		}
 		query := tx.Model(&AsyncMediaJob{}).
 			Where("id = ? AND expires_at <= ? AND lease_expires_at <= ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ? AND billing_status = ?", job.ID, now, now, job.AttemptGeneration, job.ReferenceRecoveryStage, job.BillingStatus)
+		query = ExcludePendingSubmissionReconciliation(query)
 		return ChangeAsyncMediaJob(query, changes, "")
 	})
 }

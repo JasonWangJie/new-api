@@ -252,6 +252,7 @@ func CleanupMediaObjects(ctx context.Context) error {
 		Where("expires_at <= ? AND lease_expires_at <= ? AND (status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, "expired").
 		Where("COALESCE(reference_recovery_stage, '') <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL", "refund").
 		Where("reference_recovery_stage = ? OR billing_status IN ? OR ((status <> ? OR NOT EXISTS (?)) AND (status <> ? OR NOT EXISTS (?)))", "refund", []string{"refunded", "not_billable"}, "reconciling", pendingTasks, "submitted", reservedTasks).
+		Scopes(model.ExcludePendingSubmissionReconciliation).
 		Limit(100).Find(&jobs).Error; err != nil {
 		return err
 	}

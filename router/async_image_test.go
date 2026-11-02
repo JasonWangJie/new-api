@@ -1397,6 +1397,185 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		assert.Equal(t, 404, request("GET", parsed.RequestURI(), "", "", "").Code)
 		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusEnabled).Error)
 	})
+	t.Run("yuxibox-http-admission-mapping", func(t *testing.T) {
+		service.InitHttpClient()
+		require.NoError(t, model.AdjustUserQuotaDurable(user.Id, 1000000))
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("remain_quota", 1000000).Error)
+		require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "RemainQuota", 1000000).Err())
+		require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
+		previousSubmit, previousPersist, previousAdaptor := service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc
+		service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc = controller.ExecuteAsyncVideo, controller.PersistAsyncVideo
+		service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
+		t.Cleanup(func() {
+			service.SubmitAsyncVideoFunc, service.PersistAsyncVideoFunc, service.GetTaskAdaptorFunc = previousSubmit, previousPersist, previousAdaptor
+		})
+		previousSecret := common.CryptoSecret
+		common.CryptoSecret = "yuxibox-http-admission-signing-secret"
+		t.Cleanup(func() { common.CryptoSecret = previousSecret })
+		previousMedia, err := service.GetMediaRuntimeConfig(t.Context())
+		require.NoError(t, err)
+		mediaCfg := service.DefaultMediaRuntimeConfig()
+		mediaCfg.VideoAsyncEnabled, mediaCfg.LocalPath = true, t.TempDir()
+		require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), mediaCfg))
+		t.Cleanup(func() { assert.NoError(t, service.SaveMediaRuntimeConfig(context.Background(), previousMedia)) })
+		pricing := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+		previousPricing := *pricing
+		t.Cleanup(func() { *pricing = previousPricing })
+		expressions := map[string]string{
+			"yuxibox::yuxi-http-sz": `tier("seconds", u("seconds") * 0.000001)`,
+			"yuxibox::yuxi-http-h3": `u("billing_period") == "off_peak" ? tier("off_peak", u("seconds") * 0.000001) : tier("peak", u("seconds") * 0.000002)`,
+			"yuxibox::yuxi-http-g":  `tier("video", u("video_count") * 0.000005)`,
+		}
+		*pricing = billing_setting.BillingSetting{BillingMode: map[string]string{}, BillingExpr: map[string]string{}, PluginBillingExpr: expressions}
+		var calls atomic.Int32
+		submitted := make(chan map[string]any, 4)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !assert.Equal(t, http.MethodPost, r.Method) || !assert.Equal(t, "/v1/videos", r.URL.Path) {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			assert.Equal(t, "Bearer frozen-yuxibox-http-key", r.Header.Get("Authorization"))
+			var body map[string]any
+			if !assert.NoError(t, common.DecodeJson(r.Body, &body)) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			submitted <- body
+			id := "yuxibox-http-upstream-" + strconv.Itoa(int(calls.Add(1)))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"` + id + `","status":"queued"}`))
+		}))
+		defer upstream.Close()
+		base, setting := upstream.URL, `{"task_plugin_key":"yuxibox"}`
+		mapping := `{"yuxi-http-sz":"seedance-2.5-yx-sz","yuxi-http-h3":"minimax-h3-fast","yuxi-http-g":"seedance-2.0-yx-g"}`
+		yuxiboxChannel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "frozen-yuxibox-http-key", BaseURL: &base, Setting: &setting, Status: common.ChannelStatusEnabled, Models: "yuxi-http-sz,yuxi-http-h3,yuxi-http-g", ModelMapping: &mapping, Group: "default"}
+		require.NoError(t, model.DB.Create(&yuxiboxChannel).Error)
+		for _, alias := range []string{"yuxi-http-sz", "yuxi-http-h3", "yuxi-http-g"} {
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: alias, ChannelId: yuxiboxChannel.Id, Enabled: true}).Error)
+		}
+		model.InitChannelCache()
+		t.Cleanup(func() {
+			assert.NoError(t, model.DB.Where("channel_id = ?", yuxiboxChannel.Id).Delete(&model.Ability{}).Error)
+			assert.NoError(t, model.DB.Delete(&yuxiboxChannel).Error)
+			model.InitChannelCache()
+		})
+		yuxiboxCatalog, err := common.Marshal([]service.ImageModelCapability{
+			{Id: "yuxi-http-sz", MediaType: "video", VideoOverrides: service.VideoModelOverrides{Resolutions: []string{"720p"}, DefaultResolution: "720p", AspectRatios: []string{"16:9"}, DefaultAspectRatio: "16:9", MaxInputItems: map[string]int{"reference_images": 1, "reference_videos": 1, "reference_audios": 1}}},
+			{Id: "yuxi-http-h3", MediaType: "video"},
+			{Id: "yuxi-http-g", MediaType: "video"},
+		})
+		require.NoError(t, err)
+		yuxiboxPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "yuxibox"), Group: "default", Platform: "yuxibox", Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: string(yuxiboxCatalog), Version: 1}
+		require.NoError(t, model.DB.Create(&yuxiboxPolicy).Error)
+		t.Cleanup(func() { assert.NoError(t, model.DB.Delete(&yuxiboxPolicy).Error) })
+		signedImage := "https://cdn.example/image.png?signature=A%2FB&expires=2000000000"
+		for _, tc := range []struct {
+			name, alias, upstreamModel, resolution, ratio, quantity string
+			seconds                                                 int
+			fields, wire                                            map[string]any
+		}{
+			{name: "provider omitted", alias: "yuxi-http-sz", upstreamModel: "seedance-2.5-yx-sz", resolution: "720p", ratio: "16:9", quantity: "seconds", seconds: 5},
+			{name: "explicit provider with scalar references", alias: "yuxi-http-sz", upstreamModel: "seedance-2.5-yx-sz", resolution: "720p", ratio: "16:9", quantity: "seconds", seconds: 5,
+				fields: map[string]any{"provider": "yuxibox", "reference_images": signedImage, "reference_videos": "https://cdn.example/reference.mp4", "reference_audios": "https://cdn.example/reference.mp3", "enable_audio": true, "watermark": false},
+				wire:   map[string]any{"reference_images": []any{signedImage}, "videos": []any{"https://cdn.example/reference.mp4"}, "audios": []any{"https://cdn.example/reference.mp3"}, "watermark": false}},
+			{name: "H3 public alias", alias: "yuxi-http-h3", upstreamModel: "minimax-h3-fast", resolution: "768p", ratio: "9:16", quantity: "seconds", seconds: 5,
+				fields: map[string]any{"provider": "yuxibox", "input_reference": signedImage, "resolution": "720p", "seed": 0}, wire: map[string]any{"reference_images": []any{signedImage}, "seed": 0}},
+			{name: "G public alias paired frames", alias: "yuxi-http-g", upstreamModel: "seedance-2.0-yx-g", resolution: "720p", ratio: "9:16", quantity: "video_count", seconds: 15,
+				fields: map[string]any{"provider": "yuxibox", "input_reference": signedImage, "last_frame": "https://cdn.example/last.png", "size": "720x1280"}, wire: map[string]any{"first_frame": signedImage, "last_frame": "https://cdn.example/last.png"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				body := map[string]any{"model": tc.alias, "prompt": "a blue glass cube"}
+				for key, value := range tc.fields {
+					body[key] = value
+				}
+				encoded, err := common.Marshal(body)
+				require.NoError(t, err)
+				key := "yuxibox-http-" + tc.alias + "-" + strconv.Itoa(int(calls.Load()))
+				before := calls.Load()
+				response := request(http.MethodPost, "/v1/videos/generations_async", string(encoded), key, token.Key)
+				require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+				assert.Equal(t, before, calls.Load(), "admission must not submit synchronously")
+				var receipt struct {
+					TaskID string `json:"task_id"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &receipt))
+				replay := request(http.MethodPost, "/v1/videos/generations_async", string(encoded), key, token.Key)
+				require.Equal(t, http.StatusAccepted, replay.Code, replay.Body.String())
+				assert.JSONEq(t, response.Body.String(), replay.Body.String())
+				assert.Equal(t, "true", replay.Header().Get("X-Idempotency-Replayed"))
+				assert.Equal(t, http.StatusConflict, request(http.MethodPost, "/v1/videos/generations_async", string(encoded)+" ", key, token.Key).Code)
+				assert.Equal(t, http.StatusNotFound, request(http.MethodGet, "/v1/media/tasks_async/"+receipt.TaskID, "", "", other.Key).Code)
+				var job model.AsyncMediaJob
+				require.NoError(t, model.DB.Where("task_id = ?", receipt.TaskID).Take(&job).Error)
+				assert.Equal(t, "yuxibox", job.Provider)
+				assert.Equal(t, tc.alias, job.Model)
+				assert.Equal(t, yuxiboxChannel.Id, job.ChannelId)
+				payload, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				var frozen service.AsyncVideoRequest
+				require.NoError(t, common.Unmarshal(payload, &frozen))
+				require.NotNil(t, frozen.Execution)
+				require.NotNil(t, frozen.Execution.TaskPlugin)
+				assert.Equal(t, "yuxibox", frozen.Execution.TaskPlugin.Key)
+				require.NotNil(t, frozen.Billing.Tiered)
+				assert.Equal(t, expressions["yuxibox::"+tc.alias], frozen.Billing.Tiered.ExprString)
+				quantity := tc.seconds
+				if tc.quantity == "video_count" {
+					quantity = 1
+				}
+				assert.EqualValues(t, quantity, frozen.Billing.Tiered.UsageFacts[tc.quantity])
+				assert.Equal(t, tc.resolution, frozen.Billing.Tiered.UsageFacts["resolution"])
+				if tc.alias == "yuxi-http-h3" {
+					assert.Contains(t, []string{"peak", "off_peak"}, frozen.Billing.Tiered.UsageFacts["billing_period"])
+				}
+				var frozenBody map[string]any
+				require.NoError(t, common.Unmarshal(frozen.Body, &frozenBody))
+				assert.Equal(t, tc.alias, frozenBody["model"])
+				assert.NotContains(t, frozenBody, "provider")
+				claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 30)
+				require.NoError(t, err)
+				require.True(t, claimed)
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, mediaCfg))
+				assert.Equal(t, before+1, calls.Load(), "the worker submits exactly one upstream operation")
+				sent := <-submitted
+				assert.Equal(t, tc.upstreamModel, sent["model"])
+				assert.EqualValues(t, tc.seconds, sent["seconds"])
+				assert.Equal(t, tc.resolution, sent["resolution"])
+				assert.Equal(t, tc.ratio, sent["ratio"])
+				assert.NotContains(t, sent, "provider")
+				assert.NotContains(t, sent, "generate_audio")
+				for key, value := range tc.wire {
+					assert.EqualValues(t, value, sent[key], key)
+				}
+				var task model.Task
+				require.NoError(t, model.DB.Where("task_id = ?", job.TaskId).Take(&task).Error)
+				assert.Equal(t, tc.alias, task.Properties.OriginModelName)
+				assert.Equal(t, tc.upstreamModel, task.Properties.UpstreamModelName)
+				assert.Equal(t, "frozen-yuxibox-http-key", task.PrivateData.Key)
+				assert.True(t, task.PrivateData.AsyncMedia)
+			})
+		}
+		var jobsBefore int64
+		require.NoError(t, model.DB.Model(&model.AsyncMediaJob{}).Count(&jobsBefore).Error)
+		for _, body := range []string{
+			`{"model":"yuxi-http-sz","provider":"unknown-provider","prompt":"a river"}`,
+			`{"model":"yuxi-http-sz","provider":1,"prompt":"a river"}`,
+			`{"model":"yuxi-http-sz","prompt":"a river","reference_images":"https://127.0.0.1/private.png"}`,
+			`{"model":"yuxi-http-sz","prompt":"a river","reference_images":["https://cdn.example/a.png","https://cdn.example/b.png"]}`,
+			`{"model":"yuxi-http-sz","prompt":"a river","resolution":"480p"}`,
+			`{"model":"yuxi-http-sz","prompt":"a river","ratio":"9:16"}`,
+			`{"model":"yuxi-http-g","prompt":"a river","input_reference":"https://cdn.example/first.png"}`,
+			`{"model":"yuxi-http-h3","prompt":"a river"}`,
+			`{"model":"yuxi-http-sz","prompt":"a river","metadata":{"seconds":99999}}`,
+		} {
+			response := request(http.MethodPost, "/v1/videos/generations_async", body, "", token.Key)
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		}
+		var jobsAfter int64
+		require.NoError(t, model.DB.Model(&model.AsyncMediaJob{}).Count(&jobsAfter).Error)
+		assert.Equal(t, jobsBefore, jobsAfter, "invalid requests must fail before creating a job")
+		assert.EqualValues(t, 4, calls.Load(), "replays and rejected requests must not submit more operations")
+	})
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("status", common.UserStatusDisabled).Error)
 	assert.Equal(t, 401, request("GET", "/v1/images/tasks_async/"+payload.TaskId, "", "", token.Key).Code)
 }

@@ -89,9 +89,14 @@ func handleUpstreamAsyncImageResponse(c *gin.Context, info *relaycommon.RelayInf
 			message = "Upstream image task failed"
 		}
 		failure := service.ClassifyAsyncImageFailure(errors.New(message), 0)
-		if failure.Code == 610 && c.GetBool(contextKeyTianyueImageProfile) && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-			if confirmed := service.ClassifyTianyueImageTaskFailure(rawBody, resumeTaskID); confirmed != nil {
-				failure.Code, failure.RetrySameChannel = confirmed.Code, confirmed.RetrySameChannel
+		if c.GetBool(contextKeyTianyueImageProfile) && (failure.Code == 602 || failure.Code == 610) {
+			// A reference-fetch keyword alone cannot authorize recovery of an
+			// accepted task. Validate its identity and complete failure receipt.
+			failure.Code = 610
+			if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+				if confirmed := service.ClassifyTianyueImageTaskFailure(rawBody, resumeTaskID); confirmed != nil {
+					failure.Code, failure.RetrySameChannel = confirmed.Code, confirmed.RetrySameChannel
+				}
 			}
 		}
 		failure.Message = message

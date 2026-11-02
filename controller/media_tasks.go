@@ -122,7 +122,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		return nil, nil, err
 	}
 	view["api_key_name"] = token.Name
-	if job.ExpiresAt <= time.Now().Unix() {
+	if job.ExpiresAt <= time.Now().Unix() && !(admin && job.HasPendingSubmissionReconciliation()) {
 		view["can_resume"], view["can_terminate"] = false, false
 	}
 	view["duration_ms"], view["updated_at"], view["upstream_succeeded_at"] = nil, job.CreatedAt, int64(0)
@@ -661,7 +661,16 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 	}
 	query := model.DB.WithContext(c.Request.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ? AND lease_expires_at <= ?", c.Param("task_id"), time.Now().Unix())
 	if admin {
-		query = query.Where("expires_at > ? OR (status = ? AND reference_retry_count = ? AND reference_recovery_stage = ?)", time.Now().Unix(), "execution_unknown", 1, "unknown")
+		var job model.AsyncMediaJob
+		if err := query.Session(&gorm.Session{}).Take(&job).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Media task is unavailable"))
+			return
+		}
+		if !job.HasPendingSubmissionReconciliation() {
+			query = query.Where("expires_at > ? OR (status = ? AND reference_retry_count = ? AND reference_recovery_stage = ?)", time.Now().Unix(), "execution_unknown", 1, "unknown")
+		} else {
+			query = query.Where("id = ? AND status = ? AND dispatched_at = ? AND billing_status = ?", job.ID, job.Status, job.DispatchedAt, job.BillingStatus)
+		}
 	} else {
 		query = query.Where("expires_at > ?", time.Now().Unix())
 	}

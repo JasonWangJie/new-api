@@ -681,6 +681,71 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						require.NoError(t, db.First(&job, job.ID).Error)
 						assert.Equal(t, "execution_unknown", job.Status)
 						assert.EqualValues(t, 1, calls.Load(), "reprocessing unknown execution must not generate again")
+						if tc.lostReceipt {
+							originalRequest, originalChannel := bytes.Clone(job.RequestCipher), bytes.Clone(job.ChannelCipher)
+							require.NoError(t, db.Model(&job).Update("expires_at", now-1).Error)
+							require.NoError(t, db.First(&job, job.ID).Error)
+							// A cleanup snapshot can predate the worker publishing the
+							// unknown state; eligibility must be rechecked in the write.
+							stale := job
+							stale.Status = "submitting"
+							require.ErrorIs(t, model.ExpireAsyncMediaJob(t.Context(), stale, now), model.ErrImageConflict)
+							terminal := job
+							terminal.ID, terminal.TaskId, terminal.IdentityHash = 0, model.GenerateTaskID(), common.GetUUID()
+							terminal.Status, terminal.BillingStatus, terminal.Quota = "failed", "refunded", 0
+							require.NoError(t, db.Create(&terminal).Error)
+							cfg := service.DefaultMediaRuntimeConfig()
+							cfg.LocalPath = t.TempDir()
+							require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+							require.NoError(t, service.CleanupMediaObjects(t.Context()))
+							require.NoError(t, db.First(&job, job.ID).Error)
+							assert.Equal(t, "execution_unknown", job.Status, "retention must preserve an unresolved dispatch and its financial hold")
+							assert.True(t, bytes.Equal(originalRequest, job.RequestCipher), "retain the frozen request")
+							assert.True(t, bytes.Equal(originalChannel, job.ChannelCipher), "retain the frozen channel")
+							require.NoError(t, db.First(&user, user.Id).Error)
+							require.NoError(t, db.First(&token, token.Id).Error)
+							assert.Equal(t, 900, user.Quota)
+							assert.Zero(t, token.RemainQuota)
+							require.NoError(t, db.First(&terminal, terminal.ID).Error)
+							assert.Equal(t, "expired", terminal.Status, "confirmed financial completion still permits retention cleanup")
+							assert.Empty(t, terminal.RequestCipher)
+							assert.Empty(t, terminal.ChannelCipher)
+							view, _, err = videoJobView(viewContext, job, true)
+							require.NoError(t, err)
+							assert.Equal(t, true, view["can_terminate"], "retention must not remove administrator reconciliation")
+							for _, attempt := range []struct {
+								admin bool
+								body  string
+								code  int
+							}{
+								{false, `{"confirm_upstream_checked":true}`, http.StatusConflict},
+								{true, `{}`, http.StatusConflict},
+								{true, `{"confirm_upstream_checked":true}`, http.StatusOK},
+								{true, `{"confirm_upstream_checked":true}`, http.StatusConflict},
+							} {
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Set("id", user.Id)
+								c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+								c.Request = httptest.NewRequest(http.MethodPost, "/api/media/tasks/"+job.TaskId+"/terminate", strings.NewReader(attempt.body))
+								ManageMediaTask(c, attempt.admin, "terminate")
+								require.Equal(t, attempt.code, recorder.Code, recorder.Body.String())
+							}
+							require.NoError(t, db.First(&job, job.ID).Error)
+							assert.Equal(t, "failed", job.Status)
+							assert.Equal(t, "unknown", job.BillingStatus, "manual termination does not invent a refund")
+							assert.Equal(t, 100, job.Quota)
+							require.NoError(t, service.CleanupMediaObjects(t.Context()))
+							require.NoError(t, db.First(&job, job.ID).Error)
+							assert.Equal(t, "expired", job.Status, "the confirmed local termination releases retained payloads")
+							assert.Empty(t, job.RequestCipher)
+							assert.Empty(t, job.ChannelCipher)
+							require.NoError(t, db.First(&user, user.Id).Error)
+							require.NoError(t, db.First(&token, token.Id).Error)
+							assert.Equal(t, 900, user.Quota)
+							assert.Zero(t, token.RemainQuota)
+							assert.EqualValues(t, 1, calls.Load(), "cleanup and manual reconciliation never create another video")
+						}
 					}
 				})
 			}
