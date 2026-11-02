@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/QuantumNous/new-api/relay/channel/volcengine"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -39,6 +40,93 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestSynchronousImageFallbackKeyFailure(t *testing.T) {
+	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
+	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	previousDB, previousCache := model.DB, common.MemoryCacheEnabled
+	previousType := common.MainDatabaseType()
+	previousCapability := service.ImageChannelCapabilityFunc
+	previousGroups := setting.UserUsableGroups2JSONString()
+	model.DB, common.MemoryCacheEnabled = db, false
+	common.SetMainDatabaseType(common.DatabaseType(dialect))
+	t.Cleanup(func() {
+		model.DB, common.MemoryCacheEnabled = previousDB, previousCache
+		common.SetMainDatabaseType(previousType)
+		service.ImageChannelCapabilityFunc = previousCapability
+		assert.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousGroups))
+		connection, err := db.DB()
+		if assert.NoError(t, err) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}))
+	service.ImageChannelCapabilityFunc = func(model.Channel, string) dto.ImageCapability {
+		return dto.ImageCapability{Provider: "openai", Protocol: "openai_images", Generate: true}
+	}
+	const modelName = "gpt-image-2"
+	fallbackOrganization := "fallback-organization"
+	channels := []model.Channel{
+		{Id: 1, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Group: "default", Models: modelName, Key: "ordinary-key"},
+		{Id: 2, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Group: "default", Models: modelName, Key: "fallback-key-1\nfallback-key-2", OpenAIOrganization: &fallbackOrganization, ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	require.NoError(t, db.Create(&[]model.Ability{{Group: "default", Model: modelName, ChannelId: 1, Enabled: true}, {Group: "default", Model: modelName, ChannelId: 2, Enabled: true}}).Error)
+	policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "openai"), Group: "default", Platform: "openai", Enabled: true, PoolMode: "resolution", Models: `[{"id":"gpt-image-2","resolutions":["1K"]}]`}
+	require.NoError(t, db.Create(&policy).Error)
+	key := service.ImagePoolBindingKey(policy, modelName, "1K")
+	require.NoError(t, db.Create(&[]model.ImageChannelPool{
+		{BindingKey: key, Group: "default", Platform: "openai", Mode: "resolution", Resolution: "1K", ChannelId: 1, Priority: 10},
+		{BindingKey: key, Group: "default", Platform: "openai", Mode: "resolution", Resolution: "1K", ChannelId: 2, IsFallback: true},
+	}).Error)
+	const callback = "test:sync-fallback-key-unavailable"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*model.Channel); ok {
+			tx.AddError(errors.New("fallback polling key lookup unavailable"))
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","size":"1024x1024"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("id", 1)
+	c.Set("use_channel", []string{"9"})
+	common.SetContextKey(c, constant.ContextKeyChannelOrganization, "previous-organization")
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	retry := 1
+	info := &relaycommon.RelayInfo{OriginModelName: modelName, UserGroup: "default", ChannelMeta: &relaycommon.ChannelMeta{}}
+	selected, apiErr := getChannel(c, info, &service.RetryParam{Ctx: c, TokenGroup: "default", ModelName: modelName, Retry: &retry})
+	require.Nil(t, apiErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, 1, selected.Id)
+	assert.Equal(t, "ordinary-key", common.GetContextKeyString(c, constant.ContextKeyChannelKey))
+	assert.Empty(t, common.GetContextKeyString(c, constant.ContextKeyChannelOrganization), "retry must not inherit either previous channel's organization")
+	assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey))
+	assert.Equal(t, []string{"9"}, c.GetStringSlice("use_channel"), "key lookup failure must not count as an upstream submission")
+	assert.Equal(t, 1, retry)
+	require.NoError(t, db.Callback().Query().Remove(callback))
+	selected, apiErr = getChannel(c, info, &service.RetryParam{Ctx: c, TokenGroup: "default", ModelName: modelName, Retry: &retry})
+	require.Nil(t, apiErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, 2, selected.Id, "local fallback exclusion must not persist into another attempt")
+	assert.Equal(t, "fallback-key-1", common.GetContextKeyString(c, constant.ContextKeyChannelKey), "preparation must select exactly one polling key")
+	assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey))
+	assert.Equal(t, 0, c.GetInt(string(constant.ContextKeyChannelMultiKeyIndex)))
+	assert.Equal(t, fallbackOrganization, common.GetContextKeyString(c, constant.ContextKeyChannelOrganization))
+	require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id = ?", key, 1).Update("priority", 0).Error)
+	require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id = ?", key, 2).Update("priority", 10).Error)
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*model.Channel); ok {
+			tx.AddError(errors.New("fallback polling key lookup unavailable"))
+		}
+	}))
+	c.Set("use_channel", []string{})
+	selected, apiErr = getChannel(c, info, &service.RetryParam{Ctx: c, TokenGroup: "default", ModelName: modelName, Retry: &retry})
+	assert.Nil(t, selected)
+	require.NotNil(t, apiErr, "ordinary first-attempt key failures must retain existing behavior")
+}
 
 func TestMediaRetryPolicyAPI(t *testing.T) {
 	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
@@ -364,6 +452,10 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("Database version: %s", version)
 
+			t.Run("fallback column upgrades existing pools without changing their identity", func(t *testing.T) {
+				verifyImagePoolFallbackMigration(t, db)
+			})
+
 			channels := []model.Channel{
 				{Id: 11, Type: 1, Name: "OpenAI primary", Key: "openai-secret", Status: common.ChannelStatusEnabled, Models: "image-alpha,hidden-model", Group: "default"},
 				{Id: 12, Type: 2, Name: "Gemini account", Key: "gemini-secret", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: "default"},
@@ -419,6 +511,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, 7, saved.Priority)
 			t.Run("runtime configuration revisions", func(t *testing.T) { verifyMediaConfigurationRevisions(t, db) })
 			t.Run("routing preview", func(t *testing.T) { verifyMediaRoutingPreview(t, db, redisServer) })
+			t.Run("fallback channel API", func(t *testing.T) { verifyImagePoolFallbackAPI(t, db) })
 			t.Run("pool weight API preserves legacy input and rejects conflicting aliases", func(t *testing.T) {
 				const group = "pool-weight-contract"
 				require.NoError(t, db.Create(&model.Ability{Group: group, Model: "image-alpha", ChannelId: 11, Enabled: true}).Error)
@@ -503,7 +596,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					start := make(chan struct{})
 					var workers sync.WaitGroup
 					for index := range 2 {
-						body, err := common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": expectedIDs, "channels": []gin.H{{"id": 11, "priority": index + 1}}})
+						body, err := common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": expectedIDs, "channels": []gin.H{{"id": 11, "priority": index + 1}}, "fallback_channel_id": index * 11})
 						require.NoError(t, err)
 						workers.Go(func() {
 							<-start
@@ -521,8 +614,10 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 					require.NoError(t, db.Where("binding_key = ?", key).Find(&rows).Error)
 					require.Len(t, rows, 1, "only the winning edit is stored, with no guard row")
 					assert.Equal(t, 11, rows[0].ChannelId)
+					assert.Equal(t, rows[0].Priority == 2, rows[0].IsFallback, "the fallback belongs to the winning revision")
 					assert.NotContains(t, expectedIDs, rows[0].Id, "a replacement gets a fresh revision")
 				}
+				require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", key).Update("is_fallback", true).Error)
 				var before []model.ImageChannelPool
 				require.NoError(t, db.Where("binding_key = ?", key).Find(&before).Error)
 				require.Len(t, before, 1)
@@ -551,6 +646,7 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 				require.NoError(t, db.Where("binding_key = ?", key).Find(&after).Error)
 				require.Len(t, after, 1)
 				assert.Zero(t, after[0].ChannelId, "closed bindings retain a real revision")
+				assert.False(t, after[0].IsFallback, "closed bindings do not retain a fallback")
 				body, err = common.Marshal(gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "4K", "expected_ids": []int{after[0].Id}, "channels": []gin.H{{"id": 11, "priority": 3}}})
 				require.NoError(t, err)
 				recorder = httptest.NewRecorder()
@@ -979,6 +1075,236 @@ func TestImageChannelPoolOptionsAndValidationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Find(&pools).Error)
 			require.Len(t, pools, 1)
 			assert.Equal(t, otherKey, pools[0].BindingKey)
+		})
+	}
+}
+
+func verifyImagePoolFallbackMigration(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	// This is the stored pool schema before fallback selection was introduced.
+	legacySchema := struct {
+		Id         int
+		BindingKey string `gorm:"size:64;uniqueIndex:idx_image_pool_channel,priority:1"`
+		Group      string `gorm:"size:255"`
+		Platform   string `gorm:"size:32"`
+		Mode       string `gorm:"size:32"`
+		Model      string `gorm:"size:255"`
+		Resolution string `gorm:"size:16"`
+		ChannelId  int    `gorm:"uniqueIndex:idx_image_pool_channel,priority:2"`
+		Priority   int
+	}{}
+	require.NoError(t, db.Migrator().DropTable(&model.ImageChannelPool{}))
+	require.NoError(t, db.Table("image_channel_pools").AutoMigrate(&legacySchema))
+	require.False(t, db.Migrator().HasColumn(&model.ImageChannelPool{}, "is_fallback"))
+	policy := model.ImageGroupPolicy{Group: "fallback-migration", Platform: "mixed", PoolMode: "model_resolution"}
+	imageKey := service.MediaPoolBindingKey(policy, "legacy-model", "1K", "image")
+	videoKey := service.MediaPoolBindingKey(policy, "legacy-model", "1K", "video")
+	closedKey := service.MediaPoolBindingKey(policy, "legacy-model", "2K", "image")
+	want := []model.ImageChannelPool{
+		{BindingKey: imageKey, Group: policy.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: "legacy-model", Resolution: "1K", ChannelId: 11, Priority: 7},
+		{BindingKey: imageKey, Group: policy.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: "legacy-model", Resolution: "1K", ChannelId: 12, Priority: 0},
+		{BindingKey: videoKey, Group: policy.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: "legacy-model", Resolution: "1K", ChannelId: 11, Priority: 9},
+		{BindingKey: closedKey, Group: policy.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: "legacy-model", Resolution: "2K"},
+	}
+	require.NoError(t, db.Omit("IsFallback").Create(&want).Error)
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where(map[string]any{"group": policy.Group}).Delete(&model.ImageChannelPool{}).Error)
+	})
+	duplicate := want[0]
+	duplicate.Id = 0
+	require.Error(t, db.Omit("IsFallback").Create(&duplicate).Error, "the old schema enforces one membership per binding and channel")
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&model.ImageChannelPool{}))
+		var after []model.ImageChannelPool
+		require.NoError(t, db.Order("id").Find(&after).Error)
+		assert.Equal(t, want, after, "migration preserves IDs, bindings, weights and closed pools; old rows have no fallback")
+		duplicate = want[0]
+		duplicate.Id = 0
+		require.Error(t, db.Create(&duplicate).Error, "migration preserves unique pool membership")
+	}
+	want[0].IsFallback = true
+	require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("id = ?", want[0].Id).Update("is_fallback", true).Error)
+	for range 2 {
+		require.NoError(t, db.AutoMigrate(&model.ImageChannelPool{}))
+	}
+	var after []model.ImageChannelPool
+	require.NoError(t, db.Order("id").Find(&after).Error)
+	assert.Equal(t, want, after, "subsequent startup migrations preserve configured fallback selection")
+}
+
+func verifyImagePoolFallbackAPI(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	const group = "pool-fallback-contract"
+	require.NoError(t, db.Create(&[]model.Channel{
+		{Id: 31, Type: 1, Name: "Fallback primary", Key: "fallback-primary", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: group},
+		{Id: 32, Type: 1, Name: "Fallback secondary", Key: "fallback-secondary", Status: common.ChannelStatusEnabled, Models: "image-alpha", Group: group},
+	}).Error)
+	require.NoError(t, db.Create(&[]model.Ability{
+		{Group: group, Model: "image-alpha", ChannelId: 31, Enabled: true},
+		{Group: group, Model: "image-alpha", ChannelId: 32, Enabled: true},
+	}).Error)
+	key := service.ImagePoolBindingKey(model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "resolution"}, "", "2K")
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+		assert.NoError(t, db.Where(map[string]any{"group": group}).Delete(&model.Ability{}).Error)
+		assert.NoError(t, db.Where("id IN ?", []int{31, 32}).Delete(&model.Channel{}).Error)
+	})
+	for _, tc := range []struct {
+		name         string
+		create       bool
+		channels     []int
+		fallback     any
+		omitFallback bool
+		stale        bool
+		wantFallback int
+		wantStatus   int
+	}{
+		{name: "new binding chooses zero weight fallback", create: true, channels: []int{31, 32}, fallback: 32, wantFallback: 32},
+		{name: "old client creates without fallback", create: true, channels: []int{31, 32}, omitFallback: true},
+		{name: "replace fallback", channels: []int{31, 32}, fallback: 32, wantFallback: 32},
+		{name: "explicit zero clears fallback", channels: []int{31, 32}, fallback: 0},
+		{name: "omitted field preserves fallback", channels: []int{31, 32}, omitFallback: true, wantFallback: 31},
+		{name: "null field preserves fallback", channels: []int{31, 32}, wantFallback: 31},
+		{name: "removing fallback member clears selection", channels: []int{32}, omitFallback: true},
+		{name: "empty pool clears selection", omitFallback: true},
+		{name: "negative fallback is rejected", channels: []int{31, 32}, fallback: -1, wantStatus: http.StatusBadRequest},
+		{name: "fallback outside selected members is rejected", channels: []int{31}, fallback: 32, wantStatus: http.StatusBadRequest},
+		{name: "empty pool cannot have fallback", fallback: 31, wantStatus: http.StatusBadRequest},
+		{name: "stale fallback edit preserves stored revision", channels: []int{31, 32}, fallback: 32, stale: true, wantStatus: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+			var before []model.ImageChannelPool
+			if !tc.create {
+				before = []model.ImageChannelPool{
+					{BindingKey: key, Group: group, Platform: "openai", Mode: "resolution", Resolution: "2K", ChannelId: 31, Priority: 7, IsFallback: true},
+					{BindingKey: key, Group: group, Platform: "openai", Mode: "resolution", Resolution: "2K", ChannelId: 32},
+				}
+				require.NoError(t, db.Create(&before).Error)
+			}
+			expectedIDs := make([]int, len(before))
+			for i := range before {
+				expectedIDs[i] = before[i].Id
+			}
+			if tc.stale {
+				expectedIDs = nil
+			}
+			channels := make([]gin.H, 0, len(tc.channels))
+			for _, id := range tc.channels {
+				channels = append(channels, gin.H{"id": id, "weight": 0})
+			}
+			body := gin.H{"group": group, "platform": "openai", "mode": "resolution", "resolution": "2K", "channels": channels, "expected_ids": expectedIDs}
+			if !tc.omitFallback {
+				body["fallback_channel_id"] = tc.fallback
+			}
+			data, err := common.Marshal(body)
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(data))
+			SaveImageChannelPool(ctx)
+			var after []model.ImageChannelPool
+			require.NoError(t, db.Where("binding_key = ?", key).Order("id").Find(&after).Error)
+			if tc.wantStatus != 0 {
+				assert.Equal(t, tc.wantStatus, recorder.Code, recorder.Body.String())
+				assert.Equal(t, before, after, "invalid or stale fallback edits retain the complete binding")
+				return
+			}
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.Len(t, after, max(1, len(tc.channels)))
+			var fallbackIDs []int
+			for _, row := range after {
+				assert.GreaterOrEqual(t, row.ChannelId, 0, "transaction guards never survive saving")
+				if row.IsFallback {
+					fallbackIDs = append(fallbackIDs, row.ChannelId)
+				}
+			}
+			if tc.wantFallback == 0 {
+				assert.Empty(t, fallbackIDs)
+			} else {
+				assert.Equal(t, []int{tc.wantFallback}, fallbackIDs)
+			}
+			var response struct {
+				Data []model.ImageChannelPool `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			for i := range after {
+				after[i].MediaType = service.PoolMediaType(after[i])
+			}
+			assert.Equal(t, after, response.Data, "saving returns the persisted fallback flag with each member")
+		})
+	}
+	for _, rollback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("readers see atomic fallback replacement rollback=%t", rollback), func(t *testing.T) {
+			require.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+			before := []model.ImageChannelPool{
+				{BindingKey: key, Group: group, Platform: "openai", Mode: "resolution", Resolution: "2K", ChannelId: 31, Priority: 7, IsFallback: true},
+				{BindingKey: key, Group: group, Platform: "openai", Mode: "resolution", Resolution: "2K", ChannelId: 32, Priority: 2},
+			}
+			require.NoError(t, db.Create(&before).Error)
+			body, err := common.Marshal(gin.H{
+				"group": group, "platform": "openai", "mode": "resolution", "resolution": "2K",
+				"expected_ids": []int{before[0].Id, before[1].Id},
+				"channels":     []gin.H{{"id": 32, "weight": 2}}, "fallback_channel_id": 32,
+			})
+			require.NoError(t, err)
+			beforeInsert, resume, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			const callback = "test:pool-fallback-atomic-visibility"
+			require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+				if rows, ok := tx.Statement.Dest.(*[]model.ImageChannelPool); ok && len(*rows) > 0 && (*rows)[0].BindingKey == key {
+					close(beforeInsert)
+					<-resume
+					if rollback {
+						tx.AddError(errors.New("injected fallback replacement failure"))
+					}
+				}
+			}))
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(body))
+			go func() {
+				defer close(finished)
+				SaveImageChannelPool(ctx)
+			}()
+			defer func() {
+				select {
+				case <-resume:
+				default:
+					close(resume)
+				}
+				<-finished
+				assert.NoError(t, db.Callback().Create().Remove(callback))
+			}()
+			select {
+			case <-beforeInsert:
+			case <-finished:
+				require.FailNow(t, "save did not reach pool replacement", recorder.Body.String())
+			}
+			fallbackID, err := service.GetMediaPoolFallbackChannelID(t.Context(), key)
+			require.NoError(t, err)
+			assert.Equal(t, 31, fallbackID, "uncommitted replacement cannot clear or switch the visible fallback")
+			policy := model.ImageGroupPolicy{Group: group, Platform: "openai", PoolMode: "resolution"}
+			candidates, err := service.ImageCandidateChannels(t.Context(), policy, "image-alpha", "2K")
+			require.NoError(t, err)
+			require.Len(t, candidates, 2, "readers retain the complete old pool during replacement")
+			assert.ElementsMatch(t, []int{31, 32}, []int{candidates[0].Id, candidates[1].Id})
+			close(resume)
+			<-finished
+			fallbackID, err = service.GetMediaPoolFallbackChannelID(t.Context(), key)
+			require.NoError(t, err)
+			var after []model.ImageChannelPool
+			require.NoError(t, db.Where("binding_key = ?", key).Order("id").Find(&after).Error)
+			if rollback {
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Equal(t, 31, fallbackID)
+				assert.Equal(t, before, after)
+			} else {
+				assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				assert.Equal(t, 32, fallbackID)
+				require.Len(t, after, 1)
+				assert.Equal(t, 32, after[0].ChannelId)
+				assert.True(t, after[0].IsFallback)
+			}
 		})
 	}
 }

@@ -38,6 +38,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
 )
 
@@ -976,12 +977,14 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name, action, status, receipt, output string
 		calls                                 int
+		changePolicy                          bool
 	}{
-		{"typed same", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 2},
-		{"typed other", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "", 2},
-		{"unknown without receipt", mediaretry.OtherChannel, string(model.TaskStatusUnknown), "", "", 1},
-		{"receipt is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "original-receipt", "", 1},
-		{"output is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "https://media.example/result.mp4", 1},
+		{"typed same", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 2, false},
+		{"typed other", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "", 2, false},
+		{"unknown without receipt", mediaretry.OtherChannel, string(model.TaskStatusUnknown), "", "", 1, false},
+		{"receipt is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "original-receipt", "", 1, false},
+		{"output is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "https://media.example/result.mp4", 1, false},
+		{"changed policy advances past failed local preparation", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 3, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oldLogs := common.LogConsumeEnabled
@@ -1016,6 +1019,13 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			job := model.AsyncMediaJob{TaskId: "task_public", IdentityHash: "typed", UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: channels[0].Models, Group: "default", Status: "queued", LeaseToken: "lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 120}
 			require.NoError(t, db.Create(&job).Error)
 			request := service.AsyncVideoRequest{Body: []byte(`{}`), ContentType: "application/json", Channel: channels[0], PluginHash: plugin.Engine.SourceFingerprint(), InitialRetryState: &mediaretry.State{TotalLimit: 3}}
+			if tc.changePolicy {
+				// Generation is still allowed, but local recovery's earlier
+				// deadline has expired. Its failure must advance to the fallback.
+				request.Body = []byte(`{"images":["https://reference.example/image.png"]}`)
+				request.ReferenceRecoveryVersion, request.ReferenceRecoveryDeadline, request.ReferenceURLExpiresAt = 2, now-1, now+120
+				request.ReferenceInputs = []service.AsyncVideoReferenceInput{{Index: 0, Path: "/images/0", Source: "https://reference.example/image.png", Kind: "image"}}
+			}
 			retry := &asyncVideoSubmissionRetry{job: &job, request: &request, liveChannel: &channels[0], startedAt: now}
 			c := taskSubmissionTestContext()
 			defer common.CleanupBodyStorage(c)
@@ -1033,8 +1043,18 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 				return retryAsyncVideoSubmission(c, info, func(c *gin.Context, attempt *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 					assert.Same(t, billing, attempt.Billing)
 					attempt.InitChannelMeta(c)
-					require.NoError(t, retry.dispatch(c, attempt))
 					calls++
+					if tc.changePolicy && calls == 2 {
+						latest, err := model.GetMediaRetryPolicy(t.Context())
+						require.NoError(t, err)
+						latest.Rules[0].Steps = []mediaretry.Step{{ID: "local", Action: mediaretry.LocalSameChannel, MaxAttempts: 1}, {ID: "fallback", Action: mediaretry.SameChannel, MaxAttempts: 1}}
+						_, err = model.SaveMediaRetryPolicy(t.Context(), latest, latest.Revision, 1, nil)
+						require.NoError(t, err)
+						err = retry.dispatch(c, attempt)
+						require.ErrorIs(t, err, service.ErrVideoRetryDeferred)
+						return nil, service.TaskErrorWrapperLocal(err, "media_dispatch_failed", http.StatusInternalServerError)
+					}
+					require.NoError(t, retry.dispatch(c, attempt))
 					if calls == 1 {
 						quota := 123
 						if tc.status == string(model.TaskStatusFailure) {
@@ -1050,13 +1070,76 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			assert.Equal(t, tc.calls, calls)
 			assert.Zero(t, billing.refunds)
 			assert.Equal(t, 1, outcome.Task.BillingChannelID())
-			assert.Equal(t, tc.calls-1, request.InitialRetryState.TotalUsed)
+			if tc.changePolicy {
+				assert.Equal(t, 1, request.InitialRetryState.TotalUsed, "only the fallback generated another upstream request")
+				assert.Equal(t, map[string]int{"typed/local": 1, "typed/fallback": 1}, request.InitialRetryState.StepUses)
+				assert.Equal(t, "accepted-retry", outcome.Task.PrivateData.UpstreamTaskID)
+			} else {
+				assert.Equal(t, tc.calls-1, request.InitialRetryState.TotalUsed)
+			}
 			assert.Equal(t, 1, strings.Count(strings.Join(events, ","), "settle"))
 		})
 	}
 }
 
 func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
+	t.Run("pre-consumption validation and existing holds", func(t *testing.T) {
+		user, token := setupResponsesWSRequestTest(t)
+		db := setupVideoRetryTestDatabase(t, user, token)
+		require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}))
+		for _, tc := range []struct {
+			name, validation, billingStatus      string
+			priorUnknown, dispatched, staleLease bool
+			reservedQuota                        int
+		}{
+			{name: "negative reservation", billingStatus: "not_billable"},
+			{name: "invalid zero mixed snapshot", validation: "invalid_zero", billingStatus: "not_billable"},
+			{name: "zero reservation for nonzero mixed price", validation: "nonzero_mixed", billingStatus: "not_billable"},
+			{name: "previous unknown attempt retains reconciliation", priorUnknown: true, billingStatus: "reserving"},
+			{name: "persisted dispatch retains reconciliation", dispatched: true, billingStatus: "reserving"},
+			{name: "persisted quota retains reconciliation", reservedQuota: 100, billingStatus: "reserving"},
+			{name: "stale worker cannot close another reservation", staleLease: true, billingStatus: "reserving"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, Status: "submitting", BillingStatus: "reserving", Quota: tc.reservedQuota, LeaseToken: "current-lease"}
+				if tc.dispatched {
+					job.DispatchedAt = time.Now().Unix()
+				}
+				require.NoError(t, db.Create(&job).Error)
+				c := taskSubmissionTestContext()
+				c.Set("async_media_execution", true)
+				c.Set("async_media_execution_lease_token", job.LeaseToken)
+				if tc.staleLease {
+					c.Set("async_media_execution_lease_token", "expired-lease")
+				}
+				if tc.priorUnknown {
+					c.Set("async_media_initial_retry_request", &service.AsyncVideoRequest{InitialUnknownAttempts: []model.VideoTaskAttempt{{Status: model.TaskStatusUnknown}}})
+				}
+				info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: job.TaskId}}
+				quota := -1
+				if tc.validation != "" {
+					quota = 0
+					info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{MixedVideoBilling: true}
+					if tc.validation == "nonzero_mixed" {
+						const expression = `tier("request", u("requests"))`
+						info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{ModelName: "public-video", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: billingexpr.ExprVersion(expression), GroupRatio: 1, QuotaPerUnit: 1, EstimatedQuotaAfterGroup: 1, TaskUsageBilling: true, MixedVideoBilling: true, MixedVideoSchemaVersion: billing_setting.MixedVideoBillingSchemaVersion, UsageFacts: map[string]any{"requests": float64(1), "action": "generate"}}
+						require.NoError(t, service.ValidateFrozenMixedVideoBilling(info.TieredBillingSnapshot))
+					}
+				}
+				apiErr := service.PreConsumeDurableTaskBilling(c, quota, info)
+				require.NotNil(t, apiErr)
+				assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				assert.Nil(t, info.Billing)
+				require.NoError(t, db.First(&job, job.ID).Error)
+				assert.Equal(t, tc.billingStatus, job.BillingStatus)
+				assert.Equal(t, tc.reservedQuota, job.Quota)
+				require.NoError(t, db.First(user, user.Id).Error)
+				require.NoError(t, db.First(token, token.Id).Error)
+				assert.Equal(t, 1000, user.Quota)
+				assert.Equal(t, 100, token.RemainQuota)
+			})
+		}
+	})
 	for _, provider := range []string{"nldw", "yuxibox"} {
 		t.Run(provider, func(t *testing.T) {
 			modelName := "sd2.5pp"
@@ -1076,6 +1159,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			// explicit ID. Remove it so PostgreSQL can generate the first test token.
 			require.NoError(t, db.Unscoped().Delete(baseToken).Error)
 			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
+			require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "nldw-submit:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "nldw-submit")
 			previousRegistry := pluginruntime.DefaultRegistry
@@ -1083,6 +1167,10 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
 			source, err := builtinplugins.Source(provider)
 			require.NoError(t, err)
+			// Leave descriptor validation intact, then fail in the real host
+			// serializer when a plugin references an unavailable upload.
+			source = strings.Replace(source, "export function buildSubmitRequest(ctx) {", `export function buildSubmitRequest(ctx) {
+  if (ctx.requestBody.prompt === "missing file reference") return {method:"POST",url:ctx.baseUrl+"/v1/videos",body:{image:{__fileRef:"request_file:missing",encoding:"base64"}}};`, 1)
 			plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: provider})
 			require.NoError(t, err)
 			previousSubmit := service.SubmitAsyncVideoFunc
@@ -1095,11 +1183,16 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				name, body                           string
 				httpStatus                           int
 				lostReceipt, beforeSend, insertFails bool
+				buildFails                           bool
 				wantCalls, wantWallet                int
 				wantStatus, wantBilling              string
 				configured                           string
+				billingFailure                       string
+				wantToken                            int
+				subscriptionSuccess                  bool
 			}{
 				{name: "accepted", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "submitted", wantBilling: "reserved"},
+				{name: "subscription accepted reserves only token and subscription", subscriptionSuccess: true, body: `{"id":"subscription-accepted","status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 1000, wantToken: 0, wantStatus: "submitted", wantBilling: "reserved"},
 				{name: "receipt lost after acceptance", lostReceipt: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "receipt has no id", body: `{"status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "malformed receipt", body: `{"id":`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
@@ -1109,6 +1202,18 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "explicit refusal", body: `{"error":{"code":"invalid_request","message":"unsupported prompt"}}`, httpStatus: 400, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "dispatch barrier rejected", beforeSend: true, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "custom retry cannot turn a dispatch barrier rejection into unknown execution", beforeSend: true, configured: "before_send", wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+				{name: "request body construction failure does not enter upstream retries", buildFails: true, configured: "build_request", body: `{"id":"unexpected-receipt","status":"queued"}`, httpStatus: 200, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+				{name: "token rejection has no financial hold", billingFailure: "token_short", wantWallet: 1000, wantToken: 50, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "custom retry cannot repeat a token rejection", billingFailure: "token_short", configured: "preconsume", wantWallet: 1000, wantToken: 50, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "wallet rejection has no financial hold", billingFailure: "wallet_short", configured: "preconsume", wantWallet: 50, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "atomic wallet rejection restores token debit", billingFailure: "wallet_race", configured: "preconsume", wantWallet: 50, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "failed token rollback cannot try another funding source", billingFailure: "rollback", configured: "preconsume", wantWallet: 50, wantToken: 0, wantStatus: "failed", wantBilling: "failed"},
+				{name: "token write error keeps uncertain billing", billingFailure: "token_db", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "wallet write error keeps uncertain billing", billingFailure: "wallet_db", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "subscription absence restores token debit", billingFailure: "subscription_absent", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "subscription exhaustion restores token debit", billingFailure: "subscription_short", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
+				{name: "subscription query error keeps uncertain billing", billingFailure: "subscription_db", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "clamped frozen price has no financial hold", billingFailure: "clamp", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
 				{name: "accepted receipt cannot persist", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, insertFails: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "custom unknown then explicit refusal retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "rejection", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "custom unknown then explicit refusal cannot persist retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "rejection", insertFails: true, wantCalls: 2, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
@@ -1117,8 +1222,30 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					user := model.User{Username: fmt.Sprintf("nldw-submission-%d", index), AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
+					if tc.billingFailure == "wallet_short" {
+						user.Quota = 50
+					}
+					if tc.billingFailure == "rollback" {
+						user.SetSetting(relaydto.UserSetting{BillingPreference: "wallet_first"})
+					}
+					if tc.subscriptionSuccess || strings.HasPrefix(tc.billingFailure, "subscription_") {
+						user.SetSetting(relaydto.UserSetting{BillingPreference: "subscription_only"})
+					}
 					require.NoError(t, db.Create(&user).Error)
+					var subscription model.UserSubscription
+					if tc.subscriptionSuccess || tc.billingFailure == "subscription_short" {
+						plan := model.SubscriptionPlan{Title: "Submission subscription", QuotaResetPeriod: model.SubscriptionResetNever}
+						require.NoError(t, db.Create(&plan).Error)
+						subscription = model.UserSubscription{UserId: user.Id, PlanId: plan.Id, AmountTotal: 100, AmountUsed: 50, StartTime: time.Now().Unix() - 60, EndTime: time.Now().Unix() + 3600, Status: "active"}
+						if tc.subscriptionSuccess {
+							subscription.AmountUsed = 0
+						}
+						require.NoError(t, db.Create(&subscription).Error)
+					}
 					token := model.Token{UserId: user.Id, Key: common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
+					if tc.billingFailure == "token_short" {
+						token.RemainQuota = 50
+					}
 					require.NoError(t, db.Create(&token).Error)
 					var calls atomic.Int32
 					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1154,6 +1281,12 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					now := time.Now().Unix()
 					job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: provider, Model: modelName, Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: "video-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
 					request := service.AsyncVideoRequest{Body: []byte(fmt.Sprintf(`{"model":%q,"prompt":"test generation","seconds":5,"resolution":"720p"}`, modelName)), ContentType: "application/json", ClientIP: "203.0.113.10", Channel: channel, PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: provider, Version: plugin.Meta.Version, APIVersion: 1}}, Billing: service.MediaBillingSnapshot{Price: types.PriceData{Quota: 100, QuotaToPreConsume: 100}}}
+					if tc.buildFails {
+						request.Body = bytes.Replace(request.Body, []byte("test generation"), []byte("missing file reference"), 1)
+					}
+					if tc.billingFailure == "clamp" {
+						request.Billing.Clamp = &common.QuotaClamp{Op: "QuotaRound", Kind: common.QuotaClampOverflow, Original: 3e9, Clamped: 2147483647}
+					}
 					if tc.configured != "" {
 						policy, err := model.GetMediaRetryPolicy(t.Context())
 						require.NoError(t, err)
@@ -1163,7 +1296,11 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 							request.ReferenceRecoveryVersion, request.ReferenceRecoveryDeadline = 2, now+120
 							request.ReferenceInputs = []service.AsyncVideoReferenceInput{{Index: 0, Path: "/images/0", Source: "https://reference.example/image.png", Kind: "image"}}
 						}
-						policy.Rules = []mediaretry.Rule{{ID: "custom-unknown", Name: "Custom unknown", Enabled: true, Scope: mediaretry.Scope{ChannelIDs: []int{channel.Id}}, Match: mediaretry.Match{HTTPStatuses: []int{500}}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.Stop}}
+						statuses := []int{500}
+						if tc.configured == "preconsume" {
+							statuses = []int{403, 500}
+						}
+						policy.Rules = []mediaretry.Rule{{ID: "custom-unknown", Name: "Custom unknown", Enabled: true, Scope: mediaretry.Scope{ChannelIDs: []int{channel.Id}}, Match: mediaretry.Match{HTTPStatuses: statuses}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.Stop}}
 						_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
 						require.NoError(t, err)
 					}
@@ -1173,6 +1310,59 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					require.NoError(t, err)
 					require.NoError(t, db.Create(&job).Error)
 					var barrierAttempts atomic.Int32
+					var billingAttempts, tokenReservations, tokenRollbacks atomic.Int32
+					if tc.billingFailure == "subscription_db" {
+						const callback = "video-subscription-query-failure"
+						require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+							if tx.Statement.Table == "user_subscriptions" {
+								// Matching business-error text is insufficient evidence
+								// that a database error is a confirmed quota rejection.
+								tx.AddError(errors.New("subscription quota insufficient: database query unavailable"))
+							}
+						}))
+						t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callback)) })
+					}
+					if tc.billingFailure != "" {
+						const callback = "video-preconsume-failure"
+						require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+							updates, ok := tx.Statement.Dest.(map[string]any)
+							if !ok {
+								return
+							}
+							if updates["billing_status"] == "reserving" {
+								if billingAttempts.Add(1) > 1 {
+									assert.Fail(t, "local pre-consumption failure must not re-enter custom retries")
+									tx.AddError(errors.New("repeated pre-consumption attempt"))
+								}
+							}
+							if expr, ok := updates["remain_quota"].(clause.Expr); ok {
+								switch expr.SQL {
+								case "remain_quota - ?":
+									tokenReservations.Add(1)
+									if tc.billingFailure == "token_db" {
+										tx.AddError(errors.New("token reservation unavailable"))
+									}
+								case "remain_quota + ?":
+									tokenRollbacks.Add(1)
+									if tc.billingFailure == "rollback" {
+										tx.AddError(errors.New("token rollback unavailable"))
+									}
+								}
+							}
+							if expr, ok := updates["quota"].(clause.Expr); ok && expr.SQL == "quota - ?" {
+								switch tc.billingFailure {
+								case "wallet_race", "rollback":
+									// Simulate spending after the balance read but before
+									// the atomic reservation, on the same transaction.
+									result := tx.Session(&gorm.Session{NewDB: true}).Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 50)
+									tx.AddError(result.Error)
+								case "wallet_db":
+									tx.AddError(errors.New("wallet reservation unavailable"))
+								}
+							}
+						}))
+						t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callback)) })
+					}
 					if tc.beforeSend {
 						const callback = "nldw-dispatch-rejected"
 						require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
@@ -1193,22 +1383,70 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						}))
 						t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callback)) })
 					}
+					if tc.buildFails {
+						const callback = "local-body-failure-retry"
+						require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+							if _, ok := tx.Statement.Dest.(*model.MediaRetryEvent); ok {
+								// Fail immediately if the regression returns, instead
+								// of waiting for the unconsumed retry budget to loop.
+								assert.Fail(t, "local body construction failure entered upstream retry policy")
+								tx.AddError(errors.New("unexpected retry after local body construction failure"))
+							}
+						}))
+						t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callback)) })
+					}
 					err = service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig())
 					if tc.wantStatus == "submitted" {
 						require.NoError(t, err)
 					} else {
 						require.Error(t, err)
 					}
+					if tc.buildFails {
+						require.ErrorContains(t, err, "build_request_failed")
+					}
+					if tc.billingFailure == "subscription_db" {
+						require.ErrorContains(t, err, "update_data_error")
+					}
 					require.NoError(t, db.First(&job, job.ID).Error)
 					require.NoError(t, db.First(&user, user.Id).Error)
 					require.NoError(t, db.First(&token, token.Id).Error)
 					assert.EqualValues(t, tc.wantCalls, calls.Load())
 					assert.Equal(t, tc.wantWallet, user.Quota)
-					assert.Equal(t, tc.wantWallet-900, token.RemainQuota)
+					wantToken := tc.wantWallet - 900
+					if tc.billingFailure != "" || tc.subscriptionSuccess {
+						wantToken = tc.wantToken
+					}
+					assert.Equal(t, wantToken, token.RemainQuota)
 					assert.Equal(t, tc.wantStatus, job.Status)
 					assert.Equal(t, tc.wantBilling, job.BillingStatus)
-					if tc.beforeSend {
-						assert.EqualValues(t, 1, barrierAttempts.Load(), "local failures cannot loop through upstream retries")
+					if tc.subscriptionSuccess {
+						require.NoError(t, db.First(&subscription, subscription.Id).Error)
+						assert.EqualValues(t, 100, subscription.AmountUsed)
+						assert.Equal(t, 100, token.UsedQuota)
+						assert.Equal(t, 100, job.Quota)
+					}
+					if tc.billingFailure != "" {
+						assert.EqualValues(t, 1, billingAttempts.Load())
+						if tc.billingFailure == "wallet_race" || tc.billingFailure == "rollback" || tc.billingFailure == "wallet_db" || strings.HasPrefix(tc.billingFailure, "subscription_") {
+							assert.EqualValues(t, 1, tokenReservations.Load(), "failed compensation cannot fall back to a second funding source")
+							assert.EqualValues(t, 1, tokenRollbacks.Load())
+						}
+						var retryEvents, consumeLogs, refundLogs int64
+						require.NoError(t, db.Model(&model.MediaRetryEvent{}).Where("task_id = ?", job.TaskId).Count(&retryEvents).Error)
+						require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Count(&consumeLogs).Error)
+						require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refundLogs).Error)
+						assert.Zero(t, retryEvents)
+						assert.Zero(t, consumeLogs)
+						assert.Zero(t, refundLogs, "an unsuccessful reservation must not invent a completed task refund")
+						if tc.billingFailure == "subscription_short" {
+							require.NoError(t, db.First(&subscription, subscription.Id).Error)
+							assert.EqualValues(t, 50, subscription.AmountUsed)
+						}
+					}
+					if tc.beforeSend || tc.buildFails || tc.billingFailure != "" {
+						if tc.beforeSend {
+							assert.EqualValues(t, 1, barrierAttempts.Load(), "local failures cannot loop through upstream retries")
+						}
 						assert.Zero(t, job.DispatchedAt)
 						var nativeCount int64
 						require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&nativeCount).Error)
@@ -1886,5 +2124,127 @@ func TestMixedVideoSoraPublicDimensions(t *testing.T) {
 			_, err = service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", normalized, service.VideoModelOverrides{}, 0)
 		}
 		require.Error(t, err, "unsupported mixed dimensions must fail before a retail reservation: %s", fields)
+	}
+}
+
+func TestSoraVideoPolicyAspectRatioAdmission(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.AsyncMediaJob{}))
+	previousRegistry := pluginruntime.DefaultRegistry
+	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	source, err := builtinplugins.Source("sora")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "sora"})
+	require.NoError(t, err)
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "sora-policy", Status: common.ChannelStatusEnabled, Models: "sora-2-pro", Group: "default", Key: "fixture-key", Setting: common.GetPointer(`{"task_plugin_key":"sora"}`)}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: "sora-2-pro", Enabled: true}).Error)
+	policy := model.ImageGroupPolicy{Group: "default", Platform: "sora", PolicyKey: service.ImageIdentityHash("default", "sora"), Enabled: true, AsyncEnabled: true, PoolMode: "resolution", Models: `[{"id":"sora-2-pro","media_type":"video"}]`}
+	require.NoError(t, db.Create(&policy).Error)
+	engine := gin.New()
+	engine.POST("/v1/videos/generations_async", func(c *gin.Context) {
+		c.Set("token_id", token.Id)
+		c.Set("id", user.Id)
+		c.Next()
+	}, PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, func(c *gin.Context) {
+		wire, err := plugin.Engine.Call(c.Request.Context(), "buildSubmitRequest", map[string]any{
+			"model": "sora-2-pro", "upstreamModel": "sora-2-pro", "requestBody": c.MustGet("task_request"), "action": c.GetString("task_action"), "baseUrl": "https://example.invalid",
+		})
+		require.NoError(t, err)
+		usage, err := plugin.Engine.Call(c.Request.Context(), "extractUsage", map[string]any{
+			"model": "sora-2-pro", "upstreamModel": "sora-2-pro", "requestBody": c.MustGet("task_request"), "action": c.GetString("task_action"),
+		})
+		require.NoError(t, err)
+		c.JSON(http.StatusOK, gin.H{"wire": wire, "usage": usage})
+	})
+	for _, tc := range []struct {
+		name, allowed, fields, wantSize string
+		errorText                       string
+		durationOnly, wantSeconds       int
+		multipart                       bool
+	}{
+		{name: "unrestricted default", wantSize: "720x1280"},
+		{name: "native high landscape preserved", fields: `,"size":"1792x1024"`, wantSize: "1792x1024"},
+		{name: "native high portrait preserved", fields: `,"size":"1024x1792"`, wantSize: "1024x1792"},
+		{name: "allowed public landscape", allowed: "16:9", fields: `,"aspect_ratio":"16:9"`, wantSize: "1280x720"},
+		{name: "forbidden public portrait", allowed: "16:9", fields: `,"aspect_ratio":"9:16"`},
+		{name: "forbidden camel case alias", allowed: "16:9", fields: `,"aspectRatio":"9:16"`},
+		{name: "forbidden metadata alias", allowed: "16:9", fields: `,"metadata":{"ratio":"9:16"}`},
+		{name: "forbidden native portrait", allowed: "16:9", fields: `,"size":"720x1280"`},
+		{name: "forbidden native high portrait", allowed: "16:9", fields: `,"size":"1024x1792"`},
+		{name: "forbidden provider default", allowed: "16:9"},
+		{name: "allowed native high portrait", allowed: "9:16", fields: `,"size":"1024x1792"`, wantSize: "1024x1792"},
+		{name: "forbidden native high landscape", allowed: "9:16", fields: `,"size":"1792x1024"`},
+		{name: "multipart forbidden portrait", allowed: "16:9", fields: `,"aspect_ratio":"9:16"`, multipart: true},
+		{name: "multipart allowed landscape", allowed: "16:9", fields: `,"aspect_ratio":"16:9"`, wantSize: "1280x720", multipart: true},
+		{name: "allowed native duration", durationOnly: 12, fields: `,"seconds":12`, wantSize: "720x1280", wantSeconds: 12},
+		{name: "allowed metadata duration", durationOnly: 12, fields: `,"metadata":{"duration":12}`, wantSize: "720x1280", wantSeconds: 12},
+		{name: "allowed metadata seconds", durationOnly: 12, fields: `,"metadata":{"seconds":"12"}`, wantSize: "720x1280", wantSeconds: 12},
+		{name: "matching duration aliases", durationOnly: 12, fields: `,"seconds":12,"metadata":{"duration":12}`, wantSize: "720x1280", wantSeconds: 12},
+		{name: "metadata cannot mask duration", durationOnly: 12, fields: `,"seconds":4,"metadata":{"duration":12}`, errorText: "must match"},
+		{name: "native cannot mask metadata duration", durationOnly: 12, fields: `,"seconds":12,"metadata":{"duration":4}`, errorText: "must match"},
+		{name: "forbidden native duration", durationOnly: 12, fields: `,"seconds":4`, errorText: "outside the enabled capability"},
+		{name: "forbidden default duration", durationOnly: 12, errorText: "outside the enabled capability"},
+		{name: "multipart metadata duration", durationOnly: 12, fields: `,"metadata":{"duration":12}`, wantSize: "720x1280", wantSeconds: 12, multipart: true},
+		{name: "multipart conflicting duration", durationOnly: 12, fields: `,"seconds":4,"metadata":{"duration":12}`, errorText: "must match", multipart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			models := `[{"id":"sora-2-pro","media_type":"video"}]`
+			if tc.allowed != "" {
+				models = fmt.Sprintf(`[{"id":"sora-2-pro","media_type":"video","video_overrides":{"aspect_ratios":[%q]}}]`, tc.allowed)
+			}
+			if tc.durationOnly > 0 {
+				models = fmt.Sprintf(`[{"id":"sora-2-pro","media_type":"video","video_overrides":{"duration":{"values":[%d],"default":%d}}}]`, tc.durationOnly, tc.durationOnly)
+			}
+			require.NoError(t, db.Model(&policy).Update("models", models).Error)
+			raw := []byte(`{"provider":"sora","model":"sora-2-pro","prompt":"animate"` + tc.fields + `}`)
+			contentType := "application/json"
+			if tc.multipart {
+				var fields map[string]any
+				require.NoError(t, common.Unmarshal(raw, &fields))
+				var data bytes.Buffer
+				writer := multipart.NewWriter(&data)
+				for key, value := range fields {
+					text := fmt.Sprint(value)
+					if key == "metadata" {
+						encoded, err := common.Marshal(value)
+						require.NoError(t, err)
+						text = string(encoded)
+					}
+					require.NoError(t, writer.WriteField(key, text))
+				}
+				require.NoError(t, writer.Close())
+				raw, contentType = data.Bytes(), writer.FormDataContentType()
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", bytes.NewReader(raw))
+			request.Header.Set("Content-Type", contentType)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if tc.wantSize == "" {
+				require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				message := tc.errorText
+				if message == "" {
+					message = "not enabled"
+				}
+				assert.Contains(t, response.Body.String(), message)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var wire struct {
+				Wire struct {
+					Body map[string]any `json:"body"`
+				} `json:"wire"`
+				Usage map[string]any `json:"usage"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &wire))
+			assert.Equal(t, tc.wantSize, wire.Wire.Body["size"])
+			assert.NotContains(t, wire.Wire.Body, "aspect_ratio", "policy metadata must not leak into the upstream wire body")
+			if tc.wantSeconds > 0 {
+				assert.EqualValues(t, tc.wantSeconds, wire.Wire.Body["seconds"])
+				assert.Equal(t, wire.Wire.Body["seconds"], wire.Usage["seconds"], "admitted duration must match both the provider request and the bill")
+			}
+		})
 	}
 }

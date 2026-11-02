@@ -297,7 +297,18 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 	if newAPIError != nil {
-		return nil, newAPIError
+		ordinary, selectionErr := service.SelectSyncImageChannelAfterFallbackFailure(c, info.OriginModelName, channel)
+		if selectionErr != nil {
+			return nil, selectionErr
+		}
+		if ordinary == nil {
+			return nil, newAPIError
+		}
+		channel = ordinary
+		info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
+		if setupErr := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName); setupErr != nil {
+			return nil, setupErr
+		}
 	}
 	return channel, nil
 }

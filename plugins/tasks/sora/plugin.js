@@ -20,7 +20,7 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.0.7",
+  version: "1.0.9",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
@@ -106,20 +106,27 @@ function responsesVideoText(ctx) {
   return '<video controls src="' + escaped + '"></video>';
 }
 
-function normalizeVideoRequest(req, model) {
+function normalizeVideoRequest(req, model, inheritOrigin = false) {
   const values = Object.assign({}, req || {});
   values.model = model;
-  const durations = [values.seconds, values.duration].filter((value) => value !== undefined);
-  if (durations.length) {
-    const seconds = Number(durations[0]);
-    if (![4, 8, 12].includes(seconds)) throw new Error("seconds must be one of 4, 8, or 12");
-    if (durations.some((value) => Number(value) !== seconds)) throw new Error("seconds and duration must match");
-    values.seconds = seconds;
-    delete values.duration;
-  }
   if (values.metadata !== undefined && (!values.metadata || typeof values.metadata !== "object" || Array.isArray(values.metadata)))
     throw new Error("metadata must be an object");
   const metadata = Object.assign({}, values.metadata || {});
+  let seconds;
+  for (const source of [values, metadata]) {
+    for (const field of ["seconds", "duration"]) {
+      if (source[field] === undefined) continue;
+      if (inheritOrigin) throw new Error("remix duration is inherited from the original video");
+      const raw = source[field];
+      const value = Number(raw);
+      if ((typeof raw !== "number" && typeof raw !== "string") || ![4, 8, 12].includes(value)) throw new Error("seconds must be one of 4, 8, or 12");
+      if (seconds !== undefined && seconds !== value) throw new Error("seconds and duration must match across the request and metadata");
+      seconds = value;
+      delete source[field];
+    }
+  }
+  if (seconds !== undefined) values.seconds = seconds;
+  else if (!inheritOrigin) values.seconds = 4;
   let resolution, ratio, size = values.size;
   for (const source of [values, metadata]) {
     if (source.resolution !== undefined) {
@@ -141,17 +148,19 @@ function normalizeVideoRequest(req, model) {
     size = metadata.size;
     delete metadata.size;
   }
-  if (resolution || ratio) {
-    if (size !== undefined) {
-      if (!["720x1280", "1280x720"].includes(size)) throw new Error("public video dimensions conflict with the native Sora size");
-      const nativeRatio = size === "1280x720" ? "16:9" : "9:16";
-      if (ratio && ratio !== nativeRatio) throw new Error("aspect_ratio conflicts with the native Sora size");
-    } else {
-      size = ratio === "16:9" ? "1280x720" : "720x1280";
-    }
-  }
-  if (size !== undefined) values.size = size;
   if (values.metadata !== undefined) values.metadata = metadata;
+  // A remix without dimension controls inherits the original video's size.
+  if (inheritOrigin && size === undefined && !resolution && !ratio) return values;
+  if (size === undefined) size = ratio === "16:9" ? "1280x720" : "720x1280";
+  if (!["720x1280", "1280x720", "1792x1024", "1024x1792"].includes(size)) throw new Error("size must be a supported native Sora size");
+  if (resolution && !["720x1280", "1280x720"].includes(size)) throw new Error("public video dimensions conflict with the native Sora size");
+  // Keep the native output's orientation in the host validation view. Sora's
+  // larger native sizes retain their exact pixels and use the same landscape
+  // or portrait policy choice; they do not become public 720p capabilities.
+  const nativeRatio = size === "1280x720" || size === "1792x1024" ? "16:9" : "9:16";
+  if (ratio && ratio !== nativeRatio) throw new Error("aspect_ratio conflicts with the native Sora size");
+  values.size = size;
+  values.aspect_ratio = nativeRatio;
   return values;
 }
 
@@ -159,14 +168,15 @@ export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
   if (!String(req.prompt || "").trim()) throw new Error("field prompt is required");
   const action = ctx.action === "remix" ? "remix" : ctx.action;
+  const values = normalizeVideoRequest(req, ctx.upstreamModel, action === "remix");
+  delete values.aspect_ratio;
   const headers = { Authorization: "Bearer " + ctx.apiKey };
   if (action === "remix") {
     headers["Content-Type"] = "application/json";
-    return { url: ctx.baseUrl + "/v1/videos/" + ctx.originTaskId + "/remix", method: "POST", headers, body: normalizeVideoRequest(req, ctx.upstreamModel), action };
+    return { url: ctx.baseUrl + "/v1/videos/" + ctx.originTaskId + "/remix", method: "POST", headers, body: values, action };
   }
   if ((ctx.files || []).length) {
     const parts = [];
-    const values = normalizeVideoRequest(req, ctx.upstreamModel);
     for (const key of Object.keys(values)) {
       if (values[key] !== undefined && values[key] !== null && typeof values[key] !== "object") parts.push({ name: key, value: values[key] });
     }
@@ -177,7 +187,7 @@ export function buildSubmitRequest(ctx) {
     return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, bodyType: "multipart", parts };
   }
   headers["Content-Type"] = "application/json";
-  return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, body: normalizeVideoRequest(req, ctx.upstreamModel) };
+  return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, body: values };
 }
 
 export function parseSubmitResponse(ctx, resp) {
@@ -261,7 +271,7 @@ export const protocols = {
       const requestBody = { model: model, prompt: prompt };
       if (images.length) requestBody.input_reference = images[0];
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.seconds = req.seconds;
-      else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
+      if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.duration = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
       if (Object.prototype.hasOwnProperty.call(req, "metadata")) requestBody.metadata = req.metadata;
       for (const field of ["resolution", "aspect_ratio", "aspectRatio", "ratio"]) {

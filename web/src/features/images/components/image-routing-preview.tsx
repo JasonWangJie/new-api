@@ -45,6 +45,7 @@ type RouteCandidate = {
   binding_key: string
   binding_found: boolean
   channel_id: number
+  is_fallback?: boolean
   name: string
   upstream_model: string
   provider?: string
@@ -326,8 +327,16 @@ export function ImageRoutingPreview(props: {
               {
                 id: 'channel',
                 header: t('Channel'),
-                cell: (candidate) =>
-                  `#${candidate.channel_id} · ${candidate.name}`,
+                cell: (candidate) => (
+                  <div className='flex flex-wrap items-center gap-2'>
+                    <span>
+                      #{candidate.channel_id} · {candidate.name}
+                    </span>
+                    {candidate.is_fallback && (
+                      <Badge variant='outline'>{t('Fallback channel')}</Badge>
+                    )}
+                  </div>
+                ),
               },
               {
                 id: 'provider',
@@ -362,15 +371,29 @@ export function ImageRoutingPreview(props: {
               {
                 id: 'status',
                 header: t('Status'),
-                cell: (candidate) => (
-                  <Badge variant={candidate.eligible ? 'secondary' : 'outline'}>
-                    {t(
-                      candidate.eligible
-                        ? 'Eligible by configuration'
-                        : 'Excluded'
-                    )}
-                  </Badge>
-                ),
+                cell: (candidate) => {
+                  const retryOnly =
+                    candidate.is_fallback &&
+                    candidate.reasons.length === 1 &&
+                    candidate.reasons[0] === 'zero_weight'
+                  let status = t('Excluded')
+                  if (candidate.eligible) {
+                    status = t('Eligible by configuration')
+                  } else if (retryOnly) {
+                    status = t('Fallback retries only')
+                  }
+                  return (
+                    <Badge
+                      variant={
+                        candidate.eligible || retryOnly
+                          ? 'secondary'
+                          : 'outline'
+                      }
+                    >
+                      {status}
+                    </Badge>
+                  )
+                },
               },
               {
                 id: 'reasons',

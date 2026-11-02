@@ -31,9 +31,11 @@ func PreConsumeDurableTaskBilling(c *gin.Context, preConsumedQuota int, relayInf
 	}
 	if preConsumedQuota == 0 && relayInfo != nil && relayInfo.TieredBillingSnapshot != nil && relayInfo.TieredBillingSnapshot.MixedVideoBilling && relayInfo.QuotaClamp == nil {
 		if err := ValidateFrozenMixedVideoBilling(relayInfo.TieredBillingSnapshot); err != nil {
+			recordAsyncVideoPreConsumeFailure(c, relayInfo, billingPreConsumeUncharged)
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		if relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup != 0 {
+			recordAsyncVideoPreConsumeFailure(c, relayInfo, billingPreConsumeUncharged)
 			return types.NewErrorWithStatusCode(fmt.Errorf("mixed video zero reservation does not match the frozen request price"), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		// A free mixed task still owns one durable zero reservation. Running
@@ -80,6 +82,9 @@ func SnapshotTaskReservation(task *model.Task, info *relaycommon.RelayInfo) {
 
 func preConsumeBillingWithMode(c *gin.Context, preConsumedQuota int, relayInfo *relaycommon.RelayInfo, durable bool) *types.NewAPIError {
 	if relayInfo != nil && relayInfo.QuotaClamp != nil {
+		if durable {
+			recordAsyncVideoPreConsumeFailure(c, relayInfo, billingPreConsumeUncharged)
+		}
 		return types.NewErrorWithStatusCode(
 			relayInfo.QuotaClamp,
 			types.ErrorCodeModelPriceError,
@@ -88,6 +93,9 @@ func preConsumeBillingWithMode(c *gin.Context, preConsumedQuota int, relayInfo *
 		)
 	}
 	if preConsumedQuota < 0 {
+		if durable {
+			recordAsyncVideoPreConsumeFailure(c, relayInfo, billingPreConsumeUncharged)
+		}
 		return types.NewErrorWithStatusCode(
 			fmt.Errorf("pre-consume quota cannot be negative: %d", preConsumedQuota),
 			types.ErrorCodeModelPriceError,

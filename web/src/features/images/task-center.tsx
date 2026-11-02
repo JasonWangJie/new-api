@@ -638,7 +638,7 @@ function TaskCenterSession({
     'Selected task IDs are fixed for this operation. Late results cannot change terminated tasks.'
   )
   if (operation?.confirmUpstreamChecked) {
-    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.')} ${confirmationDescription}`
+    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.')} ${confirmationDescription}`
   }
   if (operation?.action === 'resume') {
     confirmationDescription = operation.checkExistingVideo

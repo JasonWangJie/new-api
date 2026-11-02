@@ -30,6 +30,11 @@ func TestSynchronousImagePoolRouting(t *testing.T) {
 	}{
 		{"pool_excludes_ordinary_channel", 1, 0},
 		{"pool_zero_weight_is_not_selected", 1, 0},
+		{"fallback_first_request_keeps_weights", 1, 0},
+		{"fallback_retry_overrides_weight_and_affinity", 2, 0},
+		{"fallback_previous_failure_uses_weights", 1, 0},
+		{"fallback_disabled_uses_weights", 1, 0},
+		{"fallback_respects_channel_pin", 1, 0},
 		{"affinity_inside_pool_is_preserved", 2, 0},
 		{"affinity_outside_pool_is_reselected", 1, 0},
 		{"resolution_selects_matching_binding", 2, 0},
@@ -65,6 +70,12 @@ func TestSynchronousImagePoolRouting(t *testing.T) {
 			body := `{"model":"gpt-image-2","prompt":"draw","size":"1024x1024","n":1}`
 			path, contentType := "/v1/images/generations", "application/json"
 			switch tc.name {
+			case "fallback_first_request_keeps_weights", "fallback_retry_overrides_weight_and_affinity", "fallback_previous_failure_uses_weights", "fallback_disabled_uses_weights", "fallback_respects_channel_pin":
+				pool.Id, pool.ChannelId, pool.Priority, pool.IsFallback = 0, 2, 0, true
+				require.NoError(t, db.Create(&pool).Error)
+				if tc.name == "fallback_disabled_uses_weights" {
+					require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 2).Update("status", common.ChannelStatusManuallyDisabled).Error)
+				}
 			case "pool_zero_weight_is_not_selected", "affinity_inside_pool_is_preserved":
 				pool.Id, pool.ChannelId, pool.Priority = 0, 2, 0
 				require.NoError(t, db.Create(&pool).Error)
@@ -126,7 +137,21 @@ func TestSynchronousImagePoolRouting(t *testing.T) {
 			if tc.name == "pin_outside_pool_rejects" {
 				GetChannelConstraints(c).AddPin(hostdto.ChannelPin{ChannelId: 2, Source: hostdto.PinSourceToken, Rank: hostdto.PinRankToken})
 			}
-			selected, apiErr := SelectSyncImageChannel(c, modelName, &model.Channel{Id: 2})
+			initial := &model.Channel{Id: 2}
+			if strings.HasPrefix(tc.name, "fallback_") && tc.name != "fallback_first_request_keeps_weights" {
+				c.Set("use_channel", []string{"9"})
+				if tc.name == "fallback_previous_failure_uses_weights" {
+					c.Set("use_channel", []string{"9", "2"})
+				}
+				if tc.name == "fallback_respects_channel_pin" {
+					GetChannelConstraints(c).AddPin(hostdto.ChannelPin{ChannelId: 1, Source: hostdto.PinSourceToken, Rank: hostdto.PinRankToken})
+				}
+				if tc.name == "fallback_retry_overrides_weight_and_affinity" {
+					initial.Id = 1
+					c.Set(ginKeyChannelAffinityLogInfo, map[string]any{"channel_id": 1})
+				}
+			}
+			selected, apiErr := SelectSyncImageChannel(c, modelName, initial)
 			if tc.code != 0 {
 				require.NotNil(t, apiErr)
 				assert.Equal(t, tc.code, apiErr.StatusCode)
@@ -250,13 +275,14 @@ func TestSynchronousImagePreviewMatchesPoolAndBackgroundSwitch(t *testing.T) {
 	require.NoError(t, db.Where("policy_key = ?", ImageIdentityHash("default", "openai")).Take(&policy).Error)
 	require.NoError(t, db.Model(&policy).Updates(map[string]any{"async_enabled": false, "pool_mode": "model"}).Error)
 	policy.PoolMode = "model"
-	require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: ImagePoolBindingKey(policy, request.Model, "1K"), Group: policy.Group, Platform: policy.Platform, Mode: "model", Model: request.Model, ChannelId: channel.Id, Priority: 7}).Error)
+	require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: ImagePoolBindingKey(policy, request.Model, "1K"), Group: policy.Group, Platform: policy.Platform, Mode: "model", Model: request.Model, ChannelId: channel.Id, Priority: 7, IsFallback: true}).Error)
 	input := MediaRoutingPreviewRequest{ExecutionMode: "sync", Group: "default", Platform: "openai", MediaType: "image", Model: request.Model, Resolution: "1K", Operation: "text_to_image", TokenID: task.TokenId}
 	preview, err := PreviewMediaRouting(t.Context(), input)
 	require.NoError(t, err)
 	require.Len(t, preview.Eligible, 1)
 	assert.Equal(t, channel.Id, preview.Eligible[0].ChannelID)
 	assert.Equal(t, 7, preview.Eligible[0].Weight)
+	assert.True(t, preview.Eligible[0].IsFallback)
 	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", task.TokenId).Updates(map[string]any{"group": "auto", "auto_groups": `["default"]`}).Error)
 	preview, err = PreviewMediaRouting(t.Context(), input)
 	require.NoError(t, err)

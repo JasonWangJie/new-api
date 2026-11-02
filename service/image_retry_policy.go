@@ -325,8 +325,10 @@ func ImagePolicyRouting(routing ImageAccountRouting, checkpoint model.ImageRetry
 	routing.WaitForCooldown = true
 	if decision.Action == mediaretry.SameChannel || decision.Action == mediaretry.LocalSameChannel {
 		routing.PinChannel = checkpoint.Fact.ChannelID
+		routing.RetryFromChannelID = 0
 	} else {
 		routing.ExcludedChannels = append(routing.ExcludedChannels, checkpoint.Fact.ChannelID)
+		routing.RetryFromChannelID = checkpoint.Fact.ChannelID
 	}
 	return routing
 }

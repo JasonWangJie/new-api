@@ -222,6 +222,8 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 		return nil
 	}
 	return &taskdto.TaskError{
+		LocalError: true,
+		NoRetry:    types.IsSkipRetryError(apiErr),
 		Code:       string(apiErr.GetErrorCode()),
 		Message:    apiErr.Err.Error(),
 		StatusCode: apiErr.StatusCode,

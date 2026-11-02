@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -25,6 +26,7 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import i18next from 'i18next'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
@@ -33,6 +35,7 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from '../api'
 import { ImagePoolForm } from '../settings'
+import type { ImageChannelPool } from '../types'
 
 vi.mock('../api', () => ({ imageRequest: vi.fn() }))
 vi.mock('@/features/users/api', () => ({ getGroups: vi.fn() }))
@@ -59,27 +62,13 @@ const savedBinding = {
   priority: 7,
 }
 
-function renderPool(
-  pools: Array<{
-    id?: number
-    binding_key: string
-    group: string
-    platform: string
-    media_type?: 'image' | 'video'
-    mode: string
-    model: string
-    resolution: string
-    channel_id: number
-    priority: number
-    weight?: number
-  }> = []
-) {
+function renderPool(pools: ImageChannelPool[] = [], canManage = true) {
   useAuthStore.getState().auth.setUser({
     id: 1,
     username: 'configuration-admin',
     role: 20,
     permissions: {
-      admin_permissions: { image_config: { read: true, manage: true } },
+      admin_permissions: { image_config: { read: true, manage: canManage } },
     },
   })
   const client = new QueryClient({
@@ -102,6 +91,7 @@ function renderPool(
     </QueryClientProvider>
   )
   return {
+    queryClient: client,
     onSuccess,
     refreshPools: (nextPools: typeof pools) =>
       view.rerender(
@@ -333,6 +323,7 @@ test('pool partitions group all resolutions by group and platform while bindings
     'Model',
     'Resolution',
     'Channel',
+    'Fallback channel',
     'Actions',
   ])
 
@@ -526,6 +517,7 @@ test.each([
           mode: 'model',
           model: 'image-beta',
           resolution: '',
+          fallback_channel_id: 0,
           channels: [{ id: 22, weight: 9 }],
         }
       )
@@ -623,6 +615,9 @@ test('a pending pool save blocks dismissal and duplicate submissions until it su
   await waitFor(() => expect(save).toBeDisabled())
   expect(save).toHaveAttribute('aria-busy', 'true')
   expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+  expect(
+    screen.getByRole('combobox', { name: 'Fallback channel' })
+  ).toBeDisabled()
   await user.keyboard('{Escape}')
   expect(
     screen.getByRole('dialog', { name: 'Edit channel pool binding' })
@@ -646,7 +641,7 @@ test('copying a binding into another group replaces choices and preserves the so
     throw new Error(`Unexpected image request: ${method} ${url}`)
   })
   const user = userEvent.setup()
-  renderPool([savedBinding])
+  renderPool([{ ...savedBinding, is_fallback: true }])
   await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   await waitFor(() =>
@@ -677,6 +672,9 @@ test('copying a binding into another group replaces choices and preserves the so
     screen.queryByRole('spinbutton', { name: 'Weight 22' })
   ).not.toBeInTheDocument()
   expect(screen.getByRole('combobox', { name: 'Channels' })).toBeDisabled()
+  expect(
+    screen.getByRole('combobox', { name: 'Fallback channel' })
+  ).toHaveTextContent('Not configured')
   await waitFor(() => expect(model).toBeEnabled())
   await user.click(model)
   expect(
@@ -702,6 +700,7 @@ test('copying a binding into another group replaces choices and preserves the so
         mode: 'model',
         model: 'image-alpha',
         resolution: '',
+        fallback_channel_id: 0,
         channels: [{ id: 11, weight: 0 }],
       }
     )
@@ -741,7 +740,7 @@ test('copying a pool to mixed scheduling preserves channels and weights without 
     throw new Error(`Unexpected image request: ${method} ${url}`)
   })
   const user = userEvent.setup()
-  renderPool([{ ...savedBinding, platform: 'newapi' }])
+  renderPool([{ ...savedBinding, platform: 'newapi', is_fallback: true }])
   await user.click(screen.getByRole('button', { name: /premium.*newapi/ }))
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   await user.click(screen.getByRole('button', { name: 'Copy binding' }))
@@ -767,10 +766,247 @@ test('copying a pool to mixed scheduling preserves channels and weights without 
         mode: 'model',
         model: 'image-beta',
         resolution: '',
+        fallback_channel_id: 22,
         channels: [{ id: 22, weight: 7 }],
       }
     )
   )
+})
+
+test('a zero-weight pool member can be selected as fallback without adding other available channels', async () => {
+  vi.mocked(imageRequest).mockImplementation(async (_url, method, data) => {
+    if (method === 'GET') {
+      return {
+        models: [
+          { id: 'image-beta', label: 'Image Beta', channel_ids: [22, 23] },
+        ],
+        channels: [
+          { id: 22, name: 'Gemini account' },
+          { id: 23, name: 'Unselected account' },
+        ],
+      }
+    }
+    return data
+  })
+  const user = userEvent.setup()
+  renderPool([{ ...savedBinding, weight: 0 }])
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+  await waitFor(() => expect(fallback).toBeEnabled())
+  expect(fallback).toHaveTextContent('Not configured')
+  await user.click(fallback)
+  expect(
+    screen.queryByRole('option', { name: '#23 · Unselected account' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: '#22 · Gemini account' }))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      expect.objectContaining({
+        fallback_channel_id: 22,
+        channels: [{ id: 22, weight: 0 }],
+      })
+    )
+  )
+})
+
+test.each(['clear selection', 'remove member'])(
+  '%s clears the saved fallback and submits an explicit zero',
+  async (action) => {
+    const user = userEvent.setup()
+    renderPool([{ ...savedBinding, is_fallback: true }])
+    await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+    expect(screen.getByRole('cell', { name: '#22' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+    await waitFor(() =>
+      expect(fallback).toHaveTextContent('#22 · Gemini account')
+    )
+    if (action === 'clear selection') {
+      await user.click(fallback)
+      await user.click(screen.getByRole('option', { name: 'Not configured' }))
+    } else {
+      await user.click(screen.getByRole('combobox', { name: 'Channels' }))
+      await user.click(
+        screen.getByRole('option', { name: '#22 · Gemini account' })
+      )
+      await user.keyboard('{Escape}')
+      expect(fallback).toBeDisabled()
+    }
+    expect(fallback).toHaveTextContent('Not configured')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        '/api/option/images/pool',
+        'PUT',
+        expect.objectContaining({
+          fallback_channel_id: 0,
+          channels: action === 'clear selection' ? [{ id: 22, weight: 7 }] : [],
+        })
+      )
+    )
+  }
+)
+
+test('an unavailable fallback remains visible and prevents saving until its invalid member is removed', async () => {
+  vi.mocked(imageRequest).mockImplementation(async (_url, method, data) => {
+    if (method === 'GET') return geminiOptions
+    return data
+  })
+  const user = userEvent.setup()
+  renderPool([
+    savedBinding,
+    { ...savedBinding, id: 23, channel_id: 23, is_fallback: true },
+  ])
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+  await waitFor(() => expect(fallback).toBeEnabled())
+  expect(fallback).toHaveTextContent('#23 · Unavailable')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Invalid channel IDs'
+  )
+  expect(
+    vi.mocked(imageRequest).mock.calls.filter(([, method]) => method === 'PUT')
+  ).toHaveLength(0)
+  await user.click(screen.getByRole('combobox', { name: 'Channels' }))
+  await user.click(screen.getByRole('option', { name: '#23 · Unavailable' }))
+  await user.keyboard('{Escape}')
+  expect(fallback).toHaveTextContent('Not configured')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      expect.objectContaining({
+        fallback_channel_id: 0,
+        channels: [{ id: 22, weight: 7 }],
+      })
+    )
+  )
+})
+
+test('read-only configuration shows the saved fallback with selection and saving disabled', async () => {
+  const user = userEvent.setup()
+  renderPool([{ ...savedBinding, is_fallback: true }], false)
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+  await waitFor(() =>
+    expect(fallback).toHaveTextContent('#22 · Gemini account')
+  )
+  expect(fallback).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+})
+
+test('a rejected fallback save shows the translated server error and keeps the fallback draft', async () => {
+  const user = userEvent.setup()
+  renderPool([{ ...savedBinding, is_fallback: true }])
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  )
+  const errorKey = 'Fallback channel must belong to the channel pool'
+  const translation = '兜底渠道必须属于当前渠道池'
+  i18next.addResourceBundle('pool-smoke', 'translation', {
+    [errorKey]: translation,
+  })
+  await act(async () => {
+    await i18next.changeLanguage('pool-smoke')
+  })
+  try {
+    vi.mocked(imageRequest).mockRejectedValueOnce(new Error(errorKey))
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(translation)
+    expect(toast.error).toHaveBeenCalledWith(translation)
+    expect(
+      screen.getByRole('combobox', { name: 'Fallback channel' })
+    ).toHaveTextContent('#22 · Gemini account')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  } finally {
+    await act(async () => {
+      await i18next.changeLanguage('en')
+    })
+    i18next.removeResourceBundle('pool-smoke', 'translation')
+  }
+})
+
+test('new pool fallback selection waits for candidates and accepts a pool member through the keyboard', async () => {
+  let resolveOptions: (value: typeof openAIOptions) => void = () => undefined
+  const pending = new Promise<typeof openAIOptions>((resolve) => {
+    resolveOptions = resolve
+  })
+  vi.mocked(imageRequest).mockImplementation(async (_url, method, data) =>
+    method === 'GET' ? pending : data
+  )
+  const user = userEvent.setup()
+  renderPool()
+  await user.click(
+    screen.getByRole('button', { name: 'Add channel pool binding' })
+  )
+  const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+  expect(fallback).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+  await act(async () => {
+    resolveOptions(openAIOptions)
+  })
+  const channels = await screen.findByRole('combobox', { name: 'Channels' })
+  await waitFor(() => expect(channels).toBeEnabled())
+  expect(fallback).toBeDisabled()
+  await user.click(channels)
+  await user.click(screen.getByRole('option', { name: '#11 · OpenAI primary' }))
+  await user.keyboard('{Escape}')
+  fallback.focus()
+  await user.keyboard('{Enter}{ArrowDown}{Enter}')
+  expect(fallback).toHaveTextContent('#11 · OpenAI primary')
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      expect.objectContaining({
+        expected_ids: [],
+        fallback_channel_id: 11,
+        channels: [{ id: 11, weight: 0 }],
+      })
+    )
+  )
+})
+
+test('refreshed candidates mark a removed fallback unavailable without silently clearing the draft', async () => {
+  const user = userEvent.setup()
+  const { queryClient } = renderPool([{ ...savedBinding, is_fallback: true }])
+  await user.click(screen.getByRole('button', { name: /premium.*gemini/ }))
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const fallback = screen.getByRole('combobox', { name: 'Fallback channel' })
+  await waitFor(() =>
+    expect(fallback).toHaveTextContent('#22 · Gemini account')
+  )
+  vi.mocked(imageRequest).mockImplementation(async (_url, method, data) => {
+    if (method === 'GET') {
+      return {
+        models: [{ id: 'image-beta', label: 'Image Beta', channel_ids: [23] }],
+        channels: [{ id: 23, name: 'Replacement' }],
+      }
+    }
+    return data
+  })
+  await act(async () => {
+    await queryClient.invalidateQueries({ queryKey: ['image-pool-options'] })
+  })
+  await waitFor(() => expect(fallback).toHaveTextContent('#22 · Unavailable'))
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Invalid channel IDs'
+  )
+  expect(
+    vi.mocked(imageRequest).mock.calls.filter(([, method]) => method === 'PUT')
+  ).toHaveLength(0)
 })
 
 test('mixed image and video bindings with one model edit separate media targets', async () => {

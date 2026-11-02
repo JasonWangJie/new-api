@@ -377,14 +377,15 @@ func DeleteImagePolicy(c *gin.Context) {
 
 func SaveImageChannelPool(c *gin.Context) {
 	var input struct {
-		Group       string `json:"group"`
-		Platform    string `json:"platform"`
-		Mode        string `json:"mode"`
-		Model       string `json:"model"`
-		Resolution  string `json:"resolution"`
-		MediaType   string `json:"media_type"`
-		ExpectedIDs []int  `json:"expected_ids"`
-		Channels    []struct {
+		Group             string `json:"group"`
+		Platform          string `json:"platform"`
+		Mode              string `json:"mode"`
+		Model             string `json:"model"`
+		Resolution        string `json:"resolution"`
+		MediaType         string `json:"media_type"`
+		ExpectedIDs       []int  `json:"expected_ids"`
+		FallbackChannelID *int   `json:"fallback_channel_id"`
+		Channels          []struct {
 			Id       int  `json:"id"`
 			Weight   *int `json:"weight"`
 			Priority *int `json:"priority"`
@@ -451,6 +452,10 @@ func SaveImageChannelPool(c *gin.Context) {
 		seen[channel.Id] = true
 		rows = append(rows, model.ImageChannelPool{BindingKey: key, Group: input.Group, Platform: input.Platform, Mode: input.Mode, Model: input.Model, Resolution: input.Resolution, ChannelId: channel.Id, Priority: weight})
 	}
+	if input.FallbackChannelID != nil && (*input.FallbackChannelID < 0 || *input.FallbackChannelID > 0 && !seen[*input.FallbackChannelID]) {
+		imageManagementError(c, http.StatusBadRequest, errors.New("Fallback channel must belong to the channel pool"))
+		return
+	}
 	if input.Platform == "mixed" {
 		ids := make([]int, 0, len(input.Channels))
 		for _, channel := range input.Channels {
@@ -511,12 +516,28 @@ func SaveImageChannelPool(c *gin.Context) {
 		}).Create(&guard).Error; err != nil {
 			return err
 		}
-		var currentIDs []int
-		if err := tx.Model(&model.ImageChannelPool{}).Where("binding_key = ? AND channel_id >= ?", key, 0).Order("id").Pluck("id", &currentIDs).Error; err != nil {
+		var currentRows []model.ImageChannelPool
+		if err := tx.Where("binding_key = ? AND channel_id >= ?", key, 0).Order("id").Find(&currentRows).Error; err != nil {
 			return err
+		}
+		currentIDs := make([]int, len(currentRows))
+		fallbackChannelID := 0
+		for i, row := range currentRows {
+			currentIDs[i] = row.Id
+			if fallbackChannelID == 0 && row.IsFallback && seen[row.ChannelId] {
+				fallbackChannelID = row.ChannelId
+			}
 		}
 		if !slices.Equal(currentIDs, input.ExpectedIDs) {
 			return model.ErrImageConflict
+		}
+		// Older clients preserve the fallback while its member remains in the pool.
+		// An explicit zero clears it; removing the member also clears it.
+		if input.FallbackChannelID != nil {
+			fallbackChannelID = *input.FallbackChannelID
+		}
+		for i := range rows {
+			rows[i].IsFallback = fallbackChannelID > 0 && rows[i].ChannelId == fallbackChannelID
 		}
 		if len(currentIDs) > 0 {
 			deleted := tx.Where("binding_key = ? AND id IN ?", key, currentIDs).Delete(&model.ImageChannelPool{})

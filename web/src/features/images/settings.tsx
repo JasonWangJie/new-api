@@ -1459,6 +1459,14 @@ export function ImagePoolForm({
           .join(', ') || t('Disabled'),
     },
     {
+      id: 'fallback',
+      header: t('Fallback channel'),
+      cell: (binding) => {
+        const fallback = binding.channels.find((row) => row.is_fallback)
+        return fallback ? `#${fallback.channel_id}` : t('Not configured')
+      },
+    },
+    {
       id: 'edit',
       header: t('Actions'),
       cell: (binding) => (

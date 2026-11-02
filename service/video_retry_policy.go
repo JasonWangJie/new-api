@@ -131,38 +131,43 @@ func ResolveVideoRetryPolicy(ctx context.Context, token model.Token, job model.A
 // VideoRetryCandidateChannels shares authorization and compatibility checks
 // between preview and dispatch, without rotating account keys or writing state.
 func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest, upstreamModel string) ([]model.Channel, error) {
+	channels, _, err := videoRetryCandidateChannels(ctx, job, request, upstreamModel)
+	return channels, err
+}
+
+func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest, upstreamModel string) ([]model.Channel, string, error) {
 	decision := request.PendingDecision
 	if decision == nil || request.RetryFact == nil || !mediaretry.IsResubmission(decision.Action) {
-		return nil, errors.New("video recovery is missing an executable decision")
+		return nil, "", errors.New("video recovery is missing an executable decision")
 	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted || token.ExpiredTime != -1 && token.ExpiredTime <= time.Now().Unix() {
-		return nil, errors.New("video token is unavailable")
+		return nil, "", errors.New("video token is unavailable")
 	}
 	if token.ModelLimitsEnabled && !token.GetModelLimitsMap()[job.Model] {
-		return nil, errors.New("video model permission changed")
+		return nil, "", errors.New("video model permission changed")
 	}
 	if limits := token.GetIpLimits(); len(limits) > 0 {
 		ip := net.ParseIP(request.ClientIP)
 		if ip == nil || !common.IsIpInCIDRList(ip, limits) {
-			return nil, errors.New("video client IP is no longer allowed")
+			return nil, "", errors.New("video client IP is no longer allowed")
 		}
 	}
 	policy, catalog, err := ResolveVideoRetryPolicy(ctx, token, job, request.MixedRouting)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	policy.Group = job.Group
 	if request.MixedRouting != nil {
 		if request.RetryFact.Unknown || request.RetryFact.HasOutput || !request.RetryFact.Terminal && request.RetryFact.Accepted {
-			return nil, errors.New("unknown mixed video execution cannot be resubmitted")
+			return nil, "", errors.New("unknown mixed video execution cannot be resubmitted")
 		}
 		channels, err := MixedVideoPoolChannels(ctx, policy, job.Model, request.MixedRouting.Resolution)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		capability, _ := MixedVideoPolicyCapability(catalog, job.Model)
 		other := decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel
@@ -176,11 +181,11 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
 			return err != nil || (decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel) && len(candidate.Binding.Plugin.Meta.VideoRetryInputs) == 0
 		})
-		return channels, nil
+		return channels, MediaPoolBindingKey(policy, job.Model, request.MixedRouting.Resolution, "video"), nil
 	}
 	var abilities []model.Ability
 	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Find(&abilities).Error; err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ids := make([]int, 0, len(abilities))
 	for _, ability := range abilities {
@@ -188,7 +193,7 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 	}
 	var channels []model.Channel
 	if err := model.DB.WithContext(ctx).Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	resolution := ""
 	if details := request.RequestDetails(); details != nil {
@@ -196,7 +201,7 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 	}
 	var bindings []model.ImageChannelPool
 	if err := model.DB.WithContext(ctx).Where("binding_key = ?", ImagePoolBindingKey(policy, job.Model, resolution)).Find(&bindings).Error; err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	other := decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
@@ -231,14 +236,21 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 		}
 		return cmp.Compare(a.Id, b.Id)
 	})
-	return channels, nil
+	return channels, ImagePoolBindingKey(policy, job.Model, resolution), nil
 }
 
 // PickVideoRetryChannel selects an account only for a real execution attempt.
 func PickVideoRetryChannel(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest, upstreamModel string) (*model.Channel, error) {
-	channels, err := VideoRetryCandidateChannels(ctx, job, request, upstreamModel)
+	channels, bindingKey, err := videoRetryCandidateChannels(ctx, job, request, upstreamModel)
 	if err != nil {
 		return nil, err
+	}
+	fallbackID := 0
+	if request.PendingDecision.Action == mediaretry.OtherChannel || request.PendingDecision.Action == mediaretry.LocalOtherChannel {
+		fallbackID, err = GetMediaPoolFallbackChannelID(ctx, bindingKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 	for len(channels) > 0 {
 		priority := channels[0].GetPriority()
@@ -246,11 +258,17 @@ func PickVideoRetryChannel(ctx context.Context, job model.AsyncMediaJob, request
 		for count < len(channels) && channels[count].GetPriority() == priority {
 			count++
 		}
-		weights := make([]int, count)
-		for i := range count {
-			weights[i] = channels[i].GetWeight()
+		index := -1
+		if fallbackID > 0 && fallbackID != request.RetryFact.ChannelID {
+			index = slices.IndexFunc(channels[:count], func(channel model.Channel) bool { return channel.Id == fallbackID })
 		}
-		index := PickMediaChannelByWeight(weights, rand.Float64())
+		if index < 0 {
+			weights := make([]int, count)
+			for i := range count {
+				weights[i] = channels[i].GetWeight()
+			}
+			index = PickMediaChannelByWeight(weights, rand.Float64())
+		}
 		if index < 0 {
 			return nil, errors.Join(ErrVideoCompatibleChannelsUnavailable, errors.New("video channel pool has no selectable weight"))
 		}

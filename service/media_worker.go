@@ -59,6 +59,37 @@ var PersistAsyncVideoFunc func(context.Context, model.AsyncMediaJob, *model.Task
 
 const asyncMediaAgeRetryLeasePrefix = "age-limit-retry:"
 
+// A failed pre-consumption has no BillingSession for the relay's refund defer.
+// Persist only proven outcomes; an ambiguous database write retains reserving
+// so worker recovery continues to require reconciliation.
+func recordAsyncVideoPreConsumeFailure(c *gin.Context, info *relaycommon.RelayInfo, outcome billingPreConsumeOutcome) {
+	if c == nil || info == nil || info.TaskRelayInfo == nil || info.PublicTaskID == "" || !c.GetBool("async_media_execution") || outcome == billingPreConsumeUnknown {
+		return
+	}
+	leaseToken := c.GetString("async_media_execution_lease_token")
+	if leaseToken == "" {
+		return
+	}
+	if c.GetBool("async_media_policy_unknown_ended") || c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
+		return
+	}
+	if value, exists := c.Get("async_media_initial_retry_request"); exists {
+		if request, ok := value.(*AsyncVideoRequest); ok && request != nil && len(request.InitialUnknownAttempts) > 0 {
+			return
+		}
+	}
+	status := "not_billable"
+	if outcome == billingPreConsumeRollbackFailed {
+		status = "failed"
+	}
+	err := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
+		Where("task_id = ? AND user_id = ? AND token_id = ? AND lease_token = ? AND attempt_generation = ? AND COALESCE(dispatched_at, 0) = ? AND quota = ? AND billing_status = ?", info.PublicTaskID, info.UserId, info.TokenId, leaseToken, 0, 0, 0, "reserving").
+		Update("billing_status", status).Error
+	if err != nil {
+		logger.LogError(c, "video pre-consumption outcome "+info.PublicTaskID+": "+err.Error())
+	}
+}
+
 // recordAsyncVideoSubmissionRefund records only confirmed reservation rollbacks.
 // Missing consumption and its gross usage projection share a durable outbox,
 // without changing financial counters. Submit failures have not accumulated

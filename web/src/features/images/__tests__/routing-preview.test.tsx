@@ -77,6 +77,7 @@ test('previews eligible and excluded routes without generating media and clears 
         ...candidate,
         channel_id: 42,
         name: 'Disabled',
+        is_fallback: true,
         reasons: ['channel_disabled'],
       },
     ],
@@ -93,6 +94,14 @@ test('previews eligible and excluded routes without generating media and clears 
   await user.click(screen.getByRole('button', { name: 'Preview routing' }))
   expect(await screen.findByText('Channel is disabled')).toBeVisible()
   expect(screen.getByText('Eligible by configuration')).toBeVisible()
+  const fallbackRow = screen.getByRole('row', { name: /#42.*Disabled/ })
+  expect(within(fallbackRow).getByText('Fallback channel')).toBeVisible()
+  expect(within(fallbackRow).getByText('Excluded')).toBeVisible()
+  expect(
+    within(screen.getByRole('row', { name: /#41.*Primary/ })).queryByText(
+      'Fallback channel'
+    )
+  ).not.toBeInTheDocument()
   expect(screen.getByText(/Live capacity, cooldowns/)).toBeVisible()
   expect(imageRequest).toHaveBeenCalledWith(
     '/api/option/images/routing/preview',
@@ -112,6 +121,64 @@ test('previews eligible and excluded routes without generating media and clears 
   await user.clear(screen.getByRole('textbox', { name: 'Resolution' }))
   expect(screen.queryByRole('table')).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Preview routing' })).toBeDisabled()
+})
+
+test('zero-weight fallback preview distinguishes retry eligibility from channels that remain excluded', async () => {
+  const candidate = {
+    group: 'default',
+    binding_key: 'pool-1',
+    binding_found: true,
+    channel_id: 41,
+    name: 'Zero-weight fallback',
+    is_fallback: true,
+    upstream_model: 'image-model',
+    priority: 0,
+    weight: 0,
+    available_accounts: 1,
+    reasons: ['zero_weight'],
+  }
+  vi.mocked(imageRequest).mockResolvedValue({
+    binding_key: 'pool-1',
+    binding_found: true,
+    routing_groups: ['default'],
+    eligible: [],
+    excluded: [
+      candidate,
+      {
+        ...candidate,
+        channel_id: 42,
+        name: 'Ordinary zero-weight member',
+        is_fallback: false,
+      },
+      {
+        ...candidate,
+        channel_id: 43,
+        name: 'Disabled fallback',
+        reasons: ['channel_disabled'],
+      },
+    ],
+    reasons: [],
+    warnings: [],
+  })
+  const user = userEvent.setup()
+  renderPreview()
+  await user.type(screen.getByRole('textbox', { name: 'Model' }), 'image-model')
+  await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+  const fallbackRow = await screen.findByRole('row', {
+    name: /#41.*Zero-weight fallback/,
+  })
+  expect(within(fallbackRow).getByText('Fallback retries only')).toBeVisible()
+  expect(within(fallbackRow).queryByText('Excluded')).not.toBeInTheDocument()
+  expect(
+    within(
+      screen.getByRole('row', { name: /#42.*Ordinary zero-weight member/ })
+    ).getByText('Excluded')
+  ).toBeVisible()
+  expect(
+    within(
+      screen.getByRole('row', { name: /#43.*Disabled fallback/ })
+    ).getByText('Excluded')
+  ).toBeVisible()
 })
 
 test('video preview uses provider defaults and shows policy errors even when no channels exist', async () => {

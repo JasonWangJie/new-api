@@ -396,6 +396,8 @@ export type ImageChannelPool = {
   model: string
   resolution: string
   channel_id: number
+  /** Preferred pool member for channel-switch retries. */
+  is_fallback?: boolean
   /** Relative pool weight; optional while reading older server responses. */
   weight?: number
   /** Legacy alias for weight, retained for API compatibility. */

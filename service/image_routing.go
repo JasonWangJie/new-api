@@ -70,6 +70,7 @@ type MediaRoutingPreviewChannel struct {
 	Group             string   `json:"group"`
 	BindingKey        string   `json:"binding_key"`
 	BindingFound      bool     `json:"binding_found"`
+	IsFallback        bool     `json:"is_fallback"`
 	Name              string   `json:"name"`
 	UpstreamModel     string   `json:"upstream_model"`
 	Priority          int64    `json:"priority"`
@@ -529,6 +530,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					candidate.Reasons = append(candidate.Reasons, "not_in_pool")
 				} else {
 					ApplyMediaChannelPoolWeight(&channel, bindings[index].Priority)
+					candidate.IsFallback = bindings[index].IsFallback
 				}
 			} else if input.MediaType == "video" {
 				weight := uint(max(1, min(channel.GetWeight(), 1_000_000_000)))
@@ -749,6 +751,19 @@ func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution st
 		resolution = ""
 	}
 	return ImageIdentityHash(policy.Group, policy.Platform, policy.PoolMode, modelName, resolution)
+}
+
+// GetMediaPoolFallbackChannelID reads the live preference for this binding.
+// Callers must still find the channel among their fully filtered candidates.
+func GetMediaPoolFallbackChannelID(ctx context.Context, bindingKey string) (int, error) {
+	var ids []int
+	err := model.DB.WithContext(ctx).Model(&model.ImageChannelPool{}).
+		Where("binding_key = ? AND channel_id > ? AND is_fallback = ?", bindingKey, 0, true).
+		Order("channel_id").Limit(1).Pluck("channel_id", &ids).Error
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	return ids[0], nil
 }
 
 // MediaPoolBindingKey isolates new mixed video bindings from every legacy pool.
@@ -977,6 +992,7 @@ type ImageAccount struct {
 var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the request")
 
 type ImageAccountRouting struct {
+	RetryFromChannelID      int
 	AllowedChannels         []int
 	Pin                     string
 	Excluded                []string
@@ -1229,11 +1245,23 @@ func PickImageChannel(ctx context.Context, policy model.ImageGroupPolicy, reques
 	if err != nil {
 		return nil, ImageAccount{}, err
 	}
-	weights := make([]int, len(channels))
-	for i := range channels {
-		weights[i] = channels[i].GetWeight()
+	index := -1
+	if routing.RetryFromChannelID > 0 && !routing.Stop && routing.Pin == "" && routing.PinChannel == 0 {
+		fallbackID, err := GetMediaPoolFallbackChannelID(ctx, ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(request)))
+		if err != nil {
+			return nil, ImageAccount{}, err
+		}
+		if fallbackID > 0 && fallbackID != routing.RetryFromChannelID {
+			index = slices.IndexFunc(channels, func(channel model.Channel) bool { return channel.Id == fallbackID })
+		}
 	}
-	index := PickMediaChannelByWeight(weights, rand.Float64())
+	if index < 0 {
+		weights := make([]int, len(channels))
+		for i := range channels {
+			weights[i] = channels[i].GetWeight()
+		}
+		index = PickMediaChannelByWeight(weights, rand.Float64())
+	}
 	if index < 0 {
 		return nil, ImageAccount{}, errors.New("image channel selection failed")
 	}
@@ -1389,6 +1417,9 @@ func ImageAccountAttemptRouting(attempts []ImageChannelAttempt, retries int, pla
 		if attempt.ReferenceFailure && !referenceFetchFailure {
 			reference = append(reference, attempt)
 		}
+	}
+	if lastAttempt.FinishedAt > 0 {
+		routing.RetryFromChannelID = lastAttempt.ChannelId
 	}
 	lastTimedOut := lastAttempt.TimedOut && lastAttempt.FinishedAt > 0
 	lastReferenceFetchFailure := isCompletedImageReferenceFetchFailure(lastAttempt)

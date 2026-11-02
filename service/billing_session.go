@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
@@ -223,9 +222,17 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 // PreConsume — 统一预扣费入口（含信任额度旁路）
 // ---------------------------------------------------------------------------
 
+type billingPreConsumeOutcome uint8
+
+const (
+	billingPreConsumeUnknown billingPreConsumeOutcome = iota
+	billingPreConsumeUncharged
+	billingPreConsumeRollbackFailed
+)
+
 // preConsume 执行预扣费：信任检查 -> 令牌预扣 -> 资金来源预扣。
-// 任一步骤失败时原子回滚已完成的步骤。
-func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIError {
+// A failure reports whether all deductions are confirmed absent or compensated.
+func (s *BillingSession) preConsume(c *gin.Context, quota int) (billingPreConsumeOutcome, *types.NewAPIError) {
 	effectiveQuota := quota
 
 	// ---- 信任额度旁路 ----
@@ -240,7 +247,11 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	// ---- 1) 预扣令牌额度 ----
 	if effectiveQuota > 0 {
 		if err := preConsumeTokenQuotaWithMode(s.relayInfo, effectiveQuota, s.durable); err != nil {
-			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+			outcome := billingPreConsumeUnknown
+			if errors.Is(err, errInsufficientTokenQuota) {
+				outcome = billingPreConsumeUncharged
+			}
+			return outcome, types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
 		s.tokenConsumed = effectiveQuota
 	}
@@ -258,25 +269,26 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 			if rollbackErr != nil {
 				common.SysLog(fmt.Sprintf("error rolling back token quota (userId=%d, tokenId=%d, amount=%d, fundingErr=%s): %s",
 					s.relayInfo.UserId, s.relayInfo.TokenId, s.tokenConsumed, err.Error(), rollbackErr.Error()))
+				// Do not forget the outstanding debit or fall back to another
+				// funding source after an unsuccessful compensation.
+				return billingPreConsumeRollbackFailed, types.NewError(errors.Join(err, rollbackErr), types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 			}
 			s.tokenConsumed = 0
 		}
-		// TODO: model 层应定义哨兵错误（如 ErrNoActiveSubscription），用 errors.Is 替代字符串匹配
 		if errors.Is(err, ErrInsufficientWalletQuota) {
 			userQuota, quotaErr := model.GetUserQuota(s.relayInfo.UserId, false)
 			if quotaErr != nil {
 				userQuota = 0
 			}
-			return types.NewErrorWithStatusCode(
+			return billingPreConsumeUncharged, types.NewErrorWithStatusCode(
 				fmt.Errorf("用户额度不足, 剩余额度: %s", logger.FormatQuota(userQuota)),
 				types.ErrorCodeInsufficientUserQuota, http.StatusForbidden,
 				types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "no active subscription") || strings.Contains(errMsg, "subscription quota insufficient") {
-			return types.NewErrorWithStatusCode(fmt.Errorf("订阅额度不足或未配置订阅: %s", errMsg), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		if errors.Is(err, model.ErrNoActiveSubscription) || errors.Is(err, model.ErrInsufficientSubscriptionQuota) {
+			return billingPreConsumeUncharged, types.NewErrorWithStatusCode(fmt.Errorf("订阅额度不足或未配置订阅: %s", err.Error()), types.ErrorCodeInsufficientUserQuota, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}
-		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+		return billingPreConsumeUnknown, types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 	}
 
 	s.preConsumedQuota = effectiveQuota
@@ -284,7 +296,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 	// ---- 同步 RelayInfo 兼容字段 ----
 	s.syncRelayInfo()
 
-	return nil
+	return billingPreConsumeUnknown, nil
 }
 
 func (s *BillingSession) reserveFunding(delta int, requireAvailableQuota bool) error {
@@ -424,7 +436,15 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 	return newBillingSession(c, relayInfo, preConsumedQuota, false)
 }
 
-func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int, durable bool) (*BillingSession, *types.NewAPIError) {
+func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int, durable bool) (session *BillingSession, apiErr *types.NewAPIError) {
+	// Before the first mutation, query or quota-validation failures cannot
+	// leave a charge. Every attempted reservation replaces this evidence.
+	outcome := billingPreConsumeUncharged
+	defer func() {
+		if durable && apiErr != nil {
+			recordAsyncVideoPreConsumeFailure(c, relayInfo, outcome)
+		}
+	}()
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
@@ -456,7 +476,9 @@ func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 			funding:   &WalletFunding{userId: relayInfo.UserId, durable: durable, subject: relayInfo.CanvasSubject},
 			durable:   durable,
 		}
-		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
+		var apiErr *types.NewAPIError
+		outcome, apiErr = session.preConsume(c, preConsumedQuota)
+		if apiErr != nil {
 			return nil, apiErr
 		}
 		return session, nil
@@ -481,7 +503,9 @@ func newBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 		}
 		// 必须传 subConsume 而非 preConsumedQuota，保证 SubscriptionFunding.amount、
 		// preConsume 参数和 FinalPreConsumedQuota 三者一致，避免订阅多扣费。
-		if apiErr := session.preConsume(c, int(subConsume)); apiErr != nil {
+		var apiErr *types.NewAPIError
+		outcome, apiErr = session.preConsume(c, int(subConsume))
+		if apiErr != nil {
 			return nil, apiErr
 		}
 		return session, nil

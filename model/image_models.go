@@ -62,6 +62,7 @@ type ImageChannelPool struct {
 	Resolution string `json:"resolution" gorm:"size:16"`
 	ChannelId  int    `json:"channel_id" gorm:"uniqueIndex:idx_image_pool_channel,priority:2"`
 	Priority   int    `json:"priority"`
+	IsFallback bool   `json:"is_fallback"`
 }
 
 // MarshalJSON exposes the pool's relative weight while retaining the legacy

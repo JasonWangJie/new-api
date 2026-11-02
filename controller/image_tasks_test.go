@@ -2895,6 +2895,7 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 		localFailure, unknown, legacy, revokeAuto bool
 	}{
 		{name: "same", action: mediaretry.SameChannel}, {name: "other", action: mediaretry.OtherChannel}, {name: "local same", action: mediaretry.LocalSameChannel}, {name: "local other", action: mediaretry.LocalOtherChannel},
+		{name: "other prefers zero weight fallback", action: mediaretry.OtherChannel},
 		{name: "local failure advances step without generating", action: mediaretry.LocalSameChannel, localFailure: true},
 		{name: "custom unknown follows configured channel retry", action: mediaretry.OtherChannel, unknown: true},
 		{name: "captured legacy unknown replays once", action: mediaretry.SameChannel, unknown: true, legacy: true},
@@ -2945,9 +2946,22 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 			t.Cleanup(upstream.Close)
 			setting := `{"task_plugin_key":"drama"}`
 			channels := []model.Channel{{Type: constant.ChannelTypeTaskPlugin, Key: "first-key", BaseURL: &upstream.URL, Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}, {Type: constant.ChannelTypeTaskPlugin, Key: "second-key", BaseURL: &upstream.URL, Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}}
+			if tc.name == "other prefers zero weight fallback" {
+				channels = append(channels, model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "ordinary-third-key", BaseURL: &upstream.URL, Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting})
+			}
 			require.NoError(t, db.Create(&channels).Error)
 			for _, channel := range channels {
 				require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: modelName, Enabled: true}).Error)
+			}
+			if tc.name == "other prefers zero weight fallback" {
+				poolPolicy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "drama"), Group: "default", Platform: "drama", Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: `[{"id":"seedance2.0-E-720p","media_type":"video"}]`}
+				require.NoError(t, db.Create(&poolPolicy).Error)
+				binding := service.ImagePoolBindingKey(poolPolicy, modelName, "")
+				require.NoError(t, db.Create(&[]model.ImageChannelPool{
+					{BindingKey: binding, Group: "default", Platform: "drama", Mode: "model", Model: modelName, ChannelId: channels[0].Id, Priority: 100},
+					{BindingKey: binding, Group: "default", Platform: "drama", Mode: "model", Model: modelName, ChannelId: channels[1].Id, IsFallback: true},
+					{BindingKey: binding, Group: "default", Platform: "drama", Mode: "model", Model: modelName, ChannelId: channels[2].Id, Priority: 100},
+				}).Error)
 			}
 			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "reference", Name: "Reference recovery", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"material unavailable"}}, Steps: []mediaretry.Step{{ID: "recover", Action: action, MaxAttempts: 1}}}}}
 			if tc.localFailure {

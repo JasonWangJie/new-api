@@ -149,6 +149,96 @@ func asyncImageWorkerQuotaCacheFixture(t *testing.T, task model.AsyncImageTask) 
 	require.NoError(t, common.RDB.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "Id", token.Id, "RemainQuota", token.RemainQuota, "UsedQuota", token.UsedQuota).Err())
 }
 
+func TestImagePoolFallbackChannelRouting(t *testing.T) {
+	for _, scenario := range []string{
+		"first request", "legacy retry", "configured retry", "mixed retry", "mixed other namespace", "historical fallback failure",
+		"same channel retry", "fallback just failed", "not configured", "other resolution",
+		"disabled channel", "disabled key", "open circuit", "full channel", "cooling account",
+		"rule excludes fallback", "reference capacity preference",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			db, task, request, cfg, fallback := asyncImageWorkerFixture(t)
+			regular := model.Channel{Key: "regular-key", Status: common.ChannelStatusEnabled, Type: 1, Group: task.Group, Models: request.Model}
+			require.NoError(t, db.Create(&regular).Error)
+			require.NoError(t, db.Create(&model.Ability{Group: task.Group, Model: request.Model, ChannelId: regular.Id, Enabled: true}).Error)
+			policy := model.ImageGroupPolicy{Group: task.Group, Platform: "openai", PoolMode: "model_resolution", AsyncEnabled: true}
+			request.Resolution = "1K"
+			if strings.HasPrefix(scenario, "mixed ") {
+				policy.Platform, request.Provider = "mixed", ""
+				request.MixedRouting = &ImageMixedRouting{Group: task.Group, BindingKey: ImagePoolBindingKey(policy, request.Model, request.Resolution), PoolMode: policy.PoolMode}
+			}
+			key := ImagePoolBindingKey(policy, request.Model, request.Resolution)
+			bindings := []model.ImageChannelPool{
+				{BindingKey: key, Group: task.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: request.Model, Resolution: request.Resolution, ChannelId: task.ChannelId},
+				{BindingKey: key, Group: task.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: request.Model, Resolution: request.Resolution, ChannelId: fallback.Id, IsFallback: true},
+				{BindingKey: key, Group: task.Group, Platform: policy.Platform, Mode: policy.PoolMode, Model: request.Model, Resolution: request.Resolution, ChannelId: regular.Id, Priority: 10},
+			}
+			require.NoError(t, db.Create(&bindings).Error)
+			failure := ImageChannelAttempt{ChannelId: task.ChannelId, KeyFingerprint: ImageIdentityHash("image-account", strconv.Itoa(task.ChannelId), "upstream-key-a"), Dispatched: true, FinishedAt: 1, Code: 605}
+			routing := ImageAccountAttemptRouting([]ImageChannelAttempt{failure}, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+			want := regular.Id
+			switch scenario {
+			case "first request":
+				routing = ImageAccountRouting{}
+			case "legacy retry", "mixed retry":
+				want = fallback.Id
+			case "configured retry":
+				routing = ImagePolicyRouting(ImageAccountRouting{}, model.ImageRetryPolicyState{Pending: true, Fact: mediaretry.Fact{ChannelID: task.ChannelId}, Decision: mediaretry.Decision{Action: mediaretry.OtherChannel}})
+				want = fallback.Id
+			case "historical fallback failure":
+				previous := failure
+				previous.ChannelId, previous.KeyFingerprint = fallback.Id, ImageIdentityHash("image-account", strconv.Itoa(fallback.Id), fallback.Key)
+				routing = ImageAccountAttemptRouting([]ImageChannelAttempt{previous, failure}, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+				want = fallback.Id
+			case "same channel retry":
+				routing = ImagePolicyRouting(routing, model.ImageRetryPolicyState{Pending: true, Fact: mediaretry.Fact{ChannelID: task.ChannelId}, Decision: mediaretry.Decision{Action: mediaretry.LocalSameChannel}})
+				want = task.ChannelId
+			case "fallback just failed":
+				failure.ChannelId, failure.KeyFingerprint = fallback.Id, ImageIdentityHash("image-account", strconv.Itoa(fallback.Id), fallback.Key)
+				routing = ImageAccountAttemptRouting([]ImageChannelAttempt{failure}, cfg.ReferenceRetries, request.Platform, cfg.GeminiAccountSwitches)
+			case "not configured", "other resolution", "mixed other namespace":
+				require.NoError(t, db.Model(&bindings[1]).Update("is_fallback", false).Error)
+				if scenario != "not configured" {
+					other := bindings[1]
+					other.Id, other.Resolution, other.IsFallback = 0, "2K", true
+					other.BindingKey = ImagePoolBindingKey(policy, request.Model, other.Resolution)
+					if scenario == "mixed other namespace" {
+						other.Resolution = request.Resolution
+						other.BindingKey = MediaPoolBindingKey(policy, request.Model, request.Resolution, "video")
+					}
+					require.NoError(t, db.Create(&other).Error)
+				}
+			case "disabled channel":
+				require.NoError(t, db.Model(&fallback).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "disabled key":
+				require.NoError(t, db.Model(&fallback).Update("channel_info", model.ChannelInfo{IsMultiKey: true, MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}).Error)
+			case "open circuit":
+				for range cfg.FailureThreshold {
+					require.NoError(t, RecordImageCircuit(t.Context(), "async", fallback.Id, false, cfg))
+				}
+			case "full channel":
+				for i := range cfg.ImageConcurrency {
+					require.NoError(t, common.RDB.ZAdd(t.Context(), ImageChannelConcurrencyKey(fallback.Id), &redis.Z{Score: float64(time.Now().Unix() + 60), Member: strconv.Itoa(i)}).Err())
+				}
+			case "cooling account":
+				require.NoError(t, common.RDB.Set(t.Context(), ImageAccountCooldownKey(ImageIdentityHash("image-account", strconv.Itoa(fallback.Id), fallback.Key)), "1", time.Minute).Err())
+			case "rule excludes fallback":
+				routing = ImagePolicyRouting(routing, model.ImageRetryPolicyState{Pending: true, Fact: mediaretry.Fact{ChannelID: task.ChannelId}, Decision: mediaretry.Decision{Action: mediaretry.OtherChannel, AllowedChannelIDs: []int{regular.Id}}})
+			case "reference capacity preference":
+				request.Kind = "image_to_image"
+				for range model.DefaultImageChannelMaxReferenceImages + 1 {
+					request.Parts = append(request.Parts, AsyncImageInputPart{Type: "image_url", URL: "https://example.com/image.png"})
+				}
+				require.NoError(t, db.Model(&regular).Update("setting", `{"image_max_reference_images":16}`).Error)
+			}
+			selected, _, err := PickImageChannel(t.Context(), policy, request, routing)
+			require.NoError(t, err)
+			require.NotNil(t, selected)
+			assert.Equal(t, want, selected.Id)
+		})
+	}
+}
+
 func TestTabtabReferenceDownloadRejection(t *testing.T) {
 	const message = `"message":"reference media could not be downloaded: HTTP 404"`
 	const details = `"details":{"field":"images","index":0,"url":"https://diagnostic.example/failed.png"}`
@@ -3469,6 +3559,67 @@ func TestAsyncImageRetryDecisionsAndEncryptedFailureRetention(t *testing.T) {
 	})
 }
 
+func TestAsyncImageWorkerFallbackRetrySequence(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(map[bool]string{false: "builtin retry", true: "configured other channel"}[configured], func(t *testing.T) {
+			db, task, request, cfg, fallback := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			cfg.CircuitBreaker, cfg.AccountCooldownSeconds = false, 0
+			cfg.TransientRetries, cfg.TotalRetries = 3, 3
+			require.NoError(t, SaveImageRuntimeConfig(t.Context(), cfg))
+			policy := model.ImageGroupPolicy{Group: task.Group, Platform: "openai", PoolMode: "resolution"}
+			key := ImagePoolBindingKey(policy, request.Model, AsyncImageRoutingResolution(request))
+			require.NoError(t, db.Create(&[]model.ImageChannelPool{
+				{BindingKey: key, Group: task.Group, Platform: "openai", Mode: "resolution", ChannelId: task.ChannelId, Priority: 100},
+				{BindingKey: key, Group: task.Group, Platform: "openai", Mode: "resolution", ChannelId: fallback.Id, IsFallback: true},
+			}).Error)
+			if configured {
+				retryPolicy, err := model.GetMediaRetryPolicy(t.Context())
+				require.NoError(t, err)
+				retryPolicy.Rules = []mediaretry.Rule{{ID: "fallback-sequence", Name: "Retry unavailable supplier", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"supplier unavailable"}}, Steps: []mediaretry.Step{{ID: "switch", Action: mediaretry.OtherChannel, MaxAttempts: 3}}, OnExhausted: mediaretry.Stop}}
+				_, err = model.SaveMediaRetryPolicy(t.Context(), retryPolicy, retryPolicy.Revision, task.UserId, nil)
+				require.NoError(t, err)
+			}
+			originalID := task.ChannelId
+			var selected []int
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, before func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				selected = append(selected, channel.Id)
+				assert.Equal(t, request.Billing, outbound.Billing)
+				require.NoError(t, model.ReserveAsyncImageQuota(ctx, current, 100, model.ImageFundingSelection{Source: "wallet"}))
+				require.NoError(t, before())
+				var user model.User
+				require.NoError(t, db.First(&user, current.UserId).Error)
+				assert.Equal(t, 900, user.Quota, "retries share one reservation")
+				return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", Message: "supplier unavailable", SubmissionRejected: true}
+			}
+			for attempt := range 4 {
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				if attempt == 3 {
+					break
+				}
+				require.Equal(t, model.ImageTaskQueued, task.Status)
+				require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()-1).Error)
+				var err error
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, common.GetUUID(), cfg.WorkerLease)
+				require.NoError(t, err)
+			}
+			assert.Equal(t, []int{originalID, fallback.Id, originalID, fallback.Id}, selected, "first attempt uses weights; retries prefer fallback, recover after its failure, and may reuse it later")
+			assert.Equal(t, 3, task.RetryCount)
+			assert.Equal(t, model.ImageTaskFailed, task.Status, "fallback does not extend the retry budget")
+			var user model.User
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			assert.Equal(t, 1000, user.Quota, "exhausting retries releases the original reservation")
+			var reservations int64
+			require.NoError(t, db.Model(&model.AsyncImageBill{}).Where("task_id = ?", task.TaskId).Count(&reservations).Error)
+			assert.EqualValues(t, 1, reservations)
+			var refunds int64
+			require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+			assert.EqualValues(t, 1, refunds)
+		})
+	}
+}
+
 func TestAsyncImageConfiguredRetryActions(t *testing.T) {
 	for _, action := range []string{mediaretry.SameChannel, mediaretry.OtherChannel, mediaretry.LocalSameChannel, mediaretry.LocalOtherChannel} {
 		for _, scenario := range []string{"confirmed rejection", "unclassified HTTP 400", "unknown upstream job"} {
@@ -4149,6 +4300,9 @@ func TestAsyncImageDurableReferenceRoutingAndRedisIsolation(t *testing.T) {
 			require.NoError(t, err)
 			var restored []ImageChannelAttempt
 			require.NoError(t, common.Unmarshal(encoded, &restored))
+			if last := tc.history[len(tc.history)-1]; last.Dispatched && last.FinishedAt > 0 {
+				tc.want.RetryFromChannelID = last.ChannelId
+			}
 			assert.Equal(t, tc.want, ImageAccountAttemptRouting(restored, 2, tc.platform, tc.maxSwitches))
 		})
 	}
@@ -4780,6 +4934,7 @@ func TestClassifyGeminiAsyncImageHTTPFailurePreservesProviderDiagnostics(t *test
 			require.NoError(t, err)
 			var restored []ImageChannelAttempt
 			require.NoError(t, common.Unmarshal(encoded, &restored))
+			tc.want.RetryFromChannelID = 10
 			assert.Equal(t, tc.want, ImageAccountAttemptRouting(restored, 2, "gemini", 1))
 		})
 	}

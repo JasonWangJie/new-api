@@ -360,6 +360,102 @@ func TestAsyncMediaPollingWithoutFrozenJobPreservesUnconfirmedTask(t *testing.T)
 	assert.Zero(t, token.UsedQuota)
 }
 
+func TestVideoPoolFallbackChannelRouting(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		for _, scenario := range []string{"other channel", "local other channel", "same channel", "fallback just failed", "disabled fallback", "key selection failed", "rule excludes fallback", "other namespace", "unknown execution"} {
+			t.Run(fmt.Sprintf("mixed=%t/%s", mixed, scenario), func(t *testing.T) {
+				db, imageTask, _, _, fallback := asyncImageWorkerFixture(t)
+				const videoModel = "seedance2.0-E-720p"
+				source, err := builtinplugins.Source("drama")
+				require.NoError(t, err)
+				previousRegistry := jsplugin.DefaultRegistry
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "drama"})
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{imageTask.ChannelId, fallback.Id}).Updates(map[string]any{"type": constant.ChannelTypeTaskPlugin, "models": videoModel, "setting": `{"task_plugin_key":"drama"}`}).Error)
+				require.NoError(t, db.Model(&model.Ability{}).Where("model = ?", imageTask.Model).Update("model", videoModel).Error)
+				regular := model.Channel{Key: "video-regular", Status: common.ChannelStatusEnabled, Type: constant.ChannelTypeTaskPlugin, Group: imageTask.Group, Models: videoModel, Setting: common.GetPointer(`{"task_plugin_key":"drama"}`)}
+				require.NoError(t, db.Create(&regular).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: imageTask.Group, Model: videoModel, ChannelId: regular.Id, Enabled: true}).Error)
+				platform := "drama"
+				if mixed {
+					platform = "mixed"
+				}
+				policy := model.ImageGroupPolicy{PolicyKey: ImageIdentityHash(imageTask.Group, platform), Group: imageTask.Group, Platform: platform, Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"seedance2.0-E-720p","media_type":"video"}]`}
+				require.NoError(t, db.Create(&policy).Error)
+				key := MediaPoolBindingKey(policy, videoModel, "1K", "video")
+				bindings := []model.ImageChannelPool{
+					{BindingKey: key, Group: policy.Group, Platform: platform, Mode: policy.PoolMode, Model: videoModel, Resolution: "1K", ChannelId: imageTask.ChannelId},
+					{BindingKey: key, Group: policy.Group, Platform: platform, Mode: policy.PoolMode, Model: videoModel, Resolution: "1K", ChannelId: fallback.Id, IsFallback: true},
+					{BindingKey: key, Group: policy.Group, Platform: platform, Mode: policy.PoolMode, Model: videoModel, Resolution: "1K", ChannelId: regular.Id, Priority: 10},
+				}
+				require.NoError(t, db.Create(&bindings).Error)
+				job := model.AsyncMediaJob{TaskId: "video-fallback", UserId: imageTask.UserId, TokenId: imageTask.TokenId, Group: imageTask.Group, Model: videoModel, Provider: "drama", ChannelId: imageTask.ChannelId}
+				request := AsyncVideoRequest{
+					Body: []byte(`{"model":"seedance2.0-E-720p","prompt":"safe retry","seconds":5}`), ContentType: "application/json", Operation: "create",
+					Details:   &AsyncVideoRequestDetails{RequestedResolution: "720p"},
+					RetryFact: &mediaretry.Fact{ChannelID: imageTask.ChannelId, Terminal: true}, PendingDecision: &mediaretry.Decision{Action: mediaretry.OtherChannel},
+				}
+				if mixed {
+					request.MixedRouting = &MixedVideoRouting{Group: policy.Group, BindingKey: key, PoolMode: policy.PoolMode, Model: videoModel, Operation: "create", Resolution: "1K"}
+				}
+				want := regular.Id
+				switch scenario {
+				case "other channel":
+					want = fallback.Id
+				case "local other channel":
+					request.PendingDecision.Action = mediaretry.LocalOtherChannel
+					want = fallback.Id
+				case "same channel":
+					request.PendingDecision.Action = mediaretry.SameChannel
+					want = imageTask.ChannelId
+				case "fallback just failed":
+					request.RetryFact.ChannelID = fallback.Id
+				case "disabled fallback":
+					require.NoError(t, db.Model(&fallback).Update("status", common.ChannelStatusManuallyDisabled).Error)
+				case "key selection failed":
+					previousCache := common.MemoryCacheEnabled
+					common.MemoryCacheEnabled = false
+					t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
+					require.NoError(t, db.Model(&fallback).Update("channel_info", model.ChannelInfo{IsMultiKey: true, MultiKeyMode: constant.MultiKeyModePolling}).Error)
+					const callback = "test:fallback-key-unavailable"
+					require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+						if _, ok := tx.Statement.Dest.(*model.Channel); ok {
+							tx.AddError(errors.New("selected key is unavailable"))
+						}
+					}))
+					t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
+				case "rule excludes fallback":
+					request.PendingDecision.AllowedChannelIDs = []int{regular.Id}
+				case "other namespace":
+					require.NoError(t, db.Model(&bindings[1]).Update("is_fallback", false).Error)
+					other := bindings[1]
+					other.Id, other.IsFallback = 0, true
+					other.BindingKey = ImagePoolBindingKey(policy, videoModel, "1K")
+					if !mixed {
+						other.Resolution = "2K"
+						other.BindingKey = ImagePoolBindingKey(policy, videoModel, other.Resolution)
+					}
+					require.NoError(t, db.Create(&other).Error)
+				case "unknown execution":
+					request.RetryFact.Unknown, request.RetryFact.Terminal = true, false
+					want = fallback.Id
+				}
+				selected, err := PickVideoRetryChannel(t.Context(), job, request, videoModel)
+				if mixed && scenario == "unknown execution" {
+					require.Error(t, err)
+					assert.Nil(t, selected)
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, selected)
+				assert.Equal(t, want, selected.Id)
+			})
+		}
+	}
+}
+
 func TestAsyncVideoReferenceRecoverySnapshotWindow(t *testing.T) {
 	oldTimeout := constant.TaskTimeoutMinutes
 	constant.TaskTimeoutMinutes = 60

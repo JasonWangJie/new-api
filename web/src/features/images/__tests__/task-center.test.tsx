@@ -2494,7 +2494,7 @@ test.each([
       requiresConfirmation ?? status === 'execution_unknown'
     if (needsConfirmation) {
       expect(confirm).toHaveTextContent(
-        'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.'
+        'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.'
       )
     }
     vi.mocked(imageRequest).mockRejectedValueOnce(
@@ -3458,7 +3458,9 @@ test.each([
     expect(confirmation).toHaveTextContent(
       'Verify the upstream task before continuing.'
     )
-    expect(confirmation).toHaveTextContent('video billing remains unchanged')
+    expect(confirmation).toHaveTextContent(
+      'releases any remaining reserved quota'
+    )
     expect(imageRequest).not.toHaveBeenCalled()
     vi.mocked(imageRequest).mockResolvedValue({})
     vi.mocked(getImageTasks).mockResolvedValue({

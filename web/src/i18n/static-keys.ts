@@ -1182,6 +1182,7 @@ export const STATIC_I18N_KEYS = [
   'Model is not in the media policy',
   'Resolution is not in the media policy',
   'No mixed channel pool binding is configured',
+  'Fallback channel must belong to the channel pool',
   'API key is disabled',
   'API key has expired',
   'API key quota is exhausted',

@@ -730,6 +730,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{PublicTaskID: job.TaskId}
 		info.LockedChannel = &request.Channel
 		c.Set("async_media_execution", true)
+		c.Set("async_media_execution_lease_token", job.LeaseToken)
 		if retryTask != nil {
 			// Submit-time provider adjustments may have changed the original
 			// reservation. Preserve its settled hold and all frozen rates.
@@ -916,7 +917,9 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			return result, nil
 		}
 		deferred := errors.Is(taskErr.Error, service.ErrVideoRetryDeferred)
-		if !deferred && taskErr.LocalError && !retry.dispatched {
+		// Failed reference preparation has consumed its step; evaluateOnly
+		// must still advance the policy even after a deferred dispatch.
+		if !deferred && !evaluateOnly && taskErr.LocalError && !retry.dispatched {
 			// A local validation or dispatch-barrier failure never reached the
 			// provider. Keep any earlier unknown attempts, but do not invent a
 			// new uncertain operation or consume an upstream retry for this one.

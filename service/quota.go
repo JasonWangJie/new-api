@@ -419,6 +419,9 @@ func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
 	return preConsumeTokenQuotaWithMode(relayInfo, quota, false)
 }
 
+// This rejection proves the atomic token reservation made no deduction.
+var errInsufficientTokenQuota = errors.New("token quota is not enough")
+
 func preConsumeTokenQuotaWithMode(relayInfo *relaycommon.RelayInfo, quota int, durable bool) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
@@ -442,7 +445,7 @@ func preConsumeTokenQuotaWithMode(relayInfo *relaycommon.RelayInfo, quota int, d
 		if token, tokenErr := model.GetTokenByKey(relayInfo.TokenKey, false); tokenErr == nil && token != nil {
 			remainQuota = token.RemainQuota
 		}
-		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(remainQuota), logger.FormatQuota(quota))
+		return fmt.Errorf("%w, token remain quota: %s, need quota: %s", errInsufficientTokenQuota, logger.FormatQuota(remainQuota), logger.FormatQuota(quota))
 	}
 	return nil
 }

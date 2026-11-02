@@ -31,6 +31,7 @@ import { Field, FieldDescription, FieldGroup } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { handleServerError } from '@/lib/handle-server-error'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import { imageRequest } from '../api'
 import {
@@ -81,6 +82,10 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
   )
   const [channelIds, setChannelIds] = useState<number[]>(
     () => props.binding?.channels.map((row) => row.channel_id) || []
+  )
+  const [fallbackChannelId, setFallbackChannelId] = useState(
+    () =>
+      props.binding?.channels.find((row) => row.is_fallback)?.channel_id || 0
   )
   const [weights, setWeights] = useState<Record<number, number>>(() =>
     Object.fromEntries(
@@ -167,6 +172,17 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       }
     })
   }, [availableChannelIds, channelIds, poolOptions.data?.channels, t])
+  const fallbackOptions = [
+    { value: '0', label: t('Not configured') },
+    ...channelOptions
+      .filter((option) => channelIds.includes(Number(option.value)))
+      .map((option) => ({
+        ...option,
+        label: availableChannelIdSet.has(Number(option.value))
+          ? option.label
+          : `#${option.value} · ${t('Unavailable')}`,
+      })),
+  ]
   const save = useMutation({
     mutationFn: async () => {
       if (targetConflict) {
@@ -192,6 +208,9 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       if (channelIds.some((id) => !availableChannelIdSet.has(id))) {
         throw new Error(t('Invalid channel IDs'))
       }
+      if (fallbackChannelId !== 0 && !channelIds.includes(fallbackChannelId)) {
+        throw new Error(t('Invalid channel IDs'))
+      }
       await imageRequest('/api/option/images/pool', 'PUT', {
         expected_ids: editing ? props.binding?.rowIds : [],
         group: group.trim(),
@@ -200,6 +219,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         mode,
         model: mode === 'resolution' ? '' : model,
         resolution: mode === 'model' ? '' : resolution,
+        fallback_channel_id: fallbackChannelId,
         channels: channelIds.map((id) => ({
           id,
           weight: weights[id] ?? 0,
@@ -214,7 +234,10 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       toast.success(t('Saved'))
       props.onClose()
     },
-    onError: (error) => handleServerError(error, t('Image request failed')),
+    onError: (error) =>
+      handleServerError(error, t('Image request failed'), {
+        title: t(getServerErrorMessage(error, t('Image request failed'))),
+      }),
   })
   const busy = save.isPending
   return (
@@ -290,6 +313,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 setGroup(value)
                 setModel('')
                 setChannelIds([])
+                setFallbackChannelId(0)
                 setWeights({})
               }}
               disabled={busy || !props.canManage || editing}
@@ -311,6 +335,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 if (copying) return
                 setModel('')
                 setChannelIds([])
+                setFallbackChannelId(0)
                 setWeights({})
               }}
             />
@@ -327,6 +352,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                   setMediaType(value as 'image' | 'video')
                   setModel('')
                   setChannelIds([])
+                  setFallbackChannelId(0)
                   setWeights({})
                 }}
               />
@@ -352,6 +378,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 setMode(value)
                 if (value === 'resolution') setModel('')
                 setChannelIds([])
+                setFallbackChannelId(0)
                 setWeights({})
               }}
             />
@@ -365,6 +392,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                   onValueChange={(value) => {
                     setModel(value || '')
                     setChannelIds([])
+                    setFallbackChannelId(0)
                     setWeights({})
                   }}
                   placeholder={
@@ -403,6 +431,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 onChange={(values) => {
                   const ids = values.map(Number)
                   setChannelIds(ids)
+                  if (!ids.includes(fallbackChannelId)) setFallbackChannelId(0)
                   setWeights((previous) =>
                     Object.fromEntries(ids.map((id) => [id, previous[id] ?? 0]))
                   )
@@ -420,12 +449,37 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
                 }
               />
             </Field>
+            <Field>
+              <ImageSelect
+                label={t('Fallback channel')}
+                value={String(fallbackChannelId)}
+                options={fallbackOptions}
+                onChange={(value) => setFallbackChannelId(Number(value))}
+                disabled={
+                  busy ||
+                  !props.canManage ||
+                  poolOptions.isLoading ||
+                  poolOptions.isError ||
+                  channelIds.length === 0
+                }
+              />
+              <FieldDescription>
+                {t(
+                  'On a channel-switch retry, try this pool member first, even at zero weight. Initial requests still follow pool weights; if it is unavailable, use the existing selection rules.'
+                )}
+              </FieldDescription>
+            </Field>
             {poolOptions.isError && (
               <p
                 className='text-destructive text-sm sm:col-span-2'
                 role='alert'
               >
-                {poolOptions.error.message}
+                {t(
+                  getServerErrorMessage(
+                    poolOptions.error,
+                    t('Image request failed')
+                  )
+                )}
               </p>
             )}
             <div className='sm:col-span-2'>
@@ -518,7 +572,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
       </form>
       {save.isError && (
         <p role='alert' className='text-destructive mt-3 text-sm'>
-          {save.error.message}
+          {t(getServerErrorMessage(save.error, t('Image request failed')))}
         </p>
       )}
     </Dialog>
