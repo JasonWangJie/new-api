@@ -9,6 +9,10 @@ import (
 
 var ErrAsyncQueueFull = errors.New("asynchronous media admission limit reached")
 
+// AsyncMediaMaxTaskAgeSeconds bounds unfinished tasks from their original
+// acceptance time, including paused post-processing and uncertain executions.
+const AsyncMediaMaxTaskAgeSeconds = 4 * 60 * 60
+
 // enforceAsyncAdmission runs while the caller holds the user's row lock, before
 // inserting any task or idempotency record. Image and video queues each have
 // their own budget, so a video backlog cannot block image admission.

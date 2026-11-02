@@ -256,12 +256,14 @@ func QueryAsyncImage(c *gin.Context) {
 			return
 		}
 	}
-	if task.Terminal() && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() {
+	resultExpired := task.Status == model.ImageTaskSucceeded && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix()
+	if task.Terminal() && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() && !resultExpired {
 		AsyncImagePublicError(c, 404, "task_not_found", "Image task was not found")
 		return
 	}
 	c.Header("Cache-Control", "no-store")
 	response := gin.H{"task_id": task.TaskId}
+	response["result_expired"] = resultExpired
 	notice := service.ImageTaskFailureNotice(task)
 	response["failure_code"] = task.PublicErrorCode
 	response["error_summary"], response["error_suggestion"] = notice.SummaryText(), notice.SuggestionText()
@@ -285,6 +287,14 @@ func QueryAsyncImage(c *gin.Context) {
 		if task.Status == model.ImageTaskStorageFailed {
 			response["storage_status"] = "failed"
 		}
+		if resultExpired {
+			response["storage_status"] = "expired"
+		}
+	}
+	if resultExpired {
+		response["status"], response["data"] = "succeeded", []gin.H{}
+		c.JSON(http.StatusOK, response)
+		return
 	}
 	if task.ResultsAvailable() {
 		if canvas {

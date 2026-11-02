@@ -145,7 +145,7 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 			}
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &options))
 			require.Len(t, options.Data.Models, 1)
-			assert.ElementsMatch(t, []int{1, 29, 45, 60}, options.Data.Models[0].ChannelIds)
+			assert.ElementsMatch(t, []int{1, 24, 29, 45, 60}, options.Data.Models[0].ChannelIds)
 			assert.NotContains(t, recorder.Body.String(), "fixture-shared-key")
 
 			for _, mode := range []string{"resolution", "model", "model_resolution"} {
@@ -201,7 +201,7 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				excluded := make(map[int][]string)
 				for _, candidate := range response.Data.Excluded {
 					excluded[candidate.ChannelID] = candidate.Reasons
-					if candidate.ChannelID == 24 || candidate.ChannelID == 54 {
+					if candidate.ChannelID == 54 {
 						assert.Contains(t, candidate.Reasons, "platform_mismatch")
 					}
 				}
@@ -209,8 +209,8 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				assert.Contains(t, excluded, 54)
 				assert.NotContains(t, recorder.Body.String(), "fixture-openai-key")
 			})
-			t.Run("native image and video task protocols cannot be saved in mixed pools", func(t *testing.T) {
-				for _, channelID := range []int{24, 54} {
+			t.Run("video task protocols cannot be saved in mixed pools", func(t *testing.T) {
+				for _, channelID := range []int{54} {
 					recorder := call(http.MethodPut, "/pool", gin.H{"group": "default", "platform": "mixed", "mode": "model_resolution", "model": publicModel, "resolution": "2K", "channels": []gin.H{{"id": channelID, "priority": 1}}})
 					assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
 				}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -90,7 +91,7 @@ func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) erro
 	// filesystem cleanup remains discoverable on the next sweep.
 	changes := map[string]any{"storage_status": "expired", "request_cipher": nil, "channel_cipher": nil}
 	if job.ReferenceRecoveryStage != "refund" {
-		changes["status"] = "expired"
+		changes["status"] = gorm.Expr("CASE WHEN status IN ? THEN status ELSE ? END", []string{"failed", "succeeded"}, "expired")
 	}
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Match settlement's task-before-job lock order. Retention expiry must
@@ -108,6 +109,120 @@ func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) erro
 		query = ExcludePendingSubmissionReconciliation(query)
 		return ChangeAsyncMediaJob(query, changes, "")
 	})
+}
+
+// FailAgedAsyncMediaJob fences every prior worker before local timeout policy
+// ends the operation. Unknown accounting remains held for reconciliation.
+func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, automatic bool) (AsyncMediaJob, error) {
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var task Task
+		taskErr := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
+		if taskErr != nil && !errors.Is(taskErr, gorm.ErrRecordNotFound) {
+			return taskErr
+		}
+		var current AsyncMediaJob
+		if err := lockForUpdate(tx).Where("id = ? AND task_id = ? AND user_id = ?", job.ID, job.TaskId, job.UserId).Take(&current).Error; err != nil {
+			return err
+		}
+		if current.HasPendingSubmissionReconciliation() || current.Status == "failed" || current.Status == "succeeded" || current.CreatedAt <= 0 ||
+			automatic && current.CreatedAt > now-AsyncMediaMaxTaskAgeSeconds || !automatic && current.Status != "expired" ||
+			current.Status == "expired" && (taskErr == nil && task.Status == TaskStatusSuccess || current.BillingStatus == "settled") {
+			return ErrImageConflict
+		}
+		if taskErr == nil && task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation != nil && task.Status != TaskStatusSuccess && task.Status != TaskStatusFailure {
+			return ErrImageConflict
+		}
+		if current.AttemptGeneration == math.MaxInt64 {
+			return ErrTaskAttemptConflict
+		}
+		generation := current.AttemptGeneration + 1
+		reason, event := AsyncMediaTaskAgeExceededReason, "age_limit_failed"
+		if !automatic {
+			reason, event = AsyncMediaExpiredTerminatedReason, "terminated"
+		}
+		billing, stage := current.BillingStatus, "age_limit_complete"
+		dispatched := current.DispatchedAt > 0 || current.Status == "submitted" || current.ReferenceRecoveryStage == "dispatched" || current.ReferenceRecoveryStage == "waiting" ||
+			task.PrivateData.UpstreamTaskID != "" || task.Status == TaskStatusSubmitted || task.Status == TaskStatusInProgress
+		confirmedFailure := task.Status == TaskStatusFailure && task.PrivateData.VideoTerminalConfirmed
+		if billing != "settled" && billing != "refunded" && billing != "not_billable" {
+			billing, stage = "unknown", "age_limit_unknown"
+			if taskErr == nil && task.AttemptGeneration == current.AttemptGeneration && task.ChannelId == current.ChannelId && task.PrivateData.TokenId == current.TokenId {
+				switch {
+				case task.Status == TaskStatusSuccess:
+					billing, stage = "settled", "age_limit_complete"
+				case task.Status == TaskStatusFailure && task.Quota == 0:
+					billing, stage = "refunded", "age_limit_complete"
+				case task.Status != TaskStatusUnknown && current.Status != "execution_unknown" && current.ReferenceRecoveryStage != "unknown" && current.BillingStatus == "reserved" && task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && (confirmedFailure || !dispatched && task.Status != TaskStatusFailure):
+					billing, stage = "reserved", "age_limit_refund"
+				}
+			} else if errors.Is(taskErr, gorm.ErrRecordNotFound) && current.DispatchedAt == 0 && current.Quota == 0 && current.BillingStatus == "pending" {
+				billing, stage = "not_billable", "age_limit_complete"
+			}
+		}
+		if taskErr == nil && task.AttemptGeneration == current.AttemptGeneration {
+			task.AttemptGeneration = generation
+			if task.Status != TaskStatusSuccess {
+				task.Status, task.FailReason, task.Progress, task.FinishTime = TaskStatusFailure, reason, "100%", now
+				if stage == "age_limit_refund" {
+					task.Status = TaskStatusUnknown
+				}
+				task.PrivateData.VideoTerminalConfirmed = false
+				task.PrivateData.ResultURL, task.PrivateData.PluginState, task.PrivateData.UpstreamAsyncResponse = "", nil, nil
+				task.Data = nil
+			}
+			if err := tx.Model(&Task{}).Where("id = ? AND attempt_generation = ?", task.ID, current.AttemptGeneration).
+				Updates(map[string]any{"attempt_generation": generation, "status": task.Status, "fail_reason": task.FailReason, "progress": task.Progress, "finish_time": task.FinishTime, "updated_at": now, "private_data": task.PrivateData, "data": task.Data}).Error; err != nil {
+				return err
+			}
+		}
+		updates := map[string]any{"status": "failed", "billing_status": billing, "reference_recovery_stage": stage, "attempt_generation": generation,
+			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil, "error_message": reason}
+		if billing == "refunded" || billing == "not_billable" {
+			updates["quota"] = 0
+		}
+		if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", current.ID).Take(&job).Error; err != nil {
+			return err
+		}
+		if err := recordAsyncMediaEventTx(tx, job, event, "", nil, ""); err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, current, job, nil, "")
+	})
+	return job, err
+}
+
+// ReconcileAgedAsyncMediaReservation preserves the existing administrator
+// recovery path for an unconfirmed replacement of a durably reserved task.
+func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, error) {
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var task Task
+		if err := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error; err != nil {
+			return err
+		}
+		var current AsyncMediaJob
+		if err := lockForUpdate(tx).Where("id = ?", job.ID).Take(&current).Error; err != nil {
+			return err
+		}
+		if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" || current.BillingStatus != "unknown" || current.ReferenceRetryCount != 1 ||
+			current.AttemptGeneration != task.AttemptGeneration || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TokenId != task.PrivateData.TokenId ||
+			task.Status != TaskStatusFailure || task.Quota <= 0 || task.Quota != current.Quota || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.PrivateData.UpstreamTaskID != "" {
+			return ErrImageConflict
+		}
+		if err := tx.Model(&Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, TaskStatusFailure, task.AttemptGeneration).Update("status", TaskStatusUnknown).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID).Updates(map[string]any{"billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", current.ID).Take(&job).Error; err != nil {
+			return err
+		}
+		return recordAsyncMediaEventTx(tx, job, "reconciliation", "", nil, "")
+	})
+	return job, err
 }
 
 func recordAsyncMediaEventTx(tx *gorm.DB, job AsyncMediaJob, eventType, discriminator string, keyIndex *int, referenceMode string) error {
@@ -196,13 +311,19 @@ func recordAsyncMediaNativeTaskTx(tx *gorm.DB, task Task, receipt bool) error {
 		return nil
 	}
 	var job AsyncMediaJob
-	err := tx.Session(&gorm.Session{NewDB: true}).Where("task_id = ? AND user_id = ? AND channel_id = ? AND token_id = ? AND attempt_generation = ?",
-		task.TaskID, task.UserId, task.ChannelId, task.PrivateData.TokenId, task.AttemptGeneration).Take(&job).Error
+	err := lockForUpdate(tx.Session(&gorm.Session{NewDB: true})).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&job).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if strings.HasPrefix(job.ReferenceRecoveryStage, "age_limit_") &&
+		(job.AttemptGeneration != task.AttemptGeneration || receipt || task.Status == TaskStatusSuccess) {
+		return ErrTaskAttemptConflict
+	}
+	if job.ChannelId != task.ChannelId || job.TokenId != task.PrivateData.TokenId || job.AttemptGeneration != task.AttemptGeneration {
+		return nil
 	}
 	if receipt {
 		if err := recordAsyncMediaEventTx(tx, job, "submitted", "", nil, ""); err != nil {

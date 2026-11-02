@@ -841,6 +841,159 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 
+			t.Run("successful file expiry cleanup preserves outcomes and accounting", func(t *testing.T) {
+				cfg := service.DefaultMediaRuntimeConfig()
+				cfg.LocalPath = t.TempDir()
+				require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+				cleaned := make([]model.AsyncMediaJob, 100)
+				for i := range cleaned {
+					id := fmt.Sprintf("file-expiry-cleaned-%d", i)
+					cleaned[i] = model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "expired", BillingStatus: "settled", CreatedAt: now, ExpiresAt: now - 1}
+				}
+				require.NoError(t, db.Create(&cleaned).Error)
+				completed := model.AsyncMediaJob{TaskId: "file-expiry-success", IdentityHash: "file-expiry-success", UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "succeeded", BillingStatus: "settled", Quota: 240, CreatedAt: now, ExpiresAt: now - 1, RequestCipher: []byte("expired-request"), ChannelCipher: []byte("expired-channel"), OutputRootPath: cfg.LocalPath, OutputObjectKey: "expired.bin"}
+				failed := model.AsyncMediaJob{TaskId: "file-expiry-failure", IdentityHash: "file-expiry-failure", UserId: 101, TokenId: 201, Status: "failed", StorageStatus: "pending", BillingStatus: "unknown", Quota: 120, CreatedAt: now, ExpiresAt: now - 1, RequestCipher: []byte("expired-request"), ChannelCipher: []byte("expired-channel")}
+				require.NoError(t, os.WriteFile(filepath.Join(cfg.LocalPath, completed.OutputObjectKey), []byte("expired output"), 0600))
+				require.NoError(t, db.Create(&completed).Error)
+				require.NoError(t, db.Create(&failed).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&cleaned).Error)
+					assert.NoError(t, db.Delete(&completed).Error)
+					assert.NoError(t, db.Delete(&failed).Error)
+				})
+				var userBefore model.User
+				var tokenBefore model.Token
+				var logsBefore int64
+				require.NoError(t, db.Take(&userBefore, 101).Error)
+				require.NoError(t, db.Take(&tokenBefore, 201).Error)
+				require.NoError(t, logDB.Model(&model.Log{}).Count(&logsBefore).Error)
+				for range 2 {
+					require.NoError(t, service.CleanupMediaObjects(t.Context()))
+				}
+				for _, before := range []model.AsyncMediaJob{completed, failed} {
+					var after model.AsyncMediaJob
+					require.NoError(t, db.Take(&after, before.ID).Error)
+					assert.Equal(t, before.Status, after.Status)
+					assert.Equal(t, before.BillingStatus, after.BillingStatus)
+					assert.Equal(t, before.Quota, after.Quota)
+					assert.Equal(t, "expired", after.StorageStatus)
+					assert.Empty(t, after.RequestCipher)
+					assert.Empty(t, after.ChannelCipher)
+					assert.Empty(t, after.OutputRootPath)
+					assert.Empty(t, after.OutputObjectKey)
+				}
+				_, fileErr := os.Stat(filepath.Join(cfg.LocalPath, completed.OutputObjectKey))
+				assert.ErrorIs(t, fileErr, os.ErrNotExist)
+				t.Run("failed deletes do not hide later expired jobs or artifacts", func(t *testing.T) {
+					blockedPath := filepath.Join(cfg.LocalPath, "blocked-output")
+					require.NoError(t, os.Mkdir(blockedPath, 0700))
+					blocker := filepath.Join(blockedPath, "still-present.bin")
+					require.NoError(t, os.WriteFile(blocker, []byte("deletion must fail for a nonempty directory"), 0600))
+					blockedJobs := make([]model.AsyncMediaJob, 100)
+					blockedObjects := make([]model.MediaArtifactObject, 100)
+					for i := range blockedJobs {
+						id := fmt.Sprintf("file-expiry-blocked-%d", i)
+						blockedJobs[i] = model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "succeeded", BillingStatus: "settled", Quota: 240, CreatedAt: now, ExpiresAt: now - 1, OutputRootPath: cfg.LocalPath, OutputObjectKey: "blocked-output"}
+						blockedObjects[i] = model.MediaArtifactObject{ObjectId: id, IdentityHash: id, TaskId: id, UserId: 101, TokenId: 201, RootPath: cfg.LocalPath, ObjectKey: "blocked-output", Status: "active", ExpiresAt: now - 1}
+					}
+					require.NoError(t, db.Create(&blockedJobs).Error)
+					require.NoError(t, db.Create(&blockedObjects).Error)
+					laterJob := model.AsyncMediaJob{TaskId: "file-expiry-after-errors", IdentityHash: "file-expiry-after-errors", UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "succeeded", BillingStatus: "settled", Quota: 240, CreatedAt: now, ExpiresAt: now - 1, OutputRootPath: cfg.LocalPath, OutputObjectKey: "later-output.bin"}
+					laterObject := model.MediaArtifactObject{ObjectId: "file-expiry-after-errors", IdentityHash: "file-expiry-after-errors", TaskId: laterJob.TaskId, UserId: 101, TokenId: 201, RootPath: cfg.LocalPath, ObjectKey: "later-artifact.bin", Status: "active", ExpiresAt: now - 1}
+					require.NoError(t, db.Create(&laterJob).Error)
+					require.NoError(t, db.Create(&laterObject).Error)
+					require.NoError(t, os.WriteFile(filepath.Join(cfg.LocalPath, laterJob.OutputObjectKey), []byte("later output"), 0600))
+					require.NoError(t, os.WriteFile(filepath.Join(cfg.LocalPath, laterObject.ObjectKey), []byte("later artifact"), 0600))
+					t.Cleanup(func() {
+						assert.NoError(t, db.Delete(&blockedJobs).Error)
+						assert.NoError(t, db.Delete(&blockedObjects).Error)
+						assert.NoError(t, db.Delete(&laterJob).Error)
+						assert.NoError(t, db.Delete(&laterObject).Error)
+					})
+					for range 2 {
+						require.Error(t, service.CleanupMediaObjects(t.Context()), "failed deletions remain visible without stopping later cleanup")
+					}
+					var after model.AsyncMediaJob
+					require.NoError(t, db.Take(&after, laterJob.ID).Error)
+					assert.Equal(t, "succeeded", after.Status)
+					assert.Equal(t, "settled", after.BillingStatus)
+					assert.Equal(t, laterJob.Quota, after.Quota)
+					assert.Equal(t, "expired", after.StorageStatus)
+					assert.Empty(t, after.OutputObjectKey)
+					for _, name := range []string{laterJob.OutputObjectKey, laterObject.ObjectKey} {
+						_, err := os.Stat(filepath.Join(cfg.LocalPath, name))
+						assert.ErrorIs(t, err, os.ErrNotExist, "later files must be cleaned beyond a full page of failed deletions")
+					}
+					var retained model.AsyncMediaJob
+					require.NoError(t, db.Take(&retained, blockedJobs[0].ID).Error)
+					assert.Equal(t, blockedJobs[0].OutputRootPath, retained.OutputRootPath)
+					assert.Equal(t, blockedJobs[0].OutputObjectKey, retained.OutputObjectKey)
+					var remaining int64
+					require.NoError(t, db.Model(&model.MediaArtifactObject{}).Where("id = ?", laterObject.ID).Count(&remaining).Error)
+					assert.Zero(t, remaining)
+					require.NoError(t, db.Model(&model.MediaArtifactObject{}).Where("object_key = ?", "blocked-output").Count(&remaining).Error)
+					assert.EqualValues(t, len(blockedObjects), remaining, "failed file deletion must retain its retry records")
+					require.NoError(t, os.Remove(blocker))
+					for range 2 {
+						require.NoError(t, service.CleanupMediaObjects(t.Context()))
+					}
+					require.NoError(t, db.Take(&retained, blockedJobs[0].ID).Error)
+					assert.Equal(t, "succeeded", retained.Status)
+					assert.Equal(t, "settled", retained.BillingStatus)
+					assert.Equal(t, "expired", retained.StorageStatus)
+					assert.Empty(t, retained.OutputObjectKey)
+					require.NoError(t, db.Model(&model.MediaArtifactObject{}).Where("object_key = ?", "blocked-output").Count(&remaining).Error)
+					assert.Zero(t, remaining, "repairing the deletion error must allow the retained rows to be retried")
+				})
+				var userAfter model.User
+				var tokenAfter model.Token
+				var logsAfter int64
+				require.NoError(t, db.Take(&userAfter, 101).Error)
+				require.NoError(t, db.Take(&tokenAfter, 201).Error)
+				require.NoError(t, logDB.Model(&model.Log{}).Count(&logsAfter).Error)
+				assert.Equal(t, userBefore, userAfter)
+				assert.Equal(t, tokenBefore, tokenAfter)
+				assert.Equal(t, logsBefore, logsAfter, "file expiry must not repeat a financial adjustment")
+			})
+			t.Run("successful image metadata survives file expiry without links", func(t *testing.T) {
+				expired := model.AsyncImageTask{TaskId: "asyncimg_file_expiry", UserId: 101, TokenId: 201, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Progress: 100, ResultCount: 1, ExpiresAt: now - 1, PromptSummary: "expired-private-prompt", RequestCipher: []byte("expired-private-request")}
+				require.NoError(t, db.Create(&expired).Error)
+				t.Cleanup(func() { assert.NoError(t, db.Delete(&expired).Error) })
+				require.NoError(t, model.EraseExpiredAsyncImageTaskContent(t.Context()))
+				for _, surface := range []string{"public", "owner", "administrator"} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Set("token_id", 201)
+					c.Params = gin.Params{{Key: "task_id", Value: expired.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+expired.TaskId, nil)
+					if surface == "public" {
+						QueryAsyncImage(c)
+					} else {
+						GetImageTask(c, surface == "administrator")
+					}
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var view gin.H
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
+					if surface == "public" {
+						assert.Empty(t, view["data"])
+					} else {
+						assert.Empty(t, view["data"].(map[string]any)["results"])
+						view = view["data"].(map[string]any)["task"].(map[string]any)
+					}
+					assert.Equal(t, "succeeded", view["status"])
+					assert.Equal(t, "completed", view["stage"])
+					assert.Equal(t, true, view["result_expired"])
+					assert.NotContains(t, recorder.Body.String(), "expired-private")
+				}
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", 101)
+				c.Params = gin.Params{{Key: "task_id", Value: expired.TaskId}, {Key: "image_index", Value: "0"}}
+				c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+				ViewImageTaskResult(c, false)
+				assert.Equal(t, http.StatusNotFound, recorder.Code)
+			})
 			t.Run("Drama upstream queue and progress remain separate from local processing", func(t *testing.T) {
 				job := model.AsyncMediaJob{TaskId: "task_drama_progress", IdentityHash: "drama-progress", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Model: "seedance2.0-A", Status: "submitted", StorageStatus: "pending", BillingStatus: "reserved", DispatchedAt: now - 5, CreatedAt: now, ExpiresAt: now + 3600}
 				upstream := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Action: "text_to_video", Status: model.TaskStatusQueued, Progress: "0%", Data: []byte(`{"status":"queued","progress":0,"id":"private-drama-id"}`)}
@@ -858,7 +1011,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					jobBilling, billing                                                   string
 					upstreamProgress                                                      any
 					expired                                                               bool
+					resultExpired                                                         bool
 					noTask, terminable                                                    bool
+					administratorTerminable                                               bool
 					output                                                                string
 				}{
 					{name: "local queue before submission", jobStatus: "queued", noTask: true, terminable: true, status: "queued", stage: "queued", progress: 0},
@@ -877,9 +1032,19 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "saving takes precedence", taskStatus: model.TaskStatusQueued, storage: "saving", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "uploading", stage: "saving", progress: 80, upstreamProgress: float64(0)},
 					{name: "storage failure takes precedence", taskStatus: model.TaskStatusQueued, storage: "failed", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "storage_failed", stage: "saving", progress: 80, upstreamProgress: float64(0)},
 					{name: "completed job takes precedence", taskStatus: model.TaskStatusQueued, jobStatus: "succeeded", storage: "upstream", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "succeeded", stage: "completed", progress: 100, upstreamProgress: float64(0)},
-					{name: "missing saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
-					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
-					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "expired", stage: "failed", progress: 100, upstreamProgress: float64(100)},
+					{name: "missing saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
+					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
+					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
+					{name: "retained success remains successful after expiry", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "expired", jobBilling: "settled", billing: "settled", taskProgress: "100%", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "historical Drama success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "historical Sora success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "historical success derives settled cost from its native receipt", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "reserved", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "historical success with stale unknown billing keeps its settled cost", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "unknown", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "historical success cannot clear explicit billing failure", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "failed", billing: "failed", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "expired other provider cannot remain in the saving phase", taskStatus: model.TaskStatusSuccess, jobStatus: "submitted", provider: "sora", storage: "pending", billing: "settled", status: "expired", stage: "failed", progress: 100, expired: true},
+					{name: "completed job without native receipt remains successful", jobStatus: "succeeded", noTask: true, storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
+					{name: "native failure cannot become a success after file expiry", taskStatus: model.TaskStatusFailure, jobStatus: "succeeded", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true},
+					{name: "other provider expired native failure agrees with filters", taskStatus: model.TaskStatusFailure, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorTerminable: true},
 					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "failed task refund remains unconfirmed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", taskQuota: 120, billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "zero task quota cannot clear known billing failure", taskStatus: model.TaskStatusFailure, taskProgress: "100%", jobBilling: "failed", billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
@@ -946,10 +1111,15 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							var view gin.H
 							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
 							if surface != "public" {
+								if tc.resultExpired {
+									assert.Empty(t, view["data"].(map[string]any)["results"], surface)
+								}
 								view = view["data"].(map[string]any)["task"].(map[string]any)
+							} else if tc.resultExpired {
+								assert.Empty(t, view["data"], surface)
 							}
 							expectedStatus := tc.status
-							expectedTerminable := tc.terminable
+							expectedTerminable := tc.terminable || surface == "administrator" && tc.administratorTerminable
 							if tc.status == "execution_unknown" {
 								expectedStatus = "failed"
 								assert.Equal(t, "unknown", view["billing_status"], surface)
@@ -968,6 +1138,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								assert.NotContains(t, view, "error_retryable", surface)
 							}
 							assert.Equal(t, expectedStatus, view["status"], surface)
+							assert.Equal(t, tc.resultExpired, view["result_expired"], surface)
 							if tc.billing != "" {
 								assert.Equal(t, tc.billing, view["billing_status"], surface)
 							}
@@ -980,6 +1151,14 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							}
 							assert.Equal(t, expectedTerminable, view["can_terminate"], surface)
 						}
+						if tc.resultExpired {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+							serveAuthorizedMediaTaskResult(c, job, "video")
+							c.Writer.WriteHeaderNow()
+							assert.Equal(t, http.StatusNotFound, recorder.Code, "expired successful metadata must not restore media access")
+						}
 						var persisted model.AsyncMediaJob
 						require.NoError(t, db.Where("id = ?", job.ID).Take(&persisted).Error)
 						assert.Equal(t, job, persisted, "queries must preserve the job, quotation, billing and scheduling state")
@@ -988,7 +1167,14 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							filterStatus = "failed"
 						}
 						for _, admin := range []bool{false, true} {
-							for _, filter := range []string{"", "&status=" + filterStatus, "&stage=" + tc.stage, "&status=queued&stage=generating"} {
+							filters := []string{"", "&status=" + filterStatus, "&stage=" + tc.stage, "&status=queued&stage=generating"}
+							if tc.billing != "" {
+								filters = append(filters, "&billing_status="+tc.billing)
+							}
+							if tc.resultExpired {
+								filters = append(filters, "&status=expired", "&stage=failed")
+							}
+							for _, filter := range filters {
 								recorder := httptest.NewRecorder()
 								c, _ := gin.CreateTestContext(recorder)
 								c.Set("id", 101)
@@ -1003,7 +1189,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								}
 								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
-								if filter == "&status=queued&stage=generating" {
+								if filter == "&status=queued&stage=generating" || tc.resultExpired && (filter == "&status=expired" || filter == "&stage=failed") {
 									assert.Empty(t, response.Data.Items)
 									assert.Zero(t, response.Data.Total)
 									continue
@@ -1015,6 +1201,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 									expectedStatus = "failed"
 								}
 								assert.Equal(t, expectedStatus, response.Data.Items[0]["status"], filter)
+								assert.Equal(t, tc.resultExpired, response.Data.Items[0]["result_expired"], filter)
 								if tc.billing != "" {
 									assert.Equal(t, tc.billing, response.Data.Items[0]["billing_status"], filter)
 								}
@@ -1026,6 +1213,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 									stat = "failed"
 								}
 								assert.Equal(t, float64(1), response.Data.Stats[stat], filter)
+								if tc.status == "succeeded" && tc.taskStatus == model.TaskStatusSuccess {
+									settledQuota := tc.taskQuota
+									if tc.billing == "failed" {
+										settledQuota = 0
+									}
+									assert.InDelta(t, float64(settledQuota)/common.QuotaPerUnit, response.Data.Stats["succeeded_cost"], 1e-9, filter)
+								}
 								if stat != "queued" {
 									assert.Zero(t, response.Data.Stats["queued"], filter)
 								}
@@ -2150,11 +2344,190 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 
+			t.Run("age held quota requires both confirmations", func(t *testing.T) {
+				var originalUser model.User
+				var originalToken model.Token
+				require.NoError(t, db.First(&originalUser, 101).Error)
+				require.NoError(t, db.First(&originalToken, 201).Error)
+				previousRedis, previousRDB := common.RedisEnabled, common.RDB
+				common.RedisEnabled, common.RDB = false, nil
+				t.Cleanup(func() {
+					common.RedisEnabled, common.RDB = previousRedis, previousRDB
+					assert.NoError(t, db.Model(&model.User{}).Where("id = ?", originalUser.Id).Update("quota", originalUser.Quota).Error)
+					assert.NoError(t, db.Model(&model.Token{}).Where("id = ?", originalToken.Id).Updates(map[string]any{"remain_quota": originalToken.RemainQuota, "used_quota": originalToken.UsedQuota}).Error)
+				})
+				for _, batch := range []bool{false, true} {
+					id := fmt.Sprintf("asyncimg_age_held_quota_%t", batch)
+					held := model.AsyncImageTask{TaskId: id, UserId: 101, TokenId: 201, Status: model.ImageTaskFailed, BillingStatus: "reserved", Version: 1, ErrorCode: "task_age_exceeded", PublicErrorCode: 608, ReconciliationStatus: "quota_unconfirmed", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds - 60, FinishedAt: now}
+					bill := model.AsyncImageBill{TaskId: id, BillingRequestId: "age-held:" + id, UserId: 101, TokenId: 201, Status: "fixed", FundingSource: "wallet", ReservedAt: held.CreatedAt, ReservedQuota: 100, ReservedTokenQuota: 100, Quota: 100, CreatedAt: held.CreatedAt}
+					require.NoError(t, db.Model(&model.User{}).Where("id = ?", originalUser.Id).Update("quota", 900).Error)
+					require.NoError(t, db.Model(&model.Token{}).Where("id = ?", originalToken.Id).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+					require.NoError(t, db.Create(&held).Error)
+					require.NoError(t, db.Create(&bill).Error)
+					for _, step := range []struct {
+						name            string
+						upstreamChecked bool
+						quotaReconciled bool
+						wantStatus      int
+						wantBatchStatus string
+						completed       bool
+					}{
+						{name: "quota confirmation missing", upstreamChecked: true, wantStatus: http.StatusBadRequest, wantBatchStatus: "failed"},
+						{name: "upstream confirmation missing", quotaReconciled: true, wantStatus: http.StatusConflict, wantBatchStatus: "failed"},
+						{name: "both confirmed", upstreamChecked: true, quotaReconciled: true, wantStatus: http.StatusOK, wantBatchStatus: "terminated", completed: true},
+						{name: "repeated confirmation", upstreamChecked: true, quotaReconciled: true, wantStatus: http.StatusConflict, wantBatchStatus: "skipped", completed: true},
+					} {
+						body := map[string]any{"confirm_upstream_checked": step.upstreamChecked, "confirm_quota_reconciled": step.quotaReconciled}
+						path := "/api/admin/async-image-tasks/" + id + "/terminate"
+						if batch {
+							body["task_ids"], path = []string{id}, "/api/admin/async-image-tasks/batch-terminate"
+						}
+						encoded, err := common.Marshal(body)
+						require.NoError(t, err)
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: id}}
+						c.Request = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+						if batch {
+							BatchTerminateImageTasks(c)
+							require.Equal(t, http.StatusOK, recorder.Code, step.name+": "+recorder.Body.String())
+							var response struct {
+								Data struct {
+									Items []struct{ Status string }
+								}
+							}
+							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+							require.Len(t, response.Data.Items, 1)
+							assert.Equal(t, step.wantBatchStatus, response.Data.Items[0].Status, step.name)
+						} else {
+							ManageImageTask(c, "terminate")
+							assert.Equal(t, step.wantStatus, recorder.Code, step.name+": "+recorder.Body.String())
+						}
+						if !step.quotaReconciled {
+							assert.Contains(t, recorder.Body.String(), "Confirm the quota reservation has been reconciled before resuming billing")
+						}
+						var saved model.AsyncImageTask
+						var savedBill model.AsyncImageBill
+						var user model.User
+						var token model.Token
+						require.NoError(t, db.Where("task_id = ?", id).Take(&saved).Error)
+						require.NoError(t, db.Where("task_id = ?", id).Take(&savedBill).Error)
+						require.NoError(t, db.First(&user, 101).Error)
+						require.NoError(t, db.First(&token, 201).Error)
+						view := imageTaskDTO(saved, true)
+						assert.Equal(t, !step.completed, view["can_terminate"], step.name)
+						assert.Equal(t, !step.completed, view["termination_requires_reconciliation"], step.name)
+						assert.Equal(t, !step.completed, view["termination_requires_quota_reconciliation"], step.name)
+						var refunds int64
+						require.NoError(t, db.Model(&model.AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", id, "reservation_refunded").Count(&refunds).Error)
+						if step.completed {
+							assert.Equal(t, "refunded", savedBill.Status)
+							assert.Equal(t, "refunded", saved.ReconciliationStatus)
+							assert.Equal(t, 1000, user.Quota)
+							assert.Equal(t, 1000, token.RemainQuota)
+							assert.Zero(t, token.UsedQuota)
+							assert.EqualValues(t, 1, refunds)
+						} else {
+							assert.Equal(t, held, saved, "missing either confirmation must leave the held task unchanged")
+							assert.Equal(t, "fixed", savedBill.Status)
+							assert.Equal(t, 900, user.Quota)
+							assert.Equal(t, 900, token.RemainQuota)
+							assert.Equal(t, 100, token.UsedQuota)
+							assert.Zero(t, refunds)
+						}
+					}
+				}
+			})
+			t.Run("expired task management preserves successful outcomes", func(t *testing.T) {
+				for _, item := range []struct {
+					name      string
+					video     bool
+					succeeded bool
+				}{
+					{name: "image expired"},
+					{name: "image success", succeeded: true},
+					{name: "video expired", video: true},
+					{name: "video success expired", video: true, succeeded: true},
+				} {
+					t.Run(item.name, func(t *testing.T) {
+						id := "age-end-" + strings.ReplaceAll(item.name, " ", "-")
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: id}}
+						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{}`))
+						if !item.video {
+							id = "asyncimg_" + id
+							status := model.ImageTaskExpired
+							if item.succeeded {
+								status = model.ImageTaskSucceeded
+							}
+							imageTask := model.AsyncImageTask{TaskId: id, UserId: 101, TokenId: 201, Status: status, BillingStatus: "refunded", Version: 1, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds - 60, ExpiresAt: now - 1}
+							require.NoError(t, db.Create(&imageTask).Error)
+							if !item.succeeded {
+								require.NoError(t, db.Create(&model.AsyncImageBill{TaskId: id, UserId: 101, TokenId: 201, Status: "refunded", Fingerprint: id, FundingSource: "wallet", ReservedAt: now - model.AsyncMediaMaxTaskAgeSeconds - 60, ReservedQuota: 10}).Error)
+							}
+							c.Params[0].Value = id
+							view := imageTaskDTO(imageTask, true)
+							assert.Equal(t, !item.succeeded, view["can_terminate"])
+							assert.Equal(t, false, view["termination_requires_reconciliation"])
+							ManageImageTask(c, "terminate")
+							var saved model.AsyncImageTask
+							require.NoError(t, db.Where("task_id = ?", id).Take(&saved).Error)
+							if item.succeeded {
+								assert.Equal(t, http.StatusConflict, recorder.Code)
+								assert.Equal(t, imageTask, saved)
+							} else {
+								assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								assert.Equal(t, model.ImageTaskFailed, saved.Status)
+								assert.Equal(t, "task_age_exceeded", saved.ErrorCode)
+								assert.Equal(t, "refunded", saved.BillingStatus)
+							}
+							return
+						}
+						billing := "refunded"
+						var nativeStatus model.TaskStatus = model.TaskStatusFailure
+						if item.succeeded {
+							billing, nativeStatus = "settled", model.TaskStatusSuccess
+						}
+						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Provider: "drama", Status: "expired", StorageStatus: "expired", BillingStatus: billing, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds - 60, ExpiresAt: now - 1, AttemptGeneration: 1}
+						native := model.Task{TaskID: id, UserId: 101, Status: nativeStatus, AttemptGeneration: 1}
+						require.NoError(t, db.Create(&job).Error)
+						require.NoError(t, db.Create(&native).Error)
+						view, _, err := videoJobView(c, job, true)
+						require.NoError(t, err)
+						expectedStatus := "expired"
+						if item.succeeded {
+							expectedStatus = "succeeded"
+						}
+						assert.Equal(t, expectedStatus, view["status"])
+						assert.Equal(t, item.succeeded, view["result_expired"])
+						assert.Equal(t, !item.succeeded, view["can_terminate"])
+						ManageMediaTask(c, true, "terminate")
+						var saved model.AsyncMediaJob
+						require.NoError(t, db.Where("id = ?", job.ID).Take(&saved).Error)
+						if item.succeeded {
+							assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+							assert.Equal(t, job, saved)
+						} else {
+							assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							assert.Equal(t, "failed", saved.Status)
+							assert.Equal(t, "refunded", saved.BillingStatus)
+						}
+						var savedNative model.Task
+						require.NoError(t, db.Where("id = ?", native.ID).Take(&savedNative).Error)
+						assert.Equal(t, nativeStatus, savedNative.Status, "ending local processing must preserve a completed upstream outcome")
+					})
+				}
+			})
 			t.Run("unknown video execution requires administrator reconciliation", func(t *testing.T) {
 				const submissionDiagnostic = "video submission failed (HTTP 502, code fail_to_fetch_task): code task_submission_unknown: task submission state is unknown"
 				for _, item := range []struct {
 					name       string
 					status     string
+					provider   string
+					overdue    bool
 					admin      bool
 					body       string
 					leased     bool
@@ -2169,7 +2542,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "invalid confirmation", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":`, want: http.StatusConflict, terminable: true},
 					{name: "owner cannot reconcile", status: "execution_unknown", body: `{"confirm_upstream_checked":true}`, want: http.StatusForbidden},
 					{name: "active lease", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, leased: true, want: http.StatusConflict},
-					{name: "expired job", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, expired: true, want: http.StatusConflict},
+					{name: "expired job", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, expired: true, want: http.StatusOK, terminable: true},
+					{name: "expired unknown needs confirmation", status: "execution_unknown", admin: true, body: `{}`, expired: true, want: http.StatusConflict, terminable: true},
+					{name: "aged NLDW unknown still needs confirmation", provider: "nldw", overdue: true, status: "execution_unknown", admin: true, body: `{}`, expired: true, want: http.StatusConflict, terminable: true},
+					{name: "aged NLDW unknown administrator confirmed", provider: "nldw", overdue: true, status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, expired: true, want: http.StatusOK, terminable: true},
+					{name: "aged Yuxibox unknown still needs confirmation", provider: "yuxibox", overdue: true, status: "execution_unknown", admin: true, body: `{}`, expired: true, want: http.StatusConflict, terminable: true},
+					{name: "aged Yuxibox unknown administrator confirmed", provider: "yuxibox", overdue: true, status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, expired: true, want: http.StatusOK, terminable: true},
+					{name: "aged pending unknown retains active lease fence", provider: "yuxibox", overdue: true, status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, leased: true, expired: true, want: http.StatusConflict},
 					{name: "accepted upstream task", status: "execution_unknown", admin: true, body: `{"confirm_upstream_checked":true}`, accepted: true, want: http.StatusConflict},
 					{name: "other user", status: "queued", otherUser: true, want: http.StatusConflict, terminable: true},
 					{name: "queued owner", status: "queued", want: http.StatusOK, terminable: true},
@@ -2178,6 +2557,10 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				} {
 					t.Run(item.name, func(t *testing.T) {
 						job := model.AsyncMediaJob{TaskId: "video-terminate-" + strings.ReplaceAll(item.name, " ", "-"), IdentityHash: "terminate-" + item.name, UserId: 101, TokenId: 201, Status: item.status, StorageStatus: "pending", BillingStatus: "unknown", Quota: 500, RequestCipher: []byte("encrypted-video-request"), CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "expired-video-lease", NextAttemptAt: now + 30}
+						job.Provider = item.provider
+						if item.overdue {
+							job.CreatedAt = now - model.AsyncMediaMaxTaskAgeSeconds - 1
+						}
 						if item.status == "execution_unknown" {
 							job.ErrorMessage = service.VideoTaskFailureReason("Upstream submission could not be confirmed; the video operation will not be repeated\n" + submissionDiagnostic)
 						}
@@ -2205,6 +2588,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						view, _, err := videoJobView(c, job, item.admin)
 						require.NoError(t, err)
 						assert.Equal(t, item.terminable, view["can_terminate"])
+						if item.provider != "" {
+							assert.Equal(t, true, view["termination_requires_reconciliation"], "age expiry must not bypass upstream verification for a dispatched unknown operation")
+						}
 						ManageMediaTask(c, item.admin, "terminate")
 						require.Equal(t, item.want, recorder.Code, recorder.Body.String())
 						var stored model.AsyncMediaJob

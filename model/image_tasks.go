@@ -119,6 +119,12 @@ func ClaimAsyncImageTask(ctx context.Context, id, lease string, seconds int) (As
 		return task, err
 	}
 	now := time.Now().Unix()
+	if task.Status != ImageTaskSucceeded && task.Status != ImageTaskFailed && task.CreatedAt <= now-AsyncMediaMaxTaskAgeSeconds {
+		if err := FailOverdueAsyncImageTask(ctx, task); err != nil {
+			return task, err
+		}
+		return task, ErrImageConflict
+	}
 	if task.Terminal() || (task.Status == ImageTaskInvoking && task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0) || task.NextAttemptAt <= 0 || task.NextAttemptAt > now || task.LeaseExpiresAt > now {
 		return task, ErrImageConflict
 	}
@@ -398,6 +404,9 @@ func resumeAsyncImageTask(ctx context.Context, task AsyncImageTask, quotaReconci
 	if task.Status != ImageTaskStorageFailed && task.Status != ImageTaskBillingFailed {
 		return ErrImageConflict
 	}
+	if task.CreatedAt <= time.Now().Unix()-AsyncMediaMaxTaskAgeSeconds {
+		return FailOverdueAsyncImageTask(ctx, task)
+	}
 	if task.ErrorCode == "billing_quota_uncertain" && !quotaReconciled {
 		return ErrImageConflict
 	}
@@ -432,20 +441,33 @@ func resumeAsyncImageTask(ctx context.Context, task AsyncImageTask, quotaReconci
 }
 
 func TerminateAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
-	return terminateAsyncImageTask(ctx, task, false)
+	return terminateAsyncImageTask(ctx, task, "admin_terminated")
+}
+
+// FailOverdueAsyncImageTask enforces the maximum age without claiming that an
+// administrator reconciled an uncertain upstream execution.
+func FailOverdueAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
+	return terminateAsyncImageTask(ctx, task, "task_age_exceeded")
+}
+
+func (task AsyncImageTask) TerminationRequiresReconciliation() bool {
+	return task.Status == ImageTaskExecutionUnknown || task.Status == ImageTaskFailed && task.ErrorCode == "task_age_exceeded" &&
+		(task.ReconciliationStatus == "upstream_unconfirmed" || task.ReconciliationStatus == "quota_unconfirmed")
 }
 
 // The caller must require administrator authorization and explicit confirmation
-// that the uncertain upstream execution has been checked before releasing funds.
+// that uncertain upstream execution and, when needed, quota mutations have been
+// checked before releasing funds.
 func TerminateAsyncImageTaskAfterReconciliation(ctx context.Context, task AsyncImageTask) error {
-	if task.Status != ImageTaskExecutionUnknown {
+	if !task.TerminationRequiresReconciliation() {
 		return ErrImageConflict
 	}
-	return terminateAsyncImageTask(ctx, task, true)
+	return terminateAsyncImageTask(ctx, task, "admin_reconciled")
 }
 
-func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reconciled bool) error {
-	if task.Terminal() && !(reconciled && task.Status == ImageTaskExecutionUnknown) {
+func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reason string) error {
+	reconciled, ageExceeded := reason == "admin_reconciled", reason == "task_age_exceeded"
+	if task.Status == ImageTaskSucceeded || task.Status == ImageTaskFailed && !(reconciled && task.TerminationRequiresReconciliation()) || task.Status == ImageTaskExecutionUnknown && !reconciled && !ageExceeded {
 		return ErrImageConflict
 	}
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -455,28 +477,58 @@ func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reconcile
 		if err := lockForUpdate(tx).Where("task_id = ?", task.TaskId).Take(&current).Error; err != nil {
 			return err
 		}
-		if current.Terminal() && !(reconciled && current.Status == ImageTaskExecutionUnknown) || current.Version != task.Version || current.Status != task.Status {
+		if current.Status == ImageTaskSucceeded || current.Status == ImageTaskFailed && !(reconciled && current.TerminationRequiresReconciliation()) || current.Status == ImageTaskExecutionUnknown && !reconciled && !ageExceeded || current.Version != task.Version || current.Status != task.Status {
 			return ErrImageConflict
 		}
-		decision := ImageRetryDecision{Version: 1, Stage: "recovery", Action: "stop", Reason: "admin_terminated", Rule: "administrator_termination", RecordedAt: time.Now().Unix(), TotalUsed: task.RetryCount}
+		now := time.Now().Unix()
+		if ageExceeded && current.CreatedAt > now-AsyncMediaMaxTaskAgeSeconds {
+			return ErrImageConflict
+		}
+		decision := ImageRetryDecision{Version: 1, Stage: "recovery", Action: "stop", Reason: "admin_terminated", Rule: "administrator_termination", RecordedAt: now, TotalUsed: task.RetryCount}
+		event, message := "terminated", "Administrator terminated task"
+		if ageExceeded {
+			decision.Reason, decision.Rule = "task_age_exceeded", "maximum_task_age"
+			event, message = "age_limit_failed", "Task exceeded the maximum age of 4 hours"
+		} else if reconciled {
+			event, message = "admin_reconciled", "Administrator checked upstream execution and approved reservation release"
+		}
 		encoded, err := common.Marshal(decision)
 		if err != nil {
 			return err
 		}
-		updates := map[string]any{"status": ImageTaskFailed, "request_cipher": nil, "request_retain_until": 0, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "error_code": "admin_terminated", "public_error_code": 608, "error_message": "Task terminated by administrator", "reconciliation_status": "not_charged", "finished_at": time.Now().Unix()}
-		var bill AsyncImageBill
-		if err := lockForUpdate(tx).Where("task_id = ?", task.TaskId).Take(&bill).Error; err == nil && bill.Status == "applied" {
-			updates["reconciliation_status"] = "settled"
-			updates["billing_status"] = "succeeded"
-			if bill.Quota == 0 {
-				updates["billing_status"] = "not_billable"
+		updates := map[string]any{"status": ImageTaskFailed, "request_cipher": nil, "request_retain_until": 0, "retry_decision": string(encoded), "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "error_code": "admin_terminated", "public_error_code": 608, "error_message": "Task terminated by administrator", "reconciliation_status": "not_charged", "finished_at": now}
+		if ageExceeded {
+			updates["error_code"], updates["error_message"] = decision.Reason, message
+			// Retry scheduling clears the current dispatch and upstream task ID.
+			// Historical attempts do not prove that another operation is active.
+			if current.Status == ImageTaskExecutionUnknown || current.ReconciliationStatus == "upstream_unconfirmed" ||
+				current.UpstreamSucceededAt == 0 && (current.DispatchedAt > 0 || current.UpstreamTaskId != "") {
+				updates["reconciliation_status"] = "upstream_unconfirmed"
 			}
-		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			if current.ErrorCode == "billing_quota_uncertain" || current.ErrorCode == "quota_cache_uncertain" || current.ReconciliationStatus == "quota_unconfirmed" {
+				updates["reconciliation_status"] = "quota_unconfirmed"
+			}
+		}
+		var bill AsyncImageBill
+		if err := lockForUpdate(tx).Where("task_id = ?", task.TaskId).Take(&bill).Error; err == nil {
+			switch {
+			case bill.Status == "applied":
+				updates["reconciliation_status"], updates["billing_status"] = "settled", "succeeded"
+				if bill.Quota == 0 {
+					updates["billing_status"] = "not_billable"
+				}
+			case bill.Status == "refunded":
+				updates["reconciliation_status"], updates["billing_status"] = "refunded", "refunded"
+			case bill.ReservedAt > 0 && (bill.Status == "reserved" || bill.Status == "fixed") && updates["reconciliation_status"] != "upstream_unconfirmed" && updates["reconciliation_status"] != "quota_unconfirmed":
+				updates["reconciliation_status"] = "refund_pending"
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		event, message := "terminated", "Administrator terminated task"
-		if reconciled {
-			event, message = "admin_reconciled", "Administrator checked upstream execution and approved reservation release"
+		if ageExceeded {
+			// The age policy revokes even an expired worker lease. The locked
+			// row's version and status still fence every late worker mutation.
+			current.LeaseToken = ""
 		}
 		return transitionImageTaskTx(tx, current, updates, event, message, "")
 	})
@@ -520,6 +572,32 @@ func AsyncImageExecutionDeadline(task AsyncImageTask, timeout int) int64 {
 		return deadline
 	}
 	return base
+}
+
+// FailOverdueAsyncImageTasks applies the acceptance-age policy independently of
+// whether new asynchronous submissions are enabled or workers are dispatched.
+func FailOverdueAsyncImageTasks(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return nil
+	}
+	var tasks []AsyncImageTask
+	if err := DB.WithContext(ctx).Where("created_at <= ? AND status NOT IN ?", time.Now().Unix()-AsyncMediaMaxTaskAgeSeconds, []string{ImageTaskSucceeded, ImageTaskFailed}).Order("updated_at, id").Limit(limit).Find(&tasks).Error; err != nil {
+		return err
+	}
+	var failures []error
+	for _, task := range tasks {
+		err := FailOverdueAsyncImageTask(ctx, task)
+		if err == nil || errors.Is(err, ErrImageConflict) {
+			continue
+		}
+		failures = append(failures, err)
+		// Rotate damaged rows behind unattempted tasks across bounded scans.
+		// A failed refund already has a terminal task and is retried separately.
+		if updateErr := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where("task_id = ? AND version = ? AND status = ?", task.TaskId, task.Version, task.Status).Update("updated_at", time.Now().Unix()).Error; updateErr != nil {
+			failures = append(failures, updateErr)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRetentionHours int) error {
@@ -666,7 +744,7 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 	// A crash after the terminal state commit but before the separate refund
 	// transaction is recoverable without ever repeating the financial effect.
 	var refundable []AsyncImageBill
-	if err := DB.WithContext(ctx).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_bills.task_id").Where("async_image_bills.reserved_at > 0 AND async_image_bills.status IN ? AND async_image_tasks.status IN ?", []string{"reserved", "fixed"}, []string{ImageTaskFailed, ImageTaskExpired}).Order("COALESCE(async_image_bills.refund_attempt_at, 0), async_image_bills.id").Limit(limit).Find(&refundable).Error; err != nil {
+	if err := DB.WithContext(ctx).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_bills.task_id").Where("async_image_bills.reserved_at > 0 AND async_image_bills.status IN ? AND async_image_tasks.status IN ?", []string{"reserved", "fixed"}, []string{ImageTaskFailed, ImageTaskExpired}).Where("NOT (COALESCE(async_image_tasks.error_code, '') = ? AND COALESCE(async_image_tasks.reconciliation_status, '') IN ?)", "task_age_exceeded", []string{"upstream_unconfirmed", "quota_unconfirmed"}).Order("COALESCE(async_image_bills.refund_attempt_at, 0), async_image_bills.id").Limit(limit).Find(&refundable).Error; err != nil {
 		return err
 	}
 	var refundErrors []error

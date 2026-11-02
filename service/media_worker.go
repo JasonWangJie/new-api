@@ -54,6 +54,8 @@ type AsyncVideoRequest struct {
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error
 var PersistAsyncVideoFunc func(context.Context, model.AsyncMediaJob, *model.Task) error
 
+const asyncMediaAgeRetryLeasePrefix = "age-limit-retry:"
+
 // recordAsyncVideoSubmissionRefund records only confirmed reservation rollbacks.
 // Missing consumption and its gross usage projection share a durable outbox,
 // without changing financial counters. Submit failures have not accumulated
@@ -112,6 +114,9 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
+			}
+			if err := FailOverdueAsyncMediaJobs(ctx, 100); err != nil {
+				common.SysError("media maximum age cleanup: " + err.Error())
 			}
 			refundLogCtx, refundLogCancel := context.WithTimeout(ctx, 2*time.Second)
 			refundLogErr := model.ReplayAsyncMediaRefundLogs(refundLogCtx, 100)
@@ -212,6 +217,24 @@ func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.
 }
 
 func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg MediaRuntimeConfig) error {
+	if job.CreatedAt > 0 && job.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds && job.Status != "succeeded" {
+		if job.ReferenceRecoveryStage == "age_limit_refund" {
+			return completeAsyncMediaAgeRefund(parent, job)
+		}
+		stopped, err := model.FailAgedAsyncMediaJob(parent, job, time.Now().Unix(), true)
+		if errors.Is(err, model.ErrImageConflict) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return completeAsyncMediaAgeRefund(parent, stopped)
+	}
+	if job.CreatedAt > 0 {
+		var cancelAge context.CancelFunc
+		parent, cancelAge = context.WithDeadline(parent, time.Unix(job.CreatedAt+model.AsyncMediaMaxTaskAgeSeconds, 0))
+		defer cancelAge()
+	}
 	if job.Status == "failed" || job.Status == "expired" || job.Status == "execution_unknown" {
 		if job.Status == "execution_unknown" {
 			if job.ReferenceRecoveryStage == "unknown" || VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
@@ -448,4 +471,106 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 	}
 	updates["error_message"] = VideoTaskFailureReason(reason)
 	return submitErr
+}
+
+// FailOverdueAsyncMediaJobs also retries durable timeout refunds. It runs
+// independently of submission enablement, Redis worker slots, and retention.
+func FailOverdueAsyncMediaJobs(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	var jobs []model.AsyncMediaJob
+	query := model.ExcludePendingSubmissionReconciliation(model.DB.WithContext(ctx)).
+		Where("created_at > 0 AND created_at <= ?", now-model.AsyncMediaMaxTaskAgeSeconds).
+		Where("NOT (status = ? AND EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status NOT IN ?))", "reconciling", []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure}).
+		Where("COALESCE(lease_token, '') NOT LIKE ? OR COALESCE(lease_expires_at, 0) <= ?", asyncMediaAgeRetryLeasePrefix+"%", now).
+		Where("status NOT IN ? OR (status = ? AND reference_recovery_stage = ? AND next_attempt_at <= ?)", []string{"failed", "succeeded"}, "failed", "age_limit_refund", now).
+		Where("status <> ? OR (billing_status <> ? AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id AND tasks.status = ?))", "expired", "settled", model.TaskStatusSuccess).
+		Order("CASE WHEN COALESCE(lease_token, '') LIKE '" + asyncMediaAgeRetryLeasePrefix + "%' THEN 1 ELSE 0 END").
+		Order("next_attempt_at").Order("id").Limit(limit)
+	err := query.Find(&jobs).Error
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, job := range jobs {
+		candidate := job
+		err = nil
+		if job.ReferenceRecoveryStage != "age_limit_refund" {
+			var stopped model.AsyncMediaJob
+			stopped, err = model.FailAgedAsyncMediaJob(ctx, job, now, true)
+			if err == nil {
+				job, candidate = stopped, stopped
+			}
+		}
+		if err == nil {
+			err = completeAsyncMediaAgeRefund(ctx, job)
+		}
+		if err == nil {
+			continue
+		}
+		// Rotate every failed phase, including native-read and final-refund
+		// errors. Retried rows remain behind untouched paused operations even
+		// after this lease expires; ordinary active leases remain revocable.
+		rotationErr := model.DB.WithContext(context.WithoutCancel(ctx)).Model(&model.AsyncMediaJob{}).
+			Where("id = ? AND status = ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ? AND COALESCE(lease_token, '') = ?", candidate.ID, candidate.Status, candidate.AttemptGeneration, candidate.ReferenceRecoveryStage, candidate.LeaseToken).
+			Updates(map[string]any{"lease_token": asyncMediaAgeRetryLeasePrefix + common.GetUUID(), "lease_expires_at": now + 60}).Error
+		if !errors.Is(err, model.ErrImageConflict) {
+			failures = append(failures, err)
+		}
+		if rotationErr != nil {
+			failures = append(failures, rotationErr)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// TerminateExpiredAsyncMediaJob uses the same local end-of-life policy for
+// historical unsuccessful records, without asserting upstream verification.
+func TerminateExpiredAsyncMediaJob(ctx context.Context, job model.AsyncMediaJob) error {
+	automatic := job.CreatedAt > 0 && job.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds
+	stopped, err := model.FailAgedAsyncMediaJob(ctx, job, time.Now().Unix(), automatic)
+	if err != nil {
+		return err
+	}
+	return completeAsyncMediaAgeRefund(ctx, stopped)
+}
+
+// The controller must require the existing explicit upstream-check confirmation.
+func ReconcileTerminatedAsyncMediaReservation(ctx context.Context, job model.AsyncMediaJob) error {
+	reconciled, err := model.ReconcileAgedAsyncMediaReservation(ctx, job)
+	if err != nil {
+		return err
+	}
+	return completeAsyncMediaAgeRefund(ctx, reconciled)
+}
+
+func completeAsyncMediaAgeRefund(ctx context.Context, job model.AsyncMediaJob) error {
+	if job.ReferenceRecoveryStage != "age_limit_refund" {
+		return nil
+	}
+	var task model.Task
+	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", job.TaskId, job.UserId, job.AttemptGeneration).Take(&task).Error; err != nil {
+		return err
+	}
+	if task.Status != model.TaskStatusFailure || task.Quota != 0 {
+		if task.Status != model.TaskStatusUnknown || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded {
+			return model.ErrTaskAttemptConflict
+		}
+		task.Status, task.FailReason, task.Progress, task.FinishTime = model.TaskStatusFailure, job.ErrorMessage, "100%", time.Now().Unix()
+		won, err := SettleTaskBillingOnComplete(ctx, nil, &task, model.TaskStatusUnknown, relaycommon.FailTaskInfo(task.FailReason))
+		if err != nil {
+			_ = model.DB.WithContext(context.WithoutCancel(ctx)).Model(&model.AsyncMediaJob{}).
+				Where("id = ? AND status = ? AND attempt_generation = ? AND reference_recovery_stage = ?", job.ID, "failed", job.AttemptGeneration, "age_limit_refund").
+				Update("next_attempt_at", time.Now().Unix()+60).Error
+			return err
+		}
+		if !won {
+			return model.ErrTaskAttemptConflict
+		}
+	}
+	query := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+		Where("id = ? AND status = ? AND attempt_generation = ? AND reference_recovery_stage = ?", job.ID, "failed", job.AttemptGeneration, "age_limit_refund")
+	return model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": "refunded", "quota": 0, "reference_recovery_stage": "age_limit_complete", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0}, "")
 }

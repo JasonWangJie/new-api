@@ -56,8 +56,117 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 		}
 	}
 	capability := imageChannelCapability(ch, request.Model)
-	if !capability.Generate || capability.Protocol != "openai_images" {
+	if !capability.Generate || capability.Protocol != "openai_images" && capability.Protocol != "gemini_native" {
 		return fmt.Errorf("channel does not declare the requested image protocol and model")
+	}
+	c, _ := gin.CreateTestContext(&asyncImageResponseWriter{Headers: make(http.Header), Limit: 1 << 20})
+	// Capability previews must not rotate credentials or change account state.
+	c.Set("model_mapping", ch.GetModelMapping())
+	c.Set("async_image_execution", true)
+	info := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model, ChannelType: ch.Type, ChannelId: ch.Id, ParamOverride: overrides, ChannelSetting: settings, ChannelOtherSettings: otherSettings}}
+	info.ImageMixedBilling = true
+	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+		return err
+	}
+	c.Set(asyncImageResolutionModelContextKey, info.UpstreamModelName)
+	operation := dto.UpstreamAsyncOperationGenerate
+	if request.Kind == "image_to_image" && capability.Protocol != "gemini_native" && !(ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility) {
+		operation = dto.UpstreamAsyncOperationEdit
+	}
+	profile, hasProfile := otherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, operation)
+	if ch.Type == constant.ChannelTypeTabTab {
+		profile, hasProfile = service.TabtabAsyncImageProfile(info.UpstreamModelName), true
+	}
+	if !hasProfile && ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility {
+		profile = service.TianyueAsyncImageProfile(info.UpstreamModelName)
+		hasProfile = profile != nil
+	}
+	if err := validateMixedImageTokenUsage(request.Billing, capability, profile); err != nil {
+		return err
+	}
+	if capability.Protocol == "gemini_native" {
+		normalized, err := service.NormalizeMixedGeminiImageRequest(request)
+		if err != nil {
+			return err
+		}
+		parts := make([]dto.GeminiPart, 0, len(normalized.Parts))
+		references := make([]string, 0, normalized.ReferenceImageCount())
+		for _, part := range normalized.Parts {
+			if part.Type == "text" {
+				parts = append(parts, dto.GeminiPart{Text: part.Text})
+				continue
+			}
+			if part.Type == "image_url" {
+				// Admission never downloads, signs, or decodes references. The
+				// transport resolves these descriptors immediately before dispatch.
+				parts = append(parts, dto.GeminiPart{FileData: &dto.GeminiFileData{MimeType: "image/png", FileUri: part.URL}})
+				references = append(references, part.URL)
+			}
+		}
+		imageConfig := map[string]string{}
+		if normalized.Resolution != "" {
+			imageConfig["imageSize"] = normalized.Resolution
+		}
+		if normalized.AspectRatio != "" {
+			imageConfig["aspectRatio"] = normalized.AspectRatio
+		}
+		config, err := common.Marshal(imageConfig)
+		if err != nil {
+			return err
+		}
+		path := "/v1beta/models/" + info.UpstreamModelName + ":generateContent"
+		c.Request, _ = http.NewRequest(http.MethodPost, path, nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		info.ApiType, _ = common.ChannelType2APIType(ch.Type)
+		adaptor := GetAdaptor(info.ApiType)
+		if adaptor == nil {
+			return fmt.Errorf("image channel has no Gemini image adaptor")
+		}
+		adaptor.Init(info)
+		converted, err := adaptor.ConvertGeminiRequest(c, info, &dto.GeminiChatRequest{Contents: []dto.GeminiChatContent{{Role: "user", Parts: parts}}, GenerationConfig: dto.GeminiChatGenerationConfig{ResponseModalities: []string{"TEXT", "IMAGE"}, ImageConfig: config}})
+		if err != nil {
+			return err
+		}
+		data, err := common.Marshal(converted)
+		if err != nil {
+			return err
+		}
+		if len(info.ParamOverride) > 0 {
+			data, err = relaycommon.ApplyParamOverrideWithRelayInfo(data, info)
+			if err != nil {
+				return err
+			}
+		}
+		if err := validateAsyncImageResolutionModel(c, data, false); err != nil {
+			return err
+		}
+		if hasProfile && profile.Submit.Request != nil {
+			source, err := asyncImageSubmitSource(normalized, data, references)
+			if err != nil {
+				return err
+			}
+			baseURL := ch.GetBaseURL()
+			if baseURL == "" {
+				baseURL = "https://image-admission.invalid"
+			}
+			probe, err := service.BuildUpstreamAsyncSubmitRequest(c.Request.Context(), baseURL, profile, upstreamAsyncImageTemplateContext(info, ""), source, bytes.NewReader(data), "application/json")
+			if err != nil {
+				return err
+			}
+			if err := validateAsyncImageResolutionSubmitModel(c, probe); err != nil {
+				return err
+			}
+			body, err := probe.GetBody()
+			if err != nil {
+				return err
+			}
+			data, err = io.ReadAll(io.LimitReader(body, (64<<20)+1))
+			_ = body.Close()
+			if err != nil || len(data) > 64<<20 {
+				return fmt.Errorf("Gemini image submit body exceeds the byte limit")
+			}
+		}
+		return validateMixedGeminiImageSubmission(data, normalized)
 	}
 	for name := range request.Native {
 		if slices.Contains([]string{"model", "prompt", "n", "size", "resolution", "aspect_ratio", "ratio", "image", "images", "image_urls", "mask", "user", "response_format", "stream"}, name) {
@@ -74,31 +183,6 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 		if !slices.Contains(capability.Parameters, name) {
 			return fmt.Errorf("image channel does not support parameter %s", name)
 		}
-	}
-	c, _ := gin.CreateTestContext(&asyncImageResponseWriter{Headers: make(http.Header), Limit: 1 << 20})
-	// Capability previews must not rotate credentials or change account state.
-	c.Set("model_mapping", ch.GetModelMapping())
-	c.Set("async_image_execution", true)
-	info := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model, ChannelType: ch.Type, ChannelId: ch.Id, ParamOverride: overrides, ChannelSetting: settings, ChannelOtherSettings: otherSettings}}
-	info.ImageMixedBilling = true
-	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
-		return err
-	}
-	c.Set(asyncImageResolutionModelContextKey, info.UpstreamModelName)
-	operation := dto.UpstreamAsyncOperationGenerate
-	if request.Kind == "image_to_image" && !(ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility) {
-		operation = dto.UpstreamAsyncOperationEdit
-	}
-	profile, hasProfile := otherSettings.UpstreamAsync.Match(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, operation)
-	if ch.Type == constant.ChannelTypeTabTab {
-		profile, hasProfile = service.TabtabAsyncImageProfile(info.UpstreamModelName), true
-	}
-	if !hasProfile && ch.Type == constant.ChannelTypeNewAPI && settings.TianyueMediaCompatibility {
-		profile = service.TianyueAsyncImageProfile(info.UpstreamModelName)
-		hasProfile = profile != nil
-	}
-	if err := validateMixedImageTokenUsage(request.Billing, capability, profile); err != nil {
-		return err
 	}
 	passThrough := settings.PassThroughBodyEnabled || model_setting.GetGlobalSettings().PassThroughRequestEnabled
 	if passThrough && !capability.OpenAICompatibleRequest {
@@ -296,6 +380,39 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 	return nil
 }
 
+// Mixed Gemini attempts preserve the single-output contract and every declared
+// image input after provider conversion, administrator overrides and templates.
+func validateMixedGeminiImageSubmission(body []byte, request service.AsyncImageRequest) error {
+	if count := gjson.GetBytes(body, "generationConfig.candidateCount"); count.Exists() && (count.Type != gjson.Number || count.Raw != "1") {
+		return fmt.Errorf("Gemini mixed image generation requires one candidate")
+	}
+	modalities := gjson.GetBytes(body, "generationConfig.responseModalities").Array()
+	if !slices.ContainsFunc(modalities, func(modality gjson.Result) bool { return modality.String() == "IMAGE" }) {
+		return fmt.Errorf("Gemini mixed image generation requires IMAGE response modality")
+	}
+	for field, expected := range map[string]string{"imageSize": request.Resolution, "aspectRatio": request.AspectRatio} {
+		if expected != "" && gjson.GetBytes(body, "generationConfig.imageConfig."+field).String() != expected {
+			return fmt.Errorf("Gemini image submission conflicts with the requested %s", field)
+		}
+	}
+	var submitted dto.GeminiChatRequest
+	if err := common.Unmarshal(body, &submitted); err != nil {
+		return err
+	}
+	references := 0
+	for _, content := range submitted.Contents {
+		for _, part := range content.Parts {
+			if part.FileData != nil || part.InlineData != nil {
+				references++
+			}
+		}
+	}
+	if references < request.ReferenceImageCount() {
+		return fmt.Errorf("Gemini image submission cannot discard reference images")
+	}
+	return nil
+}
+
 func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapability {
 	if ch.Type <= constant.ChannelTypeUnknown || ch.Type >= constant.ChannelTypeDummy || ch.Type == constant.ChannelTypeMidjourney || ch.Type == constant.ChannelTypeMidjourneyPlus {
 		return dto.ImageCapability{}
@@ -388,6 +505,19 @@ func validateMixedImageTokenUsage(snapshot *service.MediaBillingSnapshot, capabi
 		maps.Copy(used, billingexpr.UsedVars(snapshot.Tiered.ExprString))
 	} else if !snapshot.Price.UsePrice && snapshot.Price.QuotaToPreConsume > 0 {
 		used["p"], used["c"] = true, true
+	}
+	if profile == nil && capability.Protocol == "gemini_native" {
+		// Native generateContent can report these canonical axes. Presence in
+		// each actual response is checked again from the durable completion.
+		profile = &dto.UpstreamAsyncProfile{Poll: dto.UpstreamAsyncPoll{Response: dto.UpstreamAsyncPollResponse{UsagePaths: map[string]string{
+			"prompt_tokens":                          "usageMetadata.promptTokenCount",
+			"completion_tokens":                      "usageMetadata.candidatesTokenCount",
+			"prompt_tokens_details.cached_tokens":    "usageMetadata.cachedContentTokenCount",
+			"prompt_tokens_details.image_tokens":     "usageMetadata.promptTokensDetails.IMAGE",
+			"prompt_tokens_details.audio_tokens":     "usageMetadata.promptTokensDetails.AUDIO",
+			"completion_tokens_details.image_tokens": "usageMetadata.candidatesTokensDetails.IMAGE",
+			"completion_tokens_details.audio_tokens": "usageMetadata.candidatesTokensDetails.AUDIO",
+		}}}}
 	}
 	if profile != nil {
 		// Subcategories must also supply their aggregate axes for canonical

@@ -282,6 +282,40 @@ func normalizeAsyncGeminiDimensions(request *AsyncImageRequest) error {
 	return nil
 }
 
+// NormalizeMixedGeminiImageRequest converts only the transport dimensions of a
+// unified request. Its original platform, pool identity and native billing
+// fields remain unchanged so selecting Gemini cannot change the public price.
+func NormalizeMixedGeminiImageRequest(request AsyncImageRequest) (AsyncImageRequest, error) {
+	if request.Count != 1 {
+		return request, errors.New("Gemini native image generation requires exactly one image")
+	}
+	for _, part := range request.Parts {
+		if part.Type != "text" && part.Type != "image_url" {
+			return request, errors.New("Gemini native image generation does not support masks or other image input parts")
+		}
+	}
+	for name := range request.Native {
+		switch name {
+		case "model", "prompt", "n", "size", "resolution", "aspect_ratio", "ratio", "image", "images", "image_urls", "user", "response_format", "stream":
+		default:
+			return request, fmt.Errorf("Gemini native image generation does not support parameter %s", name)
+		}
+	}
+	// Pixel dimensions belong to the unified request's routing tier, even
+	// though Gemini uses a different native convention for elongated images.
+	request.Resolution = AsyncImageRoutingResolution(request)
+	if request.Resolution == "AUTO" {
+		request.Resolution = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(request.Size), "auto") || request.Size == "自动" {
+		request.Size = ""
+	}
+	if err := normalizeAsyncGeminiDimensions(&request); err != nil {
+		return request, err
+	}
+	return request, nil
+}
+
 func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRuntimeConfig) (AsyncImageRequest, error) {
 	request := AsyncImageRequest{SourcePath: path, Count: 1, Kind: "text_to_image", Dialect: "bb", Platform: "openai"}
 	if strings.HasSuffix(path, "_gm") {

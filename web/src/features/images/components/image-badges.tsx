@@ -34,6 +34,7 @@ export function ImageStatusBadge(props: {
   status: string
   errorCode?: string | number | boolean | null
   pendingAction?: 'retry' | 'wait'
+  resultExpired?: boolean
   className?: string
 }) {
   const { t } = useTranslation()
@@ -41,7 +42,7 @@ export function ImageStatusBadge(props: {
   let pendingLabel = ''
   if (props.pendingAction === 'retry') pendingLabel = 'Retry scheduled'
   if (props.pendingAction === 'wait') pendingLabel = 'Waiting'
-  return (
+  const statusBadge = (
     <Badge
       variant={imageStatusBadgeVariant(visualStatus, props.errorCode)}
       className={cn(
@@ -52,6 +53,18 @@ export function ImageStatusBadge(props: {
       {t(imageLabel(props.status))}
       {pendingLabel && <span>· {t(pendingLabel)}</span>}
     </Badge>
+  )
+  if (!props.resultExpired) return statusBadge
+  return (
+    <span className='inline-flex min-w-0 flex-wrap items-center gap-1.5'>
+      {statusBadge}
+      <Badge
+        variant='outline'
+        className='text-muted-foreground h-auto py-0.5 wrap-anywhere whitespace-normal'
+      >
+        {t('File expired')}
+      </Badge>
+    </span>
   )
 }
 

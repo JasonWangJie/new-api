@@ -43,6 +43,7 @@ import {
   imageBlob,
   imageRequest,
 } from '../api'
+import { useMediaRetentionClock } from '../hooks/use-media-retention-clock'
 import {
   imageLabel,
   imageTimelineDotClass,
@@ -56,7 +57,10 @@ import {
   imageTaskIssue,
   imageTaskCanResume,
   imageTaskVideoReconciliation,
+  imageTaskCanTerminate,
+  imageTaskResultExpired,
   imageTaskUpstreamProgress,
+  imageTaskRequiresTerminationConfirmation,
 } from '../lib/task-presentation'
 import { CreateRetryRuleFromError } from '../retry-policy/create-from-error'
 import { ACTION_LABELS } from '../retry-policy/policy'
@@ -285,6 +289,9 @@ export function ImageTaskDetails(props: {
         ? false
         : 5000,
   })
+  const data = task.data?.task
+  const now = useMediaRetentionClock(data ? [data] : undefined)
+  const resultExpired = data ? imageTaskResultExpired(data, now) : false
   const results = task.data?.results || []
   const images = useQuery({
     queryKey: [
@@ -326,10 +333,10 @@ export function ImageTaskDetails(props: {
           }
         })
       ),
-    enabled: results.length > 0 && task.data?.task.media_type !== 'video',
+    enabled:
+      !resultExpired && results.length > 0 && data?.media_type !== 'video',
     staleTime: 60_000,
   })
-  const data = task.data?.task
   const isVideo = data?.media_type === 'video'
   let references: NonNullable<ImageTask['reference_media']> = isVideo
     ? (data.reference_media || []).filter((reference) =>
@@ -364,10 +371,11 @@ export function ImageTaskDetails(props: {
     : undefined
   const upstreamProgress = data ? imageTaskUpstreamProgress(data) : null
   const canResume = Boolean(
-    data && imageTaskCanResume(data, props.admin, props.canManage)
+    data && imageTaskCanResume(data, props.admin, props.canManage, now)
   )
   const canTerminate = Boolean(
-    data?.can_terminate &&
+    data &&
+    imageTaskCanTerminate(data, now) &&
     (props.canManage || (!props.admin && data.media_type === 'video'))
   )
   return (
@@ -407,6 +415,7 @@ export function ImageTaskDetails(props: {
                     issue && !issue.pendingAction ? data.error_code : undefined
                   }
                   pendingAction={issue?.pendingAction}
+                  resultExpired={resultExpired}
                 />
                 <ImagePlatformBadge platform={data.platform} />
                 <ImageRequestTypeBadge requestType={data.request_type} />
@@ -438,15 +447,23 @@ export function ImageTaskDetails(props: {
                     <Button
                       size='sm'
                       variant='destructive'
-                      onClick={() =>
+                      onClick={() => {
+                        if (data.termination_requires_quota_reconciliation) {
+                          props.onManage('terminate', true, true)
+                          return
+                        }
                         props.onManage(
                           'terminate',
-                          data.status === 'execution_unknown'
+                          imageTaskRequiresTerminationConfirmation(data)
                         )
-                      }
+                      }}
                     >
                       <Ban className='size-3.5' aria-hidden />
-                      {t('Terminate')}
+                      {t(
+                        data.status === 'expired'
+                          ? 'Mark as failed'
+                          : 'Terminate'
+                      )}
                     </Button>
                   )}
                 </div>
@@ -1028,7 +1045,12 @@ export function ImageTaskDetails(props: {
               </span>
             }
           >
-            {data.media_type === 'video' && (
+            {resultExpired && (
+              <p className='text-muted-foreground text-sm'>
+                {t('File expired')}
+              </p>
+            )}
+            {!resultExpired && data.media_type === 'video' && (
               <VideoResults
                 results={results}
                 onRefresh={() => {
@@ -1047,17 +1069,22 @@ export function ImageTaskDetails(props: {
                 }
               />
             )}
-            {data.media_type !== 'video' && images.isLoading && (
-              <p role='status' className='text-muted-foreground text-sm'>
-                {t('Loading...')}
-              </p>
-            )}
-            {data.media_type !== 'video' && images.isError && (
-              <p role='alert' className='text-destructive text-sm'>
-                {images.error.message}
-              </p>
-            )}
-            {data.media_type !== 'video' &&
+            {!resultExpired &&
+              data.media_type !== 'video' &&
+              images.isLoading && (
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t('Loading...')}
+                </p>
+              )}
+            {!resultExpired &&
+              data.media_type !== 'video' &&
+              images.isError && (
+                <p role='alert' className='text-destructive text-sm'>
+                  {images.error.message}
+                </p>
+              )}
+            {!resultExpired &&
+              data.media_type !== 'video' &&
               (images.data?.length ? (
                 <ImageResults images={images.data} previewMode='original' />
               ) : (

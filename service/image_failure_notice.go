@@ -20,7 +20,8 @@ type ImageFailureNotice struct {
 }
 
 var imageFailureNoticeZh = map[string]string{
-	"A reference image is required": "需要参考图",
+	"Task exceeded the maximum age of 4 hours": "任务超过 4 小时未完成，已自动结束",
+	"A reference image is required":            "需要参考图",
 	"Add an eligible account for this model and resolution, or check why the existing account timed out.":                                                    "为该模型和分辨率添加可用的备用账号，或检查现有账号超时的原因。",
 	"Adjust both image dimensions to multiples of 16 before submitting again.":                                                                               "请将图片宽度和高度都调整为 16 的整数倍后再提交。",
 	"Ask an administrator to reconcile the quota reservation before trying again.":                                                                           "请先由管理员核对额度预留，再尝试提交。",
@@ -243,6 +244,10 @@ func ImageTaskFailureNotice(task model.AsyncImageTask) (notice ImageFailureNotic
 	specificCause, specificOutputCause := false, false
 	specificAdvice := ""
 	switch task.ErrorCode {
+	case "task_age_exceeded":
+		notice.Summary = "Task exceeded the maximum age of 4 hours"
+		specificAdvice = "Do not submit again until an administrator has checked the upstream result and billing."
+		specificCause = true
 	case "upstream_transport_disconnected":
 		diagnostic, _ := strings.CutSuffix(message, "; only the existing upstream job may be polled again")
 		switch diagnostic {

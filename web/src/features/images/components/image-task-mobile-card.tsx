@@ -31,6 +31,7 @@ import {
   imageTaskListSpecifications,
   imageTaskIssue,
   imageTaskProgress,
+  imageTaskResultExpired,
   imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
 import type { ImageTask } from '../types'
@@ -44,6 +45,7 @@ export function ImageTaskMobileCard(props: {
   row: Row<ImageTask>
   isSelected: boolean
   admin: boolean
+  now?: number
   onView: (id: string) => void
   onPrefetch: (id: string) => void
 }) {
@@ -94,6 +96,7 @@ export function ImageTaskMobileCard(props: {
                 className='size-5'
                 aria-label={`${t('Select task')} ${task.id}`}
                 checked={props.isSelected}
+                disabled={!props.row.getCanSelect()}
                 onCheckedChange={(checked) => props.row.toggleSelected(checked)}
               />
             </label>
@@ -127,6 +130,7 @@ export function ImageTaskMobileCard(props: {
               issue && !issue.pendingAction ? task.error_code : undefined
             }
             pendingAction={issue?.pendingAction}
+            resultExpired={imageTaskResultExpired(task, props.now)}
             className='h-auto min-w-0 shrink py-0.5 wrap-anywhere whitespace-normal'
           />
           {progress !== null && (

@@ -31,6 +31,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 type asyncImageResponseWriter struct {
@@ -236,6 +237,9 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if task.ExecutionProtocol == "gemini_native" && request.Platform != "gemini" {
 		request.Platform = "gemini"
 	}
+	if task.ExecutionProtocol == "gemini_native" {
+		c.Set(contextKeyUpstreamAsyncOperation, dto.UpstreamAsyncOperationGenerate)
+	}
 	upstreamPath := "/v1/images/generations"
 	tianyue := channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility
 	if tianyue {
@@ -298,6 +302,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	var parsed dto.Request
 	var nativeBody []byte
 	var submitImageURLs []string
+	executionRequest := request
 	remoteReferences, localReferences := false, false
 	geminiReferenceFallbackEligible := false
 	referenceCfg := cfg
@@ -401,11 +406,18 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		parsed = imageRequest
 	} else {
+		if request.MixedRouting != nil {
+			var err error
+			executionRequest, err = service.NormalizeMixedGeminiImageRequest(request)
+			if err != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+			}
+		}
 		referenceCfg.GeminiReferenceMode = service.ImageChannelReferenceTransport(*channel, request.Platform, 0, cfg)
 		var parts []dto.GeminiPart
 		if !accepted {
 			var err error
-			parts, err = buildGeminiAsyncImageParts(ctx, task, request, referenceCfg)
+			parts, err = buildGeminiAsyncImageParts(ctx, task, executionRequest, referenceCfg)
 			if err != nil {
 				return nil, model.AsyncImageBill{}, err
 			}
@@ -423,11 +435,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			}
 		}
 		imageConfig := map[string]string{}
-		if request.Resolution != "" {
-			imageConfig["imageSize"] = request.Resolution
+		if executionRequest.Resolution != "" {
+			imageConfig["imageSize"] = executionRequest.Resolution
 		}
-		if request.AspectRatio != "" {
-			imageConfig["aspectRatio"] = request.AspectRatio
+		if executionRequest.AspectRatio != "" {
+			imageConfig["aspectRatio"] = executionRequest.AspectRatio
 		}
 		config, err := common.Marshal(imageConfig)
 		if err != nil {
@@ -440,7 +452,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, err
 		}
 	}
-	submitSource, err := asyncImageSubmitSource(request, nativeBody, submitImageURLs)
+	submitSource, err := asyncImageSubmitSource(executionRequest, nativeBody, submitImageURLs)
 	if err != nil {
 		return nil, model.AsyncImageBill{}, err
 	}
@@ -532,7 +544,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	}
 	info.InitChannelMeta(c)
 	info.ImageMixedBilling = request.MixedRouting != nil
-	facts := service.ImageBillingSpecifications(request, []service.ImageBytes{{Width: 1024, Height: 1024}})[0]
+	billingRequest := request
+	if request.MixedRouting != nil {
+		billingRequest.Platform = "openai"
+	}
+	facts := service.ImageBillingSpecifications(billingRequest, []service.ImageBytes{{Width: 1024, Height: 1024}})[0]
 	encodedFacts, err := common.Marshal(facts)
 	if err != nil {
 		return nil, model.AsyncImageBill{}, err
@@ -652,7 +668,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
-		if request.Dialect == "async" {
+		if request.Dialect == "async" && request.MixedRouting == nil {
 			var native map[string]common.RawMessage
 			if err := common.Unmarshal(body, &native); err != nil {
 				return nil, model.AsyncImageBill{}, err
@@ -678,6 +694,11 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		if err := validateAsyncImageResolutionModel(c, body, false); err != nil {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
 		}
+		if request.MixedRouting != nil && !accepted {
+			if err := validateMixedGeminiImageSubmission(body, executionRequest); err != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, model.AsyncImageBill{}, err
 		}
@@ -693,6 +714,20 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 				}
 				if err := service.ValidateUpstreamAsyncImageSubmitCount(submitRequest, request.Count); err != nil {
 					return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+				}
+				if request.MixedRouting != nil {
+					reader, err := submitRequest.GetBody()
+					if err != nil {
+						return nil, model.AsyncImageBill{}, err
+					}
+					encoded, err := io.ReadAll(io.LimitReader(reader, (64<<20)+1))
+					_ = reader.Close()
+					if err != nil || len(encoded) > 64<<20 {
+						return nil, model.AsyncImageBill{}, errors.New("Gemini image submit body exceeds the byte limit")
+					}
+					if err := validateMixedGeminiImageSubmission(encoded, executionRequest); err != nil {
+						return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+					}
 				}
 			}
 		}
@@ -763,13 +798,96 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			if !ok {
 				return nil, model.AsyncImageBill{}, errors.New("Gemini usage is missing")
 			}
+			if request.MixedRouting != nil {
+				// The general Gemini relay can estimate missing usage. Mixed
+				// settlement instead captures exactly what this response reported.
+				metadata := gjson.GetBytes(writer.Body.Bytes(), "usageMetadata")
+				fields := make(map[string]bool)
+				for target, name := range map[string]string{
+					"prompt_tokens": "promptTokenCount", "completion_tokens": "candidatesTokenCount", "prompt_tokens_details.cached_tokens": "cachedContentTokenCount",
+				} {
+					value := metadata.Get(name)
+					fields[target] = value.Exists() && value.Type == gjson.Number
+				}
+				for name, prefix := range map[string]string{"promptTokensDetails": "prompt_tokens_details.", "candidatesTokensDetails": "completion_tokens_details."} {
+					for _, detail := range metadata.Get(name).Array() {
+						modality, count := strings.ToUpper(detail.Get("modality").String()), detail.Get("tokenCount")
+						if count.Type != gjson.Number {
+							continue
+						}
+						switch modality {
+						case "IMAGE":
+							fields[prefix+"image_tokens"] = true
+						case "AUDIO":
+							fields[prefix+"audio_tokens"] = true
+						}
+					}
+				}
+				usage = &dto.Usage{}
+				var actual dto.GeminiUsageMetadata
+				if metadata.IsObject() && common.Unmarshal([]byte(metadata.Raw), &actual) == nil {
+					counts := []int{actual.PromptTokenCount, actual.ToolUsePromptTokenCount, actual.CandidatesTokenCount, actual.ThoughtsTokenCount, actual.TotalTokenCount, actual.CachedContentTokenCount}
+					for _, details := range [][]dto.GeminiPromptTokensDetails{actual.PromptTokensDetails, actual.ToolUsePromptTokensDetails, actual.CandidatesTokensDetails} {
+						for _, detail := range details {
+							counts = append(counts, detail.TokenCount)
+						}
+					}
+					valid := true
+					for _, count := range counts {
+						valid = valid && count >= 0 && count <= common.MaxQuota
+					}
+					// Bound every aggregate before the canonical DTO adds its axes.
+					valid = valid && actual.ToolUsePromptTokenCount <= common.MaxQuota-actual.PromptTokenCount && actual.ThoughtsTokenCount <= common.MaxQuota-actual.CandidatesTokenCount
+					totals := make(map[string]int)
+					for i, details := range [][]dto.GeminiPromptTokensDetails{actual.PromptTokensDetails, actual.ToolUsePromptTokensDetails, actual.CandidatesTokensDetails} {
+						for _, detail := range details {
+							axis := "input:" + strings.ToUpper(strings.TrimSpace(detail.Modality))
+							if i == 2 {
+								axis = "output:" + strings.ToUpper(strings.TrimSpace(detail.Modality))
+							}
+							if detail.TokenCount < 0 || detail.TokenCount > common.MaxQuota-totals[axis] {
+								valid = false
+								continue
+							}
+							totals[axis] += detail.TokenCount
+						}
+					}
+					if !valid {
+						actual = dto.GeminiUsageMetadata{}
+						fields = map[string]bool{"invalid_upstream_usage": true}
+					} else if fields["prompt_tokens"] && fields["completion_tokens"] {
+						// Explicit zero output must not become total-minus-prompt or
+						// a local text/image estimate during canonical settlement.
+						input := actual.PromptTokenCount + actual.ToolUsePromptTokenCount
+						output := actual.CandidatesTokenCount + actual.ThoughtsTokenCount
+						if output > common.MaxQuota-input {
+							actual = dto.GeminiUsageMetadata{}
+							fields = map[string]bool{"invalid_upstream_usage": true}
+						} else {
+							actual.TotalTokenCount = input + output
+						}
+					}
+					if canonical, valid := dto.NewGeminiChatBillingUsage(&actual).CanonicalUsage(); valid {
+						usage = canonical
+					}
+				} else {
+					// Keep explicit absence through usage_fields,omitempty so a
+					// recovered receipt cannot skip the same billing requirement.
+					fields = map[string]bool{"prompt_tokens": false, "completion_tokens": false}
+				}
+				c.Set(contextKeyUpstreamAsyncUsageFields, fields)
+			}
 		}
+	}
+	billingBody := nativeBody
+	if request.MixedRouting != nil {
+		billingBody = encodedFacts
 	}
 	completion := service.AsyncImageCompletion{
 		EvaluatedAt: time.Now(),
 		Body:        writer.Body.Bytes(), Usage: usage,
 		Billing:     service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup},
-		BillingBody: nativeBody, UpstreamModel: info.UpstreamModelName, BillingModel: info.GetBillingModelName(),
+		BillingBody: billingBody, UpstreamModel: info.UpstreamModelName, BillingModel: info.GetBillingModelName(),
 	}
 	if fields, exists := c.Get(contextKeyUpstreamAsyncUsageFields); exists {
 		completion.UsageFields, _ = fields.(map[string]bool)
@@ -839,11 +957,17 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 // crosses the submission barrier, including after a worker restart.
 func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task model.AsyncImageTask, info *relaycommon.RelayInfo, request service.AsyncImageRequest, completion service.AsyncImageCompletion, cfg service.ImageRuntimeConfig, funding model.ImageFundingSelection) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 	c.Request = c.Request.WithContext(ctx)
-	if request.MixedRouting != nil && completion.Profile != nil && completion.UsageFields != nil {
+	if request.MixedRouting != nil && completion.UsageFields != nil {
+		if completion.UsageFields["invalid_upstream_usage"] {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing", Message: "Upstream image task reported invalid token usage"}
+		}
 		// Validate only the captured price's required fields. Optional cache
 		// breakdowns may be absent; known historical checkpoints have no such
 		// presence evidence and retain their existing recovery behavior.
-		profile := *completion.Profile
+		profile := dto.UpstreamAsyncProfile{}
+		if completion.Profile != nil {
+			profile = *completion.Profile
+		}
 		profile.Poll.Response.UsagePaths = make(map[string]string)
 		for target, reported := range completion.UsageFields {
 			if reported {
@@ -908,7 +1032,11 @@ func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task mode
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, Message: "Upstream usage is missing"}
 	}
 	info.BillingRequestInput = &billingexpr.RequestInput{Body: completion.BillingBody, ImageCount: common.GetPointer(len(images)), EvaluationTime: &completion.EvaluatedAt}
-	bill, err := service.FixAsyncImageBill(c, task, info, usage, images, request, funding)
+	billingRequest := request
+	if request.MixedRouting != nil {
+		billingRequest.Platform = "openai"
+	}
+	bill, err := service.FixAsyncImageBill(c, task, info, usage, images, billingRequest, funding)
 	if err != nil {
 		if _, dynamic := c.Get(contextKeyUpstreamAsyncImageProfile); dynamic && usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 {
 			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "billing_usage_missing", Message: "Upstream image task did not report required billing usage"}
@@ -1007,15 +1135,48 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 
 func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string, cfg service.ImageRuntimeConfig) ([]service.ImageBytes, error) {
 	var references []string
-	if platform == "openai" {
+	openAIResponse := platform == "openai"
+	if !openAIResponse {
+		var response dto.GeminiChatResponse
+		if err := common.Unmarshal(body, &response); err != nil {
+			return nil, err
+		}
+		blocked := response.PromptFeedback != nil && response.PromptFeedback.BlockReason != nil && *response.PromptFeedback.BlockReason != ""
+		// Some Gemini-compatible endpoints return an OpenAI image envelope.
+		// An existing native candidate must not be bypassed by a second format.
+		openAIResponse = len(response.Candidates) == 0 && !blocked
+		if !blocked {
+			for _, candidate := range response.Candidates {
+				for _, part := range candidate.Content.Parts {
+					// Thought images are intermediate outputs, not final billable images.
+					if part.Thought {
+						continue
+					}
+					if part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "image/") {
+						references = append(references, "data:"+part.InlineData.MimeType+";base64,"+part.InlineData.Data)
+					} else if part.FileData != nil && (part.FileData.MimeType == "" || strings.HasPrefix(part.FileData.MimeType, "image/")) {
+						if strings.TrimSpace(part.FileData.FileUri) == "" {
+							return nil, errors.New("upstream image file URI is empty")
+						}
+						references = append(references, part.FileData.FileUri)
+					}
+				}
+			}
+		}
+	}
+	if openAIResponse {
 		var response struct {
-			Data []struct {
+			Error common.RawMessage `json:"error"`
+			Data  []struct {
 				URL string `json:"url"`
 				B64 string `json:"b64_json"`
 			} `json:"data"`
 		}
 		if err := common.Unmarshal(body, &response); err != nil {
 			return nil, err
+		}
+		if len(response.Error) > 0 && strings.TrimSpace(string(response.Error)) != "null" {
+			return nil, errors.New("upstream image response contains an error")
 		}
 		for _, item := range response.Data {
 			if item.B64 != "" {
@@ -1024,22 +1185,6 @@ func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string,
 				references = append(references, item.URL)
 			} else {
 				return nil, errors.New("upstream image data item is empty")
-			}
-		}
-	} else {
-		var response dto.GeminiChatResponse
-		if err := common.Unmarshal(body, &response); err != nil {
-			return nil, err
-		}
-		for _, candidate := range response.Candidates {
-			for _, part := range candidate.Content.Parts {
-				// Thought images are intermediate outputs, not final billable images.
-				if part.Thought {
-					continue
-				}
-				if part.InlineData != nil && strings.HasPrefix(part.InlineData.MimeType, "image/") {
-					references = append(references, "data:"+part.InlineData.MimeType+";base64,"+part.InlineData.Data)
-				}
 			}
 		}
 	}

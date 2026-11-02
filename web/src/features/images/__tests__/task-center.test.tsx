@@ -58,6 +58,7 @@ import {
   imageTaskCanResume,
   imageTaskIssue,
   imageTaskProgress,
+  imageTaskResultExpired,
   imageTaskSuccessRate,
   imageTaskUpstreamProgress,
 } from '../lib/task-presentation'
@@ -133,7 +134,7 @@ const task: ImageTask = {
   created_at: 1789600000,
   started_at: 1789600001,
   finished_at: 0,
-  expires_at: 1789686400,
+  expires_at: Math.floor(Date.now() / 1000) + 86400,
   next_attempt_at: 0,
   error_code: '',
   error_message: '',
@@ -850,6 +851,38 @@ test.each([
     expect(imageTaskProgress(finalTask)).toBeNull()
     if (status === 'succeeded') expect(imageTaskIssue(finalTask)).toBeNull()
     else expect(imageTaskIssue(finalTask)).not.toBeNull()
+  }
+)
+
+test.each([
+  { status: 'succeeded', result_expired: true, expires_at: 0, expected: true },
+  {
+    status: 'succeeded',
+    storage_status: 'expired',
+    result_expired: false,
+    expires_at: 0,
+    expected: true,
+  },
+  { status: 'succeeded', expires_at: 1, expected: true },
+  { status: 'succeeded', expires_at: 0, expected: false },
+  { status: 'succeeded', expires_at: 4_000_000_000, expected: false },
+  {
+    status: 'succeeded',
+    result_expired: false,
+    expires_at: 1,
+    expected: true,
+  },
+  { status: 'failed', result_expired: true, expires_at: 1, expected: false },
+  {
+    status: 'expired',
+    billing_status: 'settled',
+    expires_at: 1,
+    expected: false,
+  },
+])(
+  'file expiry is separate from task outcome for $status with expiry $expires_at and flag $result_expired',
+  ({ expected, ...fields }) => {
+    expect(imageTaskResultExpired({ ...task, ...fields })).toBe(expected)
   }
 )
 
@@ -2406,30 +2439,60 @@ test.each([
 )
 
 test.each([
-  { status: 'invoking', media_type: 'image' },
-  { status: 'execution_unknown', media_type: 'image' },
-  { status: 'execution_unknown', media_type: 'video' },
+  { status: 'invoking', media_type: 'image', requiresConfirmation: undefined },
+  {
+    status: 'execution_unknown',
+    media_type: 'image',
+    requiresConfirmation: undefined,
+  },
+  {
+    status: 'execution_unknown',
+    media_type: 'video',
+    requiresConfirmation: undefined,
+  },
+  { status: 'expired', media_type: 'image', requiresConfirmation: undefined },
+  { status: 'expired', media_type: 'video', requiresConfirmation: undefined },
+  {
+    status: 'execution_unknown',
+    media_type: 'image',
+    requiresConfirmation: false,
+  },
+  { status: 'expired', media_type: 'video', requiresConfirmation: true },
+  { status: 'failed', media_type: 'image', requiresConfirmation: true },
 ] as const)(
   'terminates one fixed $media_type $status task after confirmation and retains the dialog when the request fails',
-  async ({ status, media_type }) => {
+  async ({ status, media_type, requiresConfirmation }) => {
     const user = userEvent.setup()
     const id = media_type === 'video' ? 'video_unknown_execution' : task.id
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [{ ...task, id, task_id: id, status, media_type }],
+      items: [
+        {
+          ...task,
+          id,
+          task_id: id,
+          status,
+          media_type,
+          termination_requires_reconciliation: requiresConfirmation,
+        },
+      ],
       total: 1,
       pages: 1,
       stats: {},
     })
     mount(<ImageTaskCenter admin />)
     const terminate = (
-      await screen.findAllByRole('button', { name: 'Terminate' })
+      await screen.findAllByRole('button', {
+        name: status === 'expired' ? 'Mark as failed' : 'Terminate',
+      })
     )[0]
     await user.click(terminate)
     expect(imageRequest).not.toHaveBeenCalled()
     const confirm = await screen.findByRole('alertdialog', {
       name: 'Terminate media tasks',
     })
-    if (status === 'execution_unknown') {
+    const needsConfirmation =
+      requiresConfirmation ?? status === 'execution_unknown'
+    if (needsConfirmation) {
       expect(confirm).toHaveTextContent(
         'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task. Reserved quota is released for images; video billing remains unchanged.'
       )
@@ -2452,32 +2515,515 @@ test.each([
     expect(imageRequest).toHaveBeenLastCalledWith(
       `/api/admin/media-tasks/${id}/terminate`,
       'POST',
-      status === 'execution_unknown' ? { confirm_upstream_checked: true } : {}
+      needsConfirmation ? { confirm_upstream_checked: true } : {}
     )
     expect(getImageTasks).toHaveBeenCalledTimes(2)
   }
 )
 
-test('unknown video details offer termination with upstream verification', async () => {
-  const onManage = vi.fn()
-  vi.mocked(getImageTask).mockResolvedValue({
-    ...detail,
-    task: { ...task, media_type: 'video', status: 'execution_unknown' },
-    results: [],
+test.each(['single', 'details', 'current page', 'selected'] as const)(
+  'quota-unconfirmed failed tasks require both confirmations through %s termination',
+  async (action) => {
+    const user = userEvent.setup()
+    const heldTask = {
+      ...task,
+      status: 'failed',
+      error_code: 'task_age_exceeded',
+      billing_status: 'reserved',
+      reconciliation_status: 'quota_unconfirmed',
+      termination_requires_reconciliation: true,
+      termination_requires_quota_reconciliation: true,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [heldTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: heldTask,
+      results: [],
+      events: [],
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    if (action === 'details') {
+      await user.click(screen.getByRole('button', { name: 'View' }))
+      const details = await screen.findByRole('dialog', {
+        name: 'Media task details',
+      })
+      await waitFor(() =>
+        expect(details).toHaveTextContent(
+          'Image quota reservation could not be confirmed'
+        )
+      )
+      await user.click(
+        await within(details).findByRole('button', { name: 'Terminate' })
+      )
+    } else if (action === 'current page') {
+      await user.click(
+        screen.getByRole('button', { name: 'Terminate current page (1)' })
+      )
+    } else if (action === 'selected') {
+      await user.click(
+        screen.getByRole('checkbox', { name: `Select task ${task.id}` })
+      )
+      await user.click(
+        screen.getByRole('button', { name: 'Terminate selected' })
+      )
+    } else {
+      await user.click(screen.getByRole('button', { name: 'Terminate' }))
+    }
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Terminate media tasks',
+    })
+    expect(confirmation).toHaveTextContent(
+      'Verify the upstream task before continuing.'
+    )
+    expect(confirmation).toHaveTextContent(
+      'Ask an administrator to reconcile the quota reservation before trying again.'
+    )
+    expect(imageRequest).not.toHaveBeenCalled()
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
+    await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(1))
+    expect(imageRequest).toHaveBeenCalledWith(
+      `/api/admin/media-tasks/${task.id}/terminate`,
+      'POST',
+      {
+        confirm_upstream_checked: true,
+        confirm_quota_reconciled: true,
+      }
+    )
+  }
+)
+
+test.each([false, true])(
+  'successful tasks keep their success and show file expiry without recovery actions (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const completed = {
+      ...task,
+      status: 'succeeded',
+      billing_status: 'settled',
+      result_expired: true,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      can_resume: true,
+      can_terminate: true,
+      cost: 0.5,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [completed],
+      total: 1,
+      pages: 1,
+      stats: { succeeded: 1, failed: 0 },
+    })
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('checkbox', {
+      name: `Select task ${completed.id}`,
+    })
+    const record = mobile
+      ? screen.getByRole('article', { name: completed.id })
+      : screen.getByRole('row', { name: new RegExp(completed.id) })
+    expect(within(record).getByText('Succeeded')).toBeVisible()
+    expect(within(record).getByText('File expired')).toBeVisible()
+    expect(within(record).getByText('Settled')).toBeVisible()
+    expect(within(record).getByText('$0.5')).toBeVisible()
+    expect(
+      screen.getByRole('checkbox', { name: `Select task ${completed.id}` })
+    ).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Terminate' })).toBeNull()
+    expect(
+      screen.getByRole('button', { name: 'Terminate selected' })
+    ).toBeDisabled()
+    expect(imageRequest).not.toHaveBeenCalled()
+  }
+)
+
+test.each(['image', 'video'] as const)(
+  'successful %s task details do not offer an expired file as a playable or downloadable result',
+  async (mediaType) => {
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: {
+        ...task,
+        media_type: mediaType,
+        status: 'succeeded',
+        billing_status: 'settled',
+        result_expired: true,
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        can_resume: true,
+        can_terminate: true,
+        cost: 0.5,
+      },
+      results: [{ ...detail.results[0], authenticated: true }],
+    } as ImageTaskDetail)
+    const manage = vi.fn()
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin
+        userId={101}
+        canManage
+        onClose={vi.fn()}
+        onManage={manage}
+      />
+    )
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    expect(await within(dialog).findByText('Succeeded')).toBeVisible()
+    expect(within(dialog).getAllByText('File expired')).toHaveLength(2)
+    expect(within(dialog).getByText('$0.5')).toBeVisible()
+    expect(within(dialog).queryByRole('button', { name: 'Resume' })).toBeNull()
+    expect(
+      within(dialog).queryByRole('button', { name: 'Terminate' })
+    ).toBeNull()
+    expect(
+      within(dialog).queryByRole('button', { name: 'Download image' })
+    ).toBeNull()
+    expect(within(dialog).queryByText('Download')).toBeNull()
+    expect(
+      within(dialog).queryByRole('button', { name: 'Refresh link' })
+    ).toBeNull()
+    expect(within(dialog).queryByAltText('Generated image')).toBeNull()
+    expect(dialog.querySelector('video')).toBeNull()
+    expect(imageBlob).not.toHaveBeenCalled()
+    expect(authenticatedMediaBlob).not.toHaveBeenCalled()
+    expect(manage).not.toHaveBeenCalled()
+  }
+)
+
+test.each(['image', 'video'] as const)(
+  'open successful %s details remove cached file actions when retention expires without another task response',
+  async (mediaType) => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const expiresAt = Math.floor(Date.now() / 1000) + 2
+    const link = 'https://example.com/completed-video.mp4'
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: {
+        ...task,
+        media_type: mediaType,
+        status: 'succeeded',
+        billing_status: 'settled',
+        result_expired: false,
+        expires_at: expiresAt,
+        can_resume: true,
+        can_terminate: true,
+        cost: 0.5,
+      },
+      results: [{ ...detail.results[0], url: link, view_url: link }],
+    })
+    const view = mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin
+        userId={101}
+        canManage
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      const dialog = screen.getByRole('dialog', { name: 'Media task details' })
+      if (mediaType === 'video') {
+        expect(dialog.querySelector('video')).toHaveAttribute('src', link)
+      } else {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1)
+        })
+        expect(within(dialog).getByAltText('Generated image')).toHaveAttribute(
+          'src',
+          link
+        )
+      }
+      const requestCount = vi.mocked(getImageTask).mock.calls.length
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000)
+      })
+      expect(within(dialog).getByText('Succeeded')).toBeVisible()
+      expect(within(dialog).getAllByText('File expired')).toHaveLength(2)
+      expect(within(dialog).getByText('$0.5')).toBeVisible()
+      expect(dialog.querySelector('video')).toBeNull()
+      expect(within(dialog).queryByAltText('Generated image')).toBeNull()
+      expect(within(dialog).queryByText('Download')).toBeNull()
+      expect(
+        within(dialog).queryByRole('button', { name: 'Resume' })
+      ).toBeNull()
+      expect(
+        within(dialog).queryByRole('button', { name: 'Terminate' })
+      ).toBeNull()
+      expect(getImageTask).toHaveBeenCalledTimes(requestCount)
+      expect(imageRequest).not.toHaveBeenCalled()
+    } finally {
+      await act(async () => {
+        view.unmount()
+        // Base UI batches rAF callbacks across components. Flush its queued
+        // unmount frame before restoring timers so later dialogs can close.
+        await vi.runOnlyPendingTimersAsync()
+      })
+      vi.useRealTimers()
+    }
+  }
+)
+
+test.each([false, true])(
+  'a successful task reaching file expiry updates its badge and clears actionable selection without polling (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const completed = {
+      ...task,
+      status: 'succeeded',
+      billing_status: 'settled',
+      result_expired: false,
+      expires_at: Math.floor(Date.now() / 1000) + 2,
+      can_resume: true,
+      can_terminate: true,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [completed],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    const view = mount(<ImageTaskCenter admin />)
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      const checkbox = screen.getByRole('checkbox', {
+        name: `Select task ${completed.id}`,
+      })
+      expect(checkbox).not.toHaveAttribute('aria-disabled', 'true')
+      fireEvent.click(checkbox)
+      expect(checkbox).toBeChecked()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000)
+      })
+      const record = mobile
+        ? screen.getByRole('article', { name: completed.id })
+        : screen.getByRole('row', { name: new RegExp(completed.id) })
+      expect(within(record).getByText('Succeeded')).toBeVisible()
+      expect(within(record).getByText('File expired')).toBeVisible()
+      const expiredCheckbox = screen.getByRole('checkbox', {
+        name: `Select task ${completed.id}`,
+      })
+      expect(expiredCheckbox).toHaveAttribute('aria-disabled', 'true')
+      expect(expiredCheckbox).not.toBeChecked()
+      expect(
+        screen.getByRole('button', { name: 'Terminate selected' })
+      ).toBeDisabled()
+      expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Terminate' })).toBeNull()
+      expect(getImageTasks).toHaveBeenCalledTimes(1)
+      expect(imageRequest).not.toHaveBeenCalled()
+    } finally {
+      await act(async () => {
+        view.unmount()
+        await vi.runOnlyPendingTimersAsync()
+      })
+      vi.useRealTimers()
+    }
+  }
+)
+
+test('a 90-day file retention deadline survives browser timeout limits without polling task data', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [
+      {
+        ...task,
+        status: 'succeeded',
+        result_expired: false,
+        expires_at: Math.floor(Date.now() / 1000) + 90 * 86400,
+        can_terminate: false,
+      },
+    ],
+    total: 1,
+    pages: 1,
+    stats: {},
   })
-  mount(
-    <ImageTaskDetails
-      id={task.id}
-      admin
-      userId={101}
-      canManage
-      onClose={vi.fn()}
-      onManage={onManage}
-    />
-  )
+  const view = mount(<ImageTaskCenter />)
+  try {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30 * 86400000)
+    })
+    expect(screen.queryByText('File expired')).toBeNull()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30 * 86400000)
+    })
+    expect(screen.queryByText('File expired')).toBeNull()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30 * 86400000)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+    expect(screen.getByText('File expired')).toBeVisible()
+    expect(getImageTasks).toHaveBeenCalledTimes(1)
+    expect(imageRequest).not.toHaveBeenCalled()
+  } finally {
+    await act(async () => {
+      view.unmount()
+      await vi.runOnlyPendingTimersAsync()
+    })
+    vi.useRealTimers()
+  }
+})
+
+test.each([false, true])(
+  'expired unsuccessful tasks remain actionable while successful expired results cannot be selected (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    const expired = {
+      ...task,
+      id: 'video_expired_unsuccessful',
+      task_id: 'video_expired_unsuccessful',
+      media_type: 'video' as const,
+      status: 'expired',
+      billing_status: 'refunded',
+      can_terminate: true,
+    }
+    const successfulExpired = {
+      ...expired,
+      id: 'video_successful_result_expired',
+      task_id: 'video_successful_result_expired',
+      billing_status: 'settled',
+      can_terminate: false,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [expired, successfulExpired],
+      total: 2,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter admin />)
+    expect(
+      await screen.findByRole('checkbox', {
+        name: `Select task ${expired.id}`,
+      })
+    ).not.toHaveAttribute('aria-disabled', 'true')
+    expect(
+      screen.getByRole('checkbox', {
+        name: `Select task ${successfulExpired.id}`,
+      })
+    ).toHaveAttribute('aria-disabled', 'true')
+    expect(
+      screen.getAllByRole('button', { name: 'Mark as failed' })
+    ).toHaveLength(1)
+    expect(
+      screen.getByRole('button', { name: 'Terminate current page (1)' })
+    ).toBeEnabled()
+    await user.click(
+      screen.getByRole('checkbox', { name: 'Select current page' })
+    )
+    expect(
+      screen.getByRole('checkbox', {
+        name: `Select task ${successfulExpired.id}`,
+      })
+    ).not.toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Terminate selected' }))
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'Terminate media tasks',
+    })
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
+    await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(1))
+    expect(imageRequest).toHaveBeenCalledWith(
+      `/api/admin/media-tasks/${expired.id}/terminate`,
+      'POST',
+      undefined
+    )
+  }
+)
+
+test.each([
+  {
+    status: 'execution_unknown',
+    requiresConfirmation: undefined,
+    wantConfirmation: true,
+  },
+  { status: 'expired', requiresConfirmation: true, wantConfirmation: true },
+  {
+    status: 'execution_unknown',
+    requiresConfirmation: false,
+    wantConfirmation: false,
+  },
+])(
+  'video $status details use server termination verification=$requiresConfirmation',
+  async ({ status, requiresConfirmation, wantConfirmation }) => {
+    const onManage = vi.fn()
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: {
+        ...task,
+        media_type: 'video',
+        status,
+        termination_requires_reconciliation: requiresConfirmation,
+      },
+      results: [],
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin
+        userId={101}
+        canManage
+        onClose={vi.fn()}
+        onManage={onManage}
+      />
+    )
+    const user = userEvent.setup()
+    await user.click(
+      await screen.findByRole('button', {
+        name: status === 'expired' ? 'Mark as failed' : 'Terminate',
+      })
+    )
+    expect(onManage).toHaveBeenCalledWith('terminate', wantConfirmation)
+  }
+)
+
+test('a selected task that becomes successful on refresh is excluded from termination', async () => {
   const user = userEvent.setup()
-  await user.click(await screen.findByRole('button', { name: 'Terminate' }))
-  expect(onManage).toHaveBeenCalledWith('terminate', true)
+  mount(<ImageTaskCenter admin />)
+  await user.click(
+    await screen.findByRole('checkbox', { name: `Select task ${task.id}` })
+  )
+  expect(
+    screen.getByRole('button', { name: 'Terminate selected' })
+  ).toBeEnabled()
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [{ ...task, status: 'succeeded', can_terminate: false }],
+    total: 1,
+    pages: 1,
+    stats: {},
+  })
+  await user.click(screen.getByRole('button', { name: 'Refresh' }))
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: 'Terminate selected' })
+    ).toBeDisabled()
+  )
+  expect(
+    screen.getByRole('button', { name: 'Terminate current page (0)' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('checkbox', { name: `Select task ${task.id}` })
+  ).not.toBeChecked()
+  expect(imageRequest).not.toHaveBeenCalled()
 })
 
 test.each([

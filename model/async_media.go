@@ -13,6 +13,11 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const (
+	AsyncMediaTaskAgeExceededReason   = "Task exceeded the maximum age of 4 hours"
+	AsyncMediaExpiredTerminatedReason = "Unsuccessful expired task terminated by administrator"
+)
+
 // AsyncMediaJob owns submission and storage leases. Upstream task accounting
 // remains in Task; retrying storage never enters the submission path.
 type AsyncMediaJob struct {
@@ -133,6 +138,13 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 
 func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int) (bool, error) {
 	now := time.Now().Unix()
+	if job.CreatedAt > 0 && job.CreatedAt <= now-AsyncMediaMaxTaskAgeSeconds {
+		_, err := FailAgedAsyncMediaJob(ctx, *job, now, true)
+		if errors.Is(err, ErrImageConflict) {
+			return false, nil
+		}
+		return false, err
+	}
 	result := DB.WithContext(ctx).Model(&AsyncMediaJob{}).Where("id = ? AND lease_expires_at <= ? AND next_attempt_at <= ? AND status IN ?", job.ID, now, now, []string{"queued", "submitting", "submitted", "reconciling"}).
 		Where("status = ? AND storage_status = ? AND attempt_generation = ? AND COALESCE(reference_recovery_stage, '') = ?", job.Status, job.StorageStatus, job.AttemptGeneration, job.ReferenceRecoveryStage).
 		Updates(map[string]any{"lease_token": lease, "lease_expires_at": now + int64(seconds)})
@@ -170,6 +182,9 @@ func DispatchAsyncMediaJob(ctx context.Context, job AsyncMediaJob, updates map[s
 				return ErrImageConflict
 			}
 			return err
+		}
+		if before.CreatedAt > 0 && before.CreatedAt <= time.Now().Unix()-AsyncMediaMaxTaskAgeSeconds {
+			return ErrImageConflict
 		}
 		if err := tx.Model(&AsyncMediaJob{}).Where("id = ? AND lease_token = ? AND attempt_generation = ?", job.ID, job.LeaseToken, job.AttemptGeneration).Updates(updates).Error; err != nil {
 			return err

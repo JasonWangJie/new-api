@@ -29,7 +29,7 @@ func ImageChannelSupportsPlatform(channel model.Channel, modelName, platform str
 	}
 	if platform == "mixed" {
 		_, registered := constant.ChannelTypeNames[channel.Type]
-		return registered && channel.Type != constant.ChannelTypeUnknown && capability.Generate && capability.Protocol == "openai_images"
+		return registered && channel.Type != constant.ChannelTypeUnknown && capability.Generate && (capability.Protocol == "openai_images" || capability.Protocol == "gemini_native")
 	}
 	return capability.Generate && (platform == "openai" && capability.Protocol == "openai_images" || capability.Provider == platform)
 }

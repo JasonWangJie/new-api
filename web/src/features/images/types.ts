@@ -143,6 +143,7 @@ export type ImageTask = {
   provider?: string
   stage?: string
   storage_status?: string
+  result_expired?: boolean
   id: string
   task_id: string
   platform: ImagePlatform
@@ -210,6 +211,8 @@ export type ImageTask = {
   error_message: string
   can_resume: boolean
   can_terminate: boolean
+  termination_requires_reconciliation?: boolean
+  termination_requires_quota_reconciliation?: boolean
 }
 export type ImageRetryDecision = {
   policy?: import('./retry-policy/types').RetryDecision

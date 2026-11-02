@@ -74,6 +74,7 @@ import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
 import { ImageTaskRefreshActions } from './components/image-task-refresh-actions'
+import { useMediaRetentionClock } from './hooks/use-media-retention-clock'
 import { imageLabel } from './lib/image-labels'
 import {
   imageTaskElapsedSeconds,
@@ -84,6 +85,9 @@ import {
   imageTaskUpstreamProgress,
   imageTaskCanResume,
   imageTaskVideoReconciliation,
+  imageTaskCanTerminate,
+  imageTaskResultExpired,
+  imageTaskRequiresTerminationConfirmation,
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
 
@@ -176,10 +180,20 @@ function TaskCenterSession({
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
     refetchInterval: autoRefresh ? TASK_REFRESH_INTERVAL_SECONDS * 1000 : false,
   })
+  const now = useMediaRetentionClock(tasks.data?.items)
   const platforms = useQuery({
     queryKey: ['image-task-platforms', userId, admin],
     queryFn: ({ signal }) => getMediaTaskPlatforms(admin, signal),
   })
+  const actionableSelection = useMemo(() => {
+    const selected: RowSelectionState = {}
+    for (const task of tasks.data?.items || []) {
+      if (imageTaskCanTerminate(task, now) && selection[task.id]) {
+        selected[task.id] = true
+      }
+    }
+    return selected
+  }, [now, selection, tasks.data?.items])
   const openTask = useCallback((id: string) => {
     startTransition(() => setDetail(id))
   }, [])
@@ -213,6 +227,7 @@ function TaskCenterSession({
                 <Checkbox
                   aria-label={`${t('Select task')} ${row.original.id}`}
                   checked={row.getIsSelected()}
+                  disabled={!row.getCanSelect()}
                   onCheckedChange={(value) => row.toggleSelected(value)}
                 />
               ),
@@ -338,6 +353,7 @@ function TaskCenterSession({
                     : undefined
                 }
                 pendingAction={issue?.pendingAction}
+                resultExpired={imageTaskResultExpired(row.original, now)}
               />
               <p className='text-muted-foreground text-xs'>
                 {progress !== null && <>{progress}% · </>}
@@ -442,7 +458,7 @@ function TaskCenterSession({
               <Eye className='size-3.5' aria-hidden />
               {t('View')}
             </Button>
-            {imageTaskCanResume(row.original, admin, canManage) && (
+            {imageTaskCanResume(row.original, admin, canManage, now) && (
               <Button
                 size='sm'
                 variant='outline'
@@ -465,22 +481,34 @@ function TaskCenterSession({
               </Button>
             )}
             {(canManage || (!admin && row.original.media_type === 'video')) &&
-              row.original.can_terminate && (
+              imageTaskCanTerminate(row.original, now) && (
                 <Button
-                  size='icon-sm'
+                  size={row.original.status === 'expired' ? 'xs' : 'icon-sm'}
                   variant='ghost'
-                  aria-label={t('Terminate')}
-                  title={t('Terminate')}
+                  aria-label={t(
+                    row.original.status === 'expired'
+                      ? 'Mark as failed'
+                      : 'Terminate'
+                  )}
+                  title={t(
+                    row.original.status === 'expired'
+                      ? 'Mark as failed'
+                      : 'Terminate'
+                  )}
                   onClick={() =>
                     setOperation({
                       ids: [row.original.id],
                       action: 'terminate',
                       confirmUpstreamChecked:
-                        row.original.status === 'execution_unknown',
+                        imageTaskRequiresTerminationConfirmation(row.original),
+                      confirmQuotaReconciled:
+                        !!row.original
+                          .termination_requires_quota_reconciliation,
                     })
                   }
                 >
                   <Ban className='size-3.5' aria-hidden />
+                  {row.original.status === 'expired' && t('Mark as failed')}
                 </Button>
               )}
           </div>
@@ -489,7 +517,7 @@ function TaskCenterSession({
         size: 118,
       },
     ],
-    [admin, canManage, openTask, prefetchTask, t]
+    [admin, canManage, now, openTask, prefetchTask, t]
   )
   const { table } = useDataTable({
     data: tasks.data?.items || [],
@@ -502,8 +530,9 @@ function TaskCenterSession({
     onPaginationChange: setPagination,
     sorting,
     onSortingChange: setSorting,
-    enableRowSelection: canManage,
-    rowSelection: selection,
+    enableRowSelection: (row) =>
+      canManage && imageTaskCanTerminate(row.original, now),
+    rowSelection: actionableSelection,
     onRowSelectionChange: setSelection,
     getRowId: (row) => row.id,
   })
@@ -528,6 +557,11 @@ function TaskCenterSession({
   const confirm = async () => {
     if (!operation) return
     setBusy(true)
+    const body: Record<string, boolean> = {}
+    if (operation.confirmUpstreamChecked) body.confirm_upstream_checked = true
+    if (admin && operation.confirmQuotaReconciled) {
+      body.confirm_quota_reconciled = true
+    }
     try {
       if (operation.action === 'batch-terminate') {
         const failures: { id: string; reason: string }[] = []
@@ -536,9 +570,7 @@ function TaskCenterSession({
             await imageRequest(
               `${mediaTasksPath(true)}/${id}/terminate`,
               'POST',
-              operation.confirmUpstreamChecked
-                ? { confirm_upstream_checked: true }
-                : undefined
+              Object.keys(body).length ? body : undefined
             )
           } catch (error) {
             failures.push({
@@ -579,17 +611,6 @@ function TaskCenterSession({
           )
         }
       } else {
-        const body: Record<string, boolean> = {}
-        if (operation.confirmUpstreamChecked) {
-          body.confirm_upstream_checked = true
-        }
-        if (
-          admin &&
-          operation.action === 'resume' &&
-          operation.confirmQuotaReconciled
-        ) {
-          body.confirm_quota_reconciled = true
-        }
         await imageRequest(
           `${mediaTasksPath(admin)}/${operation.ids[0]}/${operation.action}`,
           'POST',
@@ -627,9 +648,9 @@ function TaskCenterSession({
       : t(
           'Retrieve results again and retry storage and pending billing. Media generation is never repeated.'
         )
-    if (operation.confirmQuotaReconciled) {
-      confirmationDescription = `${t('Ask an administrator to reconcile the quota reservation before trying again.')} ${confirmationDescription}`
-    }
+  }
+  if (operation?.confirmQuotaReconciled) {
+    confirmationDescription = `${t('Ask an administrator to reconcile the quota reservation before trying again.')} ${confirmationDescription}`
   }
   let confirmationTitle = t('Terminate media tasks')
   if (operation?.action === 'resume') {
@@ -802,9 +823,13 @@ function TaskCenterSession({
       </Button>
     </>
   )
-  const currentPending = (tasks.data?.items || []).filter(
-    (task) => task.can_terminate
+  const currentPending = (tasks.data?.items || []).filter((task) =>
+    imageTaskCanTerminate(task, now)
   )
+  const selectedPending = table
+    .getSelectedRowModel()
+    .rows.map((row) => row.original)
+    .filter((task) => imageTaskCanTerminate(task, now))
   const stats = tasks.data?.stats
   const statistics = [
     {
@@ -867,7 +892,10 @@ function TaskCenterSession({
             ids: currentPending.map((task) => task.id),
             action: 'batch-terminate',
             confirmUpstreamChecked: currentPending.some(
-              (task) => task.status === 'execution_unknown'
+              imageTaskRequiresTerminationConfirmation
+            ),
+            confirmQuotaReconciled: currentPending.some(
+              (task) => task.termination_requires_quota_reconciliation
             ),
           })
         }
@@ -878,14 +906,17 @@ function TaskCenterSession({
       <Button
         size='sm'
         variant='destructive'
-        disabled={!table.getSelectedRowModel().rows.length}
+        disabled={!selectedPending.length || busy}
         onClick={() =>
           setOperation({
-            ids: table.getSelectedRowModel().rows.map((row) => row.original.id),
+            ids: selectedPending.map((task) => task.id),
             action: 'batch-terminate',
-            confirmUpstreamChecked: table
-              .getSelectedRowModel()
-              .rows.some((row) => row.original.status === 'execution_unknown'),
+            confirmUpstreamChecked: selectedPending.some(
+              imageTaskRequiresTerminationConfirmation
+            ),
+            confirmQuotaReconciled: selectedPending.some(
+              (task) => task.termination_requires_quota_reconciliation
+            ),
           })
         }
       >
@@ -1092,6 +1123,7 @@ function TaskCenterSession({
                           row={row}
                           isSelected={isSelected}
                           admin={admin}
+                          now={now}
                           onView={openTask}
                           onPrefetch={prefetchTask}
                         />

@@ -47,6 +47,80 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	encoded := base64.StdEncoding.EncodeToString(bitmap.Bytes())
+	imageURI := "data:image/png;base64," + encoded
+	inline := `{"inlineData":{"mimeType":"image/png","data":"` + encoded + `"}}`
+	file := `{"fileData":{"mimeType":"image/png","fileUri":"` + imageURI + `"}}`
+	native := `{"candidates":[{"finishReason":"STOP","content":{"parts":[` + file + `,{"text":"![image](https://127.0.0.1/ignored.png)"}]}}]}`
+	openai := `{"data":[{"url":"` + imageURI + `"}]}`
+	for _, tc := range []struct {
+		name, platform, body, wantError string
+		wantCount                       int
+		maxBytes, maxPixels             int64
+	}{
+		{name: "native inline remains supported", body: `{"candidates":[{"content":{"parts":[` + inline + `]}}]}`, wantCount: 1},
+		{name: "fileData plus Markdown counts once", body: native, wantCount: 1},
+		{name: "fileData without MIME validates its bytes", body: `{"candidates":[{"content":{"parts":[{"fileData":{"fileUri":"` + imageURI + `"}}]}}]}`, wantCount: 1},
+		{name: "OpenAI URL wrapper on Gemini", body: openai, wantCount: 1},
+		{name: "OpenAI base64 wrapper on Gemini", body: `{"data":[{"b64_json":"` + encoded + `"}]}`, wantCount: 1},
+		{name: "null error still allows a successful wrapper", body: `{"error":null,"data":[{"url":"` + imageURI + `"}]}`, wantCount: 1},
+		{name: "existing OpenAI URL", platform: "openai", body: openai, wantCount: 1},
+		{name: "existing OpenAI base64 takes precedence", platform: "openai", body: `{"data":[{"url":"https://127.0.0.1/ignored.png","b64_json":"` + encoded + `"}]}`, wantCount: 1},
+		{name: "native takes precedence over duplicate wrapper", body: strings.TrimSuffix(native, "}") + `,"data":[{"url":"https://127.0.0.1/ignored.png"}]}`, wantCount: 1},
+		{name: "inline takes precedence within one part", body: `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"` + encoded + `"},"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/ignored.png"}}]}}]}`, wantCount: 1},
+		{name: "thought images are not final images", body: `{"candidates":[{"content":{"parts":[{"thought":true,"inlineData":{"mimeType":"image/png","data":"` + encoded + `"}},{"thought":true,"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/ignored.png"}},` + file + `]}}]}`, wantCount: 1},
+		{name: "legitimate repeated outputs are retained", body: `{"candidates":[{"content":{"parts":[` + file + `,` + file + `]}}]}`, wantCount: 2},
+		{name: "maximum count remains supported", body: `{"data":[` + strings.TrimSuffix(strings.Repeat(`{"url":"`+imageURI+`"},`, dto.MaxImageN), ",") + `]}`, wantCount: dto.MaxImageN},
+		{name: "too many native images fail before download", body: `{"candidates":[{"content":{"parts":[` + strings.TrimSuffix(strings.Repeat(`{"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/blocked.png"}},`, dto.MaxImageN+1), ",") + `]}}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "too many wrapper images fail before download", body: `{"data":[` + strings.TrimSuffix(strings.Repeat(`{"url":"https://127.0.0.1/blocked.png"},`, dto.MaxImageN+1), ",") + `]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "private fileData URL stays blocked", body: `{"candidates":[{"content":{"parts":[{"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/blocked.png"}}]}}]}`, wantError: "image reference address is not public"},
+		{name: "private wrapper URL stays blocked", body: `{"data":[{"url":"https://127.0.0.1/blocked.png"}]}`, wantError: "image reference address is not public"},
+		{name: "non HTTPS fileData stays blocked", body: `{"candidates":[{"content":{"parts":[{"fileData":{"mimeType":"image/png","fileUri":"http://example.com/image.png"}}]}}]}`, wantError: "image reference requires an HTTPS URL without credentials"},
+		{name: "empty file URI cannot fall back", body: `{"candidates":[{"content":{"parts":[{"fileData":{"mimeType":"image/png","fileUri":""}}]}}],"data":[{"url":"` + imageURI + `"}]}`, wantError: "upstream image file URI is empty"},
+		{name: "text only never becomes an image", body: `{"candidates":[{"content":{"parts":[{"text":"![image](https://127.0.0.1/blocked.png)"}]}}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "text candidate cannot authorize wrapper fallback", body: `{"candidates":[{"content":{"parts":[{"text":"No image"}]}}],"data":[{"url":"` + imageURI + `"}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "thought candidate cannot authorize wrapper fallback", body: `{"candidates":[{"content":{"parts":[{"thought":true,"inlineData":{"mimeType":"image/png","data":"` + encoded + `"}}]}}],"data":[{"url":"` + imageURI + `"}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "blocked prompt cannot authorize wrapper fallback", body: `{"promptFeedback":{"blockReason":"SAFETY"},"data":[{"url":"` + imageURI + `"}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "blocked prompt cannot authorize native fileData", body: strings.TrimSuffix(native, "}") + `,"promptFeedback":{"blockReason":"SAFETY"}}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "explicit error cannot authorize wrapper fallback", body: `{"error":{"message":"generation failed"},"data":[{"url":"` + imageURI + `"}]}`, wantError: "upstream image response contains an error"},
+		{name: "non image fileData is ignored", body: `{"candidates":[{"content":{"parts":[{"fileData":{"mimeType":"video/mp4","fileUri":"` + imageURI + `"}}]}}]}`, wantError: "upstream must return between 1 and 128 complete images"},
+		{name: "empty wrapper item is rejected", body: `{"data":[{}]}`, wantError: "upstream image data item is empty"},
+		{name: "one invalid image rejects the whole output", body: `{"data":[{"url":"` + imageURI + `"},{"b64_json":"bm90IGFuIGltYWdl"}]}`, wantError: "invalid image header"},
+		{name: "fileData byte limit is enforced", body: native, maxBytes: 1, wantError: "invalid or oversized image data URI"},
+		{name: "wrapper pixel limit is enforced", body: openai, maxPixels: 1, wantError: "image pixel limit exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			platform := tc.platform
+			if platform == "" {
+				platform = "gemini"
+			}
+			cfg := service.DefaultImageRuntimeConfig()
+			if tc.maxBytes > 0 {
+				cfg.DownloadMaxBytes = tc.maxBytes
+			}
+			if tc.maxPixels > 0 {
+				cfg.DownloadMaxPixels = tc.maxPixels
+			}
+			images, err := ExtractAsyncImageOutputs(t.Context(), []byte(tc.body), platform, cfg)
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				assert.Empty(t, images, "invalid batches must not expose a partial success")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, images, tc.wantCount)
+			for _, actual := range images {
+				assert.Equal(t, bitmap.Bytes(), actual.Data)
+				assert.Equal(t, 2, actual.Width)
+				assert.Equal(t, 3, actual.Height)
+			}
+		})
+	}
+}
+
 func TestTabtabImageModelContracts(t *testing.T) {
 	for _, tc := range []struct {
 		model, fields, wantArgs string
@@ -997,6 +1071,300 @@ func TestTianyueImageRatioRoutesCompatibleChannel(t *testing.T) {
 	}
 }
 
+func TestMixedGeminiImageRoutingAndExecution(t *testing.T) {
+	previousDB, previousType := model.DB, common.MainDatabaseType()
+	previousCount, previousRedis, previousUnit := constant.CountToken, common.RedisEnabled, common.QuotaPerUnit
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousModes, previousExpressions := maps.Clone(settings.BillingMode), maps.Clone(settings.BillingExpr)
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "mixed-gemini.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test", "use a dedicated disposable database")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.Contains(t, dsn, "new_api_image_job_test", "use a dedicated disposable database")
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = db, false, false, 500000
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	entities := []any{&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}}
+	t.Cleanup(func() {
+		assert.NoError(t, db.Migrator().DropTable(entities...))
+		model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = previousDB, previousCount, previousRedis, previousUnit
+		common.SetMainDatabaseType(previousType)
+		assert.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices))
+		settings.BillingMode, settings.BillingExpr = previousModes, previousExpressions
+		connection, err := db.DB()
+		require.NoError(t, err)
+		assert.NoError(t, connection.Close())
+	})
+	require.NoError(t, db.AutoMigrate(entities...))
+	require.NoError(t, db.AutoMigrate(entities...))
+	versionQuery := "SELECT sqlite_version()"
+	if db.Dialector.Name() != "sqlite" {
+		versionQuery = "SELECT VERSION()"
+	}
+	var version string
+	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("Database version: %s", version)
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-gemini:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("g"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-gemini")
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.AccountCooldownSeconds = 0
+	encoded, err := common.Marshal(cfg)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.Option{Key: "image_runtime_config", Value: string(encoded)}).Error)
+	const alias = "mixed-gemini-public-alias"
+	prices := ratio_setting.GetModelPriceCopy()
+	prices[alias], prices["gemini-3.1-flash-image"] = 0.04, 99
+	encoded, err = common.Marshal(prices)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encoded)))
+	user := model.User{Username: "mixed-gemini-user", Group: "default", Status: common.UserStatusEnabled, Quota: 10000000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "mixed-gemini-token", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	catalog, err := common.Marshal([]service.ImageModelCapability{{Id: alias, MediaType: "image", Resolutions: []string{"1K", "2K", "4K"}, MaxOutputImages: 2, MaxReferenceImages: 8}})
+	require.NoError(t, err)
+	policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", "mixed"), Group: "default", Platform: "mixed", PoolMode: "model_resolution", Enabled: true, AsyncEnabled: true, Models: string(catalog)}
+	require.NoError(t, db.Create(&policy).Error)
+	mapping := fmt.Sprintf(`{%q:"gemini-3.1-flash-image"}`, alias)
+	channel := model.Channel{Id: 45, Type: constant.ChannelTypeGemini, Name: "Gemini mixed fixture", Key: "gemini-test-key", Status: common.ChannelStatusEnabled, Group: "default", Models: alias, ModelMapping: &mapping}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: alias, ChannelId: channel.Id, Enabled: true}).Error)
+	key := service.ImagePoolBindingKey(policy, alias, "2K")
+	require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: key, Group: "default", Platform: "mixed", Mode: policy.PoolMode, Model: alias, Resolution: "2K", ChannelId: channel.Id, Priority: 7}).Error)
+	options, err := service.GetImagePoolSelectionOptions(t.Context(), "default", "mixed")
+	require.NoError(t, err)
+	require.Len(t, options.Models, 1)
+	assert.Equal(t, []int{45}, options.Models[0].ChannelIds)
+	preview, err := service.PreviewMediaRouting(t.Context(), service.MediaRoutingPreviewRequest{Group: "default", Platform: "mixed", MediaType: "image", Model: alias, Resolution: "2K", Operation: "text_to_image"})
+	require.NoError(t, err)
+	require.Len(t, preview.Eligible, 1)
+	assert.Equal(t, "gemini_native", preview.Eligible[0].Protocol)
+	assert.Equal(t, "gemini-3.1-flash-image", preview.Eligible[0].UpstreamModel)
+	assert.Equal(t, 7, preview.Eligible[0].Weight)
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	imageBase64 := base64.StdEncoding.EncodeToString(bitmap.Bytes())
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name, expression, usage string
+		reference, missingUsage bool
+		malformedUsage          bool
+		omitUsage               bool
+		quota                   int
+	}{
+		{name: "unit_price", quota: 20000},
+		{name: "unit_price_without_usage", omitUsage: true, quota: 20000},
+		{name: "reference_expression", reference: true, expression: `tier("image", fixed(0.03)) * image_count`, quota: 15000},
+		{name: "token_expression", expression: `tier("tokens", p * 2 + c * 4)`, quota: 140},
+		{name: "token_expression_public_facts", expression: `param("resolution") == "2K" ? tier("tokens", p * 2 + c * 4) : tier("other", p * 20 + c * 40)`, quota: 140},
+		{name: "explicit_zero_completion", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":0,"totalTokenCount":120}`, quota: 100},
+		{name: "missing_token_usage", expression: `tier("tokens", p * 2 + c * 4)`, missingUsage: true},
+		{name: "missing_usage_in_image_price_condition", expression: `p == 0 ? tier("zero", fixed(0.01)) * image_count : tier("image", fixed(0.03)) * image_count`, missingUsage: true},
+		{name: "missing_output_usage", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":100,"totalTokenCount":120}`, missingUsage: true},
+		{name: "negative_token_usage", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":-100,"candidatesTokenCount":20,"totalTokenCount":120}`, missingUsage: true},
+		{name: "quota_overflow_usage", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":2147483648,"candidatesTokenCount":20,"totalTokenCount":2147483668}`, missingUsage: true},
+		{name: "fractional_token_usage", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":100.5,"candidatesTokenCount":20,"totalTokenCount":120}`, malformedUsage: true},
+		{name: "overflow_token_usage", expression: `tier("tokens", p * 2 + c * 4)`, usage: `,"usageMetadata":{"promptTokenCount":9223372036854775809,"candidatesTokenCount":20,"totalTokenCount":120}`, malformedUsage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			delete(settings.BillingMode, alias)
+			delete(settings.BillingExpr, alias)
+			if tc.expression != "" {
+				settings.BillingMode[alias], settings.BillingExpr[alias] = billing_setting.BillingModeTieredExpr, tc.expression
+			}
+			received := make(chan []byte, 2)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v1beta/models/gemini-3.1-flash-image:generateContent", r.URL.Path)
+				body, err := io.ReadAll(r.Body)
+				assert.NoError(t, err)
+				received <- body
+				w.Header().Set("Content-Type", "application/json")
+				usage := `,"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"totalTokenCount":120}`
+				if tc.missingUsage || tc.omitUsage {
+					usage = ""
+				}
+				if tc.usage != "" {
+					usage = tc.usage
+				}
+				_, _ = fmt.Fprintf(w, `{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":%q}}]},"finishReason":"STOP"}]%s}`, imageBase64, usage)
+			}))
+			defer upstream.Close()
+			selectedChannel := channel
+			selectedChannel.BaseURL = &upstream.URL
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("base_url", upstream.URL).Error)
+			request, err := service.ParseAsyncImageRequest([]byte(fmt.Sprintf(`{"model":%q,"prompt":"draw","resolution":"2K","aspect_ratio":"3:2"}`, alias)), "application/json", "/v1/images/generations_async", cfg)
+			require.NoError(t, err)
+			if tc.reference {
+				request.Kind = "image_to_image"
+				request.Parts = append(request.Parts, service.AsyncImageInputPart{Type: "image_url", URL: "data:image/png;base64," + imageBase64})
+			}
+			require.NoError(t, service.PrepareMixedImageAdmission(t.Context(), token, &request))
+			require.NotNil(t, request.MixedRouting)
+			billing, err := FreezeAsyncImageBilling(t.Context(), token, request, "default", &selectedChannel)
+			require.NoError(t, err)
+			request.Billing = &billing
+			selected, _, err := service.PickImageChannel(t.Context(), policy, request, service.ImageAccountRouting{})
+			require.NoError(t, err)
+			require.Equal(t, 45, selected.Id)
+			assert.Equal(t, "openai", request.Platform, "selection preserves the public request and frozen pricing facts")
+			task := model.AsyncImageTask{TaskId: "mixed-gemini-" + tc.name, UserId: user.Id, TokenId: token.Id, ChannelId: selected.Id, Group: "default", Provider: "gemini", ExecutionProtocol: "gemini_native", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+			payload, err := common.Marshal(selected)
+			require.NoError(t, err)
+			task.SelectedChannelCipher, err = service.EncryptImagePayload(payload, "image-channel:"+task.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&task).Error)
+			dispatches := 0
+			output, bill, executionErr := ExecuteAsyncImage(t.Context(), task, request, selected, cfg, func() error { dispatches++; return model.MarkAsyncImageDispatched(t.Context(), task, selected.Id) })
+			assert.Equal(t, 1, dispatches)
+			require.NotEmpty(t, received)
+			body := <-received
+			var sent dto.GeminiChatRequest
+			require.NoError(t, common.Unmarshal(body, &sent))
+			assert.JSONEq(t, `{"imageSize":"2K","aspectRatio":"3:2"}`, string(sent.GenerationConfig.ImageConfig))
+			if tc.reference {
+				require.Len(t, sent.Contents[0].Parts, 2)
+				require.NotNil(t, sent.Contents[0].Parts[1].InlineData)
+			}
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			if tc.malformedUsage {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, executionErr, &failure)
+				assert.True(t, failure.ExecutionUnknown, "malformed protocol responses cannot authorize another generation")
+				assert.Nil(t, output)
+				assert.Zero(t, bill.Quota)
+				reservation, err := model.GetAsyncImageReservation(t.Context(), task)
+				require.NoError(t, err)
+				require.NotNil(t, reservation)
+				assert.Equal(t, "reserved", reservation.Status)
+				return
+			}
+			payload, err = service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			var recovered service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(payload, &recovered))
+			require.NotNil(t, recovered.MixedRouting)
+			require.NotNil(t, recovered.Completion)
+			_, recoveredBill, recoveryErr := ExecuteAsyncImage(t.Context(), task, recovered, selected, cfg, func() error { dispatches++; return nil })
+			assert.Equal(t, 1, dispatches, "completion recovery cannot generate again")
+			assert.Empty(t, received)
+			if tc.missingUsage {
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, executionErr, &failure)
+				assert.Equal(t, "billing_usage_missing", failure.InternalCode)
+				require.Error(t, recoveryErr)
+				reservation, err := model.GetAsyncImageReservation(t.Context(), task)
+				require.NoError(t, err)
+				require.NotNil(t, reservation)
+				assert.Equal(t, "reserved", reservation.Status)
+				return
+			}
+			require.NoError(t, executionErr)
+			require.NotNil(t, output)
+			require.Len(t, output.Images, 1)
+			assert.Equal(t, tc.quota, bill.Quota)
+			require.NoError(t, recoveryErr)
+			assert.Equal(t, bill.Quota, recoveredBill.Quota)
+			var log model.Log
+			require.NoError(t, common.UnmarshalJsonStr(bill.LogPayload, &log))
+			assert.Equal(t, alias, log.ModelName)
+		})
+	}
+	t.Run("accepted_reference_job_only_polls", func(t *testing.T) {
+		calls := make(chan string, 2)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls <- r.Method + " " + r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte(`{"status":"running"}`))
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"gemini-job"}`))
+		}))
+		defer upstream.Close()
+		selected := channel
+		selected.BaseURL = &upstream.URL
+		var profile dto.UpstreamAsyncConfig
+		require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"mixed-gemini-job","media_type":"image","models":["gemini-3.1-flash-image"],"operations":["generate"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/jobs"}},"poll":{"request":{"method":"GET","path":"/tasks/{task_id}"},"response":{"status_path":"status","status_values":{"in_progress":["running"],"succeeded":["done"],"failed":["failed"]},"result_path":"urls"}}}]}`, &profile))
+		require.NoError(t, profile.Validate())
+		selected.SetOtherSettings(dto.ChannelOtherSettings{UpstreamAsync: &profile})
+		request := service.AsyncImageRequest{Platform: "openai", Dialect: "async", Model: alias, Prompt: "draw", Count: 1, Resolution: "2K", Kind: "image_to_image", Parts: []service.AsyncImageInputPart{{Type: "text", Text: "draw"}, {Type: "image_url", URL: "data:image/png;base64," + imageBase64}}, MixedRouting: &service.ImageMixedRouting{Group: "default", BindingKey: key, PoolMode: policy.PoolMode}, Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.04, QuotaToPreConsume: 20000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+		task := model.AsyncImageTask{TaskId: "mixed-gemini-poll", UserId: user.Id, TokenId: token.Id, ChannelId: selected.Id, Group: "default", Provider: "gemini", ExecutionProtocol: "gemini_native", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
+		payload, err := common.Marshal(selected)
+		require.NoError(t, err)
+		task.SelectedChannelCipher, err = service.EncryptImagePayload(payload, "image-channel:"+task.TaskId)
+		require.NoError(t, err)
+		require.NoError(t, db.Create(&task).Error)
+		dispatches := 0
+		_, _, err = ExecuteAsyncImage(t.Context(), task, request, &selected, cfg, func() error { dispatches++; return model.MarkAsyncImageDispatched(t.Context(), task, selected.Id) })
+		var pending *service.AsyncImagePending
+		require.ErrorAs(t, err, &pending)
+		assert.Equal(t, "POST /jobs", <-calls)
+		require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+		assert.Equal(t, "gemini-job", task.UpstreamTaskId)
+		request.Reservation, err = model.GetAsyncImageReservation(t.Context(), task)
+		require.NoError(t, err)
+		request.Parts[1].URL = "https://expired.invalid/reference.png"
+		_, _, err = ExecuteAsyncImage(t.Context(), task, request, &selected, cfg, func() error { dispatches++; return nil })
+		require.ErrorAs(t, err, &pending)
+		assert.Equal(t, "GET /tasks/gemini-job", <-calls)
+		assert.Equal(t, 1, dispatches, "an accepted job is only queried, even if its reference is now unavailable")
+	})
+	t.Run("incompatible_requests_are_not_candidates", func(t *testing.T) {
+		for _, tc := range []struct{ name, fields, override string }{
+			{name: "multiple_images", fields: `,"n":2`},
+			{name: "mask", fields: `,"images":[{"image_url":"https://reference.invalid/a.png"}],"mask":{"image_url":"https://reference.invalid/mask.png"}`},
+			{name: "background", fields: `,"background":"transparent"`},
+			{name: "quality", fields: `,"quality":"high"`},
+			{name: "override_count", override: `{"operations":[{"path":"generationConfig.candidateCount","mode":"set","value":2}]}`},
+			{name: "override_discards_reference", fields: `,"image_urls":["https://reference.invalid/a.png"]`, override: `{"operations":[{"path":"contents.0.parts.0","mode":"set","value":{"text":"override"}}]}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				request, err := service.ParseAsyncImageRequest([]byte(fmt.Sprintf(`{"model":%q,"prompt":"draw","resolution":"2K"%s}`, alias, tc.fields)), "application/json", "/v1/images/generations_async", cfg)
+				require.NoError(t, err)
+				candidate := channel
+				if tc.override != "" {
+					candidate.ParamOverride = &tc.override
+				}
+				assert.False(t, service.MixedImageChannelRequestSupported(candidate, request))
+			})
+		}
+	})
+	t.Run("dimensions_preserve_the_public_request", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, size, resolution, ratio, wantResolution, wantRatio string
+			invalid                                                  bool
+		}{
+			{name: "pixels", size: "1536x1024", wantResolution: "2K", wantRatio: "3:2"},
+			{name: "explicit_tier", size: "1536x1024", resolution: "1K", ratio: "16:9", wantResolution: "1K", wantRatio: "16:9"},
+			{name: "auto", size: "auto", resolution: "AUTO", ratio: "3:2", wantRatio: "3:2"},
+			{name: "half_k", resolution: "0.5K", ratio: "1:1", wantResolution: "0.5K", wantRatio: "1:1"},
+			{name: "unsupported_ratio", resolution: "2K", ratio: "2:1", invalid: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				request := service.AsyncImageRequest{Platform: "openai", Dialect: "async", Model: alias, Count: 1, Prompt: "draw", Size: tc.size, Resolution: tc.resolution, AspectRatio: tc.ratio, Native: map[string]common.RawMessage{"prompt": common.RawMessage(`"draw"`)}}
+				normalized, err := service.NormalizeMixedGeminiImageRequest(request)
+				if tc.invalid {
+					require.Error(t, err)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantResolution, normalized.Resolution)
+				assert.Equal(t, tc.wantRatio, normalized.AspectRatio)
+				assert.Equal(t, tc.size, request.Size)
+				assert.Equal(t, tc.resolution, request.Resolution)
+				assert.Equal(t, "openai", request.Platform)
+				assert.Equal(t, map[string]common.RawMessage{"prompt": common.RawMessage(`"draw"`)}, request.Native)
+			})
+		}
+	})
+}
+
 func TestMixedImageFinalNativeCountGuard(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
@@ -1275,10 +1643,13 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 	imageData := base64.StdEncoding.EncodeToString(pngImage.Bytes())
 	for _, tc := range []struct {
 		name, platform    string
+		responseFormat    string
 		resolutionMapping bool
 	}{
 		{name: "openai", platform: "openai"},
 		{name: "gemini", platform: "gemini"},
+		{name: "gemini_file_data", platform: "gemini", responseFormat: "file_data"},
+		{name: "gemini_openai_wrapper", platform: "gemini", responseFormat: "openai"},
 		{name: "openai_resolution_mapping", platform: "openai", resolutionMapping: true},
 		{name: "gemini_resolution_mapping", platform: "gemini", resolutionMapping: true},
 	} {
@@ -1287,10 +1658,14 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 			channelType := constant.ChannelTypeOpenAI
 			if tc.platform == "gemini" {
 				channelType = constant.ChannelTypeGemini
-				response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{
-					{Thought: true, InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
-					{ThoughtSignature: common.RawMessage(`"final-image-signature"`), InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
-				}}}}}
+				if tc.responseFormat == "file_data" {
+					response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{{FileData: &dto.GeminiFileData{MimeType: "image/png", FileUri: "data:image/png;base64," + imageData}}}}}}}
+				} else if tc.responseFormat != "openai" {
+					response = dto.GeminiChatResponse{Candidates: []dto.GeminiChatCandidate{{Content: dto.GeminiChatContent{Parts: []dto.GeminiPart{
+						{Thought: true, InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
+						{ThoughtSignature: common.RawMessage(`"final-image-signature"`), InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: imageData}},
+					}}}}}
+				}
 			}
 			body, err := common.Marshal(response)
 			require.NoError(t, err)

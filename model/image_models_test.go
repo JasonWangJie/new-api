@@ -24,6 +24,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -805,6 +806,12 @@ func TestAsyncImageReservationRecoveryAndReconciliation(t *testing.T) {
 				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 				assert.ErrorIs(t, TerminateAsyncImageTask(t.Context(), task), ErrImageConflict)
 				require.NoError(t, TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
+			} else if status == ImageTaskExpired {
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				require.NoError(t, TerminateAsyncImageTask(t.Context(), task))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				assert.Equal(t, ImageTaskFailed, task.Status)
+				assert.ErrorIs(t, TerminateAsyncImageTask(t.Context(), task), ErrImageConflict)
 			}
 			require.NoError(t, RefundAsyncImageReservation(t.Context(), task.TaskId))
 			assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
@@ -816,6 +823,200 @@ func TestAsyncImageReservationRecoveryAndReconciliation(t *testing.T) {
 			assert.Equal(t, "refunded", bill.Status)
 		})
 	}
+}
+
+func TestAsyncImageMaximumAgePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     string
+		age        int64
+		applied    bool
+		fixed      bool
+		expired    bool
+		resume     bool
+		uncertain  bool
+		dispatched bool
+		accepted   bool
+		previous   bool
+		wantFailed bool
+	}{
+		{name: "never started queue", status: ImageTaskQueued, age: AsyncMediaMaxTaskAgeSeconds + 10, wantFailed: true},
+		{name: "queued almost four hours then upstream accepted", status: ImageTaskInvoking, age: AsyncMediaMaxTaskAgeSeconds + 10, dispatched: true, accepted: true, wantFailed: true},
+		{name: "current dispatch without upstream receipt", status: ImageTaskInvoking, age: AsyncMediaMaxTaskAgeSeconds + 10, dispatched: true, wantFailed: true},
+		{name: "completed attempt history is not current dispatch", status: ImageTaskQueued, age: AsyncMediaMaxTaskAgeSeconds + 10, previous: true, wantFailed: true},
+		{name: "expired worker lease", status: ImageTaskStorageFailed, age: AsyncMediaMaxTaskAgeSeconds + 10, expired: true, wantFailed: true},
+		{name: "postprocessing charge already applied", status: ImageTaskBillingFailed, age: AsyncMediaMaxTaskAgeSeconds + 10, applied: true, wantFailed: true},
+		{name: "overdue storage resume ends before requeue", status: ImageTaskStorageFailed, age: AsyncMediaMaxTaskAgeSeconds + 10, resume: true, wantFailed: true},
+		{name: "overdue billing resume preserves charge", status: ImageTaskBillingFailed, age: AsyncMediaMaxTaskAgeSeconds + 10, applied: true, resume: true, wantFailed: true},
+		{name: "expired task", status: ImageTaskExpired, age: AsyncMediaMaxTaskAgeSeconds + 10, wantFailed: true},
+		{name: "unconfirmed upstream execution", status: ImageTaskExecutionUnknown, age: AsyncMediaMaxTaskAgeSeconds + 10, wantFailed: true},
+		{name: "uncertain billing preserves funds", status: ImageTaskBillingFailed, age: AsyncMediaMaxTaskAgeSeconds + 10, fixed: true, uncertain: true, wantFailed: true},
+		{name: "age boundary", status: ImageTaskQueued, age: AsyncMediaMaxTaskAgeSeconds, wantFailed: true},
+		{name: "recently accepted", status: ImageTaskQueued, age: 60},
+		{name: "successful record", status: ImageTaskSucceeded, age: AsyncMediaMaxTaskAgeSeconds + 10, applied: true},
+		{name: "already failed", status: ImageTaskFailed, age: AsyncMediaMaxTaskAgeSeconds + 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, bill := imageDatabaseFixture(t)
+			require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+			if tc.applied {
+				require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Updates(map[string]any{"status": "applied", "quota": 100}).Error)
+			} else if tc.fixed {
+				require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("status", "fixed").Error)
+			}
+			now := time.Now().Unix()
+			updates := map[string]any{"status": tc.status, "created_at": now - tc.age, "started_at": now - 1, "next_attempt_at": 0, "error_code": "original_failure"}
+			if tc.uncertain {
+				updates["error_code"] = "billing_quota_uncertain"
+			}
+			if tc.status == ImageTaskQueued {
+				updates["started_at"] = 0
+			}
+			if tc.dispatched {
+				updates["dispatched_at"] = now - 1
+			}
+			if tc.accepted {
+				updates["upstream_task_id"] = "accepted-before-age-limit"
+			}
+			if tc.previous {
+				updates["attempts"] = `[{"dispatched":true,"finished_at":1,"upstream_task_id":"previous-closed-job","code":606}]`
+			}
+			if tc.expired {
+				updates["lease_expires_at"] = now - 10
+			}
+			require.NoError(t, db.Model(&task).Updates(updates).Error)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			require.NoError(t, db.Create(&AsyncImageEvent{TaskId: task.TaskId, EventKey: "original-diagnostic", EventType: "invocation_failed", Message: "Original recovery diagnostic", CreatedAt: now - 1}).Error)
+			if tc.resume {
+				require.NoError(t, ResumeAsyncImageTask(t.Context(), task))
+			}
+			for range 2 {
+				require.NoError(t, FailOverdueAsyncImageTasks(t.Context(), 100))
+			}
+			var saved AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			var ageEvents int64
+			require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "age_limit_failed").Count(&ageEvents).Error)
+			if !tc.wantFailed {
+				assert.Equal(t, task.Status, saved.Status)
+				assert.Equal(t, task.Version, saved.Version)
+				assert.Equal(t, task.RequestCipher, saved.RequestCipher)
+				assert.Zero(t, ageEvents)
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+				return
+			}
+			assert.Equal(t, ImageTaskFailed, saved.Status)
+			assert.Equal(t, "task_age_exceeded", saved.ErrorCode)
+			assert.Equal(t, task.Version+1, saved.Version)
+			assert.Empty(t, saved.LeaseToken)
+			assert.Empty(t, saved.RequestCipher)
+			assert.Zero(t, saved.NextAttemptAt)
+			assert.EqualValues(t, 1, ageEvents)
+			var decision ImageRetryDecision
+			require.NoError(t, common.UnmarshalJsonStr(saved.RetryDecision, &decision))
+			assert.Equal(t, "maximum_task_age", decision.Rule)
+			assert.Equal(t, "task_age_exceeded", decision.Reason)
+			var prior AsyncImageEvent
+			require.NoError(t, db.Where("event_key = ?", "original-diagnostic").Take(&prior).Error)
+			assert.Equal(t, "Original recovery diagnostic", prior.Message)
+			assert.ErrorIs(t, TransitionImageTask(t.Context(), task, map[string]any{"status": ImageTaskSucceeded}, "late_completion", "", ""), ErrImageConflict)
+			assert.ErrorIs(t, StageAsyncImageOutput(t.Context(), task, []AsyncImageStagingObject{{Data: []byte("late"), Checksum: "late", Width: 1, Height: 1}}, bill), ErrImageConflict)
+			_, err := ClaimAsyncImageTask(t.Context(), task.TaskId, "late-worker", 120)
+			assert.ErrorIs(t, err, ErrImageConflict)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			if tc.status == ImageTaskExecutionUnknown || tc.uncertain || tc.dispatched || tc.accepted {
+				wantBillStatus := "reserved"
+				if tc.fixed {
+					wantBillStatus = "fixed"
+				}
+				assert.Equal(t, wantBillStatus, bill.Status)
+				assert.True(t, saved.TerminationRequiresReconciliation())
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+				var reconciliations int64
+				require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "admin_reconciled").Count(&reconciliations).Error)
+				assert.Zero(t, reconciliations, "the age policy must not claim administrator verification")
+				require.NoError(t, RefundAsyncImageReservation(t.Context(), task.TaskId))
+				require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60, 0))
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId), "automatic recovery must not release an uncertain hold")
+				assert.ErrorIs(t, TerminateAsyncImageTask(t.Context(), saved), ErrImageConflict)
+				require.NoError(t, TerminateAsyncImageTaskAfterReconciliation(t.Context(), saved))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+				assert.False(t, saved.TerminationRequiresReconciliation())
+				assert.ErrorIs(t, TerminateAsyncImageTaskAfterReconciliation(t.Context(), saved), ErrImageConflict)
+				require.NoError(t, RefundAsyncImageReservation(t.Context(), task.TaskId))
+				assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+				var refunds int64
+				require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+				require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "admin_reconciled").Count(&reconciliations).Error)
+				assert.EqualValues(t, 1, refunds)
+				assert.EqualValues(t, 1, reconciliations)
+				return
+			}
+			if tc.applied {
+				assert.Equal(t, "applied", bill.Status)
+				assert.Equal(t, "settled", saved.ReconciliationStatus)
+				assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+			} else {
+				assert.Equal(t, "refunded", bill.Status)
+				assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+			}
+		})
+	}
+}
+
+func TestAsyncImageMaximumAgeClaimAndRefundRecovery(t *testing.T) {
+	db, task, _ := imageDatabaseFixture(t)
+	require.NoError(t, ReserveAsyncImageQuota(t.Context(), task, 100, ImageFundingSelection{Source: "wallet"}))
+	require.NoError(t, db.Model(&task).Updates(map[string]any{"status": ImageTaskQueued, "created_at": time.Now().Unix() - AsyncMediaMaxTaskAgeSeconds - 10, "next_attempt_at": time.Now().Unix()}).Error)
+	// A damaged ledger must not let an overdue task start another generation.
+	require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("token_id", -1).Error)
+	_, err := ClaimAsyncImageTask(t.Context(), task.TaskId, "new-worker", 120)
+	require.Error(t, err)
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	assert.Equal(t, ImageTaskFailed, task.Status)
+	assert.Equal(t, "task_age_exceeded", task.ErrorCode)
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
+	require.NoError(t, db.Model(&AsyncImageBill{}).Where("task_id = ?", task.TaskId).Update("token_id", task.TokenId).Error)
+	for range 2 {
+		require.NoError(t, RecoverAsyncImageTasks(t.Context(), 100, 60, 0))
+	}
+	assert.Equal(t, 1000, getUserQuotaFromDB(t, task.UserId))
+	var refunds int64
+	require.NoError(t, db.Model(&AsyncImageEvent{}).Where("task_id = ? AND event_type = ?", task.TaskId, "reservation_refunded").Count(&refunds).Error)
+	assert.EqualValues(t, 1, refunds)
+}
+
+func TestAsyncImageMaximumAgeScanDoesNotStarve(t *testing.T) {
+	db, task, _ := imageDatabaseFixture(t)
+	other := task
+	other.Id, other.TaskId = 0, "later-overdue-image"
+	require.NoError(t, db.Create(&other).Error)
+	for _, pending := range []AsyncImageTask{task, other} {
+		require.NoError(t, ReserveAsyncImageQuota(t.Context(), pending, 100, ImageFundingSelection{Source: "wallet"}))
+		require.NoError(t, db.Model(&pending).Updates(map[string]any{"created_at": time.Now().Unix() - AsyncMediaMaxTaskAgeSeconds - 10, "updated_at": pending.Id}).Error)
+	}
+	broken := errors.New("injected overdue task transition failure")
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("age-policy-damaged-row", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]any)
+		if !ok || updates["error_code"] != "task_age_exceeded" {
+			return
+		}
+		where, ok := tx.Statement.Clauses["WHERE"].Expression.(clause.Where)
+		if !ok {
+			return
+		}
+		for _, expression := range where.Exprs {
+			if condition, ok := expression.(clause.Expr); ok && len(condition.Vars) > 0 && condition.Vars[0] == task.TaskId {
+				tx.AddError(broken)
+			}
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Update().Remove("age-policy-damaged-row")) })
+	assert.ErrorIs(t, FailOverdueAsyncImageTasks(t.Context(), 1), broken)
+	require.NoError(t, FailOverdueAsyncImageTasks(t.Context(), 1))
+	require.NoError(t, db.Where("task_id = ?", other.TaskId).Take(&other).Error)
+	assert.Equal(t, ImageTaskFailed, other.Status)
+	assert.Equal(t, 900, getUserQuotaFromDB(t, task.UserId))
 }
 
 func TestAsyncImageReservationSharesBatchQuotaAndCompensates(t *testing.T) {

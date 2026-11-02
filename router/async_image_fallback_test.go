@@ -586,7 +586,7 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 						}
 					})
 				}
-				for _, identity := range []struct{ user, token int }{{user.Id + 1, token.Id}, {user.Id, token.Id + 1}, {user.Id, token.Id}} {
+				for _, identity := range []struct{ user, token, status int }{{user.Id + 1, token.Id, http.StatusNotFound}, {user.Id, token.Id + 1, http.StatusNotFound}, {user.Id, token.Id, http.StatusOK}} {
 					recorder := httptest.NewRecorder()
 					c, _ := gin.CreateTestContext(recorder)
 					c.Set("id", identity.user)
@@ -594,8 +594,12 @@ func TestAsyncImageUpstreamFallbackBilling(t *testing.T) {
 					c.Params = gin.Params{{Key: "task_id", Value: task.TaskId}}
 					c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+task.TaskId, nil)
 					controller.QueryAsyncImage(c)
-					assert.Equal(t, http.StatusNotFound, recorder.Code)
+					assert.Equal(t, identity.status, recorder.Code)
 					assert.NotContains(t, recorder.Body.String(), urls[0])
+					if identity.status == http.StatusOK {
+						assert.Contains(t, recorder.Body.String(), `"status":"succeeded"`)
+						assert.Contains(t, recorder.Body.String(), `"result_expired":true`)
+					}
 				}
 			}
 			require.NoError(t, model.DB.Model(&task).Update("expires_at", now-1).Error)

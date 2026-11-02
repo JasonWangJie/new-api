@@ -15,6 +15,7 @@ import (
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type TaskStatus string
@@ -409,6 +410,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
 	err := DB.Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Scopes(excludeLocallyTerminatedMediaTasks).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
 		Limit(limit).
@@ -423,7 +425,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// Only a settled terminal status completes a task; provider progress is advisory.
-	err = DB.Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).Limit(limit).Order("id").Find(&tasks).Error
+	err = DB.Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).Scopes(excludeLocallyTerminatedMediaTasks).Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -436,6 +438,7 @@ func GetUnfinishedSyncTaskPage(ctx context.Context, afterID, cutoffUnix int64, l
 	var tasks []*Task
 	query := DB.WithContext(ctx).
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
+		Scopes(excludeLocallyTerminatedMediaTasks).
 		Where("id > ?", afterID)
 	if cutoffUnix > 0 {
 		query = query.Where("submit_time < ?", cutoffUnix)
@@ -453,9 +456,21 @@ func HasUnfinishedSyncTasks() bool {
 	err := DB.Model(&Task{}).
 		Where("status != ?", TaskStatusFailure).
 		Where("status != ?", TaskStatusSuccess).
+		Scopes(excludeLocallyTerminatedMediaTasks).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+func excludeLocallyTerminatedMediaTasks(query *gorm.DB) *gorm.DB {
+	tasksTable := query.NamingStrategy.TableName("Task")
+	jobsTable := query.NamingStrategy.TableName("AsyncMediaJob")
+	stopped := query.Session(&gorm.Session{NewDB: true}).Model(&AsyncMediaJob{}).Select("1")
+	for _, field := range []string{"task_id", "user_id", "attempt_generation"} {
+		stopped = stopped.Where(clause.Eq{Column: clause.Column{Table: jobsTable, Name: field}, Value: clause.Column{Table: tasksTable, Name: field}})
+	}
+	stopped = stopped.Where("status = ? AND reference_recovery_stage IN ?", "failed", []string{"age_limit_refund", "age_limit_unknown", "age_limit_complete"})
+	return query.Where("NOT EXISTS (?)", stopped)
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {

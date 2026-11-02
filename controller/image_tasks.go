@@ -293,7 +293,9 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 
 func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	displayStatus := task.DisplayStatus()
-	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(displayStatus), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": displayStatus, "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed, "can_terminate": false}
+	overdue := task.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds
+	data := gin.H{"id": task.TaskId, "task_id": task.TaskId, "provider": task.Provider, "media_type": "image", "stage": mediaStage(displayStatus), "protocol": task.Dialect, "platform": task.Platform, "request_type": task.RequestType, "model": task.Model, "status": displayStatus, "billing_status": task.BillingStatus, "progress": task.Progress, "requested_size": task.RequestedSize, "requested_resolution": task.RequestedResolution, "actual_size": task.ActualSize, "aspect_ratio": task.AspectRatio, "image_count": task.ImageCount, "result_count": task.ResultCount, "quota": task.Quota, "cost": float64(task.Quota) / common.QuotaPerUnit, "currency": "USD", "prompt_summary": task.PromptSummary, "retry_count": task.RetryCount, "error_code": task.ErrorCode, "error_message": task.ErrorMessage, "api_key_id": task.TokenId, "group": task.Group, "created_at": task.CreatedAt, "updated_at": task.UpdatedAt, "started_at": task.StartedAt, "upstream_succeeded_at": task.UpstreamSucceededAt, "finished_at": task.FinishedAt, "expires_at": task.ExpiresAt, "next_attempt_at": task.NextAttemptAt, "duration_ms": nil, "can_resume": !overdue && (task.Status == model.ImageTaskStorageFailed || task.Status == model.ImageTaskBillingFailed), "can_terminate": false}
+	data["result_expired"] = task.Status == model.ImageTaskSucceeded && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix()
 	if task.ErrorCode == "billing_quota_uncertain" && !admin {
 		data["can_resume"] = false
 	}
@@ -342,7 +344,9 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 			}
 		}
 		data["reference_urls"] = task.ReferenceUrls
-		data["can_terminate"] = !task.Terminal() || task.Status == model.ImageTaskExecutionUnknown
+		data["can_terminate"] = task.Status != model.ImageTaskSucceeded && task.Status != model.ImageTaskFailed || task.TerminationRequiresReconciliation()
+		data["termination_requires_reconciliation"] = task.TerminationRequiresReconciliation() && !(task.Status == model.ImageTaskExecutionUnknown && overdue)
+		data["termination_requires_quota_reconciliation"] = task.TerminationRequiresReconciliation() && task.ReconciliationStatus == "quota_unconfirmed"
 		data["reconciliation_status"] = task.ReconciliationStatus
 	}
 	return data
@@ -655,12 +659,19 @@ func ManageImageTask(c *gin.Context, action string) {
 		} else {
 			err = model.ResumeAsyncImageTask(c.Request.Context(), task)
 		}
-	} else if task.Status == model.ImageTaskExecutionUnknown {
+	} else if task.Status != model.ImageTaskSucceeded && task.Status != model.ImageTaskFailed && task.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds {
+		err = model.FailOverdueAsyncImageTask(c.Request.Context(), task)
+	} else if task.TerminationRequiresReconciliation() {
 		var confirmation struct {
 			UpstreamChecked bool `json:"confirm_upstream_checked"`
+			QuotaReconciled bool `json:"confirm_quota_reconciled"`
 		}
 		if decodeErr := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &confirmation); decodeErr != nil || !confirmation.UpstreamChecked {
 			imageManagementError(c, http.StatusConflict, errors.New("Verify the upstream task before releasing reserved quota"))
+			return
+		}
+		if task.ReconciliationStatus == "quota_unconfirmed" && !confirmation.QuotaReconciled {
+			imageManagementError(c, http.StatusBadRequest, errors.New("Confirm the quota reservation has been reconciled before resuming billing"))
 			return
 		}
 		err = model.TerminateAsyncImageTaskAfterReconciliation(c.Request.Context(), task)
@@ -682,6 +693,7 @@ func BatchTerminateImageTasks(c *gin.Context) {
 	var input struct {
 		TaskIds         []string `json:"task_ids"`
 		UpstreamChecked bool     `json:"confirm_upstream_checked"`
+		QuotaReconciled bool     `json:"confirm_quota_reconciled"`
 	}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
@@ -703,15 +715,23 @@ func BatchTerminateImageTasks(c *gin.Context) {
 		var task model.AsyncImageTask
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", id).Take(&task).Error; err != nil {
 			item["message"] = "Image task was not found"
-		} else if task.Status == model.ImageTaskExecutionUnknown {
+		} else if task.Status != model.ImageTaskSucceeded && task.Status != model.ImageTaskFailed && task.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds {
+			if err := model.FailOverdueAsyncImageTask(c.Request.Context(), task); err != nil {
+				item["message"] = err.Error()
+			} else {
+				item["status"] = "terminated"
+			}
+		} else if task.TerminationRequiresReconciliation() {
 			if !input.UpstreamChecked {
 				item["message"] = "Verify the upstream task before releasing reserved quota"
+			} else if task.ReconciliationStatus == "quota_unconfirmed" && !input.QuotaReconciled {
+				item["message"] = "Confirm the quota reservation has been reconciled before resuming billing"
 			} else if err := model.TerminateAsyncImageTaskAfterReconciliation(c.Request.Context(), task); err != nil {
 				item["message"] = err.Error()
 			} else {
 				item["status"] = "terminated"
 			}
-		} else if task.Terminal() {
+		} else if task.Status == model.ImageTaskSucceeded || task.Status == model.ImageTaskFailed {
 			item["status"] = "skipped"
 			item["message"] = "Task is already terminal"
 		} else if err := model.TerminateAsyncImageTask(c.Request.Context(), task); err != nil {

@@ -485,7 +485,9 @@ func TestAsyncMediaAuditAtomicTransitions(t *testing.T) {
 		for _, event := range events {
 			types = append(types, event.EventType)
 		}
-		assert.Equal(t, []string{"failed", "billing_refunded", "expired", "storage_expired"}, types)
+		assert.Equal(t, []string{"failed", "billing_refunded", "storage_expired"}, types)
+		require.NoError(t, db.First(&job, job.ID).Error)
+		assert.Equal(t, "failed", job.Status, "retention expiry must not replace an already failed outcome")
 	})
 }
 

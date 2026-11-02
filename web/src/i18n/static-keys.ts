@@ -130,6 +130,8 @@ export const STATIC_I18N_KEYS = [
   'Check rule fields, channel IDs and retry limits.',
   'Historical decision replay. Current task eligibility is checked again before execution.',
 
+  'Task exceeded the maximum age of 4 hours',
+  'Automatically ended after 4 hours',
   'TabTab',
   'Generate asynchronous images through the TabTab Task API',
   'TabTab API key (sk_...)',

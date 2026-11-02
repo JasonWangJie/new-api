@@ -242,83 +242,143 @@ func VerifyMediaObjectAccess(object model.MediaArtifactObject, expires, access s
 }
 
 func CleanupMediaObjects(ctx context.Context) error {
-	var jobs []model.AsyncMediaJob
 	now := time.Now().Unix()
+	var failures []error
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	pendingTasks := model.DB.Model(&model.Task{}).Select("1").
 		Where("task_id = media_cleanup.task_id AND user_id = media_cleanup.user_id AND attempt_generation = media_cleanup.attempt_generation").
 		Where("status NOT IN ?", []string{model.TaskStatusSuccess, model.TaskStatusFailure})
 	reservedTasks := pendingTasks.Session(&gorm.Session{}).Where("quota > ?", 0)
-	if err := model.DB.WithContext(ctx).Table(model.DB.NamingStrategy.TableName("AsyncMediaJob")+" AS media_cleanup").
-		Where("expires_at <= ? AND lease_expires_at <= ? AND (status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, "expired").
+	jobsQuery := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+		Table(model.DB.NamingStrategy.TableName("AsyncMediaJob")+" AS media_cleanup").
+		Where("expires_at <= ? AND lease_expires_at <= ? AND (status NOT IN ? OR storage_status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, []string{"expired", "failed", "succeeded"}, "expired").
 		Where("COALESCE(reference_recovery_stage, '') <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL", "refund").
 		Where("reference_recovery_stage = ? OR billing_status IN ? OR ((status <> ? OR NOT EXISTS (?)) AND (status <> ? OR NOT EXISTS (?)))", "refund", []string{"refunded", "not_billable"}, "reconciling", pendingTasks, "submitted", reservedTasks).
-		Scopes(model.ExcludePendingSubmissionReconciliation).
-		Limit(100).Find(&jobs).Error; err != nil {
-		return err
+		Scopes(model.ExcludePendingSubmissionReconciliation)
+	var lastJob model.AsyncMediaJob
+	jobsErr := jobsQuery.Session(&gorm.Session{}).Select("id").Order("id DESC").Take(&lastJob).Error
+	if jobsErr != nil && !errors.Is(jobsErr, gorm.ErrRecordNotFound) {
+		failures = append(failures, jobsErr)
 	}
-	for _, job := range jobs {
-		// Expire private payloads without removing a pending refund from its
-		// queue. Financial completion does not require a live replay envelope.
-		if err := model.ExpireAsyncMediaJob(ctx, job, now); err != nil {
-			if errors.Is(err, model.ErrImageConflict) {
+	// Keep the normal batch at 100 completed cleanups. Failed rows retain their
+	// pointers, but cannot hide later rows within this finite ID snapshot.
+	for afterID, cleaned := 0, 0; jobsErr == nil && cleaned < 100; {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		var jobs []model.AsyncMediaJob
+		if err := jobsQuery.Session(&gorm.Session{}).Where("id > ? AND id <= ?", afterID, lastJob.ID).Order("id").Limit(100 - cleaned).Find(&jobs).Error; err != nil {
+			failures = append(failures, err)
+			break
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		for _, job := range jobs {
+			afterID = job.ID
+			if err := ctx.Err(); err != nil {
+				return errors.Join(append(failures, err)...)
+			}
+			// Expire private payloads without removing a pending refund from its
+			// queue. Financial completion does not require a live replay envelope.
+			if err := model.ExpireAsyncMediaJob(ctx, job, now); err != nil {
+				if !errors.Is(err, model.ErrImageConflict) {
+					failures = append(failures, fmt.Errorf("media retention cleanup %s: %w", job.TaskId, err))
+				}
 				continue
 			}
-			return err
-		}
-		if err := RemoveAsyncMediaOutput(job); err != nil {
-			return err
-		}
-		if err := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
-			Where("id = ? AND attempt_generation = ? AND storage_status = ? AND output_object_key = ?", job.ID, job.AttemptGeneration, "expired", job.OutputObjectKey).
-			Updates(map[string]any{"output_root_path": "", "output_object_key": ""}).Error; err != nil {
-			return err
+			if err := RemoveAsyncMediaOutput(job); err != nil {
+				failures = append(failures, fmt.Errorf("media output cleanup %s: %w", job.TaskId, err))
+				continue
+			}
+			if err := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+				Where("id = ? AND attempt_generation = ? AND storage_status = ? AND output_object_key = ?", job.ID, job.AttemptGeneration, "expired", job.OutputObjectKey).
+				Updates(map[string]any{"output_root_path": "", "output_object_key": ""}).Error; err != nil {
+				failures = append(failures, fmt.Errorf("media output pointer cleanup %s: %w", job.TaskId, err))
+				continue
+			}
+			cleaned++
 		}
 	}
-	var objects []model.MediaArtifactObject
-	if err := model.DB.WithContext(ctx).Where("expires_at <= ?", time.Now().Unix()).Limit(100).Find(&objects).Error; err != nil {
-		return err
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(failures, err)...)
 	}
-	for _, object := range objects {
-		if err := model.DB.WithContext(ctx).Model(&object).Update("status", "expired").Error; err != nil {
-			return err
+	objectsQuery := model.DB.WithContext(ctx).Model(&model.MediaArtifactObject{}).Where("expires_at <= ?", now)
+	var lastObject model.MediaArtifactObject
+	objectsErr := objectsQuery.Session(&gorm.Session{}).Select("id").Order("id DESC").Take(&lastObject).Error
+	if objectsErr != nil && !errors.Is(objectsErr, gorm.ErrRecordNotFound) {
+		failures = append(failures, objectsErr)
+	}
+	for afterID, cleaned := 0, 0; objectsErr == nil && cleaned < 100; {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
 		}
-		root, err := os.OpenRoot(object.RootPath)
-		if errors.Is(err, os.ErrNotExist) {
-			err = nil
-		} else if err == nil {
-			err = root.Remove(object.ObjectKey)
-			root.Close()
+		var objects []model.MediaArtifactObject
+		if err := objectsQuery.Session(&gorm.Session{}).Where("id > ? AND id <= ?", afterID, lastObject.ID).Order("id").Limit(100 - cleaned).Find(&objects).Error; err != nil {
+			failures = append(failures, err)
+			break
 		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		if len(objects) == 0 {
+			break
 		}
-		if err := model.DB.WithContext(ctx).Delete(&object).Error; err != nil {
-			return err
+		for _, object := range objects {
+			afterID = object.ID
+			if err := ctx.Err(); err != nil {
+				return errors.Join(append(failures, err)...)
+			}
+			if err := model.DB.WithContext(ctx).Model(&object).Update("status", "expired").Error; err != nil {
+				failures = append(failures, fmt.Errorf("media artifact expiry %s: %w", object.ObjectId, err))
+				continue
+			}
+			root, err := os.OpenRoot(object.RootPath)
+			if errors.Is(err, os.ErrNotExist) {
+				err = nil
+			} else if err == nil {
+				err = root.Remove(object.ObjectKey)
+				root.Close()
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				failures = append(failures, fmt.Errorf("media artifact cleanup %s: %w", object.ObjectId, err))
+				continue
+			}
+			if err := model.DB.WithContext(ctx).Delete(&object).Error; err != nil {
+				failures = append(failures, fmt.Errorf("media artifact removal %s: %w", object.ObjectId, err))
+				continue
+			}
+			cleaned++
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(append(failures, err)...)
 	}
 	cfg, err := GetMediaRuntimeConfig(ctx)
 	if err != nil {
-		return err
+		return errors.Join(append(failures, err)...)
 	}
 	rootPath, err := filepath.Abs(cfg.LocalPath)
 	if err != nil {
-		return err
+		return errors.Join(append(failures, err)...)
 	}
 	root, err := os.OpenRoot(rootPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return errors.Join(failures...)
 	}
 	if err != nil {
-		return err
+		return errors.Join(append(failures, err)...)
 	}
 	defer root.Close()
 	entries, err := os.ReadDir(rootPath)
 	if err != nil {
-		return err
+		return errors.Join(append(failures, err)...)
 	}
 	cutoff := time.Now().Add(-time.Duration(cfg.DownloadTimeout+420) * time.Second)
 	removed := 0
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
 		name := entry.Name()
 		if entry.IsDir() || !(strings.HasPrefix(name, "media_") || strings.HasPrefix(name, "media-output-")) || !(strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".mp4")) {
 			continue
@@ -329,24 +389,25 @@ func CleanupMediaObjects(ctx context.Context) error {
 		}
 		var count int64
 		if err := model.DB.WithContext(ctx).Model(&model.MediaArtifactObject{}).Where("root_path = ? AND object_key = ?", rootPath, name).Count(&count).Error; err != nil {
-			return err
+			return errors.Join(append(failures, err)...)
 		}
 		if count > 0 {
 			continue
 		}
 		if err := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).Where("output_root_path = ? AND output_object_key = ?", rootPath, name).Count(&count).Error; err != nil {
-			return err
+			return errors.Join(append(failures, err)...)
 		}
 		if count > 0 {
 			continue
 		}
 		if err := root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			failures = append(failures, err)
+			continue
 		}
 		removed++
 		if removed >= 100 {
 			break
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }

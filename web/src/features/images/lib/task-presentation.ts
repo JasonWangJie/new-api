@@ -42,10 +42,32 @@ const WAIT_ACTIONS = new Set([
   'wait_capacity',
 ])
 
+export function imageTaskResultExpired(
+  task: ImageTask,
+  now = Date.now() / 1000
+): boolean {
+  return (
+    task.status === 'succeeded' &&
+    (task.result_expired === true ||
+      task.storage_status === 'expired' ||
+      (Number.isFinite(task.expires_at) &&
+        task.expires_at > 0 &&
+        task.expires_at <= now))
+  )
+}
+
+export function imageTaskCanTerminate(
+  task: ImageTask,
+  now = Date.now() / 1000
+): boolean {
+  return task.can_terminate && !imageTaskResultExpired(task, now)
+}
+
 export function imageTaskCanResume(
   task: ImageTask,
   admin: boolean,
-  canManage: boolean
+  canManage: boolean,
+  now = Date.now() / 1000
 ): boolean {
   const reconciliation = imageTaskVideoReconciliation(task)
   if (reconciliation) {
@@ -55,6 +77,7 @@ export function imageTaskCanResume(
   }
   return (
     task.can_resume &&
+    !imageTaskResultExpired(task, now) &&
     (canManage || !admin) &&
     (admin || task.error_code !== 'billing_quota_uncertain')
   )
@@ -70,6 +93,16 @@ export function imageTaskVideoReconciliation(
     return task.video_reconciliation
   }
   return undefined
+}
+
+export function imageTaskRequiresTerminationConfirmation(
+  task: ImageTask
+): boolean {
+  return (
+    !!task.termination_requires_quota_reconciliation ||
+    (task.termination_requires_reconciliation ??
+      task.status === 'execution_unknown')
+  )
 }
 
 export function imageTaskProgress(task: ImageTask): number | null {

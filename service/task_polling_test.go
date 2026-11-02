@@ -242,11 +242,11 @@ func setupTaskPollingDatabase(t *testing.T) {
 		common.SetDatabaseTypes(previousType, previousLogType)
 		taskPollingCursor.Store(previousPollingCursor)
 		taskTimeoutCursor.Store(previousTimeoutCursor)
-		assert.NoError(t, db.Migrator().DropTable(&model.Task{}, &model.Channel{}, &model.User{}, &model.Log{}))
+		assert.NoError(t, db.Migrator().DropTable(&model.Task{}, &model.AsyncMediaJob{}, &model.Channel{}, &model.User{}, &model.Log{}))
 		assert.NoError(t, connection.Close())
 	})
 	for range 2 {
-		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Channel{}, &model.User{}, &model.Log{}))
+		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.Channel{}, &model.User{}, &model.Log{}))
 	}
 }
 
@@ -1739,13 +1739,20 @@ func TestAsyncVideoReconciliationCleanupRetainsPendingAndRetriesFiles(t *testing
 		pending.ID, pending.TaskID = 0, fmt.Sprintf("cleanup-pending-%d", i)
 		pending.PrivateData.VideoReconciliation = &model.VideoTaskReconciliation{StartedAt: now - 60, DeadlineAt: now, ManualRequired: true, Revision: 1}
 		require.NoError(t, model.DB.Create(&pending).Error)
-		job := model.AsyncMediaJob{TaskId: pending.TaskID, IdentityHash: pending.TaskID, UserId: task.UserId, Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", ExpiresAt: now - 1, RequestCipher: []byte("keep-request"), ChannelCipher: []byte("keep-channel")}
+		job := model.AsyncMediaJob{TaskId: pending.TaskID, IdentityHash: pending.TaskID, UserId: task.UserId, Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now - 1, RequestCipher: []byte("keep-request"), ChannelCipher: []byte("keep-channel")}
 		if i == 0 {
 			job.OutputRootPath, job.OutputObjectKey = root, "pending.bin"
 		}
 		pendingJobs = append(pendingJobs, job)
 	}
 	require.NoError(t, model.DB.Create(&pendingJobs).Error)
+	_, err := model.FailAgedAsyncMediaJob(t.Context(), pendingJobs[0], now, true)
+	require.ErrorIs(t, err, model.ErrImageConflict, "age limits must retain an accepted operation's reconciliation evidence")
+	overdue := model.AsyncMediaJob{TaskId: "cleanup-overdue", IdentityHash: "cleanup-overdue", UserId: task.UserId, Status: "queued", BillingStatus: "pending", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 3600}
+	require.NoError(t, model.DB.Create(&overdue).Error)
+	require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&overdue, overdue.ID).Error)
+	assert.Equal(t, "failed", overdue.Status, "retained reconciliation must not hide later overdue work")
 	finished := *task
 	finished.ID, finished.TaskID, finished.Status = 0, "cleanup-finished", model.TaskStatusSuccess
 	require.NoError(t, model.DB.Create(&finished).Error)
@@ -1757,7 +1764,8 @@ func TestAsyncVideoReconciliationCleanupRetainsPendingAndRetriesFiles(t *testing
 	require.NoError(t, model.DB.Create(&job).Error)
 	require.Error(t, CleanupMediaObjects(t.Context()), "a nonempty directory deterministically prevents output removal")
 	require.NoError(t, model.DB.First(&job, job.ID).Error)
-	assert.Equal(t, "expired", job.Status)
+	assert.Equal(t, "succeeded", job.Status)
+	assert.Equal(t, "expired", job.StorageStatus)
 	assert.Empty(t, job.RequestCipher)
 	assert.Empty(t, job.ChannelCipher)
 	assert.Equal(t, "blocked", job.OutputObjectKey, "failed filesystem cleanup retains a retry pointer")
@@ -1766,7 +1774,7 @@ func TestAsyncVideoReconciliationCleanupRetainsPendingAndRetriesFiles(t *testing
 	require.NoError(t, model.DB.First(&job, job.ID).Error)
 	assert.Empty(t, job.OutputObjectKey)
 	assert.Empty(t, job.OutputRootPath)
-	_, err := os.Stat(blockedPath)
+	_, err = os.Stat(blockedPath)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 	_, err = os.Stat(pendingPath)
 	require.NoError(t, err, "cleanup must not remove output before its task eligibility check")

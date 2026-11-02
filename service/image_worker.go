@@ -309,30 +309,31 @@ func (pool *asyncImageWorkerPool) recoveryLoop(interval int, recoverTasks func()
 }
 
 func RebuildAsyncImageQueue(ctx context.Context) error {
+	ageError := model.FailOverdueAsyncImageTasks(ctx, 100)
 	if common.RDB == nil {
-		return errors.New("Redis is required for image scheduling")
+		return errors.Join(ageError, errors.New("Redis is required for image scheduling"))
 	}
 	cfg, err := GetImageRuntimeConfig(ctx)
 	if err != nil {
-		return err
+		return errors.Join(ageError, err)
 	}
 	if err := model.RecoverAsyncImageTasks(ctx, 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours); err != nil {
-		return err
+		return errors.Join(ageError, err)
 	}
 	if err := deliverAsyncImageOutbox(ctx); err != nil {
-		return err
+		return errors.Join(ageError, err)
 	}
 	var tasks []model.AsyncImageTask
 	statuses := []string{model.ImageTaskQueued, model.ImageTaskInvoking, model.ImageTaskUpstreamSucceeded, model.ImageTaskUploading, model.ImageTaskBillingPending, model.ImageTaskStorageFailed, model.ImageTaskBillingFailed}
 	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at > 0", statuses, time.Now().Unix()).Order("next_attempt_at,id").Limit(100).Find(&tasks).Error; err != nil {
-		return err
+		return errors.Join(ageError, err)
 	}
 	for _, task := range tasks {
 		if err := common.RDB.ZAdd(ctx, ImageRedisKey("queue"), &redis.Z{Score: float64(task.NextAttemptAt), Member: task.TaskId}).Err(); err != nil {
-			return err
+			return errors.Join(ageError, err)
 		}
 	}
-	return nil
+	return ageError
 }
 
 func deliverAsyncImageOutbox(ctx context.Context) error {
@@ -378,7 +379,7 @@ func RunAsyncImageTask(parent context.Context, id string) (runError error) {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithDeadline(parent, time.Unix(task.CreatedAt+model.AsyncMediaMaxTaskAgeSeconds, 0))
 	defer cancel()
 	done := make(chan struct{})
 	defer close(done)
@@ -768,7 +769,11 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return err
 		}
 	}
-	mode := ImageChannelReferenceTransport(*channel, request.Platform, task.ReferenceRetryCount, cfg)
+	referencePlatform := request.Platform
+	if capability.Protocol == "gemini_native" {
+		referencePlatform = "gemini"
+	}
+	mode := ImageChannelReferenceTransport(*channel, referencePlatform, task.ReferenceRetryCount, cfg)
 	if !knownUpstreamTask && !acceptedOutput {
 		previousDispatch := false
 		for _, attempt := range attempts {

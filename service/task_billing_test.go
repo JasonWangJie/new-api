@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -65,6 +67,8 @@ func TestMain(m *testing.M) {
 		&model.UserSubscription{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.AsyncMediaJob{},
+		&model.AsyncMediaEvent{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
@@ -232,6 +236,266 @@ func makeTask(userId, channelId, quota, tokenId int, billingSource string, subsc
 			},
 		},
 	}
+}
+
+func TestAsyncMediaMaximumAgeTermination(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, billing, storage                 string
+		provider                                       string
+		recoveryStage                                  string
+		native                                         model.TaskStatus
+		recent, manual, refundFailure                  bool
+		reconcile                                      bool
+		undispatched, recentDispatch, confirmedFailure bool
+		wantStatus, wantBilling                        string
+		wantQuota                                      int
+	}{
+		{name: "recent queued operation remains pending", status: "queued", billing: "pending", recent: true, wantStatus: "queued", wantBilling: "pending", wantQuota: 900},
+		{name: "queued timeout terminates before dispatch", status: "queued", billing: "pending", wantStatus: "failed", wantBilling: "not_billable", wantQuota: 900},
+		{name: "durable undispatched reservation refunded once", status: "queued", recoveryStage: "prepare", billing: "reserved", native: model.TaskStatusQueued, undispatched: true, wantStatus: "failed", wantBilling: "refunded", wantQuota: 1000},
+		{name: "undispatched refund failure recovers without generation", status: "queued", recoveryStage: "prepare", billing: "reserved", native: model.TaskStatusQueued, undispatched: true, refundFailure: true, wantStatus: "failed", wantBilling: "refunded", wantQuota: 1000},
+		{name: "recently dispatched accepted operation retains its hold", status: "submitted", billing: "reserved", native: model.TaskStatusInProgress, recentDispatch: true, wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "authoritative failed operation can refund its reservation", status: "submitted", billing: "reserved", native: model.TaskStatusFailure, confirmedFailure: true, wantStatus: "failed", wantBilling: "refunded", wantQuota: 1000},
+		{name: "unknown accounting retains its hold", status: "execution_unknown", billing: "unknown", native: model.TaskStatusUnknown, wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "nldw unconfirmed dispatch retains reconciliation evidence past age limit", provider: "nldw", status: "execution_unknown", billing: "unknown", recentDispatch: true, wantStatus: "execution_unknown", wantBilling: "unknown", wantQuota: 900},
+		{name: "yuxibox unconfirmed dispatch retains reconciliation evidence past age limit", provider: "yuxibox", status: "execution_unknown", billing: "unknown", native: model.TaskStatusUnknown, recentDispatch: true, wantStatus: "execution_unknown", wantBilling: "unknown", wantQuota: 900},
+		{name: "unknown job cannot refund a pending native task automatically", status: "execution_unknown", billing: "reserved", native: model.TaskStatusInProgress, wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "unknown reference recovery retains funds until verification", status: "submitted", billing: "reserved", recoveryStage: "unknown", native: model.TaskStatusInProgress, wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "confirmed replacement reservation retains its reconciliation entry", status: "execution_unknown", billing: "unknown", recoveryStage: "unknown", native: model.TaskStatusUnknown, reconcile: true, wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "submitted without native receipt retains unknown funds", status: "submitted", billing: "reserved", wantStatus: "failed", wantBilling: "unknown", wantQuota: 900},
+		{name: "already succeeded output is protected", status: "succeeded", billing: "settled", native: model.TaskStatusSuccess, wantStatus: "succeeded", wantBilling: "settled", wantQuota: 900},
+		{name: "expired successful output is protected", status: "expired", billing: "settled", native: model.TaskStatusSuccess, wantStatus: "expired", wantBilling: "settled", wantQuota: 900},
+		{name: "expired success without duplicated billing marker protected", status: "expired", billing: "reserved", native: model.TaskStatusSuccess, wantStatus: "expired", wantBilling: "reserved", wantQuota: 900},
+		{name: "expired settled evidence without native row protected", status: "expired", billing: "settled", wantStatus: "expired", wantBilling: "settled", wantQuota: 900},
+		{name: "successful generation stalled in storage stops without refund", status: "submitted", storage: "failed", billing: "settled", native: model.TaskStatusSuccess, wantStatus: "failed", wantBilling: "settled", wantQuota: 900},
+		{name: "expired refunded failure becomes failed", status: "expired", billing: "refunded", native: model.TaskStatusFailure, wantStatus: "failed", wantBilling: "refunded", wantQuota: 900},
+		{name: "administrator can end recent unsuccessful expired record", status: "expired", billing: "refunded", native: model.TaskStatusFailure, recent: true, manual: true, wantStatus: "failed", wantBilling: "refunded", wantQuota: 900},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupMeasuredTaskBillingDB(t)
+			seedUser(t, 950, 900)
+			seedToken(t, 950, 950, "age-limit-token", 900)
+			seedChannel(t, 950)
+			seedChargedAccounting(t, 950, 950, 950, 100, 1)
+			now := time.Now().Unix()
+			created := now - model.AsyncMediaMaxTaskAgeSeconds
+			if tc.recent {
+				created = now
+			}
+			job := model.AsyncMediaJob{TaskId: "task_age_limit", IdentityHash: "age-limit", UserId: 950, TokenId: 950, ChannelId: 950, Provider: "drama", Model: "test-model", Status: tc.status, BillingStatus: tc.billing, StorageStatus: tc.storage, CreatedAt: created, ExpiresAt: now + 86400, Quota: 100, RequestCipher: []byte("private request"), LeaseToken: "stale-worker", LeaseExpiresAt: now + 60}
+			if tc.provider != "" {
+				job.Provider = tc.provider
+			}
+			job.ReferenceRecoveryStage = tc.recoveryStage
+			if tc.recentDispatch {
+				job.DispatchedAt = now - 10
+			}
+			if tc.undispatched {
+				job.AttemptGeneration, job.ReferenceRetryCount = 1, 1
+			}
+			if tc.reconcile {
+				job.ReferenceRetryCount = 1
+			}
+			if tc.billing == "pending" {
+				job.Quota = 0
+			}
+			if tc.status == "expired" {
+				job.ExpiresAt = now - 1
+			}
+			require.NoError(t, model.DB.Create(&job).Error)
+			var native *model.Task
+			if tc.native != "" {
+				native = makeTask(950, 950, 100, 950, BillingSourceWallet, 0)
+				native.TaskID, native.Status, native.SubmitTime, native.Platform = job.TaskId, tc.native, created, "drama"
+				native.AttemptGeneration = job.AttemptGeneration
+				native.PrivateData.AsyncMedia, native.PrivateData.DurableBilling, native.PrivateData.SubmitAccountingRecorded = true, true, true
+				native.PrivateData.UpstreamTaskID = "known-provider-task"
+				if tc.reconcile {
+					native.PrivateData.UpstreamTaskID = ""
+				}
+				if tc.undispatched {
+					native.PrivateData.UpstreamTaskID = ""
+				}
+				if tc.confirmedFailure {
+					native.PrivateData.VideoTerminalConfirmed = true
+				}
+				if tc.native == model.TaskStatusFailure && !tc.confirmedFailure {
+					native.Quota = 0
+				}
+				require.NoError(t, model.DB.Create(native).Error)
+			}
+			var late *model.Task
+			if native != nil {
+				copy := *native
+				late = &copy
+			}
+			if tc.refundFailure {
+				require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 950).Update("used_quota", 0).Error)
+				require.Error(t, FailOverdueAsyncMediaJobs(t.Context(), 100))
+				var paused model.AsyncMediaJob
+				require.NoError(t, model.DB.First(&paused, job.ID).Error)
+				assert.Equal(t, "failed", paused.Status)
+				assert.Equal(t, "age_limit_refund", paused.ReferenceRecoveryStage)
+				assert.False(t, model.HasUnfinishedSyncTasks(), "local termination must stop the native poller before its refund recovers")
+				require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", 950).Update("used_quota", 100).Error)
+				require.NoError(t, model.DB.Model(&model.AsyncMediaJob{}).Where("id = ?", job.ID).Updates(map[string]any{"next_attempt_at": 0, "lease_expires_at": now - 1}).Error)
+			}
+			if job.HasPendingSubmissionReconciliation() {
+				_, err := model.FailAgedAsyncMediaJob(t.Context(), job, now, true)
+				require.ErrorIs(t, err, model.ErrImageConflict)
+				sibling := model.AsyncMediaJob{TaskId: "age_cleanup_sibling", IdentityHash: "age-cleanup-sibling", UserId: job.UserId, TokenId: job.TokenId, ChannelId: job.ChannelId, Provider: job.Provider, Status: "queued", BillingStatus: "pending", CreatedAt: created, ExpiresAt: now + 86400}
+				require.NoError(t, model.DB.Create(&sibling).Error)
+				require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+				require.NoError(t, model.DB.First(&sibling, sibling.ID).Error)
+				assert.Equal(t, "failed", sibling.Status, "retained reconciliation must not starve other overdue jobs")
+			}
+			if tc.manual {
+				require.NoError(t, TerminateExpiredAsyncMediaJob(t.Context(), job))
+			} else {
+				require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 100))
+			}
+			require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 100))
+			var got model.AsyncMediaJob
+			require.NoError(t, model.DB.First(&got, job.ID).Error)
+			assert.Equal(t, tc.wantStatus, got.Status)
+			assert.Equal(t, tc.wantBilling, got.BillingStatus)
+			assert.Equal(t, tc.wantQuota, getUserQuota(t, 950))
+			if job.HasPendingSubmissionReconciliation() {
+				assert.Equal(t, job.RequestCipher, got.RequestCipher)
+				assert.Equal(t, job.AttemptGeneration, got.AttemptGeneration)
+				assert.Equal(t, job.LeaseToken, got.LeaseToken)
+			}
+			if got.Status == "failed" {
+				assert.Empty(t, got.LeaseToken)
+				assert.Empty(t, got.RequestCipher)
+				assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "succeeded"}), model.ErrImageConflict)
+				if late != nil && late.Status != model.TaskStatusSuccess && late.Status != model.TaskStatusFailure {
+					from := late.Status
+					late.Status = model.TaskStatusSuccess
+					won, _, err := model.SettleTaskBilling(t.Context(), late, from, 100, nil, "")
+					require.NoError(t, err)
+					assert.False(t, won, "old generation cannot settle after the policy fence")
+				}
+			}
+			if tc.native == "" && got.Status == "failed" {
+				lateTask := makeTask(950, 950, 100, 950, BillingSourceWallet, 0)
+				lateTask.TaskID = job.TaskId
+				lateTask.PrivateData.AsyncMedia = true
+				assert.ErrorIs(t, lateTask.InsertWithContext(t.Context()), model.ErrTaskAttemptConflict, "a late submit receipt cannot recreate a terminated operation")
+			}
+			if got.Status == "failed" && !tc.manual {
+				events, err := model.ListAsyncMediaEvents(t.Context(), job.TaskId)
+				require.NoError(t, err)
+				assert.True(t, slices.ContainsFunc(events, func(event model.AsyncMediaEvent) bool { return event.EventType == "age_limit_failed" }))
+				assert.False(t, slices.ContainsFunc(events, func(event model.AsyncMediaEvent) bool {
+					return event.EventType == "upstream_failed" || event.EventType == "reconciliation"
+				}))
+			}
+			if tc.reconcile {
+				require.NoError(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), got))
+				require.NoError(t, model.DB.First(&got, job.ID).Error)
+				assert.Equal(t, "failed", got.Status)
+				assert.Equal(t, "refunded", got.BillingStatus)
+				assert.Equal(t, 1000, getUserQuota(t, 950))
+				assert.ErrorIs(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), got), model.ErrImageConflict)
+			} else if got.ReferenceRecoveryStage == "age_limit_unknown" {
+				assert.Error(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), got), "an administrator confirmation cannot manufacture a reservation without the existing durable recovery proof")
+				assert.Equal(t, 900, getUserQuota(t, 950))
+			}
+		})
+	}
+}
+
+func TestAsyncMediaMaximumAgeDispatchAndPollingBarriers(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	now := time.Now().Unix()
+	job := model.AsyncMediaJob{TaskId: "age-dispatch", IdentityHash: "age-dispatch", Status: "queued", BillingStatus: "pending", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400, LeaseToken: "old", LeaseExpiresAt: now + 60}
+	require.NoError(t, model.DB.Create(&job).Error)
+	assert.ErrorIs(t, model.DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": now}, 0, "original"), model.ErrImageConflict)
+	claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "new", 120)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+	var current model.AsyncMediaJob
+	require.NoError(t, model.DB.First(&current, job.ID).Error)
+	assert.Equal(t, "failed", current.Status)
+	ordinary := model.Task{TaskID: "ordinary-unknown", Status: model.TaskStatusUnknown, FailReason: model.AsyncMediaTaskAgeExceededReason, SubmitTime: now - 60}
+	require.NoError(t, model.DB.Create(&ordinary).Error)
+	page, err := model.GetUnfinishedSyncTaskPage(t.Context(), 0, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, ordinary.TaskID, page[0].TaskID, "provider wording alone cannot block an unrelated UNKNOWN task")
+	for index := range 2 {
+		id := fmt.Sprintf("protected-expired-%d", index)
+		completed := model.AsyncMediaJob{TaskId: id, IdentityHash: id, Status: "expired", BillingStatus: "reserved", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now - 1}
+		require.NoError(t, model.DB.Create(&completed).Error)
+		require.NoError(t, model.DB.Create(&model.Task{TaskID: id, Status: model.TaskStatusSuccess}).Error)
+	}
+	waiting := model.AsyncMediaJob{TaskId: "waiting-behind-success", IdentityHash: "waiting-behind-success", Status: "queued", BillingStatus: "pending", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400}
+	require.NoError(t, model.DB.Create(&waiting).Error)
+	require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&waiting, waiting.ID).Error)
+	assert.Equal(t, "failed", waiting.Status, "protected successful rows must be excluded before applying the batch limit")
+	broken := model.AsyncMediaJob{TaskId: "broken-age-row", IdentityHash: "broken-age-row", Status: "submitted", BillingStatus: "unknown", AttemptGeneration: math.MaxInt64, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400}
+	require.NoError(t, model.DB.Create(&broken).Error)
+	later := model.AsyncMediaJob{TaskId: "after-broken-age-row", IdentityHash: "after-broken-age-row", Status: "submitted", StorageStatus: "failed", BillingStatus: "pending", NextAttemptAt: 1 << 62, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400}
+	require.NoError(t, model.DB.Create(&later).Error)
+	require.Error(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&broken, broken.ID).Error)
+	assert.Contains(t, broken.LeaseToken, asyncMediaAgeRetryLeasePrefix)
+	assert.Greater(t, broken.LeaseExpiresAt, now)
+	assert.Zero(t, broken.NextAttemptAt, "cleanup retry must not rewrite the submission schedule")
+	require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&later, later.ID).Error)
+	assert.Equal(t, "failed", later.Status, "one damaged operation must not monopolize the cleanup batch")
+	require.NoError(t, model.DB.Model(&broken).Update("lease_expires_at", now-1).Error)
+	refundBroken := model.AsyncMediaJob{TaskId: "missing-native-refund", IdentityHash: "missing-native-refund", Status: "failed", BillingStatus: "reserved", ReferenceRecoveryStage: "age_limit_refund", CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400}
+	require.NoError(t, model.DB.Create(&refundBroken).Error)
+	paused := model.AsyncMediaJob{TaskId: "paused-after-refund-error", IdentityHash: "paused-after-refund-error", Status: "submitted", StorageStatus: "failed", BillingStatus: "pending", NextAttemptAt: 1 << 62, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds, ExpiresAt: now + 86400}
+	require.NoError(t, model.DB.Create(&paused).Error)
+	require.Error(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&refundBroken, refundBroken.ID).Error)
+	assert.Contains(t, refundBroken.LeaseToken, asyncMediaAgeRetryLeasePrefix)
+	assert.Equal(t, "reserved", refundBroken.BillingStatus, "a failed native lookup cannot invent a refund")
+	require.NoError(t, FailOverdueAsyncMediaJobs(t.Context(), 1))
+	require.NoError(t, model.DB.First(&paused, paused.ID).Error)
+	assert.Equal(t, "failed", paused.Status, "expired retry markers must remain behind unattempted paused operations")
+}
+
+func TestAsyncMediaMaximumAgeReferenceRecoveryDeadline(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "age-test:"+base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "age-test")
+	seedUser(t, 951, 900)
+	seedToken(t, 951, 951, "reference-age-token", 900)
+	seedChannel(t, 951)
+	seedChargedAccounting(t, 951, 951, 951, 100, 1)
+	now := time.Now().Unix()
+	created := now - model.AsyncMediaMaxTaskAgeSeconds + 600
+	request := AsyncVideoRequest{ReferenceRecoveryVersion: 1, ReferenceRecoveryDeadline: now + 86400}
+	plain, err := common.Marshal(request)
+	require.NoError(t, err)
+	cipher, err := EncryptImagePayload(plain, "media-request:reference-age")
+	require.NoError(t, err)
+	job := model.AsyncMediaJob{TaskId: "reference-age", IdentityHash: "reference-age", UserId: 951, TokenId: 951, ChannelId: 951, Provider: "drama", Status: "queued", BillingStatus: "reserved", ReferenceRecoveryStage: "submit", ReferenceRetryCount: 1, AttemptGeneration: 1, Quota: 100, CreatedAt: created, ExpiresAt: now + 86400, RequestCipher: cipher, LeaseToken: "reference-age-worker", LeaseExpiresAt: now + 120}
+	require.NoError(t, model.DB.Create(&job).Error)
+	task := makeTask(951, 951, 100, 951, BillingSourceWallet, 0)
+	task.TaskID, task.Status, task.AttemptGeneration = job.TaskId, model.TaskStatusQueued, job.AttemptGeneration
+	task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
+	require.NoError(t, model.DB.Create(task).Error)
+	previous := SubmitAsyncVideoReferenceRetryFunc
+	t.Cleanup(func() { SubmitAsyncVideoReferenceRetryFunc = previous })
+	calls := 0
+	SubmitAsyncVideoReferenceRetryFunc = func(ctx context.Context, current model.AsyncMediaJob, _ model.Task, _ AsyncVideoRequest) error {
+		calls++
+		deadline, present := ctx.Deadline()
+		require.True(t, present)
+		assert.Equal(t, created+model.AsyncMediaMaxTaskAgeSeconds, deadline.Unix(), "reference recovery must inherit the acceptance-age deadline instead of its longer provider deadline")
+		return model.UpdateAsyncMediaJob(ctx, current, map[string]any{"reference_recovery_stage": "waiting"})
+	}
+	require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, DefaultMediaRuntimeConfig()))
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, 900, getUserQuota(t, 951))
 }
 
 func TestPriceDataOtherRatiosFilterAndSnapshot(t *testing.T) {

@@ -278,6 +278,9 @@ func RefundAsyncImageReservation(ctx context.Context, taskID string) error {
 		if task.Status != ImageTaskFailed && task.Status != ImageTaskExpired {
 			return nil
 		}
+		if task.TerminationRequiresReconciliation() {
+			return nil
+		}
 		var bill AsyncImageBill
 		err := lockForUpdate(tx).Where("task_id = ?", taskID).Take(&bill).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
