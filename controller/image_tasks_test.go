@@ -849,17 +849,25 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				for i := range cleaned {
 					id := fmt.Sprintf("file-expiry-cleaned-%d", i)
 					cleaned[i] = model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "expired", BillingStatus: "settled", CreatedAt: now, ExpiresAt: now - 1}
+					if i%2 == 0 {
+						cleaned[i].Status, cleaned[i].BillingStatus = "failed", "refunded"
+					}
 				}
 				require.NoError(t, db.Create(&cleaned).Error)
+				require.NoError(t, db.Model(&cleaned).Updates(map[string]any{"request_cipher": nil, "channel_cipher": nil}).Error)
 				completed := model.AsyncMediaJob{TaskId: "file-expiry-success", IdentityHash: "file-expiry-success", UserId: 101, TokenId: 201, Status: "succeeded", StorageStatus: "succeeded", BillingStatus: "settled", Quota: 240, CreatedAt: now, ExpiresAt: now - 1, RequestCipher: []byte("expired-request"), ChannelCipher: []byte("expired-channel"), OutputRootPath: cfg.LocalPath, OutputObjectKey: "expired.bin"}
 				failed := model.AsyncMediaJob{TaskId: "file-expiry-failure", IdentityHash: "file-expiry-failure", UserId: 101, TokenId: 201, Status: "failed", StorageStatus: "pending", BillingStatus: "unknown", Quota: 120, CreatedAt: now, ExpiresAt: now - 1, RequestCipher: []byte("expired-request"), ChannelCipher: []byte("expired-channel")}
+				rootOnly := model.AsyncMediaJob{TaskId: "file-expiry-root-only", IdentityHash: "file-expiry-root-only", UserId: 101, TokenId: 201, Status: "failed", StorageStatus: "expired", BillingStatus: "refunded", CreatedAt: now, ExpiresAt: now - 1, OutputRootPath: cfg.LocalPath}
 				require.NoError(t, os.WriteFile(filepath.Join(cfg.LocalPath, completed.OutputObjectKey), []byte("expired output"), 0600))
 				require.NoError(t, db.Create(&completed).Error)
 				require.NoError(t, db.Create(&failed).Error)
+				require.NoError(t, db.Create(&rootOnly).Error)
+				require.NoError(t, db.Model(&rootOnly).Updates(map[string]any{"request_cipher": nil, "channel_cipher": nil}).Error)
 				t.Cleanup(func() {
 					assert.NoError(t, db.Delete(&cleaned).Error)
 					assert.NoError(t, db.Delete(&completed).Error)
 					assert.NoError(t, db.Delete(&failed).Error)
+					assert.NoError(t, db.Delete(&rootOnly).Error)
 				})
 				var userBefore model.User
 				var tokenBefore model.Token
@@ -870,7 +878,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				for range 2 {
 					require.NoError(t, service.CleanupMediaObjects(t.Context()))
 				}
-				for _, before := range []model.AsyncMediaJob{completed, failed} {
+				for _, before := range []model.AsyncMediaJob{completed, failed, rootOnly} {
 					var after model.AsyncMediaJob
 					require.NoError(t, db.Take(&after, before.ID).Error)
 					assert.Equal(t, before.Status, after.Status)
@@ -1046,6 +1054,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "native failure cannot become a success after file expiry", taskStatus: model.TaskStatusFailure, jobStatus: "succeeded", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true},
 					{name: "other provider expired native failure agrees with filters", taskStatus: model.TaskStatusFailure, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorTerminable: true},
 					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
+					{name: "expired Drama native failure remains failed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(100)},
+					{name: "historical Drama expired native failure remains failed", taskStatus: model.TaskStatusFailure, jobStatus: "expired", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorTerminable: true},
+					{name: "expired failed job without native task remains failed", noTask: true, jobStatus: "failed", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", expired: true},
 					{name: "failed task refund remains unconfirmed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", taskQuota: 120, billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "zero task quota cannot clear known billing failure", taskStatus: model.TaskStatusFailure, taskProgress: "100%", jobBilling: "failed", billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "expiry takes precedence", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "expired", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(0)},
@@ -2497,7 +2508,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, db.Create(&native).Error)
 						view, _, err := videoJobView(c, job, true)
 						require.NoError(t, err)
-						expectedStatus := "expired"
+						expectedStatus := "failed"
 						if item.succeeded {
 							expectedStatus = "succeeded"
 						}

@@ -202,7 +202,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, err
 	}
-	if job.Provider == "drama" && job.ExpiresAt <= now && job.Status != "failed" && job.Status != "succeeded" {
+	if job.Provider == "drama" && job.ExpiresAt <= now && job.Status != "failed" && job.Status != "succeeded" && (err != nil || task.Status != model.TaskStatusFailure) {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
 	if err == nil && job.Status == "reconciling" && task.PrivateData.AsyncMedia && task.PrivateData.VideoReconciliation != nil && task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
@@ -933,7 +933,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	now := time.Now().Unix()
 	videoStatus := gorm.Expr(`CASE
 		WHEN status = 'failed' THEN 'failed'
-		WHEN status = 'succeeded' AND EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
+		WHEN EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
 			AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'FAILURE') THEN 'failed'
 		WHEN status = 'succeeded' AND storage_status = 'pending' AND expires_at > ? AND EXISTS(SELECT 1 FROM tasks
 			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
@@ -947,11 +947,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		WHEN status = 'reconciling' AND EXISTS(SELECT 1 FROM tasks
 			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
 			AND tasks.status NOT IN ('SUCCESS','FAILURE')) THEN 'invoking'
-		WHEN expires_at <= ? AND (provider = 'drama' OR NOT EXISTS(SELECT 1 FROM tasks
-			WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id
-			AND tasks.status = 'FAILURE')) THEN 'expired'
-		WHEN EXISTS(SELECT 1 FROM tasks WHERE tasks.task_id = async_media_jobs.task_id
-			AND tasks.user_id = async_media_jobs.user_id AND tasks.status = 'FAILURE') THEN 'failed'
+		WHEN expires_at <= ? THEN 'expired'
 		WHEN storage_status = 'succeeded' AND NOT EXISTS(SELECT 1 FROM media_artifact_objects
 			WHERE media_artifact_objects.task_id = async_media_jobs.task_id
 			AND media_artifact_objects.user_id = async_media_jobs.user_id

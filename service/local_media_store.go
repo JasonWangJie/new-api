@@ -253,7 +253,7 @@ func CleanupMediaObjects(ctx context.Context) error {
 	reservedTasks := pendingTasks.Session(&gorm.Session{}).Where("quota > ?", 0)
 	jobsQuery := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
 		Table(model.DB.NamingStrategy.TableName("AsyncMediaJob")+" AS media_cleanup").
-		Where("expires_at <= ? AND lease_expires_at <= ? AND (status NOT IN ? OR storage_status <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, []string{"expired", "failed", "succeeded"}, "expired").
+		Where("expires_at <= ? AND lease_expires_at <= ? AND (status NOT IN ? OR storage_status <> ? OR output_root_path <> '' OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL)", now, now, []string{"expired", "failed", "succeeded"}, "expired").
 		Where("COALESCE(reference_recovery_stage, '') <> ? OR output_object_key <> '' OR request_cipher IS NOT NULL OR channel_cipher IS NOT NULL", "refund").
 		Where("reference_recovery_stage = ? OR billing_status IN ? OR ((status <> ? OR NOT EXISTS (?)) AND (status <> ? OR NOT EXISTS (?)))", "refund", []string{"refunded", "not_billable"}, "reconciling", pendingTasks, "submitted", reservedTasks).
 		Scopes(model.ExcludePendingSubmissionReconciliation)
