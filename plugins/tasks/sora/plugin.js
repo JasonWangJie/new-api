@@ -12,7 +12,7 @@ export const meta = {
     en: "OpenAI Sora video generation (text-to-video, image-to-video, and remix)",
     zh: "OpenAI Sora 视频生成（文生视频、图生视频、remix）",
   },
-  version: "1.0.5",
+  version: "1.0.6",
   channelTypes: [55, 1], // OpenAI-type channels natively serve sora with the same wire format
   author: { name: "QuantumNous" },
   models: ["sora-2", "sora-2-pro"],
@@ -113,7 +113,7 @@ export function buildSubmitRequest(ctx) {
     if (values.metadata && typeof values.metadata === "object" && !Array.isArray(values.metadata)) {
       parts.push({ name: "metadata", value: JSON.stringify(values.metadata) });
     }
-    for (const file of ctx.files) parts.push({ name: file.field, fileRef: file.ref, filename: file.filename });
+    for (const file of ctx.files) parts.push({ name: file.field === "image" ? "input_reference" : file.field, fileRef: file.ref, filename: file.filename });
     return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers, bodyType: "multipart", parts };
   }
   headers["Content-Type"] = "application/json";
@@ -287,8 +287,8 @@ protocols.openai_video = {
     }
     let hasInputReferenceFile = false;
     for (const file of ctx.body.files || []) {
-      if (file.field !== "input_reference") throw new Error("unexpected file field: " + file.field);
-      if (hasInputReferenceFile) throw new Error("input_reference must be provided once");
+      if (file.field !== "input_reference" && file.field !== "image") throw new Error("unexpected file field: " + file.field);
+      if (hasInputReferenceFile) throw new Error("image or input_reference must be provided once");
       hasInputReferenceFile = true;
     }
     if (req.metadata !== undefined) {

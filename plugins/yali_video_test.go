@@ -88,6 +88,50 @@ func TestYaliVideoRequestMappingAndBillingIdentity(t *testing.T) {
 	assert.NotContains(t, plugin.Meta.Models, "minimax-h3-2k", "the lower-resolution provider must not join the existing 2K model")
 }
 
+func TestYaliVideoMappedAliasesEndToEnd(t *testing.T) {
+	plugin := loadYaliVideoPlugin(t)
+	for _, tc := range []struct {
+		name, publicModel, upstreamModel string
+	}{
+		{"native public name", "minimax-h3-720p", ""},
+		{"native upstream name", "MiniMaxH3-720p-realistic", ""},
+		{"alias to public name", "cinema-public", "minimax-h3-720p"},
+		{"alias to upstream name", "cinema-public", "MiniMaxH3-720p-realistic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := map[string]any{
+				"model": tc.publicModel, "upstreamModel": tc.upstreamModel, "operation": "create",
+				"body": map[string]any{"kind": "json", "value": map[string]any{
+					"model": tc.publicModel, "prompt": "a walking cat", "seconds": 15, "resolution": "720p", "aspect_ratio": "9:16",
+				}},
+				"baseUrl": "https://api.yaliai.example", "apiKey": "test-only-key",
+			}
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+			require.NoError(t, err)
+			intent := value.(map[string]any)
+			assert.Equal(t, tc.publicModel, intent["model"])
+			ctx["requestBody"], ctx["action"] = intent["requestBody"], intent["action"]
+			value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.NoError(t, err)
+			descriptor := value.(map[string]any)
+			assert.NotContains(t, descriptor, "model")
+			body := descriptor["body"].(map[string]any)
+			assert.Equal(t, "MiniMaxH3-720p-realistic", body["model"])
+			assert.Equal(t, "768P", body["resolution"])
+			assert.Equal(t, "9:16", body["aspect_ratio"])
+			value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			facts := value.(map[string]any)
+			assert.EqualValues(t, 1, facts["requests"])
+			assert.Equal(t, "720p", facts["resolution"])
+		})
+	}
+	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"model": "cinema-public", "upstreamModel": "unsupported-model", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "cat"}},
+	})
+	require.ErrorContains(t, err, "Unsupported Yali video model")
+}
+
 func TestYaliVideoRequestValidation(t *testing.T) {
 	plugin := loadYaliVideoPlugin(t)
 	for _, tc := range []struct {

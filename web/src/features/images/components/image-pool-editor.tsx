@@ -36,6 +36,7 @@ import { imageRequest } from '../api'
 import {
   imageLabel,
   imagePlatformLabel,
+  imagePoolMediaType,
   imageRoutingPlatforms,
 } from '../lib/image-labels'
 import type {
@@ -68,6 +69,11 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
   const editing = !!props.binding && !copying
   const [group, setGroup] = useState(props.binding?.group || 'default')
   const [platform, setPlatform] = useState(props.binding?.platform || 'openai')
+  const [mediaType, setMediaType] = useState<'image' | 'video'>(() =>
+    props.binding
+      ? imagePoolMediaType(props.binding, props.config) || 'image'
+      : 'image'
+  )
   const [mode, setMode] = useState(props.binding?.mode || 'resolution')
   const [model, setModel] = useState(props.binding?.model || '')
   const [resolution, setResolution] = useState(
@@ -88,15 +94,22 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
     (binding) =>
       binding.group === group.trim() &&
       binding.platform === platform &&
+      (platform !== 'mixed' || (binding.media_type || 'image') === mediaType) &&
       binding.mode === mode &&
       binding.model === (mode === 'resolution' ? '' : model) &&
       binding.resolution === (mode === 'model' ? '' : resolution)
   )
   const targetConflict = !editing && targetBindings.length > 0
   const poolOptions = useQuery({
-    queryKey: ['image-pool-options', group, platform],
+    queryKey: [
+      'image-pool-options',
+      group,
+      platform,
+      platform === 'mixed' ? mediaType : '',
+    ],
     queryFn: ({ signal }) => {
       const params = new URLSearchParams({ group, platform })
+      if (platform === 'mixed') params.set('media_type', mediaType)
       return imageRequest<ImagePoolSelectionOptions>(
         `/api/option/images/pool/options?${params}`,
         'GET',
@@ -183,6 +196,7 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
         expected_ids: editing ? props.binding?.rowIds : [],
         group: group.trim(),
         platform,
+        ...(platform === 'mixed' ? { media_type: mediaType } : {}),
         mode,
         model: mode === 'resolution' ? '' : model,
         resolution: mode === 'model' ? '' : resolution,
@@ -301,9 +315,26 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
               }}
             />
             {platform === 'mixed' && (
+              <ImageSelect
+                label={t('Media type')}
+                value={mediaType}
+                disabled={busy || !props.canManage || editing}
+                options={[
+                  { value: 'image', label: t('Image') },
+                  { value: 'video', label: t('Video') },
+                ]}
+                onChange={(value) => {
+                  setMediaType(value as 'image' | 'video')
+                  setModel('')
+                  setChannelIds([])
+                  setWeights({})
+                }}
+              />
+            )}
+            {platform === 'mixed' && (
               <FieldDescription className='sm:col-span-2'>
                 {t(
-                  'Mixed scheduling accepts asynchronous image requests without provider. Explicit provider requests keep their platform routing.'
+                  'Mixed scheduling routes asynchronous image and video requests without provider. Explicit provider requests keep their platform routing.'
                 )}
               </FieldDescription>
             )}
@@ -442,8 +473,11 @@ export function ImagePoolEditor(props: ImagePoolEditorProps) {
             <AlertTitle>{t('Binding impact')}</AlertTitle>
             <AlertDescription>
               <p className='break-words'>
-                {group} / {platform} / {t(imageLabel(mode))} /{' '}
-                {model || t('All Models')} /{' '}
+                {group} / {platform} /{' '}
+                {platform === 'mixed'
+                  ? `${t(mediaType === 'video' ? 'Video' : 'Image')} / `
+                  : ''}
+                {t(imageLabel(mode))} / {model || t('All Models')} /{' '}
                 {mode === 'model' ? t('All resolutions') : resolution}
               </p>
               <p>

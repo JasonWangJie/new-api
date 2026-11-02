@@ -28,12 +28,14 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
+	MixedRouting                     *MixedVideoRouting `json:"mixed_routing,omitempty"`
 	Body                             []byte
 	ContentType                      string
 	ClientIP                         string
 	Operation                        string
 	Channel                          model.Channel
 	Execution                        *model.TaskExecutionSnapshot
+	InitialExecution                 *model.TaskExecutionSnapshot `json:"initial_execution,omitempty"`
 	Billing                          MediaBillingSnapshot
 	InitialBillingChannelID          int                      `json:"initial_billing_channel_id,omitempty"`
 	InitialRetryState                *mediaretry.State        `json:"initial_retry_state,omitempty"`
@@ -246,7 +248,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
-			if job.ReferenceRecoveryStage == "unknown" || VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
+			if job.ReferenceRecoveryStage == "unknown" || VideoJobRequiresReconciliation(job) && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
 				return nil
 			}
 			return model.UpdateAsyncMediaJob(parent, job, map[string]any{"status": "failed", "next_attempt_at": 0})
@@ -427,7 +429,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 			billingStatus = "unknown"
 		}
 		updates["status"], updates["billing_status"], updates["error_message"], updates["next_attempt_at"] = "failed", billingStatus, VideoTaskFailureReason(reason), 0
-		if VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && billingStatus == "unknown" {
+		if VideoJobRequiresReconciliation(job) && job.DispatchedAt > 0 && billingStatus == "unknown" {
 			updates["status"] = "execution_unknown"
 		}
 		return nil
@@ -453,13 +455,13 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		return err
 	}
 	if submitErr == nil {
-		updates["status"], updates["request_cipher"] = "submitted", retainAsyncVideoRequestDetails(job)
+		updates["status"], updates["request_cipher"] = "submitted", retainAsyncVideoRequestDetails(current)
 		return nil
 	}
 	// The durable Task barrier may have been crossed before a billing error.
 	var accepted model.Task
 	if err := model.DB.WithContext(context.WithoutCancel(parent)).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&accepted).Error; err == nil {
-		updates["status"], updates["billing_status"], updates["quota"], updates["request_cipher"], updates["error_message"] = "submitted", "failed", accepted.Quota, retainAsyncVideoRequestDetails(job), "Task billing confirmation requires reconciliation"
+		updates["status"], updates["billing_status"], updates["quota"], updates["request_cipher"], updates["error_message"] = "submitted", "failed", accepted.Quota, retainAsyncVideoRequestDetails(current), "Task billing confirmation requires reconciliation"
 		return submitErr
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
@@ -473,7 +475,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		}
 	}
 	if current.DispatchedAt > 0 && updates["billing_status"] == "unknown" {
-		if VideoSubmissionRequiresReconciliation(current.Provider) {
+		if VideoJobRequiresReconciliation(current) {
 			updates["status"] = "execution_unknown"
 		}
 		reason = "Upstream submission could not be confirmed; the video operation will not be repeated\n" + reason

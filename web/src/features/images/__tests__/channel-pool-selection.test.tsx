@@ -65,6 +65,7 @@ function renderPool(
     binding_key: string
     group: string
     platform: string
+    media_type?: 'image' | 'video'
     mode: string
     model: string
     resolution: string
@@ -311,7 +312,7 @@ test('pool partitions group all resolutions by group and platform while bindings
     rows.map((row) =>
       within(row)
         .getAllByRole('cell')
-        .slice(1, 3)
+        .slice(2, 4)
         .map((cell) => cell.textContent)
     )
   ).toEqual([
@@ -326,7 +327,14 @@ test('pool partitions group all resolutions by group and platform while bindings
     within(modelTable)
       .getAllByRole('columnheader')
       .map((header) => header.textContent)
-  ).toEqual(['Pool binding', 'Model', 'Resolution', 'Channel', 'Actions'])
+  ).toEqual([
+    'Media type',
+    'Pool binding',
+    'Model',
+    'Resolution',
+    'Channel',
+    'Actions',
+  ])
 
   const mergedRow = rows[2]
   expect(within(mergedRow).getByText('11 (7), 22 (3)')).toBeVisible()
@@ -755,11 +763,86 @@ test('copying a pool to mixed scheduling preserves channels and weights without 
         expected_ids: [],
         group: 'premium',
         platform: 'mixed',
+        media_type: 'image',
         mode: 'model',
         model: 'image-beta',
         resolution: '',
         channels: [{ id: 22, weight: 7 }],
       }
+    )
+  )
+})
+
+test('mixed image and video bindings with one model edit separate media targets', async () => {
+  vi.mocked(imageRequest).mockImplementation(async (url, method, data) => {
+    if (method === 'GET' && url.includes('platform=mixed')) {
+      return {
+        models: [
+          {
+            id: 'shared-model',
+            label: 'Shared model',
+            media_types: ['video'],
+            channel_ids: [72],
+          },
+        ],
+        channels: [{ id: 72, name: 'Video supplier' }],
+      }
+    }
+    if (method === 'PUT') return data
+    throw new Error(`Unexpected request: ${method} ${url}`)
+  })
+  renderPool([
+    {
+      id: 101,
+      binding_key: 'image-key',
+      group: 'default',
+      platform: 'mixed',
+      media_type: 'image',
+      mode: 'model',
+      model: 'shared-model',
+      resolution: '',
+      channel_id: 71,
+      priority: 2,
+    },
+    {
+      id: 102,
+      binding_key: 'video-key',
+      group: 'default',
+      platform: 'mixed',
+      media_type: 'video',
+      mode: 'model',
+      model: 'shared-model',
+      resolution: '',
+      channel_id: 72,
+      priority: 3,
+    },
+  ])
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: /default.*Mixed scheduling/ })
+  )
+  const videoRow = screen.getByRole('row', { name: /Video.*shared-model/ })
+  await user.click(within(videoRow).getByRole('button', { name: 'Edit' }))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  )
+  expect(imageRequest).toHaveBeenCalledWith(
+    expect.stringContaining('media_type=video'),
+    'GET',
+    undefined,
+    expect.any(AbortSignal)
+  )
+  expect(screen.getByRole('combobox', { name: 'Media type' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/pool',
+      'PUT',
+      expect.objectContaining({
+        expected_ids: [102],
+        media_type: 'video',
+        channels: [{ id: 72, weight: 3 }],
+      })
     )
   )
 })

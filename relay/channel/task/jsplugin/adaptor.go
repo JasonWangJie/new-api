@@ -1109,7 +1109,9 @@ func taskArtifactContext(task *model.Task) (map[string]any, error) {
 		}
 	}
 	producerVersion := ""
-	if task.PrivateData.Execution != nil && task.PrivateData.Execution.TaskPlugin != nil {
+	if task.PrivateData.CurrentAttempt != nil {
+		producerVersion = task.PrivateData.CurrentAttempt.PluginVersion
+	} else if task.PrivateData.Execution != nil && task.PrivateData.Execution.TaskPlugin != nil {
 		producerVersion = task.PrivateData.Execution.TaskPlugin.Version
 	}
 	var state any

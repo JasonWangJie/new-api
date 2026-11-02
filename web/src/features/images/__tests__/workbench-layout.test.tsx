@@ -948,6 +948,211 @@ const capabilityModel: VideoModel = {
   },
 }
 
+test.each([
+  {
+    name: 'provider collection with one URL',
+    mixed: false,
+    limits: [2],
+    count: 1,
+    array: true,
+  },
+  {
+    name: 'provider collection with two URLs',
+    mixed: false,
+    limits: [2],
+    count: 2,
+    array: true,
+  },
+  {
+    name: 'mixed single input with one URL',
+    mixed: true,
+    limits: [1],
+    count: 1,
+    array: false,
+  },
+  {
+    name: 'mixed single URL with a wider candidate',
+    mixed: true,
+    limits: [1, 2],
+    count: 1,
+    array: false,
+  },
+  {
+    name: 'mixed collection with two URLs',
+    mixed: true,
+    limits: [1, 2],
+    count: 2,
+    array: true,
+  },
+])('$name preserves every input and its wire shape', async (testCase) => {
+  const variants = testCase.limits.map((limit) => ({
+    models: ['custom-video'],
+    modes: [
+      {
+        name: 'image_to_video' as const,
+        inputs: [
+          {
+            name: 'image' as const,
+            kind: 'image' as const,
+            sources: ['url' as const],
+            maxItems: limit,
+            required: true,
+          },
+        ],
+      },
+    ],
+  }))
+  const model: VideoModel = {
+    ...capabilityModel,
+    id: 'custom-video',
+    provider: testCase.mixed ? '' : 'custom-video',
+    routing_platform: testCase.mixed ? 'mixed' : undefined,
+    capability: variants[0],
+    capability_variants: testCase.mixed ? variants : undefined,
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={model}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  const urls = [
+    'https://cdn.example/one.png',
+    'https://cdn.example/two.png',
+  ].slice(0, testCase.count)
+  await user.type(
+    screen.getByLabelText('First frame or reference image *'),
+    urls.join('\n')
+  )
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit).toHaveBeenCalledOnce()
+  expect(onSubmit.mock.calls[0][0].body.image).toEqual(
+    testCase.array ? urls : urls[0]
+  )
+})
+
+test('mixed video keeps complete capability combinations and submits without a provider', async () => {
+  const first = {
+    name: 'text_to_video' as const,
+    duration: { values: [5], default: 5 },
+    resolutions: ['720p'],
+    defaultResolution: '720p',
+  }
+  const second = {
+    ...first,
+    duration: { values: [10], default: 10 },
+    resolutions: ['1080p'],
+    defaultResolution: '1080p',
+  }
+  const mixed: VideoModel = {
+    ...capabilityModel,
+    id: 'shared-video',
+    provider: '',
+    routing_platform: 'mixed',
+    capability: { models: ['shared-video'], modes: [first] },
+    capability_variants: [
+      { models: ['shared-video'], modes: [first] },
+      { models: ['shared-video'], modes: [second] },
+    ],
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={mixed}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('Prompt'), 'A city at dawn')
+  await user.click(screen.getByRole('combobox', { name: 'Resolution' }))
+  await user.click(screen.getByRole('option', { name: '1080p' }))
+  expect(
+    screen.getByRole('combobox', { name: 'Duration (seconds)' })
+  ).toHaveTextContent('5')
+  expect(screen.getByRole('button', { name: 'Generate video' })).toBeDisabled()
+  expect(screen.getByRole('status')).toHaveTextContent(
+    'No mixed video channel supports this complete request.'
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Duration (seconds)' }))
+  await user.click(screen.getByRole('option', { name: '10' }))
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit).toHaveBeenCalledWith({
+    mode: 'text_to_video',
+    body: {
+      model: 'shared-video',
+      prompt: 'A city at dawn',
+      seconds: 10,
+      resolution: '1080p',
+    },
+    files: [],
+  })
+})
+
+test('mixed video preserves omitted booleans and explicit false without changing reference arrays', async () => {
+  const mode = {
+    name: 'reference_to_video' as const,
+    inputs: [
+      {
+        name: 'reference_images' as const,
+        kind: 'image' as const,
+        sources: ['url' as const],
+        maxItems: 1,
+        required: true,
+      },
+    ],
+    options: { generateAudio: true },
+  }
+  const mixed: VideoModel = {
+    ...capabilityModel,
+    id: 'shared-reference',
+    provider: '',
+    routing_platform: 'mixed',
+    capability: { models: ['shared-reference'], modes: [mode] },
+    capability_variants: [{ models: ['shared-reference'], modes: [mode] }],
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={mixed}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  await user.type(
+    screen.getByLabelText('Reference images *'),
+    'asset://private-account'
+  )
+  expect(screen.getByRole('button', { name: 'Generate video' })).toBeDisabled()
+  await user.clear(screen.getByLabelText('Reference images *'))
+  await user.type(
+    screen.getByLabelText('Reference images *'),
+    'https://cdn.example/ref.png'
+  )
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit.mock.calls[0][0].body).toEqual({
+    model: 'shared-reference',
+    reference_images: ['https://cdn.example/ref.png'],
+  })
+  await user.click(
+    screen.getByRole('combobox', { name: 'Generate synchronized audio' })
+  )
+  await user.click(screen.getByRole('option', { name: 'No' }))
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit.mock.calls[1][0].body).toEqual({
+    model: 'shared-reference',
+    reference_images: ['https://cdn.example/ref.png'],
+    generate_audio: false,
+  })
+})
+
 test('renders video fields from capability and prevents additional JSON overrides', async () => {
   const user = userEvent.setup()
   const onSubmit = vi.fn()
@@ -1124,6 +1329,77 @@ test('allows an xAI last-frame request without a prompt or first frame', async (
       last_frame: 'https://cdn.example/last.png',
     },
     files: [],
+  })
+})
+
+test('switching video modes clears native uploads so the same image can be selected again', async () => {
+  const input = {
+    name: 'image' as const,
+    kind: 'image' as const,
+    sources: ['url' as const, 'upload' as const],
+    maxItems: 1,
+    required: true,
+  }
+  const profile = {
+    models: [capabilityModel.id],
+    modes: [
+      { name: 'image_to_video' as const, inputs: [input] },
+      {
+        name: 'first_last_frame' as const,
+        inputs: [
+          { ...input, required: false },
+          { ...input, name: 'last_frame' as const },
+        ],
+      },
+    ],
+  }
+  const model: VideoModel = {
+    ...capabilityModel,
+    provider: '',
+    routing_platform: 'mixed',
+    capability: profile,
+    capability_variants: [profile],
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={model}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  const image = new File(['image'], 'first.png', { type: 'image/png' })
+  await user.upload(
+    screen.getByLabelText('Upload First frame or reference image'),
+    image
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Generation mode' }))
+  await user.click(screen.getByRole('option', { name: 'First and last frame' }))
+  expect(
+    (
+      screen.getByLabelText(
+        'Upload First frame or reference image'
+      ) as HTMLInputElement
+    ).files
+  ).toHaveLength(0)
+  await user.upload(
+    screen.getByLabelText('Upload Last frame'),
+    new File(['last'], 'last.png', { type: 'image/png' })
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Generation mode' }))
+  await user.click(screen.getByRole('option', { name: 'Image to video' }))
+  const upload = screen.getByLabelText(
+    'Upload First frame or reference image'
+  ) as HTMLInputElement
+  expect(upload.files).toHaveLength(0)
+  await user.upload(upload, image)
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit).toHaveBeenCalledWith({
+    mode: 'image_to_video',
+    body: { model: model.id },
+    files: [{ field: 'image', file: image }],
   })
 })
 

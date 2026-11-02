@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -484,10 +485,16 @@ func executeTaskSubmissionWith(
 	stage := "start"
 	defer func() {
 		if !durable && relayInfo.Billing != nil {
-			if c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
+			unconfirmed := c.GetBool("async_media_policy_unknown_ended") || c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected")
+			if value, exists := c.Get("async_media_initial_retry_request"); exists {
+				request, ok := value.(*service.AsyncVideoRequest)
+				unconfirmed = unconfirmed || ok && request != nil && len(request.InitialUnknownAttempts) > 0
+			}
+			if unconfirmed {
 				// The persisted media dispatch barrier owns this reservation even
 				// when a receipt is lost or its Task row cannot be saved. Refund
-				// requires confirmed rejection, not a local timeout or parse error.
+				// requires confirmation of every attempt; a later rejection cannot
+				// settle an earlier unknown submission.
 				logger.LogWarn(c, fmt.Sprintf("video submission requires reconciliation; retaining reservation task=%s stage=%s", relayInfo.PublicTaskID, stage))
 				return
 			}
@@ -552,6 +559,41 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		mixedUnconfirmed := c.GetBool("async_media_mixed_video") && c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected")
+		if taskErr != nil && mixedUnconfirmed {
+			// A mixed operation may already be running on its pinned provider.
+			// Neither the outer relay loop nor a local refund may replay it.
+			taskErr.NoRetry = true
+			value, _ := c.Get("async_media_initial_retry_request")
+			request, ok := value.(*service.AsyncVideoRequest)
+			if ok && request != nil && request.RetryFact != nil && request.RetryFact.Unknown && !request.RetryFact.HasOutput && service.HasDurableTaskReservation(relayInfo, 0) {
+				attempt := model.VideoTaskAttempt{ChannelID: relayInfo.ChannelId}
+				if value, exists := c.Get("async_media_current_attempt"); exists {
+					if current, valid := value.(*model.VideoTaskAttempt); valid && current != nil {
+						attempt = *current
+					}
+				}
+				attempt.Status, attempt.Reason, attempt.FinishedAt = model.TaskStatusUnknown, request.RetryFact.Message, time.Now().Unix()
+				c.Set("async_media_current_attempt", &attempt)
+				if !slices.ContainsFunc(request.InitialUnknownAttempts, func(previous model.VideoTaskAttempt) bool {
+					return previous.Generation == attempt.Generation && previous.ChannelID == attempt.ChannelID
+				}) {
+					request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, attempt)
+				}
+				if request.InitialRetryState == nil {
+					request.InitialRetryState = &mediaretry.State{}
+				}
+				request.PendingDecision = &mediaretry.Decision{Action: mediaretry.ManualReview, BlockedReason: "mixed_video_unknown_not_replayable"}
+				c.Set("async_media_policy_unknown_ended", true)
+				result = &relay.TaskSubmitResult{Platform: constant.TaskPlatform(c.GetString("platform")), Quota: relayInfo.Billing.GetPreConsumedQuota(), Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message}}
+				taskErr = nil
+				// Submission deadlines stop network work. Persisting its unknown
+				// outcome must still retain the dispatch evidence and existing hold.
+				persistContext, cancelPersist := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
+				defer cancelPersist()
+				c.Request = c.Request.WithContext(persistContext)
+			}
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -632,6 +674,14 @@ func executeTaskSubmissionWith(
 		}
 	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
+	if initialRequest != nil && initialRequest.MixedRouting != nil && initialRequest.InitialExecution != nil {
+		task.PrivateData.Execution = initialRequest.InitialExecution
+	}
+	if value, exists := c.Get("async_media_current_attempt"); exists {
+		if attempt, ok := value.(*model.VideoTaskAttempt); ok {
+			task.PrivateData.CurrentAttempt = attempt
+		}
+	}
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.UpstreamAsync = result.UpstreamAsync
 	task.PrivateData.UpstreamAsyncResponse = result.UpstreamAsyncResponse

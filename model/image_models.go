@@ -51,6 +51,8 @@ type TokenImagePlatformMapping struct {
 }
 
 type ImageChannelPool struct {
+	// MediaType is derived from the binding namespace; existing rows need no migration.
+	MediaType  string `json:"media_type,omitempty" gorm:"-"`
 	Id         int    `json:"id"`
 	BindingKey string `json:"binding_key" gorm:"size:64;uniqueIndex:idx_image_pool_channel,priority:1"`
 	Group      string `json:"group" gorm:"size:255"`

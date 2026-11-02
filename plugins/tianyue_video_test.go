@@ -41,6 +41,7 @@ func TestTianyueVideoRequestBillingAndReferences(t *testing.T) {
 		{name: "per call public duration", upstream: "L-sd2-video", request: map[string]any{"duration": 6, "input_reference": "https://cdn.example/image.png"}, wantDuration: 1, wantAction: "image_to_video", wantUsage: map[string]any{"requests": float64(1), "resolution": "720p"}},
 		// The -se name is a protocol fixture, not a claim that this model exists.
 		{name: "mapped per second model", upstream: "protocol-fixture-se", request: map[string]any{"seconds": 6, "image_urls": []any{"https://cdn.example/1.png", "https://cdn.example/2.png"}, "audio_urls": []any{"https://cdn.example/reference.mp3"}, "video_urls": []any{"https://cdn.example/reference.mp4"}}, wantDuration: 6, wantAction: "reference_to_video", wantUsage: map[string]any{"seconds": float64(6), "resolution": "720p"}},
+		{name: "per second native duration equals output seconds", upstream: "protocol-fixture-se", request: map[string]any{"duration": 6, "video_duration": 6}, wantDuration: 6, wantAction: "text_to_video", wantUsage: map[string]any{"seconds": float64(6), "resolution": "720p"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := map[string]any{"model": "public-alias", "prompt": " retain reference identity ", "resolution": "720p", "aspect_ratio": "9:16"}
@@ -98,6 +99,10 @@ func TestTianyueVideoRequestBillingAndReferences(t *testing.T) {
 
 func TestTianyueVideoRejectsUnsafeInputsBeforeSubmission(t *testing.T) {
 	plugin := loadTianyueVideoPlugin(t)
+	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+		"model": "public-alias", "upstreamModel": "protocol-fixture-se", "operation": "create", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "animate", "resolution": "720p", "duration": 1, "video_duration": 6}},
+	})
+	require.ErrorContains(t, err, "duration conflicts", "the -se protocol uses duration as output seconds rather than a per-operation unit")
 	for _, tc := range []struct {
 		name   string
 		fields map[string]any

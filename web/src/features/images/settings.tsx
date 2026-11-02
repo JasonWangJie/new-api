@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -72,7 +72,10 @@ import { isConfigurationConflict } from './lib/configuration-conflict'
 import {
   imageLabel,
   imagePlatformLabel,
+  imagePoolMediaType,
   imageRoutingPlatforms,
+  isVideoModelEntry,
+  normalizeMediaModelCatalog,
 } from './lib/image-labels'
 import type { ImageAdminConfiguration, ImageStorageProfile } from './types'
 import { VideoConfiguration } from './video-settings'
@@ -981,40 +984,96 @@ function ImagePolicyForm({
   const [deleting, setDeleting] = useState<
     ImageConfiguration['policies'][number] | null
   >(null)
+  const initialPolicy = config.policies.find(
+    (item) => item.group === 'default' && item.platform === 'openai'
+  )
   const [group, setGroup] = useState('default')
   const [platform, setPlatform] = useState('openai')
-  const [mode, setMode] = useState('resolution')
-  const [enabled, setEnabled] = useState(false)
-  const [asyncEnabled, setAsyncEnabled] = useState(false)
+  const selectedPolicy = useRef({ group: 'default', platform: 'openai' })
+  const [policyDeleted, setPolicyDeleted] = useState(false)
+  const [mode, setMode] = useState(initialPolicy?.pool_mode ?? 'resolution')
+  const [enabled, setEnabled] = useState(initialPolicy?.enabled ?? false)
+  const [asyncEnabled, setAsyncEnabled] = useState(
+    initialPolicy?.async_enabled ?? false
+  )
   const [models, setModels] = useState(
-    JSON.stringify(
-      [
-        {
-          id: 'gpt-image-2',
-          label: 'gpt-image-2',
-          media_type: 'image',
-          qualities: ['low', 'medium', 'high'],
-          resolutions: ['1K', '2K', '4K'],
-          formats: ['png', 'jpeg', 'webp'],
-          backgrounds: ['auto', 'opaque', 'transparent'],
-          max_output_images: 128,
-          max_reference_images: 14,
-        },
-      ],
-      null,
-      2
-    )
+    () =>
+      initialPolicy?.models ??
+      JSON.stringify(
+        [
+          {
+            id: 'gpt-image-2',
+            label: 'gpt-image-2',
+            media_type: 'image',
+            qualities: ['low', 'medium', 'high'],
+            resolutions: ['1K', '2K', '4K'],
+            formats: ['png', 'jpeg', 'webp'],
+            backgrounds: ['auto', 'opaque', 'transparent'],
+            max_output_images: 128,
+            max_reference_images: 14,
+          },
+        ],
+        null,
+        2
+      )
   )
   const [busy, setBusy] = useState(false)
+  const [saveError, setSaveError] = useState<unknown>(null)
+  // Refetches must not rebase a draft onto another administrator's version.
+  const [editingPolicy, setEditingPolicy] = useState(initialPolicy)
+  const selectPolicy = (
+    nextGroup: string,
+    nextPlatform: string,
+    policies = config.policies
+  ) => {
+    selectedPolicy.current = { group: nextGroup, platform: nextPlatform }
+    setGroup(nextGroup)
+    setPlatform(nextPlatform)
+    setPolicyDeleted(false)
+    const current = policies.find(
+      (item) => item.group === nextGroup && item.platform === nextPlatform
+    )
+    setEditingPolicy(current)
+    setSaveError(null)
+    setMode(current?.pool_mode || 'resolution')
+    setEnabled(current?.enabled || false)
+    setAsyncEnabled(current?.async_enabled || false)
+    const saved = current?.models || '[]'
+    if (nextPlatform !== 'mixed') {
+      setModels(saved)
+      return
+    }
+    try {
+      const catalog = normalizeMediaModelCatalog(JSON.parse(saved))
+      setModels(
+        JSON.stringify(
+          catalog.filter((entry) => !isVideoModelEntry(entry)),
+          null,
+          2
+        )
+      )
+    } catch {
+      setModels(saved)
+    }
+  }
   const deletion = useMutation({
     mutationFn: (policy: ImageConfiguration['policies'][number]) =>
       imageRequest('/api/option/images/policy', 'DELETE', {
+        id: policy.id || 0,
         group: policy.group,
         platform: policy.platform,
         version: policy.version,
       }),
-    onSuccess: async () => {
+    onSuccess: async (_, policy) => {
       setDeleting(null)
+      const selected = selectedPolicy.current
+      if (
+        selected.group === policy.group &&
+        selected.platform === policy.platform
+      ) {
+        selectPolicy(selected.group, selected.platform, [])
+        setPolicyDeleted(true)
+      }
       await Promise.all([
         onSuccess(),
         queryClient.invalidateQueries({ queryKey: ['image-pool-options'] }),
@@ -1025,27 +1084,58 @@ function ImagePolicyForm({
     onError: (error) => handleServerError(error, t('Image request failed')),
   })
   const save = async () => {
+    if (
+      busy ||
+      deletion.isPending ||
+      policyDeleted ||
+      isConfigurationConflict(saveError)
+    ) {
+      return
+    }
     setBusy(true)
+    setSaveError(null)
     try {
-      JSON.parse(models)
-      const current = config.policies.find(
-        (item) => item.group === group && item.platform === platform
+      const catalog: unknown = JSON.parse(models)
+      if (!Array.isArray(catalog)) {
+        throw new Error(t('Model capabilities must be a JSON array'))
+      }
+      let savedModels = models
+      if (platform === 'mixed') {
+        const normalized = normalizeMediaModelCatalog(catalog)
+        const existing = normalizeMediaModelCatalog(
+          JSON.parse(editingPolicy?.models || '[]')
+        )
+        savedModels = JSON.stringify([
+          ...normalized.filter((entry) => !isVideoModelEntry(entry)),
+          ...existing.filter(isVideoModelEntry),
+        ])
+      }
+      const saved = await imageRequest<ImageConfiguration['policies'][number]>(
+        '/api/option/images/policy',
+        'PUT',
+        {
+          id: editingPolicy?.id || 0,
+          group,
+          platform,
+          pool_mode: mode,
+          enabled,
+          async_enabled: platform === 'mixed' || asyncEnabled,
+          models: savedModels,
+          version: editingPolicy?.version || 0,
+        }
       )
-      await imageRequest('/api/option/images/policy', 'PUT', {
-        group,
-        platform,
-        pool_mode: mode,
-        enabled,
-        async_enabled: platform === 'mixed' || asyncEnabled,
-        models,
-        version: current?.version || 0,
-      })
+      selectPolicy(group, platform, [saved])
       await onSuccess()
       toast.success(t('Saved'))
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
+      setSaveError(error)
+      if (isConfigurationConflict(error)) {
+        markServerErrorHandled(error)
+      } else {
+        toast.error(
+          error instanceof Error ? error.message : t('Image request failed')
+        )
+      }
     } finally {
       setBusy(false)
     }
@@ -1068,7 +1158,7 @@ function ImagePolicyForm({
           <ImageGroupSelect
             config={config}
             value={group}
-            onChange={setGroup}
+            onChange={(value) => selectPolicy(value, platform)}
             disabled={busy || deletion.isPending}
           />
           <ImageSelect
@@ -1082,7 +1172,8 @@ function ImagePolicyForm({
               value,
               label: t(imagePlatformLabel(value)),
             }))}
-            onChange={setPlatform}
+            onChange={(value) => selectPolicy(group, value)}
+            disabled={busy || deletion.isPending}
           />
           <ImageSelect
             label={t('Pool binding')}
@@ -1091,6 +1182,7 @@ function ImagePolicyForm({
               (value) => ({ value, label: t(imageLabel(value)) })
             )}
             onChange={setMode}
+            disabled={busy || deletion.isPending}
           />
         </div>
         {platform === 'mixed' && (
@@ -1106,6 +1198,7 @@ function ImagePolicyForm({
               id='policy-enabled'
               checked={enabled}
               onCheckedChange={setEnabled}
+              disabled={busy || deletion.isPending}
             />
             <Label htmlFor='policy-enabled'>{t('Enable image platform')}</Label>
           </div>
@@ -1113,7 +1206,7 @@ function ImagePolicyForm({
             <Checkbox
               id='policy-async'
               checked={platform === 'mixed' || asyncEnabled}
-              disabled={platform === 'mixed'}
+              disabled={busy || deletion.isPending || platform === 'mixed'}
               onCheckedChange={setAsyncEnabled}
             />
             <Label htmlFor='policy-async'>
@@ -1135,10 +1228,35 @@ function ImagePolicyForm({
           className='min-h-64 font-mono text-xs'
           value={models}
           onChange={(event) => setModels(event.target.value)}
+          disabled={busy || deletion.isPending}
         />
-        <Button disabled={busy || deletion.isPending} type='submit'>
+        {policyDeleted && <p role='status'>{t('Deleted')}</p>}
+        <Button
+          disabled={
+            busy ||
+            deletion.isPending ||
+            policyDeleted ||
+            isConfigurationConflict(saveError)
+          }
+          type='submit'
+        >
           {t('Save')}
         </Button>
+        <ConfigurationConflict
+          error={saveError}
+          onReload={async () => {
+            if (busy || deletion.isPending) return
+            setBusy(true)
+            try {
+              const latest =
+                await imageRequest<ImageConfiguration>('/api/option/images')
+              selectPolicy(group, platform, latest.policies)
+              await onSuccess()
+            } finally {
+              setBusy(false)
+            }
+          }}
+        />
         <StaticDataTable
           data={config.policies}
           getRowKey={(item) => `${item.group}:${item.platform}`}
@@ -1164,14 +1282,7 @@ function ImagePolicyForm({
                     size='sm'
                     variant='outline'
                     disabled={busy || deletion.isPending}
-                    onClick={() => {
-                      setGroup(item.group)
-                      setPlatform(item.platform)
-                      setMode(item.pool_mode)
-                      setModels(item.models)
-                      setEnabled(item.enabled)
-                      setAsyncEnabled(item.async_enabled)
-                    }}
+                    onClick={() => selectPolicy(item.group, item.platform)}
                   >
                     {t('Edit')}
                   </Button>
@@ -1313,6 +1424,14 @@ export function ImagePoolForm({
     sections.length > 0 &&
     sections.every((section) => expandedKeys.has(section.key))
   const columns: StaticDataTableColumn<ImagePoolBinding>[] = [
+    {
+      id: 'media_type',
+      header: t('Media type'),
+      cell: (binding) => {
+        const mediaType = imagePoolMediaType(binding, config)
+        return mediaType ? t(mediaType === 'video' ? 'Video' : 'Image') : '—'
+      },
+    },
     {
       id: 'mode',
       header: t('Pool binding'),

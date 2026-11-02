@@ -157,6 +157,14 @@ func mediaChannelSupportsVideoPlatform(channel *model.Channel, modelName, platfo
 	if channel == nil {
 		return false
 	}
+	if platform == "mixed" {
+		for _, operation := range []string{"create", "edit", "extend"} {
+			if _, _, err := MixedVideoChannelBinding(*channel, modelName, operation); err == nil {
+				return true
+			}
+		}
+		return false
+	}
 	for _, candidate := range mediaVideoCandidates(modelName) {
 		if candidate.Plugin == nil || candidate.Protocol != "openai_video" || candidate.Plugin.Meta.Key != platform {
 			continue
@@ -614,7 +622,7 @@ func ValidateVideoProfileRequest(profile jsplugin.VideoProfile, action string, r
 	return nil
 }
 
-func videoInputSources(name string, body, metadata map[string]any, files []map[string]any) []string {
+func videoInputValues(name string, body, metadata map[string]any) []any {
 	values := make([]any, 0)
 	appendValues := func(value any) {
 		switch items := value.(type) {
@@ -653,8 +661,9 @@ func videoInputSources(name string, body, metadata map[string]any, files []map[s
 	default:
 		appendValues(body[name])
 	}
-	if content, ok := metadata["content"].([]any); ok {
-		firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["images"]) > 0
+	firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["images"]) > 0
+	for _, source := range []map[string]any{body, metadata} {
+		content, _ := source["content"].([]any)
 		for _, raw := range content {
 			item, ok := raw.(map[string]any)
 			if !ok {
@@ -691,15 +700,48 @@ func videoInputSources(name string, body, metadata map[string]any, files []map[s
 			appendValues(value)
 		}
 	}
+	return values
+}
+
+// videoInputFileRef identifies an uploaded file after a decoder has placed its
+// request-scoped reference in a canonical media object.
+func videoInputFileRef(value any) string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if ref, _ := object["__fileRef"].(string); ref != "" {
+		return ref
+	}
+	for _, field := range []string{"url", "image_url", "video_url", "audio_url"} {
+		if ref := videoInputFileRef(object[field]); ref != "" {
+			return ref
+		}
+	}
+	return ""
+}
+
+func videoInputSources(name string, body, metadata map[string]any, files []map[string]any) []string {
+	values := videoInputValues(name, body, metadata)
 	for _, file := range files {
 		field, _ := file["field"].(string)
 		if field == name || name == "image" && (field == "image" || field == "input_reference") {
-			values = append(values, videoUploadedFileSource{})
+			ref, _ := file["ref"].(string)
+			if ref == "" || !slices.ContainsFunc(values, func(value any) bool { return videoInputFileRef(value) == ref }) {
+				values = append(values, videoUploadedFileSource{})
+			}
 		}
 	}
 	sources := make([]string, 0, len(values))
 	for _, value := range values {
-		sources = append(sources, classifyVideoInputSource(value, name))
+		if ref := videoInputFileRef(value); ref != "" && slices.ContainsFunc(files, func(file map[string]any) bool {
+			field, _ := file["field"].(string)
+			return file["ref"] == ref && (field == name || name == "image" && (field == "image" || field == "input_reference"))
+		}) {
+			sources = append(sources, "upload")
+		} else {
+			sources = append(sources, classifyVideoInputSource(value, name))
+		}
 	}
 	return sources
 }
@@ -807,8 +849,9 @@ func videoInputCounts(body, metadata map[string]any, files []map[string]any) map
 		}
 		counts["reference_images"] += images
 	}
-	if content, ok := metadata["content"].([]any); ok {
-		firstImageAssigned := counts["image"] > 0
+	firstImageAssigned := counts["image"] > 0
+	for _, source := range []map[string]any{body, metadata} {
+		content, _ := source["content"].([]any)
 		for _, raw := range content {
 			item, ok := raw.(map[string]any)
 			if !ok {
@@ -836,6 +879,14 @@ func videoInputCounts(body, metadata map[string]any, files []map[string]any) map
 	}
 	for _, file := range files {
 		field, _ := file["field"].(string)
+		name := field
+		if name == "input_reference" {
+			name = "image"
+		}
+		ref, _ := file["ref"].(string)
+		if ref != "" && slices.ContainsFunc(videoInputValues(name, body, metadata), func(value any) bool { return videoInputFileRef(value) == ref }) {
+			continue
+		}
 		switch field {
 		case "image", "input_reference":
 			counts["image"]++
@@ -844,6 +895,74 @@ func videoInputCounts(body, metadata map[string]any, files []map[string]any) map
 		}
 	}
 	return counts
+}
+
+func videoMediaIdentity(value any) string {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	if object, ok := value.(map[string]any); ok {
+		if ref, _ := object["__fileRef"].(string); ref != "" {
+			return "upload:" + ref
+		}
+		for _, field := range []string{"url", "image_url", "video_url", "audio_url"} {
+			if identity := videoMediaIdentity(object[field]); identity != "" {
+				return identity
+			}
+		}
+	}
+	return ""
+}
+
+// videoMediaValues includes explicit reference roles as well as public aliases.
+// The projection and conservation checks use the same identities as validation.
+func videoMediaValues(name string, body map[string]any) []any {
+	metadata, _ := body["metadata"].(map[string]any)
+	values := videoInputValues(name, body, metadata)
+	references, _ := body["references"].([]any)
+	for _, raw := range references {
+		item, _ := raw.(map[string]any)
+		kind, _ := item["type"].(string)
+		role, _ := item["role"].(string)
+		target := "reference_" + kind + "s"
+		if kind == "image" && role == "first_frame" {
+			target = "image"
+		} else if kind == "image" && role == "last_frame" {
+			target = "last_frame"
+		}
+		if name == target {
+			values = append(values, item["source"])
+		}
+	}
+	return values
+}
+
+func videoMediaInventory(body map[string]any, files []map[string]any) map[string]int {
+	inventory := make(map[string]int)
+	for name, kind := range map[string]string{"image": "image", "last_frame": "image", "reference_images": "image", "video": "video", "reference_videos": "video", "reference_audios": "audio"} {
+		for _, value := range videoMediaValues(name, body) {
+			if identity := videoMediaIdentity(value); identity != "" {
+				inventory[kind+":"+identity]++
+			}
+		}
+	}
+	for _, file := range files {
+		field, _ := file["field"].(string)
+		kind := ""
+		switch field {
+		case "image", "input_reference", "last_frame", "reference_images":
+			kind = "image"
+		case "video", "reference_videos":
+			kind = "video"
+		case "reference_audios":
+			kind = "audio"
+		}
+		ref, _ := file["ref"].(string)
+		if kind != "" && ref != "" && inventory[kind+":upload:"+ref] == 0 {
+			inventory[kind+":upload:"+ref]++
+		}
+	}
+	return inventory
 }
 
 func NormalizeVideoResolution(value string) string {

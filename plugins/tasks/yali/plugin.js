@@ -35,7 +35,7 @@ export const meta = {
   key: "yali",
   name: "Yali Video",
   icon: "text:YL",
-  version: "1.0.4",
+  version: "1.0.5",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.yaliai.com",
   website: "https://api.yaliai.com/video-api.md",
@@ -170,7 +170,7 @@ function normalizeRequest(request, model) {
 }
 
 export function buildSubmitRequest(ctx) {
-  const normalized = normalizeRequest(ctx.requestBody, ctx.model);
+  const normalized = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   let model = ctx.upstreamModel || ctx.model;
   if (model === PUBLIC_MODEL) model = UPSTREAM_MODEL;
   if (model !== UPSTREAM_MODEL) throw new Error("Unsupported Yali upstream model");
@@ -195,7 +195,7 @@ export function parseSubmitResponse(_ctx, response) {
 
 export function extractUsage(ctx) {
   if (ctx.usagePurpose === "billing_ratios") return null;
-  const normalized = normalizeRequest(ctx.requestBody, ctx.model);
+  const normalized = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   return { requests: 1, resolution: normalized.body.resolution };
 }
 
@@ -229,7 +229,7 @@ export const protocols = {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("Yali video requires JSON with public media URLs");
       if (ctx.operation && ctx.operation !== "create") throw new Error("Yali video supports generation only");
-      const normalized = normalizeRequest(ctx.body.value, ctx.model);
+      const normalized = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model);
       return { kind: "submit", model: ctx.model, action: normalized.action, requestBody: normalized.body };
     },
     render(_ctx, task) {

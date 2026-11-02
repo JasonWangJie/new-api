@@ -2896,7 +2896,7 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 	}{
 		{name: "same", action: mediaretry.SameChannel}, {name: "other", action: mediaretry.OtherChannel}, {name: "local same", action: mediaretry.LocalSameChannel}, {name: "local other", action: mediaretry.LocalOtherChannel},
 		{name: "local failure advances step without generating", action: mediaretry.LocalSameChannel, localFailure: true},
-		{name: "custom unknown cannot resend", action: mediaretry.OtherChannel, unknown: true},
+		{name: "custom unknown follows configured channel retry", action: mediaretry.OtherChannel, unknown: true},
 		{name: "captured legacy unknown replays once", action: mediaretry.SameChannel, unknown: true, legacy: true},
 		{name: "revoked automatic group blocks replacement", action: mediaretry.OtherChannel, revokeAuto: true},
 	} {
@@ -2978,17 +2978,6 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 				assert.Equal(t, 1000, user.Quota, "explicit refusal refunds the single reservation")
 				return
 			}
-			if tc.unknown && !tc.legacy {
-				require.Error(t, err)
-				assert.EqualValues(t, 1, calls.Load())
-				require.NoError(t, db.Take(user, user.Id).Error)
-				assert.Equal(t, 1000, user.Quota)
-				var event model.MediaRetryEvent
-				require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&event).Error)
-				assert.False(t, event.Executed)
-				assert.Equal(t, mediaretry.ManualReview, event.Action)
-				return
-			}
 			require.NoError(t, err)
 			assert.EqualValues(t, 2, calls.Load())
 			expectedChannel := channels[0]
@@ -3000,6 +2989,12 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 			require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
 			assert.Equal(t, expectedChannel.Id, task.ChannelId)
 			assert.Equal(t, channels[0].Id, task.BillingChannelID())
+			if tc.unknown && !tc.legacy {
+				require.Len(t, task.PrivateData.VideoAttempts, 1)
+				assert.Equal(t, model.TaskStatusUnknown, task.PrivateData.VideoAttempts[0].Status)
+				assert.Equal(t, channels[0].Id, task.PrivateData.VideoAttempts[0].ChannelID)
+				assert.Contains(t, task.PrivateData.VideoAttempts[0].Reason, "unknown")
+			}
 			require.NotNil(t, task.PrivateData.MediaRetryState)
 			assert.Equal(t, 1, task.PrivateData.MediaRetryState.TotalUsed)
 			if !tc.legacy {
@@ -3027,6 +3022,13 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 				require.Len(t, events, 1)
 			}
 			assert.True(t, events[0].Executed)
+			if tc.unknown && !tc.legacy {
+				assert.Equal(t, action, events[0].Action)
+				var originalFact mediaretry.Fact
+				require.NoError(t, common.UnmarshalJsonStr(events[0].FactJSON, &originalFact))
+				assert.True(t, originalFact.Unknown)
+				assert.False(t, originalFact.Terminal, "custom replay must not fabricate a confirmed rejection")
+			}
 			var savedJob model.AsyncMediaJob
 			require.NoError(t, db.Take(&savedJob, job.ID).Error)
 			plain, err := service.DecryptImagePayload(savedJob.RequestCipher, "media-request:"+job.TaskId)

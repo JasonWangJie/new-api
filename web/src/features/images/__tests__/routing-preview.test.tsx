@@ -150,12 +150,20 @@ test('switching from background to synchronous preview clears stale routes and e
     binding_found: false,
     routing_groups: ['default'],
     eligible: [],
-    excluded: [{
-      channel_id: 43, group: 'default', name: 'Background only',
-      upstream_model: 'image-model', priority: 0, weight: 1,
-      available_accounts: 1, reasons: ['synchronous_protocol_not_supported'],
-    }],
-    reasons: [], warnings: [],
+    excluded: [
+      {
+        channel_id: 43,
+        group: 'default',
+        name: 'Background only',
+        upstream_model: 'image-model',
+        priority: 0,
+        weight: 1,
+        available_accounts: 1,
+        reasons: ['synchronous_protocol_not_supported'],
+      },
+    ],
+    reasons: [],
+    warnings: [],
   })
   const user = userEvent.setup()
   renderPreview()
@@ -163,11 +171,25 @@ test('switching from background to synchronous preview clears stale routes and e
   await user.click(screen.getByRole('button', { name: 'Preview routing' }))
   expect(await screen.findByRole('table')).toBeVisible()
   await user.click(screen.getByRole('combobox', { name: 'Execution mode' }))
-  await user.click(screen.getByRole('option', { name: 'Synchronous image API' }))
+  await user.click(
+    screen.getByRole('option', { name: 'Synchronous image API' })
+  )
   expect(screen.queryByRole('table')).not.toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'Preview routing' }))
-  expect(await screen.findByRole('cell', { name: 'Channel supports background tasks only or does not accept this synchronous API' })).toBeVisible()
-  expect(imageRequest).toHaveBeenLastCalledWith('/api/option/images/routing/preview', 'POST', expect.objectContaining({ execution_mode: 'sync', model: 'image-model', resolution: '1K' }))
+  expect(
+    await screen.findByRole('cell', {
+      name: 'Channel supports background tasks only or does not accept this synchronous API',
+    })
+  ).toBeVisible()
+  expect(imageRequest).toHaveBeenLastCalledWith(
+    '/api/option/images/routing/preview',
+    'POST',
+    expect.objectContaining({
+      execution_mode: 'sync',
+      model: 'image-model',
+      resolution: '1K',
+    })
+  )
 })
 
 test('mixed preview explains missing bindings and incompatible image parameters in readable language', async () => {
@@ -232,7 +254,7 @@ test('failed route preview exposes retry and does not retain previous candidates
   expect(await screen.findByRole('table')).toBeVisible()
 })
 
-test('mixed preview limits media to images and displays the actual provider and protocol', async () => {
+test('mixed preview accepts video and displays the actual provider and protocol', async () => {
   vi.mocked(imageRequest).mockResolvedValue({
     binding_found: true,
     binding_key: 'mixed-pool',
@@ -262,10 +284,10 @@ test('mixed preview limits media to images and displays the actual provider and 
   await user.click(screen.getByRole('option', { name: 'Video' }))
   await user.click(screen.getByRole('combobox', { name: 'Platform' }))
   await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
-  expect(screen.getByRole('combobox', { name: 'Media type' })).toBeDisabled()
+  expect(screen.getByRole('combobox', { name: 'Media type' })).toBeEnabled()
   expect(
     screen.getByRole('combobox', { name: 'Media type' })
-  ).toHaveTextContent('Image')
+  ).toHaveTextContent('Video')
   await user.type(
     screen.getByRole('textbox', { name: 'Model' }),
     'seedream-5-pro'
@@ -278,9 +300,8 @@ test('mixed preview limits media to images and displays the actual provider and 
     'POST',
     expect.objectContaining({
       platform: 'mixed',
-      media_type: 'image',
-      resolution: '1K',
-      operation: 'text_to_image',
+      media_type: 'video',
+      operation: 'text_to_video',
     })
   )
 })

@@ -3,7 +3,9 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,12 +15,21 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -61,9 +72,12 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				connection.SetMaxOpenConns(1)
 			}
 			previousDB, previousType := model.DB, common.MainDatabaseType()
+			previousLogDB, previousLogType, previousRedis := model.LOG_DB, common.LogDatabaseType(), common.RedisEnabled
 			previousCapability := service.ImageChannelCapabilityFunc
 			model.DB = db
+			model.LOG_DB, common.RedisEnabled = db, false
 			common.SetMainDatabaseType(common.DatabaseType(engine))
+			common.SetLogDatabaseType(common.DatabaseType(engine))
 			service.ImageChannelCapabilityFunc = func(channel model.Channel, _ string) dto.ImageCapability {
 				provider := ""
 				switch channel.Type {
@@ -78,10 +92,12 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				}
 				return dto.ImageCapability{Provider: provider, Protocol: "openai_images", Generate: provider != "", Edit: provider != "", ReferenceField: "image"}
 			}
-			entities := []any{&model.ImageChannelPool{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.Ability{}, &model.Channel{}, &model.Token{}, &model.User{}, &model.Option{}}
+			entities := []any{&model.ImageChannelPool{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.Ability{}, &model.Channel{}, &model.Token{}, &model.User{}, &model.Option{}, &model.AuditLog{}}
 			t.Cleanup(func() {
 				model.DB, service.ImageChannelCapabilityFunc = previousDB, previousCapability
 				common.SetMainDatabaseType(previousType)
+				model.LOG_DB, common.RedisEnabled = previousLogDB, previousRedis
+				common.SetLogDatabaseType(previousLogType)
 				assert.NoError(t, db.Migrator().DropTable(entities...))
 				assert.NoError(t, connection.Close())
 			})
@@ -111,13 +127,15 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 			token := model.Token{Id: 702, UserId: 701, Key: "mixed-database-fixture-token", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 			require.NoError(t, db.Create(&token).Error)
 			router := gin.New()
-			router.Use(func(c *gin.Context) { c.Set("id", 701) })
+			router.Use(func(c *gin.Context) { c.Set("id", 701); c.Set("role", common.RoleRootUser) })
 			router.PUT("/policy", SaveImagePolicy)
+			router.DELETE("/policy", DeleteImagePolicy)
 			router.PUT("/pool", SaveImageChannelPool)
 			router.GET("/options", GetImageChannelPoolOptions)
 			router.POST("/preview", PreviewMediaRouting)
 			router.GET("/capabilities/:token_id", GetImageWorkbenchCapabilities)
 			router.PUT("/token/:id", UpdateTokenImageMappings)
+			router.PUT("/option", UpdateOption)
 			call := func(method, path string, input any) *httptest.ResponseRecorder {
 				body, marshalErr := common.Marshal(input)
 				require.NoError(t, marshalErr)
@@ -209,13 +227,14 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				assert.Contains(t, excluded, 54)
 				assert.NotContains(t, recorder.Body.String(), "fixture-openai-key")
 			})
-			t.Run("video task protocols cannot be saved in mixed pools", func(t *testing.T) {
+			t.Run("image bindings reject video-only members and video preview reports exclusion", func(t *testing.T) {
 				for _, channelID := range []int{54} {
 					recorder := call(http.MethodPut, "/pool", gin.H{"group": "default", "platform": "mixed", "mode": "model_resolution", "model": publicModel, "resolution": "2K", "channels": []gin.H{{"id": channelID, "priority": 1}}})
 					assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
 				}
 				recorder := call(http.MethodPost, "/preview", gin.H{"group": "default", "platform": "mixed", "media_type": "video", "model": publicModel, "resolution": "480p"})
-				assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+				assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Body.String(), "model_not_in_policy")
 			})
 
 			t.Run("duplicate supplier is rejected without exposing credentials", func(t *testing.T) {
@@ -419,6 +438,396 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 				var channel model.Channel
 				require.NoError(t, db.Where("id = ?", 29).Take(&channel).Error)
 				assert.Equal(t, 60, channel.Type)
+			})
+			t.Run("mixed video aliases preserve image pools and expose provider variants", func(t *testing.T) {
+				for i, key := range []string{"mixed-video-first", "mixed-video-second"} {
+					upstreamModel := fmt.Sprintf("vendor-video-%d", i)
+					source := fmt.Sprintf(`
+export const meta = {apiVersion:1,key:%q,name:"Mixed fixture",version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:[%q],modes:[{name:"text_to_video",duration:{min:1,max:10,step:1,default:5},resolutions:["720p"],defaultResolution:"720p"}]}]};
+export function buildSubmitRequest(){return {};}
+export function parseSubmitResponse(){return {};}
+export function buildQueryRequest(){return {};}
+export function parseTaskResult(){return {};}
+export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};
+export function listArtifacts(){return [];}
+export function buildContentRequest(){return {};}
+`, key, upstreamModel, upstreamModel)
+					_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+					require.NoError(t, err)
+					t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+					mapping, err := common.Marshal(map[string]string{publicModel: upstreamModel})
+					require.NoError(t, err)
+					baseURL := fmt.Sprintf("https://mixed-video-%d.example", i)
+					channel := model.Channel{Id: 101 + i, Type: 61, Name: key, Key: "fixture-video-key", BaseURL: &baseURL, Status: common.ChannelStatusEnabled, Models: publicModel, Group: "default", ModelMapping: common.GetPointer(string(mapping))}
+					channel.SetSetting(dto.ChannelSettings{TaskPluginKey: key})
+					require.NoError(t, db.Create(&channel).Error)
+					require.NoError(t, db.Create(&model.Ability{Group: "default", Model: publicModel, ChannelId: channel.Id, Enabled: true}).Error)
+				}
+				var policy model.ImageGroupPolicy
+				require.NoError(t, db.Where("policy_key = ?", service.ImageIdentityHash("default", "mixed")).Take(&policy).Error)
+				var catalog []service.ImageModelCapability
+				require.NoError(t, common.UnmarshalJsonStr(policy.Models, &catalog))
+				catalog = append(catalog, service.ImageModelCapability{Id: publicModel, Label: "Mixed video", MediaType: "video"})
+				encoded, err := common.Marshal(catalog)
+				require.NoError(t, err)
+				policy.Models, policy.Enabled, policy.AsyncEnabled = string(encoded), true, true
+				recorder := call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				recorder = call(http.MethodGet, "/options?group=default&platform=mixed&media_type=video", nil)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var options struct {
+					Data service.ImagePoolSelectionOptions
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &options))
+				require.Len(t, options.Data.Models, 1)
+				assert.Equal(t, []int{101, 102}, options.Data.Models[0].ChannelIds)
+				imageKey := service.ImagePoolBindingKey(policy, publicModel, "1K")
+				videoKey := service.MediaPoolBindingKey(policy, publicModel, "1K", "video")
+				require.NotEqual(t, imageKey, videoKey)
+				var before []model.ImageChannelPool
+				require.NoError(t, db.Where("binding_key = ?", imageKey).Order("id").Find(&before).Error)
+				recorder = call(http.MethodPut, "/pool", gin.H{"group": "default", "platform": "mixed", "media_type": "video", "mode": policy.PoolMode, "model": publicModel, "resolution": "1K", "channels": []gin.H{{"id": 101, "weight": 1}, {"id": 102, "weight": 1}}})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Body.String(), `"media_type":"video"`)
+				var after []model.ImageChannelPool
+				require.NoError(t, db.Where("binding_key = ?", imageKey).Order("id").Find(&after).Error)
+				assert.Equal(t, before, after)
+				recorder = call(http.MethodPost, "/preview", gin.H{"group": "default", "platform": "mixed", "media_type": "video", "model": publicModel, "resolution": "720p", "seconds": 5})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var preview struct{ Data service.MediaRoutingPreview }
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &preview))
+				require.Len(t, preview.Data.Eligible, 2)
+				assert.Equal(t, "vendor-video-0", preview.Data.Eligible[0].UpstreamModel)
+				assert.Equal(t, "mixed-video-second", preview.Data.Eligible[1].Provider)
+				assert.NotContains(t, recorder.Body.String(), "fixture-video-key")
+				profiles, err := service.MixedVideoModelProfiles(t.Context(), policy, publicModel, service.VideoModelOverrides{}, true)
+				require.NoError(t, err)
+				require.NotEmpty(t, profiles)
+				// Repeated migration leaves both namespaces and legacy data intact.
+				require.NoError(t, db.AutoMigrate(entities...))
+				require.NoError(t, db.AutoMigrate(entities...))
+				var count int64
+				require.NoError(t, db.Model(&model.ImageChannelPool{}).Where("binding_key = ?", videoKey).Count(&count).Error)
+				assert.EqualValues(t, 2, count)
+			})
+			t.Run("mixed video defaults and prices match enabled capabilities", func(t *testing.T) {
+				const source = `
+export const meta={apiVersion:1,key:"mixed-facts",name:"Mixed facts",version:"1.0.0",author:{name:"Test"},models:["vendor-default","vendor-edit"],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:["vendor-default"],modes:[{name:"text_to_video",duration:{min:8,max:8,step:1,default:8},resolutions:["1080p"],defaultResolution:"1080p"}]},{models:["vendor-edit"],modes:[{name:"edit_video",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]}]}]};
+export function buildSubmitRequest(){return {};}
+export function parseSubmitResponse(){return {};}
+export function buildQueryRequest(){return {};}
+export function parseTaskResult(){return {};}
+export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};
+export function listArtifacts(){return [];}
+export function buildContentRequest(){return {};}
+`
+				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("mixed-facts") })
+				settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+				previousPrices, previousOptions := settings.MixedVideoBillingExpr, common.OptionMap
+				settings.MixedVideoBillingExpr, common.OptionMap = make(map[string]string), make(map[string]string)
+				t.Cleanup(func() { settings.MixedVideoBillingExpr, common.OptionMap = previousPrices, previousOptions })
+				for i, name := range []string{"default", "edit"} {
+					publicName, upstreamName := "public-"+name, "vendor-"+name
+					mapping, err := common.Marshal(map[string]string{publicName: upstreamName})
+					require.NoError(t, err)
+					channel := model.Channel{Id: 201 + i, Type: 61, Name: name, Key: "fixture-facts-key", Status: common.ChannelStatusEnabled, Models: publicName, Group: "mixed-facts", ModelMapping: common.GetPointer(string(mapping))}
+					channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "mixed-facts"})
+					require.NoError(t, db.Create(&channel).Error)
+					require.NoError(t, db.Create(&model.Ability{Group: "mixed-facts", Model: publicName, ChannelId: channel.Id, Enabled: true}).Error)
+				}
+				policy := model.ImageGroupPolicy{Group: "mixed-facts", Platform: "mixed", PoolMode: "model_resolution"}
+				catalog := []service.ImageModelCapability{{Id: "public-default", MediaType: "video"}, {Id: "public-edit", MediaType: "video"}}
+				encoded, err := common.Marshal(catalog)
+				require.NoError(t, err)
+				policy.Models, policy.Enabled, policy.AsyncEnabled = string(encoded), true, true
+				recorder := call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("policy_key = ?", service.ImageIdentityHash(policy.Group, policy.Platform)).Take(&policy).Error)
+				key := service.MediaPoolBindingKey(policy, "public-default", "2K", "video")
+				require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: key, Group: policy.Group, Platform: "mixed", Mode: policy.PoolMode, Model: "public-default", Resolution: "2K", ChannelId: 201, Priority: 1}).Error)
+				recorder = call(http.MethodPost, "/preview", gin.H{"group": policy.Group, "platform": "mixed", "media_type": "video", "model": "public-default"})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var preview struct{ Data service.MediaRoutingPreview }
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &preview))
+				require.Len(t, preview.Data.Eligible, 1, recorder.Body.String())
+				assert.Equal(t, key, preview.Data.BindingKey)
+				assert.Equal(t, "1080p", preview.Data.Resolution)
+				require.NotNil(t, preview.Data.Seconds)
+				assert.Equal(t, 8, *preview.Data.Seconds)
+				profiles, err := service.MixedVideoModelProfiles(t.Context(), policy, "public-default", service.VideoModelOverrides{}, true)
+				require.NoError(t, err)
+				_, _, admitted, err := service.NormalizeMixedVideoDefaults([]byte(`{"model":"public-default","prompt":"test"}`), "application/json", "create", profiles)
+				require.NoError(t, err)
+				assert.Equal(t, admitted["resolution"], preview.Data.Resolution)
+				assert.Equal(t, admitted["seconds"], float64(*preview.Data.Seconds))
+				// A missing pool in an earlier auto group must not exclude a later valid group.
+				previousUsable, previousRatios := setting.UserUsableGroups2JSONString(), ratio_setting.GroupRatio2JSONString()
+				t.Cleanup(func() {
+					require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+					require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+				})
+				require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","mixed-facts":"Mixed"}`))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"mixed-facts":1}`))
+				autoPolicy := model.ImageGroupPolicy{Group: "auto", Platform: "mixed", PolicyKey: service.ImageIdentityHash("auto", "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: policy.PoolMode, Models: `[{"id":"public-default","media_type":"video"}]`, Version: 1}
+				require.NoError(t, db.Create(&autoPolicy).Error)
+				autoToken := model.Token{Id: 703, UserId: 701, Group: "auto", Key: "mixed-auto-fixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true, AutoGroups: `["default","mixed-facts"]`}
+				require.NoError(t, db.Create(&autoToken).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "public-default", ChannelId: 201, Enabled: true}).Error)
+				recorder = call(http.MethodPost, "/preview", gin.H{"token_id": 703, "platform": "mixed", "media_type": "video", "model": "public-default"})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &preview))
+				require.Len(t, preview.Data.Eligible, 1, recorder.Body.String())
+				assert.Equal(t, "mixed-facts", preview.Data.Eligible[0].Group)
+				assert.NotContains(t, preview.Data.Reasons, "mixed_pool_missing")
+				// An incompatible price must leave persisted and active prices untouched.
+				prices, err := common.Marshal(map[string]string{"public-edit": `tier("time", u("seconds") * 0.1)`})
+				require.NoError(t, err)
+				recorder = call(http.MethodPut, "/option", gin.H{"key": billing_setting.MixedVideoBillingExprOption, "value": string(prices)})
+				assert.Contains(t, recorder.Body.String(), `"success":false`)
+				assert.Contains(t, recorder.Body.String(), "seconds")
+				assert.Empty(t, settings.MixedVideoBillingExpr)
+				var priceRows int64
+				require.NoError(t, db.Model(&model.Option{}).Where(map[string]any{"key": billing_setting.MixedVideoBillingExprOption}).Count(&priceRows).Error)
+				assert.Zero(t, priceRows)
+				policy.Enabled = false
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("policy_key = ?", policy.PolicyKey).Take(&policy).Error)
+				recorder = call(http.MethodPut, "/option", gin.H{"key": billing_setting.MixedVideoBillingExprOption, "value": string(prices)})
+				assert.Contains(t, recorder.Body.String(), `"success":true`)
+				policy.Enabled = true
+				recorder = call(http.MethodPut, "/policy", policy)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), "seconds")
+				var unchanged model.ImageGroupPolicy
+				require.NoError(t, db.Where("policy_key = ?", policy.PolicyKey).Take(&unchanged).Error)
+				assert.False(t, unchanged.Enabled)
+				assert.Equal(t, policy.Version, unchanged.Version)
+				prices, err = common.Marshal(map[string]string{"public-edit": `tier("edit", u("requests") * 0.1)`, "public-default": `tier("time", u("seconds") * 0.1)`})
+				require.NoError(t, err)
+				recorder = call(http.MethodPut, "/option", gin.H{"key": billing_setting.MixedVideoBillingExprOption, "value": string(prices)})
+				require.Contains(t, recorder.Body.String(), `"success":true`)
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			})
+			t.Run("inactive mixed drafts and current pooled pricing", func(t *testing.T) {
+				const group, publicModel = "mixed-lifecycle", "lifecycle-video"
+				const catalog = `[{"id":"lifecycle-video","media_type":"video"}]`
+				policy := model.ImageGroupPolicy{Group: group, Platform: "mixed", PolicyKey: service.ImageIdentityHash(group, "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: catalog, Version: 1}
+				require.NoError(t, db.Create(&policy).Error)
+				stale := policy
+				policy.Enabled = false
+				recorder := call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("policy_key = ?", policy.PolicyKey).Take(&policy).Error)
+				assert.False(t, policy.Enabled, "a policy can be disabled after its last compatible channel disappears")
+				stale.Enabled = false
+				assert.Equal(t, http.StatusConflict, call(http.MethodPut, "/policy", stale).Code)
+				policy.Enabled, policy.AsyncEnabled = true, false
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("id = ?", policy.Id).Take(&policy).Error)
+				assert.False(t, policy.AsyncEnabled, "asynchronous video can also be disabled without a live channel")
+				for _, override := range []string{
+					`{"modes":["unknown"]}`, `{"modes":["text_to_video","text_to_video"]}`,
+					`{"duration":{"min":0}}`, fmt.Sprintf(`{"duration":{"max":%d}}`, relaycommon.MaxTaskDurationSeconds+1),
+					`{"duration":{"min":10,"max":5}}`, `{"duration":{"min":8,"max":8,"default":6}}`,
+					`{"duration":{"values":[8,8]}}`, `{"duration":{"values":[4],"default":8}}`,
+					`{"max_input_items":{"video":0}}`, `{"max_input_items":{"video":65}}`,
+					`{"resolutions":["720p","720p"]}`, `{"extension_directions":["unknown"]}`,
+					`{"resolutions":["1080p"],"default_resolution":"720p"}`,
+				} {
+					invalid := policy
+					invalid.Models = fmt.Sprintf(`[{"id":%q,"media_type":"video","video_overrides":%s}]`, publicModel, override)
+					assert.Equal(t, http.StatusBadRequest, call(http.MethodPut, "/policy", invalid).Code, override)
+				}
+				invalid := policy
+				invalid.Models = "["
+				assert.Equal(t, http.StatusBadRequest, call(http.MethodPut, "/policy", invalid).Code)
+				var unchanged model.ImageGroupPolicy
+				require.NoError(t, db.Where("id = ?", policy.Id).Take(&unchanged).Error)
+				assert.Equal(t, policy, unchanged)
+				policy.Models = `[{"id":"lifecycle-video","media_type":"video","video_overrides":{"modes":[],"resolutions":[],"aspect_ratios":[],"extension_directions":[],"duration":{"values":[]}}}]`
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("id = ?", policy.Id).Take(&policy).Error)
+				var draft []service.ImageModelCapability
+				require.NoError(t, common.UnmarshalJsonStr(policy.Models, &draft))
+				require.Len(t, draft, 1)
+				assert.NotNil(t, draft[0].VideoOverrides.Modes)
+				assert.NotNil(t, draft[0].VideoOverrides.Resolutions)
+				assert.NotNil(t, draft[0].VideoOverrides.AspectRatios)
+				assert.NotNil(t, draft[0].VideoOverrides.ExtensionDirections)
+				require.NotNil(t, draft[0].VideoOverrides.Duration)
+				assert.NotNil(t, draft[0].VideoOverrides.Duration.Values)
+
+				const source = `
+export const meta={apiVersion:1,key:"mixed-lifecycle",name:"Mixed lifecycle",version:"1.0.0",author:{name:"Test"},models:["vendor-timed","vendor-edit"],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:["vendor-timed"],modes:[{name:"text_to_video",duration:{values:[8],default:8},resolutions:["1080p"],defaultResolution:"1080p"}]},{models:["vendor-edit"],modes:[{name:"edit_video",inputs:[{name:"video",kind:"video",sources:["url"],maxItems:1,required:true}]}]}]};
+export function buildSubmitRequest(){return {};}
+export function parseSubmitResponse(){return {};}
+export function buildQueryRequest(){return {};}
+export function parseTaskResult(){return {};}
+export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:ctx.operation==="edit"?"edit_video":"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};
+export function listArtifacts(){return [];}
+export function buildContentRequest(){return {};}
+`
+				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("mixed-lifecycle") })
+				mapping := `{"lifecycle-video":"vendor-timed"}`
+				channel := model.Channel{Id: 301, Type: 61, Name: "Mixed lifecycle", Key: "fixture-lifecycle-key", Status: common.ChannelStatusEnabled, Models: publicModel, Group: group, ModelMapping: &mapping}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "mixed-lifecycle"})
+				require.NoError(t, db.Create(&channel).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: group, Model: publicModel, ChannelId: channel.Id, Enabled: true}).Error)
+				policy.Enabled, policy.AsyncEnabled = true, true
+				assert.Equal(t, http.StatusBadRequest, call(http.MethodPut, "/policy", policy).Code, "empty allowlists must not become unrestricted on save")
+				policy.Models = catalog
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("id = ?", policy.Id).Take(&policy).Error)
+				key := service.MediaPoolBindingKey(policy, publicModel, "", "video")
+				require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: key, Group: group, Platform: "mixed", Mode: "model", Model: publicModel, ChannelId: channel.Id, Priority: 1}).Error)
+
+				previousUsable, previousRatios := setting.UserUsableGroups2JSONString(), ratio_setting.GroupRatio2JSONString()
+				require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","mixed-lifecycle":"Lifecycle"}`))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"mixed-lifecycle":1}`))
+				t.Cleanup(func() {
+					require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousUsable))
+					require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+				})
+				capabilityToken := model.Token{Id: 740, UserId: 701, Group: group, Key: "mixed-lifecycle-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+				require.NoError(t, db.Create(&capabilityToken).Error)
+				redisServer := miniredis.RunT(t)
+				previousRDB, previousRedis, previousSecret, previousPlugins := common.RDB, common.RedisEnabled, common.CryptoSecret, constant.TaskPluginEnabled
+				common.RDB = redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+				common.RedisEnabled, common.CryptoSecret, constant.TaskPluginEnabled = true, "fixture-media-signing-key", true
+				t.Cleanup(func() {
+					assert.NoError(t, common.RDB.Close())
+					common.RDB, common.RedisEnabled, common.CryptoSecret, constant.TaskPluginEnabled = previousRDB, previousRedis, previousSecret, previousPlugins
+				})
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "lifecycle:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "lifecycle")
+				cfg := service.DefaultMediaRuntimeConfig()
+				cfg.VideoAsyncEnabled = true
+				require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+				readiness, err := service.GetVideoReadiness(t.Context())
+				require.NoError(t, err)
+				require.True(t, readiness.Ready, "%+v", readiness.Checks)
+				settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+				previousPrices, previousOptions := settings.MixedVideoBillingExpr, common.OptionMap
+				settings.MixedVideoBillingExpr, common.OptionMap = make(map[string]string), make(map[string]string)
+				t.Cleanup(func() { settings.MixedVideoBillingExpr, common.OptionMap = previousPrices, previousOptions })
+				setPrice := func(expression string) {
+					expressions := make(map[string]string)
+					if expression != "" {
+						expressions[publicModel] = expression
+					}
+					encoded, err := common.Marshal(expressions)
+					require.NoError(t, err)
+					recorder := call(http.MethodPut, "/option", gin.H{"key": billing_setting.MixedVideoBillingExprOption, "value": string(encoded)})
+					require.Contains(t, recorder.Body.String(), `"success":true`)
+				}
+				assertPricing := func(status string, available bool, reason string) {
+					recorder := call(http.MethodGet, "/capabilities/740", nil)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Models []struct {
+								Id              string `json:"id"`
+								RoutingPlatform string `json:"routing_platform"`
+								PricingStatus   string `json:"pricing_status"`
+								Available       bool   `json:"available"`
+								Reason          string `json:"availability_reason"`
+							} `json:"video_models"`
+						}
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					for _, entry := range response.Data.Models {
+						if entry.Id == publicModel && entry.RoutingPlatform == "mixed" {
+							assert.Equal(t, status, entry.PricingStatus)
+							assert.Equal(t, available, entry.Available)
+							assert.Equal(t, reason, entry.Reason)
+							return
+						}
+					}
+					t.Fatal("mixed lifecycle capability is missing")
+				}
+				setPrice(`tier("time", u("seconds") * 0.1)`)
+				assertPricing("configured", true, "")
+				require.NoError(t, db.Model(&channel).Update("model_mapping", `{"lifecycle-video":"vendor-edit"}`).Error)
+				assertPricing("invalid_configuration", false, "Pricing configuration is invalid")
+				setPrice(`tier("request", u("requests") * 0.1)`)
+				assertPricing("configured", true, "")
+				setPrice("")
+				assertPricing("needs_configuration", true, "")
+				setPrice(`tier("request", u("requests") * 0.1)`)
+				require.NoError(t, db.Where("binding_key = ?", key).Delete(&model.ImageChannelPool{}).Error)
+				assertPricing("invalid_configuration", false, "No executable mixed video channel is available")
+			})
+			t.Run("deleted policy drafts cannot recreate or replace a new policy", func(t *testing.T) {
+				previousRegistry := jsplugin.DefaultRegistry
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+				source, err := builtinplugins.Source("xai")
+				require.NoError(t, err)
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "xai"})
+				require.NoError(t, err)
+				const group, publicModel = "mixed-delete-cas", "delete-cas-video"
+				mapping := `{"delete-cas-video":"grok-imagine-video-1.5"}`
+				channel := model.Channel{Id: 401, Type: 61, Name: "Policy deletion CAS", Key: "fixture-delete-key", Status: common.ChannelStatusEnabled, Models: publicModel, Group: group, ModelMapping: &mapping}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "xai"})
+				require.NoError(t, db.Create(&channel).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: group, Model: publicModel, ChannelId: channel.Id, Enabled: true}).Error)
+				policy := model.ImageGroupPolicy{Group: group, Platform: "mixed", Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: `[{"id":"delete-cas-image","media_type":"image","max_output_images":1},{"id":"delete-cas-video","media_type":"video"}]`}
+				recorder := call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("policy_key = ?", service.ImageIdentityHash(group, "mixed")).Take(&policy).Error)
+				versionOne := policy
+				policy.Models = strings.Replace(policy.Models, "delete-cas-image", "delete-cas-image-v2", 1)
+				recorder = call(http.MethodPut, "/policy", policy)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("id = ?", policy.Id).Take(&policy).Error)
+				require.Equal(t, int64(2), policy.Version)
+				recorder = call(http.MethodDelete, "/policy", gin.H{"id": policy.Id, "group": group, "platform": "mixed", "version": policy.Version})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				recorder = call(http.MethodPut, "/policy", policy)
+				assert.Equal(t, http.StatusConflict, recorder.Code, "a deleted nonzero revision is an update, never a create")
+				var missing model.ImageGroupPolicy
+				require.ErrorIs(t, db.Where("policy_key = ?", policy.PolicyKey).Take(&missing).Error, gorm.ErrRecordNotFound)
+				legacyStale := versionOne
+				legacyStale.Id = 0
+				assert.Equal(t, http.StatusConflict, call(http.MethodPut, "/policy", legacyStale).Code)
+				invalidCreate := policy
+				invalidCreate.Version = 0
+				assert.Equal(t, http.StatusConflict, call(http.MethodPut, "/policy", invalidCreate).Code)
+
+				fresh := versionOne
+				fresh.Id, fresh.Version = 0, 0
+				fresh.Models = strings.Replace(fresh.Models, "delete-cas-image", "new-policy-image", 1)
+				recorder = call(http.MethodPut, "/policy", fresh)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("policy_key = ?", policy.PolicyKey).Take(&fresh).Error)
+				require.NotEqual(t, policy.Id, fresh.Id)
+				require.Equal(t, versionOne.Version, fresh.Version, "deletion and recreation can reuse the numeric revision")
+				assert.Equal(t, http.StatusConflict, call(http.MethodPut, "/policy", versionOne).Code, "the old row ID fences a stale same-version draft")
+				assert.Equal(t, http.StatusConflict, call(http.MethodDelete, "/policy", gin.H{"id": versionOne.Id, "group": group, "platform": "mixed", "version": versionOne.Version}).Code)
+				var unchanged model.ImageGroupPolicy
+				require.NoError(t, db.Where("id = ?", fresh.Id).Take(&unchanged).Error)
+				assert.Equal(t, fresh, unchanged)
+
+				// Older callers may omit the row ID for a matching-version update.
+				legacyUpdate := fresh
+				legacyUpdate.Id = 0
+				legacyUpdate.AsyncEnabled = false
+				recorder = call(http.MethodPut, "/policy", legacyUpdate)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				require.NoError(t, db.Where("id = ?", fresh.Id).Take(&fresh).Error)
+				assert.False(t, fresh.AsyncEnabled)
+				assert.Equal(t, int64(2), fresh.Version)
+				recorder = call(http.MethodDelete, "/policy", gin.H{"group": group, "platform": "mixed", "version": fresh.Version})
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 			})
 		})
 	}

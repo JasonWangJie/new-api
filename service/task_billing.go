@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -212,6 +213,12 @@ func appendTaskLogInfo(task *model.Task, other *model.LogOther) {
 	if task.PrivateData.Execution != nil {
 		AppendTaskPluginAuditInfo(other, task.PrivateData.Execution.TaskPlugin)
 	}
+	if attempt := task.PrivateData.CurrentAttempt; attempt != nil {
+		other.SetAdmin("current_video_attempt", map[string]any{
+			"plugin_key": attempt.PluginKey, "plugin_version": attempt.PluginVersion,
+			"upstream_model": attempt.UpstreamModel, "generation": attempt.Generation, "channel_id": attempt.ChannelID,
+		})
+	}
 	if task.PrivateData.UpstreamTaskID == "" && task.PrivateData.NodeName == "" {
 		return
 	}
@@ -263,6 +270,11 @@ func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 func settleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, actualQuota int, usageFacts map[string]any, clamp *common.QuotaClamp) (bool, error) {
 	if task == nil {
 		return false, fmt.Errorf("measured task is missing")
+	}
+	if billing := task.PrivateData.BillingContext; billing != nil && billing.TieredSnapshot != nil && billing.TieredSnapshot.MixedVideoBilling {
+		// A channel may expose actual-duration metering while its mixed public
+		// contract charges requested quantities. Never replace that contract.
+		return settleTaskBillingOnComplete(ctx, nil, task, fromStatus, &relaycommon.TaskInfo{UsageFacts: usageFacts})
 	}
 	if task.Status == model.TaskStatusSuccess {
 		billingContext := task.PrivateData.BillingContext
@@ -361,6 +373,9 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 	} else if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		evaluated, usage, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, result.UsageFacts)
 		if err != nil {
+			if bc.TieredSnapshot.MixedVideoBilling {
+				return false, err
+			}
 			// Preserve the established contract: invalid measured usage retains
 			// the frozen reservation rather than silently creating a free result.
 			logger.LogWarn(ctx, fmt.Sprintf("task %s completion billing unavailable; retaining reservation: %v", task.TaskID, err))
@@ -621,7 +636,16 @@ func EvaluateTaskCompletionUsage(snap *billingexpr.BillingSnapshot, facts map[st
 	}
 	usage := make(map[string]any, len(snap.UsageFacts)+len(facts))
 	maps.Copy(usage, snap.UsageFacts)
-	maps.Copy(usage, facts)
+	if snap.MixedVideoBilling {
+		if snap.MixedVideoSchemaVersion != billing_setting.MixedVideoBillingSchemaVersion {
+			return billingexpr.TieredResult{}, nil, fmt.Errorf("unsupported mixed video billing schema version")
+		}
+		if err := ValidateFrozenMixedVideoBilling(snap); err != nil {
+			return billingexpr.TieredResult{}, nil, err
+		}
+	} else {
+		maps.Copy(usage, facts)
+	}
 	result, err := billingexpr.ComputeTieredQuotaWithRequest(snap, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: usage, Frozen: snap.TaskRequest})
 	if err == nil && (result.ActualQuotaBeforeGroup < 0 || math.IsNaN(result.ActualQuotaBeforeGroup)) {
 		err = fmt.Errorf("task completion expression produced an invalid cost")

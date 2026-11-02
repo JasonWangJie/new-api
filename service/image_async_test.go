@@ -3778,8 +3778,11 @@ func TestAsyncImagePendingRuleReadsChangesBeforeDispatch(t *testing.T) {
 }
 
 func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
-	for _, expired := range []bool{false, true} {
-		t.Run("replacement_expired_"+strconv.FormatBool(expired), func(t *testing.T) {
+	for _, scenario := range []struct {
+		action  string
+		expired bool
+	}{{mediaretry.OtherChannel, false}, {mediaretry.OtherChannel, true}, {mediaretry.Stop, false}, {mediaretry.ManualReview, false}} {
+		t.Run(scenario.action+"/replacement_expired_"+strconv.FormatBool(scenario.expired), func(t *testing.T) {
 			db, task, _, cfg, alternate := asyncImageWorkerFixture(t)
 			asyncImageWorkerQuotaCacheFixture(t, task)
 			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
@@ -3791,7 +3794,7 @@ func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
 			policy, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
 			require.NoError(t, err)
 			require.NoError(t, failAsyncImageInvocation(t.Context(), task, &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "poll timeout", ExecutionUnknown: true}, cfg))
-			policy.Rules[0].Steps[0].Action = mediaretry.OtherChannel
+			policy.Rules[0].Steps[0].Action = scenario.action
 			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
 			require.NoError(t, err)
 			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()-1).Error)
@@ -3804,7 +3807,7 @@ func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
 				assert.Equal(t, alternate.Id, channel.Id)
 				require.NoError(t, before())
 				failure := &AsyncImageFailure{Code: 604, InternalCode: "upstream_failed", Message: "invalid dimensions", SubmissionRejected: true}
-				if expired {
+				if scenario.expired {
 					failure.InternalCode, failure.Message = "execution_deadline", "execution deadline reached"
 				}
 				return nil, model.AsyncImageBill{}, failure
@@ -3812,6 +3815,22 @@ func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			assert.Zero(t, calls, "replace the old receipt transactionally before dispatching the revised action")
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			if !mediaretry.IsResubmission(scenario.action) {
+				wantStatus := model.ImageTaskExecutionUnknown
+				if scenario.action == mediaretry.Stop {
+					wantStatus = model.ImageTaskFailed
+				}
+				assert.Equal(t, wantStatus, task.Status)
+				assert.Equal(t, "original-unconfirmed-job", task.UpstreamTaskId)
+				assert.Zero(t, task.RetryCount)
+				var checkpoint model.ImageRetryPolicyState
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &checkpoint))
+				assert.Equal(t, scenario.action, checkpoint.Decision.Action)
+				var bill model.AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				assert.Equal(t, "reserved", bill.Status)
+				return
+			}
 			assert.Equal(t, model.ImageTaskQueued, task.Status)
 			assert.Empty(t, task.UpstreamTaskId)
 			assert.Zero(t, task.DispatchedAt)
@@ -3823,7 +3842,7 @@ func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
 			assert.Equal(t, 1, calls)
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			wantStatus := model.ImageTaskFailed
-			if expired {
+			if scenario.expired {
 				wantStatus = model.ImageTaskExpired
 			}
 			assert.Equal(t, wantStatus, task.Status)

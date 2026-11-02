@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Loader2, Settings2, Sparkles } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { type FieldErrors, type Resolver, useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { z } from 'zod'
@@ -30,6 +30,10 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 
 import { imageLabel } from '../lib/image-labels'
+import {
+  videoCapabilityModes,
+  videoSelectionMatches,
+} from '../lib/video-capabilities'
 import type {
   VideoInputCapability,
   VideoModeCapability,
@@ -84,15 +88,11 @@ const PROTECTED_FIELDS = new Set([
   'source_task_id',
 ])
 
-function initialMode(model: VideoModel): VideoModeCapability {
-  return model.capability.modes[0]
-}
-
 function modeDefaults(mode: VideoModeCapability): VideoFormValues {
   return {
     mode: mode.name,
     prompt: '',
-    seconds: mode.duration ? String(mode.duration.default) : '',
+    seconds: mode.duration?.default ? String(mode.duration.default) : '',
     resolution: mode.defaultResolution || '',
     aspectRatio: mode.defaultAspectRatio || '',
     extensionDirection: mode.defaultExtensionDirection || '',
@@ -133,6 +133,7 @@ function inputAccept(kind: VideoInputCapability['kind']): string {
 
 function formSchema(
   model: VideoModel,
+  modes: VideoModeCapability[],
   invalid: string,
   protectedField: (field: string) => string
 ) {
@@ -156,9 +157,7 @@ function formSchema(
       additional: z.string(),
     })
     .superRefine((values, context) => {
-      const mode = model.capability.modes.find(
-        (candidate) => candidate.name === values.mode
-      )
+      const mode = modes.find((candidate) => candidate.name === values.mode)
       if (!mode) {
         context.addIssue({ code: 'custom', path: ['mode'], message: invalid })
         return
@@ -169,7 +168,10 @@ function formSchema(
       ) {
         context.addIssue({ code: 'custom', path: ['prompt'], message: invalid })
       }
-      if (mode.duration) {
+      if (
+        mode.duration &&
+        (model.routing_platform !== 'mixed' || values.seconds)
+      ) {
         const seconds = Number(values.seconds)
         const valuesList = mode.duration.values
         const minimum = mode.duration.min ?? 1
@@ -192,6 +194,7 @@ function formSchema(
       }
       if (
         mode.resolutions?.length &&
+        (model.routing_platform !== 'mixed' || values.resolution) &&
         !mode.resolutions.includes(values.resolution)
       ) {
         context.addIssue({
@@ -202,6 +205,7 @@ function formSchema(
       }
       if (
         mode.aspectRatios?.length &&
+        (model.routing_platform !== 'mixed' || values.aspectRatio) &&
         !mode.aspectRatios.includes(values.aspectRatio)
       ) {
         context.addIssue({
@@ -282,9 +286,14 @@ export function VideoCapabilityForm(props: {
   onSubmit: (submission: VideoFormSubmission) => void
 }) {
   const { t } = useTranslation()
-  const firstMode = initialMode(props.model)
-  const schema = formSchema(props.model, t('Invalid video request'), (field) =>
-    t('Additional parameters cannot override {{field}}.', { field })
+  const mixed = props.model.routing_platform === 'mixed'
+  const modes = useMemo(() => videoCapabilityModes(props.model), [props.model])
+  const firstMode = modes[0]
+  const schema = formSchema(
+    props.model,
+    modes,
+    t('Invalid video request'),
+    (field) => t('Additional parameters cannot override {{field}}.', { field })
   )
   const form = useForm<VideoFormValues>({
     resolver: zodResolver(schema) as Resolver<VideoFormValues>,
@@ -293,14 +302,23 @@ export function VideoCapabilityForm(props: {
   const [uploads, setUploads] = useState<Record<string, File[]>>({})
   const [localError, setLocalError] = useState('')
   const modeName = form.watch('mode')
-  const mode =
-    props.model.capability.modes.find((item) => item.name === modeName) ||
-    firstMode
+  const mode = modes.find((item) => item.name === modeName) || firstMode
   const inputValues = form.watch('inputs')
   const options = form.watch('options')
+  const selection = form.watch()
+  const variants = props.model.capability_variants?.length
+    ? props.model.capability_variants
+    : [props.model.capability]
+  const compatible =
+    !mixed ||
+    variants.some((profile) =>
+      profile.modes.some((candidate) =>
+        videoSelectionMatches(candidate, selection, uploads)
+      )
+    )
 
   const changeMode = (name: string) => {
-    const next = props.model.capability.modes.find((item) => item.name === name)
+    const next = modes.find((item) => item.name === name)
     if (!next) return
     form.reset(modeDefaults(next))
     setUploads({})
@@ -310,18 +328,29 @@ export function VideoCapabilityForm(props: {
 
   const submit = (values: VideoFormValues) => {
     try {
+      if (!compatible) {
+        throw new Error(
+          t(
+            'No mixed video channel supports this complete request. Change the selected settings or inputs.'
+          )
+        )
+      }
       const extra = JSON.parse(values.additional) as Record<string, unknown>
       const nativeContent = (extra as { metadata?: { content?: unknown } })
         .metadata?.content
       const body: Record<string, unknown> = {
         ...extra,
         model: props.model.id,
-        provider: props.model.provider,
+        ...(!mixed ? { provider: props.model.provider } : {}),
       }
       if (values.prompt.trim()) body.prompt = values.prompt.trim()
-      if (mode.duration) body.seconds = Number(values.seconds)
-      if (mode.resolutions?.length) body.resolution = values.resolution
-      if (mode.aspectRatios?.length) body.aspect_ratio = values.aspectRatio
+      if (mode.duration && values.seconds) body.seconds = Number(values.seconds)
+      if (mode.resolutions?.length && values.resolution) {
+        body.resolution = values.resolution
+      }
+      if (mode.aspectRatios?.length && values.aspectRatio) {
+        body.aspect_ratio = values.aspectRatio
+      }
       if (mode.name === 'extend_video') {
         body.extension_direction = values.extensionDirection
       }
@@ -365,18 +394,33 @@ export function VideoCapabilityForm(props: {
         }
         const parsedValues = lines.map(parseReferenceValue)
         if (parsedValues.length > 0) {
-          body[input.name] =
-            input.maxItems === 1 ? parsedValues[0] : parsedValues
+          // Mixed candidates may have different limits for the same field.
+          // Keep reference arrays fixed and singular fields independent of
+          // those aggregate limits, while preserving provider collection DTOs.
+          const arrayInput =
+            input.name.startsWith('reference_') ||
+            parsedValues.length > 1 ||
+            (!mixed && input.maxItems > 1)
+          body[input.name] = arrayInput ? parsedValues : parsedValues[0]
         }
         for (const file of inputFiles) files.push({ field: input.name, file })
       }
-      if (mode.options?.generateAudio) {
+      if (
+        mode.options?.generateAudio &&
+        (!mixed || 'generate_audio' in values.options)
+      ) {
         body.generate_audio = values.options.generate_audio === true
       }
-      if (mode.options?.watermark) {
+      if (
+        mode.options?.watermark &&
+        (!mixed || 'watermark' in values.options)
+      ) {
         body.watermark = values.options.watermark === true
       }
-      if (mode.options?.returnLastFrame) {
+      if (
+        mode.options?.returnLastFrame &&
+        (!mixed || 'return_last_frame' in values.options)
+      ) {
         body.return_last_frame = values.options.return_last_frame === true
       }
       setLocalError('')
@@ -406,7 +450,7 @@ export function VideoCapabilityForm(props: {
       <ImageSelect
         label={t('Generation mode')}
         value={mode.name}
-        options={props.model.capability.modes.map((item) => ({
+        options={modes.map((item) => ({
           value: item.name,
           label: t(imageLabel(item.name)),
         }))}
@@ -450,10 +494,13 @@ export function VideoCapabilityForm(props: {
             <ImageSelect
               label={t('Duration (seconds)')}
               value={form.watch('seconds')}
-              options={mode.duration.values.map((value) => ({
-                value: String(value),
-                label: String(value),
-              }))}
+              options={[
+                ...(mixed ? [{ value: '', label: t('Default') }] : []),
+                ...mode.duration.values.map((value) => ({
+                  value: String(value),
+                  label: String(value),
+                })),
+              ]}
               onChange={(value) => {
                 form.setValue('seconds', value, { shouldDirty: true })
                 props.onChanged()
@@ -479,10 +526,13 @@ export function VideoCapabilityForm(props: {
             <ImageSelect
               label={t('Resolution')}
               value={form.watch('resolution')}
-              options={mode.resolutions.map((value) => ({
-                value,
-                label: value,
-              }))}
+              options={[
+                ...(mixed ? [{ value: '', label: t('Default') }] : []),
+                ...mode.resolutions.map((value) => ({
+                  value,
+                  label: value,
+                })),
+              ]}
               onChange={(value) => {
                 form.setValue('resolution', value, { shouldDirty: true })
                 props.onChanged()
@@ -494,10 +544,13 @@ export function VideoCapabilityForm(props: {
             <ImageSelect
               label={t('Aspect ratio')}
               value={form.watch('aspectRatio')}
-              options={mode.aspectRatios.map((value) => ({
-                value,
-                label: value,
-              }))}
+              options={[
+                ...(mixed ? [{ value: '', label: t('Default') }] : []),
+                ...mode.aspectRatios.map((value) => ({
+                  value,
+                  label: value,
+                })),
+              ]}
               onChange={(value) => {
                 form.setValue('aspectRatio', value, { shouldDirty: true })
                 props.onChanged()
@@ -542,7 +595,8 @@ export function VideoCapabilityForm(props: {
                 (source) => source === 'url' || source === 'asset'
               )
             : input.sources
-        const multiple = input.maxItems > 1
+        const multiple =
+          input.name.startsWith('reference_') || input.maxItems > 1
         return (
           <div
             key={input.name}
@@ -604,6 +658,7 @@ export function VideoCapabilityForm(props: {
             </p>
             {supportsUpload ? (
               <Input
+                key={`${mode.name}:${input.name}`}
                 aria-label={t('Upload {{input}}', {
                   input: t(inputLabel(input.name)),
                 })}
@@ -654,28 +709,54 @@ export function VideoCapabilityForm(props: {
                 key={String(name)}
                 className='bg-muted/30 flex min-h-11 items-center gap-3 rounded-lg border px-3 py-2.5'
               >
-                <Checkbox
-                  id={`video-${name}`}
-                  checked={options[String(name)] === true}
-                  onCheckedChange={(checked) => {
-                    form.setValue(
-                      'options',
-                      {
-                        ...form.getValues('options'),
-                        [String(name)]: checked === true,
-                      },
-                      { shouldDirty: true }
-                    )
-                    props.onChanged()
-                  }}
-                  disabled={props.busy}
-                />
-                <Label
-                  htmlFor={`video-${name}`}
-                  className='flex-1 cursor-pointer text-xs leading-relaxed'
-                >
-                  {t(String(label))}
-                </Label>
+                {mixed ? (
+                  <ImageSelect
+                    label={t(String(label))}
+                    value={
+                      String(name) in options
+                        ? String(options[String(name)])
+                        : 'default'
+                    }
+                    options={[
+                      { value: 'default', label: t('Default') },
+                      { value: 'true', label: t('Yes') },
+                      { value: 'false', label: t('No') },
+                    ]}
+                    onChange={(value) => {
+                      const next = { ...form.getValues('options') }
+                      if (value === 'default') delete next[String(name)]
+                      else next[String(name)] = value === 'true'
+                      form.setValue('options', next, { shouldDirty: true })
+                      props.onChanged()
+                    }}
+                    disabled={props.busy}
+                  />
+                ) : (
+                  <Checkbox
+                    id={`video-${name}`}
+                    checked={options[String(name)] === true}
+                    onCheckedChange={(checked) => {
+                      form.setValue(
+                        'options',
+                        {
+                          ...form.getValues('options'),
+                          [String(name)]: checked === true,
+                        },
+                        { shouldDirty: true }
+                      )
+                      props.onChanged()
+                    }}
+                    disabled={props.busy}
+                  />
+                )}
+                {!mixed && (
+                  <Label
+                    htmlFor={`video-${name}`}
+                    className='flex-1 cursor-pointer text-xs leading-relaxed'
+                  >
+                    {t(String(label))}
+                  </Label>
+                )}
               </div>
             ) : null
           )}
@@ -702,7 +783,7 @@ export function VideoCapabilityForm(props: {
       <Button
         className='min-h-11 w-full rounded-xl shadow-sm'
         type='submit'
-        disabled={!props.model.available || props.busy}
+        disabled={!props.model.available || props.busy || !compatible}
       >
         {props.busy ? (
           <Loader2 className='size-4 animate-spin' aria-hidden='true' />
@@ -711,6 +792,13 @@ export function VideoCapabilityForm(props: {
         )}
         {t(props.busy ? 'Submitting...' : submitLabel)}
       </Button>
+      {mixed && !compatible && (
+        <p role='status' className='text-destructive text-xs'>
+          {t(
+            'No mixed video channel supports this complete request. Change the selected settings or inputs.'
+          )}
+        </p>
+      )}
       {(localError || props.error) && (
         <p
           role='alert'

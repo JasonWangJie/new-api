@@ -722,6 +722,10 @@ func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {
 	task.TaskID = "task_public"
 	task.PrivateData.UpstreamTaskID = "upstream-private"
 	task.PrivateData.NodeName = "node-a"
+	task.PrivateData.CurrentAttempt = &model.VideoTaskAttempt{
+		PluginKey: "current-video", PluginVersion: "2.0.0", UpstreamModel: "provider-video", Generation: 3, ChannelID: 99,
+		UpstreamTaskID: "private-replacement-id", PluginHash: "private-source-hash", Reason: "private-provider-diagnostic",
+	}
 	task.PrivateData.Execution = &model.TaskExecutionSnapshot{
 		TaskPlugin: &model.TaskPluginSnapshot{
 			Key:     "document-parser",
@@ -745,6 +749,9 @@ func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "document-parser", pluginInfo["key"])
 	assert.Equal(t, "1.2.3", pluginInfo["version"])
+	assert.Equal(t, map[string]any{
+		"plugin_key": "current-video", "plugin_version": "2.0.0", "upstream_model": "provider-video", "generation": int64(3), "channel_id": 99,
+	}, adminInfo["current_video_attempt"])
 	assert.Equal(t, map[string]any{
 		"name": "Community Author",
 		"url":  "https://plugins.example/author",
@@ -2432,4 +2439,176 @@ func TestTaskBillingSubscriptionPeriodRefund(t *testing.T) {
 			assert.Equal(t, actual, saved.Quota)
 		})
 	}
+}
+
+func TestMixedVideoPublicBillingContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression string
+		wantError        bool
+	}{
+		{name: "request price", expression: `tier("request", u("requests") * 0.5)`},
+		{name: "duration and conditions", expression: `u("resolution") == "1080p" && u("action") == "generate" ? tier("hd", u("seconds") * 0.2) : tier("base", u("requests") * 0.3)`},
+		{name: "provider tokens forbidden", expression: `tier("tokens", u("tokens"))`, wantError: true},
+		{name: "unreachable provider tokens forbidden", expression: `true ? tier("request", u("requests")) : tier("tokens", u("tokens"))`, wantError: true},
+		{name: "dynamic usage forbidden", expression: `tier("dynamic", u("sec" + "onds"))`, wantError: true},
+		{name: "request probes forbidden", expression: `tier("body", param("seconds"))`, wantError: true},
+		{name: "token variables forbidden", expression: `tier("tokens", p * 2)`, wantError: true},
+		{name: "negative price forbidden", expression: `tier("negative", -1)`, wantError: true},
+		{name: "all resolutions validated", expression: `u("resolution") == "1080p" ? tier("negative", -1) : tier("normal", 1)`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := billing_setting.ValidateMixedVideoBillingExpr(tc.expression)
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previous := settings.MixedVideoBillingExpr
+	t.Cleanup(func() { settings.MixedVideoBillingExpr = previous })
+	settings.MixedVideoBillingExpr = map[string]string{"public-video": `tier("seconds", u("seconds") * 0.25)`}
+	facts := map[string]any{"requests": float64(1), "seconds": float64(4), "resolution": "720p", "action": "generate"}
+	frozen, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	assert.True(t, frozen.Tiered.MixedVideoBilling)
+	assert.Equal(t, billing_setting.MixedVideoBillingSchemaVersion, frozen.Tiered.MixedVideoSchemaVersion)
+	assert.Equal(t, common.QuotaRound(common.QuotaPerUnit), frozen.Price.Quota)
+	facts["seconds"] = float64(99)
+	settings.MixedVideoBillingExpr["public-video"] = `tier("changed", u("requests") * 99)`
+	result, usage, err := EvaluateTaskCompletionUsage(frozen.Tiered, map[string]any{"seconds": float64(1), "tokens": float64(999999), "requests": float64(99)})
+	require.NoError(t, err)
+	assert.Equal(t, frozen.Price.Quota, result.ActualQuotaAfterGroup)
+	assert.Equal(t, float64(4), usage["seconds"])
+	assert.NotContains(t, usage, "tokens")
+
+	encoded, err := common.Marshal(frozen.Tiered)
+	require.NoError(t, err)
+	var restored billingexpr.BillingSnapshot
+	require.NoError(t, common.Unmarshal(encoded, &restored))
+	result, _, err = EvaluateTaskCompletionUsage(&restored, map[string]any{"seconds": float64(0)})
+	require.NoError(t, err)
+	assert.Equal(t, frozen.Price.Quota, result.ActualQuotaAfterGroup)
+	restored.MixedVideoSchemaVersion++
+	_, _, err = EvaluateTaskCompletionUsage(&restored, nil)
+	require.Error(t, err)
+
+	_, err = FreezeMixedVideoBilling("unpriced-video", facts, types.GroupRatioInfo{GroupRatio: 1})
+	require.ErrorContains(t, err, "no public billing expression")
+	settings.MixedVideoBillingExpr["public-video"] = `tier("request", u("requests") * 0.5)`
+	requestFacts := map[string]any{"requests": float64(1), "action": "edit"}
+	_, err = FreezeMixedVideoBilling("public-video", requestFacts, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	settings.MixedVideoBillingExpr["public-video"] = `tier("seconds", u("seconds"))`
+	_, err = FreezeMixedVideoBilling("public-video", requestFacts, types.GroupRatioInfo{GroupRatio: 1})
+	require.ErrorContains(t, err, "cannot be determined")
+	for _, seconds := range []float64{0, -1, 0.5, relaycommon.MaxTaskDurationSeconds + 1, math.Inf(1), math.NaN()} {
+		requestFacts["seconds"] = seconds
+		_, err = FreezeMixedVideoBilling("public-video", requestFacts, types.GroupRatioInfo{GroupRatio: 1})
+		require.Error(t, err)
+	}
+	settings.MixedVideoBillingExpr["public-video"] = `tier("oversized", u("requests") * 1e20)`
+	delete(requestFacts, "seconds")
+	saturated, err := FreezeMixedVideoBilling("public-video", requestFacts, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	assert.Equal(t, common.MaxQuota, saturated.Price.Quota)
+	assert.NotNil(t, saturated.Clamp)
+}
+
+func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		measured bool
+		failed   bool
+	}{
+		{name: "normal completion"},
+		{name: "measured channel completion", measured: true},
+		{name: "terminal failure", failed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupMeasuredTaskBillingDB(t)
+			const id, reserved = 981, 4000
+			seedUser(t, id, 6000)
+			seedToken(t, id, id, "sk-mixed-public-billing", 6000)
+			seedChannel(t, id)
+			seedChargedAccounting(t, id, id, id, reserved, 1)
+			task := makeTask(id, id, reserved, id, BillingSourceWallet, 0)
+			task.PrivateData.DurableBilling = true
+			task.PrivateData.SubmitAccountingRecorded = true
+			expression := `tier("seconds", u("seconds"))`
+			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
+				ModelName: "public-video", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+				GroupRatio: 1, QuotaPerUnit: 1000, ExprVersion: 1, TaskUsageBilling: true,
+				EstimatedQuotaAfterGroup: reserved,
+				MixedVideoBilling:        true, MixedVideoSchemaVersion: billing_setting.MixedVideoBillingSchemaVersion,
+				UsageFacts: map[string]any{"requests": float64(1), "seconds": float64(4), "action": "generate"},
+			}
+			require.NoError(t, model.DB.Create(task).Error)
+			stale := *task
+			task.Status = model.TaskStatusSuccess
+			if tc.failed {
+				task.Status = model.TaskStatusFailure
+			}
+			var won bool
+			var err error
+			if tc.measured {
+				won, err = SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 2000, map[string]any{"seconds": float64(2)}, nil)
+			} else {
+				won, err = SettleTaskBillingOnComplete(t.Context(), nil, task, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(2)}})
+			}
+			require.NoError(t, err)
+			require.True(t, won)
+			wantQuota, wantBalance := reserved, 6000
+			if tc.failed {
+				wantQuota, wantBalance = 0, 10000
+			}
+			assert.Equal(t, wantQuota, task.Quota)
+			assert.Equal(t, wantBalance, getUserQuota(t, id))
+			assert.Equal(t, wantBalance, getTokenRemainQuota(t, id))
+			assert.Equal(t, float64(4), task.PrivateData.BillingContext.TieredSnapshot.UsageFacts["seconds"])
+			stale.Status = task.Status
+			won, err = SettleTaskBillingOnComplete(t.Context(), nil, &stale, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(999)}})
+			require.NoError(t, err)
+			assert.False(t, won)
+			assert.Equal(t, wantBalance, getUserQuota(t, id))
+		})
+	}
+}
+
+func TestMixedVideoFreeReservationDoesNotChargeSubscription(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	const id = 980
+	seedUser(t, id, 0)
+	seedToken(t, id, id, "sk-mixed-free-billing", 0)
+	seedChannel(t, id)
+	seedSubscription(t, id, id, 10000, 0)
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previous := settings.MixedVideoBillingExpr
+	t.Cleanup(func() { settings.MixedVideoBillingExpr = previous })
+	settings.MixedVideoBillingExpr = map[string]string{"free-public-video": `tier("free", u("requests") * 0)`}
+	frozen, err := FreezeMixedVideoBilling("free-public-video", map[string]any{"requests": float64(1), "action": "extend"}, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	info := &relaycommon.RelayInfo{UserId: id, TokenId: id, TokenKey: "sk-mixed-free-billing", TieredBillingSnapshot: frozen.Tiered, PriceData: frozen.Price}
+	info.UserSetting.BillingPreference = "subscription_only"
+	require.Nil(t, PreConsumeDurableTaskBilling(c, 0, info))
+	assert.True(t, HasDurableTaskReservation(info, 0))
+	task := makeTask(id, id, 0, id, info.BillingSource, info.SubscriptionId)
+	task.PrivateData.BillingContext.TieredSnapshot = frozen.Tiered
+	SnapshotTaskReservation(task, info)
+	require.True(t, task.PrivateData.DurableBilling)
+	require.NoError(t, model.DB.Create(task).Error)
+	_, err = model.RecordMeasuredTaskSubmitAccounting(t.Context(), task)
+	require.NoError(t, err)
+	task.Status = model.TaskStatusSuccess
+	won, err := SettleTaskBillingOnComplete(t.Context(), nil, task, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(999)}})
+	require.NoError(t, err)
+	assert.True(t, won)
+	assert.Zero(t, getUserQuota(t, id))
+	assert.Zero(t, getTokenRemainQuota(t, id))
+	assert.Zero(t, getSubscriptionUsed(t, id))
+	assert.Zero(t, task.Quota)
 }

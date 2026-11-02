@@ -182,14 +182,16 @@ type ImageModelCapability struct {
 	VideoOverrides     VideoModelOverrides `json:"video_overrides,omitempty"`
 }
 
+// Nil allowlists inherit plugin choices; explicit empty lists disable them and
+// must survive saving an inactive policy draft.
 type VideoModelOverrides struct {
-	Modes                     []string                `json:"modes,omitempty"`
+	Modes                     []string                `json:"modes,omitzero"`
 	Duration                  *VideoDurationOverrides `json:"duration,omitempty"`
-	Resolutions               []string                `json:"resolutions,omitempty"`
+	Resolutions               []string                `json:"resolutions,omitzero"`
 	DefaultResolution         string                  `json:"default_resolution,omitempty"`
-	AspectRatios              []string                `json:"aspect_ratios,omitempty"`
+	AspectRatios              []string                `json:"aspect_ratios,omitzero"`
 	DefaultAspectRatio        string                  `json:"default_aspect_ratio,omitempty"`
-	ExtensionDirections       []string                `json:"extension_directions,omitempty"`
+	ExtensionDirections       []string                `json:"extension_directions,omitzero"`
 	DefaultExtensionDirection string                  `json:"default_extension_direction,omitempty"`
 	MaxInputItems             map[string]int          `json:"max_input_items,omitempty"`
 }
@@ -197,7 +199,7 @@ type VideoModelOverrides struct {
 type VideoDurationOverrides struct {
 	Min     *int  `json:"min,omitempty"`
 	Max     *int  `json:"max,omitempty"`
-	Values  []int `json:"values,omitempty"`
+	Values  []int `json:"values,omitzero"`
 	Default *int  `json:"default,omitempty"`
 }
 

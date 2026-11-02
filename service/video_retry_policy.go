@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
@@ -23,8 +24,20 @@ var ErrVideoCompatibleChannelsUnavailable = errors.New("no compatible video chan
 
 // VideoSubmissionRequiresReconciliation preserves reservations for providers
 // whose submission failures may leave a billable operation running upstream.
-func VideoSubmissionRequiresReconciliation(provider string) bool {
-	return provider == "nldw" || provider == "yuxibox"
+func VideoSubmissionRequiresReconciliation(provider string, mixed ...bool) bool {
+	return provider == "nldw" || provider == "yuxibox" || len(mixed) > 0 && mixed[0]
+}
+
+func VideoJobRequiresReconciliation(job model.AsyncMediaJob) bool {
+	if VideoSubmissionRequiresReconciliation(job.Provider) {
+		return true
+	}
+	if len(job.RequestCipher) == 0 {
+		return false
+	}
+	plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+	var request AsyncVideoRequest
+	return err == nil && common.Unmarshal(plain, &request) == nil && request.MixedRouting != nil
 }
 
 // PlanInitialVideoFailure is shared by live submission and sample previews.
@@ -76,7 +89,14 @@ func PreviewInitialVideoFailure(ctx context.Context, taskID string, fact mediare
 
 // ResolveVideoRetryPolicy applies the token's current group restrictions to the
 // frozen routing group. A worker must never inherit authority from admission.
-func ResolveVideoRetryPolicy(ctx context.Context, token model.Token, job model.AsyncMediaJob) (model.ImageGroupPolicy, []ImageModelCapability, error) {
+func ResolveVideoRetryPolicy(ctx context.Context, token model.Token, job model.AsyncMediaJob, routes ...*MixedVideoRouting) (model.ImageGroupPolicy, []ImageModelCapability, error) {
+	var route *MixedVideoRouting
+	if len(routes) > 0 {
+		route = routes[0]
+	}
+	if route != nil {
+		return MixedVideoPolicy(ctx, token, route)
+	}
 	var owner model.User
 	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", job.UserId, common.UserStatusEnabled).Take(&owner).Error; err != nil {
 		return model.ImageGroupPolicy{}, nil, err
@@ -131,11 +151,33 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 			return nil, errors.New("video client IP is no longer allowed")
 		}
 	}
-	policy, _, err := ResolveVideoRetryPolicy(ctx, token, job)
+	policy, catalog, err := ResolveVideoRetryPolicy(ctx, token, job, request.MixedRouting)
 	if err != nil {
 		return nil, err
 	}
 	policy.Group = job.Group
+	if request.MixedRouting != nil {
+		if request.RetryFact.Unknown || request.RetryFact.HasOutput || !request.RetryFact.Terminal && request.RetryFact.Accepted {
+			return nil, errors.New("unknown mixed video execution cannot be resubmitted")
+		}
+		channels, err := MixedVideoPoolChannels(ctx, policy, job.Model, request.MixedRouting.Resolution)
+		if err != nil {
+			return nil, err
+		}
+		capability, _ := MixedVideoPolicyCapability(catalog, job.Model)
+		other := decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel
+		channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
+			if other && channel.Id == request.RetryFact.ChannelID || !other && channel.Id != request.RetryFact.ChannelID || slices.Contains(decision.ExcludedChannelIDs, channel.Id) || len(decision.AllowedChannelIDs) > 0 && !slices.Contains(decision.AllowedChannelIDs, channel.Id) {
+				return true
+			}
+			if len(ImageChannelAccounts(channel, ImageAccountRouting{})) == 0 {
+				return true
+			}
+			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+			return err != nil || (decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel) && len(candidate.Binding.Plugin.Meta.VideoRetryInputs) == 0
+		})
+		return channels, nil
+	}
 	var abilities []model.Ability
 	if err := model.DB.WithContext(ctx).Where(map[string]any{"group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Find(&abilities).Error; err != nil {
 		return nil, err
@@ -268,6 +310,10 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		result.Reason = "initial_submission_session_not_replayable"
 		return result, nil
 	}
+	if task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) {
+		result.Reason = "upstream_result_unknown"
+		return result, nil
+	}
 	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		result.Reason = "historical_task_not_restarted"
 		return result, nil
@@ -285,7 +331,7 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		result.Reason = "current_upstream_terminal_state_unconfirmed"
 		return result, nil
 	}
-	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 || job.BillingStatus != "reserved" && !(configured && job.BillingStatus == "unknown") || task.Quota != job.Quota || task.AttemptGeneration != job.AttemptGeneration {
+	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || !task.VideoRecoveryQuotaValid() || job.BillingStatus != "reserved" && !(configured && job.BillingStatus == "unknown") || task.Quota != job.Quota || task.AttemptGeneration != job.AttemptGeneration {
 		result.Reason = "reservation_unavailable"
 		return result, nil
 	}
@@ -369,6 +415,10 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 // ApplyConfiguredVideoDecision executes only the currently matched unknown-result
 // action. The captured protocol evidence remains unchanged in the retry record.
 func ApplyConfiguredVideoDecision(ctx context.Context, task model.Task, job model.AsyncMediaJob, fact mediaretry.Fact, decision *mediaretry.Decision, state mediaretry.State) (bool, error) {
+	if task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) && mediaretry.IsResubmission(decision.Action) {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "mixed_video_unknown_not_replayable"
+		return false, nil
+	}
 	if !decision.Matched || decision.BlockedReason != "" || fact.HasOutput || !fact.Unknown && !(fact.Accepted && !fact.Terminal) || !mediaretry.IsResubmission(decision.Action) && decision.Action != mediaretry.Stop {
 		return false, nil
 	}
@@ -379,7 +429,7 @@ func ApplyConfiguredVideoDecision(ctx context.Context, task model.Task, job mode
 	if decision.Action == mediaretry.Stop {
 		return true, model.EndAsyncVideoPolicyExecution(ctx, task, job, fact, decision, state)
 	}
-	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 || task.Quota != job.Quota || job.BillingStatus != "reserved" && job.BillingStatus != "unknown" {
+	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || !task.VideoRecoveryQuotaValid() || task.Quota != job.Quota || job.BillingStatus != "reserved" && job.BillingStatus != "unknown" {
 		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "reservation_unavailable"
 		return false, nil
 	}
@@ -451,10 +501,35 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 	selected.PrivateData.BillingChannelID = task.BillingChannelID()
 	selected.PrivateData.MediaRetryDecision = request.PendingDecision
 	upstream := task.Properties.UpstreamModelName
+	if request.MixedRouting != nil {
+		var token model.Token
+		if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
+			return err
+		}
+		_, catalog, err := MixedVideoPolicy(ctx, token, request.MixedRouting)
+		if err != nil {
+			return err
+		}
+		capability, _ := MixedVideoPolicyCapability(catalog, job.Model)
+		decoded, err := DecodeMixedVideoCandidate(ctx, *candidate, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+		if err != nil {
+			return err
+		}
+		selected.Platform = constant.TaskPlatform(decoded.Binding.Plugin.Meta.Key)
+		selected.PrivateData.CurrentAttempt = MixedVideoAttempt(decoded, task.AttemptGeneration)
+		selected.Properties.UpstreamModelName = decoded.UpstreamModel
+		if action, ok := decoded.Intent["action"].(string); ok {
+			selected.Action = action
+		}
+		upstream = decoded.UpstreamModel
+		if err := RebindMixedVideoRequest(request, decoded, job.ExpiresAt); err != nil {
+			return err
+		}
+	}
 	if upstream == "" {
 		upstream = job.Model
 	}
-	selected.PrivateData.UpstreamAsync, _ = candidate.GetOtherSettings().UpstreamAsync.Match("video", upstream, UpstreamAsyncOperation(task.Action))
+	selected.PrivateData.UpstreamAsync, _ = candidate.GetOtherSettings().UpstreamAsync.Match("video", upstream, UpstreamAsyncOperation(selected.Action))
 	request.Channel = *candidate
 	encoded, err := common.Marshal(request)
 	if err != nil {
@@ -477,6 +552,7 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 	}
 	*task = selected
 	job.ChannelId, job.RequestCipher, job.ChannelCipher = candidate.Id, cipher, channelCipher
+	job.Provider = string(selected.Platform)
 	return nil
 }
 

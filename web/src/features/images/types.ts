@@ -68,6 +68,8 @@ export type VideoModel = {
   id: string
   label: string
   provider: string
+  routing_platform?: string
+  capability_variants?: VideoCapability[]
   available: boolean
   availability_reason?: string
   pricing_status?:
@@ -389,6 +391,7 @@ export type ImageChannelPool = {
   binding_key: string
   group: string
   platform: string
+  media_type?: 'image' | 'video'
   mode: string
   model: string
   resolution: string
@@ -409,12 +412,14 @@ export type VideoPluginTemplate = {
   video_profiles: VideoCapability[]
 }
 export type ImageAdminConfiguration = {
+  mixed_video_billing_expr?: Record<string, string>
   routing_platforms?: string[]
   image_providers?: string[]
   media_providers?: string[]
   runtime: Record<string, string | number | boolean>
   storage_profiles: ImageStorageProfile[]
   policies: {
+    id?: number
     group: string
     platform: string
     pool_mode: string

@@ -294,15 +294,34 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
+	mixedVideoBilling := c.GetBool("mixed_video_billing") || c.GetBool("async_media_mixed_video")
 	if value, ok := c.Get("async_media_billing"); ok {
 		frozen, valid := value.(service.MediaBillingSnapshot)
 		if !valid {
 			return nil, service.TaskErrorWrapperLocal(errors.New("invalid frozen media billing"), "model_price_error", http.StatusInternalServerError)
 		}
+		if mixedVideoBilling || frozen.Tiered != nil && frozen.Tiered.MixedVideoBilling {
+			if err := service.ValidateFrozenMixedVideoBilling(frozen.Tiered); err != nil || frozen.Tiered.ModelName != modelName || frozen.Price.Quota != frozen.Tiered.EstimatedQuotaAfterGroup {
+				return nil, service.TaskErrorWrapperLocal(errors.New("mixed video billing snapshot is invalid"), "model_price_error", http.StatusBadRequest)
+			}
+			mixedVideoBilling = true
+		}
 		info.PriceData, info.TieredBillingSnapshot, info.QuotaClamp = frozen.Price, frozen.Tiered, frozen.Clamp
 		for key, ratio := range frozen.Ratios {
 			info.PriceData.AddOtherRatio(key, ratio)
 		}
+	} else if mixedVideoBilling {
+		value, _ := c.Get("mixed_video_billing_facts")
+		facts, valid := value.(map[string]any)
+		if !valid {
+			return nil, service.TaskErrorWrapperLocal(errors.New("mixed video billing request facts are unavailable"), "model_price_error", http.StatusBadRequest)
+		}
+		frozen, err := service.FreezeMixedVideoBilling(modelName, facts, helper.HandleGroupRatio(c, info))
+		if err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "model_price_error", http.StatusBadRequest)
+		}
+		info.PriceData, info.TieredBillingSnapshot = frozen.Price, frozen.Tiered
+		noteTaskQuotaClamp(info, frozen.Clamp)
 	} else {
 		// A retry may select another plugin with legacy pricing. Only a frozen
 		// media job may carry the previous attempt's expression into this one.
@@ -420,7 +439,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.UpstreamModelName,
 		service.UpstreamAsyncOperation(info.Action),
 	)
-	measuredVideo := hasAsyncProfile && asyncProfile.Poll.Response.ActualSecondsPath != ""
+	measuredVideo := hasAsyncProfile && asyncProfile.Poll.Response.ActualSecondsPath != "" && !mixedVideoBilling
 	if measuredVideo {
 		pinnedValue, _ := c.Get(jsplugin.ContextKeyPinnedPlugin)
 		pinnedPlugin, _ := pinnedValue.(jsplugin.PinnedPlugin)
@@ -441,7 +460,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	referenceRetry := false
 	if value, exists := c.Get("async_media_reference_retry_task"); exists {
 		task, valid := value.(model.Task)
-		if !valid || !c.GetBool("async_media_execution") || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.AttemptGeneration < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || task.Quota <= 0 || task.Quota != info.PriceData.Quota || task.UserId != info.UserId || task.ChannelId != info.ChannelId || info.TaskRelayInfo == nil || task.TaskID != info.TaskRelayInfo.PublicTaskID {
+		validRecoveryCharge := task.Quota > 0 || task.Quota == 0 && mixedVideoBilling && task.VideoRecoveryQuotaValid()
+		if !valid || !c.GetBool("async_media_execution") || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.AttemptGeneration < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !validRecoveryCharge || task.Quota != info.PriceData.Quota || task.UserId != info.UserId || task.ChannelId != info.ChannelId || info.TaskRelayInfo == nil || task.TaskID != info.TaskRelayInfo.PublicTaskID {
 			return nil, service.TaskErrorWrapperLocal(errors.New("video recovery requires its original durable reservation"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
 		referenceRetry = true
@@ -468,7 +488,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			return nil, service.TaskErrorWrapperLocal(errors.New("measured video reservation does not cover estimated cost"), "task_billing_reservation_invalid", http.StatusConflict)
 		}
 	}
-	if info.Billing == nil && !info.PriceData.FreeModel && !referenceRetry {
+	if info.Billing == nil && (!info.PriceData.FreeModel || mixedVideoBilling) && !referenceRetry {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeDurableTaskBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
@@ -575,7 +595,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				c.Set("async_media_submission_rejected", true)
 				c.Set("async_media_submission_retry_reason", message)
 			}
-			if c.GetBool("async_media_execution") && platform == "drama" && !hasAsyncProfile && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
+			if c.GetBool("async_media_execution") && !mixedVideoBilling && platform == "drama" && !hasAsyncProfile && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
 				c.Set("async_media_retryable_submission_rejection", true)
 				reason := "explicit_rejection"
 				if resp.StatusCode == http.StatusBadGateway {

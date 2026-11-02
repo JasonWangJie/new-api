@@ -78,7 +78,7 @@ export const meta = {
     en: "xAI Grok video generation with text, image, references, and pinned frames",
     zh: "xAI Grok 视频生成，支持文本、图片、参考素材和首尾帧",
   },
-  version: "1.1.4",
+  version: "1.1.5",
   author: { name: "QuantumNous", url: "https://x.ai" },
   baseUrl: "https://api.x.ai",
   channelTypes: [48],
@@ -648,15 +648,16 @@ export const protocols = {
       const req = ctx.body.kind === "json" ? ctx.body.value : multipartRequest(ctx);
       if (!req || typeof req !== "object" || Array.isArray(req)) throw new Error("request body must be an object");
       const model = trimmed(ctx.model || req.model);
-      if (!meta.models.includes(model)) throw new Error("unsupported xAI video model");
+      const upstreamModel = trimmed(ctx.upstreamModel || model);
+      if (!meta.models.includes(upstreamModel)) throw new Error("unsupported xAI video model");
       if (ctx.operation === "edit" || ctx.operation === "extend") {
         if (ctx.body.kind !== "json") throw new Error("xAI video editing and extension require a JSON body");
-        const prepared = videoOperationRequest(req, model, ctx.operation);
+        const prepared = videoOperationRequest(req, upstreamModel, ctx.operation);
         return { kind: "submit", model, action: prepared.action, requestBody: prepared.body };
       }
       const fileCounts = ctx.body.kind === "multipart" ? multipartFileCounts(ctx.body.files || []) : { image: 0, lastFrame: 0, references: 0 };
-      const validation = validateRequest(req, model, fileCounts);
-      return { kind: "submit", model: model, action: validation.action, requestBody: normalizedRequest(req, model, validation) };
+      const validation = validateRequest(req, upstreamModel, fileCounts);
+      return { kind: "submit", model: model, action: validation.action, requestBody: normalizedRequest(req, upstreamModel, validation) };
     },
     render(_ctx, task) {
       const statuses = { NOT_START: "pending", SUBMITTED: "pending", QUEUED: "pending", IN_PROGRESS: "pending", SUCCESS: "done", FAILURE: "failed" };

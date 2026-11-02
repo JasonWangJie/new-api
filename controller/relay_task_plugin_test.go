@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
@@ -27,6 +29,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -37,6 +40,243 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
+
+func TestMixedVideoAdmissionAndCrossPluginRecovery(t *testing.T) {
+	previousTaskTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 10
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTaskTimeout })
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-test")
+	previousRegistry := pluginruntime.DefaultRegistry
+	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	const publicModel = "shared-public-video"
+	plugins := make([]*pluginruntime.LoadedPlugin, 0, 2)
+	channels := make([]model.Channel, 0, 2)
+	for index, key := range []string{"mixed-first", "mixed-second"} {
+		target := fmt.Sprintf("vendor-model-%d", index)
+		source := fmt.Sprintf(`
+export const meta = {apiVersion:1,key:%q,name:%q,version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:[%q],modes:[{name:"text_to_video",duration:{values:[5,10],default:%d},resolutions:["720p"],defaultResolution:"720p"},{name:"image_to_video",duration:{values:[5,10],default:%d},resolutions:["720p"],defaultResolution:"720p",inputs:[{name:"image",kind:"image",sources:["upload"],maxItems:1,required:true}]}]}]};
+export const protocols={openai_video:{decodeRequest(ctx){if(ctx.upstreamModel!==%q)throw new Error("incorrect member mapping");let body=ctx.body.value;if(ctx.body.kind==="multipart"){body={};for(const key in ctx.body.fields)body[key]=ctx.body.fields[key][0];}if(body.prompt==="change-specs")body.seconds=10;return {kind:"submit",model:ctx.model,action:ctx.body.files&&ctx.body.files.length?"image_to_video":"text_to_video",requestBody:body};},render(ctx,task){return task;}}};
+export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q,body:ctx.requestBody};}export function parseSubmitResponse(ctx,resp){if(resp.statusCode>=400)throw new Error("receipt is unknown");return {taskId:"accepted"};}export function buildQueryRequest(){return {method:"GET",url:"https://example.invalid/query"};}export function parseTaskResult(){return {status:"SUCCESS"};}export function listArtifacts(){return [];}export function buildContentRequest(){return {method:"GET",url:"https://example.invalid/content"};}
+`, key, key, target, target, 5+index*5, 5+index*5, target, fmt.Sprintf("/vendor-%d/generate", index))
+		plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: key})
+		require.NoError(t, err)
+		plugins = append(plugins, plugin)
+		setting := fmt.Sprintf(`{"task_plugin_key":%q}`, key)
+		mapping := fmt.Sprintf(`{%q:%q}`, publicModel, target)
+		channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: key, Status: common.ChannelStatusEnabled, Models: publicModel, Group: "default", Key: key + "-key", Setting: &setting, ModelMapping: &mapping}
+		require.NoError(t, db.Create(&channel).Error)
+		require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: publicModel, Enabled: true}).Error)
+		channels = append(channels, channel)
+	}
+	policy := model.ImageGroupPolicy{Group: "default", Platform: "mixed", PolicyKey: service.ImageIdentityHash("default", "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"shared-public-video","media_type":"video"}]`}
+	require.NoError(t, db.Create(&policy).Error)
+	bindingKey := service.MediaPoolBindingKey(policy, publicModel, "1K", "video")
+	for index := range channels {
+		require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: bindingKey, Group: "default", Platform: "mixed", Mode: policy.PoolMode, Model: publicModel, Resolution: "1K", ChannelId: channels[index].Id, Priority: index}).Error)
+	}
+	engine := gin.New()
+	var observedFacts map[string]any
+	engine.POST("/v1/videos/generations_async", func(c *gin.Context) { c.Set("token_id", token.Id); c.Set("id", user.Id); c.Next() }, PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, func(c *gin.Context) {
+		pinned := c.MustGet(pluginruntime.ContextKeyPinnedEndpoint).(pluginruntime.PinnedEndpoint)
+		observedFacts = c.MustGet("mixed_video_billing_facts").(map[string]any)
+		c.JSON(200, gin.H{"model": pinned.Model, "mapped": pinned.MappedModel, "plugin": pinned.Plugin.Meta.Key, "mixed": c.GetBool("mixed_video_billing")})
+	})
+	for _, multipartBody := range []bool{false, true} {
+		var raw bytes.Buffer
+		contentType := "application/json"
+		if multipartBody {
+			writer := multipart.NewWriter(&raw)
+			require.NoError(t, writer.WriteField("model", publicModel))
+			require.NoError(t, writer.WriteField("seconds", "5"))
+			require.NoError(t, writer.WriteField("resolution", "720p"))
+			file, err := writer.CreateFormFile("input_reference", "reference.png")
+			require.NoError(t, err)
+			_, err = file.Write([]byte("bounded-upload-fixture"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			contentType = writer.FormDataContentType()
+		} else {
+			raw.WriteString(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"test"}`)
+		}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", &raw)
+		request.Header.Set("Content-Type", contentType)
+		engine.ServeHTTP(recorder, request)
+		require.Equal(t, 200, recorder.Code, recorder.Body.String())
+		assert.JSONEq(t, `{"model":"shared-public-video","mapped":"vendor-model-1","plugin":"mixed-second","mixed":true}`, recorder.Body.String())
+	}
+	defaults := httptest.NewRecorder()
+	defaultRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"shared-public-video","prompt":"public defaults"}`))
+	defaultRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(defaults, defaultRequest)
+	require.Equal(t, 200, defaults.Code, defaults.Body.String())
+	assert.Equal(t, float64(5), observedFacts["seconds"], "one complete stable variant determines the public default before request filtering and weighting")
+	assert.Equal(t, "720p", observedFacts["resolution"])
+	altered := httptest.NewRecorder()
+	alteredRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"change-specs"}`))
+	alteredRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(altered, alteredRequest)
+	assert.Equal(t, 400, altered.Code, "a decoder cannot change five billed seconds to ten even when both durations are supported")
+	assert.Contains(t, altered.Body.String(), "changed the public seconds")
+	require.NoError(t, db.Model(&policy).Update("enabled", false).Error)
+	recorder := httptest.NewRecorder()
+	requestHTTP := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"shared-public-video","seconds":5,"resolution":"720p"}`))
+	requestHTTP.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, requestHTTP)
+	assert.Equal(t, 403, recorder.Code, "a disabled mixed policy cannot fall back")
+	require.NoError(t, db.Model(&policy).Update("enabled", true).Error)
+
+	now := time.Now().Unix()
+	route := &service.MixedVideoRouting{Group: "default", BindingKey: bindingKey, PoolMode: policy.PoolMode, Model: publicModel, Operation: "create", Resolution: "1K"}
+	decision := mediaretry.Decision{Matched: true, Action: mediaretry.OtherChannel, RequestedAction: mediaretry.OtherChannel, RuleID: "mixed-failure", StepID: "other", Revision: 1}
+	fact := mediaretry.Fact{MediaType: "video", Provider: plugins[0].Meta.Key, Model: publicModel, ChannelID: channels[0].Id, Stage: "terminal", Accepted: true, Terminal: true, HasUpstreamTask: true, Message: "confirmed failure"}
+	frozen := service.AsyncVideoRequest{MixedRouting: route, Body: []byte(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"test"}`), ContentType: "application/json", Operation: "create", ClientIP: "203.0.113.10", Channel: channels[0], PluginHash: plugins[0].Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugins[0].Meta.Key, Version: "1.0.0"}}, PendingDecision: &decision, RetryFact: &fact, ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: now + 120}
+	task := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: channels[0].Id, Platform: constant.TaskPlatform(plugins[0].Meta.Key), Status: model.TaskStatusSubmitted, Quota: 7, Properties: model.Properties{OriginModelName: publicModel, UpstreamModelName: "vendor-model-0"}}
+	task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
+	task.PrivateData.TokenId, task.PrivateData.UpstreamTaskID, task.PrivateData.Execution = token.Id, "first-upstream-operation", frozen.Execution
+	task.PrivateData.CurrentAttempt = &model.VideoTaskAttempt{MixedVideo: true, ChannelID: channels[0].Id, PluginKey: plugins[0].Meta.Key, PluginVersion: "1.0.0", UpstreamModel: "vendor-model-0"}
+	require.NoError(t, db.Create(&task).Error)
+	encoded, err := common.Marshal(frozen)
+	require.NoError(t, err)
+	cipher, err := service.EncryptImagePayload(encoded, "media-request:"+task.TaskID)
+	require.NoError(t, err)
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channels[0].Id, Provider: plugins[0].Meta.Key, Model: publicModel, Group: "default", Status: "submitted", BillingStatus: "reserved", RequestCipher: cipher, CreatedAt: now, ExpiresAt: now + 600, Quota: 7}
+	require.NoError(t, db.Create(&job).Error)
+	stale := task
+	staleSnapshot := stale.Snapshot()
+	won, err := model.ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, fact.Message, false, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: mediaretry.State{TotalLimit: 2}, RequestCipher: cipher})
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	job.LeaseToken, job.LeaseExpiresAt = "mixed-recovery-lease", now+120
+	require.NoError(t, db.Model(&job).Updates(map[string]any{"lease_token": job.LeaseToken, "lease_expires_at": job.LeaseExpiresAt}).Error)
+	require.NoError(t, service.SelectVideoRecoveryChannel(t.Context(), &job, &task, &frozen))
+	assert.Equal(t, plugins[1].Meta.Key, job.Provider)
+	assert.Equal(t, constant.TaskPlatform(plugins[1].Meta.Key), task.Platform)
+	assert.Equal(t, "vendor-model-1", task.Properties.UpstreamModelName)
+	assert.Equal(t, plugins[0].Meta.Key, task.PrivateData.Execution.TaskPlugin.Key)
+	assert.Equal(t, plugins[1].Meta.Key, task.PrivateData.CurrentAttempt.PluginKey)
+	assert.Equal(t, channels[0].Id, task.BillingChannelID())
+	assert.Equal(t, 7, task.Quota)
+	stale.Status = model.TaskStatusInProgress
+	won, err = stale.UpdatePollingState(t.Context(), staleSnapshot)
+	require.NoError(t, err)
+	assert.False(t, won, "old provider polling cannot overwrite a replacement generation")
+	unknown := *frozen.RetryFact
+	unknown.Unknown, unknown.Terminal = true, false
+	frozen.RetryFact = &unknown
+	_, err = service.VideoRetryCandidateChannels(t.Context(), job, frozen, task.Properties.UpstreamModelName)
+	require.ErrorContains(t, err, "unknown mixed video")
+	// An unknown dispatched replacement retains its original hold and encrypted
+	// evidence instead of pretending the upstream failed or permitting cleanup.
+	task.Status = model.TaskStatusUnknown
+	task.PrivateData.VideoAttempts = append(task.PrivateData.VideoAttempts, model.VideoTaskAttempt{Status: model.TaskStatusUnknown, MixedVideo: true})
+	require.NoError(t, db.Model(&task).Updates(map[string]any{"status": task.Status, "private_data": task.PrivateData}).Error)
+	job.DispatchedAt = now
+	require.NoError(t, db.Model(&job).Updates(map[string]any{"dispatched_at": now}).Error)
+	require.NoError(t, model.EndAsyncVideoPolicyExecution(t.Context(), task, job, unknown, nil, mediaretry.State{}))
+	require.NoError(t, db.First(&task, task.ID).Error)
+	require.NoError(t, db.First(&job, job.ID).Error)
+	assert.Equal(t, model.TaskStatusUnknown, string(task.Status))
+	assert.Equal(t, "execution_unknown", job.Status)
+	assert.Equal(t, "unknown", job.BillingStatus)
+	assert.Equal(t, 7, task.Quota)
+	assert.NotEmpty(t, job.RequestCipher)
+	assert.NotEmpty(t, job.ChannelCipher)
+	assert.True(t, job.HasPendingSubmissionReconciliation())
+	require.ErrorIs(t, model.ExpireAsyncMediaJob(t.Context(), job, now+10000), model.ErrImageConflict)
+
+	// Exercise the actual first-submission refund boundary on a plugin outside
+	// the legacy reconciliation whitelist, including an explicit free price.
+	require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}))
+	previousSubmit := service.SubmitAsyncVideoFunc
+	previousBatch, previousLogs := common.BatchUpdateEnabled, common.LogConsumeEnabled
+	service.SubmitAsyncVideoFunc, common.BatchUpdateEnabled, common.LogConsumeEnabled = ExecuteAsyncVideo, false, false
+	t.Cleanup(func() {
+		service.SubmitAsyncVideoFunc, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousSubmit, previousBatch, previousLogs
+	})
+	for _, tc := range []struct {
+		reserved int
+		accepted bool
+	}{{100, false}, {0, false}, {0, true}} {
+		t.Run(fmt.Sprintf("first_submit_hold_%d_accepted_%t", tc.reserved, tc.accepted), func(t *testing.T) {
+			reserved := tc.reserved
+			require.NoError(t, db.Model(token).Updates(map[string]any{"status": common.TokenStatusEnabled, "remain_quota": 100}).Error)
+			require.NoError(t, db.First(user, user.Id).Error)
+			require.NoError(t, db.First(token, token.Id).Error)
+			beforeWallet, beforeToken := user.Quota, token.RemainQuota
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if tc.accepted {
+					_, _ = w.Write([]byte(`{"id":"accepted"}`))
+					return
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream response was lost"}}`))
+			}))
+			t.Cleanup(upstream.Close)
+			channel := channels[0]
+			channel.BaseURL = &upstream.URL
+			require.NoError(t, db.Model(&channel).Update("base_url", upstream.URL).Error)
+			expression := fmt.Sprintf(`tier("public", u("requests") * %.12f)`, float64(reserved)/common.QuotaPerUnit)
+			snapshot := &billingexpr.BillingSnapshot{ModelName: publicModel, BillingMode: "tiered_expr", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: 1, GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, EstimatedQuotaBeforeGroup: float64(reserved), EstimatedQuotaAfterGroup: reserved, TaskUsageBilling: true, MixedVideoBilling: true, MixedVideoSchemaVersion: 1, UsageFacts: map[string]any{"requests": float64(1), "action": "generate", "seconds": float64(5), "resolution": "720p"}}
+			initial := service.AsyncVideoRequest{MixedRouting: route, Body: []byte(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"unknown submit"}`), ContentType: "application/json", Operation: "create", ClientIP: "203.0.113.10", Channel: channel, PluginHash: plugins[0].Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugins[0].Meta.Key, Version: "1.0.0"}}, Billing: service.MediaBillingSnapshot{Tiered: snapshot, Price: types.PriceData{Quota: reserved, QuotaToPreConsume: reserved, FreeModel: reserved == 0, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+			require.NoError(t, service.FreezeAsyncVideoReferenceRecovery(&initial, nil, now+600))
+			require.Equal(t, 2, initial.ReferenceRecoveryVersion)
+			initialJob := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: plugins[0].Meta.Key, Model: publicModel, Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: fmt.Sprintf("first-mixed-%d", reserved), LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 600}
+			encoded, err := common.Marshal(initial)
+			require.NoError(t, err)
+			initialJob.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+initialJob.TaskId)
+			require.NoError(t, err)
+			channelData, err := common.Marshal(channel)
+			require.NoError(t, err)
+			initialJob.ChannelCipher, err = service.EncryptImagePayload(channelData, "media-channel:"+initialJob.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, db.Create(&initialJob).Error)
+			processErr := service.ProcessAsyncMediaJob(t.Context(), initialJob, service.DefaultMediaRuntimeConfig())
+			require.NoError(t, db.First(&initialJob, initialJob.ID).Error)
+			require.NoError(t, db.First(user, user.Id).Error)
+			require.NoError(t, db.First(token, token.Id).Error)
+			assert.EqualValues(t, 1, calls.Load(), "an unknown initial send cannot replay on the same or another plugin")
+			assert.Equal(t, beforeWallet-reserved, user.Quota, "the original hold is not refunded")
+			assert.Equal(t, beforeToken-reserved, token.RemainQuota)
+			if tc.accepted {
+				require.NoError(t, processErr)
+				require.Equal(t, "submitted", initialJob.Status)
+				plain, err := service.DecryptImagePayload(initialJob.RequestCipher, "media-request:"+initialJob.TaskId)
+				require.NoError(t, err)
+				var retained service.AsyncVideoRequest
+				require.NoError(t, common.Unmarshal(plain, &retained))
+				assert.Equal(t, 2, retained.ReferenceRecoveryVersion)
+				require.NotNil(t, retained.MixedRouting)
+				assert.Equal(t, route.BindingKey, retained.MixedRouting.BindingKey)
+				assert.Equal(t, initial.Body, retained.Body, "successful admission must retain the complete v2 replay body until terminal execution")
+				assert.Equal(t, initial.PluginHash, retained.PluginHash)
+				return
+			}
+			assert.Equal(t, "execution_unknown", initialJob.Status)
+			assert.Equal(t, "unknown", initialJob.BillingStatus)
+			assert.NotEmpty(t, initialJob.RequestCipher)
+			assert.NotEmpty(t, initialJob.ChannelCipher)
+			var native model.Task
+			require.NoError(t, db.Where("task_id = ?", initialJob.TaskId).Take(&native).Error)
+			assert.Equal(t, model.TaskStatusUnknown, string(native.Status))
+			assert.Equal(t, reserved, native.Quota)
+			assert.True(t, native.PrivateData.DurableBilling)
+			assert.True(t, native.PrivateData.SubmitAccountingRecorded)
+			require.NotNil(t, native.PrivateData.CurrentAttempt)
+			assert.True(t, native.PrivateData.CurrentAttempt.MixedVideo)
+		})
+	}
+}
 
 type taskSubmissionTestBilling struct {
 	events     *[]string
@@ -64,6 +304,214 @@ func (b *taskSubmissionTestBilling) GetPreConsumedQuota() int { return 0 }
 func (b *taskSubmissionTestBilling) Reserve(int) error {
 	*b.events = append(*b.events, "reserve")
 	return b.reserveErr
+}
+
+func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
+	previousRegistry := pluginruntime.DefaultRegistry
+	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	source, err := os.ReadFile("../plugins/tasks/drama/plugin.js")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(string(source), pluginruntime.Options{Key: "drama"})
+	require.NoError(t, err)
+	const publicModel = "public-drama-video"
+	setting := `{"task_plugin_key":"drama"}`
+	for _, tc := range []struct {
+		name, model, operation, fields, resolution, ratio, wantError string
+	}{
+		{name: "F default retains wire resolution", model: "seedance2.0-F", fields: `"seconds":4`, resolution: "720px", ratio: "16:9"},
+		{name: "F explicit wire resolution", model: "seedance2.0-F", fields: `"seconds":4,"resolution":"720px"`, resolution: "720px", ratio: "16:9"},
+		{name: "H3 camel case portrait", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","aspectRatio":"9:16"`, resolution: "720p", ratio: "9:16"},
+		{name: "H3 short portrait alias", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","ratio":"9:16"`, resolution: "720p", ratio: "9:16"},
+		{name: "matching aliases", model: "minimax-h3", fields: `"seconds":4,"aspectRatio":"9:16","aspect_ratio":"9:16","ratio":"9:16"`, resolution: "480p", ratio: "9:16"},
+		{name: "conflicting aliases", model: "minimax-h3", fields: `"seconds":4,"aspectRatio":"9:16","aspect_ratio":"16:9"`, wantError: "conflicting mixed video aspect ratios"},
+		{name: "F wire resolution is not global", model: "minimax-h3", fields: `"seconds":4,"resolution":"720px"`, wantError: "resolution is invalid"},
+		{name: "editing inherits source duration", model: "seedance2.5-G", operation: "edit", fields: `"video":"https://example.invalid/source.mp4"`, resolution: "720p", ratio: "adaptive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			operation := tc.operation
+			if operation == "" {
+				operation = "create"
+			}
+			mapping := fmt.Sprintf(`{%q:%q}`, publicModel, tc.model)
+			channel := model.Channel{Id: 399, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: publicModel, Group: "default", Setting: &setting, ModelMapping: &mapping, Key: "test-drama-key"}
+			binding, _, err := service.MixedVideoChannelBinding(channel, publicModel, operation)
+			require.NoError(t, err)
+			profile, err := service.EffectiveMixedVideoProfile(binding, publicModel, service.VideoModelOverrides{})
+			require.NoError(t, err)
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"a portrait",%s}`, publicModel, tc.fields))
+			normalized, _, body, err := service.NormalizeMixedVideoDefaults(raw, "application/json", operation, []pluginruntime.VideoProfile{profile})
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.resolution, body["resolution"])
+			assert.Equal(t, tc.ratio, body["aspect_ratio"])
+			candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, operation, normalized, service.VideoModelOverrides{}, 1, "application/json")
+			require.NoError(t, err)
+			facts, err := service.MixedVideoPublicFacts(body, operation, profile)
+			require.NoError(t, err)
+			publicResolution := tc.resolution
+			if publicResolution == "720px" {
+				publicResolution = "720p"
+			}
+			assert.Equal(t, publicResolution, facts["resolution"], "the public fact does not change the provider's model-specific wire value")
+			descriptor, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": publicModel, "upstreamModel": tc.model, "action": candidate.Intent["action"], "baseUrl": "https://example.invalid", "apiKey": "test-drama-key", "requestBody": candidate.Intent["requestBody"]})
+			require.NoError(t, err)
+			request, ok := descriptor.(map[string]any)
+			require.True(t, ok)
+			wire, ok := request["body"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, tc.resolution, wire["resolution"])
+			assert.Equal(t, tc.ratio, wire["aspect_ratio"])
+			if tc.resolution == "720px" {
+				_, err := service.MixedVideoPublicFacts(body, operation)
+				require.ErrorContains(t, err, "resolution is invalid", "720px requires the actual bound model profile")
+			}
+			if tc.operation == "edit" {
+				assert.NotContains(t, body, "seconds")
+				assert.NotContains(t, facts, "seconds")
+				require.NoError(t, billing_setting.ValidateMixedVideoBillingFacts(`tier("request", u("requests") * 0.5)`, facts))
+				require.ErrorContains(t, billing_setting.ValidateMixedVideoBillingFacts(`tier("seconds", u("seconds") * 0.1)`, facts), "cannot be determined")
+			}
+		})
+	}
+}
+
+func TestMixedVideoGooglePublicParametersAndUploads(t *testing.T) {
+	previousRegistry := pluginruntime.DefaultRegistry
+	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
+	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
+	for _, key := range []string{"google", "xai", "sora", "drama"} {
+		source, err := builtinplugins.Source(key)
+		require.NoError(t, err)
+		_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: key})
+		require.NoError(t, err)
+	}
+	const publicModel = "shared-video-parameters"
+	member := func(t *testing.T, key, target string) (model.Channel, pluginruntime.ProtocolBinding, pluginruntime.VideoProfile) {
+		t.Helper()
+		setting := fmt.Sprintf(`{"task_plugin_key":%q}`, key)
+		mapping := fmt.Sprintf(`{%q:%q}`, publicModel, target)
+		channel := model.Channel{Id: 399, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: publicModel, Group: "default", Setting: &setting, ModelMapping: &mapping}
+		binding, _, err := service.MixedVideoChannelBinding(channel, publicModel, "create")
+		require.NoError(t, err)
+		profile, err := service.EffectiveMixedVideoProfile(binding, publicModel, service.VideoModelOverrides{})
+		require.NoError(t, err)
+		return channel, binding, profile
+	}
+	for _, tc := range []struct {
+		name, key, target, fields, ratio, wantError string
+		seconds                                     int
+		decodeError                                 bool
+	}{
+		{name: "native four seconds", fields: `"metadata":{"durationSeconds":4}`, seconds: 4, ratio: "16:9"},
+		{name: "top native seconds", fields: `"durationSeconds":6`, seconds: 6, ratio: "16:9"},
+		{name: "matching durations", fields: `"seconds":4,"metadata":{"durationSeconds":4}`, seconds: 4, ratio: "16:9"},
+		{name: "conflicting native duration", fields: `"seconds":4,"metadata":{"durationSeconds":8}`, wantError: "conflicting mixed video durations"},
+		{name: "native duration zero", fields: `"metadata":{"durationSeconds":0}`, wantError: "bounded positive whole number"},
+		{name: "native duration overflow", fields: `"metadata":{"durationSeconds":18446744073709551615}`, wantError: "bounded positive whole number"},
+		{name: "portrait pixels", fields: `"size":"720x1280"`, seconds: 8, ratio: "9:16"},
+		{name: "matching pixel ratio", fields: `"size":"720x1280","aspect_ratio":"9:16"`, seconds: 8, ratio: "9:16"},
+		{name: "conflicting pixel ratio", fields: `"size":"720x1280","aspect_ratio":"16:9"`, wantError: "conflicting mixed video size aspect ratios"},
+		{name: "conflicting metadata pixels", fields: `"size":"720x1280","metadata":{"size":"1280x720"}`, wantError: "conflicting mixed video size aspect ratios"},
+		{name: "Google square retains native landscape mapping", fields: `"size":"1280x1280"`, seconds: 8, ratio: "16:9"},
+		{name: "xAI square retains declared shape", key: "xai", target: "grok-imagine-video-1.5", fields: `"seconds":8,"size":"1280x1280","aspect_ratio":"1:1"`, seconds: 8, ratio: "1:1"},
+		{name: "Sora retains size without aspect dimension", key: "sora", target: "sora-2", fields: `"seconds":8,"size":"720x1280"`, seconds: 8},
+		{name: "Drama pixel size remains unsupported", key: "drama", target: "minimax-h3", fields: `"seconds":4,"size":"720x1280"`, wantError: "resolution is not supported", decodeError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key, target := tc.key, tc.target
+			if key == "" {
+				key, target = "google", "veo-3.1-generate-preview"
+			}
+			channel, binding, profile := member(t, key, target)
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"cat",%s}`, publicModel, tc.fields))
+			normalized, _, body, err := service.NormalizeMixedVideoDefaults(raw, "application/json", "create", []pluginruntime.VideoProfile{profile})
+			if tc.wantError != "" && !tc.decodeError {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", normalized, service.VideoModelOverrides{}, 0)
+			if tc.decodeError {
+				require.ErrorContains(t, err, tc.wantError)
+				return
+			}
+			require.NoError(t, err)
+			facts, err := service.MixedVideoPublicFacts(body, "create", profile)
+			require.NoError(t, err)
+			assert.EqualValues(t, tc.seconds, facts["seconds"])
+			if tc.ratio == "" {
+				assert.NotContains(t, body, "aspect_ratio")
+			} else {
+				assert.Equal(t, tc.ratio, body["aspect_ratio"])
+			}
+			ctx := map[string]any{"model": publicModel, "upstreamModel": target, "action": candidate.Intent["action"], "requestBody": candidate.Intent["requestBody"], "baseUrl": "https://example.invalid", "apiKey": "test-only"}
+			value, err := binding.Plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.NoError(t, err)
+			wire := value.(map[string]any)["body"].(map[string]any)
+			if key == "google" {
+				parameters := wire["parameters"].(map[string]any)
+				assert.EqualValues(t, tc.seconds, parameters["durationSeconds"])
+				assert.Equal(t, tc.ratio, parameters["aspectRatio"])
+				value, err = binding.Plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+				require.NoError(t, err)
+				assert.EqualValues(t, facts["seconds"], value.(map[string]any)["seconds"])
+			} else if key == "sora" {
+				assert.Equal(t, "720x1280", wire["size"])
+				assert.NotContains(t, wire, "aspect_ratio")
+			} else {
+				assert.Equal(t, tc.ratio, wire["aspect_ratio"])
+			}
+		})
+	}
+	for _, field := range []string{"image", "input_reference"} {
+		t.Run("Google upload "+field, func(t *testing.T) {
+			channel, binding, profile := member(t, "google", "veo-3.1-generate-preview")
+			var data bytes.Buffer
+			writer := multipart.NewWriter(&data)
+			require.NoError(t, writer.WriteField("model", publicModel))
+			require.NoError(t, writer.WriteField("prompt", "animate this frame"))
+			file, err := writer.CreateFormFile(field, "frame.png")
+			require.NoError(t, err)
+			_, err = file.Write([]byte("image-fixture"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			normalized, contentType, _, err := service.NormalizeMixedVideoDefaults(data.Bytes(), writer.FormDataContentType(), "create", []pluginruntime.VideoProfile{profile})
+			require.NoError(t, err)
+			candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", normalized, service.VideoModelOverrides{}, 0, contentType)
+			require.NoError(t, err)
+			view, _, err := service.MixedVideoRequestContext(normalized, contentType, "create")
+			require.NoError(t, err)
+			value, err := binding.Plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": publicModel, "upstreamModel": "veo-3.1-generate-preview", "requestBody": candidate.Intent["requestBody"], "files": view.Files, "baseUrl": "https://example.invalid"})
+			require.NoError(t, err)
+			wire := value.(map[string]any)["body"].(map[string]any)
+			image := wire["instances"].([]any)[0].(map[string]any)["image"].(map[string]any)
+			placeholder := image["inlineData"].(map[string]any)["data"].(map[string]any)
+			assert.Equal(t, "request_file:"+field, placeholder["__fileRef"])
+		})
+	}
+	t.Run("uploads cannot bypass count or source limits", func(t *testing.T) {
+		_, _, profile := member(t, "google", "veo-3.1-generate-preview")
+		for _, fields := range [][]string{{"image", "image"}, {"image", "input_reference"}} {
+			var data bytes.Buffer
+			writer := multipart.NewWriter(&data)
+			require.NoError(t, writer.WriteField("model", publicModel))
+			for _, field := range fields {
+				file, err := writer.CreateFormFile(field, "frame.png")
+				require.NoError(t, err)
+				_, err = file.Write([]byte("image-fixture"))
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+			_, _, _, err := service.NormalizeMixedVideoDefaults(data.Bytes(), writer.FormDataContentType(), "create", []pluginruntime.VideoProfile{profile})
+			require.Error(t, err, "two distinct files remain two inputs even when their field names match")
+		}
+		_, _, _, err := service.NormalizeMixedVideoDefaults([]byte(fmt.Sprintf(`{"model":%q,"image":{"__fileRef":"request_file:image"}}`, publicModel)), "application/json", "create", []pluginruntime.VideoProfile{profile})
+		require.Error(t, err, "a JSON placeholder without an actual upload is not an upload source")
+	})
 }
 
 func TestPresentTaskSubmissionUsesNativePresenterAfterPersistence(t *testing.T) {
@@ -312,44 +760,57 @@ func TestExecuteTaskSubmissionDisconnectBeforeUpstreamAcceptanceSkipsSubmitAndRe
 }
 
 func TestExecuteTaskSubmissionCallerCancellationDuringSubmitRefundsBeforeDurableBarrier(t *testing.T) {
-	events := make([]string, 0, 1)
-	setupTaskSubmissionDatabase(t, true, &events)
-	billing := &taskSubmissionTestBilling{events: &events}
-	c := taskSubmissionTestContext()
-	requestContext, cancel := context.WithCancel(c.Request.Context())
-	c.Request = c.Request.WithContext(requestContext)
-	info := taskSubmissionRelayInfo(billing)
-	submitStarted := make(chan struct{})
-	done := make(chan struct{})
-	var outcome *taskSubmissionOutcome
-	var taskErr *dto.TaskError
+	for _, unconfirmed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("previous_unknown_%t", unconfirmed), func(t *testing.T) {
+			events := make([]string, 0, 1)
+			setupTaskSubmissionDatabase(t, true, &events)
+			billing := &taskSubmissionTestBilling{events: &events}
+			c := taskSubmissionTestContext()
+			if unconfirmed {
+				c.Set("async_media_initial_retry_request", &service.AsyncVideoRequest{InitialUnknownAttempts: []model.VideoTaskAttempt{{Status: model.TaskStatusUnknown}}})
+				c.Set("async_media_submission_rejected", true)
+			}
+			requestContext, cancel := context.WithCancel(c.Request.Context())
+			c.Request = c.Request.WithContext(requestContext)
+			info := taskSubmissionRelayInfo(billing)
+			submitStarted := make(chan struct{})
+			done := make(chan struct{})
+			var outcome *taskSubmissionOutcome
+			var taskErr *dto.TaskError
 
-	go func() {
-		defer close(done)
-		outcome, taskErr = executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
-			close(submitStarted)
-			<-c.Request.Context().Done()
-			return nil, service.TaskErrorWrapperLocal(c.Request.Context().Err(), "do_request_failed", http.StatusInternalServerError)
+			go func() {
+				defer close(done)
+				outcome, taskErr = executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					close(submitStarted)
+					<-c.Request.Context().Done()
+					return nil, service.TaskErrorWrapperLocal(c.Request.Context().Err(), "do_request_failed", http.StatusInternalServerError)
+				})
+			}()
+			select {
+			case <-submitStarted:
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "submission did not start")
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "submission did not stop after disconnect")
+			}
+
+			assert.Nil(t, outcome)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, "request_cancelled", taskErr.Code)
+			if unconfirmed {
+				assert.Empty(t, events)
+				assert.Zero(t, billing.refunds, "disconnect cannot refund an earlier unconfirmed submission")
+			} else {
+				assert.Equal(t, []string{"refund"}, events)
+				assert.Equal(t, 1, billing.refunds)
+			}
+			assert.False(t, c.Writer.Written())
 		})
-	}()
-	select {
-	case <-submitStarted:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "submission did not start")
 	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "submission did not stop after disconnect")
-	}
-
-	assert.Nil(t, outcome)
-	require.NotNil(t, taskErr)
-	assert.Equal(t, "request_cancelled", taskErr.Code)
-	assert.Equal(t, []string{"refund"}, events)
-	assert.Equal(t, 1, billing.refunds)
-	assert.False(t, c.Writer.Written())
 }
 
 func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testing.T) {
@@ -594,6 +1055,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "dispatch barrier rejected", beforeSend: true, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "accepted receipt cannot persist", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, insertFails: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "custom unknown then explicit refusal retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "rejection", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "custom unknown then explicit refusal cannot persist retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "rejection", insertFails: true, wantCalls: 2, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "custom unknown retry budget stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "budget", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "custom unknown local preparation stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "local", wantCalls: 1, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 			} {
@@ -687,6 +1149,18 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					assert.Equal(t, tc.wantWallet-900, token.RemainQuota)
 					assert.Equal(t, tc.wantStatus, job.Status)
 					assert.Equal(t, tc.wantBilling, job.BillingStatus)
+					if tc.configured != "" && tc.insertFails {
+						var nativeCount int64
+						require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&nativeCount).Error)
+						assert.Zero(t, nativeCount)
+						plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+						require.NoError(t, err)
+						var frozen service.AsyncVideoRequest
+						require.NoError(t, common.Unmarshal(plain, &frozen))
+						require.NotEmpty(t, frozen.InitialUnknownAttempts)
+						assert.Equal(t, model.TaskStatusUnknown, frozen.InitialUnknownAttempts[0].Status)
+						return
+					}
 					if tc.configured != "" {
 						assert.Equal(t, "policy_stopped_unknown", job.ReferenceRecoveryStage)
 						var native model.Task
@@ -1095,4 +1569,191 @@ func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {
 	assert.Equal(t, []string{"reserve", "refund"}, events)
 	assert.Equal(t, 1, billing.refunds)
 	assert.False(t, c.Writer.Written())
+}
+
+func TestMixedVideoConfirmedFailureRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		mixed, unknown bool
+		response       string
+	}{
+		{name: "ordinary confirmed", response: `{"id":"native-terminal","status":"failed"}`},
+		{name: "mixed confirmed", mixed: true, response: `{"id":"native-terminal","status":"failed"}`},
+		{name: "mixed conflicting status", mixed: true, unknown: true, response: `{"id":"native-terminal","status":"processing"}`},
+		{name: "mixed conflicting identity", mixed: true, unknown: true, response: `{"id":"another-native","status":"failed"}`},
+		{name: "mixed output present", mixed: true, unknown: true, response: `{"id":"native-terminal","status":"failed","video_url":"https://example.invalid/result.mp4"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, token := setupResponsesWSRequestTest(t)
+			db := setupVideoRetryTestDatabase(t, user, token)
+			require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "third:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "third")
+			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "terminal", Name: "Confirmed failure retry", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"confirmed provider failure"}}, Steps: []mediaretry.Step{{ID: "other", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}}
+			_, err := model.SaveMediaRetryPolicy(t.Context(), policy, 0, user.Id, nil)
+			require.NoError(t, err)
+			now := time.Now().Unix()
+			task := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: 11, Platform: "xai", Status: model.TaskStatusSubmitted, Quota: 100, Properties: model.Properties{OriginModelName: "public-video", UpstreamModelName: "grok-imagine-video-1.5"}}
+			task.PrivateData.TokenId, task.PrivateData.UpstreamTaskID = token.Id, "native-terminal"
+			task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
+			request := service.AsyncVideoRequest{Body: []byte(`{"model":"public-video","seconds":5,"resolution":"720p","prompt":"test"}`), ContentType: "application/json", Operation: "create", ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: now + 120, ReferenceURLExpiresAt: now + 3600}
+			if tc.mixed {
+				request.MixedRouting = &service.MixedVideoRouting{Group: "default", Model: "public-video", Operation: "create", Resolution: "1K"}
+				task.PrivateData.CurrentAttempt = &model.VideoTaskAttempt{MixedVideo: true, PluginKey: "xai", ChannelID: 11, UpstreamModel: "grok-imagine-video-1.5"}
+			}
+			require.NoError(t, db.Create(&task).Error)
+			raw, err := common.Marshal(request)
+			require.NoError(t, err)
+			cipher, err := service.EncryptImagePayload(raw, "media-request:"+task.TaskID)
+			require.NoError(t, err)
+			job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: 11, Provider: "xai", Model: "public-video", Group: "default", Status: "submitted", BillingStatus: "reserved", Quota: 100, RequestCipher: cipher, CreatedAt: now, ExpiresAt: now + 600}
+			require.NoError(t, db.Create(&job).Error)
+			result := &relaycommon.TaskInfo{TaskID: "native-terminal", Status: model.TaskStatusFailure, Reason: "confirmed provider failure"}
+			recovered, err := service.TryAsyncVideoReferenceRecovery(t.Context(), task, result, 200, []byte(tc.response))
+			require.NoError(t, err)
+			require.True(t, recovered)
+			require.NoError(t, db.First(&task, task.ID).Error)
+			require.NoError(t, db.First(&job, job.ID).Error)
+			assert.Equal(t, 100, task.Quota)
+			assert.Equal(t, 100, job.Quota)
+			assert.Equal(t, "reserved", job.BillingStatus)
+			if tc.unknown {
+				assert.Equal(t, model.TaskStatusSubmitted, string(task.Status))
+				assert.Zero(t, task.AttemptGeneration)
+				assert.Empty(t, job.ReferenceRecoveryStage)
+				assert.Equal(t, "native-terminal", task.PrivateData.UpstreamTaskID)
+				require.NotNil(t, task.PrivateData.VideoReconciliation)
+				assert.True(t, task.PrivateData.VideoReconciliation.ManualRequired)
+				require.NotNil(t, task.PrivateData.MediaRetryFact)
+				assert.True(t, task.PrivateData.MediaRetryFact.Unknown)
+				return
+			}
+			assert.Equal(t, model.TaskStatusQueued, string(task.Status))
+			assert.Empty(t, task.PrivateData.UpstreamTaskID)
+			require.Len(t, task.PrivateData.VideoAttempts, 1)
+			assert.Equal(t, model.TaskStatusFailure, task.PrivateData.VideoAttempts[0].Status)
+			assert.Equal(t, "native-terminal", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+			assert.Equal(t, int64(1), task.AttemptGeneration, "confirmed terminal failure must reach a new recovery generation")
+			assert.Equal(t, "submit", job.ReferenceRecoveryStage)
+			assert.Nil(t, task.PrivateData.VideoReconciliation, "known failed execution must not become unknown/manual")
+		})
+	}
+}
+
+func TestMixedVideoBuiltinInputProjection(t *testing.T) {
+	const public = "third-smoke-public"
+	member := func(t *testing.T, key, target string) (model.Channel, pluginruntime.ProtocolBinding, pluginruntime.VideoProfile) {
+		t.Helper()
+		channel := model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Name: key, Key: "no-network", Status: common.ChannelStatusEnabled, Models: public, Group: "default"}
+		channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: key})
+		mapping, err := common.Marshal(map[string]string{public: target})
+		require.NoError(t, err)
+		channel.ModelMapping = common.GetPointer(string(mapping))
+		binding, _, err := service.MixedVideoChannelBinding(channel, public, "create")
+		require.NoError(t, err)
+		profile, err := service.EffectiveMixedVideoProfile(binding, public, service.VideoModelOverrides{})
+		require.NoError(t, err)
+		return channel, binding, profile
+	}
+	for _, tc := range []struct{ name, key, target, fields string }{
+		{"Tianyue one declared reference image", "tianyue", "L-sd2-video", `"seconds":5,"resolution":"720p","reference_images":["https://cdn.example/frame.png"]`},
+		{"Drama primary image alias is ordinary reference", "drama", "minimax-h3", `"seconds":4,"resolution":"720p","image":"https://cdn.example/frame.png"`},
+		{"Doubao native content first frame", "doubao", "doubao-seedance-1-0-pro-250528", `"seconds":5,"resolution":"720p","content":[{"type":"text","text":"animate"},{"type":"image_url","role":"first_frame","image_url":{"url":"https://cdn.example/frame.png"}}]`},
+		{"Tianyue native output duration", "tianyue", "L-sd2-video", `"resolution":"720p","video_duration":4`},
+		{"Tianyue native per-operation duration unit", "tianyue", "L-sd2-video", `"resolution":"720p","video_duration":4,"duration":1`},
+		{"control Tianyue explicit primary image", "tianyue", "L-sd2-video", `"seconds":5,"resolution":"720p","image":"https://cdn.example/frame.png"`},
+		{"control Tianyue two declared reference images", "tianyue", "L-sd2-video", `"seconds":5,"resolution":"720p","reference_images":["https://cdn.example/frame.png","https://cdn.example/other.png"]`},
+		{"control Drama explicit reference image", "drama", "minimax-h3", `"seconds":4,"resolution":"720p","reference_images":["https://cdn.example/frame.png"]`},
+		{"control Doubao structured first frame", "doubao", "doubao-seedance-1-0-pro-250528", `"seconds":5,"resolution":"720p","image":"https://cdn.example/frame.png"`},
+		{"control Tianyue public output duration", "tianyue", "L-sd2-video", `"seconds":4,"resolution":"720p"`},
+		{"control Tianyue preserves primary and reference identities", "tianyue", "L-sd2-video", `"seconds":5,"resolution":"720p","image":"https://cdn.example/frame.png","reference_images":["https://cdn.example/other.png"]`},
+		{"control Drama preserves primary alias and reference identities", "drama", "minimax-h3", `"seconds":4,"resolution":"720p","image":"https://cdn.example/frame.png","reference_images":["https://cdn.example/other.png"]`},
+		{"control explicit frame roles remain distinct", "drama", "seedance2.0-A", `"seconds":4,"resolution":"720p","aspect_ratio":"Auto","references":[{"type":"image","role":"first_frame","source":"https://cdn.example/frame.png"},{"type":"image","role":"last_frame","source":"https://cdn.example/other.png"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel, binding, profile := member(t, tc.key, tc.target)
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"animate",%s}`, public, tc.fields))
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(raw, &body))
+			value, err := binding.Plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": public, "upstreamModel": tc.target, "operation": "create", "body": map[string]any{"kind": "json", "value": body},
+			})
+			require.NoError(t, err, "the actual builtin decoder accepts this input")
+			intent := value.(map[string]any)
+			driver := map[string]any{"model": public, "upstreamModel": tc.target, "action": intent["action"], "requestBody": intent["requestBody"], "baseUrl": "https://third-smoke.invalid", "apiKey": "no-network"}
+			value, err = binding.Plugin.Engine.Call(t.Context(), "buildSubmitRequest", driver)
+			require.NoError(t, err, "the actual builtin builds a provider-native request")
+			wire := value.(map[string]any)["body"]
+			usage, err := binding.Plugin.Engine.Call(t.Context(), "extractUsage", driver)
+			require.NoError(t, err)
+			normalized, _, publicBody, normalizeErr := service.NormalizeMixedVideoDefaults(raw, "application/json", "create", []pluginruntime.VideoProfile{profile})
+			var candidate service.MixedVideoCandidate
+			decodeErr := normalizeErr
+			if normalizeErr == nil {
+				candidate, decodeErr = service.DecodeMixedVideoCandidate(t.Context(), channel, public, "create", normalized, service.VideoModelOverrides{}, 0)
+			}
+			facts, _ := service.MixedVideoPublicFacts(publicBody, "create", profile)
+			t.Logf("key=%s input=%s native.action=%v native.wire=%v native.usage=%v mixed.body=%v mixed.facts=%v mixed.intent=%v error=%v", tc.key, raw, intent["action"], wire, usage, publicBody, facts, candidate.Intent, decodeErr)
+			require.NoError(t, decodeErr, "a real builtin's supported request must survive mixed admission")
+			driver["requestBody"], driver["action"] = candidate.Intent["requestBody"], candidate.Intent["action"]
+			value, err = binding.Plugin.Engine.Call(t.Context(), "buildSubmitRequest", driver)
+			require.NoError(t, err)
+			expected, err := common.Marshal(wire)
+			require.NoError(t, err)
+			actual, err := common.Marshal(value.(map[string]any)["body"])
+			require.NoError(t, err)
+			assert.JSONEq(t, string(expected), string(actual), "mixed projection must preserve the real provider payload, including every media identity and frame role")
+			if seconds, supplied := body["video_duration"]; supplied {
+				assert.EqualValues(t, seconds, facts["seconds"], "a native duration unit must not replace output seconds in the public price")
+			}
+		})
+	}
+	t.Run("native duration aliases remain bounded and channel-specific", func(t *testing.T) {
+		_, _, profile := member(t, "tianyue", "L-sd2-video")
+		for _, fields := range []string{
+			`"seconds":5,"video_duration":4`, `"duration":2,"video_duration":4`,
+			`"video_duration":0`, `"video_duration":4.5`, `"video_duration":18446744073709551615`,
+		} {
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","resolution":"720p",%s}`, public, fields))
+			_, _, _, err := service.NormalizeMixedVideoDefaults(raw, "application/json", "create", []pluginruntime.VideoProfile{profile})
+			require.Error(t, err, fields)
+		}
+		for _, tc := range []struct{ key, target string }{{"google", "veo-3.1-generate-preview"}, {"xai", "grok-imagine-video-1.5"}, {"sora", "sora-2"}} {
+			channel, _, profile := member(t, tc.key, tc.target)
+			raw, _, _, err := service.NormalizeMixedVideoDefaults([]byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","resolution":"720p","video_duration":4,"duration":1}`, public)), "application/json", "create", []pluginruntime.VideoProfile{profile})
+			require.NoError(t, err)
+			_, err = service.DecodeMixedVideoCandidate(t.Context(), channel, public, "create", raw, service.VideoModelOverrides{}, 0)
+			require.ErrorContains(t, err, "Tianyue per-operation channel", tc.key)
+		}
+	})
+	t.Run("unconsumed media cannot be dropped by alias projection", func(t *testing.T) {
+		channel, _, profile := member(t, "google", "veo-3.1-generate-preview")
+		raw, _, _, err := service.NormalizeMixedVideoDefaults([]byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","seconds":8,"resolution":"720p","reference_images":["data:image/png;base64,QQ=="]}`, public)), "application/json", "create", []pluginruntime.VideoProfile{profile})
+		require.NoError(t, err)
+		_, err = service.DecodeMixedVideoCandidate(t.Context(), channel, public, "create", raw, service.VideoModelOverrides{}, 0)
+		require.Error(t, err, "Google does not consume reference_images as a primary image")
+	})
+	t.Run("Sora advertised image file alias", func(t *testing.T) {
+		channel, _, profile := member(t, "sora", "sora-2")
+		for _, field := range []string{"input_reference", "image"} {
+			t.Run(field, func(t *testing.T) {
+				var data bytes.Buffer
+				writer := multipart.NewWriter(&data)
+				require.NoError(t, writer.WriteField("model", public))
+				require.NoError(t, writer.WriteField("prompt", "animate this"))
+				require.NoError(t, writer.WriteField("seconds", "8"))
+				require.NoError(t, writer.WriteField("size", "1280x720"))
+				file, err := writer.CreateFormFile(field, "frame.png")
+				require.NoError(t, err)
+				_, err = file.Write([]byte("image-fixture"))
+				require.NoError(t, err)
+				require.NoError(t, writer.Close())
+				raw, contentType, body, err := service.NormalizeMixedVideoDefaults(data.Bytes(), writer.FormDataContentType(), "create", []pluginruntime.VideoProfile{profile})
+				require.NoError(t, err)
+				candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, public, "create", raw, service.VideoModelOverrides{}, 0, contentType)
+				t.Logf("field=%s declared.image.sources=%v normalized=%v intent=%v error=%v", field, profile.Modes[1].Inputs[0].Sources, body, candidate.Intent, err)
+				assert.NoError(t, err, "the advertised image/upload input must match the actual decoder file field")
+			})
+		}
+	})
 }

@@ -286,6 +286,10 @@ func asyncVideoCapabilityRequest(c *gin.Context) (map[string]any, []map[string]a
 // RouteAsyncVideo applies provider policy before freezing a channel. A provider
 // can inherit the Token group or override it through the existing mapping.
 func RouteAsyncVideo(c *gin.Context) {
+	if c.GetBool("async_media_mixed_video") {
+		c.Next()
+		return
+	}
 	value, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 	pinned, ok := value.(pluginruntime.PinnedEndpoint)
 	if !ok {
@@ -515,6 +519,10 @@ func AcceptAsyncVideo(c *gin.Context) {
 		return
 	}
 	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
+	if value, exists := c.Get("async_media_mixed_routing"); exists {
+		request.MixedRouting, _ = value.(*service.MixedVideoRouting)
+		request.InitialExecution = execution
+	}
 	request.Details = request.RequestDetails()
 	canonical, _ := c.Get("task_request")
 	if err := service.FreezeAsyncVideoReferenceRecovery(&request, canonical, job.ExpiresAt); err != nil {
@@ -572,7 +580,7 @@ func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request ser
 }
 
 func ExecuteAsyncVideoReferenceRetry(ctx context.Context, job model.AsyncMediaJob, task model.Task, request service.AsyncVideoRequest) error {
-	if task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.AttemptGeneration != job.AttemptGeneration || job.ReferenceRetryCount < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 {
+	if task.TaskID != job.TaskId || task.UserId != job.UserId || task.ChannelId != job.ChannelId || task.AttemptGeneration != job.AttemptGeneration || job.ReferenceRetryCount < 1 || task.Status != model.TaskStatusQueued || task.PrivateData.UpstreamTaskID != "" || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || !task.VideoRecoveryQuotaValid() {
 		return errors.New("video reference recovery reservation is unavailable")
 	}
 	return executeAsyncVideoAttempt(ctx, job, request, &task)
@@ -625,7 +633,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 	if !validOperation {
 		return errors.New("encrypted video operation is invalid")
 	}
-	handler := []gin.HandlerFunc{middleware.BodyStorageCleanup(), authenticate, middleware.PinTaskPluginEndpoint(), func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+	handler := []gin.HandlerFunc{middleware.BodyStorageCleanup(), authenticate, func(c *gin.Context) { pinAsyncVideoWorker(c, job, request) }, func(c *gin.Context) { c.Set("async_media_provider", job.Provider); FilterAsyncVideoProvider(c) }, middleware.PrepareTaskPluginEndpoint(), func(c *gin.Context) {
 		value, _ := c.Get(pluginruntime.ContextKeyPinnedPlugin)
 		pinned, ok := value.(pluginruntime.PinnedPlugin)
 		endpointValue, _ := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
@@ -673,12 +681,15 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			executionErr = err
 			return
 		}
-		policy, catalog, err := service.ResolveVideoRetryPolicy(ctx, token, job)
+		policy, catalog, err := service.ResolveVideoRetryPolicy(ctx, token, job, request.MixedRouting)
 		if err != nil {
 			executionErr = err
 			return
 		}
 		capability, _ := service.VideoPolicyCapability(catalog, job.Model)
+		if request.MixedRouting != nil {
+			capability, _ = service.MixedVideoPolicyCapability(catalog, job.Model)
+		}
 		bindingIndex := slices.IndexFunc(endpoint.Candidates, func(binding pluginruntime.ProtocolBinding) bool {
 			return binding.Plugin != nil && binding.Plugin.Meta.Key == job.Provider && binding.Protocol == "openai_video"
 		})
@@ -692,6 +703,9 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			return
 		}
 		profile, profileErr := service.EffectiveVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
+		if request.MixedRouting != nil {
+			profile, profileErr = service.EffectiveMixedVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
+		}
 		if profileErr != nil {
 			executionErr = errors.New("video provider capability changed")
 			return
@@ -705,7 +719,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		common.SetContextKey(c, constant.ContextKeyAutoGroup, job.Group)
 		policy.Group = job.Group
 		var pools []model.ImageChannelPool
-		if err := model.DB.WithContext(ctx).Where("binding_key = ?", service.ImagePoolBindingKey(policy, job.Model, service.VideoPoolResolution(videoResolution))).Find(&pools).Error; err != nil {
+		if err := model.DB.WithContext(ctx).Where("binding_key = ?", service.MediaPoolBindingKey(policy, job.Model, service.VideoPoolResolution(videoResolution), "video")).Find(&pools).Error; err != nil {
 			executionErr = err
 			return
 		}
@@ -729,7 +743,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&liveToken).Error; err != nil {
 					return err
 				}
-				if _, _, err := service.ResolveVideoRetryPolicy(ctx, liveToken, job); err != nil {
+				if _, _, err := service.ResolveVideoRetryPolicy(ctx, liveToken, job, request.MixedRouting); err != nil {
 					return err
 				}
 				var active model.Task
@@ -880,7 +894,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 	typedRejection := false
 	for changes := 0; changes < 32; {
 		if !evaluateOnly {
-			if service.VideoSubmissionRequiresReconciliation(job.Provider) {
+			if service.VideoSubmissionRequiresReconciliation(job.Provider, request.MixedRouting != nil) {
 				// A prior confirmed rejection may allow another attempt. Only a
 				// successful dispatch barrier for this attempt can retain its hold.
 				c.Set("async_media_reconciliation_dispatched", false)
@@ -996,6 +1010,43 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 				return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
 			}
 			request.Channel = *candidate
+			if request.MixedRouting != nil {
+				var token model.Token
+				if err := model.DB.WithContext(c.Request.Context()).First(&token, job.TokenId).Error; err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", 503)
+				}
+				_, catalog, err := service.MixedVideoPolicy(c.Request.Context(), token, request.MixedRouting)
+				if err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", 403)
+				}
+				capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)
+				decoded, err := service.DecodeMixedVideoCandidate(c.Request.Context(), *candidate, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+				if err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", 400)
+				}
+				if err := service.RebindMixedVideoRequest(request, decoded, job.ExpiresAt); err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "media_retry_input_unavailable", 400)
+				}
+				job.Provider = decoded.Binding.Plugin.Meta.Key
+				pinMixedVideoCandidate(c, decoded, request.MixedRouting, job.AttemptGeneration)
+				view, _, err := service.MixedVideoRequestContext(request.Body, request.ContentType, request.Operation)
+				if err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "plugin_request_invalid", 400)
+				}
+				c.Set(pluginruntime.ContextKeyProtocolRequest, pluginruntime.ProtocolRequestContext{RouteRequestContext: view, Protocol: decoded.Binding.Protocol, Operation: decoded.Binding.Operation.Name, Model: job.Model, UpstreamModel: decoded.UpstreamModel})
+				c.Set(pluginruntime.ContextKeyRouteRequest, view)
+				c.Set("task_request", decoded.Intent["requestBody"])
+				c.Set("task_action", decoded.Intent["action"])
+				c.Set("task_plugin_key", job.Provider)
+				c.Set("expected_task_plugin_key", job.Provider)
+				c.Set("platform", job.Provider)
+				c.Set("async_media_provider", job.Provider)
+				constraints := service.GetChannelConstraints(c)
+				constraints.Filters = slices.DeleteFunc(constraints.Filters, func(filter gatewaydto.ChannelFilter) bool { return filter.Kind == gatewaydto.FilterTaskPluginIdentity })
+				constraints.Pins = slices.DeleteFunc(constraints.Pins, func(pin gatewaydto.ChannelPin) bool { return pin.Source == "media_policy" })
+				constraints.AddPin(gatewaydto.ChannelPin{ChannelId: candidate.Id, Source: "media_policy", Rank: 20, RetryMode: gatewaydto.PinRetrySingleAttempt})
+				service.AppendTaskPluginIdentityFilter(c, job.Provider)
+			}
 			*retry.liveChannel = model.Channel{}
 			if err := model.DB.WithContext(c.Request.Context()).Where("id = ?", candidate.Id).Take(retry.liveChannel).Error; err != nil {
 				return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
@@ -1065,6 +1116,9 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 }
 
 func (retry *asyncVideoSubmissionRetry) decision(ctx context.Context) (mediaretry.Decision, error) {
+	if retry.request.MixedRouting != nil && retry.request.RetryFact != nil && (retry.request.RetryFact.Unknown || retry.request.RetryFact.HasOutput || retry.request.RetryFact.Accepted && !retry.request.RetryFact.Terminal) {
+		return mediaretry.Decision{Action: mediaretry.ManualReview, BlockedReason: "mixed_video_unknown_not_replayable"}, nil
+	}
 	policy, err := service.GetMediaRetryPolicy(ctx)
 	if err != nil {
 		return mediaretry.Decision{}, err
@@ -1082,7 +1136,7 @@ func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycomm
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
 		return err
 	}
-	if _, _, err := service.ResolveVideoRetryPolicy(ctx, token, *job); err != nil {
+	if _, _, err := service.ResolveVideoRetryPolicy(ctx, token, *job, request.MixedRouting); err != nil {
 		return err
 	}
 	if request.PendingDecision != nil {
@@ -1167,10 +1221,13 @@ func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycomm
 		referenceMode = "local_download"
 	}
 	updates := map[string]any{"dispatched_at": time.Now().Unix(), "quota": info.FinalPreConsumedQuota, "billing_status": "reserved", "channel_id": request.Channel.Id, "request_cipher": cipher, "channel_cipher": channelCipher}
+	if request.MixedRouting != nil {
+		updates["provider"] = job.Provider
+	}
 	if err := model.DispatchAsyncMediaJob(ctx, *job, updates, slices.Index(retry.liveChannel.GetKeys(), request.Channel.Key), referenceMode, retry.event); err != nil {
 		return err
 	}
-	if service.VideoSubmissionRequiresReconciliation(job.Provider) {
+	if service.VideoSubmissionRequiresReconciliation(job.Provider, request.MixedRouting != nil) {
 		c.Set("async_media_reconciliation_dispatched", true)
 	}
 	job.ChannelId, job.RequestCipher, job.ChannelCipher = request.Channel.Id, cipher, channelCipher

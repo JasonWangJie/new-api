@@ -353,10 +353,10 @@ func refreshImageRetryDecision(ctx context.Context, task *model.AsyncImageTask, 
 	if err != nil {
 		return checkpoint, false, fmt.Errorf("%w: %v", errImageRetryPolicyUnavailable, err)
 	}
-	if decision.Matched && mediaretry.IsResubmission(decision.Action) && (task.UpstreamTaskId != "" || task.DispatchedAt > 0) {
-		// A waiting poll rule may become a replacement rule. Re-enter the
-		// failure planner so clearing the old receipt, preserving its hold and
-		// scheduling generation commit together before another worker sends.
+	if decision.Matched && !checkpoint.Fact.HasOutput && (mediaretry.IsResubmission(decision.Action) || decision.Action == mediaretry.Stop || decision.Action == mediaretry.ManualReview) && (task.UpstreamTaskId != "" || task.DispatchedAt > 0) {
+		// A waiting poll rule may change to replacement, stop or manual review.
+		// Re-enter the failure planner so the configured action and any receipt
+		// change commit together before another worker sends or polls.
 		return checkpoint, true, nil
 	}
 	if !decision.Matched {

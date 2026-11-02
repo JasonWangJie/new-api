@@ -29,6 +29,24 @@ func PreConsumeDurableTaskBilling(c *gin.Context, preConsumedQuota int, relayInf
 	if c.GetBool("async_media_prepare") {
 		return nil
 	}
+	if preConsumedQuota == 0 && relayInfo != nil && relayInfo.TieredBillingSnapshot != nil && relayInfo.TieredBillingSnapshot.MixedVideoBilling && relayInfo.QuotaClamp == nil {
+		if err := ValidateFrozenMixedVideoBilling(relayInfo.TieredBillingSnapshot); err != nil {
+			return types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		if relayInfo.TieredBillingSnapshot.EstimatedQuotaAfterGroup != 0 {
+			return types.NewErrorWithStatusCode(fmt.Errorf("mixed video zero reservation does not match the frozen request price"), types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		// A free mixed task still owns one durable zero reservation. Running
+		// the subscription selector would manufacture a one-unit precharge.
+		session := &BillingSession{
+			relayInfo: relayInfo,
+			funding:   &WalletFunding{userId: relayInfo.UserId, durable: true, subject: relayInfo.CanvasSubject},
+			durable:   true,
+		}
+		session.syncRelayInfo()
+		relayInfo.Billing = session
+		return nil
+	}
 	return preConsumeBillingWithMode(c, preConsumedQuota, relayInfo, true)
 }
 

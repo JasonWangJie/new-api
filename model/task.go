@@ -127,6 +127,8 @@ type TaskPrivateData struct {
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
+	// CurrentAttempt is mutable execution identity; Execution retains the original provenance.
+	CurrentAttempt *VideoTaskAttempt `json:"current_attempt,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
 	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
@@ -178,6 +180,11 @@ type VideoTaskReconciliation struct {
 // VideoTaskAttempt keeps the failed native operation separate from a later
 // submission. Diagnostics are sanitized by the caller before persistence.
 type VideoTaskAttempt struct {
+	PluginKey      string               `json:"plugin_key,omitempty"`
+	PluginVersion  string               `json:"plugin_version,omitempty"`
+	PluginHash     string               `json:"plugin_hash,omitempty"`
+	UpstreamModel  string               `json:"upstream_model,omitempty"`
+	MixedVideo     bool                 `json:"mixed_video,omitempty"`
 	Generation     int64                `json:"generation"`
 	ChannelID      int                  `json:"channel_id,omitempty"`
 	Decision       *mediaretry.Decision `json:"retry_decision,omitempty"`
@@ -195,6 +202,13 @@ func (t *Task) BillingChannelID() int {
 		return t.PrivateData.BillingChannelID
 	}
 	return t.ChannelId
+}
+
+// VideoRecoveryQuotaValid retains legacy nonzero holds and permits a frozen
+// mixed retail contract whose explicit price is zero. Durable markers are still
+// checked separately by every recovery transaction.
+func (t *Task) VideoRecoveryQuotaValid() bool {
+	return t.Quota > 0 || t.Quota == 0 && t.PrivateData.CurrentAttempt != nil && t.PrivateData.CurrentAttempt.MixedVideo
 }
 
 type TaskExecutionSnapshot struct {

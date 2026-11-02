@@ -94,6 +94,8 @@ type BillingSnapshot struct {
 	QuotaPerUnit              float64          `json:"quota_per_unit"`
 	ExprVersion               int              `json:"expr_version"`
 	TaskUsageBilling          bool             `json:"task_usage_billing,omitempty"`
+	MixedVideoBilling         bool             `json:"mixed_video_billing,omitempty"`
+	MixedVideoSchemaVersion   int              `json:"mixed_video_schema_version,omitempty"`
 	UsageFacts                map[string]any   `json:"usage_facts,omitempty"`
 	TaskRequest               *RequestSnapshot `json:"task_request,omitempty"`
 }

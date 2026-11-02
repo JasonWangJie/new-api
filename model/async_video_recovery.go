@@ -28,13 +28,18 @@ func SelectAsyncVideoRecoveryChannel(ctx context.Context, job AsyncMediaJob, tas
 		if err := lockForUpdate(tx).Where("id = ?", job.ID).Take(&queued).Error; err != nil {
 			return err
 		}
-		if current.Status != TaskStatusQueued || current.AttemptGeneration != task.AttemptGeneration || queued.AttemptGeneration != task.AttemptGeneration || queued.LeaseToken != job.LeaseToken || queued.LeaseExpiresAt <= time.Now().Unix() || queued.DispatchedAt != 0 || queued.ReferenceRecoveryStage != "submit" || current.PrivateData.UpstreamTaskID != "" || queued.BillingStatus != "reserved" || current.Quota != task.Quota || current.BillingChannelID() != selected.BillingChannelID() || selected.ChannelId <= 0 || current.TaskID != queued.TaskId || current.UserId != queued.UserId || current.PrivateData.TokenId != queued.TokenId || string(current.Platform) != queued.Provider || selected.TaskID != current.TaskID || selected.UserId != current.UserId || selected.Platform != current.Platform || selected.Quota != current.Quota || selected.AttemptGeneration != current.AttemptGeneration {
+		mixed := current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo
+		if mixed && (selected.PrivateData.CurrentAttempt == nil || !selected.PrivateData.CurrentAttempt.MixedVideo || selected.PrivateData.CurrentAttempt.PluginKey != string(selected.Platform) || selected.PrivateData.CurrentAttempt.ChannelID != selected.ChannelId || selected.PrivateData.CurrentAttempt.Generation != current.AttemptGeneration || selected.PrivateData.CurrentAttempt.UpstreamModel != selected.Properties.UpstreamModelName) {
 			return ErrTaskAttemptConflict
 		}
-		if err := tx.Model(&current).Updates(map[string]any{"channel_id": selected.ChannelId, "private_data": selected.PrivateData}).Error; err != nil {
+		if current.Status != TaskStatusQueued || current.AttemptGeneration != task.AttemptGeneration || queued.AttemptGeneration != task.AttemptGeneration || queued.LeaseToken != job.LeaseToken || queued.LeaseExpiresAt <= time.Now().Unix() || queued.DispatchedAt != 0 || queued.ReferenceRecoveryStage != "submit" || current.PrivateData.UpstreamTaskID != "" || queued.BillingStatus != "reserved" || current.Quota != task.Quota || current.BillingChannelID() != selected.BillingChannelID() || selected.ChannelId <= 0 || current.TaskID != queued.TaskId || current.UserId != queued.UserId || current.PrivateData.TokenId != queued.TokenId || string(current.Platform) != queued.Provider || selected.TaskID != current.TaskID || selected.UserId != current.UserId || !mixed && selected.Platform != current.Platform || selected.Quota != current.Quota || selected.AttemptGeneration != current.AttemptGeneration {
+			return ErrTaskAttemptConflict
+		}
+		selected.PrivateData.Execution = current.PrivateData.Execution
+		if err := tx.Model(&current).Updates(map[string]any{"channel_id": selected.ChannelId, "platform": selected.Platform, "properties": selected.Properties, "action": selected.Action, "private_data": selected.PrivateData}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&queued).Updates(map[string]any{"channel_id": selected.ChannelId, "request_cipher": requestCipher, "channel_cipher": channelCipher}).Error
+		return tx.Model(&queued).Updates(map[string]any{"channel_id": selected.ChannelId, "provider": string(selected.Platform), "request_cipher": requestCipher, "channel_cipher": channelCipher}).Error
 	})
 }
 
@@ -115,13 +120,16 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		}
 		now := time.Now().Unix()
 		configuredUnknown := policyRecovery && plans[0].Decision.BlockedReason == "" && mediaretry.IsResubmission(plans[0].Decision.Action) && !plans[0].Fact.HasOutput && (plans[0].Fact.Unknown || plans[0].Fact.Accepted && !plans[0].Fact.Terminal)
+		if configuredUnknown && current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo {
+			return ErrTaskAttemptConflict
+		}
 		rejected := policyRecovery && plans[0].RejectedSubmission && currentJob.ReferenceRecoveryStage == "dispatched" && currentJob.DispatchedAt > 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
 		preparationFailed := policyRecovery && plans[0].PreparationFailed && currentJob.ReferenceRecoveryStage == "prepare" && currentJob.DispatchedAt == 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
 		unknownStage := configuredUnknown && (currentJob.Status == "submitted" || currentJob.Status == "reconciling" || currentJob.Status == "execution_unknown" || currentJob.ReferenceRecoveryStage == "dispatched" || currentJob.ReferenceRecoveryStage == "unknown")
 		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.PrivateData.VideoReconciliation != nil && !configuredUnknown || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
 			currentJob.AttemptGeneration != job.AttemptGeneration || currentJob.AttemptGeneration != current.AttemptGeneration || (!policyRecovery && currentJob.ReferenceRetryCount != 0 || currentJob.ReferenceRetryCount >= 1000) || (!rejected && !preparationFailed && !unknownStage && currentJob.Status != "submitted") || currentJob.BillingStatus != "reserved" && !(configuredUnknown && currentJob.BillingStatus == "unknown") || currentJob.RefundLogPayload != "" || currentJob.OutputObjectKey != "" || currentJob.ArtifactKeys != "" || currentJob.ExpiresAt <= now ||
 			current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId || (string(current.Platform) != currentJob.Provider || !policyRecovery && current.Platform != "drama") || len(currentJob.RequestCipher) == 0 ||
-			current.Quota <= 0 || current.Quota != currentJob.Quota || !current.PrivateData.AsyncMedia || !current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || (!rejected && !preparationFailed && !configuredUnknown && current.PrivateData.UpstreamTaskID == "") || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput ||
+			!current.VideoRecoveryQuotaValid() || current.Quota != currentJob.Quota || !current.PrivateData.AsyncMedia || !current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || (!rejected && !preparationFailed && !configuredUnknown && current.PrivateData.UpstreamTaskID == "") || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput ||
 			current.TaskID != task.TaskID || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.Quota != task.Quota || current.Properties.OriginModelName != task.Properties.OriginModelName || current.Properties.UpstreamModelName != task.Properties.UpstreamModelName || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID || currentJob.TaskId != job.TaskId || currentJob.UserId != job.UserId || currentJob.TokenId != job.TokenId || currentJob.ChannelId != job.ChannelId || currentJob.Model != job.Model {
 			return ErrTaskAttemptConflict
 		}
@@ -152,7 +160,11 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		if configuredUnknown {
 			attemptStatus = TaskStatusUnknown
 		}
-		current.PrivateData.VideoAttempts = append(current.PrivateData.VideoAttempts, VideoTaskAttempt{ChannelID: current.ChannelId, Decision: current.PrivateData.MediaRetryDecision, Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, Status: string(attemptStatus), Reason: string(diagnostic[:min(len(diagnostic), common.LocalLogContentLimit)]), StartedAt: startedAt, FinishedAt: now})
+		attempt := VideoTaskAttempt{ChannelID: current.ChannelId, Decision: current.PrivateData.MediaRetryDecision, Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, Status: string(attemptStatus), Reason: string(diagnostic[:min(len(diagnostic), common.LocalLogContentLimit)]), StartedAt: startedAt, FinishedAt: now}
+		if current.PrivateData.CurrentAttempt != nil {
+			attempt.PluginKey, attempt.PluginVersion, attempt.PluginHash, attempt.UpstreamModel, attempt.MixedVideo = current.PrivateData.CurrentAttempt.PluginKey, current.PrivateData.CurrentAttempt.PluginVersion, current.PrivateData.CurrentAttempt.PluginHash, current.PrivateData.CurrentAttempt.UpstreamModel, current.PrivateData.CurrentAttempt.MixedVideo
+		}
+		current.PrivateData.VideoAttempts = append(current.PrivateData.VideoAttempts, attempt)
 		current.PrivateData.UpstreamTaskID, current.PrivateData.ResultURL = "", ""
 		current.PrivateData.VideoReconciliation = nil
 		current.PrivateData.PollFailures = 0
@@ -236,14 +248,18 @@ func EndAsyncVideoPolicyExecution(ctx context.Context, task Task, job AsyncMedia
 		current.PrivateData.VideoReconciliation = nil
 		now := time.Now().Unix()
 		generation := current.AttemptGeneration + 1
-		if err := tx.Model(&current).Updates(map[string]any{"attempt_generation": generation, "status": TaskStatusFailure, "fail_reason": fact.Message, "progress": "100%", "finish_time": now, "updated_at": now, "private_data": current.PrivateData}).Error; err != nil {
+		taskStatus, jobStatus, stage := TaskStatusFailure, "failed", "policy_stopped_unknown"
+		if current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo && queued.DispatchedAt > 0 && (fact.Unknown || fact.Accepted && !fact.Terminal) {
+			taskStatus, jobStatus, stage = TaskStatusUnknown, "execution_unknown", "unknown"
+		}
+		if err := tx.Model(&current).Updates(map[string]any{"attempt_generation": generation, "status": taskStatus, "fail_reason": fact.Message, "progress": "100%", "finish_time": now, "updated_at": now, "private_data": current.PrivateData}).Error; err != nil {
 			return err
 		}
 		billing := queued.BillingStatus
 		if billing != "settled" && billing != "refunded" && billing != "not_billable" && billing != "failed" {
 			billing = "unknown"
 		}
-		return tx.Model(&queued).Updates(map[string]any{"attempt_generation": generation, "status": "failed", "billing_status": billing, "reference_recovery_stage": "policy_stopped_unknown", "error_message": fact.Message, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0}).Error
+		return tx.Model(&queued).Updates(map[string]any{"attempt_generation": generation, "status": jobStatus, "billing_status": billing, "reference_recovery_stage": stage, "error_message": fact.Message, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0}).Error
 	})
 }
 
@@ -274,7 +290,7 @@ func CommitAsyncVideoReferenceSubmission(ctx context.Context, job AsyncMediaJob,
 		if current.AttemptGeneration != task.AttemptGeneration || currentJob.AttemptGeneration != job.AttemptGeneration || current.AttemptGeneration != currentJob.AttemptGeneration ||
 			currentJob.LeaseToken != job.LeaseToken || currentJob.LeaseExpiresAt <= time.Now().Unix() || currentJob.ReferenceRetryCount < 1 || currentJob.ReferenceRecoveryStage != "dispatched" || currentJob.DispatchedAt <= 0 || currentJob.BillingStatus != "reserved" || string(current.Platform) != currentJob.Provider || currentJob.ExpiresAt <= time.Now().Unix() ||
 			current.Status == TaskStatusSuccess || current.Status == TaskStatusFailure || current.PrivateData.UpstreamTaskID != "" || current.PrivateData.ResultURL != "" ||
-			current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId || current.Quota <= 0 || current.Quota != currentJob.Quota ||
+			current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId || !current.VideoRecoveryQuotaValid() || current.Quota != currentJob.Quota ||
 			current.TaskID != task.TaskID || current.UserId != task.UserId || current.ChannelId != task.ChannelId || currentJob.TaskId != job.TaskId || currentJob.UserId != job.UserId || currentJob.TokenId != job.TokenId || currentJob.ChannelId != job.ChannelId {
 			return ErrTaskAttemptConflict
 		}
@@ -349,7 +365,7 @@ func MarkAsyncVideoReferenceSubmissionUnknown(ctx context.Context, job AsyncMedi
 		now := time.Now().Unix()
 		if current.AttemptGeneration <= 0 || current.AttemptGeneration != task.AttemptGeneration || currentJob.AttemptGeneration != job.AttemptGeneration || current.AttemptGeneration != currentJob.AttemptGeneration || current.Status != task.Status || current.Status == TaskStatusSuccess || current.Status == TaskStatusFailure ||
 			currentJob.LeaseToken != job.LeaseToken || currentJob.LeaseExpiresAt <= now || currentJob.ReferenceRetryCount < 1 || currentJob.ReferenceRecoveryStage != "dispatched" || currentJob.DispatchedAt <= 0 || currentJob.BillingStatus != "reserved" || string(current.Platform) != currentJob.Provider ||
-			current.PrivateData.UpstreamTaskID != "" || current.PrivateData.ResultURL != "" || current.Quota <= 0 || current.Quota != currentJob.Quota || current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId {
+			current.PrivateData.UpstreamTaskID != "" || current.PrivateData.ResultURL != "" || !current.VideoRecoveryQuotaValid() || current.Quota != currentJob.Quota || current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId {
 			return ErrTaskAttemptConflict
 		}
 		diagnostic := []rune(strings.TrimSpace(reason))

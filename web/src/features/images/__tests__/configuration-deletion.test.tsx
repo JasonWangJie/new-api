@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  fireEvent,
   cleanup,
   render,
   screen,
@@ -57,7 +58,8 @@ const cases = [
 function renderSettings(
   manage = true,
   deletion?: () => Promise<unknown>,
-  groups?: { policy: string; pool: string }
+  groups?: { policy: string; pool: string },
+  policies?: ImageAdminConfiguration['policies']
 ) {
   useAuthStore.getState().auth.setUser({
     id: 1,
@@ -71,6 +73,10 @@ function renderSettings(
     image_providers: ['openai', 'gemini'],
     media_providers: ['openai', 'gemini'],
     runtime: {
+      failed_request_retention_hours: 24,
+      account_cooldown_seconds: 30,
+      supplier_retry_capacity: 10,
+      supplier_retry_window_seconds: 60,
       async_enabled: false,
       worker_concurrency: 1,
       image_concurrency: 1,
@@ -88,8 +94,9 @@ function renderSettings(
     },
     storage_profiles: [],
     storage_providers: [],
-    policies: [
+    policies: policies ?? [
       {
+        id: 71,
         group: groups?.policy ?? 'default',
         platform: 'gemini',
         pool_mode: 'model_resolution',
@@ -111,16 +118,42 @@ function renderSettings(
       priority: 0,
     })),
   }
-  vi.mocked(imageRequest).mockImplementation(async (url, method) => {
+  vi.mocked(imageRequest).mockImplementation(async (url, method, body) => {
     if (url === '/api/option/images' && method === 'GET') return config
     if (url.startsWith('/api/option/images/pool/options?')) {
       return { models: [], channels: [] }
     }
-    if (url === '/api/option/images/policy' && method === 'PUT') return null
+    if (url === '/api/option/images/policy' && method === 'PUT') {
+      const input = body as ImageAdminConfiguration['policies'][number]
+      const saved = {
+        ...input,
+        id: input.id || 900,
+        version: input.version + 1,
+      }
+      config = {
+        ...config,
+        policies: [
+          ...config.policies.filter(
+            (policy) =>
+              policy.group !== input.group || policy.platform !== input.platform
+          ),
+          saved,
+        ],
+      }
+      return saved
+    }
     if (method === 'DELETE') {
       await deletion?.()
+      const input = body as ImageAdminConfiguration['policies'][number]
       config = url.endsWith('/policy')
-        ? { ...config, policies: [] }
+        ? {
+            ...config,
+            policies: config.policies.filter(
+              (policy) =>
+                policy.group !== input.group ||
+                policy.platform !== input.platform
+            ),
+          }
         : { ...config, pools: [] }
       return null
     }
@@ -254,7 +287,11 @@ test.each(cases)(
     expect(requests).toHaveLength(1)
     expect(requests[0]).toEqual(
       tab === 'Image policies'
-        ? [url, 'DELETE', { group: 'default', platform: 'gemini', version: 3 }]
+        ? [
+            url,
+            'DELETE',
+            { id: 71, group: 'default', platform: 'gemini', version: 3 },
+          ]
         : [url, 'DELETE', { expected_ids: [111, 112] }]
     )
     finish()
@@ -267,6 +304,118 @@ test.each(cases)(
       })
     ).not.toBeInTheDocument()
     expect(toast.success).toHaveBeenCalledWith('Deleted')
+  }
+)
+
+test.each(['default', 'premium'])(
+  'deleting default mixed invalidates only its editor while %s is selected',
+  async (selectedGroup) => {
+    let finishDeletion: () => void = () => undefined
+    const deletion = new Promise<void>((resolve) => {
+      finishDeletion = resolve
+    })
+    const image = { id: 'gpt-image-2', media_type: 'image' }
+    const video = {
+      id: 'grok-imagine-video',
+      media_type: 'video',
+      video_overrides: {},
+    }
+    const policies = ['default', 'premium'].map((group, index) => ({
+      id: 81 + index,
+      group,
+      platform: 'mixed',
+      pool_mode: 'model_resolution',
+      enabled: true,
+      async_enabled: true,
+      models: JSON.stringify([image, video]),
+      version: 3 + index,
+    }))
+    renderSettings(true, () => deletion, undefined, policies)
+    const user = userEvent.setup()
+    await user.click(await screen.findByRole('tab', { name: 'Image policies' }))
+    await user.click(
+      within(
+        screen.getByRole('row', {
+          name: new RegExp(`${selectedGroup} Mixed scheduling`),
+        })
+      ).getByRole('button', { name: 'Edit' })
+    )
+    const catalog = screen.getByRole('textbox', { name: 'Model capabilities' })
+    const save = screen.getByRole('button', { name: 'Save' })
+    const form = save.closest('form')
+    if (!form) throw new Error('Missing policy form')
+    const draft = JSON.stringify([{ ...image, label: 'Selected draft' }])
+    fireEvent.change(catalog, { target: { value: draft } })
+    await user.click(
+      within(
+        screen.getByRole('row', { name: /default Mixed scheduling/ })
+      ).getByRole('button', { name: 'Delete' })
+    )
+    await user.click(
+      within(
+        screen.getByRole('alertdialog', { name: 'Delete platform policy' })
+      ).getByRole('button', { name: 'Delete' })
+    )
+    expect(save).toBeDisabled()
+    expect(catalog).toBeDisabled()
+    fireEvent.submit(form)
+    expect(
+      vi.mocked(imageRequest).mock.calls.some(([, method]) => method === 'PUT')
+    ).toBe(false)
+    finishDeletion()
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('row', { name: /default Mixed scheduling/ })
+      ).not.toBeInTheDocument()
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Platform' })).toBeEnabled()
+    )
+    if (selectedGroup === 'default') {
+      expect(catalog).toHaveValue('[]')
+      expect(save).toBeDisabled()
+      fireEvent.submit(form)
+      expect(
+        vi
+          .mocked(imageRequest)
+          .mock.calls.some(([, method]) => method === 'PUT')
+      ).toBe(false)
+      await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+      await user.click(screen.getByRole('option', { name: 'openai' }))
+      await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+      await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+      fireEvent.change(catalog, { target: { value: JSON.stringify([image]) } })
+      await user.click(save)
+      await waitFor(() =>
+        expect(imageRequest).toHaveBeenCalledWith(
+          '/api/option/images/policy',
+          'PUT',
+          expect.objectContaining({
+            id: 0,
+            version: 0,
+            models: JSON.stringify([image]),
+          })
+        )
+      )
+    } else {
+      expect(catalog).toHaveValue(draft)
+      await user.click(save)
+      await waitFor(() =>
+        expect(imageRequest).toHaveBeenCalledWith(
+          '/api/option/images/policy',
+          'PUT',
+          expect.objectContaining({
+            id: 82,
+            group: 'premium',
+            version: 4,
+            models: JSON.stringify([
+              { ...image, label: 'Selected draft' },
+              video,
+            ]),
+          })
+        )
+      )
+    }
   }
 )
 

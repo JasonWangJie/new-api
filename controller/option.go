@@ -190,6 +190,10 @@ func UpdateOption(c *gin.Context) {
 		})
 		return
 	}
+	if option.Key == billing_setting.MixedVideoBillingExprOption {
+		mixedVideoConfigurationMu.Lock()
+		defer mixedVideoConfigurationMu.Unlock()
+	}
 	switch option.Value.(type) {
 	case bool:
 		option.Value = common.Interface2String(option.Value.(bool))
@@ -426,6 +430,25 @@ func UpdateOption(c *gin.Context) {
 				common.ApiErrorMsg(c, fmt.Sprintf("模型 %s 的计费表达式无效: %v", modelName, err))
 				return
 			}
+		}
+	case billing_setting.MixedVideoBillingExprOption:
+		var expressions map[string]string
+		if err = common.UnmarshalJsonStr(option.Value.(string), &expressions); err != nil || expressions == nil {
+			common.ApiErrorMsg(c, "mixed video billing expressions must be a JSON object")
+			return
+		}
+		for name, expression := range expressions {
+			if err = service.ValidateImageModelName(name); err == nil {
+				err = billing_setting.ValidateMixedVideoBillingExpr(expression)
+			}
+			if err != nil {
+				common.ApiErrorMsg(c, fmt.Sprintf("mixed video model %s: %v", name, err))
+				return
+			}
+		}
+		if err = service.ValidateMixedVideoPricing(c.Request.Context(), expressions); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
 		}
 	case billing_setting.PluginBillingExprOption:
 		var expressions map[string]string

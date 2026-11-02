@@ -1,3 +1,20 @@
+const MODELS_30 = ["veo-3.0-generate-001", "veo-3.0-fast-generate-001"];
+const MODELS_31 = ["veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"];
+
+function videoModes(duration, resolutions) {
+  const dimensions = {
+    duration,
+    resolutions,
+    defaultResolution: "720p",
+    aspectRatios: ["16:9", "9:16"],
+    defaultAspectRatio: "16:9",
+  };
+  return [
+    { name: "text_to_video", ...dimensions },
+    { name: "image_to_video", ...dimensions, inputs: [{ name: "image", kind: "image", sources: ["data_uri", "upload"], maxItems: 1, required: true }] },
+  ];
+}
+
 export const meta = {
   videoRetryInputs: [
     {"path": "/image", "kind": "image"},
@@ -12,13 +29,17 @@ export const meta = {
     en: "Google Veo video generation on the Gemini API (text-to-video and image-to-video)",
     zh: "Google Veo 视频生成（文生视频、图生视频），Gemini API 版本",
   },
-  version: "1.0.3",
+  version: "1.0.5",
   author: { name: "QuantumNous" },
   channelTypes: [24],
-  models: ["veo-3.0-generate-001", "veo-3.0-fast-generate-001", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],
+  models: [...MODELS_30, ...MODELS_31],
+  videoProfiles: [
+    { models: MODELS_30, modes: videoModes({ values: [8], default: 8 }, ["720p", "1080p"]) },
+    { models: MODELS_31, modes: videoModes({ values: [4, 6, 8], default: 8 }, ["720p", "1080p", "4k"]) },
+  ],
   fetchMode: "per_task",
   usageSchema: {
-    // Requested video duration in seconds. Allowed values: 4, 6, 8.
+    // Veo 3.0 uses eight seconds; Veo 3.1 supports four, six, or eight.
     seconds: {
       type: "number",
       unit: "second",
@@ -99,6 +120,8 @@ function sizeParts(size) {
 }
 
 function resolutionForSize(size) {
+  const resolution = String(size || "").toLowerCase();
+  if (["720p", "1080p", "4k"].includes(resolution)) return resolution;
   const parts = sizeParts(size);
   if (!parts) return "720p";
   const max = Math.max(parts[0], parts[1]);
@@ -145,17 +168,40 @@ function imageInput(value, files) {
   return { inlineData: { mimeType: mime, data: value } };
 }
 
+function videoParameters(req, model) {
+  if (req.metadata !== undefined && (!req.metadata || typeof req.metadata !== "object" || Array.isArray(req.metadata)))
+    throw new Error("metadata must be an object");
+  const params = Object.assign({}, req.metadata || {});
+  if (req.seconds !== undefined && req.duration !== undefined && Number(req.seconds) !== Number(req.duration))
+    throw new Error("seconds and duration must match");
+  const durations = [req.seconds, req.duration, req.durationSeconds, params.seconds, params.duration, params.durationSeconds].filter((value) => value !== undefined);
+  const seconds = durations.length ? Number(durations[0]) : 8;
+  if (durations.some((value) => Number(value) !== seconds)) throw new Error("video duration aliases must match");
+  const classic = MODELS_30.includes(model);
+  if (!(classic ? [8] : [4, 6, 8]).includes(seconds))
+    throw new Error(classic ? "seconds must be 8 for Veo 3.0" : "seconds must be one of 4, 6, or 8");
+  const resolution = String(req.resolution || params.resolution || resolutionForSize(req.size)).toLowerCase();
+  if (!(classic ? ["720p", "1080p"] : ["720p", "1080p", "4k"]).includes(resolution))
+    throw new Error(classic ? "resolution must be 720p or 1080p for Veo 3.0" : "resolution must be one of 720p, 1080p, or 4k");
+  const aspectRatio = trimmed(req.aspect_ratio || req.aspectRatio || req.ratio || params.aspectRatio || aspectForSize(req.size));
+  if (aspectRatio !== "16:9" && aspectRatio !== "9:16") throw new Error("aspect_ratio must be 16:9 or 9:16");
+  // Gemini's higher-resolution generation requires the full eight-second clip.
+  if (resolution !== "720p" && seconds !== 8) throw new Error("1080p and 4k resolution require 8 seconds");
+  if (classic && resolution === "1080p" && aspectRatio !== "16:9") throw new Error("Veo 3.0 1080p requires aspect_ratio 16:9");
+  params.durationSeconds = seconds;
+  delete params.seconds;
+  delete params.duration;
+  params.resolution = resolution;
+  params.aspectRatio = aspectRatio;
+  params.numberOfVideos = 1;
+  return params;
+}
+
 function converted(ctx) {
   const req = ctx.requestBody || {};
-  const metadata = Object.assign({}, req.metadata || {});
-  const params = Object.assign({}, metadata);
-  if (Number(req.duration) > 0) params.durationSeconds = Number(req.duration);
-  if (!params.resolution && req.size) params.resolution = resolutionForSize(req.size);
-  if (!params.aspectRatio && req.size) params.aspectRatio = aspectForSize(req.size);
-  if (params.resolution) params.resolution = String(params.resolution).toLowerCase();
-  params.numberOfVideos = 1;
+  const params = videoParameters(req, ctx.upstreamModel || ctx.model);
   const instance = { prompt: req.prompt };
-  const image = imageInput((req.images || [])[0], ctx.files);
+  const image = imageInput((req.images || [])[0] || req.image || req.input_reference, ctx.files);
   if (image) instance.image = image;
   return { body: { instances: [instance], parameters: params }, action: image ? "image_to_video" : "text_to_video" };
 }
@@ -168,7 +214,7 @@ function version(ctx) {
 export function buildSubmitRequest(ctx) {
   const result = converted(ctx);
   return {
-    url: ctx.baseUrl + "/" + version(ctx) + "/models/" + ctx.upstreamModel + ":predictLongRunning",
+    url: ctx.baseUrl + "/" + version(ctx) + "/models/" + (ctx.upstreamModel || ctx.model) + ":predictLongRunning",
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "x-goog-api-key": ctx.apiKey },
     body: result.body,
@@ -189,12 +235,8 @@ export function parseSubmitResponse(ctx, resp) {
 }
 
 export function extractUsage(ctx) {
-  const req = ctx.requestBody || {};
-  const metadata = req.metadata || {};
-  let seconds = Number(req.duration);
-  if (!Number.isFinite(seconds) || seconds <= 0) seconds = 8;
-  const resolution = String(metadata.resolution || resolutionForSize(req.size) || "720p").toLowerCase();
-  return { seconds: seconds, resolution: resolution };
+  const params = videoParameters(ctx.requestBody || {}, ctx.upstreamModel || ctx.model);
+  return { seconds: params.durationSeconds, resolution: params.resolution };
 }
 
 export function extractUsageOnComplete() {
@@ -252,7 +294,7 @@ export const protocols = {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
       const req = ctx.body.value;
       if (!req || typeof req !== "object" || Array.isArray(req)) throw new Error("request body must be an object");
-      const model = trimmed(req.model);
+      const model = trimmed(ctx.model || req.model);
       if (!model) throw new Error("model is required");
       if (req.input !== undefined && typeof req.input !== "string" && !Array.isArray(req.input)) throw new Error("input must be a string or array");
       if (req.images !== undefined && !Array.isArray(req.images)) throw new Error("images must be an array");
@@ -273,6 +315,10 @@ export const protocols = {
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.duration = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.duration = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
+      for (const name of ["aspect_ratio", "aspectRatio", "ratio"]) {
+        if (Object.prototype.hasOwnProperty.call(req, name)) requestBody[name] = req[name];
+      }
+      videoParameters(requestBody, ctx.upstreamModel || ctx.model || model);
       return { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
     },
     renderEvents: function (ctx, task, previousState) {
@@ -330,7 +376,7 @@ protocols.openai_video = {
   decodeRequest: function (ctx) {
     if (!ctx.body || (ctx.body.kind !== "json" && ctx.body.kind !== "multipart")) throw new Error("JSON or multipart body required");
     let req;
-    let hasInputReferenceFile = false;
+    let inputReferenceFile = null;
     if (ctx.body.kind === "json") {
       if (!ctx.body.value || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
       req = Object.assign({}, ctx.body.value);
@@ -346,9 +392,10 @@ protocols.openai_video = {
         req[name] = first(name);
       }
       for (const file of ctx.body.files || []) {
-        if (file.field !== "input_reference") throw new Error("unexpected file field: " + file.field);
-        if (hasInputReferenceFile) throw new Error("input_reference must be provided once");
-        hasInputReferenceFile = true;
+        if (file.field !== "input_reference" && file.field !== "image") throw new Error("unexpected file field: " + file.field);
+        if (inputReferenceFile) throw new Error("image or input_reference must be provided once");
+        if (!trimmed(file.ref)) throw new Error("uploaded image reference is missing");
+        inputReferenceFile = file;
       }
       if (req.metadata !== undefined) {
         let parsed;
@@ -363,24 +410,17 @@ protocols.openai_video = {
       if (req.seconds !== undefined) req.seconds = Number(req.seconds);
       else if (req.duration !== undefined) req.seconds = Number(req.duration);
     }
-    const seconds = req.seconds === undefined ? req.duration : req.seconds;
-    if (seconds !== undefined) {
-      const n = Number(seconds);
-      if (n !== 4 && n !== 6 && n !== 8) throw new Error("seconds must be one of 4, 6, or 8");
-      req.duration = n;
-    }
-    const providedResolution = req.resolution !== undefined ? req.resolution : req.metadata && req.metadata.resolution;
-    if (providedResolution !== undefined && providedResolution !== "") {
-      const resolution = String(providedResolution).toLowerCase();
-      if (resolution !== "720p" && resolution !== "1080p" && resolution !== "4k") throw new Error("resolution must be one of 720p, 1080p, or 4k");
-    }
-    if (hasInputReferenceFile) {
-      req.images = [{ __fileRef: "request_file:input_reference", encoding: "base64", maxBytes: 20971520 }];
+    const params = videoParameters(req, ctx.upstreamModel || ctx.model);
+    req.duration = params.durationSeconds;
+    req.resolution = params.resolution;
+    req.aspect_ratio = params.aspectRatio;
+    if (inputReferenceFile) {
+      req.images = [{ __fileRef: inputReferenceFile.ref, encoding: "base64", maxBytes: 20971520 }];
     }
     return {
       kind: "submit",
       model: ctx.model,
-      action: hasInputReferenceFile || req.input_reference || req.image ? "image_to_video" : "text_to_video",
+      action: inputReferenceFile || req.input_reference || req.image || (req.images || []).length ? "image_to_video" : "text_to_video",
       requestBody: Object.assign({}, req, { model: ctx.model }),
     };
   },

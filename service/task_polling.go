@@ -1421,6 +1421,9 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 }
 
 func taskUsesMeasuredVideoBilling(task *model.Task) bool {
+	if task != nil && task.PrivateData.BillingContext != nil && task.PrivateData.BillingContext.TieredSnapshot != nil && task.PrivateData.BillingContext.TieredSnapshot.MixedVideoBilling {
+		return false
+	}
 	return task != nil && task.PrivateData.UpstreamAsync != nil &&
 		task.PrivateData.UpstreamAsync.MediaType == "video" &&
 		task.PrivateData.UpstreamAsync.Poll.Response.ActualSecondsPath != ""

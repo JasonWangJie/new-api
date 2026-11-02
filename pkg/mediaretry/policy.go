@@ -99,8 +99,9 @@ type Fact struct {
 	Deadline                int64                 `json:"deadline"`
 }
 
-// VideoFailureEvidence is produced only by host protocol validation. Error
-// keywords cannot grant either an ambiguous submission replay or a legacy path.
+// VideoFailureEvidence is produced only by host protocol validation for
+// built-in recovery. Custom rules authorize actions without rewriting this
+// evidence or granting a legacy path.
 type VideoFailureEvidence struct {
 	LegacySubmissionRejected bool  `json:"legacy_submission_rejected,omitempty"`
 	SubmissionStartedAt      int64 `json:"submission_started_at,omitempty"`

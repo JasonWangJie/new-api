@@ -160,11 +160,7 @@ export function ImageRoutingPreview(props: {
                 platform: value,
                 ...(value === 'mixed'
                   ? {
-                      media_type: 'image',
                       execution_mode: 'async',
-                      operation: 'text_to_image',
-                      resolution: '1K',
-                      seconds: '',
                     }
                   : {}),
               }))
@@ -174,7 +170,7 @@ export function ImageRoutingPreview(props: {
           <ImageSelect
             label={t('Media type')}
             value={values.media_type}
-            disabled={preview.isPending || values.platform === 'mixed'}
+            disabled={preview.isPending}
             options={[
               { value: 'image', label: t('Image') },
               { value: 'video', label: t('Video') },
@@ -183,7 +179,8 @@ export function ImageRoutingPreview(props: {
               setValues((previous) => ({
                 ...previous,
                 media_type: value,
-                execution_mode: value === 'video' ? 'async' : previous.execution_mode,
+                execution_mode:
+                  value === 'video' ? 'async' : previous.execution_mode,
                 operation:
                   value === 'image' ? 'text_to_image' : 'text_to_video',
                 resolution: value === 'image' ? '1K' : '',
@@ -194,7 +191,11 @@ export function ImageRoutingPreview(props: {
           <ImageSelect
             label={t('Execution mode')}
             value={values.execution_mode}
-            disabled={preview.isPending || values.media_type === 'video' || values.platform === 'mixed'}
+            disabled={
+              preview.isPending ||
+              values.media_type === 'video' ||
+              values.platform === 'mixed'
+            }
             options={[
               { value: 'sync', label: t('Synchronous image API') },
               { value: 'async', label: t('Background task API') },
@@ -270,8 +271,10 @@ export function ImageRoutingPreview(props: {
           {t('Preview routing')}
         </Button>
       </form>
-      <p className='mt-3 text-sm text-muted-foreground'>
-        {t('Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.')}
+      <p className='text-muted-foreground mt-3 text-sm'>
+        {t(
+          'Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.'
+        )}
       </p>
       {preview.isPending && <LoadingState size='sm' />}
       {preview.error && (

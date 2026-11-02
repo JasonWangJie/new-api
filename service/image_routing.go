@@ -309,15 +309,66 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			routingGroups = []string{policy.Group}
 		}
 	}
+	var videoParameters map[string]any
+	if input.Platform == "mixed" && input.MediaType == "video" && capabilityIndex >= 0 {
+		profiles := make([]jsplugin.VideoProfile, 0)
+		for _, group := range routingGroups {
+			poolPolicy := policy
+			poolPolicy.Group = group
+			variants, err := MixedVideoModelProfiles(ctx, poolPolicy, input.Model, catalog[capabilityIndex].VideoOverrides, true)
+			if err != nil {
+				continue
+			}
+			for _, profile := range variants {
+				modes := make([]jsplugin.VideoModeProfile, 0)
+				for _, mode := range profile.Modes {
+					if mode.Name == input.Operation {
+						mode.Inputs = nil // Preview checks dimensions, without submitting reference material.
+						modes = append(modes, mode)
+					}
+				}
+				profile.Modes = modes
+				profiles = append(profiles, profile)
+			}
+		}
+		parameters := map[string]any{"prompt": "routing preview"}
+		if input.Resolution != "" {
+			parameters["resolution"] = input.Resolution
+		}
+		if input.Seconds != nil {
+			parameters["seconds"] = *input.Seconds
+		}
+		raw, err := common.Marshal(parameters)
+		if err != nil {
+			return preview, err
+		}
+		operation := "create"
+		if input.Operation == "edit_video" {
+			operation = "edit"
+		} else if input.Operation == "extend_video" {
+			operation = "extend"
+		}
+		_, _, videoParameters, err = NormalizeMixedVideoDefaults(raw, "application/json", operation, profiles)
+		if err != nil {
+			policyReasons = append(policyReasons, "video_parameters_not_supported")
+		} else {
+			input.Resolution, _ = videoParameters["resolution"].(string)
+			if seconds, ok := videoParameters["seconds"].(float64); ok {
+				input.Seconds = common.GetPointer(int(seconds))
+			}
+			preview.Resolution, preview.Seconds = input.Resolution, input.Seconds
+		}
+	}
 	preview.Reasons, preview.RoutingGroups = policyReasons, routingGroups
 	for _, group := range routingGroups {
 		poolPolicy := policy
 		poolPolicy.Group = group
+		groupReasons := slices.Clone(policyReasons)
 		resolution := input.Resolution
 		if input.MediaType == "video" {
 			resolution = VideoPoolResolution(resolution)
 		}
-		bindingKey := ImagePoolBindingKey(poolPolicy, input.Model, resolution)
+		bindingKey := MediaPoolBindingKey(poolPolicy, input.Model, resolution, input.MediaType)
 		if len(routingGroups) == 1 {
 			preview.BindingKey = bindingKey
 		}
@@ -329,8 +380,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			bindings = nil
 		}
 		if input.Platform == "mixed" && len(bindings) == 0 {
-			policyReasons = append(policyReasons, "mixed_pool_missing")
-			preview.Reasons = policyReasons
+			groupReasons = append(groupReasons, "mixed_pool_missing")
 		}
 		preview.BindingFound = preview.BindingFound || len(bindings) > 0
 		var abilities []model.Ability
@@ -366,7 +416,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			}
 		}
 		for _, channel := range channels {
-			candidate := MediaRoutingPreviewChannel{ChannelID: channel.Id, Group: group, BindingKey: bindingKey, BindingFound: len(bindings) > 0, Name: channel.Name, UpstreamModel: input.Model, Reasons: slices.Clone(policyReasons)}
+			candidate := MediaRoutingPreviewChannel{ChannelID: channel.Id, Group: group, BindingKey: bindingKey, BindingFound: len(bindings) > 0, Name: channel.Name, UpstreamModel: input.Model, Reasons: slices.Clone(groupReasons)}
 			if channel.Status != common.ChannelStatusEnabled {
 				candidate.Reasons = append(candidate.Reasons, "channel_disabled")
 			}
@@ -414,17 +464,38 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				if !mediaChannelSupportsVideoPlatform(&channel, input.Model, input.Platform) {
 					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
 				}
-				for _, binding := range mediaVideoCandidates(input.Model) {
-					if binding.Plugin == nil || binding.Plugin.Meta.Key != input.Platform {
+				videoBindings := mediaVideoCandidates(input.Model)
+				if input.Platform == "mixed" {
+					operation := "create"
+					if input.Operation == "edit_video" {
+						operation = "edit"
+					} else if input.Operation == "extend_video" {
+						operation = "extend"
+					}
+					binding, _, err := MixedVideoChannelBinding(channel, input.Model, operation)
+					videoBindings = nil
+					if err == nil {
+						videoBindings = []jsplugin.ProtocolBinding{binding}
+					} else {
+						candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
+					}
+				}
+				for _, binding := range videoBindings {
+					if binding.Plugin == nil || input.Platform != "mixed" && binding.Plugin.Meta.Key != input.Platform {
 						continue
 					}
+					candidate.Provider, candidate.Protocol = binding.Plugin.Meta.Key, binding.Protocol
 					var overrides VideoModelOverrides
 					if capabilityIndex >= 0 {
 						overrides = catalog[capabilityIndex].VideoOverrides
 					}
 					profile, err := EffectiveVideoProfile(binding, input.Model, overrides)
+					if input.Platform == "mixed" {
+						profile, err = EffectiveMixedVideoProfile(binding, input.Model, overrides)
+					}
 					if err != nil {
-						return preview, err
+						candidate.Reasons = append(candidate.Reasons, "video_parameters_not_supported")
+						break
 					}
 					modeIndex := slices.IndexFunc(profile.Modes, func(mode jsplugin.VideoModeProfile) bool { return mode.Name == input.Operation })
 					if modeIndex < 0 {
@@ -442,6 +513,9 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					}
 					if input.Seconds != nil {
 						parameters["seconds"] = *input.Seconds
+					}
+					if videoParameters != nil {
+						parameters = videoParameters
 					}
 					if err := ValidateVideoProfileRequest(profile, input.Operation, parameters, nil); err != nil {
 						candidate.Reasons = append(candidate.Reasons, "video_parameters_not_supported")
@@ -477,6 +551,9 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			}
 		}
 	}
+	if input.Platform == "mixed" && !preview.BindingFound {
+		preview.Reasons = append(preview.Reasons, "mixed_pool_missing")
+	}
 	if len(preview.Eligible) > 0 {
 		priority := preview.Eligible[0].Priority
 		for _, channel := range preview.Eligible {
@@ -507,6 +584,14 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 // for a configured group and media platform. A saved policy catalog limits the
 // selectable models; without one, enabled channel abilities form the catalog.
 func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (ImagePoolSelectionOptions, error) {
+	mediaType := ""
+	if platform == "mixed" {
+		mediaType = "image"
+	}
+	return GetMediaPoolSelectionOptions(ctx, group, platform, mediaType)
+}
+
+func GetMediaPoolSelectionOptions(ctx context.Context, group, platform, mediaType string) (ImagePoolSelectionOptions, error) {
 	options := ImagePoolSelectionOptions{
 		Models:   make([]ImagePoolModelOption, 0),
 		Channels: make([]ImagePoolChannelOption, 0),
@@ -530,6 +615,12 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 			return options, err
 		}
 		for _, capability := range catalog {
+			if platform == "mixed" && mediaType == "video" && capability.MediaType != "video" {
+				continue
+			}
+			if mediaType != "" && !capability.MatchesMedia(capability.Id, mediaType) {
+				continue
+			}
 			if !configuredModelSet[capability.Id] {
 				configuredModels = append(configuredModels, capability.Id)
 				configuredModelSet[capability.Id] = true
@@ -586,7 +677,7 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 	for _, modelName := range configuredModels {
 		ids := slices.Clone(abilityChannels[modelName])
 		routingModel := ratio_setting.RoutingMatchModelName(modelName)
-		videoModel := MediaPlatformSupportsVideoModel(modelName, platform)
+		videoModel := mediaType == "video" || slices.Contains(mediaTypes[modelName], "video") || MediaPlatformSupportsVideoModel(modelName, platform)
 		if videoModel {
 			ids = append(ids, abilityChannels[routingModel]...)
 		} else if len(ids) == 0 {
@@ -594,6 +685,7 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 		}
 		modelChannels := make([]int, 0, len(ids))
 		hasImageChannel := false
+		hasVideoChannel := false
 		seen := make(map[int]bool)
 		for _, channelId := range ids {
 			channel := channelsById[channelId]
@@ -614,19 +706,24 @@ func GetImagePoolSelectionOptions(ctx context.Context, group, platform string) (
 					}
 				}
 			}
-			if !imageSupported && (platform == "mixed" || !mediaChannelSupportsVideoPlatform(channel, modelName, platform)) {
+			videoSupported := mediaChannelSupportsVideoPlatform(channel, modelName, platform)
+			if mediaType == "video" && !videoSupported || mediaType == "image" && !imageSupported || mediaType == "" && !imageSupported && !videoSupported {
 				continue
 			}
 			seen[channelId] = true
 			selectedChannels[channelId] = true
 			modelChannels = append(modelChannels, channelId)
 			hasImageChannel = hasImageChannel || imageSupported
+			hasVideoChannel = hasVideoChannel || videoSupported
 		}
 		if len(modelChannels) == 0 {
 			continue
 		}
 		if len(policies) == 0 && hasImageChannel && !slices.Contains(mediaTypes[modelName], "image") {
 			mediaTypes[modelName] = append(mediaTypes[modelName], "image")
+		}
+		if len(policies) == 0 && hasVideoChannel && !slices.Contains(mediaTypes[modelName], "video") {
+			mediaTypes[modelName] = append(mediaTypes[modelName], "video")
 		}
 		slices.Sort(modelChannels)
 		label := labels[modelName]
@@ -652,6 +749,31 @@ func ImagePoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution st
 		resolution = ""
 	}
 	return ImageIdentityHash(policy.Group, policy.Platform, policy.PoolMode, modelName, resolution)
+}
+
+// MediaPoolBindingKey isolates new mixed video bindings from every legacy pool.
+func MediaPoolBindingKey(policy model.ImageGroupPolicy, modelName, resolution, mediaType string) string {
+	if policy.Platform != "mixed" || mediaType != "video" {
+		return ImagePoolBindingKey(policy, modelName, resolution)
+	}
+	if policy.PoolMode == "resolution" {
+		modelName = ""
+	} else if policy.PoolMode == "model" {
+		resolution = ""
+	}
+	return ImageIdentityHash("mixed-video-pool", policy.Group, policy.Platform, policy.PoolMode, modelName, resolution)
+}
+
+// PoolMediaType preserves inference for historical provider-specific video pools.
+func PoolMediaType(pool model.ImageChannelPool) string {
+	if pool.Platform != "mixed" {
+		return ""
+	}
+	policy := model.ImageGroupPolicy{Group: pool.Group, Platform: pool.Platform, PoolMode: pool.Mode}
+	if pool.BindingKey == MediaPoolBindingKey(policy, pool.Model, pool.Resolution, "video") {
+		return "video"
+	}
+	return "image"
 }
 
 func ResolveImageChannelUpstreamModel(channel model.Channel, modelName string) (string, error) {

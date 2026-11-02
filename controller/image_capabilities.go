@@ -389,7 +389,82 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 		}
 	}
-	versionFacts = append(versionFacts, videoReadiness, videoModels)
+	mixedPolicy, mixedCatalog, err := service.ResolveImagePolicy(ctx, token, "mixed")
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	mixedGroups := []string{mixedPolicy.Group}
+	if mixedPolicy.Group == "auto" {
+		groups, parseErr := token.GetAutoGroups()
+		if parseErr != nil {
+			mixedGroups = nil
+		} else if len(groups) > 0 {
+			mixedGroups = service.FilterUserTokenAutoGroups(owner.Group, groups)
+		} else {
+			mixedGroups = service.GetUserAutoGroup(owner.Group)
+		}
+	}
+	if mixedPolicy.Id > 0 {
+		for _, capability := range mixedCatalog {
+			if capability.MediaType != "video" || token.ModelLimitsEnabled && !token.GetModelLimitsMap()[capability.Id] {
+				continue
+			}
+			variants := make([]pluginruntime.VideoProfile, 0)
+			for _, group := range mixedGroups {
+				if !service.GroupInUserUsableGroups(owner.Group, group) {
+					continue
+				}
+				poolPolicy := mixedPolicy
+				poolPolicy.Group = group
+				profiles, profileErr := service.MixedVideoModelProfiles(ctx, poolPolicy, capability.Id, capability.VideoOverrides, true)
+				if profileErr == nil {
+					variants = append(variants, profiles...)
+				}
+			}
+			reason := ""
+			switch {
+			case !valid:
+				reason = "Token is unavailable"
+			case !mixedPolicy.Enabled || !mixedPolicy.AsyncEnabled:
+				reason = "Mixed video policy is disabled"
+			case !videoReadiness.Ready:
+				reason = "Asynchronous video service is unavailable"
+			case len(variants) == 0:
+				reason = "No executable mixed video channel is available"
+			}
+			profile := service.GenericVideoProfile(capability.Id)
+			maximumDuration := videoProfileMaxDuration(profile)
+			if len(variants) > 0 {
+				profile = variants[0]
+				maximumDuration = 0
+				for _, variant := range variants {
+					maximumDuration = max(maximumDuration, videoProfileMaxDuration(variant))
+				}
+			}
+			pricingStatus := "needs_configuration"
+			if expression, configured := billing_setting.GetMixedVideoBillingExpr(capability.Id); configured {
+				pricingStatus = "invalid_configuration"
+				if len(variants) > 0 && billing_setting.ValidateMixedVideoBillingExpr(expression) == nil && service.ValidateMixedVideoProfilePricing(expression, variants) == nil {
+					pricingStatus = "configured"
+				}
+			}
+			if pricingStatus == "invalid_configuration" && reason == "" {
+				reason = "Pricing configuration is invalid"
+			}
+			label := capability.Label
+			if label == "" {
+				label = capability.Id
+			}
+			videoModels = append(videoModels, gin.H{
+				"id": capability.Id, "label": label, "provider": "", "routing_platform": "mixed",
+				"media_type": "video", "protocol": "openai_video", "mode": "async", "available": reason == "", "availability_reason": reason,
+				"pricing_status": pricingStatus, "capability": profile, "capability_variants": variants, "max_duration_seconds": maximumDuration,
+				"supported_parameters": []string{"model", "prompt", "seconds", "duration", "size", "resolution", "aspect_ratio", "generate_audio", "image", "input_reference", "last_frame", "reference_images", "reference_videos", "reference_audios", "provider_extensions"},
+			})
+		}
+	}
+	versionFacts = append(versionFacts, videoReadiness, videoModels, mixedPolicy, billing_setting.GetMixedVideoBillingExprCopy())
 	var pools []model.ImageChannelPool
 	if err := model.DB.WithContext(ctx).Find(&pools).Error; err != nil {
 		imageManagementError(c, 503, err)

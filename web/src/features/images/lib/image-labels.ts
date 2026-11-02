@@ -16,6 +16,91 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { t } from 'i18next'
+
+import type { ImageAdminConfiguration, ImageChannelPool } from '../types'
+
+export function isVideoModelEntry(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'media_type' in value &&
+    typeof value.media_type === 'string' &&
+    value.media_type.trim().toLowerCase() === 'video'
+  )
+}
+
+export function normalizeMediaModelCatalog(
+  value: unknown
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    throw new Error(t('Model capabilities must be a JSON array'))
+  }
+  return value.map((entry: unknown) => {
+    const invalid = t(
+      'Model capabilities must be JSON objects with a valid image or video media type.'
+    )
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(invalid)
+    }
+    const record = entry as Record<string, unknown>
+    const rawType = record.media_type
+    if (rawType != null && typeof rawType !== 'string') {
+      throw new Error(invalid)
+    }
+    const mediaType =
+      typeof rawType === 'string' ? rawType.trim().toLowerCase() : ''
+    if (mediaType !== '' && mediaType !== 'image' && mediaType !== 'video') {
+      throw new Error(invalid)
+    }
+    // Omitted/null types retain the legacy catalog's image inference. Normalize
+    // supplied strings exactly as the server does before either editor filters.
+    return typeof rawType === 'string'
+      ? { ...record, media_type: mediaType }
+      : { ...record }
+  })
+}
+
+export function imagePoolMediaType(
+  binding: ImageChannelPool,
+  config?: ImageAdminConfiguration
+): 'image' | 'video' | undefined {
+  if (binding.media_type) return binding.media_type
+  if (binding.platform === 'mixed') return 'image'
+  const policy = config?.policies.find(
+    (item) => item.group === binding.group && item.platform === binding.platform
+  )
+  if (policy) {
+    try {
+      const catalog: unknown = JSON.parse(policy.models)
+      if (Array.isArray(catalog)) {
+        const entry = catalog.find(
+          (item: unknown) =>
+            item !== null &&
+            typeof item === 'object' &&
+            'id' in item &&
+            item.id === binding.model
+        ) as { media_type?: unknown } | undefined
+        if (entry?.media_type === 'video' || entry?.media_type === 'image') {
+          return entry.media_type
+        }
+      }
+    } catch {
+      /* Unavailable legacy metadata leaves the media type unknown. */
+    }
+  }
+  if (
+    config?.video_plugin_templates?.some(
+      (template) =>
+        template.provider === binding.platform &&
+        template.models.includes(binding.model)
+    )
+  ) {
+    return 'video'
+  }
+  return undefined
+}
+
 export const IMAGE_LABELS: Record<string, string> = {
   token_required_for_auto_group:
     'Select an API key to preview automatic routing groups',

@@ -70,7 +70,9 @@ export function VideoWorkbench(props: { userId: number }) {
   })
   const models = capabilities.data?.video_models || []
   const selectedModel = models.find(
-    (candidate) => `${candidate.provider}:${candidate.id}` === modelId
+    (candidate) =>
+      `${candidate.routing_platform || candidate.provider}:${candidate.id}` ===
+      modelId
   )
   const task = useQuery({
     queryKey: ['video-workbench-task', props.userId, taskId],
@@ -188,8 +190,8 @@ export function VideoWorkbench(props: { userId: number }) {
                 label={t('Model')}
                 value={modelId}
                 options={models.map((entry) => ({
-                  value: `${entry.provider}:${entry.id}`,
-                  label: `${entry.label} · ${entry.provider}`,
+                  value: `${entry.routing_platform || entry.provider}:${entry.id}`,
+                  label: `${entry.label} · ${entry.routing_platform === 'mixed' ? t('Mixed scheduling') : entry.provider}`,
                 }))}
                 disabled={
                   submit.isPending || !tokenId || capabilities.isFetching
@@ -256,7 +258,7 @@ export function VideoWorkbench(props: { userId: number }) {
             </div>
             {selectedModel && (
               <VideoCapabilityForm
-                key={`${selectedModel.provider}:${selectedModel.id}`}
+                key={`${selectedModel.routing_platform || selectedModel.provider}:${selectedModel.id}`}
                 model={selectedModel}
                 busy={submit.isPending}
                 error={submit.error?.message}

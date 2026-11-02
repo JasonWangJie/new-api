@@ -97,6 +97,9 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 	if request == nil || request.Execution == nil || request.Execution.TaskPlugin == nil {
 		return nil
 	}
+	if request.MixedRouting != nil {
+		return freezeVideoRetryInputs(request, expiresAt)
+	}
 	if request.Execution.TaskPlugin.Key != "drama" {
 		return freezeVideoRetryInputs(request, expiresAt)
 	}
@@ -416,7 +419,7 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 		blockedReason = "request_replay_unavailable"
 	case request.ReferenceRecoveryDeadline <= time.Now().Unix():
 		blockedReason = "execution_deadline_reached"
-	case job.BillingStatus != "reserved" || task.Quota <= 0:
+	case job.BillingStatus != "reserved" || !task.VideoRecoveryQuotaValid():
 		blockedReason = "reservation_unavailable"
 	case !task.PrivateData.SubmitAccountingRecorded || !task.PrivateData.DurableBilling:
 		blockedReason = "submission_accounting_unavailable"

@@ -17,12 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Braces, CircleCheck, CircleX } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
+import { JsonCodeEditor } from '@/components/json-code-editor'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -30,9 +31,16 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
+import { markServerErrorHandled } from '@/lib/handle-server-error'
 
 import { imageRequest } from './api'
+import { ConfigurationConflict } from './components/configuration-conflict'
 import { ImageSelect } from './components/image-select'
+import { isConfigurationConflict } from './lib/configuration-conflict'
+import {
+  isVideoModelEntry,
+  normalizeMediaModelCatalog,
+} from './lib/image-labels'
 import { MediaSettingsCard } from './media-settings'
 import type { ImageAdminConfiguration, VideoPluginTemplate } from './types'
 
@@ -235,28 +243,100 @@ export function VideoConfiguration(props: {
     templates.find((item) => item.provider === 'xai')?.provider ||
     templates[0]?.provider ||
     'xai'
+  const initialPolicy = props.config.policies.find(
+    (item) => item.group === 'default' && item.platform === initialProvider
+  )
+  const initialTemplate = templates.find(
+    (item) => item.provider === initialProvider
+  )
   const [group, setGroup] = useState('default')
   const [provider, setProvider] = useState(initialProvider)
-  const [poolMode, setPoolMode] = useState('model_resolution')
-  const [enabled, setEnabled] = useState(false)
-  const [asyncEnabled, setAsyncEnabled] = useState(false)
-  const [models, setModels] = useState('[]')
-  const [busy, setBusy] = useState(false)
-  const template = templates.find((item) => item.provider === provider)
-  const current = useMemo(
-    () =>
-      props.config.policies.find(
-        (item) => item.group === group && item.platform === provider
-      ),
-    [group, props.config.policies, provider]
+  const [poolMode, setPoolMode] = useState(
+    initialPolicy?.pool_mode || 'model_resolution'
   )
-
-  useEffect(() => {
+  const [enabled, setEnabled] = useState(initialPolicy?.enabled || false)
+  const [asyncEnabled, setAsyncEnabled] = useState(
+    initialPolicy?.async_enabled || false
+  )
+  const [models, setModels] = useState(
+    () => initialPolicy?.models || defaultVideoCatalog(initialTemplate)
+  )
+  // Keep the catalog and its expected version together until select/reload/save.
+  const [editingPolicy, setEditingPolicy] = useState(initialPolicy)
+  const [saveError, setSaveError] = useState<unknown>(null)
+  const [busy, setBusy] = useState(false)
+  const [pricing, setPricing] = useState(() =>
+    JSON.stringify(props.config.mixed_video_billing_expr || {}, null, 2)
+  )
+  const [pricingBusy, setPricingBusy] = useState(false)
+  const template = templates.find((item) => item.provider === provider)
+  const selectPolicy = (
+    nextGroup: string,
+    nextProvider: string,
+    policies = props.config.policies
+  ) => {
+    const current = policies.find(
+      (item) => item.group === nextGroup && item.platform === nextProvider
+    )
+    const selectedTemplate = templates.find(
+      (item) => item.provider === nextProvider
+    )
+    setGroup(nextGroup)
+    setProvider(nextProvider)
+    setEditingPolicy(current)
+    setSaveError(null)
     setPoolMode(current?.pool_mode || 'model_resolution')
     setEnabled(current?.enabled || false)
     setAsyncEnabled(current?.async_enabled || false)
-    setModels(current?.models || defaultVideoCatalog(template))
-  }, [current, template])
+    const saved = current?.models || defaultVideoCatalog(selectedTemplate)
+    if (nextProvider !== 'mixed') {
+      setModels(saved)
+      return
+    }
+    try {
+      const catalog = normalizeMediaModelCatalog(JSON.parse(saved))
+      setModels(JSON.stringify(catalog.filter(isVideoModelEntry), null, 2))
+    } catch {
+      setModels(saved)
+    }
+  }
+
+  useEffect(() => {
+    setPricing(
+      JSON.stringify(props.config.mixed_video_billing_expr || {}, null, 2)
+    )
+  }, [props.config.mixed_video_billing_expr])
+
+  const savePricing = async () => {
+    setPricingBusy(true)
+    try {
+      const parsed: unknown = JSON.parse(pricing)
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        Object.values(parsed).some((value) => typeof value !== 'string')
+      ) {
+        throw new Error(
+          t(
+            'Mixed video prices must map public model names to billing expressions.'
+          )
+        )
+      }
+      await imageRequest('/api/option/', 'PUT', {
+        key: 'billing_setting.mixed_video_billing_expr',
+        value: JSON.stringify(parsed),
+      })
+      await props.onSuccess()
+      toast.success(t('Saved'))
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t('Invalid video policy')
+      )
+    } finally {
+      setPricingBusy(false)
+    }
+  }
 
   const importModels = () => {
     try {
@@ -296,26 +376,47 @@ export function VideoConfiguration(props: {
 
   const save = async () => {
     setBusy(true)
+    setSaveError(null)
     try {
       const parsed = JSON.parse(models) as unknown
       if (!Array.isArray(parsed)) {
         throw new Error(t('Model capabilities must be a JSON array'))
       }
-      await imageRequest('/api/option/images/policy', 'PUT', {
+      let catalog: unknown[] = parsed
+      if (provider === 'mixed') {
+        const normalized = normalizeMediaModelCatalog(parsed)
+        const existing = normalizeMediaModelCatalog(
+          JSON.parse(editingPolicy?.models || '[]')
+        )
+        catalog = [
+          ...existing.filter((entry) => !isVideoModelEntry(entry)),
+          ...normalized.filter(isVideoModelEntry),
+        ]
+      }
+      const saved = await imageRequest<
+        ImageAdminConfiguration['policies'][number]
+      >('/api/option/images/policy', 'PUT', {
+        id: editingPolicy?.id || 0,
         group,
         platform: provider,
         pool_mode: poolMode,
         enabled,
         async_enabled: asyncEnabled,
-        models: JSON.stringify(parsed),
-        version: current?.version || 0,
+        models: JSON.stringify(catalog),
+        version: editingPolicy?.version || 0,
       })
+      selectPolicy(group, provider, [saved])
       await props.onSuccess()
       toast.success(t('Saved'))
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Invalid video policy')
-      )
+      setSaveError(error)
+      if (isConfigurationConflict(error)) {
+        markServerErrorHandled(error)
+      } else {
+        toast.error(
+          error instanceof Error ? error.message : t('Invalid video policy')
+        )
+      }
     } finally {
       setBusy(false)
     }
@@ -380,17 +481,22 @@ export function VideoConfiguration(props: {
               <Input
                 id='video-policy-group'
                 value={group}
-                onChange={(event) => setGroup(event.target.value)}
+                onChange={(event) => selectPolicy(event.target.value, provider)}
+                disabled={busy}
               />
             </div>
             <ImageSelect
               label={t('Provider')}
               value={provider}
-              options={templates.map((item) => ({
-                value: item.provider,
-                label: `${item.name} · ${item.provider}`,
-              }))}
-              onChange={setProvider}
+              options={[
+                ...templates.map((item) => ({
+                  value: item.provider,
+                  label: `${item.name} · ${item.provider}`,
+                })),
+                { value: 'mixed', label: t('Mixed scheduling') },
+              ]}
+              onChange={(value) => selectPolicy(group, value)}
+              disabled={busy}
             />
             <ImageSelect
               label={t('Pool binding')}
@@ -402,6 +508,7 @@ export function VideoConfiguration(props: {
                 })
               )}
               onChange={setPoolMode}
+              disabled={busy}
             />
           </div>
           <div className='flex flex-wrap gap-4'>
@@ -410,6 +517,7 @@ export function VideoConfiguration(props: {
                 id='video-policy-enabled'
                 checked={enabled}
                 onCheckedChange={(checked) => setEnabled(checked === true)}
+                disabled={busy}
               />
               <Label htmlFor='video-policy-enabled'>
                 {t('Enable media platform')}
@@ -420,6 +528,7 @@ export function VideoConfiguration(props: {
                 id='video-policy-async'
                 checked={asyncEnabled}
                 onCheckedChange={(checked) => setAsyncEnabled(checked === true)}
+                disabled={busy}
               />
               <Label htmlFor='video-policy-async'>
                 {t('Use asynchronous execution')}
@@ -428,7 +537,9 @@ export function VideoConfiguration(props: {
           </div>
           <div className='flex flex-wrap items-center justify-between gap-2'>
             <Label htmlFor='video-policy-models'>
-              {t('Combined image and video model catalog')}
+              {provider === 'mixed'
+                ? t('Video model catalog')
+                : t('Combined image and video model catalog')}
             </Label>
             <div className='flex flex-wrap gap-2'>
               <Button
@@ -436,12 +547,15 @@ export function VideoConfiguration(props: {
                 variant='secondary'
                 size='sm'
                 onClick={importModels}
+                disabled={busy || provider === 'mixed'}
               >
                 {t('Import {{provider}} video models', {
                   provider: provider === 'doubao' ? 'Seedance' : provider,
                 })}
               </Button>
-              <VideoExamplesDialog provider={provider} />
+              {provider !== 'mixed' && (
+                <VideoExamplesDialog provider={provider} />
+              )}
             </div>
           </div>
           <Textarea
@@ -449,6 +563,7 @@ export function VideoConfiguration(props: {
             className='min-h-72 font-mono text-xs'
             value={models}
             onChange={(event) => setModels(event.target.value)}
+            disabled={busy}
           />
           <div className='flex flex-wrap items-center gap-2 text-sm'>
             <Badge variant='outline'>{t('Shared channel pool')}</Badge>
@@ -476,11 +591,60 @@ export function VideoConfiguration(props: {
               </Button>
             </div>
           )}
-          <Button type='submit' disabled={busy}>
+          <Button
+            type='submit'
+            disabled={busy || isConfigurationConflict(saveError)}
+          >
             {t('Save video policy')}
           </Button>
+          <ConfigurationConflict
+            error={saveError}
+            onReload={async () => {
+              setBusy(true)
+              try {
+                const latest =
+                  await imageRequest<ImageAdminConfiguration>(
+                    '/api/option/images'
+                  )
+                selectPolicy(group, provider, latest.policies)
+                await props.onSuccess()
+              } finally {
+                setBusy(false)
+              }
+            }}
+          />
         </form>
       </SettingsCard>
+      {provider === 'mixed' && (
+        <SettingsCard
+          title={t('Mixed video pricing')}
+          description={t(
+            'Set one billing expression per public video model. Mixed video never falls back to a plugin price.'
+          )}
+        >
+          <form
+            className='space-y-3'
+            onSubmit={(event) => {
+              event.preventDefault()
+              void savePricing()
+            }}
+          >
+            <Label htmlFor='mixed-video-prices'>
+              {t('Public video model billing expressions')}
+            </Label>
+            <JsonCodeEditor
+              id='mixed-video-prices'
+              ariaLabel={t('Public video model billing expressions')}
+              value={pricing}
+              onChange={setPricing}
+              disabled={pricingBusy}
+            />
+            <Button type='submit' disabled={pricingBusy}>
+              {t('Save mixed video prices')}
+            </Button>
+          </form>
+        </SettingsCard>
+      )}
     </div>
   )
 }

@@ -52,6 +52,55 @@ func TestXAIVideoPlugin(t *testing.T) {
 		_, claimed = registry.Generation().LookupEndpoint("POST", path, "grok-imagine-video-1.5")
 		assert.False(t, claimed, path)
 	}
+	t.Run("channel aliases preserve identity through submission and usage", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, model, upstreamModel, operation, path, resolution string
+			request                                                 map[string]any
+			seconds                                                 float64
+		}{
+			{"native", "grok-imagine-video-1.5", "", "create", "generations", "1080p", map[string]any{"prompt": "cat", "seconds": 6, "resolution": "1080p"}, 6},
+			{"mapped modern", "cinema-public", "grok-imagine-video-1.5", "create", "generations", "1080p", map[string]any{"prompt": "cat", "seconds": 6, "resolution": "1080p"}, 6},
+			{"mapped classic", "cinema-public", "grok-imagine-video", "create", "generations", "720p", map[string]any{"prompt": "cat", "seconds": 6, "resolution": "720p"}, 6},
+			{"mapped edit", "cinema-public", "grok-imagine-video", "edit", "edits", "720p", map[string]any{"prompt": "restyle", "video": "https://cdn.example/source.mp4"}, 8.7},
+			{"mapped extension", "cinema-public", "grok-imagine-video", "extend", "extensions", "720p", map[string]any{"prompt": "continue", "video": "https://cdn.example/source.mp4", "seconds": 6}, 6},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := map[string]any{
+					"model": tc.model, "upstreamModel": tc.upstreamModel, "operation": tc.operation,
+					"body":    map[string]any{"kind": "json", "value": tc.request},
+					"baseUrl": "https://api.x.ai", "apiKey": "test-only-key",
+				}
+				value, callErr := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+				require.NoError(t, callErr)
+				intent := object(t, value)
+				assert.Equal(t, tc.model, intent["model"])
+				ctx["requestBody"], ctx["action"] = intent["requestBody"], intent["action"]
+				value, callErr = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+				require.NoError(t, callErr)
+				descriptor := object(t, value)
+				assert.NotContains(t, descriptor, "model")
+				assert.Equal(t, "https://api.x.ai/v1/videos/"+tc.path, descriptor["url"])
+				upstreamModel := tc.upstreamModel
+				if upstreamModel == "" {
+					upstreamModel = tc.model
+				}
+				assert.Equal(t, upstreamModel, descriptor["body"].(map[string]any)["model"])
+				value, callErr = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+				require.NoError(t, callErr)
+				facts := object(t, value)
+				assert.Equal(t, tc.seconds, facts["seconds"])
+				assert.Equal(t, tc.resolution, facts["resolution"])
+			})
+		}
+		_, callErr := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+			"model": "cinema-public", "upstreamModel": "grok-imagine-video", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "cat", "resolution": "1080p"}},
+		})
+		require.ErrorContains(t, callErr, "grok-imagine-video supports only")
+		_, callErr = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+			"model": "cinema-public", "upstreamModel": "unsupported-model", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "cat"}},
+		})
+		require.ErrorContains(t, callErr, "unsupported xAI video model")
+	})
 	t.Run("current reference and keyframe contracts", func(t *testing.T) {
 		references := make([]any, 14)
 		for i := range references {

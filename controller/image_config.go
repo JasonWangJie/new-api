@@ -19,6 +19,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -53,6 +54,9 @@ func GetImageConfiguration(c *gin.Context) {
 		imageManagementError(c, 503, err)
 		return
 	}
+	for i := range pools {
+		pools[i].MediaType = service.PoolMediaType(pools[i])
+	}
 	readiness, err := service.GetVideoReadiness(ctx)
 	if err != nil {
 		imageManagementError(c, 503, err)
@@ -70,20 +74,38 @@ func GetImageConfiguration(c *gin.Context) {
 			continue
 		}
 		seenPlugins[meta.Key] = true
-		templates = append(templates, gin.H{"provider": meta.Key, "name": meta.Name, "models": slices.Clone(meta.Models), "video_profiles": plugin.Meta.VideoProfiles})
+		videoModels := make([]string, 0)
+		generation := pluginruntime.DefaultRegistry.Generation()
+		for _, modelName := range meta.Models {
+			for _, binding := range generation.LookupEndpointCandidates(http.MethodPost, "/v1/videos", modelName) {
+				if binding.Plugin != nil && binding.Plugin.Meta.Key == meta.Key && binding.Protocol == "openai_video" {
+					videoModels = append(videoModels, modelName)
+					break
+				}
+			}
+		}
+		templates = append(templates, gin.H{"provider": meta.Key, "name": meta.Name, "models": videoModels, "video_profiles": plugin.Meta.VideoProfiles})
 	}
 	sort.Slice(templates, func(i, j int) bool { return templates[i]["provider"].(string) < templates[j]["provider"].(string) })
-	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates})
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates, "mixed_video_billing_expr": billing_setting.GetMixedVideoBillingExprCopy(), "mixed_video_usage_schema": billing_setting.MixedVideoUsageSchema()})
 }
 
 func GetImageChannelPoolOptions(c *gin.Context) {
 	group := c.Query("group")
 	platform := c.Query("platform")
+	mediaType := c.Query("media_type")
+	if mediaType != "" && mediaType != "image" && mediaType != "video" {
+		imageManagementError(c, 400, errors.New("Invalid pool media type"))
+		return
+	}
+	if platform == "mixed" && mediaType == "" {
+		mediaType = "image"
+	}
 	if strings.TrimSpace(group) == "" || len(group) > 64 || !service.ImageRoutingPlatform(platform) {
 		imageManagementError(c, 400, errors.New("Invalid image channel pool selection"))
 		return
 	}
-	options, err := service.GetImagePoolSelectionOptions(c.Request.Context(), group, platform)
+	options, err := service.GetMediaPoolSelectionOptions(c.Request.Context(), group, platform, mediaType)
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
@@ -111,10 +133,6 @@ func PreviewMediaRouting(c *gin.Context) {
 	}
 	if input.Seconds != nil && (*input.Seconds < 1 || *input.Seconds > relaycommon.MaxTaskDurationSeconds) {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid video duration"))
-		return
-	}
-	if input.Platform == "mixed" && input.MediaType != "image" {
-		imageManagementError(c, http.StatusBadRequest, errors.New("Mixed pools support images only"))
 		return
 	}
 	if input.MediaType == "image" {
@@ -197,6 +215,10 @@ func SaveImagePolicy(c *gin.Context) {
 		imageManagementError(c, 400, errors.New("Invalid image platform group or pool mode"))
 		return
 	}
+	if policy.Platform == "mixed" {
+		mixedVideoConfigurationMu.Lock()
+		defer mixedVideoConfigurationMu.Unlock()
+	}
 	var catalog []service.ImageModelCapability
 	if err := common.UnmarshalJsonStr(policy.Models, &catalog); err != nil {
 		imageManagementError(c, 400, err)
@@ -220,10 +242,6 @@ func SaveImagePolicy(c *gin.Context) {
 			catalog[i].Label = catalog[i].Id
 		}
 		media := catalog[i].MediaType
-		if policy.Platform == "mixed" && media == "video" {
-			imageManagementError(c, 400, errors.New("Mixed pools support images only"))
-			return
-		}
 		if seenMedia[catalog[i].Id] == nil {
 			seenMedia[catalog[i].Id] = make(map[string]bool)
 		}
@@ -236,8 +254,23 @@ func SaveImagePolicy(c *gin.Context) {
 
 		legacyVideo := media == "" && service.MediaPlatformSupportsVideoModel(catalog[i].Id, policy.Platform) && catalog[i].MaxOutputImages == 0 && catalog[i].MaxReferenceImages == 0 && len(catalog[i].Qualities) == 0 && len(catalog[i].Resolutions) == 0 && len(catalog[i].Formats) == 0 && len(catalog[i].Backgrounds) == 0
 		if media == "video" || legacyVideo {
-			if err := service.ValidateVideoModelOverrides(policy.Platform, catalog[i].Id, catalog[i].VideoOverrides); err != nil {
-				imageManagementError(c, 400, err)
+			var validationErr error
+			if policy.Platform == "mixed" {
+				validationErr = service.ValidateMixedVideoOverridesStatic(catalog[i].VideoOverrides)
+				if validationErr == nil && policy.Enabled && policy.AsyncEnabled {
+					var profiles []pluginruntime.VideoProfile
+					profiles, validationErr = service.MixedVideoModelProfiles(c.Request.Context(), policy, catalog[i].Id, catalog[i].VideoOverrides, false)
+					if validationErr == nil {
+						if expression, configured := billing_setting.GetMixedVideoBillingExpr(catalog[i].Id); configured {
+							validationErr = service.ValidateMixedVideoProfilePricing(expression, profiles)
+						}
+					}
+				}
+			} else {
+				validationErr = service.ValidateVideoModelOverrides(policy.Platform, catalog[i].Id, catalog[i].VideoOverrides)
+			}
+			if validationErr != nil {
+				imageManagementError(c, 400, validationErr)
 				return
 			}
 			continue
@@ -255,20 +288,27 @@ func SaveImagePolicy(c *gin.Context) {
 		imageManagementError(c, 400, err)
 		return
 	}
+	expectedID := policy.Id
 	policy.Id = 0
 	policy.Models = string(encoded)
 	policy.PolicyKey = service.ImageIdentityHash(policy.Group, policy.Platform)
 	err = model.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if expectedID != 0 && policy.Version == 0 {
+			return model.ErrImageConflict
+		}
 		var existing model.ImageGroupPolicy
 		err := tx.Where("policy_key = ?", policy.PolicyKey).Take(&existing).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if policy.Version != 0 || expectedID != 0 {
+				return model.ErrImageConflict
+			}
 			policy.Version = 1
 			return tx.Create(&policy).Error
 		}
 		if err != nil {
 			return err
 		}
-		if existing.Version != policy.Version {
+		if existing.Version != policy.Version || expectedID != 0 && existing.Id != expectedID {
 			return model.ErrImageConflict
 		}
 		policy.Version++
@@ -295,6 +335,7 @@ func SaveImagePolicy(c *gin.Context) {
 
 func DeleteImagePolicy(c *gin.Context) {
 	var input struct {
+		Id       int    `json:"id"`
 		Group    string `json:"group"`
 		Platform string `json:"platform"`
 		Version  *int64 `json:"version"`
@@ -303,7 +344,7 @@ func DeleteImagePolicy(c *gin.Context) {
 		imageManagementError(c, http.StatusBadRequest, err)
 		return
 	}
-	if input.Group == "" || len(input.Group) > 64 || input.Platform == "" || len(input.Platform) > 32 || input.Version == nil || *input.Version < 0 {
+	if input.Id < 0 || input.Group == "" || len(input.Group) > 64 || input.Platform == "" || len(input.Platform) > 32 || input.Version == nil || *input.Version < 0 {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid image policy deletion"))
 		return
 	}
@@ -318,7 +359,7 @@ func DeleteImagePolicy(c *gin.Context) {
 		imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image configuration is unavailable"))
 		return
 	}
-	if policy.Version != *input.Version {
+	if policy.Version != *input.Version || input.Id != 0 && policy.Id != input.Id {
 		imageManagementError(c, http.StatusConflict, model.ErrImageConflict)
 		return
 	}
@@ -341,6 +382,7 @@ func SaveImageChannelPool(c *gin.Context) {
 		Mode        string `json:"mode"`
 		Model       string `json:"model"`
 		Resolution  string `json:"resolution"`
+		MediaType   string `json:"media_type"`
 		ExpectedIDs []int  `json:"expected_ids"`
 		Channels    []struct {
 			Id       int  `json:"id"`
@@ -357,6 +399,13 @@ func SaveImageChannelPool(c *gin.Context) {
 		return
 	}
 	input.Model = strings.TrimSpace(input.Model)
+	if input.MediaType != "" && input.MediaType != "image" && input.MediaType != "video" {
+		imageManagementError(c, 400, errors.New("Invalid pool media type"))
+		return
+	}
+	if input.Platform == "mixed" && input.MediaType == "" {
+		input.MediaType = "image"
+	}
 	if input.Mode != "resolution" {
 		if err := service.ValidateImageModelName(input.Model); err != nil {
 			imageManagementError(c, 400, err)
@@ -381,7 +430,7 @@ func SaveImageChannelPool(c *gin.Context) {
 		}
 	}
 	policy := model.ImageGroupPolicy{Group: input.Group, Platform: input.Platform, PoolMode: input.Mode}
-	key := service.ImagePoolBindingKey(policy, input.Model, input.Resolution)
+	key := service.MediaPoolBindingKey(policy, input.Model, input.Resolution, input.MediaType)
 	seen := make(map[int]bool)
 	rows := make([]model.ImageChannelPool, 0, len(input.Channels))
 	for _, channel := range input.Channels {
@@ -413,7 +462,7 @@ func SaveImageChannelPool(c *gin.Context) {
 		}
 	}
 	if input.Mode != "resolution" || len(input.Channels) > 0 {
-		options, err := service.GetImagePoolSelectionOptions(c.Request.Context(), input.Group, input.Platform)
+		options, err := service.GetMediaPoolSelectionOptions(c.Request.Context(), input.Group, input.Platform, input.MediaType)
 		if err != nil {
 			imageManagementError(c, 503, err)
 			return
@@ -490,6 +539,9 @@ func SaveImageChannelPool(c *gin.Context) {
 		}
 		imageManagementError(c, status, err)
 		return
+	}
+	for i := range rows {
+		rows[i].MediaType = service.PoolMediaType(rows[i])
 	}
 	imageManagementData(c, rows)
 }

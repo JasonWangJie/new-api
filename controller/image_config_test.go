@@ -87,6 +87,7 @@ func TestMediaRetryPolicyAPI(t *testing.T) {
 		Data struct {
 			Mode     string              `json:"mode"`
 			Decision mediaretry.Decision `json:"decision"`
+			Fact     mediaretry.Fact     `json:"fact"`
 		} `json:"data"`
 	}
 	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &response))
@@ -99,7 +100,8 @@ func TestMediaRetryPolicyAPI(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&model.MediaRetryEvent{}).Count(&count).Error)
 	assert.Zero(t, count, "simulation must not write execution events")
-	event, err := model.NewMediaRetryEvent("video-sample", 1, mediaretry.Fact{MediaType: "video", Message: "busy", Unknown: true, HasUpstreamTask: true}, mediaretry.Decision{}, mediaretry.State{TotalLimit: 2, Now: 100})
+	sampleFact := mediaretry.Fact{MediaType: "video", HTTPStatus: 503, Message: "busy", Unknown: true, HasUpstreamTask: true}
+	event, err := model.NewMediaRetryEvent("video-sample", 1, sampleFact, mediaretry.Decision{}, mediaretry.State{TotalLimit: 2, Now: 100})
 	require.NoError(t, err)
 	require.NoError(t, model.RecordMediaRetryEventTx(db, event))
 	persisted, err := model.GetLatestMediaRetryEvent(t.Context(), "video-sample")
@@ -114,11 +116,18 @@ func TestMediaRetryPolicyAPI(t *testing.T) {
 	filtered := request(http.MethodGet, detailPath+"?start_timestamp=1&end_timestamp=1", nil, common.RoleRootUser)
 	require.Equal(t, http.StatusOK, filtered.Code)
 	assert.Contains(t, filtered.Body.String(), `"total":0`)
-	preview = request(http.MethodPost, "/preview", gin.H{"event_id": persisted.ID, "fact": mediaretry.Fact{Unknown: false}}, common.RoleRootUser)
+	samplePolicy := policy
+	samplePolicy.Rules = []mediaretry.Rule{policy.Rules[0]}
+	samplePolicy.Rules[0].Scope.MediaTypes = []string{"video"}
+	samplePolicy.Rules[0].Match.HTTPStatuses = []int{503}
+	preview = request(http.MethodPost, "/preview", gin.H{"policy": samplePolicy, "event_id": persisted.ID, "fact": mediaretry.Fact{MediaType: "image", HTTPStatus: 400, Message: "different error", Unknown: false}}, common.RoleRootUser)
 	require.Equal(t, http.StatusOK, preview.Code, preview.Body.String())
 	require.NoError(t, common.Unmarshal(preview.Body.Bytes(), &response))
 	assert.Equal(t, "sample", response.Data.Mode)
-	assert.Equal(t, mediaretry.PollSameJob, response.Data.Decision.Action, "saved sample facts override caller facts")
+	assert.Equal(t, sampleFact, response.Data.Fact, "saved sample facts override caller media, status, message and unknown outcome")
+	assert.True(t, response.Data.Decision.Matched, "the rule requires the sample's video media type, HTTP 503 and busy diagnostic")
+	assert.Equal(t, "busy", response.Data.Decision.RuleID)
+	assert.Equal(t, mediaretry.SameChannel, response.Data.Decision.Action, "matched custom recovery also applies to an unknown sample")
 	rollback := request(http.MethodPost, "/rollback", gin.H{"revision": 1, "target_revision": 0}, common.RoleRootUser)
 	require.Equal(t, http.StatusOK, rollback.Code, rollback.Body.String())
 	current, err := model.GetMediaRetryPolicy(t.Context())
