@@ -52,10 +52,10 @@ func TestPolicyExecutionGuards(t *testing.T) {
 		wantReason string
 	}{
 		{"confirmed failure can retry", Fact{Accepted: true, Terminal: true}, false, 3, SameChannel, ""},
-		{"unknown receipt only polls", Fact{Unknown: true, HasUpstreamTask: true, LegacyTimeoutAuthorized: true}, false, 3, PollSameJob, "upstream_result_unknown"},
+		{"custom retry replaces unknown receipt", Fact{Unknown: true, HasUpstreamTask: true, LegacyTimeoutAuthorized: true}, false, 3, SameChannel, ""},
 		{"expired unknown receipt needs review", Fact{Unknown: true, HasUpstreamTask: true, Deadline: 100}, false, 3, ManualReview, "execution_deadline_reached"},
-		{"unknown without receipt needs review", Fact{Unknown: true}, false, 3, ManualReview, "upstream_result_unknown"},
-		{"accepted pending only polls", Fact{Accepted: true, HasUpstreamTask: true}, false, 3, PollSameJob, "upstream_result_unknown"},
+		{"custom retry replaces unknown without receipt", Fact{Unknown: true}, false, 3, SameChannel, ""},
+		{"custom retry replaces accepted pending", Fact{Accepted: true, HasUpstreamTask: true}, false, 3, SameChannel, ""},
 		{"success output resumes storage", Fact{HasOutput: true}, false, 3, ResumeDownload, "output_already_available"},
 		{"billing resumes existing output", Fact{HasOutput: true, Stage: "billing"}, false, 3, ResumeBilling, "output_already_available"},
 		{"paused policy prevents generation", Fact{}, true, 3, ManualReview, "resubmissions_paused"},
@@ -71,6 +71,33 @@ func TestPolicyExecutionGuards(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantAction, decision.Action)
 			assert.Equal(t, tc.wantReason, decision.BlockedReason)
+		})
+	}
+}
+
+func TestPolicyCustomActionsPreserveUnknownFacts(t *testing.T) {
+	for _, action := range []string{SameChannel, OtherChannel, LocalSameChannel, LocalOtherChannel, Stop, ManualReview, PollSameJob} {
+		t.Run(action, func(t *testing.T) {
+			policy := Policy{Rules: []Rule{{ID: "custom", Name: "Custom recovery", Enabled: true, Match: Match{HTTPStatuses: []int{400}, ContainsAny: []string{"请提供请求 ID 联系支持"}}, Steps: []Step{{ID: "step", Action: action, MaxAttempts: 1}}, OnExhausted: Stop}}}
+			fact := Fact{HTTPStatus: 400, Message: "请求处理失败，请提供请求 ID 联系支持", Accepted: true, Unknown: true, HasUpstreamTask: true, HasReferences: true, LocalSupported: true}
+			state := State{TotalLimit: 16}
+			decision, err := Evaluate(policy, fact, state)
+			require.NoError(t, err)
+			assert.True(t, decision.Matched)
+			assert.Equal(t, action, decision.Action)
+			assert.Empty(t, decision.BlockedReason)
+			assert.True(t, fact.Unknown)
+			assert.False(t, fact.Terminal, "a custom action must not fabricate upstream confirmation")
+			state = Consume(state, decision)
+			decision, err = Evaluate(policy, fact, state)
+			require.NoError(t, err)
+			assert.True(t, decision.Exhausted)
+			assert.Equal(t, Stop, decision.Action)
+			fact.Message = "different error"
+			decision, err = Evaluate(policy, fact, state)
+			require.NoError(t, err)
+			assert.False(t, decision.Matched)
+			assert.Empty(t, decision.Action, "unmatched failures still use built-in recovery")
 		})
 	}
 }

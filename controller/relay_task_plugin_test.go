@@ -581,6 +581,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				lostReceipt, beforeSend, insertFails bool
 				wantCalls, wantWallet                int
 				wantStatus, wantBilling              string
+				configured                           string
 			}{
 				{name: "accepted", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, wantCalls: 1, wantWallet: 900, wantStatus: "submitted", wantBilling: "reserved"},
 				{name: "receipt lost after acceptance", lostReceipt: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
@@ -592,6 +593,9 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "explicit refusal", body: `{"error":{"code":"invalid_request","message":"unsupported prompt"}}`, httpStatus: 400, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "dispatch barrier rejected", beforeSend: true, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "accepted receipt cannot persist", body: `{"id":"nldw-accepted","status":"queued"}`, httpStatus: 200, insertFails: true, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
+				{name: "custom unknown then explicit refusal retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "rejection", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "custom unknown retry budget stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "budget", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
+				{name: "custom unknown local preparation stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "local", wantCalls: 1, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					user := model.User{Username: fmt.Sprintf("nldw-submission-%d", index), AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
@@ -616,6 +620,11 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 							return
 						}
 						w.Header().Set("Content-Type", "application/json")
+						if tc.configured == "rejection" && calls.Load() > 1 {
+							w.WriteHeader(http.StatusBadRequest)
+							_, _ = w.Write([]byte(`{"error":{"code":"invalid_request","message":"unsupported prompt"}}`))
+							return
+						}
 						w.WriteHeader(tc.httpStatus)
 						_, _ = w.Write([]byte(tc.body))
 					}))
@@ -627,6 +636,19 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					now := time.Now().Unix()
 					job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: provider, Model: modelName, Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: "video-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
 					request := service.AsyncVideoRequest{Body: []byte(fmt.Sprintf(`{"model":%q,"prompt":"test generation","seconds":5,"resolution":"720p"}`, modelName)), ContentType: "application/json", ClientIP: "203.0.113.10", Channel: channel, PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: provider, Version: plugin.Meta.Version, APIVersion: 1}}, Billing: service.MediaBillingSnapshot{Price: types.PriceData{Quota: 100, QuotaToPreConsume: 100}}}
+					if tc.configured != "" {
+						policy, err := model.GetMediaRetryPolicy(t.Context())
+						require.NoError(t, err)
+						action := mediaretry.SameChannel
+						if tc.configured == "local" {
+							action = mediaretry.LocalSameChannel
+							request.ReferenceRecoveryVersion, request.ReferenceRecoveryDeadline = 2, now+120
+							request.ReferenceInputs = []service.AsyncVideoReferenceInput{{Index: 0, Path: "/images/0", Source: "https://reference.example/image.png", Kind: "image"}}
+						}
+						policy.Rules = []mediaretry.Rule{{ID: "custom-unknown", Name: "Custom unknown", Enabled: true, Scope: mediaretry.Scope{ChannelIDs: []int{channel.Id}}, Match: mediaretry.Match{HTTPStatuses: []int{500}}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.Stop}}
+						_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
+						require.NoError(t, err)
+					}
 					encoded, err := common.Marshal(request)
 					require.NoError(t, err)
 					job.RequestCipher, err = service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
@@ -665,6 +687,20 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					assert.Equal(t, tc.wantWallet-900, token.RemainQuota)
 					assert.Equal(t, tc.wantStatus, job.Status)
 					assert.Equal(t, tc.wantBilling, job.BillingStatus)
+					if tc.configured != "" {
+						assert.Equal(t, "policy_stopped_unknown", job.ReferenceRecoveryStage)
+						var native model.Task
+						require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&native).Error)
+						require.NotEmpty(t, native.PrivateData.VideoAttempts)
+						assert.Equal(t, model.TaskStatusUnknown, native.PrivateData.VideoAttempts[0].Status)
+						view, _, err := videoJobView(taskSubmissionTestContext(), job, true)
+						require.NoError(t, err)
+						assert.Equal(t, true, view["can_terminate"])
+						require.NoError(t, service.ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Equal(t, 1000, user.Quota)
+						return
+					}
 					if tc.wantBilling == "unknown" {
 						assert.Equal(t, 100, job.Quota)
 						assert.NotEmpty(t, job.ChannelCipher)

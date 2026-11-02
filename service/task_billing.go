@@ -247,6 +247,9 @@ func taskModelName(task *model.Task) string {
 // emit another billing log. The caller must have validated the upstream duration
 // against the reserved limit before passing the actual charge.
 func SettleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus model.TaskStatus, actualQuota int, usageFacts map[string]any, clamp *common.QuotaClamp) (bool, error) {
+	if retained, err := RetainUnconfirmedVideoBilling(ctx, task); retained || err != nil {
+		return retained, err
+	}
 	if err := VideoBillingRetryBoundary(ctx, task, nil, true); err != nil {
 		return false, err
 	}
@@ -335,6 +338,9 @@ func settleMeasuredVideoTask(ctx context.Context, task *model.Task, fromStatus m
 // SettleTaskBillingOnComplete evaluates the frozen bill before publishing a
 // terminal result. Balance changes and the terminal CAS commit together.
 func SettleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, result *relaycommon.TaskInfo) (bool, error) {
+	if retained, err := RetainUnconfirmedVideoBilling(ctx, task); retained || err != nil {
+		return retained, err
+	}
 	if err := VideoBillingRetryBoundary(ctx, task, nil, true); err != nil {
 		return false, err
 	}

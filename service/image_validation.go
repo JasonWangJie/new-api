@@ -268,6 +268,16 @@ func imageReferenceClient(cfg ImageRuntimeConfig, resolver imageReferenceResolve
 }
 
 func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	return downloadImage(ctx, raw, cfg, false)
+}
+
+// DownloadImageOutput tolerates mislabeled raster formats in upstream results.
+// References remain strict; outputs still require complete image validation.
+func DownloadImageOutput(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	return downloadImage(ctx, raw, cfg, true)
+}
+
+func downloadImage(ctx context.Context, raw string, cfg ImageRuntimeConfig, output bool) (ImageBytes, error) {
 	if strings.HasPrefix(strings.ToLower(raw), "data:") {
 		meta, payload, ok := strings.Cut(raw, ",")
 		if !ok || !strings.HasSuffix(strings.ToLower(meta), ";base64") || base64.StdEncoding.DecodedLen(len(payload)) > int(cfg.DownloadMaxBytes)+2 {
@@ -276,6 +286,9 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 		data, err := base64.StdEncoding.Strict().DecodeString(payload)
 		if err != nil {
 			return ImageBytes{}, newImageValidationError("invalid base64 image")
+		}
+		if output {
+			return validateImageOutputBytes(data, meta[5:len(meta)-7], cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 		}
 		return ValidateImageBytes(data, meta[5:len(meta)-7], cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 	}
@@ -305,7 +318,23 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 	if err != nil {
 		return ImageBytes{}, errors.New("image reference read failed")
 	}
+	if output {
+		return validateImageOutputBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+	}
 	return ValidateImageBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+}
+
+func validateImageOutputBytes(data []byte, declared string, maxBytes, maxPixels int64) (ImageBytes, error) {
+	mediaType, _, err := mime.ParseMediaType(declared)
+	if err == nil {
+		switch strings.ToLower(mediaType) {
+		case "image/png", "image/jpeg", "image/webp":
+			// Provider/CDN labels may disagree with the actual raster format.
+			// Decode and validate the bytes, then store only their detected MIME.
+			declared = ""
+		}
+	}
+	return ValidateImageBytes(data, declared, maxBytes, maxPixels)
 }
 
 func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dto.UpstreamAsyncProfile, baseURL, proxy string, values UpstreamAsyncTemplateContext, cfg ImageRuntimeConfig) ([]ImageBytes, error) {
@@ -441,7 +470,7 @@ func readUpstreamAsyncImageResponse(response *http.Response, cfg ImageRuntimeCon
 	if err != nil {
 		return ImageBytes{}, ErrUpstreamAsyncImageTransport
 	}
-	return ValidateImageBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+	return validateImageOutputBytes(data, response.Header.Get("Content-Type"), cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 }
 
 func validatePublicUpstreamAsyncImageURL(raw string) (*url.URL, error) {

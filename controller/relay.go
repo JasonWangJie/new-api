@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
@@ -616,13 +618,17 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	var initialRequest *service.AsyncVideoRequest
 	if billingChannelID := c.GetInt("async_media_initial_billing_channel_id"); billingChannelID > 0 {
 		task.PrivateData.BillingChannelID = billingChannelID
 	}
 	if value, exists := c.Get("async_media_initial_retry_request"); exists {
 		if request, ok := value.(*service.AsyncVideoRequest); ok {
+			initialRequest = request
 			task.PrivateData.MediaRetryState = request.InitialRetryState
 			task.PrivateData.MediaRetryDecision = request.PendingDecision
+			task.PrivateData.MediaRetryFact = request.RetryFact
+			task.PrivateData.VideoAttempts = slices.Clone(request.InitialUnknownAttempts)
 		}
 	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
@@ -665,6 +671,9 @@ func executeTaskSubmissionWith(
 			task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 		}
 	}
+	if c.GetBool("async_media_policy_unknown_ended") {
+		task.Status = model.TaskStatusUnknown
+	}
 	diagnostics.insertStart(task)
 	if c.GetBool("async_media_execution") && task.Status == model.TaskStatusSuccess {
 		if _, err := service.CaptureAsyncMediaOutput(c.Request.Context(), task); err != nil {
@@ -698,6 +707,22 @@ func executeTaskSubmissionWith(
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task usage"), "task_billing_settlement_failed", http.StatusInternalServerError)
 		diagnostics.failed("settle", "usage_error", taskErr, true)
 		return nil, taskErr
+	}
+	if c.GetBool("async_media_policy_unknown_ended") && initialRequest != nil && initialRequest.RetryFact != nil {
+		var job model.AsyncMediaJob
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&job).Error; err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusServiceUnavailable)
+		}
+		decision := initialRequest.PendingDecision
+		if decision == nil || !decision.Matched || decision.Action != mediaretry.Stop || decision.BlockedReason != "" {
+			decision = nil
+		}
+		if err := model.EndAsyncVideoPolicyExecution(c.Request.Context(), *task, job, *initialRequest.RetryFact, decision, *initialRequest.InitialRetryState); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusServiceUnavailable)
+		}
+		if err := model.DB.WithContext(c.Request.Context()).First(task, task.ID).Error; err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusServiceUnavailable)
+		}
 	}
 	diagnostics.complete(task, result.Quota)
 

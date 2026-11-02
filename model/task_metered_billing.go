@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -136,6 +137,15 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		}
 		if current.PrivateData.AsyncMedia && current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput && task.Status == TaskStatusFailure {
 			return errors.New("confirmed video output requires billing reconciliation")
+		}
+		if current.PrivateData.AsyncMedia && task.Status == TaskStatusFailure && slices.ContainsFunc(current.PrivateData.VideoAttempts, func(attempt VideoTaskAttempt) bool { return attempt.Status == TaskStatusUnknown }) {
+			var job AsyncMediaJob
+			if err := lockForUpdate(tx).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", current.TaskID, current.UserId, current.AttemptGeneration).Take(&job).Error; err != nil {
+				return err
+			}
+			if job.ReferenceRecoveryStage != "age_limit_refund" {
+				return errors.New("unconfirmed video attempt requires billing reconciliation")
+			}
 		}
 		if current.PrivateData.DurableBilling && !current.PrivateData.SubmitAccountingRecorded {
 			return errors.New("task submission accounting is not yet recorded")

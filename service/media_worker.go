@@ -35,14 +35,15 @@ type AsyncVideoRequest struct {
 	Channel                          model.Channel
 	Execution                        *model.TaskExecutionSnapshot
 	Billing                          MediaBillingSnapshot
-	InitialBillingChannelID          int                  `json:"initial_billing_channel_id,omitempty"`
-	InitialRetryState                *mediaretry.State    `json:"initial_retry_state,omitempty"`
-	RetryFailedAt                    int64                `json:"retry_failed_at,omitempty"`
-	RetryFact                        *mediaretry.Fact     `json:"retry_fact,omitempty"`
-	PendingDecision                  *mediaretry.Decision `json:"pending_retry_decision,omitempty"`
-	ReferenceLocalizationUnsupported bool                 `json:"reference_localization_unsupported,omitempty"`
-	LocalReferencesReady             bool                 `json:"local_references_ready,omitempty"`
-	OriginalBody                     []byte               `json:"original_body,omitempty"`
+	InitialBillingChannelID          int                      `json:"initial_billing_channel_id,omitempty"`
+	InitialRetryState                *mediaretry.State        `json:"initial_retry_state,omitempty"`
+	InitialUnknownAttempts           []model.VideoTaskAttempt `json:"initial_unknown_attempts,omitempty"`
+	RetryFailedAt                    int64                    `json:"retry_failed_at,omitempty"`
+	RetryFact                        *mediaretry.Fact         `json:"retry_fact,omitempty"`
+	PendingDecision                  *mediaretry.Decision     `json:"pending_retry_decision,omitempty"`
+	ReferenceLocalizationUnsupported bool                     `json:"reference_localization_unsupported,omitempty"`
+	LocalReferencesReady             bool                     `json:"local_references_ready,omitempty"`
+	OriginalBody                     []byte                   `json:"original_body,omitempty"`
 	PluginHash                       string
 	Details                          *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
 	ReferenceInputs                  []AsyncVideoReferenceInput `json:"reference_inputs,omitempty"`
@@ -237,6 +238,14 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 	}
 	if job.Status == "failed" || job.Status == "expired" || job.Status == "execution_unknown" {
 		if job.Status == "execution_unknown" {
+			var task model.Task
+			if err := model.DB.WithContext(parent).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error; err == nil {
+				if applied, err := tryUnknownVideoRecovery(parent, task, job, job.ErrorMessage); err != nil || applied {
+					return err
+				}
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 			if job.ReferenceRecoveryStage == "unknown" || VideoSubmissionRequiresReconciliation(job.Provider) && job.DispatchedAt > 0 && job.BillingStatus == "unknown" {
 				return nil
 			}

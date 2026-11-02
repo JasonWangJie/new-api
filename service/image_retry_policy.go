@@ -186,6 +186,7 @@ func commitImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, f
 
 func buildImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, failure *AsyncImageFailure, cfg ImageRuntimeConfig, checkpoint model.ImageRetryPolicyState, updates map[string]any) (imageFailurePlan, error) {
 	decision := checkpoint.Decision
+	unconfirmed := checkpoint.Fact.Unknown || checkpoint.Fact.Accepted && !checkpoint.Fact.Terminal
 	now := time.Now().Unix()
 	status, outbox := model.ImageTaskExecutionUnknown, ""
 	if checkpoint.Fact.HasOutput {
@@ -199,7 +200,7 @@ func buildImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, fa
 	checkpoint.Pending = false
 	switch decision.Action {
 	case mediaretry.SameChannel, mediaretry.OtherChannel, mediaretry.LocalSameChannel, mediaretry.LocalOtherChannel:
-		if checkpoint.Fact.Accepted && !checkpoint.Fact.Terminal || checkpoint.Fact.Unknown || checkpoint.Fact.HasOutput {
+		if checkpoint.Fact.HasOutput || unconfirmed && (!decision.Matched || decision.BlockedReason != "") {
 			return imageFailurePlan{}, errors.New("media retry decision cannot replay an unconfirmed or completed image request")
 		}
 		if task.DispatchedAt > 0 {
@@ -249,6 +250,12 @@ func buildImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, fa
 		}
 	case mediaretry.Stop:
 		status = model.ImageTaskFailed
+	}
+	if unconfirmed && (mediaretry.IsResubmission(decision.Action) || decision.Action == mediaretry.Stop) {
+		// An administrator-selected replay/stop is not evidence that the old
+		// upstream request ended. Retain the original hold until settlement or
+		// explicit reconciliation, including when a replacement later fails.
+		updates["reconciliation_status"] = model.ImagePolicyUnconfirmed
 	}
 	if decision.BlockedReason == "resubmissions_paused" {
 		status, outbox, checkpoint.Pending = model.ImageTaskQueued, "execute", true
@@ -303,8 +310,8 @@ func buildImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, fa
 	return imageFailurePlan{Updates: updates, Event: event, EventType: "retry_policy_decision", EventMessage: failure.Message, OutboxKind: outbox, Audit: audit, Decision: decision}, nil
 }
 
-// ImagePolicyRouting retains credential exclusions but replaces implicit retry
-// preferences with the administrator's explicit channel action.
+// ImagePolicyRouting replaces implicit retry exclusions and preferences with
+// the administrator's explicit channel action. Capability exclusions remain.
 func ImagePolicyRouting(routing ImageAccountRouting, checkpoint model.ImageRetryPolicyState) ImageAccountRouting {
 	decision := checkpoint.Decision
 	if !checkpoint.Pending || !mediaretry.IsResubmission(decision.Action) {
@@ -312,6 +319,7 @@ func ImagePolicyRouting(routing ImageAccountRouting, checkpoint model.ImageRetry
 	}
 	routing.Stop, routing.Pin, routing.PinChannel, routing.Avoid, routing.AvoidChannel = false, "", 0, "", 0
 	routing.Excluded = nil
+	routing.TimedOutAccounts, routing.TimedOutCredentials, routing.DeadlineChannels = nil, nil, nil
 	routing.ExcludedChannels = slices.Clone(decision.ExcludedChannelIDs)
 	routing.AllowedChannels = slices.Clone(decision.AllowedChannelIDs)
 	routing.WaitForCooldown = true
@@ -344,6 +352,12 @@ func refreshImageRetryDecision(ctx context.Context, task *model.AsyncImageTask, 
 	decision, err := EvaluateMediaRetry(ctx, checkpoint.Fact, checkpoint.State)
 	if err != nil {
 		return checkpoint, false, fmt.Errorf("%w: %v", errImageRetryPolicyUnavailable, err)
+	}
+	if decision.Matched && mediaretry.IsResubmission(decision.Action) && (task.UpstreamTaskId != "" || task.DispatchedAt > 0) {
+		// A waiting poll rule may become a replacement rule. Re-enter the
+		// failure planner so clearing the old receipt, preserving its hold and
+		// scheduling generation commit together before another worker sends.
+		return checkpoint, true, nil
 	}
 	if !decision.Matched {
 		if checkpoint.BuiltinPending {

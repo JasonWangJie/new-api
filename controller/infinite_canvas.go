@@ -300,8 +300,8 @@ func serveAuthorizedImageTaskResult(c *gin.Context, task model.AsyncImageTask, i
 			return
 		}
 		// Preserve DNS, connected-peer, redirect, byte and pixel restrictions.
-		// Application credentials never enter the reference downloader.
-		image, err := service.DownloadImageReference(ctx, urls[index], cfg)
+		// Application credentials never enter the output downloader.
+		image, err := service.DownloadImageOutput(ctx, urls[index], cfg)
 		if err != nil {
 			c.Status(503)
 			return

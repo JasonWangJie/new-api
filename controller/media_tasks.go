@@ -227,16 +227,16 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if resultExpired {
 		view["storage_status"], view["can_resume"], view["can_terminate"] = "expired", false, false
 	}
-	if job.Status == "failed" && strings.HasPrefix(job.ReferenceRecoveryStage, "age_limit_") {
+	if job.Status == "failed" && (strings.HasPrefix(job.ReferenceRecoveryStage, "age_limit_") || job.ReferenceRecoveryStage == "policy_stopped_unknown") {
 		view["status"], view["stage"], view["progress"] = "failed", "failed", 100
 		view["error_message"], view["billing_status"] = job.ErrorMessage, job.BillingStatus
 		view["can_resume"], view["can_terminate"] = false, false
 		if job.ErrorMessage == model.AsyncMediaTaskAgeExceededReason {
 			view["error_code"] = "task_age_exceeded"
 		}
-		if job.ReferenceRecoveryStage == "age_limit_unknown" {
+		if job.ReferenceRecoveryStage == "age_limit_unknown" || job.ReferenceRecoveryStage == "policy_stopped_unknown" {
 			view["reconciliation_status"], view["error_retryable"] = "upstream_unconfirmed", false
-			canReconcile := admin && err == nil && job.BillingStatus == "unknown" && job.ReferenceRetryCount == 1 && task.AttemptGeneration == job.AttemptGeneration && task.ChannelId == job.ChannelId && task.PrivateData.TokenId == job.TokenId && task.Status == model.TaskStatusFailure && task.Quota > 0 && task.Quota == job.Quota && task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && task.PrivateData.UpstreamTaskID == ""
+			canReconcile := admin && err == nil && job.BillingStatus == "unknown" && (job.ReferenceRecoveryStage == "policy_stopped_unknown" || job.ReferenceRetryCount == 1 && task.PrivateData.UpstreamTaskID == "") && task.AttemptGeneration == job.AttemptGeneration && task.ChannelId == job.ChannelId && task.PrivateData.TokenId == job.TokenId && task.Status == model.TaskStatusFailure && task.Quota > 0 && task.Quota == job.Quota && task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded
 			view["can_terminate"], view["termination_requires_reconciliation"] = canReconcile, canReconcile
 		}
 	}
@@ -756,7 +756,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			}
 			return
 		}
-		if job.Status == "failed" && job.ReferenceRecoveryStage == "age_limit_unknown" {
+		if job.Status == "failed" && (job.ReferenceRecoveryStage == "age_limit_unknown" || job.ReferenceRecoveryStage == "policy_stopped_unknown") {
 			if !admin {
 				imageManagementError(c, http.StatusForbidden, errors.New("Permission denied"))
 				return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -113,12 +114,14 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 			return err
 		}
 		now := time.Now().Unix()
+		configuredUnknown := policyRecovery && plans[0].Decision.BlockedReason == "" && mediaretry.IsResubmission(plans[0].Decision.Action) && !plans[0].Fact.HasOutput && (plans[0].Fact.Unknown || plans[0].Fact.Accepted && !plans[0].Fact.Terminal)
 		rejected := policyRecovery && plans[0].RejectedSubmission && currentJob.ReferenceRecoveryStage == "dispatched" && currentJob.DispatchedAt > 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
 		preparationFailed := policyRecovery && plans[0].PreparationFailed && currentJob.ReferenceRecoveryStage == "prepare" && currentJob.DispatchedAt == 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
-		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.PrivateData.VideoReconciliation != nil || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
-			currentJob.AttemptGeneration != job.AttemptGeneration || currentJob.AttemptGeneration != current.AttemptGeneration || (!policyRecovery && currentJob.ReferenceRetryCount != 0 || currentJob.ReferenceRetryCount >= 1000) || (!rejected && !preparationFailed && currentJob.Status != "submitted") || currentJob.BillingStatus != "reserved" || currentJob.RefundLogPayload != "" || currentJob.OutputObjectKey != "" || currentJob.ExpiresAt <= now ||
+		unknownStage := configuredUnknown && (currentJob.Status == "submitted" || currentJob.Status == "reconciling" || currentJob.Status == "execution_unknown" || currentJob.ReferenceRecoveryStage == "dispatched" || currentJob.ReferenceRecoveryStage == "unknown")
+		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.PrivateData.VideoReconciliation != nil && !configuredUnknown || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
+			currentJob.AttemptGeneration != job.AttemptGeneration || currentJob.AttemptGeneration != current.AttemptGeneration || (!policyRecovery && currentJob.ReferenceRetryCount != 0 || currentJob.ReferenceRetryCount >= 1000) || (!rejected && !preparationFailed && !unknownStage && currentJob.Status != "submitted") || currentJob.BillingStatus != "reserved" && !(configuredUnknown && currentJob.BillingStatus == "unknown") || currentJob.RefundLogPayload != "" || currentJob.OutputObjectKey != "" || currentJob.ArtifactKeys != "" || currentJob.ExpiresAt <= now ||
 			current.TaskID != currentJob.TaskId || current.UserId != currentJob.UserId || current.ChannelId != currentJob.ChannelId || current.PrivateData.TokenId != currentJob.TokenId || (string(current.Platform) != currentJob.Provider || !policyRecovery && current.Platform != "drama") || len(currentJob.RequestCipher) == 0 ||
-			current.Quota <= 0 || current.Quota != currentJob.Quota || !current.PrivateData.AsyncMedia || !current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || (!rejected && !preparationFailed && current.PrivateData.UpstreamTaskID == "") || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput ||
+			current.Quota <= 0 || current.Quota != currentJob.Quota || !current.PrivateData.AsyncMedia || !current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || (!rejected && !preparationFailed && !configuredUnknown && current.PrivateData.UpstreamTaskID == "") || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput ||
 			current.TaskID != task.TaskID || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.Quota != task.Quota || current.Properties.OriginModelName != task.Properties.OriginModelName || current.Properties.UpstreamModelName != task.Properties.UpstreamModelName || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID || currentJob.TaskId != job.TaskId || currentJob.UserId != job.UserId || currentJob.TokenId != job.TokenId || currentJob.ChannelId != job.ChannelId || currentJob.Model != job.Model {
 			return ErrTaskAttemptConflict
 		}
@@ -145,8 +148,13 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 			startedAt = current.SubmitTime
 		}
 		diagnostic := []rune(strings.TrimSpace(reason))
-		current.PrivateData.VideoAttempts = append(current.PrivateData.VideoAttempts, VideoTaskAttempt{ChannelID: current.ChannelId, Decision: current.PrivateData.MediaRetryDecision, Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, Status: string(TaskStatusFailure), Reason: string(diagnostic[:min(len(diagnostic), common.LocalLogContentLimit)]), StartedAt: startedAt, FinishedAt: now})
+		attemptStatus := TaskStatusFailure
+		if configuredUnknown {
+			attemptStatus = TaskStatusUnknown
+		}
+		current.PrivateData.VideoAttempts = append(current.PrivateData.VideoAttempts, VideoTaskAttempt{ChannelID: current.ChannelId, Decision: current.PrivateData.MediaRetryDecision, Generation: current.AttemptGeneration, UpstreamTaskID: current.PrivateData.UpstreamTaskID, Status: string(attemptStatus), Reason: string(diagnostic[:min(len(diagnostic), common.LocalLogContentLimit)]), StartedAt: startedAt, FinishedAt: now})
 		current.PrivateData.UpstreamTaskID, current.PrivateData.ResultURL = "", ""
+		current.PrivateData.VideoReconciliation = nil
 		current.PrivateData.PollFailures = 0
 		current.PrivateData.VideoTerminalConfirmed = false
 		current.PrivateData.PluginState, current.PrivateData.UpstreamAsyncResponse = nil, nil
@@ -163,11 +171,14 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 			stage, nextAttempt = "submit", now+5
 		}
 		jobChanges := map[string]any{"attempt_generation": generation, "reference_retry_count": currentJob.ReferenceRetryCount + 1, "reference_recovery_stage": stage, "status": "queued", "storage_status": "pending", "dispatched_at": 0, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": nextAttempt, "error_message": ""}
+		if configuredUnknown {
+			jobChanges["billing_status"] = "reserved"
+		}
 		if policyRecovery {
 			jobChanges["request_cipher"] = plans[0].RequestCipher
 			jobChanges["next_attempt_at"] = now + int64(plans[0].Decision.DelaySeconds)
 		}
-		result = tx.Model(&AsyncMediaJob{}).Where("id = ? AND attempt_generation = ? AND reference_retry_count = ? AND status = ? AND billing_status = ?", currentJob.ID, job.AttemptGeneration, currentJob.ReferenceRetryCount, currentJob.Status, "reserved").Updates(jobChanges)
+		result = tx.Model(&AsyncMediaJob{}).Where("id = ? AND attempt_generation = ? AND reference_retry_count = ? AND status = ? AND billing_status = ?", currentJob.ID, job.AttemptGeneration, currentJob.ReferenceRetryCount, currentJob.Status, currentJob.BillingStatus).Updates(jobChanges)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -187,6 +198,53 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// EndAsyncVideoPolicyExecution ends local execution without claiming that an
+// uncertain upstream operation failed or that its existing hold was refunded.
+func EndAsyncVideoPolicyExecution(ctx context.Context, task Task, job AsyncMediaJob, fact mediaretry.Fact, decision *mediaretry.Decision, state mediaretry.State) error {
+	configuredStop := decision != nil && decision.Matched && decision.Action == mediaretry.Stop && decision.BlockedReason == "" && (fact.Unknown || fact.Accepted && !fact.Terminal)
+	if fact.HasOutput || !configuredStop && !slices.ContainsFunc(task.PrivateData.VideoAttempts, func(attempt VideoTaskAttempt) bool { return attempt.Status == TaskStatusUnknown }) {
+		return ErrTaskAttemptConflict
+	}
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current Task
+		if err := lockForUpdate(tx).Where("id = ?", task.ID).Take(&current).Error; err != nil {
+			return err
+		}
+		var queued AsyncMediaJob
+		if err := lockForUpdate(tx).Where("id = ?", job.ID).Take(&queued).Error; err != nil {
+			return err
+		}
+		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration == math.MaxInt64 || queued.AttemptGeneration != task.AttemptGeneration || current.TaskID != queued.TaskId || current.UserId != queued.UserId || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID || current.PrivateData.ResultURL != "" || current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput || queued.OutputObjectKey != "" || queued.ArtifactKeys != "" || queued.Status == "failed" || queued.Status == "succeeded" || queued.Status == "expired" {
+			return ErrTaskAttemptConflict
+		}
+		if decision != nil {
+			event, err := NewMediaRetryEvent(current.TaskID, current.AttemptGeneration, fact, *decision, state)
+			if err != nil {
+				return err
+			}
+			event.Executed = true
+			if err := RecordMediaRetryEventTx(tx, event); err != nil {
+				return err
+			}
+			state = mediaretry.Consume(state, *decision)
+			current.PrivateData.MediaRetryDecision, current.PrivateData.MediaRetryState = decision, &state
+		}
+		current.PrivateData.MediaRetryFact = &fact
+		current.PrivateData.VideoTerminalConfirmed = false
+		current.PrivateData.VideoReconciliation = nil
+		now := time.Now().Unix()
+		generation := current.AttemptGeneration + 1
+		if err := tx.Model(&current).Updates(map[string]any{"attempt_generation": generation, "status": TaskStatusFailure, "fail_reason": fact.Message, "progress": "100%", "finish_time": now, "updated_at": now, "private_data": current.PrivateData}).Error; err != nil {
+			return err
+		}
+		billing := queued.BillingStatus
+		if billing != "settled" && billing != "refunded" && billing != "not_billable" && billing != "failed" {
+			billing = "unknown"
+		}
+		return tx.Model(&queued).Updates(map[string]any{"attempt_generation": generation, "status": "failed", "billing_status": billing, "reference_recovery_stage": "policy_stopped_unknown", "error_message": fact.Message, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0}).Error
+	})
 }
 
 // CommitAsyncVideoReferenceSubmission publishes a replacement native receipt

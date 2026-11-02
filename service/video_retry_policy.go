@@ -272,15 +272,20 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		result.Reason = "historical_task_not_restarted"
 		return result, nil
 	}
-	if job.Status == "execution_unknown" || job.ReferenceRecoveryStage == "unknown" || job.ReferenceRecoveryStage == "dispatched" || task.PrivateData.VideoReconciliation != nil && task.PrivateData.VideoReconciliation.ManualRequired {
+	if task.PrivateData.ResultURL != "" || job.OutputObjectKey != "" || job.ArtifactKeys != "" || task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.HasOutput {
+		result.Reason = "output_already_available"
+		return result, nil
+	}
+	configured := decision.Matched && decision.BlockedReason == "" && mediaretry.IsResubmission(decision.Action)
+	if !configured && (job.Status == "execution_unknown" || job.ReferenceRecoveryStage == "unknown" || job.ReferenceRecoveryStage == "dispatched" || task.PrivateData.VideoReconciliation != nil && task.PrivateData.VideoReconciliation.ManualRequired) {
 		result.Reason = "upstream_result_unknown"
 		return result, nil
 	}
-	if task.PrivateData.UpstreamTaskID != "" && !task.PrivateData.VideoTerminalConfirmed {
+	if !configured && task.PrivateData.UpstreamTaskID != "" && !task.PrivateData.VideoTerminalConfirmed {
 		result.Reason = "current_upstream_terminal_state_unconfirmed"
 		return result, nil
 	}
-	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 || job.BillingStatus != "reserved" || task.Quota != job.Quota || task.AttemptGeneration != job.AttemptGeneration {
+	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 || job.BillingStatus != "reserved" && !(configured && job.BillingStatus == "unknown") || task.Quota != job.Quota || task.AttemptGeneration != job.AttemptGeneration {
 		result.Reason = "reservation_unavailable"
 		return result, nil
 	}
@@ -359,6 +364,78 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		result.Reason = "no_compatible_channel"
 	}
 	return result, nil
+}
+
+// ApplyConfiguredVideoDecision executes only the currently matched unknown-result
+// action. The captured protocol evidence remains unchanged in the retry record.
+func ApplyConfiguredVideoDecision(ctx context.Context, task model.Task, job model.AsyncMediaJob, fact mediaretry.Fact, decision *mediaretry.Decision, state mediaretry.State) (bool, error) {
+	if !decision.Matched || decision.BlockedReason != "" || fact.HasOutput || !fact.Unknown && !(fact.Accepted && !fact.Terminal) || !mediaretry.IsResubmission(decision.Action) && decision.Action != mediaretry.Stop {
+		return false, nil
+	}
+	if task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusSuccess || job.Status == "failed" || job.Status == "expired" || job.Status == "succeeded" {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "historical_task_not_restarted"
+		return false, nil
+	}
+	if decision.Action == mediaretry.Stop {
+		return true, model.EndAsyncVideoPolicyExecution(ctx, task, job, fact, decision, state)
+	}
+	if !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.Quota <= 0 || task.Quota != job.Quota || job.BillingStatus != "reserved" && job.BillingStatus != "unknown" {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "reservation_unavailable"
+		return false, nil
+	}
+	plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+	var request AsyncVideoRequest
+	if err != nil || common.Unmarshal(plain, &request) != nil || len(request.Body) == 0 || request.ReferenceRecoveryVersion < 1 || request.ReferenceRecoveryVersion > 2 {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "request_replay_unavailable"
+		return false, nil
+	}
+	if request.ReferenceRecoveryDeadline <= time.Now().Unix() || job.ExpiresAt <= time.Now().Unix() {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "execution_deadline_reached"
+		return false, nil
+	}
+	request.RetryFact, request.PendingDecision, request.RetryFailedAt = &fact, decision, time.Now().Unix()
+	if len(request.OriginalBody) > 0 {
+		request.Body = append([]byte(nil), request.OriginalBody...)
+		request.LocalReferencesReady = false
+	}
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return false, err
+	}
+	cipher, err := EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	if err != nil {
+		return false, err
+	}
+	local := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
+	_, err = model.ScheduleAsyncVideoReferenceRecovery(ctx, task, job, fact.Message, local, model.AsyncVideoRecoveryPlan{Fact: fact, Decision: *decision, State: state, RequestCipher: cipher})
+	return true, err
+}
+
+// RetainUnconfirmedVideoBilling keeps a retired unknown attempt's hold when a
+// replacement fails. Only the existing explicit reconciliation can release it.
+func RetainUnconfirmedVideoBilling(ctx context.Context, task *model.Task) (bool, error) {
+	if task == nil || !task.PrivateData.AsyncMedia || task.Status != model.TaskStatusFailure || !slices.ContainsFunc(task.PrivateData.VideoAttempts, func(attempt model.VideoTaskAttempt) bool { return attempt.Status == model.TaskStatusUnknown }) {
+		return false, nil
+	}
+	var current model.Task
+	if err := model.DB.WithContext(ctx).First(&current, task.ID).Error; err != nil {
+		return false, err
+	}
+	if current.AttemptGeneration != task.AttemptGeneration || current.Status == model.TaskStatusFailure || current.Status == model.TaskStatusSuccess {
+		return false, nil
+	}
+	var job model.AsyncMediaJob
+	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", current.TaskID, current.UserId).Take(&job).Error; err != nil {
+		return false, err
+	}
+	if job.ReferenceRecoveryStage == "age_limit_refund" {
+		return false, nil
+	}
+	fact := NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "terminal", ErrorCode: "upstream_failed", Message: task.FailReason, Accepted: true, Terminal: task.PrivateData.VideoTerminalConfirmed, Unknown: !task.PrivateData.VideoTerminalConfirmed, HasUpstreamTask: task.PrivateData.UpstreamTaskID != ""})
+	if err := model.EndAsyncVideoPolicyExecution(ctx, current, job, fact, nil, videoRetryState(current, job)); err != nil {
+		return false, err
+	}
+	return true, model.DB.WithContext(ctx).First(task, task.ID).Error
 }
 
 // SelectVideoRecoveryChannel pins execution while retaining the first hold's
@@ -520,7 +597,7 @@ func VideoPostprocessDecision(ctx context.Context, job model.AsyncMediaJob, task
 	return decision, nil
 }
 
-func videoPollingDecision(ctx context.Context, task *model.Task, reason string, statusCode int, begin bool) (mediaretry.Decision, error) {
+func videoPollingDecision(ctx context.Context, task *model.Task, reason string, statusCode int, begin bool, recorded ...*mediaretry.Fact) (mediaretry.Decision, error) {
 	var job model.AsyncMediaJob
 	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -529,7 +606,18 @@ func videoPollingDecision(ctx context.Context, task *model.Task, reason string, 
 		return mediaretry.Decision{}, err
 	}
 	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "poll", HTTPStatus: statusCode, ErrorCode: "upstream_result_unknown", Category: "execution_unknown", Message: reason, Unknown: true, Accepted: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != ""}
-	if begin && task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.Stage == "poll" {
+	if plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId); err == nil {
+		var request AsyncVideoRequest
+		if common.Unmarshal(plain, &request) == nil {
+			fact.HasReferences, fact.LocalSupported = len(request.ReferenceInputs) > 0, !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0
+			fact.Deadline = request.ReferenceRecoveryDeadline
+		}
+	}
+	if len(recorded) > 0 && recorded[0] != nil && recorded[0].Stage == "poll" {
+		// Readiness rechecks the same captured failure after a policy change;
+		// it has no new HTTP response and must retain the original match facts.
+		fact = *recorded[0]
+	} else if begin && task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.Stage == "poll" {
 		fact = *task.PrivateData.MediaRetryFact
 	}
 	if task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.HasOutput {
@@ -540,6 +628,14 @@ func videoPollingDecision(ctx context.Context, task *model.Task, reason string, 
 	decision, err := evaluateVideoRetry(ctx, fact, &state)
 	if err != nil {
 		return decision, err
+	}
+	if applied, err := ApplyConfiguredVideoDecision(ctx, *task, job, fact, &decision, state); err != nil {
+		return decision, err
+	} else if applied {
+		if err := model.DB.WithContext(ctx).First(task, task.ID).Error; err != nil {
+			return decision, err
+		}
+		return decision, nil
 	}
 	consume := begin && decision.Matched && decision.Action == mediaretry.PollSameJob
 	if !begin || decision.Matched {

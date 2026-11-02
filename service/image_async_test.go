@@ -3471,73 +3471,87 @@ func TestAsyncImageRetryDecisionsAndEncryptedFailureRetention(t *testing.T) {
 
 func TestAsyncImageConfiguredRetryActions(t *testing.T) {
 	for _, action := range []string{mediaretry.SameChannel, mediaretry.OtherChannel, mediaretry.LocalSameChannel, mediaretry.LocalOtherChannel} {
-		t.Run(action, func(t *testing.T) {
-			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
-			asyncImageWorkerQuotaCacheFixture(t, task)
-			originalChannel := task.ChannelId
-			require.NoError(t, db.AutoMigrate(&model.ImageInputAlias{}, &model.ImageInputObject{}))
-			t.Cleanup(func() {
-				assert.NoError(t, db.Migrator().DropTable(&model.ImageInputAlias{}, &model.ImageInputObject{}))
+		for _, scenario := range []string{"confirmed rejection", "unclassified HTTP 400", "unknown upstream job"} {
+			t.Run(action+"/"+scenario, func(t *testing.T) {
+				db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
+				asyncImageWorkerQuotaCacheFixture(t, task)
+				originalChannel := task.ChannelId
+				require.NoError(t, db.AutoMigrate(&model.ImageInputAlias{}, &model.ImageInputObject{}))
+				t.Cleanup(func() {
+					assert.NoError(t, db.Migrator().DropTable(&model.ImageInputAlias{}, &model.ImageInputObject{}))
+				})
+				request.Kind, request.Parts = "image_to_image", []AsyncImageInputPart{{Type: "image_url", URL: asyncImageBytesFixture(t).DataURL()}}
+				payload, err := common.Marshal(request)
+				require.NoError(t, err)
+				task.RequestCipher, err = EncryptImagePayload(payload, "task:"+task.TaskId)
+				require.NoError(t, err)
+				task.DispatchedAt = time.Now().Unix()
+				if scenario == "unknown upstream job" {
+					task.UpstreamTaskId = "original-unconfirmed-job"
+				}
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "dispatched_at": task.DispatchedAt, "upstream_task_id": task.UpstreamTaskId}).Error)
+				require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+				policy, err := model.GetMediaRetryPolicy(t.Context())
+				require.NoError(t, err)
+				policy.Rules = []mediaretry.Rule{{ID: "busy", Name: "Temporary capacity failure", Enabled: true, Category: "transient", Match: mediaretry.Match{ContainsAny: []string{"retryable capacity"}}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.ManualReview}}
+				_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+				require.NoError(t, err)
+				failure := &AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", Message: "retryable capacity", SubmissionRejected: true}
+				if scenario != "confirmed rejection" {
+					failure.Code, failure.HTTPStatus, failure.SubmissionRejected = 610, http.StatusBadRequest, false
+					failure.ExecutionUnknown = scenario == "unknown upstream job"
+				}
+				require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, cfg))
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				require.Equal(t, model.ImageTaskQueued, task.Status)
+				var planned model.ImageRetryPolicyState
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &planned))
+				assert.Equal(t, scenario == "confirmed rejection", planned.Fact.Terminal)
+				assert.Equal(t, scenario != "confirmed rejection", planned.Fact.Accepted)
+				assert.Equal(t, scenario == "unknown upstream job", planned.Fact.Unknown)
+				assert.Empty(t, planned.Decision.BlockedReason)
+				preview, err := PreviewImageRetryEligibility(t.Context(), task.TaskId, planned.Fact, planned.Decision)
+				require.NoError(t, err)
+				require.True(t, preview.Eligible, preview.Reason)
+				if action == mediaretry.SameChannel || action == mediaretry.LocalSameChannel {
+					assert.Equal(t, []int{originalChannel}, preview.CandidateChannelIDs)
+				} else {
+					assert.Equal(t, []int{alternate.Id}, preview.CandidateChannelIDs)
+				}
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"next_attempt_at": time.Now().Unix() - 1}).Error)
+				task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "configured-retry-lease", 120)
+				require.NoError(t, err)
+				calls := 0
+				ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, runtime ImageRuntimeConfig, before func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+					calls++
+					wantChannel := originalChannel
+					if action == mediaretry.OtherChannel || action == mediaretry.LocalOtherChannel {
+						wantChannel = alternate.Id
+					}
+					assert.Equal(t, wantChannel, channel.Id)
+					assert.Empty(t, current.UpstreamTaskId, "custom replacement submits a new operation")
+					wantTransport := "passthrough"
+					if action == mediaretry.LocalSameChannel || action == mediaretry.LocalOtherChannel {
+						wantTransport = "local"
+					}
+					assert.Equal(t, wantTransport, ImageChannelReferenceTransport(*channel, outbound.Platform, current.ReferenceRetryCount, runtime))
+					assert.Equal(t, request.Parts, outbound.Parts)
+					require.NoError(t, before())
+					return nil, model.AsyncImageBill{}, failure
+				}
+				require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+				assert.Equal(t, 1, calls)
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				var state model.ImageRetryPolicyState
+				require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &state))
+				assert.Equal(t, 1, state.State.StepUses["busy/retry"])
+				assert.True(t, state.Decision.Exhausted)
+				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+				var user model.User
+				require.NoError(t, db.First(&user, task.UserId).Error)
+				assert.Equal(t, 900, user.Quota, "replacement shares the original hold")
 			})
-			request.Kind, request.Parts = "image_to_image", []AsyncImageInputPart{{Type: "image_url", URL: asyncImageBytesFixture(t).DataURL()}}
-			payload, err := common.Marshal(request)
-			require.NoError(t, err)
-			task.RequestCipher, err = EncryptImagePayload(payload, "task:"+task.TaskId)
-			require.NoError(t, err)
-			task.DispatchedAt = time.Now().Unix()
-			require.NoError(t, db.Model(&task).Updates(map[string]any{"request_cipher": task.RequestCipher, "dispatched_at": task.DispatchedAt}).Error)
-			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
-			policy, err := model.GetMediaRetryPolicy(t.Context())
-			require.NoError(t, err)
-			policy.Rules = []mediaretry.Rule{{ID: "busy", Name: "Temporary capacity failure", Enabled: true, Category: "transient", Match: mediaretry.Match{ContainsAny: []string{"retryable capacity"}}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.ManualReview}}
-			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
-			require.NoError(t, err)
-			failure := &AsyncImageFailure{Code: 606, InternalCode: "upstream_failed", Message: "retryable capacity", SubmissionRejected: true}
-			require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, cfg))
-			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
-			require.Equal(t, model.ImageTaskQueued, task.Status)
-			var planned model.ImageRetryPolicyState
-			require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &planned))
-			preview, err := PreviewImageRetryEligibility(t.Context(), task.TaskId, planned.Fact, planned.Decision)
-			require.NoError(t, err)
-			require.True(t, preview.Eligible, preview.Reason)
-			if action == mediaretry.SameChannel || action == mediaretry.LocalSameChannel {
-				assert.Equal(t, []int{originalChannel}, preview.CandidateChannelIDs)
-			} else {
-				assert.Equal(t, []int{alternate.Id}, preview.CandidateChannelIDs)
-			}
-			require.NoError(t, db.Model(&task).Updates(map[string]any{"next_attempt_at": time.Now().Unix() - 1}).Error)
-			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "configured-retry-lease", 120)
-			require.NoError(t, err)
-			calls := 0
-			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound AsyncImageRequest, channel *model.Channel, runtime ImageRuntimeConfig, before func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
-				calls++
-				wantChannel := originalChannel
-				if action == mediaretry.OtherChannel || action == mediaretry.LocalOtherChannel {
-					wantChannel = alternate.Id
-				}
-				assert.Equal(t, wantChannel, channel.Id)
-				wantTransport := "passthrough"
-				if action == mediaretry.LocalSameChannel || action == mediaretry.LocalOtherChannel {
-					wantTransport = "local"
-				}
-				assert.Equal(t, wantTransport, ImageChannelReferenceTransport(*channel, outbound.Platform, current.ReferenceRetryCount, runtime))
-				assert.Equal(t, request.Parts, outbound.Parts)
-				require.NoError(t, before())
-				return nil, model.AsyncImageBill{}, failure
-			}
-			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
-			assert.Equal(t, 1, calls)
-			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
-			var state model.ImageRetryPolicyState
-			require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &state))
-			assert.Equal(t, 1, state.State.StepUses["busy/retry"])
-			assert.True(t, state.Decision.Exhausted)
-			assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
-			var user model.User
-			require.NoError(t, db.First(&user, task.UserId).Error)
-			assert.Equal(t, 900, user.Quota, "replacement shares the original hold")
-		})
+		}
 	}
 }
 
@@ -3697,11 +3711,8 @@ func TestAsyncImageLegacyPendingRetryUsesNewPolicy(t *testing.T) {
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
 			assert.Zero(t, sends)
-			if rejected {
-				assert.Equal(t, model.ImageTaskFailed, task.Status, "a newly saved stop rule takes over the historical pending retry")
-			} else {
-				assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status, "an unproven prior outcome retains its hold for review")
-			}
+			assert.Equal(t, model.ImageTaskFailed, task.Status, "a newly saved stop rule takes over the pending retry")
+			assert.Equal(t, !rejected, task.TerminationRequiresReconciliation())
 		})
 	}
 }
@@ -3766,23 +3777,143 @@ func TestAsyncImagePendingRuleReadsChangesBeforeDispatch(t *testing.T) {
 	assert.Equal(t, 100, bill.ReservedQuota)
 }
 
-func TestAsyncImageRuleCannotReplayUnknownResult(t *testing.T) {
-	db, task, _, cfg, _ := asyncImageWorkerFixture(t)
-	policy, err := model.GetMediaRetryPolicy(t.Context())
-	require.NoError(t, err)
-	policy.Rules = []mediaretry.Rule{{ID: "timeout", Name: "Timeout", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"timeout"}}, Steps: []mediaretry.Step{{ID: "switch", Action: mediaretry.OtherChannel, MaxAttempts: 2}}}}
-	_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
-	require.NoError(t, err)
-	task.DispatchedAt = time.Now().Unix()
-	require.NoError(t, db.Model(&task).Update("dispatched_at", task.DispatchedAt).Error)
-	require.NoError(t, failAsyncImageInvocation(t.Context(), task, &AsyncImageFailure{Code: 608, InternalCode: "upstream_transport_timeout", Message: "timeout", ExecutionUnknown: true}, cfg))
-	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
-	assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
-	assert.Zero(t, task.RetryCount)
-	var state model.ImageRetryPolicyState
-	require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &state))
-	assert.Equal(t, "upstream_result_unknown", state.Decision.BlockedReason)
-	assert.Empty(t, state.State.StepUses)
+func TestAsyncImagePendingPollRuleChangesToResubmission(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run("replacement_expired_"+strconv.FormatBool(expired), func(t *testing.T) {
+			db, task, _, cfg, alternate := asyncImageWorkerFixture(t)
+			asyncImageWorkerQuotaCacheFixture(t, task)
+			require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+			task.UpstreamTaskId, task.DispatchedAt = "original-unconfirmed-job", time.Now().Unix()
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"upstream_task_id": task.UpstreamTaskId, "dispatched_at": task.DispatchedAt}).Error)
+			policy, err := model.GetMediaRetryPolicy(t.Context())
+			require.NoError(t, err)
+			policy.Rules = []mediaretry.Rule{{ID: "pending", Name: "Pending upstream recovery", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"poll timeout"}}, Steps: []mediaretry.Step{{ID: "step", Action: mediaretry.PollSameJob, MaxAttempts: 1}}}}
+			policy, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+			require.NoError(t, err)
+			require.NoError(t, failAsyncImageInvocation(t.Context(), task, &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "poll timeout", ExecutionUnknown: true}, cfg))
+			policy.Rules[0].Steps[0].Action = mediaretry.OtherChannel
+			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()-1).Error)
+			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "changed-poll-rule", cfg.WorkerLease)
+			require.NoError(t, err)
+			calls := 0
+			ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, _ AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, before func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Empty(t, current.UpstreamTaskId)
+				assert.Equal(t, alternate.Id, channel.Id)
+				require.NoError(t, before())
+				failure := &AsyncImageFailure{Code: 604, InternalCode: "upstream_failed", Message: "invalid dimensions", SubmissionRejected: true}
+				if expired {
+					failure.InternalCode, failure.Message = "execution_deadline", "execution deadline reached"
+				}
+				return nil, model.AsyncImageBill{}, failure
+			}
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			assert.Zero(t, calls, "replace the old receipt transactionally before dispatching the revised action")
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskQueued, task.Status)
+			assert.Empty(t, task.UpstreamTaskId)
+			assert.Zero(t, task.DispatchedAt)
+			assert.Equal(t, 1, task.RetryCount)
+			require.NoError(t, db.Model(&task).Update("next_attempt_at", time.Now().Unix()-1).Error)
+			task, err = model.ClaimAsyncImageTask(t.Context(), task.TaskId, "replacement-rule", cfg.WorkerLease)
+			require.NoError(t, err)
+			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+			assert.Equal(t, 1, calls)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			wantStatus := model.ImageTaskFailed
+			if expired {
+				wantStatus = model.ImageTaskExpired
+			}
+			assert.Equal(t, wantStatus, task.Status)
+			assert.Equal(t, model.ImagePolicyUnconfirmed, task.ReconciliationStatus)
+			assert.True(t, task.TerminationRequiresReconciliation())
+			require.NoError(t, model.RefundAsyncImageReservation(t.Context(), task.TaskId))
+			var bill model.AsyncImageBill
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+			assert.Equal(t, "reserved", bill.Status, "a failed replacement cannot confirm the original unknown operation")
+		})
+	}
+}
+
+func TestAsyncImageCustomRuleReplaysUnknownResult(t *testing.T) {
+	for _, action := range []string{mediaretry.OtherChannel, mediaretry.Stop, "unmatched"} {
+		for _, knownJob := range []bool{false, true} {
+			t.Run(action+"/known_job_"+strconv.FormatBool(knownJob), func(t *testing.T) {
+				db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+				asyncImageWorkerQuotaCacheFixture(t, task)
+				require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+				policy, err := model.GetMediaRetryPolicy(t.Context())
+				require.NoError(t, err)
+				stepAction, keyword := action, "timeout"
+				if action == "unmatched" {
+					stepAction, keyword = mediaretry.OtherChannel, "different error"
+				}
+				policy.Rules = []mediaretry.Rule{{ID: "timeout", Name: "Timeout", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{keyword}}, Steps: []mediaretry.Step{{ID: "switch", Action: stepAction, MaxAttempts: 2}}}}
+				_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+				require.NoError(t, err)
+				task.DispatchedAt = time.Now().Unix()
+				if knownJob {
+					task.UpstreamTaskId = "original-unconfirmed-job"
+				}
+				require.NoError(t, db.Model(&task).Updates(map[string]any{"dispatched_at": task.DispatchedAt, "upstream_task_id": task.UpstreamTaskId}).Error)
+				failure := &AsyncImageFailure{Code: 608, InternalCode: "execution_unknown", Message: "timeout", ExecutionUnknown: true}
+				if knownJob {
+					polls := 0
+					ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, _ AsyncImageRequest, _ *model.Channel, _ ImageRuntimeConfig, _ func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+						polls++
+						assert.Equal(t, "original-unconfirmed-job", current.UpstreamTaskId)
+						return nil, model.AsyncImageBill{}, failure
+					}
+					require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
+					assert.Equal(t, 1, polls)
+				} else {
+					require.NoError(t, failAsyncImageInvocation(t.Context(), task, failure, cfg))
+				}
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+				wantStatus := model.ImageTaskQueued
+				if action == mediaretry.Stop {
+					wantStatus = model.ImageTaskFailed
+				} else if action == "unmatched" {
+					wantStatus = model.ImageTaskExecutionUnknown
+					if knownJob {
+						wantStatus = model.ImageTaskInvoking
+					}
+				}
+				assert.Equal(t, wantStatus, task.Status)
+				var state model.ImageRetryPolicyState
+				if task.RetryPolicyState != "" {
+					require.NoError(t, common.UnmarshalJsonStr(task.RetryPolicyState, &state))
+				}
+				assert.Equal(t, action != "unmatched", state.Decision.Matched)
+				if action != "unmatched" {
+					assert.Equal(t, action, state.Decision.Action)
+					assert.Empty(t, state.Decision.BlockedReason)
+				}
+				assert.Empty(t, state.State.StepUses)
+				if action == mediaretry.OtherChannel {
+					assert.Equal(t, 1, task.RetryCount)
+					assert.True(t, state.Pending)
+					assert.True(t, state.Fact.Unknown)
+					assert.False(t, state.Fact.Terminal)
+				}
+				if action == mediaretry.Stop {
+					assert.True(t, task.TerminationRequiresReconciliation())
+					require.NoError(t, model.RefundAsyncImageReservation(t.Context(), task.TaskId))
+					require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 100, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+				}
+				var bill model.AsyncImageBill
+				require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+				assert.Equal(t, "reserved", bill.Status, "unknown original execution keeps its hold even when a rule stops")
+				if action == mediaretry.Stop {
+					require.NoError(t, model.TerminateAsyncImageTaskAfterReconciliation(t.Context(), task))
+					require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+					assert.Equal(t, "refunded", bill.Status, "explicit administrator reconciliation can release the hold")
+				}
+			})
+		}
+	}
 }
 
 func TestAsyncImageSupplierWaitPreservesHoldAndBypassesAcceptedJobPolling(t *testing.T) {
@@ -5323,6 +5454,98 @@ func TestAsyncImageValidationContainerMIMEAndPublicAddress(t *testing.T) {
 	decoded, err := DownloadImageReference(context.Background(), valid.DataURL(), DefaultImageRuntimeConfig())
 	require.NoError(t, err)
 	assert.Equal(t, valid.Checksum, decoded.Checksum)
+}
+
+func TestAsyncImageOutputMIMECompatibility(t *testing.T) {
+	pngImage := asyncImageBytesFixture(t)
+	var jpegData bytes.Buffer
+	require.NoError(t, jpeg.Encode(&jpegData, image.NewRGBA(image.Rect(0, 0, 2, 2)), nil))
+	jpegImage, err := ValidateImageBytes(jpegData.Bytes(), "image/jpeg", 1<<20, 100)
+	require.NoError(t, err)
+	webpData, err := base64.StdEncoding.DecodeString("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA")
+	require.NoError(t, err)
+	webpImage, err := ValidateImageBytes(webpData, "image/webp", 1<<20, 100)
+	require.NoError(t, err)
+	cfg := DefaultImageRuntimeConfig()
+	cfg.DownloadMaxBytes, cfg.DownloadMaxPixels = 1<<20, 100
+	task := model.AsyncImageTask{TaskId: "asyncimg_mime_compatibility", CreatedAt: 1793607929}
+	for _, tc := range []struct {
+		name, declared, extension string
+		image                     ImageBytes
+	}{
+		{"PNG labeled JPEG", "image/jpeg", ".png", pngImage},
+		{"JPEG labeled PNG", "image/png", ".jpg", jpegImage},
+		{"WebP labeled JPEG", "image/jpeg", ".webp", webpImage},
+		{"MIME case and parameters", `IMAGE/WEBP; name="image.webp"`, ".png", pngImage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "data:" + tc.declared + ";base64," + base64.StdEncoding.EncodeToString(tc.image.Data)
+			output, err := DownloadImageOutput(t.Context(), raw, cfg)
+			require.NoError(t, err)
+			assert.Equal(t, tc.image, output, "output MIME, dimensions, bytes and checksum must describe the decoded image")
+			assert.Equal(t, tc.extension, filepath.Ext(ImageResultObjectKey(task, 0, output.ContentType)))
+			response := &http.Response{
+				StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{tc.declared}},
+				Body: io.NopCloser(bytes.NewReader(tc.image.Data)), ContentLength: int64(len(tc.image.Data)),
+			}
+			downloaded, err := readUpstreamAsyncImageResponse(response, cfg)
+			require.NoError(t, err)
+			assert.Equal(t, tc.image, downloaded, "HTTP outputs must use the same validated content type and bytes")
+			assert.Equal(t, tc.extension, filepath.Ext(ImageResultObjectKey(task, 0, downloaded.ContentType)))
+			_, err = DownloadImageReference(t.Context(), raw, cfg)
+			require.ErrorContains(t, err, "declared image MIME does not match its bytes")
+			_, err = ValidateImageBytes(tc.image.Data, tc.declared, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+			assert.ErrorContains(t, err, "declared image MIME does not match its bytes")
+		})
+	}
+	badCRC := bytes.Clone(pngImage.Data)
+	badCRC[len(badCRC)-1] ^= 1
+	for _, tc := range []struct {
+		name, declared, wantError string
+		data                      []byte
+		maxBytes, maxPixels       int64
+	}{
+		{name: "HTML MIME", declared: "text/html", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
+		{name: "SVG MIME", declared: "image/svg+xml", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
+		{name: "generic binary MIME", declared: "application/octet-stream", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
+		{name: "malformed MIME", declared: "image/jpeg; bad", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
+		{name: "HTML body", declared: "image/jpeg", data: []byte("<!doctype html><html>upstream error</html>"), wantError: "invalid image header"},
+		{name: "SVG body", declared: "image/png", data: []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/>`), wantError: "invalid image header"},
+		{name: "truncated PNG", declared: "image/jpeg", data: pngImage.Data[:len(pngImage.Data)-1], wantError: "invalid image container"},
+		{name: "corrupt PNG CRC", declared: "image/jpeg", data: badCRC, wantError: "image could not be fully decoded"},
+		{name: "excessive trailing data", declared: "image/jpeg", data: append(bytes.Clone(pngImage.Data), bytes.Repeat([]byte{0x5a}, maxNormalizedImageTrailingBytes+1)...), wantError: "invalid image container"},
+		{name: "byte limit", declared: "image/jpeg", data: pngImage.Data, maxBytes: int64(len(pngImage.Data) - 1)},
+		{name: "pixel limit", declared: "image/jpeg", data: pngImage.Data, maxPixels: 5, wantError: "image pixel limit exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limited := cfg
+			if tc.maxBytes > 0 {
+				limited.DownloadMaxBytes = tc.maxBytes
+			}
+			if tc.maxPixels > 0 {
+				limited.DownloadMaxPixels = tc.maxPixels
+			}
+			raw := "data:" + tc.declared + ";base64," + base64.StdEncoding.EncodeToString(tc.data)
+			output, err := DownloadImageOutput(t.Context(), raw, limited)
+			require.Error(t, err)
+			assert.True(t, IsImageValidationError(err))
+			assert.Empty(t, output.Data)
+			if tc.wantError != "" {
+				assert.ErrorContains(t, err, tc.wantError)
+			}
+			response := &http.Response{
+				StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{tc.declared}},
+				Body: io.NopCloser(bytes.NewReader(tc.data)), ContentLength: int64(len(tc.data)),
+			}
+			downloaded, err := readUpstreamAsyncImageResponse(response, limited)
+			require.Error(t, err)
+			assert.True(t, IsImageValidationError(err))
+			assert.Empty(t, downloaded.Data)
+			if tc.wantError != "" {
+				assert.ErrorContains(t, err, tc.wantError)
+			}
+		})
+	}
 }
 
 func TestResolveImageReferenceTransportMode(t *testing.T) {

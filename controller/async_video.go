@@ -896,21 +896,11 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 				taskErr = service.TaskErrorWrapper(errors.New(result.Immediate.Reason), "upstream_rejected", http.StatusOK)
 			}
 		}
-		if taskErr != nil && c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
-			// An idempotency key does not prove the upstream refused the job.
-			// Keep the original reservation for reconciliation and never submit
-			// again merely because its receipt could not be read or persisted.
-			taskErr.NoRetry = true
-			return result, taskErr
-		}
 		if taskErr == nil {
 			return result, nil
 		}
 		deferred := errors.Is(taskErr.Error, service.ErrVideoRetryDeferred)
 		if !deferred && !evaluateOnly {
-			if taskErr.NoRetry {
-				return result, taskErr
-			}
 			message := taskErr.Message
 			if reason := c.GetString("async_media_submission_retry_reason"); reason != "" {
 				message = reason
@@ -951,10 +941,34 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		}
 		retry.event = event
 		if !mediaretry.IsResubmission(decision.Action) || decision.BlockedReason != "" {
+			unknownStop := decision.Matched && decision.Action == mediaretry.Stop && decision.BlockedReason == "" && request.RetryFact.Unknown && job.DispatchedAt > 0
+			if c.GetBool("async_media_execution") && info.Billing != nil && (unknownStop || len(request.InitialUnknownAttempts) > 0) && info.Billing.GetPreConsumedQuota() > 0 {
+				// End locally while carrying every earlier uncertain dispatch into
+				// the durable Task and its existing reservation. A later rejection
+				// does not confirm those earlier upstream operations.
+				request.PendingDecision = &decision
+				c.Set("async_media_policy_unknown_ended", true)
+				if result == nil {
+					result = &relay.TaskSubmitResult{Platform: constant.TaskPlatform(job.Provider), Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: request.RetryFact.Message}}
+				}
+				result.Quota = info.Billing.GetPreConsumedQuota()
+				return result, nil
+			}
+			if c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") {
+				taskErr.NoRetry = true
+			}
 			if typedRejection {
 				return result, nil
 			}
 			return result, taskErr
+		}
+		if taskErr.NoRetry && !decision.Matched {
+			return result, taskErr
+		}
+		if request.RetryFact.Unknown && !slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
+			return attempt.Generation == int64(state.TotalUsed) && attempt.ChannelID == request.RetryFact.ChannelID
+		}) {
+			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID, Decision: &decision, Generation: int64(state.TotalUsed), Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message, StartedAt: job.DispatchedAt, FinishedAt: time.Now().Unix()})
 		}
 		request.PendingDecision = &decision
 		if decision.DelaySeconds > 0 {
@@ -1160,7 +1174,9 @@ func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycomm
 		c.Set("async_media_reconciliation_dispatched", true)
 	}
 	job.ChannelId, job.RequestCipher, job.ChannelCipher = request.Channel.Id, cipher, channelCipher
+	job.DispatchedAt = updates["dispatched_at"].(int64)
 	request.InitialRetryState = &nextState
+	request.InitialUnknownAttempts = snapshot.InitialUnknownAttempts
 	request.RetryFact = snapshot.RetryFact
 	if request.PendingDecision != nil && !request.PendingDecision.Matched {
 		retry.legacyUsed = true

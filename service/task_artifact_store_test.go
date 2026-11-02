@@ -851,7 +851,7 @@ func TestVideoRecoveryRechecksLivePolicyWithoutResettingUse(t *testing.T) {
 			{name: "legacy switch applies", change: "disabled"},
 			{name: "captured deadline applies", change: "deadline"},
 			{name: "global zero disables", change: "budget"},
-			{name: "custom unknown rule cannot broaden exception", change: "custom", want: mediaretry.ManualReview},
+			{name: "custom unknown rule explicitly selects another channel", change: "custom", want: mediaretry.OtherChannel},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				policy := mediaretry.Policy{Revision: 3, LegacyTimeoutEnabled: true, LegacyVideoChannelIDs: []int{1}, LegacyTimeoutConfig: map[string]int{"video_submission_timeout_seconds": 120}}
@@ -893,6 +893,59 @@ func TestVideoRecoveryRechecksLivePolicyWithoutResettingUse(t *testing.T) {
 		assert.Equal(t, 9, request.RetryFact.ChannelID)
 		assert.EqualValues(t, 123, request.RetryFailedAt)
 	})
+	t.Run("unpausing a poll rule retains its HTTP status", func(t *testing.T) {
+		setupMeasuredTaskBillingDB(t)
+		asyncImageKeyFixture(t)
+		extra := []any{&model.Option{}, &model.MediaRetryPolicyVersion{}}
+		require.NoError(t, model.DB.AutoMigrate(extra...))
+		t.Cleanup(func() {
+			for _, row := range extra {
+				assert.NoError(t, model.DB.Where("1 = 1").Delete(row).Error)
+			}
+		})
+		task := makeTask(1, 1, 100, 1, "wallet", 0)
+		task.TaskID, task.Platform = "task-paused-poll-rule", "drama"
+		task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
+		task.PrivateData.UpstreamTaskID = "native-original"
+		require.NoError(t, model.DB.Create(task).Error)
+		now := time.Now().Unix()
+		request := AsyncVideoRequest{Body: []byte(`{"model":"test-model","prompt":"retry"}`), ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: now + 3600}
+		encoded, err := common.Marshal(request)
+		require.NoError(t, err)
+		cipher, err := EncryptImagePayload(encoded, "media-request:"+task.TaskID)
+		require.NoError(t, err)
+		job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: ImageIdentityHash(task.TaskID), UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: "test-model", Group: "default", Status: "submitted", BillingStatus: "reserved", Quota: 100, RequestCipher: cipher, CreatedAt: now, ExpiresAt: now + 86400}
+		require.NoError(t, model.DB.Create(&job).Error)
+		policy, err := model.GetMediaRetryPolicy(t.Context())
+		require.NoError(t, err)
+		policy.PauseResubmissions = true
+		policy.Rules = []mediaretry.Rule{{ID: "poll-503", Name: "Retry polling failure", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}, Stages: []string{"poll"}}, Match: mediaretry.Match{HTTPStatuses: []int{503}, ErrorCodes: []string{"upstream_result_unknown"}}, Steps: []mediaretry.Step{{ID: "switch", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}
+		policy, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
+		require.NoError(t, err)
+		require.NoError(t, reconcileAsyncVideoTask(t.Context(), task, task.Snapshot(), "upstream_error", 503))
+		require.NoError(t, model.DB.First(task, task.ID).Error)
+		require.NotNil(t, task.PrivateData.VideoReconciliation)
+		assert.True(t, task.PrivateData.VideoReconciliation.ManualRequired)
+		require.NotNil(t, task.PrivateData.MediaRetryFact)
+		assert.Equal(t, 503, task.PrivateData.MediaRetryFact.HTTPStatus)
+		assert.Equal(t, "resubmissions_paused", task.PrivateData.MediaRetryDecision.BlockedReason)
+		policy.PauseResubmissions = false
+		_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
+		require.NoError(t, err)
+		ready, err := asyncVideoPollReady(t.Context(), task)
+		require.NoError(t, err)
+		assert.False(t, ready, "the configured replacement is queued instead of polling the retired job")
+		assert.EqualValues(t, 1, task.AttemptGeneration)
+		assert.EqualValues(t, model.TaskStatusQueued, task.Status)
+		require.NotNil(t, task.PrivateData.MediaRetryFact)
+		assert.Equal(t, 503, task.PrivateData.MediaRetryFact.HTTPStatus)
+		assert.Equal(t, mediaretry.OtherChannel, task.PrivateData.MediaRetryDecision.Action)
+		require.NoError(t, model.DB.First(&job, job.ID).Error)
+		assert.Equal(t, "queued", job.Status)
+		assert.Equal(t, "reserved", job.BillingStatus)
+		assert.Equal(t, 100, job.Quota)
+		assert.Empty(t, task.PrivateData.MediaRetryState.StepUses, "waiting does not consume the unsent action")
+	})
 	job, _, _ := mediaInputFixture(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
 	t.Cleanup(func() {
@@ -928,8 +981,9 @@ func TestVideoRecoveryRechecksLivePolicyWithoutResettingUse(t *testing.T) {
 	require.NoError(t, err)
 	fact.Unknown = true
 	decision, err = RecheckVideoRecoveryPolicy(t.Context(), job, task, request)
-	require.Error(t, err)
-	assert.Equal(t, mediaretry.PollSameJob, decision.Action)
+	require.NoError(t, err)
+	assert.Equal(t, mediaretry.LocalOtherChannel, decision.Action)
+	assert.True(t, fact.Unknown, "explicit recovery does not rewrite protocol evidence")
 	fact.Unknown = false
 	fact.HasOutput = true
 	decision, err = RecheckVideoRecoveryPolicy(t.Context(), job, task, request)
@@ -973,6 +1027,7 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 		name, response, parsedURL            string
 		output, replayUnavailable            bool
 		capabilityMissing, accountingPending bool
+		stop, poll, replacement, unknownJob  bool
 	}{
 		{name: "raw output URL", response: `{"id":"native-original","status":"failed","video_url":"https://cdn.example/video.mp4"}`, output: true},
 		{name: "unavailable replay still retains output", response: `{"status":"failed","video_url":"https://cdn.example/video.mp4"}`, output: true, replayUnavailable: true},
@@ -981,6 +1036,12 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 		{name: "accepted status", response: `{"status":"in_progress"}`},
 		{name: "different native receipt", response: `{"id":"other-native","status":"failed"}`},
 		{name: "non-string native receipt", response: `{"id":123,"status":"failed"}`},
+		{name: "unknown stop retains its hold", response: `{"status":"queued"}`, stop: true},
+		{name: "poll unknown schedules another generation", poll: true},
+		{name: "poll unknown stop retains its hold", poll: true, stop: true},
+		{name: "replacement unknown schedules another generation", replacement: true},
+		{name: "replacement unknown stop retains its hold", replacement: true, stop: true},
+		{name: "persisted unknown hold schedules another generation", response: `{"status":"queued"}`, unknownJob: true},
 		{name: "missing replay capability records blocked stop", response: `{"id":"native-original","status":"failed"}`, capabilityMissing: true},
 		{name: "submission accounting precedes capability stop", response: `{"id":"native-original","status":"failed"}`, capabilityMissing: true, accountingPending: true},
 	} {
@@ -1002,10 +1063,17 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 			task.TaskID, task.Platform = "task-conflicting-response", "drama"
 			task.PrivateData.AsyncMedia, task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true, true
 			task.PrivateData.UpstreamTaskID = "native-original"
+			if tc.replacement {
+				task.Status, task.PrivateData.UpstreamTaskID = model.TaskStatusQueued, ""
+			}
+			if tc.unknownJob {
+				task.Status = model.TaskStatusUnknown
+			}
 			if tc.accountingPending {
 				task.PrivateData.SubmitAccountingRecorded = false
 			}
 			require.NoError(t, model.DB.Create(task).Error)
+			stale := *task
 			now := time.Now().Unix()
 			request := AsyncVideoRequest{Body: []byte(`{"model":"test-model","prompt":"safe retry"}`), ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: now + 3600}
 			if tc.capabilityMissing {
@@ -1019,14 +1087,31 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 				cipher = []byte("unavailable-encrypted-request")
 			}
 			job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: ImageIdentityHash(task.TaskID), UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: "test-model", Group: "default", Status: "submitted", BillingStatus: "reserved", Quota: 100, RequestCipher: cipher, CreatedAt: now, ExpiresAt: now + 86400}
+			if tc.replacement {
+				job.Status, job.ReferenceRecoveryStage, job.DispatchedAt = "queued", "dispatched", now-10
+			}
+			if tc.unknownJob {
+				job.Status, job.BillingStatus, job.ReferenceRecoveryStage = "execution_unknown", "unknown", "unknown"
+			}
 			require.NoError(t, model.DB.Create(&job).Error)
 			policy, err := model.GetMediaRetryPolicy(t.Context())
 			require.NoError(t, err)
 			policy.Rules = []mediaretry.Rule{{ID: "busy-retry", Name: "Retry busy", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"busy"}}, Steps: []mediaretry.Step{{ID: "switch", Action: mediaretry.OtherChannel, MaxAttempts: 2}}}}
+			if tc.stop {
+				policy.Rules[0].Steps[0].Action = mediaretry.Stop
+			}
 			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
 			require.NoError(t, err)
 			result := &relaycommon.TaskInfo{Status: string(model.TaskStatusFailure), Reason: "server busy", Url: tc.parsedURL}
-			handled, err := TryAsyncVideoReferenceRecovery(t.Context(), *task, result, 200, []byte(tc.response))
+			var handled bool
+			if tc.poll {
+				_, err = videoPollingDecision(t.Context(), task, "server busy", 503, false)
+				handled = true
+			} else if tc.replacement {
+				handled, err = tryUnknownVideoRecovery(t.Context(), *task, job, "server busy")
+			} else {
+				handled, err = TryAsyncVideoReferenceRecovery(t.Context(), *task, result, 200, []byte(tc.response))
+			}
 			require.NoError(t, err)
 			require.NoError(t, model.DB.First(task, task.ID).Error)
 			if tc.capabilityMissing {
@@ -1070,6 +1155,49 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 			assert.Equal(t, tc.output, task.PrivateData.MediaRetryFact.HasOutput)
 			assert.True(t, task.PrivateData.MediaRetryFact.Unknown)
 			assert.False(t, task.PrivateData.MediaRetryFact.Terminal)
+			if !tc.output {
+				assert.EqualValues(t, 1, task.AttemptGeneration)
+				assert.Equal(t, 100, task.Quota)
+				require.NoError(t, model.DB.First(&job, job.ID).Error)
+				if tc.stop {
+					assert.EqualValues(t, model.TaskStatusFailure, task.Status)
+					assert.Equal(t, "failed", job.Status)
+					assert.Equal(t, "unknown", job.BillingStatus)
+					assert.Zero(t, job.NextAttemptAt)
+					assert.False(t, task.PrivateData.VideoTerminalConfirmed)
+				} else {
+					assert.EqualValues(t, model.TaskStatusQueued, task.Status)
+					assert.Empty(t, task.PrivateData.UpstreamTaskID)
+					assert.Equal(t, "queued", job.Status)
+					assert.Equal(t, "reserved", job.BillingStatus)
+					assert.Equal(t, 1, job.ReferenceRetryCount)
+					require.NotEmpty(t, task.PrivateData.VideoAttempts)
+					assert.Equal(t, model.TaskStatusUnknown, task.PrivateData.VideoAttempts[len(task.PrivateData.VideoAttempts)-1].Status)
+				}
+				stale.Status = model.TaskStatusFailure
+				won, staleErr := SettleTaskBillingOnComplete(t.Context(), nil, &stale, model.TaskStatusInProgress, relaycommon.FailTaskInfo("stale failure"))
+				require.NoError(t, staleErr)
+				assert.False(t, won, "the retired generation cannot refund the retained hold")
+				var owner model.User
+				require.NoError(t, model.DB.First(&owner, 1).Error)
+				assert.Equal(t, 900, owner.Quota)
+				if !tc.stop {
+					fromStatus := task.Status
+					task.Status, task.FailReason = model.TaskStatusFailure, "replacement failed"
+					task.PrivateData.VideoTerminalConfirmed = true
+					won, settleErr := SettleTaskBillingOnComplete(t.Context(), nil, task, fromStatus, relaycommon.FailTaskInfo(task.FailReason))
+					require.NoError(t, settleErr)
+					assert.True(t, won)
+					require.NoError(t, model.DB.First(&job, job.ID).Error)
+					assert.Equal(t, "unknown", job.BillingStatus, "a failed replacement cannot confirm an earlier unknown generation")
+					assert.Equal(t, 100, task.Quota)
+				}
+				require.NoError(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
+				require.NoError(t, model.DB.First(&owner, 1).Error)
+				assert.Equal(t, 1000, owner.Quota, "explicit upstream verification can release the original hold once")
+				assert.Error(t, ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
+				return
+			}
 			assert.False(t, mediaretry.IsResubmission(task.PrivateData.MediaRetryDecision.Action))
 			preview, err := PlanTerminalVideoFailure(policy, *task.PrivateData.MediaRetryFact, videoRetryState(*task, job))
 			require.NoError(t, err)

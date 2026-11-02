@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -152,7 +153,7 @@ func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, au
 					billing, stage = "settled", "age_limit_complete"
 				case task.Status == TaskStatusFailure && task.Quota == 0:
 					billing, stage = "refunded", "age_limit_complete"
-				case task.Status != TaskStatusUnknown && current.Status != "execution_unknown" && current.ReferenceRecoveryStage != "unknown" && current.BillingStatus == "reserved" && task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && (confirmedFailure || !dispatched && task.Status != TaskStatusFailure):
+				case task.Status != TaskStatusUnknown && current.Status != "execution_unknown" && current.ReferenceRecoveryStage != "unknown" && current.BillingStatus == "reserved" && task.PrivateData.DurableBilling && task.PrivateData.SubmitAccountingRecorded && !slices.ContainsFunc(task.PrivateData.VideoAttempts, func(attempt VideoTaskAttempt) bool { return attempt.Status == TaskStatusUnknown }) && (confirmedFailure || !dispatched && task.Status != TaskStatusFailure):
 					billing, stage = "reserved", "age_limit_refund"
 				}
 			} else if errors.Is(taskErr, gorm.ErrRecordNotFound) && current.DispatchedAt == 0 && current.Quota == 0 && current.BillingStatus == "pending" {
@@ -206,9 +207,10 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 		if err := lockForUpdate(tx).Where("id = ?", job.ID).Take(&current).Error; err != nil {
 			return err
 		}
-		if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" || current.BillingStatus != "unknown" || current.ReferenceRetryCount != 1 ||
+		policyStopped := current.ReferenceRecoveryStage == "policy_stopped_unknown"
+		if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" && !policyStopped || current.BillingStatus != "unknown" || !policyStopped && current.ReferenceRetryCount != 1 ||
 			current.AttemptGeneration != task.AttemptGeneration || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TokenId != task.PrivateData.TokenId ||
-			task.Status != TaskStatusFailure || task.Quota <= 0 || task.Quota != current.Quota || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || task.PrivateData.UpstreamTaskID != "" {
+			task.Status != TaskStatusFailure || task.Quota <= 0 || task.Quota != current.Quota || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded || !policyStopped && task.PrivateData.UpstreamTaskID != "" {
 			return ErrImageConflict
 		}
 		if err := tx.Model(&Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, TaskStatusFailure, task.AttemptGeneration).Update("status", TaskStatusUnknown).Error; err != nil {

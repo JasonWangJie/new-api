@@ -23,6 +23,7 @@ const (
 	ImageResultSourceUpstream  = "upstream"
 	ImageTaskExpired           = "expired"
 	ImageTaskExecutionUnknown  = "execution_unknown"
+	ImagePolicyUnconfirmed     = "policy_unconfirmed"
 )
 
 var ErrImageConflict = errors.New("image operation conflict")

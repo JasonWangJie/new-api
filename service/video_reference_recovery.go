@@ -348,6 +348,9 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 	if err != nil {
 		return true, false, err
 	}
+	if applied, err := ApplyConfiguredVideoDecision(ctx, task, job, fact, &decision, state); err != nil || applied {
+		return true, true, err
+	}
 	if fact.Unknown {
 		// A failure envelope containing output, an accepted status, or another
 		// native identity cannot prove that this generation failed. Retain its
@@ -650,6 +653,9 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 		return nil
 	}
 	if job.ReferenceRecoveryStage == "dispatched" || job.ReferenceRecoveryStage == "unknown" {
+		if applied, err := tryUnknownVideoRecovery(parent, task, job, "Upstream recovery submission could not be confirmed"); err != nil || applied {
+			return err
+		}
 		_, err := model.MarkAsyncVideoReferenceSubmissionUnknown(context.WithoutCancel(parent), job, task, "Upstream recovery submission could not be confirmed; the video operation will not be repeated")
 		return err
 	}
@@ -835,6 +841,9 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			if err != nil {
 				reason = VideoTaskFailureReason(reason + ": " + err.Error())
 			}
+			if applied, retryErr := tryUnknownVideoRecovery(context.WithoutCancel(parent), task, current, reason); retryErr != nil || applied {
+				return errors.Join(err, retryErr)
+			}
 			_, markErr := model.MarkAsyncVideoReferenceSubmissionUnknown(context.WithoutCancel(parent), job, task, reason)
 			return errors.Join(err, markErr)
 		}
@@ -878,6 +887,24 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 	job.Status = "failed"
 	updates["request_cipher"] = retainAsyncVideoRequestDetails(job)
 	return err
+}
+
+func tryUnknownVideoRecovery(ctx context.Context, task model.Task, job model.AsyncMediaJob, reason string) (bool, error) {
+	plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+	if err != nil {
+		return false, nil
+	}
+	var request AsyncVideoRequest
+	if common.Unmarshal(plain, &request) != nil {
+		return false, nil
+	}
+	fact := NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_submission_unknown", Category: "execution_unknown", Message: VideoTaskFailureReason(reason), Unknown: true, Accepted: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0, Deadline: request.ReferenceRecoveryDeadline})
+	state := videoRetryState(task, job)
+	decision, err := evaluateVideoRetry(ctx, fact, &state)
+	if err != nil {
+		return false, err
+	}
+	return ApplyConfiguredVideoDecision(ctx, task, job, fact, &decision, state)
 }
 
 func tryRejectedVideoRecovery(ctx context.Context, task model.Task, job model.AsyncMediaJob, request AsyncVideoRequest, reason string) (bool, error) {

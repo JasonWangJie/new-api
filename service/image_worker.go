@@ -988,6 +988,13 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			failure.ExecutionUnknown = true
 		}
 		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
+			plan, planErr := buildImageFailurePlan(context.WithoutCancel(ctx), *task, failure, cfg, nil)
+			if planErr != nil {
+				return planErr
+			}
+			if plan.Decision.Matched {
+				return model.TransitionImageTask(context.WithoutCancel(ctx), *task, plan.Updates, plan.EventType, plan.EventMessage, plan.OutboxKind, plan.Event)
+			}
 			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, min(time.Now().Unix()+10, model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout)), "recovered", "Upstream image task polling will continue")
 		}
 		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 602 || failure.Code == 605 || failure.Code == 606 || failure.Code == 603 && (failure.SubmissionRejected || failure.SynchronousRetryableResponse) || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {

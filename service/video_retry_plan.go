@@ -10,7 +10,7 @@ func PlanTerminalVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, st
 	if err != nil {
 		return decision, err
 	}
-	if fact.Unknown && fact.VideoEvidence != nil && fact.VideoEvidence.TerminalResponseConflict {
+	if !decision.Matched && fact.Unknown && fact.VideoEvidence != nil && fact.VideoEvidence.TerminalResponseConflict {
 		if !decision.Matched && fact.HasUpstreamTask {
 			decision.Action = mediaretry.PollSameJob
 		} else if decision.Action != mediaretry.PollSameJob || !fact.HasUpstreamTask {

@@ -1300,6 +1300,9 @@ func reconcileAsyncVideoTask(ctx context.Context, task *model.Task, before model
 	if policyErr != nil {
 		return policyErr
 	}
+	if task.AttemptGeneration != before.AttemptGeneration || task.Status == model.TaskStatusFailure {
+		return nil
+	}
 	if decision.Matched {
 		if decision.Action == mediaretry.PollSameJob && !state.ManualRequired {
 			state.NextPollAt = min(state.DeadlineAt, now+int64(max(1, decision.DelaySeconds)))
@@ -1337,7 +1340,12 @@ func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
 	if !task.PrivateData.AsyncMedia || state == nil {
 		return true, nil
 	}
-	if state.ManualRequired {
+	generation := task.AttemptGeneration
+	decision, err := videoPollingDecision(ctx, task, state.Reason, 0, false, task.PrivateData.MediaRetryFact)
+	if err != nil {
+		return false, err
+	}
+	if task.AttemptGeneration != generation || task.Status == model.TaskStatusFailure || state.ManualRequired {
 		return false, nil
 	}
 	now := time.Now().Unix()
@@ -1350,12 +1358,8 @@ func asyncVideoPollReady(ctx context.Context, task *model.Task) (bool, error) {
 		_, err := task.UpdatePollingState(ctx, before)
 		return false, err
 	}
-	if now < state.NextPollAt {
+	if now < state.NextPollAt && !state.ManualRequired {
 		return false, nil
-	}
-	decision, err := videoPollingDecision(ctx, task, state.Reason, 0, false)
-	if err != nil {
-		return false, err
 	}
 	if decision.Matched && decision.Action != mediaretry.PollSameJob {
 		before := task.Snapshot()

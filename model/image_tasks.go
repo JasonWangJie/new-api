@@ -451,8 +451,10 @@ func FailOverdueAsyncImageTask(ctx context.Context, task AsyncImageTask) error {
 }
 
 func (task AsyncImageTask) TerminationRequiresReconciliation() bool {
-	return task.Status == ImageTaskExecutionUnknown || task.Status == ImageTaskFailed && task.ErrorCode == "task_age_exceeded" &&
-		(task.ReconciliationStatus == "upstream_unconfirmed" || task.ReconciliationStatus == "quota_unconfirmed")
+	return task.Status == ImageTaskExecutionUnknown ||
+		(task.Status == ImageTaskFailed || task.Status == ImageTaskExpired) && task.ReconciliationStatus == ImagePolicyUnconfirmed ||
+		task.Status == ImageTaskFailed && task.ErrorCode == "task_age_exceeded" &&
+			(task.ReconciliationStatus == "upstream_unconfirmed" || task.ReconciliationStatus == "quota_unconfirmed")
 }
 
 // The caller must require administrator authorization and explicit confirmation
@@ -501,7 +503,7 @@ func terminateAsyncImageTask(ctx context.Context, task AsyncImageTask, reason st
 			updates["error_code"], updates["error_message"] = decision.Reason, message
 			// Retry scheduling clears the current dispatch and upstream task ID.
 			// Historical attempts do not prove that another operation is active.
-			if current.Status == ImageTaskExecutionUnknown || current.ReconciliationStatus == "upstream_unconfirmed" ||
+			if current.Status == ImageTaskExecutionUnknown || current.ReconciliationStatus == "upstream_unconfirmed" || current.ReconciliationStatus == ImagePolicyUnconfirmed ||
 				current.UpstreamSucceededAt == 0 && (current.DispatchedAt > 0 || current.UpstreamTaskId != "") {
 				updates["reconciliation_status"] = "upstream_unconfirmed"
 			}
@@ -744,7 +746,7 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 	// A crash after the terminal state commit but before the separate refund
 	// transaction is recoverable without ever repeating the financial effect.
 	var refundable []AsyncImageBill
-	if err := DB.WithContext(ctx).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_bills.task_id").Where("async_image_bills.reserved_at > 0 AND async_image_bills.status IN ? AND async_image_tasks.status IN ?", []string{"reserved", "fixed"}, []string{ImageTaskFailed, ImageTaskExpired}).Where("NOT (COALESCE(async_image_tasks.error_code, '') = ? AND COALESCE(async_image_tasks.reconciliation_status, '') IN ?)", "task_age_exceeded", []string{"upstream_unconfirmed", "quota_unconfirmed"}).Order("COALESCE(async_image_bills.refund_attempt_at, 0), async_image_bills.id").Limit(limit).Find(&refundable).Error; err != nil {
+	if err := DB.WithContext(ctx).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_bills.task_id").Where("async_image_bills.reserved_at > 0 AND async_image_bills.status IN ? AND async_image_tasks.status IN ?", []string{"reserved", "fixed"}, []string{ImageTaskFailed, ImageTaskExpired}).Where("NOT (COALESCE(async_image_tasks.error_code, '') = ? AND COALESCE(async_image_tasks.reconciliation_status, '') IN ?)", "task_age_exceeded", []string{"upstream_unconfirmed", "quota_unconfirmed"}).Where("COALESCE(async_image_tasks.reconciliation_status, '') <> ?", ImagePolicyUnconfirmed).Order("COALESCE(async_image_bills.refund_attempt_at, 0), async_image_bills.id").Limit(limit).Find(&refundable).Error; err != nil {
 		return err
 	}
 	var refundErrors []error

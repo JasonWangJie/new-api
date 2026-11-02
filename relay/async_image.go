@@ -1193,7 +1193,7 @@ func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string,
 	}
 	images := make([]service.ImageBytes, 0, len(references))
 	for _, reference := range references {
-		image, err := service.DownloadImageReference(ctx, reference, cfg)
+		image, err := service.DownloadImageOutput(ctx, reference, cfg)
 		if err != nil {
 			return nil, err
 		}

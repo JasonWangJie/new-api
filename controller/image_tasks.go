@@ -348,6 +348,9 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 		data["termination_requires_reconciliation"] = task.TerminationRequiresReconciliation() && !(task.Status == model.ImageTaskExecutionUnknown && overdue)
 		data["termination_requires_quota_reconciliation"] = task.TerminationRequiresReconciliation() && task.ReconciliationStatus == "quota_unconfirmed"
 		data["reconciliation_status"] = task.ReconciliationStatus
+		if task.ReconciliationStatus == model.ImagePolicyUnconfirmed {
+			data["reconciliation_status"] = "upstream_unconfirmed"
+		}
 	}
 	return data
 }

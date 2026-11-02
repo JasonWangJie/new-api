@@ -73,8 +73,9 @@ type Step struct {
 	MaxDelaySeconds int    `json:"max_delay_seconds"`
 }
 
-// Facts about acceptance and completion come from the host, never from a text
-// matcher. Message is a bounded, sanitized error message, not a request body.
+// Facts about acceptance and completion come from the host. A matched custom
+// rule authorizes its configured action without changing those facts. Message
+// is a bounded, sanitized error message, not a request body.
 type Fact struct {
 	ImageEvidence           *ImageFailureEvidence `json:"image_evidence,omitempty"`
 	VideoEvidence           *VideoFailureEvidence `json:"video_evidence,omitempty"`
@@ -376,12 +377,9 @@ func (compiled *CompiledPolicy) guard(decision Decision, fact Fact, state State)
 		}
 		return decision
 	}
-	if (fact.Unknown || fact.Accepted && !fact.Terminal) && (IsResubmission(decision.Action) || decision.Action == Stop) {
-		decision.Action, decision.BlockedReason = ManualReview, "upstream_result_unknown"
-		if fact.HasUpstreamTask {
-			decision.Action = PollSameJob
-		}
-	}
+	// Only matched administrator rules reach this guard. Their chosen action
+	// also applies to unconfirmed submissions; built-in recovery still decides
+	// unknown outcomes separately and cannot inherit this authorization.
 	if IsResubmission(decision.Action) {
 		switch {
 		case fact.Deadline > 0 && (state.Now >= fact.Deadline || int64(decision.DelaySeconds) >= fact.Deadline-state.Now):
