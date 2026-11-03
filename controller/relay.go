@@ -502,6 +502,7 @@ func executeTaskSubmissionWith(
 				unconfirmed = unconfirmed || ok && request != nil && len(request.InitialUnknownAttempts) > 0
 			}
 			if unconfirmed {
+				service.RecordAsyncVideoReservationFailure(c, relayInfo)
 				// The persisted media dispatch barrier owns this reservation even
 				// when a receipt is lost or its Task row cannot be saved. Refund
 				// requires confirmation of every attempt; a later rejection cannot

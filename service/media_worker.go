@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -37,15 +38,16 @@ type AsyncVideoRequest struct {
 	Execution                        *model.TaskExecutionSnapshot
 	InitialExecution                 *model.TaskExecutionSnapshot `json:"initial_execution,omitempty"`
 	Billing                          MediaBillingSnapshot
-	InitialBillingChannelID          int                      `json:"initial_billing_channel_id,omitempty"`
-	InitialRetryState                *mediaretry.State        `json:"initial_retry_state,omitempty"`
-	InitialUnknownAttempts           []model.VideoTaskAttempt `json:"initial_unknown_attempts,omitempty"`
-	RetryFailedAt                    int64                    `json:"retry_failed_at,omitempty"`
-	RetryFact                        *mediaretry.Fact         `json:"retry_fact,omitempty"`
-	PendingDecision                  *mediaretry.Decision     `json:"pending_retry_decision,omitempty"`
-	ReferenceLocalizationUnsupported bool                     `json:"reference_localization_unsupported,omitempty"`
-	LocalReferencesReady             bool                     `json:"local_references_ready,omitempty"`
-	OriginalBody                     []byte                   `json:"original_body,omitempty"`
+	InitialBillingChannelID          int                        `json:"initial_billing_channel_id,omitempty"`
+	ReservationFailure               *BillingReservationFailure `json:"billing_reservation_failure,omitempty"`
+	InitialRetryState                *mediaretry.State          `json:"initial_retry_state,omitempty"`
+	InitialUnknownAttempts           []model.VideoTaskAttempt   `json:"initial_unknown_attempts,omitempty"`
+	RetryFailedAt                    int64                      `json:"retry_failed_at,omitempty"`
+	RetryFact                        *mediaretry.Fact           `json:"retry_fact,omitempty"`
+	PendingDecision                  *mediaretry.Decision       `json:"pending_retry_decision,omitempty"`
+	ReferenceLocalizationUnsupported bool                       `json:"reference_localization_unsupported,omitempty"`
+	LocalReferencesReady             bool                       `json:"local_references_ready,omitempty"`
+	OriginalBody                     []byte                     `json:"original_body,omitempty"`
 	PluginHash                       string
 	Details                          *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
 	ReferenceInputs                  []AsyncVideoReferenceInput `json:"reference_inputs,omitempty"`
@@ -87,6 +89,50 @@ func recordAsyncVideoPreConsumeFailure(c *gin.Context, info *relaycommon.RelayIn
 		Update("billing_status", status).Error
 	if err != nil {
 		logger.LogError(c, "video pre-consumption outcome "+info.PublicTaskID+": "+err.Error())
+	}
+}
+
+// RecordAsyncVideoReservationFailure preserves unequal or uncertain holds when
+// a dispatched operation cannot safely enter the ordinary refund path.
+func RecordAsyncVideoReservationFailure(c *gin.Context, info *relaycommon.RelayInfo) {
+	if c == nil || info == nil || info.TaskRelayInfo == nil || info.PublicTaskID == "" || !c.GetBool("async_media_execution") {
+		return
+	}
+	session, ok := info.Billing.(*BillingSession)
+	if !ok {
+		return
+	}
+	failure := session.ReservationFailure()
+	leaseToken := c.GetString("async_media_execution_lease_token")
+	if failure == nil || leaseToken == "" {
+		return
+	}
+	updates := map[string]any{"billing_status": "failed", "error_message": "Video billing adjustment requires reconciliation"}
+	if value, exists := c.Get("async_media_initial_retry_request"); exists {
+		if request, valid := value.(*AsyncVideoRequest); valid && request != nil {
+			request.ReservationFailure = failure
+			encoded, err := common.Marshal(request)
+			if err == nil {
+				var cipher []byte
+				cipher, err = EncryptImagePayload(encoded, "media-request:"+info.PublicTaskID)
+				if err == nil {
+					updates["request_cipher"] = cipher
+				}
+			}
+			if err != nil {
+				logger.LogError(c, "video reservation failure snapshot "+info.PublicTaskID+": "+err.Error())
+			}
+		}
+	}
+	logger.LogWarn(c, fmt.Sprintf("video reservation requires reconciliation task=%s funding=%s funding_quota=%d token_quota=%d paired_quota=%d attempted_quota=%d uncertain=%t stage=%s",
+		info.PublicTaskID, failure.FundingSource, failure.ConfirmedFundingQuota, failure.ConfirmedTokenQuota,
+		failure.PairedQuota, failure.AttemptedQuota, failure.Uncertain, failure.Stage))
+	err := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
+		Where("task_id = ? AND user_id = ? AND token_id = ? AND lease_token = ? AND attempt_generation = ?", info.PublicTaskID, info.UserId, info.TokenId, leaseToken, 0).
+		Where("billing_status IN ?", []string{"reserving", "reserved", "unknown", "failed"}).
+		Updates(updates).Error
+	if err != nil {
+		logger.LogError(c, "video reservation reconciliation "+info.PublicTaskID+": "+err.Error())
 	}
 }
 
@@ -463,6 +509,18 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		if VideoJobRequiresReconciliation(job) && job.DispatchedAt > 0 && billingStatus == "unknown" {
 			updates["status"] = "execution_unknown"
 		}
+		return nil
+	}
+	switch job.BillingStatus {
+	case "failed", "unknown", "refunded", "not_billable":
+		// Billing can finish before the submit worker persists its terminal
+		// status. Reclaiming that lease must not reserve again or erase an
+		// outstanding debit left by an unsuccessful compensation.
+		reason := job.ErrorMessage
+		if reason == "" {
+			reason = "Video submission ended before completion; the video operation will not be repeated"
+		}
+		updates["status"], updates["error_message"], updates["next_attempt_at"] = "failed", VideoTaskFailureReason(reason), 0
 		return nil
 	}
 	if SubmitAsyncVideoFunc == nil {

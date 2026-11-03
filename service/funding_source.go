@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 )
 
@@ -53,7 +54,7 @@ func (w *WalletFunding) PreConsume(amount int) error {
 		if errors.Is(err, model.ErrCanvasWalletInsufficient) {
 			err = nil
 		}
-	} else if w.durable {
+	} else if w.durable || !common.BatchUpdateEnabled {
 		reserved, err = model.TryReserveUserQuotaDurable(w.userId, amount)
 	} else {
 		reserved, err = model.TryReserveUserQuota(w.userId, amount)
@@ -75,7 +76,7 @@ func (w *WalletFunding) Settle(delta int) error {
 	if w.subject != "" {
 		return model.AdjustCanvasWallet(w.userId, w.subject, -delta, false)
 	}
-	if w.durable {
+	if w.durable || delta < 0 && !common.BatchUpdateEnabled {
 		return model.AdjustUserQuotaDurable(w.userId, -delta)
 	}
 	if delta > 0 {
@@ -93,7 +94,7 @@ func (w *WalletFunding) Refund() error {
 	}
 	// IncreaseUserQuota 是 quota += N 的非幂等操作，不能重试，否则会多退额度。
 	// 订阅的 RefundSubscriptionPreConsume 有 requestId 幂等保护所以可以重试。
-	if w.durable {
+	if w.durable || !common.BatchUpdateEnabled {
 		return model.AdjustUserQuotaDurable(w.userId, w.consumed)
 	}
 	return model.IncreaseUserQuota(w.userId, w.consumed, false)
@@ -155,6 +156,16 @@ func (s *SubscriptionFunding) Settle(delta int) error {
 		return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta), s.PeriodStart)
 	}
 	return model.PostConsumeUserSubscriptionDelta(s.subscriptionId, int64(delta))
+}
+
+func (s *SubscriptionFunding) Reserve(delta int) error {
+	res, err := model.ReserveSubscriptionPreConsume(s.requestId, s.subscriptionId, s.preConsumed+int64(delta), s.subject, s.PeriodStart)
+	if err != nil {
+		return err
+	}
+	s.preConsumed = res.PreConsumed
+	s.AmountUsedAfter = res.AmountUsedAfter
+	return nil
 }
 
 func (s *SubscriptionFunding) Refund() error {

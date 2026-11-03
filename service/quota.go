@@ -432,7 +432,7 @@ func preConsumeTokenQuotaWithMode(relayInfo *relaycommon.RelayInfo, quota int, d
 	// 原子预扣：检查与扣减在同一操作中完成，并发请求不可能同时通过检查后超扣。
 	var reserved bool
 	var err error
-	if durable {
+	if durable || !common.BatchUpdateEnabled {
 		reserved, err = model.TryReserveTokenQuotaDurable(relayInfo.TokenId, relayInfo.TokenKey, quota, relayInfo.TokenUnlimited)
 	} else {
 		reserved, err = model.TryReserveTokenQuota(relayInfo.TokenId, relayInfo.TokenKey, quota, relayInfo.TokenUnlimited)

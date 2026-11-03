@@ -65,7 +65,7 @@ func HasDurableTaskReservation(relayInfo *relaycommon.RelayInfo, requiredQuota i
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.durable && !session.trusted && !session.settled && !session.refunded && session.preConsumedQuota >= requiredQuota
+	return session.durable && !session.trusted && !session.settled && !session.refundStarted && session.reservationErr == nil && session.preConsumedQuota >= requiredQuota
 }
 
 // SnapshotTaskReservation freezes the funding period captured under the

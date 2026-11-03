@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -1410,6 +1411,62 @@ func PreConsumeUserSubscription(requestId string, userId int, modelName string, 
 		return nil, err
 	}
 	return returnValue, nil
+}
+
+// ReserveSubscriptionPreConsume raises the original reservation to a total
+// amount. The debit and refundable total commit together, so lost commit
+// acknowledgements cannot leave an untracked or doubly refunded increment.
+func ReserveSubscriptionPreConsume(requestId string, userSubscriptionId int, amount int64, subject string, periodStart int64) (*SubscriptionPreConsumeResult, error) {
+	if requestId == "" || userSubscriptionId <= 0 || amount <= 0 || amount > common.MaxQuota {
+		return nil, fmt.Errorf("invalid subscription reservation")
+	}
+	result := &SubscriptionPreConsumeResult{}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if subject != "" {
+			var owner SubscriptionPreConsumeRecord
+			if err := tx.Where("request_id = ?", requestId).Take(&owner).Error; err != nil {
+				return err
+			}
+			if err := LockCanvasBillingOwner(tx, owner.UserId, subject); err != nil {
+				return err
+			}
+		}
+		var record SubscriptionPreConsumeRecord
+		if err := lockForUpdate(tx).Where("request_id = ?", requestId).Take(&record).Error; err != nil {
+			return err
+		}
+		if record.Status != "consumed" || record.UserSubscriptionId != userSubscriptionId || record.PreConsumed < 0 || amount < record.PreConsumed {
+			return fmt.Errorf("subscription reservation is no longer extendable")
+		}
+		var sub UserSubscription
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", userSubscriptionId, record.UserId).Take(&sub).Error; err != nil {
+			return err
+		}
+		if !SubscriptionReservationMatchesPeriod(&sub, &periodStart, 0) {
+			return fmt.Errorf("%w: reservation period has reset", ErrInsufficientSubscriptionQuota)
+		}
+		delta := amount - record.PreConsumed
+		if sub.AmountUsed < 0 || sub.AmountUsed > math.MaxInt64-delta || sub.AmountTotal > 0 && delta > sub.AmountTotal-sub.AmountUsed {
+			return fmt.Errorf("%w, need=%d", ErrInsufficientSubscriptionQuota, delta)
+		}
+		result.UserSubscriptionId = sub.Id
+		result.PreConsumed = amount
+		result.AmountTotal = sub.AmountTotal
+		result.AmountUsedBefore = sub.AmountUsed
+		result.AmountUsedAfter = sub.AmountUsed + delta
+		result.PeriodStart = sub.LastResetTime
+		if delta == 0 {
+			return nil
+		}
+		if err := tx.Model(&sub).Update("amount_used", result.AmountUsedAfter).Error; err != nil {
+			return err
+		}
+		return tx.Model(&record).Update("pre_consumed", amount).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // RefundSubscriptionPreConsume is idempotent and refunds pre-consumed subscription quota by requestId.

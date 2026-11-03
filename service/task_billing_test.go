@@ -35,6 +35,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func TestMain(m *testing.M) {
@@ -2611,4 +2612,343 @@ func TestMixedVideoFreeReservationDoesNotChargeSubscription(t *testing.T) {
 	assert.Zero(t, getTokenRemainQuota(t, id))
 	assert.Zero(t, getSubscriptionUsed(t, id))
 	assert.Zero(t, task.Quota)
+}
+
+// Commit succeeds in the real database, but exactly one acknowledgement is
+// lost. Counting commits selects funding, token, or refund without timing races.
+type reservationCommitErrorPool struct {
+	gorm.ConnPool
+	commits int
+	failAt  int
+}
+
+// Ordinary wallet debt reservations update their cache in a goroutine. Wait
+// for that specific debit before checking balances or restoring the client.
+type reservationCacheDebitHook struct {
+	key, delta string
+	applied    chan struct{}
+}
+
+func (h *reservationCacheDebitHook) BeforeProcess(ctx context.Context, _ redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (h *reservationCacheDebitHook) AfterProcess(_ context.Context, command redis.Cmder) error {
+	args := command.Args()
+	if command.Name() == "eval" && len(args) > 4 && fmt.Sprint(args[3]) == h.key && fmt.Sprint(args[4]) == h.delta {
+		select {
+		case h.applied <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (h *reservationCacheDebitHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (h *reservationCacheDebitHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func (pool *reservationCommitErrorPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := pool.ConnPool.(gorm.TxBeginner).BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &reservationCommitErrorTx{Tx: tx, pool: pool}, nil
+}
+
+type reservationCommitErrorTx struct {
+	*sql.Tx
+	pool *reservationCommitErrorPool
+}
+
+func (tx *reservationCommitErrorTx) Commit() error {
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	tx.pool.commits++
+	if tx.pool.commits == tx.pool.failAt {
+		return assert.AnError
+	}
+	return nil
+}
+
+func TestBillingReservationFailureRefundDatabase(t *testing.T) {
+	for _, funding := range []string{BillingSourceWallet, BillingSourceSubscription} {
+		for _, durable := range []bool{false, true} {
+			for _, scenario := range []string{"success", "settle_success", "token_short", "zero_initial", "refund_transient", "refund_persistent", "token_refund_failure", "funding_commit_unknown", "token_commit_unknown", "refund_commit_unknown", "token_refund_commit_unknown", "period_reset", "funding_settle_unknown", "token_settle_unknown"} {
+				if scenario == "period_reset" && funding != BillingSourceSubscription {
+					continue
+				}
+				if scenario == "zero_initial" && funding != BillingSourceWallet {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/durable_%t/%s", funding, durable, scenario), func(t *testing.T) {
+					setupMeasuredTaskBillingDB(t)
+					db := model.DB
+					require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}, &model.CanvasGrant{}, &model.AsyncImageUsageProjection{}))
+					require.NoError(t, model.LOG_DB.AutoMigrate(&model.AsyncImageLogReceipt{}))
+					// Initialize the same token cache that request authentication
+					// primes, including for real atomic insufficient-quota refusal.
+					server := miniredis.RunT(t)
+					client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+					oldRedis, oldEnabled, oldBatch := common.RDB, common.RedisEnabled, common.BatchUpdateEnabled
+					common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = client, true, false
+					t.Cleanup(func() {
+						common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldEnabled, oldBatch
+						require.NoError(t, client.Close())
+					})
+					const id = 9982
+					initialQuota := 40
+					if scenario == "zero_initial" {
+						initialQuota = 0
+					}
+					initialToken := 50
+					if scenario == "success" || scenario == "settle_success" || scenario == "token_commit_unknown" {
+						initialToken = 100
+					}
+					seedUser(t, id, 1000)
+					seedToken(t, id, id, "sk-reservation-regression", initialToken)
+					seedChannel(t, id)
+					_, err := model.GetUserCache(id)
+					require.NoError(t, err)
+					require.NoError(t, client.HSet(t.Context(), "token:"+common.GenerateHMAC("sk-reservation-regression"), map[string]any{"Id": id, "UserId": id, "RemainQuota": initialToken, "UsedQuota": 0, "Status": common.TokenStatusEnabled}).Err())
+					var subscription model.UserSubscription
+					if funding == BillingSourceSubscription {
+						plan := model.SubscriptionPlan{Title: "Reservation regression", QuotaResetPeriod: model.SubscriptionResetNever}
+						require.NoError(t, db.Create(&plan).Error)
+						t.Cleanup(func() { require.NoError(t, db.Delete(&model.SubscriptionPlan{}, plan.Id).Error) })
+						subscription = model.UserSubscription{UserId: id, PlanId: plan.Id, AmountTotal: 200, Status: "active", EndTime: time.Now().Unix() + 3600, LastResetTime: time.Now().Unix()}
+						require.NoError(t, db.Create(&subscription).Error)
+					}
+					requestID := common.GetUUID()
+					t.Cleanup(func() {
+						require.NoError(t, db.Where("request_id = ?", requestID).Delete(&model.SubscriptionPreConsumeRecord{}).Error)
+					})
+					job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: id, TokenId: id, ChannelId: id, Status: "submitting", BillingStatus: "reserved", Quota: initialQuota, LeaseToken: "reservation-regression"}
+					require.NoError(t, db.Create(&job).Error)
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+					// Run refund synchronously while exercising both durable
+					// and ordinary funding/token mutation implementations.
+					c.Set("async_media_execution", true)
+					c.Set("async_media_execution_lease_token", job.LeaseToken)
+					info := &relaycommon.RelayInfo{UserId: id, TokenId: id, TokenKey: "sk-reservation-regression", ChannelMeta: &relaycommon.ChannelMeta{ChannelId: id}, RequestId: requestID, ForcePreConsume: true, UserSetting: dto.UserSetting{BillingPreference: funding + "_only"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: job.TaskId}}
+					if durable {
+						require.Nil(t, PreConsumeDurableTaskBilling(c, initialQuota, info))
+					} else {
+						require.Nil(t, PreConsumeBilling(c, initialQuota, info))
+					}
+					session := info.Billing.(*BillingSession)
+					if scenario == "funding_settle_unknown" || scenario == "token_settle_unknown" {
+						failAt, stage, wantToken := 1, "funding_settle", initialToken-40
+						if scenario == "token_settle_unknown" {
+							failAt, stage, wantToken = 2, "token_settle", initialToken-30
+						}
+						injected := db.Session(&gorm.Session{Context: t.Context()})
+						pool := &reservationCommitErrorPool{ConnPool: db.ConnPool, failAt: failAt}
+						injected.ConnPool, injected.Statement.ConnPool = pool, pool
+						model.DB = injected
+						settleErr := session.Settle(30)
+						model.DB = db
+						require.ErrorIs(t, settleErr, assert.AnError)
+						require.ErrorIs(t, session.Settle(30), assert.AnError)
+						require.ErrorIs(t, session.Settle(40), assert.AnError)
+						require.ErrorIs(t, session.Reserve(40), assert.AnError)
+						assert.False(t, HasDurableTaskReservation(info, 0))
+						evidence := session.ReservationFailure()
+						require.NotNil(t, evidence)
+						assert.True(t, evidence.Uncertain)
+						assert.Equal(t, stage, evidence.Stage)
+						assert.Equal(t, 30, evidence.AttemptedQuota)
+						session.Refund(c)
+						session.Refund(c)
+						if funding == BillingSourceWallet {
+							assert.Equal(t, 970, getUserQuota(t, id))
+						} else {
+							assert.EqualValues(t, 30, getSubscriptionUsed(t, subscription.Id))
+						}
+						assert.Equal(t, wantToken, getTokenRemainQuota(t, id), "uncertain settlement must not retry or refund either accounting side")
+						cachedWallet, err := client.HGet(t.Context(), "user:9982", "Quota").Int()
+						require.NoError(t, err)
+						cachedToken, err := client.HGet(t.Context(), "token:"+common.GenerateHMAC("sk-reservation-regression"), "RemainQuota").Int()
+						require.NoError(t, err)
+						assert.LessOrEqual(t, cachedWallet, getUserQuota(t, id))
+						assert.LessOrEqual(t, cachedToken, wantToken, "an uncertain credit must not release spendable token quota")
+						require.NoError(t, db.First(&job, job.ID).Error)
+						assert.Equal(t, "failed", job.BillingStatus)
+						assert.False(t, session.refunded)
+						var refundCount int64
+						require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", id, model.LogTypeRefund).Count(&refundCount).Error)
+						assert.Zero(t, refundCount)
+						return
+					}
+					if scenario == "period_reset" {
+						require.NoError(t, db.Model(&subscription).Updates(map[string]any{"amount_used": 0, "last_reset_time": subscription.LastResetTime + 1}).Error)
+					}
+					if scenario == "funding_commit_unknown" || scenario == "token_commit_unknown" {
+						failAt := 1
+						if scenario == "token_commit_unknown" {
+							failAt = 2
+						}
+						injected := db.Session(&gorm.Session{Context: t.Context()})
+						pool := &reservationCommitErrorPool{ConnPool: db.ConnPool, failAt: failAt}
+						injected.ConnPool, injected.Statement.ConnPool = pool, pool
+						model.DB = injected
+					}
+					var cacheDebit *reservationCacheDebitHook
+					if funding == BillingSourceWallet && !durable {
+						cacheDebit = &reservationCacheDebitHook{key: "user:9982", delta: fmt.Sprint(initialQuota - 60), applied: make(chan struct{}, 1)}
+						client.AddHook(cacheDebit)
+					}
+					reserveErr := session.Reserve(60)
+					model.DB = db
+					if cacheDebit != nil {
+						select {
+						case <-cacheDebit.applied:
+						case <-time.After(5 * time.Second):
+							t.Fatal("ordinary wallet reservation cache debit did not finish")
+						}
+					}
+					if scenario == "success" || scenario == "settle_success" {
+						require.NoError(t, reserveErr)
+						require.NoError(t, session.Reserve(60))
+						assert.Nil(t, session.ReservationFailure())
+						if scenario == "settle_success" {
+							require.NoError(t, session.Settle(50))
+							require.NoError(t, session.Settle(50))
+							session.Refund(c)
+							assert.Equal(t, 50, getTokenRemainQuota(t, id))
+							if funding == BillingSourceWallet {
+								assert.Equal(t, 950, getUserQuota(t, id))
+							} else {
+								assert.EqualValues(t, 50, getSubscriptionUsed(t, subscription.Id))
+							}
+							return
+						}
+					} else {
+						require.Error(t, reserveErr)
+						require.Error(t, session.Reserve(40), "even a smaller target must not hide a failed reservation")
+						require.Error(t, session.Settle(40), "zero-delta settlement must not hide a failed reservation")
+						assert.False(t, HasDurableTaskReservation(info, 0))
+						evidence := session.ReservationFailure()
+						require.NotNil(t, evidence)
+						assert.Equal(t, initialQuota, evidence.PairedQuota)
+						assert.Equal(t, initialQuota, evidence.ConfirmedTokenQuota)
+						assert.Equal(t, 60, evidence.AttemptedQuota)
+						assert.Equal(t, scenario == "funding_commit_unknown" || scenario == "token_commit_unknown", evidence.Uncertain)
+					}
+					refundAttempts := 0
+					if scenario == "refund_transient" || scenario == "refund_persistent" || scenario == "token_refund_failure" {
+						require.NoError(t, db.Callback().Update().Before("gorm:update").Register("reservation:refund-failure", func(tx *gorm.DB) {
+							updates, ok := tx.Statement.Dest.(map[string]any)
+							if !ok || tx.Statement.Schema == nil {
+								return
+							}
+							refund := tx.Statement.Schema.Name == "UserSubscription" && updates["amount_used"] == int64(0)
+							if expr, ok := updates["quota"].(clause.Expr); ok && tx.Statement.Schema.Name == "User" && expr.SQL == "quota + ?" {
+								refund = true
+							}
+							if scenario == "token_refund_failure" {
+								expr, ok := updates["remain_quota"].(clause.Expr)
+								refund = ok && tx.Statement.Schema.Name == "Token" && expr.SQL == "remain_quota + ?"
+							}
+							if refund {
+								refundAttempts++
+								if scenario == "refund_persistent" || refundAttempts == 1 {
+									tx.AddError(assert.AnError)
+								}
+							}
+						}))
+						t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove("reservation:refund-failure")) })
+					}
+					if scenario == "refund_commit_unknown" || scenario == "token_refund_commit_unknown" {
+						injected := db.Session(&gorm.Session{Context: t.Context()})
+						pool := &reservationCommitErrorPool{ConnPool: db.ConnPool, failAt: 1}
+						if scenario == "token_refund_commit_unknown" {
+							pool.failAt = 2
+						}
+						injected.ConnPool, injected.Statement.ConnPool = pool, pool
+						model.DB = injected
+					}
+					session.Refund(c)
+					model.DB = db
+					session.Refund(c)
+					require.Error(t, session.Reserve(40))
+					require.Error(t, session.Settle(40))
+					require.NoError(t, db.First(&job, job.ID).Error)
+					wantStatus := "refunded"
+					wantWallet, wantSubscription, wantToken := 1000, int64(0), initialToken
+					switch scenario {
+					case "refund_transient":
+						if funding == BillingSourceWallet {
+							wantStatus, wantWallet = "failed", 940
+						}
+					case "refund_persistent":
+						wantStatus = "failed"
+						if funding == BillingSourceWallet {
+							wantWallet = 940
+						} else {
+							wantSubscription = 60
+						}
+					case "token_refund_failure":
+						wantStatus, wantToken = "failed", initialToken-40
+					case "funding_commit_unknown":
+						wantStatus = "failed"
+						if funding == BillingSourceWallet {
+							wantWallet = 980
+						}
+					case "token_commit_unknown":
+						wantStatus, wantToken = "failed", 80
+					case "refund_commit_unknown":
+						if funding == BillingSourceWallet {
+							wantStatus = "failed"
+						}
+					case "token_refund_commit_unknown":
+						wantStatus = "failed"
+					}
+					assert.Equal(t, wantWallet, getUserQuota(t, id))
+					assert.Equal(t, wantToken, getTokenRemainQuota(t, id))
+					cachedWallet, err := client.HGet(t.Context(), "user:9982", "Quota").Int()
+					require.NoError(t, err)
+					cachedToken, err := client.HGet(t.Context(), "token:"+common.GenerateHMAC("sk-reservation-regression"), "RemainQuota").Int()
+					require.NoError(t, err)
+					assert.LessOrEqual(t, cachedWallet, wantWallet, "failed or uncertain writes cannot release unbacked wallet quota")
+					assert.LessOrEqual(t, cachedToken, wantToken, "failed or uncertain writes cannot release unbacked token quota")
+					if funding == BillingSourceSubscription {
+						assert.Equal(t, wantSubscription, getSubscriptionUsed(t, subscription.Id))
+					}
+					assert.Equal(t, wantStatus, job.BillingStatus)
+					assert.Equal(t, wantStatus == "refunded", session.refunded)
+					if scenario == "refund_transient" || scenario == "refund_persistent" {
+						if funding == BillingSourceWallet {
+							assert.Equal(t, 1, refundAttempts, "wallet refunds must never retry a possibly committed credit")
+						} else if scenario == "refund_transient" {
+							assert.Equal(t, 2, refundAttempts)
+						} else {
+							assert.Equal(t, 3, refundAttempts)
+						}
+					}
+					if scenario == "token_refund_failure" {
+						assert.Equal(t, 1, refundAttempts, "token credits must not be blindly retried")
+					}
+					var refunds []model.Log
+					require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", id, model.LogTypeRefund).Find(&refunds).Error)
+					if wantStatus == "refunded" {
+						require.Len(t, refunds, 1)
+						expectedQuota := 60
+						if scenario == "period_reset" {
+							expectedQuota = 40
+						}
+						assert.Equal(t, expectedQuota, refunds[0].Quota, "refund audit uses the complete confirmed funding reservation")
+					} else {
+						assert.Empty(t, refunds, "uncertain or failed refunds must not manufacture a completed refund log")
+					}
+				})
+			}
+		}
+	}
 }

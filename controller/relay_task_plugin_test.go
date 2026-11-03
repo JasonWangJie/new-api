@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1140,6 +1141,150 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			})
 		}
 	})
+	t.Run("reclaimed submission preserves billing outcomes", func(t *testing.T) {
+		user, token := setupResponsesWSRequestTest(t)
+		db := setupVideoRetryTestDatabase(t, user, token)
+		require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}))
+		t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "reclaimed-video:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+		t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "reclaimed-video")
+		previousSubmit := service.SubmitAsyncVideoFunc
+		t.Cleanup(func() { service.SubmitAsyncVideoFunc = previousSubmit })
+		for _, tc := range []struct {
+			name, billing, status, wantStatus string
+			staleLease                        bool
+			wantSubmits                       int
+		}{
+			{name: "failed compensation", billing: "failed", status: "submitting", wantStatus: "failed"},
+			{name: "uncertain accounting", billing: "unknown", status: "submitting", wantStatus: "failed"},
+			{name: "confirmed refund", billing: "refunded", status: "submitting", wantStatus: "failed"},
+			{name: "confirmed absence of charge", billing: "not_billable", status: "submitting", wantStatus: "failed"},
+			{name: "stale worker cannot close reclaimed lease", billing: "failed", status: "submitting", wantStatus: "submitting", staleLease: true},
+			{name: "ordinary queued submission", billing: "pending", status: "queued", wantStatus: "submitted", wantSubmits: 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				now := time.Now().Unix()
+				job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, Status: tc.status, BillingStatus: tc.billing, StorageStatus: "pending", LeaseToken: "interrupted-lease", LeaseExpiresAt: now - 1, CreatedAt: now, ExpiresAt: now + 86400}
+				var err error
+				job.RequestCipher, err = service.EncryptImagePayload([]byte(`{}`), "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Create(&job).Error)
+				eligible, err := model.GetDueAsyncMediaJobsForPhase(t.Context(), now, 100, "submit")
+				require.NoError(t, err)
+				require.True(t, slices.ContainsFunc(eligible, func(candidate model.AsyncMediaJob) bool { return candidate.ID == job.ID }))
+				stale := job
+				claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "recovered-lease", 120)
+				require.NoError(t, err)
+				require.True(t, claimed)
+				var submits int
+				service.SubmitAsyncVideoFunc = func(context.Context, model.AsyncMediaJob, service.AsyncVideoRequest) error {
+					submits++
+					return nil
+				}
+				workerJob := job
+				if tc.staleLease {
+					workerJob = stale
+				}
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), workerJob, service.DefaultMediaRuntimeConfig()))
+				require.NoError(t, db.First(&job, job.ID).Error)
+				assert.Equal(t, tc.wantSubmits, submits)
+				assert.Equal(t, tc.wantStatus, job.Status)
+				assert.Equal(t, tc.billing, job.BillingStatus)
+				assert.Zero(t, job.Quota)
+				assert.Zero(t, job.DispatchedAt)
+				if tc.staleLease {
+					assert.Equal(t, "recovered-lease", job.LeaseToken)
+				} else {
+					assert.Empty(t, job.LeaseToken)
+				}
+			})
+		}
+	})
+	t.Run("dispatched reservation failure retains separate financial holds", func(t *testing.T) {
+		for _, staleLease := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stale lease %t", staleLease), func(t *testing.T) {
+				user, token := setupResponsesWSRequestTest(t)
+				db := setupVideoRetryTestDatabase(t, user, token)
+				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}, &model.Log{}))
+				require.NoError(t, db.Model(token).Update("remain_quota", 40).Error)
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "reserve-failure:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "reserve-failure")
+				previousBatch := common.BatchUpdateEnabled
+				common.BatchUpdateEnabled = false
+				t.Cleanup(func() { common.BatchUpdateEnabled = previousBatch })
+				now := time.Now().Unix()
+				request := service.AsyncVideoRequest{Body: []byte(`{"model":"plugin-model","prompt":"retain original input"}`), ContentType: "application/json", Operation: "create"}
+				raw, err := common.Marshal(request)
+				require.NoError(t, err)
+				job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: 1, Provider: "drama", Model: "plugin-model", Status: "submitting", BillingStatus: "reserved", Quota: 40, LeaseToken: "dispatch-lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 86400}
+				job.RequestCipher, err = service.EncryptImagePayload(raw, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Create(&job).Error)
+				originalCipher := bytes.Clone(job.RequestCipher)
+				c := taskSubmissionTestContext()
+				defer common.CleanupBodyStorage(c)
+				c.Set("async_media_execution", true)
+				c.Set("async_media_execution_lease_token", job.LeaseToken)
+				c.Set("async_media_initial_retry_request", &request)
+				info := taskSubmissionRelayInfo(nil)
+				info.UserId, info.TokenId, info.TokenKey, info.PublicTaskID = user.Id, token.Id, token.Key, job.TaskId
+				info.UserSetting.BillingPreference = "wallet_only"
+				require.Nil(t, service.PreConsumeDurableTaskBilling(c, 40, info))
+				var submissions int
+				outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					submissions++
+					updates := map[string]any{"dispatched_at": now}
+					if staleLease {
+						updates["lease_token"] = "replacement-lease"
+					}
+					require.NoError(t, db.Model(&job).Updates(updates).Error)
+					c.Set("async_media_reconciliation_dispatched", true)
+					return &relay.TaskSubmitResult{Platform: "drama", Quota: 60, UpstreamTaskID: "accepted-before-topup"}, nil
+				})
+				require.Nil(t, outcome)
+				require.NotNil(t, taskErr)
+				assert.Equal(t, http.StatusForbidden, taskErr.StatusCode)
+				assert.Equal(t, 1, submissions)
+				assert.Error(t, info.Billing.Reserve(60), "the partial reservation cannot be charged again")
+				assert.Error(t, info.Billing.Settle(40), "the old paired quota cannot hide the failed top-up")
+				assert.False(t, service.HasDurableTaskReservation(info, 40))
+				require.NoError(t, db.First(user, user.Id).Error)
+				require.NoError(t, db.First(token, token.Id).Error)
+				assert.Equal(t, 940, user.Quota, "accepted execution retains the confirmed 60-unit funding hold")
+				assert.Zero(t, token.RemainQuota)
+				assert.Equal(t, 40, token.UsedQuota, "only the original paired token reservation succeeded")
+				require.NoError(t, db.First(&job, job.ID).Error)
+				assert.Equal(t, 40, job.Quota, "a partial hold must not replace the paired settlement quota")
+				assert.Equal(t, int64(now), job.DispatchedAt)
+				var taskCount, refundCount int64
+				require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&taskCount).Error)
+				require.NoError(t, db.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refundCount).Error)
+				assert.Zero(t, taskCount, "partial accounting must not enter normal task settlement")
+				assert.Zero(t, refundCount)
+				decoded, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				var retained service.AsyncVideoRequest
+				require.NoError(t, common.Unmarshal(decoded, &retained))
+				assert.Equal(t, request.Body, retained.Body)
+				assert.Equal(t, request.ContentType, retained.ContentType)
+				if staleLease {
+					assert.Equal(t, "replacement-lease", job.LeaseToken)
+					assert.Equal(t, "reserved", job.BillingStatus)
+					assert.Equal(t, originalCipher, job.RequestCipher)
+					assert.Nil(t, retained.ReservationFailure)
+					return
+				}
+				assert.Equal(t, "failed", job.BillingStatus)
+				require.NotNil(t, retained.ReservationFailure)
+				assert.Equal(t, service.BillingSourceWallet, retained.ReservationFailure.FundingSource)
+				assert.Equal(t, 60, retained.ReservationFailure.ConfirmedFundingQuota)
+				assert.Equal(t, 40, retained.ReservationFailure.ConfirmedTokenQuota)
+				assert.Equal(t, 40, retained.ReservationFailure.PairedQuota)
+				assert.Equal(t, 60, retained.ReservationFailure.AttemptedQuota)
+				assert.Equal(t, "token_reserve", retained.ReservationFailure.Stage)
+				assert.False(t, retained.ReservationFailure.Uncertain)
+			})
+		}
+	})
 	for _, provider := range []string{"nldw", "yuxibox"} {
 		t.Run(provider, func(t *testing.T) {
 			modelName := "sd2.5pp"
@@ -1207,7 +1352,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "custom retry cannot repeat a token rejection", billingFailure: "token_short", configured: "preconsume", wantWallet: 1000, wantToken: 50, wantStatus: "failed", wantBilling: "not_billable"},
 				{name: "wallet rejection has no financial hold", billingFailure: "wallet_short", configured: "preconsume", wantWallet: 50, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
 				{name: "atomic wallet rejection restores token debit", billingFailure: "wallet_race", configured: "preconsume", wantWallet: 50, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
-				{name: "failed token rollback cannot try another funding source", billingFailure: "rollback", configured: "preconsume", wantWallet: 50, wantToken: 0, wantStatus: "failed", wantBilling: "failed"},
+				{name: "failed token rollback cannot try another funding source", billingFailure: "rollback", configured: "preconsume", wantWallet: 50, wantToken: 150, wantStatus: "failed", wantBilling: "failed"},
 				{name: "token write error keeps uncertain billing", billingFailure: "token_db", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "wallet write error keeps uncertain billing", billingFailure: "wallet_db", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "subscription absence restores token debit", billingFailure: "subscription_absent", configured: "preconsume", wantWallet: 1000, wantToken: 100, wantStatus: "failed", wantBilling: "not_billable"},
@@ -1245,6 +1390,8 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					token := model.Token{UserId: user.Id, Key: common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
 					if tc.billingFailure == "token_short" {
 						token.RemainQuota = 50
+					} else if tc.billingFailure == "rollback" {
+						token.RemainQuota = 250
 					}
 					require.NoError(t, db.Create(&token).Error)
 					var calls atomic.Int32
@@ -1451,6 +1598,36 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						var nativeCount int64
 						require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&nativeCount).Error)
 						assert.Zero(t, nativeCount, "a rejected dispatch cannot create a retained unknown task")
+						if tc.billingFailure == "rollback" {
+							require.NoError(t, db.Callback().Update().Remove("video-preconsume-failure"))
+							// Simulate a crash after the failed compensation was recorded,
+							// before the worker finalized the submission status.
+							require.NoError(t, db.Model(&job).Updates(map[string]any{"status": "submitting", "lease_token": "interrupted-lease", "lease_expires_at": now - 1, "next_attempt_at": 0}).Error)
+							require.NoError(t, db.First(&job, job.ID).Error)
+							eligible, err := model.GetDueAsyncMediaJobsForPhase(t.Context(), now, 100, "submit")
+							require.NoError(t, err)
+							require.True(t, slices.ContainsFunc(eligible, func(candidate model.AsyncMediaJob) bool { return candidate.ID == job.ID }))
+							claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "recovered-lease", 120)
+							require.NoError(t, err)
+							require.True(t, claimed)
+							var recoveredSubmits int
+							service.SubmitAsyncVideoFunc = func(ctx context.Context, recoveredJob model.AsyncMediaJob, recoveredRequest service.AsyncVideoRequest) error {
+								recoveredSubmits++
+								return ExecuteAsyncVideo(ctx, recoveredJob, recoveredRequest)
+							}
+							require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
+							service.SubmitAsyncVideoFunc = ExecuteAsyncVideo
+							require.NoError(t, db.First(&job, job.ID).Error)
+							require.NoError(t, db.First(&user, user.Id).Error)
+							require.NoError(t, db.First(&token, token.Id).Error)
+							assert.Zero(t, recoveredSubmits)
+							assert.Zero(t, calls.Load())
+							assert.Equal(t, "failed", job.Status)
+							assert.Equal(t, "failed", job.BillingStatus)
+							assert.Equal(t, 50, user.Quota)
+							assert.Equal(t, 150, token.RemainQuota)
+							assert.Equal(t, 100, token.UsedQuota)
+						}
 						return
 					}
 					if tc.configured != "" && tc.insertFails {
