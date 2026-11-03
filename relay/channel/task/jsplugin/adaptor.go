@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -321,6 +322,8 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	return bytes.NewReader(body), nil
 }
 
+var errInlineFileTooLarge = errors.New("inline file byte limit exceeded")
+
 func maxInlineFileBytes() int64 {
 	limitMB := constant.MaxFileDownloadMB
 	if limitMB <= 0 {
@@ -342,7 +345,28 @@ func inlineJSONFilePlaceholders(c *gin.Context, body any) (any, error) {
 	}
 	limit := maxInlineFileBytes()
 	var total int64
-	return replaceJSONFilePlaceholders(cloned, form, limit, &total)
+	if c != nil && !c.GetBool("async_media_inline_after_override") {
+		if value, exists := c.Get("async_media_inline_references"); exists {
+			prepare, ok := value.(func(any, int64, *int64) (any, error))
+			if !ok {
+				return nil, fmt.Errorf("invalid video reference transport hook")
+			}
+			var err error
+			cloned, err = prepare(cloned, limit, &total)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	inlined, err := replaceJSONFilePlaceholders(cloned, form, limit, &total)
+	if err != nil && errors.Is(err, errInlineFileTooLarge) && c != nil && c.GetBool("async_media_inline_reference_mode") {
+		return nil, &service.MediaReferencePreparationError{Code: "media_reference_too_large", Status: http.StatusRequestEntityTooLarge, Cause: err}
+	}
+	if c != nil && c.GetBool("async_media_inline_after_override") {
+		c.Set("async_media_inline_byte_limit", limit)
+		c.Set("async_media_inlined_file_bytes", total)
+	}
+	return inlined, err
 }
 
 func replaceJSONFilePlaceholders(value any, form *multipart.Form, limit int64, total *int64) (any, error) {
@@ -424,7 +448,7 @@ func encodeFilePlaceholder(placeholder map[string]any, form *multipart.Form, lim
 		}
 	}
 	if header.Size > maxBytes {
-		return "", fmt.Errorf("file %q exceeds the %d byte limit", ref, maxBytes)
+		return "", fmt.Errorf("%w: file %q exceeds the %d byte limit", errInlineFileTooLarge, ref, maxBytes)
 	}
 	file, openErr := header.Open()
 	if openErr != nil {
@@ -436,10 +460,10 @@ func encodeFilePlaceholder(placeholder map[string]any, form *multipart.Form, lim
 		return "", readErr
 	}
 	if int64(len(data)) > maxBytes {
-		return "", fmt.Errorf("file %q exceeds the %d byte limit", ref, maxBytes)
+		return "", fmt.Errorf("%w: file %q exceeds the %d byte limit", errInlineFileTooLarge, ref, maxBytes)
 	}
 	if *total+int64(len(data)) > limit {
-		return "", fmt.Errorf("inlined files exceed the %d byte limit", limit)
+		return "", fmt.Errorf("%w: inlined files exceed the %d byte limit", errInlineFileTooLarge, limit)
 	}
 	*total += int64(len(data))
 	encoded := base64.StdEncoding.EncodeToString(data)

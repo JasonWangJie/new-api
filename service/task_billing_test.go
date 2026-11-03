@@ -2526,6 +2526,62 @@ func TestMixedVideoPublicBillingContract(t *testing.T) {
 	assert.NotNil(t, saturated.Clamp)
 }
 
+func TestMixedVideoModelPricingInheritance(t *testing.T) {
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previous := *settings
+	t.Cleanup(func() { *settings = previous })
+	const modelExpression = `tier("seconds", u("seconds") * 0.8) * (u("video_input") == "video" ? 1.45 : 1)`
+	facts := map[string]any{"requests": float64(1), "seconds": float64(30), "resolution": "720p", "action": "generate", "video_input": "none"}
+	for _, tc := range []struct {
+		name       string
+		mode       string
+		expression string
+		overrides  map[string]string
+		videoInput string
+		wantUSD    float64
+		wantError  bool
+	}{
+		{name: "inherits model price", mode: "tiered_expr", expression: modelExpression, wantUSD: 24},
+		{name: "inherits reference video multiplier once", mode: "tiered_expr", expression: modelExpression, videoInput: "video", wantUSD: 34.8},
+		{name: "explicit mixed price wins", mode: "tiered_expr", expression: modelExpression, overrides: map[string]string{"public-video": `tier("custom", u("requests") * 2)`}, wantUSD: 2},
+		{name: "explicit zero stays free", mode: "tiered_expr", expression: modelExpression, overrides: map[string]string{"public-video": `tier("free", u("requests") * 0)`}},
+		{name: "invalid override does not inherit", mode: "tiered_expr", expression: modelExpression, overrides: map[string]string{"public-video": ""}, wantError: true},
+		{name: "inactive model expression is unavailable", mode: "ratio", expression: modelExpression, wantError: true},
+		{name: "missing model price does not use provider override", wantError: true},
+		{name: "provider tokens are incompatible", mode: "tiered_expr", expression: `tier("tokens", u("tokens") * 0.1)`, wantError: true},
+		{name: "request probes are incompatible", mode: "tiered_expr", expression: `tier("s", u("seconds")) * (header("x-fast") == "1" ? 2 : 1)`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings.BillingMode = map[string]string{"public-video": tc.mode}
+			settings.BillingExpr = map[string]string{"public-video": tc.expression}
+			settings.PluginBillingExpr = map[string]string{"drama::public-video": `tier("provider", u("requests") * 99)`}
+			settings.MixedVideoBillingExpr = tc.overrides
+			facts["video_input"] = "none"
+			if tc.videoInput != "" {
+				facts["video_input"] = tc.videoInput
+			}
+			frozen, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 2})
+			if tc.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, common.QuotaRound(tc.wantUSD*common.QuotaPerUnit*2), frozen.Price.Quota)
+			require.NoError(t, ValidateFrozenMixedVideoBilling(frozen.Tiered))
+			settings.BillingExpr["public-video"] = `tier("changed", u("requests") * 999)`
+			settings.MixedVideoBillingExpr = map[string]string{"public-video": `tier("changed", u("requests") * 888)`}
+			result, _, err := EvaluateTaskCompletionUsage(frozen.Tiered, map[string]any{"seconds": float64(1), "video_input": "video"})
+			require.NoError(t, err)
+			assert.Equal(t, frozen.Price.Quota, result.ActualQuotaAfterGroup, "settlement retains the accepted price after either configuration changes")
+		})
+	}
+	settings.MixedVideoBillingExpr = nil
+	settings.BillingExpr["public-video"] = `tier("new", u("requests") * 3)`
+	updated, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	assert.Equal(t, common.QuotaRound(3*common.QuotaPerUnit), updated.Price.Quota)
+}
+
 func TestMixedVideoReferenceInputPricing(t *testing.T) {
 	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
 	previous := settings.MixedVideoBillingExpr
@@ -2630,6 +2686,7 @@ func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
 		measured   bool
 		failed     bool
 		videoInput string
+		inherited  bool
 	}{
 		{name: "normal completion"},
 		{name: "measured channel completion", measured: true},
@@ -2638,6 +2695,9 @@ func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
 		{name: "reference video completion", videoInput: "video"},
 		{name: "reference video measured completion", videoInput: "video", measured: true},
 		{name: "reference video failure", videoInput: "video", failed: true},
+		{name: "inherited model completion", videoInput: "none", inherited: true},
+		{name: "inherited reference video measured completion", videoInput: "video", measured: true, inherited: true},
+		{name: "inherited reference video failure", videoInput: "video", failed: true, inherited: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setupMeasuredTaskBillingDB(t)
@@ -2665,6 +2725,20 @@ func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
 				EstimatedQuotaAfterGroup: reserved,
 				MixedVideoBilling:        true, MixedVideoSchemaVersion: billing_setting.MixedVideoBillingSchemaVersion,
 				UsageFacts: facts,
+			}
+			if tc.inherited {
+				settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+				previous, previousUnit := *settings, common.QuotaPerUnit
+				t.Cleanup(func() { *settings, common.QuotaPerUnit = previous, previousUnit })
+				settings.MixedVideoBillingExpr = nil
+				settings.BillingMode = map[string]string{"public-video": billing_setting.BillingModeTieredExpr}
+				settings.BillingExpr = map[string]string{"public-video": expression}
+				common.QuotaPerUnit = 1000
+				frozen, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 1})
+				require.NoError(t, err)
+				require.Equal(t, reserved, frozen.Price.Quota)
+				task.PrivateData.BillingContext.TieredSnapshot = frozen.Tiered
+				settings.BillingExpr["public-video"] = `tier("changed", u("requests") * 99)`
 			}
 			require.NoError(t, model.DB.Create(task).Error)
 			require.NoError(t, model.DB.First(task, task.ID).Error)

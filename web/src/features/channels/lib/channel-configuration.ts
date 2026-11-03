@@ -57,6 +57,7 @@ const CONFIGURATION_BLOCKS = {
       'weight',
       'image_max_reference_images',
       'image_reference_transport_mode',
+      'video_reference_transport_mode',
       'image_reference_timeout_retry_same_channel',
       'tianyue_media_compatibility',
       'image_resolution_model_mapping',
@@ -160,6 +161,7 @@ export function getChannelConfigurationState(
       (values.type === CHANNEL_TYPE_NEW_API &&
         values.tianyue_media_compatibility) ||
       values.image_reference_transport_mode ||
+      values.video_reference_transport_mode === 'inline' ||
       values.image_reference_timeout_retry_same_channel ||
       values.image_resolution_model_mapping?.length ||
       values.image_max_reference_bytes ||

@@ -47,6 +47,8 @@ type AsyncVideoRequest struct {
 	PendingDecision                  *mediaretry.Decision       `json:"pending_retry_decision,omitempty"`
 	ReferenceLocalizationUnsupported bool                       `json:"reference_localization_unsupported,omitempty"`
 	LocalReferencesReady             bool                       `json:"local_references_ready,omitempty"`
+	VideoReferenceTransportMode      string                     `json:"video_reference_transport_mode,omitempty"`
+	InlineReferenceInputs            []AsyncVideoReferenceInput `json:"inline_reference_inputs,omitempty"`
 	OriginalBody                     []byte                     `json:"original_body,omitempty"`
 	PluginHash                       string
 	Details                          *AsyncVideoRequestDetails  `json:"request_details,omitempty"`
@@ -54,6 +56,10 @@ type AsyncVideoRequest struct {
 	ReferenceRecoveryVersion         int                        `json:"reference_recovery_version,omitempty"`
 	ReferenceRecoveryDeadline        int64                      `json:"reference_recovery_deadline,omitempty"`
 	ReferenceURLExpiresAt            int64                      `json:"reference_url_expires_at,omitempty"`
+}
+
+func (request AsyncVideoRequest) HasReferenceInputs() bool {
+	return len(request.ReferenceInputs)+len(request.InlineReferenceInputs) > 0
 }
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error

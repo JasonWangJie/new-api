@@ -496,8 +496,16 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 8. 构建请求体
+	// A channel-managed body template is applied after the driver's JSON. In
+	// that case prepare media on the final body, sharing the upload byte budget.
+	deferInline := hasAsyncProfile && asyncProfile.Submit.Request != nil && asyncProfile.Submit.Request.Body != nil && string(platform) == "xai" && c.GetBool("async_media_execution")
+	c.Set("async_media_inline_after_override", deferInline)
 	requestBody, err := adaptor.BuildRequestBody(c, info)
 	if err != nil {
+		var preparation *service.MediaReferencePreparationError
+		if errors.As(err, &preparation) {
+			return nil, service.TaskErrorWrapperLocal(err, preparation.Code, preparation.Status)
+		}
 		return nil, service.TaskErrorWrapperLocal(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
@@ -513,6 +521,34 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		if asyncProfile.Submit.Request.Body != nil {
 			if err := service.ValidateUpstreamAsyncVideoSubmitDuration(submitRequest, source, relaycommon.MaxTaskDurationSeconds); err != nil {
 				return nil, service.TaskErrorWrapperLocal(err, "upstream_async_submit_invalid", http.StatusBadRequest)
+			}
+			if deferInline {
+				value, exists := c.Get("async_media_inline_references")
+				prepare, ok := value.(func(any, int64, *int64) (any, error))
+				if !exists || !ok {
+					return nil, service.TaskErrorWrapperLocal(errors.New("video reference transport is unavailable"), "build_request_failed", http.StatusInternalServerError)
+				}
+				var body any
+				if err := common.DecodeJson(submitRequest.Body, &body); err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "upstream_async_submit_invalid", http.StatusBadRequest)
+				}
+				submitRequest.Body.Close()
+				total := c.GetInt64("async_media_inlined_file_bytes")
+				prepared, err := prepare(body, c.GetInt64("async_media_inline_byte_limit"), &total)
+				if err != nil {
+					var failure *service.MediaReferencePreparationError
+					if errors.As(err, &failure) {
+						return nil, service.TaskErrorWrapperLocal(err, failure.Code, failure.Status)
+					}
+					return nil, service.TaskErrorWrapperLocal(err, "build_request_failed", http.StatusInternalServerError)
+				}
+				encoded, err := common.Marshal(prepared)
+				if err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "build_request_failed", http.StatusInternalServerError)
+				}
+				submitRequest.Body = io.NopCloser(bytes.NewReader(encoded))
+				submitRequest.ContentLength = int64(len(encoded))
+				submitRequest.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(encoded)), nil }
 			}
 		}
 	}

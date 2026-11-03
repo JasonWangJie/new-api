@@ -364,6 +364,9 @@ export const channelFormSchema = z
     image_reference_transport_mode: z
       .enum(['', 'passthrough', 'local', 'passthrough_fallback_local'])
       .optional(),
+    video_reference_transport_mode: z
+      .enum(['passthrough', 'inline'])
+      .optional(),
     tianyue_media_compatibility: z.boolean().optional(),
     image_reference_timeout_retry_same_channel: z.boolean().optional(),
     image_resolution_model_mapping: imageResolutionMappingSchema.optional(),
@@ -401,6 +404,19 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (
+      data.video_reference_transport_mode === 'inline' &&
+      data.type !== 48 &&
+      !(
+        data.type === CHANNEL_TYPE_TASK_PLUGIN && data.task_plugin_key === 'xai'
+      )
+    ) {
+      addRequiredIssue(
+        ctx,
+        'video_reference_transport_mode',
+        'Inline video references require an xAI/Grok channel'
+      )
+    }
     if (
       [
         3,
@@ -568,6 +584,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   http2_connection_shards: 1,
   image_max_reference_images: DEFAULT_IMAGE_CHANNEL_MAX_REFERENCE_IMAGES,
   image_reference_transport_mode: '',
+  video_reference_transport_mode: 'passthrough',
   tianyue_media_compatibility: false,
   image_reference_timeout_retry_same_channel: false,
   image_resolution_model_mapping: [],
@@ -621,6 +638,9 @@ export function transformChannelToFormDefaults(
     image_reference_transport_mode: '' as NonNullable<
       ChannelFormValues['image_reference_transport_mode']
     >,
+    video_reference_transport_mode: 'passthrough' as NonNullable<
+      ChannelFormValues['video_reference_transport_mode']
+    >,
     tianyue_media_compatibility: false,
     image_reference_timeout_retry_same_channel: false,
     image_resolution_model_mapping: [] as NonNullable<
@@ -647,6 +667,10 @@ export function transformChannelToFormDefaults(
       )
       extraSettings = {
         task_plugin_key: parsed.task_plugin_key || '',
+        video_reference_transport_mode:
+          parsed.video_reference_transport_mode === 'inline'
+            ? 'inline'
+            : 'passthrough',
         force_format: parsed.force_format || false,
         thinking_to_content: parsed.thinking_to_content || false,
         proxy: parsed.proxy || '',
@@ -847,6 +871,9 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   if (formData.image_reference_transport_mode) {
     settingObj.image_reference_transport_mode =
       formData.image_reference_transport_mode
+  }
+  if (formData.video_reference_transport_mode === 'inline') {
+    settingObj.video_reference_transport_mode = 'inline'
   }
   if (formData.image_reference_timeout_retry_same_channel === true) {
     settingObj.image_reference_timeout_retry_same_channel = true

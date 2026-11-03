@@ -375,7 +375,7 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 	}
 	local := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
 	if local {
-		if request.ReferenceLocalizationUnsupported || len(request.ReferenceInputs) == 0 || request.ReferenceURLExpiresAt <= now || request.ReferenceURLExpiresAt > job.ExpiresAt || request.ReferenceURLExpiresAt > job.CreatedAt+7*86400 {
+		if request.ReferenceLocalizationUnsupported || !request.HasReferenceInputs() || request.ReferenceURLExpiresAt <= now || request.ReferenceURLExpiresAt > job.ExpiresAt || request.ReferenceURLExpiresAt > job.CreatedAt+7*86400 {
 			result.Reason = "reference_unavailable"
 			return result, nil
 		}
@@ -384,15 +384,27 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		if len(request.OriginalBody) > 0 {
 			data = request.OriginalBody
 		}
-		if common.Unmarshal(data, &body) != nil {
-			result.Reason = "request_replay_unavailable"
-			return result, nil
-		}
-		for _, input := range request.ReferenceInputs {
-			value, err := videoRetryReferenceValue(body, input.Path, nil)
-			if err != nil || value != input.Source {
-				result.Reason = "reference_slots_changed"
+		jsonBody := strings.HasPrefix(strings.ToLower(request.ContentType), "application/json")
+		inputs := request.ReferenceInputs
+		if jsonBody {
+			if common.Unmarshal(data, &body) != nil {
+				result.Reason = "request_replay_unavailable"
 				return result, nil
+			}
+		} else {
+			if job.Provider != "xai" || len(request.InlineReferenceInputs) == 0 {
+				result.Reason = "reference_unavailable"
+				return result, nil
+			}
+			inputs = request.InlineReferenceInputs
+		}
+		for _, input := range inputs {
+			if jsonBody {
+				value, err := videoRetryReferenceValue(body, input.Path, nil)
+				if err != nil || value != input.Source {
+					result.Reason = "reference_slots_changed"
+					return result, nil
+				}
 			}
 			if strings.HasPrefix(input.Source, "asset://") {
 				continue
@@ -648,7 +660,7 @@ func RestoreVideoRetryFact(task model.Task, job model.AsyncMediaJob, request *As
 	if reason == "" {
 		return
 	}
-	fact := NormalizeMediaRetryFact(mediaretry.Fact{VideoEvidence: legacyEvidence, MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: channelID, Stage: "terminal", ErrorCode: "upstream_failed", Category: "unclassified", Message: reason, Accepted: true, Terminal: true, HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline})
+	fact := NormalizeMediaRetryFact(mediaretry.Fact{VideoEvidence: legacyEvidence, MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: channelID, Stage: "terminal", ErrorCode: "upstream_failed", Category: "unclassified", Message: reason, Accepted: true, Terminal: true, HasReferences: request.HasReferenceInputs(), LocalSupported: request.HasReferenceInputs() && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline})
 	if isAsyncVideoReferenceDownloadFailure(fact.Message) {
 		fact.Category = "reference_download"
 	} else if isAsyncVideoBusyFailure(fact.Message) {
@@ -703,7 +715,7 @@ func videoPollingDecision(ctx context.Context, task *model.Task, reason string, 
 	if plain, err := DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId); err == nil {
 		var request AsyncVideoRequest
 		if common.Unmarshal(plain, &request) == nil {
-			fact.HasReferences, fact.LocalSupported = len(request.ReferenceInputs) > 0, !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0
+			fact.HasReferences, fact.LocalSupported = request.HasReferenceInputs(), !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0
 			fact.Deadline = request.ReferenceRecoveryDeadline
 		}
 	}

@@ -87,7 +87,35 @@ func GetImageConfiguration(c *gin.Context) {
 		templates = append(templates, gin.H{"provider": meta.Key, "name": meta.Name, "models": videoModels, "video_profiles": plugin.Meta.VideoProfiles})
 	}
 	sort.Slice(templates, func(i, j int) bool { return templates[i]["provider"].(string) < templates[j]["provider"].(string) })
-	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates, "mixed_video_billing_expr": billing_setting.GetMixedVideoBillingExprCopy(), "mixed_video_usage_schema": billing_setting.MixedVideoUsageSchema()})
+	mixedOverrides := billing_setting.GetMixedVideoBillingExprCopy()
+	mixedModels := make(map[string]bool, len(mixedOverrides))
+	for name := range mixedOverrides {
+		mixedModels[name] = true
+	}
+	for _, policy := range policies {
+		if policy.Platform != "mixed" {
+			continue
+		}
+		var catalog []service.ImageModelCapability
+		if common.UnmarshalJsonStr(policy.Models, &catalog) != nil {
+			continue
+		}
+		for _, capability := range catalog {
+			if capability.MediaType == "video" {
+				mixedModels[capability.Id] = true
+			}
+		}
+	}
+	modelExpressions := make(map[string]string, len(mixedModels))
+	for name := range mixedModels {
+		if billing_setting.GetBillingMode(name) != billing_setting.BillingModeTieredExpr {
+			continue
+		}
+		if expression, configured := billing_setting.GetBillingExpr(name); configured {
+			modelExpressions[name] = expression
+		}
+	}
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates, "mixed_video_billing_expr": mixedOverrides, "mixed_video_model_billing_expr": modelExpressions, "mixed_video_usage_schema": billing_setting.MixedVideoUsageSchema()})
 }
 
 func GetImageChannelPoolOptions(c *gin.Context) {

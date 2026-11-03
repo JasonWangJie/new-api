@@ -239,7 +239,7 @@ func imageReferenceClient(cfg ImageRuntimeConfig, resolver imageReferenceResolve
 		}
 		for _, ip := range addresses {
 			if !ImagePublicIP(ip) {
-				return nil, errors.New("image reference resolved to a non-public address")
+				return nil, newImageValidationError("image reference resolved to a non-public address")
 			}
 		}
 		var lastError error
@@ -252,7 +252,7 @@ func imageReferenceClient(cfg ImageRuntimeConfig, resolver imageReferenceResolve
 			peer, err := netip.ParseAddrPort(conn.RemoteAddr().String())
 			if err != nil || !ImagePublicIP(peer.Addr()) || peer.Addr().Unmap() != ip.Unmap() {
 				_ = conn.Close()
-				return nil, errors.New("image reference connected to an unexpected address")
+				return nil, newImageValidationError("image reference connected to an unexpected address")
 			}
 			return conn, nil
 		}

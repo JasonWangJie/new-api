@@ -1645,6 +1645,69 @@ test('edits and saves the image channel reference capacity from routing settings
   expect(JSON.parse(payload.setting).image_max_reference_images).toBe(12)
 })
 
+test('an xAI channel saves and restores inline video references and can return to URL fetch', async () => {
+  editingChannel = { ...editingChannel, type: 48, setting: '' }
+  const put = vi.spyOn(api, 'put').mockImplementation(async (_url, data) => {
+    editingChannel = {
+      ...editingChannel,
+      setting: (data as { setting: string }).setting,
+    }
+    return { data: { success: true } }
+  })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const transport = screen.getByRole('combobox', {
+    name: 'Video reference transport',
+  })
+  expect(transport).toHaveTextContent('Upstream URL fetch')
+  await user.click(transport)
+  await user.click(
+    screen.getByRole('option', { name: 'Server download and inline upload' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(1))
+  expect(JSON.parse(editingChannel.setting || '{}')).toHaveProperty(
+    'video_reference_transport_mode',
+    'inline'
+  )
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  await user.click(screen.getByRole('button', { name: 'Open channel' }))
+  await screen.findByDisplayValue('Existing channel')
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const restored = screen.getByRole('combobox', {
+    name: 'Video reference transport',
+  })
+  expect(restored).toHaveTextContent('Server download and inline upload')
+  await user.click(restored)
+  await user.click(screen.getByRole('option', { name: 'Upstream URL fetch' }))
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledTimes(2))
+  expect(JSON.parse(editingChannel.setting || '{}')).not.toHaveProperty(
+    'video_reference_transport_mode'
+  )
+})
+
+test('inline video references reject incompatible providers and default to URL fetch', () => {
+  expect(
+    transformChannelToFormDefaults(editingChannel)
+      .video_reference_transport_mode
+  ).toBe('passthrough')
+  expect(
+    channelFormSchema.safeParse({
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      name: 'other',
+      key: 'key',
+      models: ['model'],
+      type: 1,
+      video_reference_transport_mode: 'inline',
+    }).success
+  ).toBe(false)
+})
+
 test('restores a channel reference transport override and saves global inheritance', async () => {
   editingChannel = {
     ...editingChannel,

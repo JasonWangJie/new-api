@@ -21,13 +21,21 @@ import (
 // AsyncVideoReferenceInput identifies a slot in the canonical request. Display
 // snapshots and download completion order must never determine these positions.
 type AsyncVideoReferenceInput struct {
-	Index     int    `json:"index"`
-	Kind      string `json:"kind"`
-	Role      string `json:"role"`
-	Source    string `json:"source"`
-	Path      string `json:"path"`
-	KindIndex int    `json:"kind_index"`
-	ObjectId  string `json:"object_id,omitempty"`
+	Index      int    `json:"index"`
+	Kind       string `json:"kind"`
+	Role       string `json:"role"`
+	Source     string `json:"source"`
+	Path       string `json:"path"`
+	KindIndex  int    `json:"kind_index"`
+	ObjectId   string `json:"object_id,omitempty"`
+	ObjectSlot string `json:"object_slot,omitempty"`
+}
+
+func (input AsyncVideoReferenceInput) StorageSlot() string {
+	if input.ObjectSlot != "" {
+		return input.ObjectSlot
+	}
+	return strconv.Itoa(input.Index)
 }
 
 var SubmitAsyncVideoReferenceRetryFunc func(context.Context, model.AsyncMediaJob, model.Task, AsyncVideoRequest) error
@@ -96,6 +104,9 @@ func isAsyncVideoBusyFailure(reason string) bool {
 func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any, expiresAt int64) error {
 	if request == nil || request.Execution == nil || request.Execution.TaskPlugin == nil {
 		return nil
+	}
+	if request.Execution.TaskPlugin.Key == "xai" {
+		request.InlineReferenceInputs = xaiInlineReferenceInputs(canonical)
 	}
 	if request.MixedRouting != nil {
 		return freezeVideoRetryInputs(request, expiresAt)
@@ -310,7 +321,7 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 	if requestErr == nil {
 		requestErr = common.Unmarshal(plain, &request)
 	}
-	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "terminal", HTTPStatus: httpStatus, ErrorCode: "upstream_failed", Message: result.Reason, Accepted: true, Terminal: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
+	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "terminal", HTTPStatus: httpStatus, ErrorCode: "upstream_failed", Message: result.Reason, Accepted: true, Terminal: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: request.HasReferenceInputs(), LocalSupported: request.HasReferenceInputs() && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
 	fact.Category = "unclassified"
 	if isAsyncVideoReferenceDownloadFailure(fact.Message) {
 		fact.Category = "reference_download"
@@ -709,7 +720,8 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			}
 			wantsLocal := decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel
 			prepared := request.LocalReferencesReady
-			if wantsLocal && job.ReferenceRecoveryStage == "submit" && !prepared {
+			deferredPreparation := request.Execution != nil && request.Execution.TaskPlugin != nil && request.Execution.TaskPlugin.Key == "xai"
+			if wantsLocal && job.ReferenceRecoveryStage == "submit" && !prepared && !deferredPreparation {
 				// A changed action re-enters the download pool rather than using
 				// a submission slot for potentially slow input downloads.
 				updates["reference_recovery_stage"], updates["next_attempt_at"] = "prepare", time.Now().Unix()
@@ -756,6 +768,27 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 				return nil
 			}
 		}
+	}
+	if err == nil && request.PendingDecision != nil {
+		err = SelectVideoRecoveryChannel(parent, &job, &task, &request)
+		if err != nil {
+			updates["next_attempt_at"], updates["error_message"] = time.Now().Unix()+3, VideoTaskFailureReason(err.Error())
+			return err
+		}
+	}
+	if err == nil {
+		if SubmitAsyncVideoReferenceRetryFunc == nil {
+			err = errors.New("video reference recovery submission is unavailable")
+		} else {
+			ctx, cancel := context.WithDeadline(parent, time.Unix(request.ReferenceRecoveryDeadline, 0))
+			defer cancel()
+			err = SubmitAsyncVideoReferenceRetryFunc(ctx, job, task, request)
+		}
+	}
+	var inlineFailure *MediaReferencePreparationError
+	if errors.As(err, &inlineFailure) {
+		preparationAttempted = true
+		request.RetryFact = &mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: request.Channel.Id, Stage: "submit", HTTPStatus: inlineFailure.Status, ErrorCode: inlineFailure.Code, Category: "reference_download", Message: VideoTaskFailureReason(inlineFailure.Error()), HasReferences: request.HasReferenceInputs(), LocalSupported: request.HasReferenceInputs(), Deadline: request.ReferenceRecoveryDeadline}
 	}
 	if err != nil && preparationAttempted && request.PendingDecision != nil && request.RetryFact != nil {
 		// Failed local preparation used the action even though it sent no
@@ -804,22 +837,6 @@ func ProcessAsyncVideoReferenceRecovery(parent context.Context, job model.AsyncM
 			}
 			updates["status"], updates["reference_recovery_stage"] = "execution_unknown", "manual"
 			return nil
-		}
-	}
-	if err == nil && request.PendingDecision != nil {
-		err = SelectVideoRecoveryChannel(parent, &job, &task, &request)
-		if err != nil {
-			updates["next_attempt_at"], updates["error_message"] = time.Now().Unix()+3, VideoTaskFailureReason(err.Error())
-			return err
-		}
-	}
-	if err == nil {
-		if SubmitAsyncVideoReferenceRetryFunc == nil {
-			err = errors.New("video reference recovery submission is unavailable")
-		} else {
-			ctx, cancel := context.WithDeadline(parent, time.Unix(request.ReferenceRecoveryDeadline, 0))
-			defer cancel()
-			err = SubmitAsyncVideoReferenceRetryFunc(ctx, job, task, request)
 		}
 	}
 	var current model.AsyncMediaJob
@@ -901,7 +918,7 @@ func tryUnknownVideoRecovery(ctx context.Context, task model.Task, job model.Asy
 	if common.Unmarshal(plain, &request) != nil {
 		return false, nil
 	}
-	fact := NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_submission_unknown", Category: "execution_unknown", Message: VideoTaskFailureReason(reason), Unknown: true, Accepted: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0, Deadline: request.ReferenceRecoveryDeadline})
+	fact := NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_submission_unknown", Category: "execution_unknown", Message: VideoTaskFailureReason(reason), Unknown: true, Accepted: true, HasUpstreamTask: task.PrivateData.UpstreamTaskID != "", HasReferences: request.HasReferenceInputs(), LocalSupported: !request.ReferenceLocalizationUnsupported && request.ReferenceRecoveryVersion > 0, Deadline: request.ReferenceRecoveryDeadline})
 	state := videoRetryState(task, job)
 	decision, err := evaluateVideoRetry(ctx, fact, &state)
 	if err != nil {
@@ -911,7 +928,7 @@ func tryUnknownVideoRecovery(ctx context.Context, task model.Task, job model.Asy
 }
 
 func tryRejectedVideoRecovery(ctx context.Context, task model.Task, job model.AsyncMediaJob, request AsyncVideoRequest, reason string) (bool, error) {
-	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_rejected", Message: VideoTaskFailureReason(reason), Terminal: true, HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
+	fact := mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: task.ChannelId, Stage: "submit", ErrorCode: "upstream_rejected", Message: VideoTaskFailureReason(reason), Terminal: true, HasReferences: request.HasReferenceInputs(), LocalSupported: request.HasReferenceInputs() && !request.ReferenceLocalizationUnsupported, Deadline: request.ReferenceRecoveryDeadline}
 	fact.Category = "unclassified"
 	if isAsyncVideoReferenceDownloadFailure(fact.Message) {
 		fact.Category = "reference_download"

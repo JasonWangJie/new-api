@@ -37,11 +37,21 @@ func MixedVideoUsageSchema() map[string]jsplugin.UsageFieldSchema {
 	}
 }
 
+// GetMixedVideoBillingExpr uses an explicit mixed override before the public
+// model's active expression. Provider overrides and mapped models never define
+// the public price. An invalid explicit override must not silently inherit.
 func GetMixedVideoBillingExpr(model string) (string, bool) {
-	expression, ok := billingSetting.MixedVideoBillingExpr[model]
-	return expression, ok && strings.TrimSpace(expression) != ""
+	if expression, overridden := billingSetting.MixedVideoBillingExpr[model]; overridden {
+		return expression, true
+	}
+	if GetBillingMode(model) != BillingModeTieredExpr {
+		return "", false
+	}
+	return GetBillingExpr(model)
 }
 
+// GetMixedVideoBillingExprCopy returns only explicit overrides. Inherited model
+// expressions must not become overrides when the administration form is saved.
 func GetMixedVideoBillingExprCopy() map[string]string {
 	expressions := maps.Clone(billingSetting.MixedVideoBillingExpr)
 	if expressions == nil {

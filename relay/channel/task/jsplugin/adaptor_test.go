@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"mime/multipart"
@@ -195,6 +196,60 @@ export function parseSubmitResponse(){return {taskId:"1"}} export function build
 	require.Len(t, items, 1)
 	assert.Equal(t, "data:image/png;base64,"+encoded, items[0])
 	assert.Equal(t, "data:image/jpeg;base64,"+encoded, decoded["dataUrl"])
+}
+
+func TestTaskAdaptorPreparesVideoReferencesAfterJSAndSharesUploadBudget(t *testing.T) {
+	source := `
+export const meta = {apiVersion:1,key:"inline-budget",name:"Inline Budget",version:"1.0.0",author:{name:"Test"},models:["m"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx) { return {url:ctx.baseUrl+"/submit",body:{image:{url:"https://cdn.example.com/reference.png"},upload:{__fileRef:ctx.files[0].ref,encoding:"dataUrl"}}}; }
+export function parseSubmitResponse(){return {taskId:"1"}} export function buildQueryRequest(){return {url:"https://example.com"}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	previousLimit := constant.MaxFileDownloadMB
+	constant.MaxFileDownloadMB = 2
+	t.Cleanup(func() { constant.MaxFileDownloadMB = previousLimit })
+	for _, overflow := range []bool{false, true} {
+		t.Run(fmt.Sprint(overflow), func(t *testing.T) {
+			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+			require.NoError(t, err)
+			adaptor := New(plugin)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			adaptor.Init(info)
+			uploaded := []byte("uploaded-image")
+			c := newMultipartFileContext(t, "input_reference", "ref.png", "image/png", uploaded)
+			c.Set("task_request", map[string]any{"model": "m"})
+			c.Set("async_media_inline_reference_mode", true)
+			downloaded := bytes.Repeat([]byte{1}, (1<<20)+1)
+			called := false
+			c.Set("async_media_inline_references", func(body any, limit int64, total *int64) (any, error) {
+				called = true
+				require.Equal(t, int64(2<<20), limit)
+				require.Zero(t, *total)
+				*total = int64(len(downloaded))
+				if overflow {
+					*total = limit - 1
+				}
+				body.(map[string]any)["image"].(map[string]any)["url"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(downloaded)
+				return body, nil
+			})
+			reader, err := adaptor.BuildRequestBody(c, info)
+			require.True(t, called)
+			if overflow {
+				require.ErrorContains(t, err, "inlined files exceed")
+				var preparation *service.MediaReferencePreparationError
+				require.ErrorAs(t, err, &preparation)
+				assert.Equal(t, "media_reference_too_large", preparation.Code)
+				return
+			}
+			require.NoError(t, err)
+			raw, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			require.Greater(t, len(raw), 1<<20)
+			var posted map[string]any
+			require.NoError(t, common.Unmarshal(raw, &posted))
+			assert.Equal(t, "data:image/png;base64,"+base64.StdEncoding.EncodeToString(downloaded), posted["image"].(map[string]any)["url"])
+			assert.Equal(t, "data:image/png;base64,"+base64.StdEncoding.EncodeToString(uploaded), posted["upload"])
+		})
+	}
 }
 
 func TestTaskAdaptorJSONFilePlaceholderErrors(t *testing.T) {

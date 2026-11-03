@@ -417,6 +417,7 @@ export type VideoPluginTemplate = {
 }
 export type ImageAdminConfiguration = {
   mixed_video_billing_expr?: Record<string, string>
+  mixed_video_model_billing_expr?: Record<string, string>
   mixed_video_usage_schema?: BillingUsageSchema
   routing_platforms?: string[]
   image_providers?: string[]

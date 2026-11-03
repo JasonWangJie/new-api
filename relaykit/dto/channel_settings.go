@@ -23,6 +23,7 @@ type ChannelSettings struct {
 	ImageAttemptTimeoutSeconds            *int   `json:"image_attempt_timeout_seconds,omitempty"`
 	ImageConcurrencyLimit                 *int   `json:"image_concurrency_limit,omitempty"`
 	ImageReferenceTransportMode           string `json:"image_reference_transport_mode,omitempty"`
+	VideoReferenceTransportMode           string `json:"video_reference_transport_mode,omitempty"`
 	ImageReferenceTimeoutRetrySameChannel bool   `json:"image_reference_timeout_retry_same_channel,omitempty"`
 	TianyueMediaCompatibility             bool   `json:"tianyue_media_compatibility,omitempty"`
 	// ImageResolutionModelMapping selects final upstream names for asynchronous

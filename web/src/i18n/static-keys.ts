@@ -1233,4 +1233,5 @@ export const STATIC_I18N_KEYS = [
   'Preview does not download remote reference media',
   'Uses the recorded error with current task budgets and deadlines. Eligibility is checked again before execution.',
   'Current task context is unavailable',
+  'Inline video references require an xAI/Grok channel',
 ] as const

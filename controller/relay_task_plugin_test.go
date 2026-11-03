@@ -978,14 +978,16 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name, action, status, receipt, output string
 		calls                                 int
-		changePolicy                          bool
+		changePolicy, preparationFailure      bool
 	}{
-		{"typed same", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 2, false},
-		{"typed other", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "", 2, false},
-		{"unknown without receipt", mediaretry.OtherChannel, string(model.TaskStatusUnknown), "", "", 1, false},
-		{"receipt is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "original-receipt", "", 1, false},
-		{"output is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "https://media.example/result.mp4", 1, false},
-		{"changed policy advances past failed local preparation", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 3, true},
+		{"typed same", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 2, false, false},
+		{"typed other", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "", 2, false, false},
+		{"unknown without receipt", mediaretry.OtherChannel, string(model.TaskStatusUnknown), "", "", 1, false, false},
+		{"receipt is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "original-receipt", "", 1, false, false},
+		{"output is retained", mediaretry.OtherChannel, string(model.TaskStatusFailure), "", "https://media.example/result.mp4", 1, false, false},
+		{"changed policy advances past failed local preparation", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 3, true, false},
+		{"inline preparation advances the rule without dispatch", mediaretry.SameChannel, string(model.TaskStatusFailure), "", "", 3, false, true},
+		{"xai multipart local retry", mediaretry.LocalSameChannel, string(model.TaskStatusFailure), "", "", 2, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oldLogs := common.LogConsumeEnabled
@@ -999,27 +1001,45 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			previousRegistry := pluginruntime.DefaultRegistry
 			pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
 			t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })
-			source, err := builtinplugins.Source("drama")
+			provider, modelName := "drama", "seedance2.0-E-720p"
+			if tc.action == mediaretry.LocalSameChannel {
+				provider, modelName = "xai", "grok-imagine-video"
+			}
+			source, err := builtinplugins.Source(provider)
 			require.NoError(t, err)
-			plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "drama"})
+			plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: provider})
 			require.NoError(t, err)
 			user := model.User{Id: 1, Username: "typed-user", Group: "default", Status: common.UserStatusEnabled}
 			require.NoError(t, db.Create(&user).Error)
 			token := model.Token{Id: 1, UserId: 1, Key: "typed-token", Status: common.TokenStatusEnabled, ExpiredTime: -1}
 			require.NoError(t, db.Create(&token).Error)
-			setting := `{"task_plugin_key":"drama"}`
-			channels := []model.Channel{{Id: 1, Type: constant.ChannelTypeTaskPlugin, Key: "first", Models: "seedance2.0-E-720p", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}, {Id: 2, Type: constant.ChannelTypeTaskPlugin, Key: "second", Models: "seedance2.0-E-720p", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}}
+			setting := fmt.Sprintf(`{"task_plugin_key":%q}`, provider)
+			channels := []model.Channel{{Id: 1, Type: constant.ChannelTypeTaskPlugin, Key: "first", Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}, {Id: 2, Type: constant.ChannelTypeTaskPlugin, Key: "second", Models: modelName, Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting}}
 			require.NoError(t, db.Create(&channels).Error)
 			for _, channel := range channels {
 				require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Model: channel.Models, Group: "default", Enabled: true}).Error)
 			}
 			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "typed", Name: "Typed failure", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"typed rejection"}}, Steps: []mediaretry.Step{{ID: "retry", Action: tc.action, MaxAttempts: 1}}}}}
+			if tc.preparationFailure {
+				policy.Rules[0].Steps = []mediaretry.Step{{ID: "prepare", Action: mediaretry.SameChannel, MaxAttempts: 1}, {ID: "fallback", Action: mediaretry.SameChannel, MaxAttempts: 1}}
+			}
 			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, 0, 1, nil)
 			require.NoError(t, err)
 			now := time.Now().Unix()
-			job := model.AsyncMediaJob{TaskId: "task_public", IdentityHash: "typed", UserId: 1, TokenId: 1, ChannelId: 1, Provider: "drama", Model: channels[0].Models, Group: "default", Status: "queued", LeaseToken: "lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 120}
+			job := model.AsyncMediaJob{TaskId: "task_public", IdentityHash: "typed", UserId: 1, TokenId: 1, ChannelId: 1, Provider: provider, Model: channels[0].Models, Group: "default", Status: "queued", LeaseToken: "lease", LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 120}
 			require.NoError(t, db.Create(&job).Error)
 			request := service.AsyncVideoRequest{Body: []byte(`{}`), ContentType: "application/json", Channel: channels[0], PluginHash: plugin.Engine.SourceFingerprint(), InitialRetryState: &mediaretry.State{TotalLimit: 3}}
+			if provider == "xai" {
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				require.NoError(t, writer.WriteField("model", modelName))
+				require.NoError(t, writer.WriteField("image", "https://cdn.example.com/reference.png"))
+				require.NoError(t, writer.Close())
+				request.Body, request.ContentType = body.Bytes(), writer.FormDataContentType()
+				request.Execution = &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: provider}}
+				request.ReferenceRecoveryVersion, request.ReferenceRecoveryDeadline = 2, now+120
+				request.InlineReferenceInputs = []service.AsyncVideoReferenceInput{{Kind: "image", Source: "https://cdn.example.com/reference.png", Path: "/image/url"}}
+			}
 			if tc.changePolicy {
 				// Generation is still allowed, but local recovery's earlier
 				// deadline has expired. Its failure must advance to the fallback.
@@ -1045,6 +1065,18 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 					assert.Same(t, billing, attempt.Billing)
 					attempt.InitChannelMeta(c)
 					calls++
+					if tc.preparationFailure && calls <= 2 {
+						request.InlineReferenceInputs = []service.AsyncVideoReferenceInput{{Kind: "image", Source: "https://cdn.example.com/ref.png", Path: "/image/url"}}
+						err := &service.MediaReferencePreparationError{Code: "media_reference_download_failed", Status: 502, Cause: errors.New("typed rejection: reference download failed")}
+						return nil, service.TaskErrorWrapperLocal(err, err.Code, err.Status)
+					}
+					if provider == "xai" && calls == 2 {
+						body, err := io.ReadAll(c.Request.Body)
+						require.NoError(t, err)
+						assert.Equal(t, request.Body, body, "local retry preserves the multipart source for normalization")
+						assert.Contains(t, request.ContentType, "multipart/form-data")
+					}
+
 					if tc.changePolicy && calls == 2 {
 						latest, err := model.GetMediaRetryPolicy(t.Context())
 						require.NoError(t, err)
@@ -1071,7 +1103,14 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			assert.Equal(t, tc.calls, calls)
 			assert.Zero(t, billing.refunds)
 			assert.Equal(t, 1, outcome.Task.BillingChannelID())
-			if tc.changePolicy {
+			if tc.preparationFailure {
+				assert.Equal(t, 1, request.InitialRetryState.TotalUsed)
+				assert.Equal(t, map[string]int{"typed/prepare": 1, "typed/fallback": 1}, request.InitialRetryState.StepUses)
+				require.NotNil(t, request.RetryFact)
+				assert.Equal(t, "reference_download", request.RetryFact.Category)
+				assert.Equal(t, "submit", request.RetryFact.Stage)
+				assert.False(t, request.RetryFact.Unknown)
+			} else if tc.changePolicy {
 				assert.Equal(t, 1, request.InitialRetryState.TotalUsed, "only the fallback generated another upstream request")
 				assert.Equal(t, map[string]int{"typed/local": 1, "typed/fallback": 1}, request.InitialRetryState.StepUses)
 				assert.Equal(t, "accepted-retry", outcome.Task.PrivateData.UpstreamTaskID)

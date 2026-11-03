@@ -58,8 +58,14 @@ func ValidateMixedVideoPricing(ctx context.Context, expressions map[string]strin
 		}
 		for _, capability := range catalog {
 			expression, configured := expressions[capability.Id]
+			if !configured && billing_setting.GetBillingMode(capability.Id) == billing_setting.BillingModeTieredExpr {
+				expression, configured = billing_setting.GetBillingExpr(capability.Id)
+			}
 			if capability.MediaType != "video" || !configured {
 				continue
+			}
+			if err := billing_setting.ValidateMixedVideoBillingExpr(expression); err != nil {
+				return fmt.Errorf("mixed video model %s in group %s: %w", capability.Id, policy.Group, err)
 			}
 			profiles, err := MixedVideoModelProfiles(ctx, policy, capability.Id, capability.VideoOverrides, false)
 			if err == nil {
@@ -74,7 +80,8 @@ func ValidateMixedVideoPricing(ctx context.Context, expressions map[string]strin
 }
 
 // FreezeMixedVideoBilling pins the public model's host-owned request price.
-// It has no provider or mapped-model fallback, including during recovery.
+// An explicit mixed override wins; otherwise it inherits the public model's
+// expression. Provider or mapped-model prices never affect this snapshot.
 func FreezeMixedVideoBilling(modelName string, facts map[string]any, group types.GroupRatioInfo) (MediaBillingSnapshot, error) {
 	expression, configured := billing_setting.GetMixedVideoBillingExpr(modelName)
 	if !configured {

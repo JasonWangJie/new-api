@@ -94,6 +94,7 @@ export interface ChannelSettings {
     | 'passthrough'
     | 'local'
     | 'passthrough_fallback_local'
+  video_reference_transport_mode?: 'passthrough' | 'inline'
   image_resolution_model_mapping?: Record<
     string,
     Partial<Record<'1K' | '2K' | '4K', string>>

@@ -733,6 +733,190 @@ const mixedVideoPricingSchema: BillingUsageSchema = {
   },
 }
 
+test('mixed pricing inherits model prices until an explicit override is saved and can return to inheritance', async () => {
+  const expression =
+    'tier("seconds", u("seconds") * 0.8) * (u("video_input") == "video" ? 1.45 : 1)'
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  vi.mocked(imageRequest).mockResolvedValue({})
+  render(
+    <QueryClientProvider client={client}>
+      <MixedVideoPricing
+        config={{
+          runtime: {},
+          storage_profiles: [],
+          pools: [],
+          storage_providers: [],
+          policies: [],
+          mixed_video_usage_schema: mixedVideoPricingSchema,
+          mixed_video_model_billing_expr: { 'shared-video': expression },
+          mixed_video_billing_expr: {
+            other: 'tier("other", u("requests") * 2)',
+          },
+        }}
+        catalog='[{"id":"shared-video","media_type":"video"}]'
+        onSuccess={vi.fn().mockResolvedValue(undefined)}
+      />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('combobox', { name: 'Public video model' }))
+  await user.click(screen.getByRole('option', { name: 'shared-video' }))
+  expect(
+    screen.getByRole('combobox', { name: 'Mixed video price source' })
+  ).toHaveTextContent('Use model pricing')
+  expect(
+    screen.getByRole('textbox', { name: 'With reference video multiplier' })
+  ).toBeDisabled()
+  expect(
+    screen.getByRole('link', { name: 'Open model pricing' })
+  ).toHaveAttribute('href', '/system-settings/billing/model-pricing')
+  expect(imageRequest).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('combobox', { name: 'Mixed video price source' })
+  )
+  await user.click(
+    screen.getByRole('option', { name: 'Custom mixed video price' })
+  )
+  const multiplier = screen.getByRole('textbox', {
+    name: 'With reference video multiplier',
+  })
+  expect(multiplier).toBeEnabled()
+  expect(multiplier).toHaveValue('1.45')
+  await user.clear(multiplier)
+  await user.type(multiplier, '1.8')
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() => expect(imageRequest).toHaveBeenCalled())
+  const saved = vi.mocked(imageRequest).mock.calls.at(-1)?.[2] as {
+    value: string
+  }
+  const prices = JSON.parse(saved.value) as Record<string, string>
+  expect(prices.other).toBe('tier("other", u("requests") * 2)')
+  const cost = evaluateBillingExpression(prices['shared-video'], {
+    usage: { seconds: 30, video_input: 'video' },
+  })
+  expect(cost.status).toBe('success')
+  if (cost.status === 'success') expect(cost.cost).toBeCloseTo(43.2)
+  await user.click(
+    screen.getByRole('combobox', { name: 'Mixed video price source' })
+  )
+  await user.click(screen.getByRole('option', { name: 'Use model pricing' }))
+  expect(
+    screen.getByRole('textbox', { name: 'With reference video multiplier' })
+  ).toHaveValue('1.45')
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenLastCalledWith('/api/option/', 'PUT', {
+      key: 'billing_setting.mixed_video_billing_expr',
+      value: JSON.stringify({ other: 'tier("other", u("requests") * 2)' }),
+    })
+  )
+})
+
+test('inherited mixed pricing reflects refreshed model prices without saving an override', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const config: ImageAdminConfiguration = {
+    runtime: {},
+    storage_profiles: [],
+    pools: [],
+    storage_providers: [],
+    policies: [],
+    mixed_video_usage_schema: mixedVideoPricingSchema,
+    mixed_video_billing_expr: {},
+    mixed_video_model_billing_expr: {
+      'shared-video':
+        'tier("s", u("seconds") * 0.8) * (u("video_input") == "video" ? 1.45 : 1)',
+    },
+  }
+  const pricing = (current: ImageAdminConfiguration) => (
+    <QueryClientProvider client={client}>
+      <MixedVideoPricing
+        config={current}
+        catalog='[{"id":"shared-video","media_type":"video"}]'
+        onSuccess={vi.fn().mockResolvedValue(undefined)}
+      />
+    </QueryClientProvider>
+  )
+  vi.mocked(imageRequest).mockResolvedValue({})
+  const view = render(pricing(config))
+  view.rerender(
+    pricing({
+      ...config,
+      mixed_video_model_billing_expr: {
+        'shared-video':
+          'tier("s", u("seconds") * 0.8) * (u("video_input") == "video" ? 1.8 : 1)',
+      },
+    })
+  )
+  await waitFor(() =>
+    expect(
+      screen.getByRole('textbox', { name: 'With reference video multiplier' })
+    ).toHaveValue('1.8')
+  )
+  expect(
+    screen.getByRole('textbox', { name: 'With reference video multiplier' })
+  ).toBeDisabled()
+  expect(imageRequest).not.toHaveBeenCalled()
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith('/api/option/', 'PUT', {
+      key: 'billing_setting.mixed_video_billing_expr',
+      value: '{}',
+    })
+  )
+})
+
+test.each([undefined, 'tier("tokens", u("tokens") * 0.1)'])(
+  'inherited missing or incompatible model price is shown as needing configuration: %s',
+  (expression) => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    render(
+      <QueryClientProvider client={client}>
+        <MixedVideoPricing
+          config={{
+            runtime: {},
+            storage_profiles: [],
+            pools: [],
+            storage_providers: [],
+            policies: [],
+            mixed_video_usage_schema: mixedVideoPricingSchema,
+            mixed_video_model_billing_expr: expression
+              ? { 'shared-video': expression }
+              : {},
+            mixed_video_billing_expr: {},
+          }}
+          catalog='[{"id":"shared-video","media_type":"video"}]'
+          onSuccess={vi.fn().mockResolvedValue(undefined)}
+        />
+      </QueryClientProvider>
+    )
+    expect(
+      screen.getByText(
+        'Configure a compatible model billing expression or set a custom mixed video price.'
+      )
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('combobox', { name: 'Mixed video price source' })
+    ).toHaveTextContent('Use model pricing')
+    expect(imageRequest).not.toHaveBeenCalled()
+  }
+)
+
 test('mixed visual pricing edits reference multipliers once and retains the draft across configuration refreshes', async () => {
   const expression =
     '(u("resolution") == "720p" ? tier("720p", u("requests") * 6) : tier("1080p", u("requests") * 9)) * (u("video_input") == "video" ? 1.5 : 1.25)'

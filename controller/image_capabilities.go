@@ -405,6 +405,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			mixedGroups = service.GetUserAutoGroup(owner.Group)
 		}
 	}
+	mixedVideoPrices := make(map[string]string)
 	if mixedPolicy.Id > 0 {
 		for _, capability := range mixedCatalog {
 			if capability.MediaType != "video" || token.ModelLimitsEnabled && !token.GetModelLimitsMap()[capability.Id] {
@@ -444,6 +445,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			}
 			pricingStatus := "needs_configuration"
 			if expression, configured := billing_setting.GetMixedVideoBillingExpr(capability.Id); configured {
+				mixedVideoPrices[capability.Id] = expression
 				pricingStatus = "invalid_configuration"
 				if len(variants) > 0 && billing_setting.ValidateMixedVideoBillingExpr(expression) == nil && service.ValidateMixedVideoProfilePricing(expression, variants) == nil {
 					pricingStatus = "configured"
@@ -464,7 +466,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			})
 		}
 	}
-	versionFacts = append(versionFacts, videoReadiness, videoModels, mixedPolicy, billing_setting.GetMixedVideoBillingExprCopy())
+	versionFacts = append(versionFacts, videoReadiness, videoModels, mixedPolicy, mixedVideoPrices)
 	var pools []model.ImageChannelPool
 	if err := model.DB.WithContext(ctx).Find(&pools).Error; err != nil {
 		imageManagementError(c, 503, err)

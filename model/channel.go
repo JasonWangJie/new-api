@@ -1005,6 +1005,15 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelParams.ValidateImageGeneration(); err != nil {
 		return err
 	}
+	switch channelParams.VideoReferenceTransportMode {
+	case "", "passthrough":
+	case "inline":
+		if channel.Type != constant.ChannelTypeXai && (channel.Type != constant.ChannelTypeTaskPlugin || channelParams.TaskPluginKey != "xai") {
+			return fmt.Errorf("video_reference_transport_mode inline requires an xAI/Grok channel")
+		}
+	default:
+		return fmt.Errorf("invalid video_reference_transport_mode: %s", channelParams.VideoReferenceTransportMode)
+	}
 	channelOtherSettings := &dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, channelOtherSettings)

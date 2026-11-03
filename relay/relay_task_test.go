@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -803,6 +804,70 @@ export function extractUsageOnSubmit(){return {seconds:99};}
 			for _, secret := range []string{"sk_current-secret", "sk_other-secret", "unrelated-secret", "private-prompt-canary", `"request"`} {
 				assert.NotContains(t, taskErr.Message, secret)
 				assert.NotContains(t, taskErr.Error.Error(), secret)
+			}
+		})
+	}
+}
+
+func TestVideoReferencePreparationRunsOnFinalAsyncTemplateBeforeDispatch(t *testing.T) {
+	service.InitHttpClient()
+	const source = `
+export const meta={apiVersion:1,key:"xai",name:"xAI fixture",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",body:{model:ctx.upstreamModel,image:{url:"https://cdn.example.com/driver.png"}},action:"text_to_video"};}
+export function parseSubmitResponse(){return {taskId:"accepted"};}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+`
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprint(failed), func(t *testing.T) {
+			var sends atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				var body map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				assert.Equal(t, "data:image/png;base64,aGVsbG8=", body["image"].(map[string]any)["url"])
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"accepted","status":"queued"}`))
+			}))
+			defer upstream.Close()
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			pinMappingOrderPlugin(t, c, source)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			info.OriginModelName = "declared-model"
+			c.Set("async_media_execution", true)
+			c.Set("async_media_billing", service.MediaBillingSnapshot{Price: types.PriceData{Quota: 123, FreeModel: true}})
+			var rules kitdto.UpstreamAsyncConfig
+			require.NoError(t, common.UnmarshalJsonStr(`{"profiles":[{"id":"inline-template","media_type":"video","models":["declared-model"],"operations":["generate"],"submit":{"task_id_path":"id","request":{"method":"POST","path":"/submit","body":{"model":"{upstream_model}","image":{"url":"https://cdn.example.com/override.png"}}}},"poll":{"request":{"method":"GET","path":"/query/{task_id}"},"response":{"status_path":"status","status_values":{"succeeded":["done"],"failed":["failed"]},"result_path":"url"}}}]}`, &rules))
+			require.NoError(t, rules.Validate())
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, kitdto.ChannelOtherSettings{UpstreamAsync: &rules})
+			preparations, dispatches := 0, 0
+			c.Set("async_media_inline_references", func(body any, limit int64, total *int64) (any, error) {
+				preparations++
+				assert.Positive(t, limit)
+				assert.Zero(t, *total)
+				image := body.(map[string]any)["image"].(map[string]any)
+				assert.Equal(t, "https://cdn.example.com/override.png", image["url"])
+				if failed {
+					return nil, &service.MediaReferencePreparationError{Code: "media_reference_download_failed", Status: 502, Cause: errors.New("reference download failed")}
+				}
+				image["url"] = "data:image/png;base64,aGVsbG8="
+				return body, nil
+			})
+			c.Set("async_media_before_dispatch", func(*relaycommon.RelayInfo) error { dispatches++; return nil })
+			result, taskErr := RelayTaskSubmit(c, info)
+			assert.Equal(t, 1, preparations)
+			if failed {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, "media_reference_download_failed", taskErr.Code)
+				assert.Equal(t, 502, taskErr.StatusCode)
+				assert.Zero(t, dispatches)
+				assert.Zero(t, sends.Load())
+			} else {
+				require.Nil(t, taskErr)
+				require.NotNil(t, result)
+				assert.Equal(t, "accepted", result.UpstreamTaskID)
+				assert.Equal(t, 1, dispatches)
+				assert.EqualValues(t, 1, sends.Load())
 			}
 		})
 	}

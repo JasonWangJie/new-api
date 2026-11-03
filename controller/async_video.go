@@ -731,6 +731,11 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		info.LockedChannel = &request.Channel
 		c.Set("async_media_execution", true)
 		c.Set("async_media_execution_lease_token", job.LeaseToken)
+		c.Set("async_media_inline_references", func(body any, limit int64, total *int64) (any, error) {
+			prepared, err := service.InlineAsyncVideoReferences(c.Request.Context(), job, &request, body, limit, total)
+			c.Set("async_media_inline_reference_mode", request.VideoReferenceTransportMode == "inline")
+			return prepared, err
+		})
 		if retryTask != nil {
 			// Submit-time provider adjustments may have changed the original
 			// reservation. Preserve its settled hold and all frozen rates.
@@ -768,6 +773,20 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				if decision != nil && request.PendingDecision != nil && (decision.Revision != request.PendingDecision.Revision || decision.RuleID != request.PendingDecision.RuleID || decision.StepID != request.PendingDecision.StepID || decision.Action != request.PendingDecision.Action) {
 					return service.ErrVideoRetryDeferred
 				}
+				if request.LocalReferencesReady && len(request.InlineReferenceInputs) > 0 {
+					encoded, err := common.Marshal(request)
+					if err != nil {
+						return err
+					}
+					cipher, err := service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+					if err != nil {
+						return err
+					}
+					if err := model.UpdateAsyncMediaJob(ctx, job, map[string]any{"request_cipher": cipher}); err != nil {
+						return err
+					}
+					referenceMode = "local_download"
+				}
 				return model.DispatchAsyncVideoRecovery(ctx, job, *retryTask, decision, slices.Index(liveChannel.GetKeys(), request.Channel.Key), referenceMode)
 			})
 			result, taskErr := relay.RelayTaskSubmit(c, info)
@@ -777,7 +796,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				} else if errors.Is(taskErr.Error, service.ErrVideoRetryDeferred) {
 					executionErr = service.ErrVideoRetryDeferred
 				} else {
-					executionErr = fmt.Errorf("video recovery submission failed (HTTP %d, code %s)", taskErr.StatusCode, taskErr.Code)
+					executionErr = fmt.Errorf("video recovery submission failed (HTTP %d, code %s): %w", taskErr.StatusCode, taskErr.Code, taskErr.Error)
 				}
 				return
 			}
@@ -917,9 +936,11 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			return result, nil
 		}
 		deferred := errors.Is(taskErr.Error, service.ErrVideoRetryDeferred)
+		var preparation *service.MediaReferencePreparationError
+		preparationFailed := errors.As(taskErr.Error, &preparation) && !retry.dispatched
 		// Failed reference preparation has consumed its step; evaluateOnly
 		// must still advance the policy even after a deferred dispatch.
-		if !deferred && !evaluateOnly && taskErr.LocalError && !retry.dispatched {
+		if !deferred && !evaluateOnly && taskErr.LocalError && !retry.dispatched && !preparationFailed {
 			// A local validation or dispatch-barrier failure never reached the
 			// provider. Keep any earlier unknown attempts, but do not invent a
 			// new uncertain operation or consume an upstream retry for this one.
@@ -937,8 +958,34 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			if end, ok := c.Request.Context().Deadline(); ok && (deadline == 0 || end.Unix() < deadline) {
 				deadline = end.Unix()
 			}
-			fact := service.NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: info.ChannelId, Stage: "submit", HTTPStatus: taskErr.StatusCode, ErrorCode: taskErr.Code, Message: message, Category: "unclassified", Unknown: retry.dispatched && !c.GetBool("async_media_submission_rejected"), Terminal: c.GetBool("async_media_submission_rejected"), HasReferences: len(request.ReferenceInputs) > 0, LocalSupported: (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && len(request.ReferenceInputs) > 0 && !request.ReferenceLocalizationUnsupported, Deadline: deadline})
+			fact := service.NormalizeMediaRetryFact(mediaretry.Fact{MediaType: "video", Provider: job.Provider, Model: job.Model, ChannelID: info.ChannelId, Stage: "submit", HTTPStatus: taskErr.StatusCode, ErrorCode: taskErr.Code, Message: message, Category: "unclassified", Unknown: retry.dispatched && !c.GetBool("async_media_submission_rejected"), Terminal: c.GetBool("async_media_submission_rejected"), HasReferences: request.HasReferenceInputs(), LocalSupported: (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && request.HasReferenceInputs() && !request.ReferenceLocalizationUnsupported, Deadline: deadline})
 			fact.VideoEvidence = &mediaretry.VideoFailureEvidence{LegacySubmissionRejected: c.GetBool("async_media_retryable_submission_rejection"), SubmissionStartedAt: retry.startedAt, LegacySubmissionUsed: retry.legacyUsed}
+			if preparationFailed {
+				fact.Category = "reference_download"
+				fact.HasReferences = request.HasReferenceInputs()
+				fact.LocalSupported = fact.HasReferences
+				fact.Accepted, fact.Unknown, fact.Terminal = false, false, false
+				if request.PendingDecision != nil && retry.event != nil {
+					next := mediaretry.Consume(*request.InitialRetryState, *request.PendingDecision)
+					next.TotalUsed = request.InitialRetryState.TotalUsed
+					request.InitialRetryState = &next
+					request.PendingDecision = nil
+					snapshot := *request
+					snapshot.RetryFact = &fact
+					encoded, err := common.Marshal(snapshot)
+					if err != nil {
+						return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusInternalServerError)
+					}
+					cipher, err := service.EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+					if err != nil {
+						return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusInternalServerError)
+					}
+					if err := model.RecordAsyncVideoSubmissionPreparation(c.Request.Context(), *job, cipher, retry.event); err != nil {
+						return nil, service.TaskErrorWrapperLocal(err, "media_retry_state_failed", http.StatusServiceUnavailable)
+					}
+					job.RequestCipher = cipher
+				}
+			}
 			if fact.Unknown {
 				fact.Category = "execution_unknown"
 			}
@@ -1069,7 +1116,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		}
 		request.Body = append([]byte(nil), request.OriginalBody...)
 		request.LocalReferencesReady = false
-		if local {
+		if local && retry.liveChannel.GetSetting().VideoReferenceTransportMode != "inline" {
 			prepared, err := service.PrepareAsyncVideoLocalReferences(c.Request.Context(), *job, *request)
 			if err != nil {
 				// This action ran, but sent no generation. Retain its step usage
@@ -1107,7 +1154,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		}
 		c.Set(common.KeyBodyStorage, storage)
 		c.Request.Body, c.Request.ContentLength = io.NopCloser(storage), int64(len(request.Body))
-		if local || strings.HasPrefix(request.ContentType, "application/json") {
+		if strings.HasPrefix(strings.ToLower(request.ContentType), "application/json") {
 			var body map[string]any
 			if err := common.Unmarshal(request.Body, &body); err != nil {
 				return nil, service.TaskErrorWrapperLocal(err, "read_request_body_failed", http.StatusBadRequest)

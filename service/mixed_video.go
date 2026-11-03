@@ -706,6 +706,10 @@ func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCan
 	meta := candidate.Binding.Plugin.Meta
 	execution.TaskPlugin = &model.TaskPluginSnapshot{Key: meta.Key, Name: meta.Name, Version: meta.Version, Author: &model.TaskPluginAuthorSnapshot{Name: meta.Author.Name, URL: meta.Author.URL}, APIVersion: meta.APIVersion, Generation: jsplugin.DefaultRegistry.Generation().Number}
 	request.Execution = execution
+	request.InlineReferenceInputs = nil
+	if meta.Key == "xai" {
+		request.InlineReferenceInputs = xaiInlineReferenceInputs(candidate.Intent["requestBody"])
+	}
 	replay := *request
 	if len(request.OriginalBody) > 0 {
 		replay.Body = request.OriginalBody

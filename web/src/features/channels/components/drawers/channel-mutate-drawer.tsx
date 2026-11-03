@@ -283,6 +283,7 @@ const SENSITIVE_FORM_FIELDS = [
   'http2_connection_shards',
   'image_max_reference_images',
   'image_reference_transport_mode',
+  'video_reference_transport_mode',
   'image_reference_timeout_retry_same_channel',
   'tianyue_media_compatibility',
   'image_resolution_model_mapping',
@@ -807,6 +808,15 @@ export function ChannelMutateDrawer({
         }
       }
       setProviderTarget(target)
+      if (
+        !(target.kind === 'builtin' && target.type === 48) &&
+        !(target.kind === 'plugin' && target.key === 'xai')
+      ) {
+        form.setValue('video_reference_transport_mode', 'passthrough', {
+          shouldDirty: true,
+          shouldValidate: true,
+        })
+      }
       setChoosingProvider(false)
     },
     [
@@ -2103,6 +2113,53 @@ export function ChannelMutateDrawer({
             </FormItem>
           )}
         />
+        {(currentType === 48 ||
+          (currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+            currentTaskPluginKey === 'xai')) && (
+          <FormField
+            control={form.control}
+            name='video_reference_transport_mode'
+            render={({ field }) => (
+              <FormItem className='sm:col-span-2'>
+                <FormLabel>{t('Video reference transport')}</FormLabel>
+                <Select
+                  disabled={sensitiveLocked}
+                  value={field.value || 'passthrough'}
+                  onValueChange={field.onChange}
+                  items={[
+                    { value: 'passthrough', label: t('Upstream URL fetch') },
+                    {
+                      value: 'inline',
+                      label: t('Server download and inline upload'),
+                    },
+                  ]}
+                >
+                  <FormControl>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent alignItemWithTrigger={false}>
+                    <SelectGroup>
+                      <SelectItem value='passthrough'>
+                        {t('Upstream URL fetch')}
+                      </SelectItem>
+                      <SelectItem value='inline'>
+                        {t('Server download and inline upload')}
+                      </SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <FormDescription>
+                  {t(
+                    'Download image and MP4 video references before every submission on this channel, including the first. Download failures follow your retry rules.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        )}
         <FormField
           control={form.control}
           name='image_reference_timeout_retry_same_channel'

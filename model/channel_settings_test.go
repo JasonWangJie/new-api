@@ -259,6 +259,42 @@ func TestUpstreamAsyncSettingsDatabaseRoundTrip(t *testing.T) {
 			assert.Equal(t, "Bearer {api_key}", fresh.Poll.Request.Headers["Authorization"])
 			assert.Equal(t, "Bearer {api_key}", fresh.Submit.Request.Headers["Authorization"])
 			assert.Equal(t, "data.output.duration", fresh.Poll.Response.ActualSecondsPath)
+			for _, mode := range []string{"inline", "passthrough", ""} {
+				loaded.Type = constant.ChannelTypeXai
+				loaded.SetSetting(dto.ChannelSettings{VideoReferenceTransportMode: mode})
+				require.NoError(t, loaded.ValidateSettings())
+				require.NoError(t, table.Save(&loaded).Error)
+				var roundTrip Channel
+				require.NoError(t, table.First(&roundTrip, loaded.Id).Error)
+				assert.Equal(t, mode, roundTrip.GetSetting().VideoReferenceTransportMode)
+			}
+		})
+	}
+}
+
+func TestVideoReferenceTransportChannelValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		kind         int
+		plugin, mode string
+		valid        bool
+	}{
+		{"legacy", constant.ChannelTypeOpenAI, "", "", true},
+		{"passthrough", constant.ChannelTypeOpenAI, "", "passthrough", true},
+		{"xai inline", constant.ChannelTypeXai, "", "inline", true},
+		{"xai plugin", constant.ChannelTypeTaskPlugin, "xai", "inline", true},
+		{"drama unsupported", constant.ChannelTypeTaskPlugin, "drama", "inline", false},
+		{"non xai", constant.ChannelTypeOpenAI, "xai", "inline", false},
+		{"invalid mode", constant.ChannelTypeXai, "", "local", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := Channel{Type: tc.kind}
+			channel.SetSetting(dto.ChannelSettings{TaskPluginKey: tc.plugin, VideoReferenceTransportMode: tc.mode})
+			if tc.valid {
+				require.NoError(t, channel.ValidateSettings())
+			} else {
+				require.ErrorContains(t, channel.ValidateSettings(), "video_reference_transport_mode")
+			}
 		})
 	}
 }

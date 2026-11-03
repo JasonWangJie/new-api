@@ -33,6 +33,8 @@ var ErrMediaInputUnavailable = errors.New("reference media is unavailable")
 
 var errMediaInputDownloadTransient = errors.New("temporary reference media download failure")
 var errMediaInputBatchLimit = errors.New("reference media batch byte limit exceeded")
+var errMediaInputTooLarge = errors.New("reference media exceeds byte limits")
+var errMediaInputInvalid = errors.New("reference media has an unsupported format")
 
 type mediaInputRetryAfterError struct {
 	status int
@@ -50,6 +52,12 @@ var mediaInputDataURIPattern = regexp.MustCompile(`^data:[^;,]+;base64,[A-Za-z0-
 // PrepareAsyncVideoLocalReferences replaces only frozen canonical reference
 // slots. Download completion order never changes media order, roles or prompts.
 func PrepareAsyncVideoLocalReferences(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest) (AsyncVideoRequest, error) {
+	// xAI transport is prepared after selecting the actual retry destination
+	// and normalizing multipart fields. The Go driver chooses signed URLs or
+	// inline bytes there; this earlier worker phase must not rewrite its input.
+	if request.Execution != nil && request.Execution.TaskPlugin != nil && request.Execution.TaskPlugin.Key == "xai" {
+		return request, nil
+	}
 	now := time.Now().Unix()
 	if (request.ReferenceRecoveryVersion != 1 && request.ReferenceRecoveryVersion != 2) || len(request.ReferenceInputs) == 0 || len(request.ReferenceInputs) > 64 || request.ReferenceRecoveryDeadline <= now || request.ReferenceURLExpiresAt <= now || request.ReferenceURLExpiresAt > job.ExpiresAt || request.ReferenceURLExpiresAt > job.CreatedAt+7*86400 {
 		return request, ErrMediaInputUnavailable
@@ -265,8 +273,11 @@ func downloadMediaInputAttempt(ctx context.Context, job model.AsyncMediaJob, inp
 	if input.Kind == "image" {
 		limit = min(limit, imageCfg.DownloadMaxBytes)
 	}
-	if response.ContentLength > limit || response.Header.Get("Content-Encoding") != "" && response.Header.Get("Content-Encoding") != "identity" {
-		return model.MediaInputObject{}, errors.New("reference media response is unavailable or exceeds limits")
+	if response.ContentLength > limit {
+		return model.MediaInputObject{}, errMediaInputTooLarge
+	}
+	if response.Header.Get("Content-Encoding") != "" && response.Header.Get("Content-Encoding") != "identity" {
+		return model.MediaInputObject{}, errMediaInputInvalid
 	}
 	rootPath, err := filepath.Abs(filepath.Join(cfg.LocalPath, "inputs"))
 	if err != nil {
@@ -297,12 +308,15 @@ func downloadMediaInputAttempt(ctx context.Context, job model.AsyncMediaJob, inp
 	if response.ContentLength > size && size <= limit {
 		return model.MediaInputObject{}, fmt.Errorf("%w: truncated response", errMediaInputDownloadTransient)
 	}
-	if size <= 0 || size > limit || response.ContentLength >= 0 && size > response.ContentLength {
+	if size > limit {
+		return model.MediaInputObject{}, errMediaInputTooLarge
+	}
+	if size <= 0 || response.ContentLength >= 0 && size > response.ContentLength {
 		return model.MediaInputObject{}, errors.New("truncated or oversized reference media")
 	}
 	contentType, extension, err := ValidateMediaInputFile(ctx, file, size, input.Kind, response.Header.Get("Content-Type"), imageCfg)
 	if err != nil {
-		return model.MediaInputObject{}, err
+		return model.MediaInputObject{}, fmt.Errorf("%w: %v", errMediaInputInvalid, err)
 	}
 	if err := file.Sync(); err != nil {
 		return model.MediaInputObject{}, err
@@ -314,7 +328,7 @@ func downloadMediaInputAttempt(ctx context.Context, job model.AsyncMediaJob, inp
 	if err := root.Rename(temporary, key); err != nil {
 		return model.MediaInputObject{}, err
 	}
-	object := model.MediaInputObject{ObjectId: objectID, TaskId: job.TaskId, Slot: strconv.Itoa(input.Index), Kind: input.Kind, SourceHash: ImageIdentityHash(input.Source), UserId: job.UserId, TokenId: job.TokenId, RootPath: rootPath, ObjectKey: key, MimeType: contentType, ByteSize: size, Checksum: hex.EncodeToString(hash.Sum(nil)), Status: "active", CreatedAt: time.Now().Unix(), ExpiresAt: expiresAt}
+	object := model.MediaInputObject{ObjectId: objectID, TaskId: job.TaskId, Slot: input.StorageSlot(), Kind: input.Kind, SourceHash: ImageIdentityHash(input.Source), UserId: job.UserId, TokenId: job.TokenId, RootPath: rootPath, ObjectKey: key, MimeType: contentType, ByteSize: size, Checksum: hex.EncodeToString(hash.Sum(nil)), Status: "active", CreatedAt: time.Now().Unix(), ExpiresAt: expiresAt}
 	saved, err := model.SaveMediaInputObject(ctx, object)
 	if err != nil || saved.ObjectId != objectID {
 		_ = root.Remove(key)
@@ -325,6 +339,9 @@ func downloadMediaInputAttempt(ctx context.Context, job model.AsyncMediaJob, inp
 // Classify without retaining URL-bearing transport errors or source response
 // bodies. Policy, validation and filesystem failures must not authorize retries.
 func mediaInputDownloadFailure(ctx context.Context, err error) error {
+	if errors.Is(err, ErrMediaInputUnavailable) || IsImageValidationError(err) {
+		return ErrMediaInputUnavailable
+	}
 	if errors.Is(err, errMediaInputBatchLimit) {
 		return errMediaInputBatchLimit
 	}
