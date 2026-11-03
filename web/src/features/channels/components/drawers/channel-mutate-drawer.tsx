@@ -215,6 +215,7 @@ import { UpstreamAsyncEditorDialog } from '../dialogs/upstream-async-editor-dial
 import { ImageResolutionModelMapping } from '../image-resolution-model-mapping'
 import { ModelMappingEditor } from '../model-mapping-editor'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
+import { TaskVideoModelEditor } from '../task-video-model-editor'
 import { UpstreamModelSelection } from '../upstream-model-selection'
 import {
   ChannelConfiguration,
@@ -548,6 +549,11 @@ export function ChannelMutateDrawer({
   const currentStatus = formValues.status
   const currentBaseUrl = formValues.base_url
   const currentTaskPluginKey = formValues.task_plugin_key
+  const isSudashui =
+    currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+    currentTaskPluginKey === 'sudashui'
+  const canFetchModels = MODEL_FETCHABLE_TYPES.has(currentType) || isSudashui
+  const currentModelSourceURL = formValues.task_plugin_model_source_url
   const currentKey = formValues.key
   const currentModels = formValues.models
   const currentModelMapping = formValues.model_mapping
@@ -775,7 +781,7 @@ export function ChannelMutateDrawer({
         if (!isEditing && !providerTarget && !form.getValues('name').trim()) {
           form.setValue('name', plugin.name)
         }
-        if (plugin.models.length) {
+        if (plugin.models.length && plugin.key !== 'sudashui') {
           form.setValue('models', formatModelsArray(plugin.models), {
             shouldDirty: true,
           })
@@ -1137,6 +1143,7 @@ export function ChannelMutateDrawer({
   // preview path, which reuses the saved credential on the server.
   const previewModels =
     !isEditing ||
+    (isSudashui && canEditSensitive) ||
     (currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && canEditSensitive)
   const canDiscoverModels = previewModels ? canEditSensitive : canOperateChannel
   const previewKey = isEditing ? undefined : currentKey
@@ -1151,6 +1158,8 @@ export function ChannelMutateDrawer({
         advanced_custom: currentAdvancedCustom,
         header_override: currentHeaderOverride,
         proxy: currentProxy,
+        task_plugin_key: currentTaskPluginKey,
+        task_plugin_model_source_url: currentModelSourceURL,
       },
     }),
     [
@@ -1162,6 +1171,8 @@ export function ChannelMutateDrawer({
       currentAdvancedCustom,
       currentHeaderOverride,
       currentProxy,
+      currentTaskPluginKey,
+      currentModelSourceURL,
     ]
   )
   const savedRequest = useMemo<ChannelModelDiscoveryRequest>(
@@ -1172,14 +1183,20 @@ export function ChannelMutateDrawer({
     enabled:
       open &&
       canDiscoverModels &&
-      MODEL_FETCHABLE_TYPES.has(currentType) &&
+      canFetchModels &&
       (!isEditing || Boolean(channelData?.data)),
     request: previewModels ? previewRequest : savedRequest,
   })
   const fetchDiscoveredModels = discovery.fetch
   const handleFetchModels = useCallback(async () => {
     const type = form.getValues('type')
-    if (!MODEL_FETCHABLE_TYPES.has(type)) {
+    if (
+      !MODEL_FETCHABLE_TYPES.has(type) &&
+      !(
+        type === CHANNEL_TYPE_TASK_PLUGIN &&
+        form.getValues('task_plugin_key') === 'sudashui'
+      )
+    ) {
       toast.error(t('This channel type does not support fetching models'))
       return
     }
@@ -3169,7 +3186,7 @@ export function ChannelMutateDrawer({
               )}
             />
 
-            {MODEL_FETCHABLE_TYPES.has(currentType) && (
+            {canFetchModels && (
               <div aria-live='polite' className='mt-4 space-y-3'>
                 {discovery.status === 'loading' && (
                   <LoadingState
@@ -3260,6 +3277,29 @@ export function ChannelMutateDrawer({
               </div>
             )}
 
+            {isSudashui && (
+              <TaskVideoModelEditor
+                sourceURL={currentModelSourceURL || ''}
+                onSourceURLChange={(value) =>
+                  form.setValue('task_plugin_model_source_url', value, {
+                    shouldDirty: true,
+                  })
+                }
+                value={formValues.task_plugin_model_configs || '{}'}
+                onChange={(value) =>
+                  form.setValue('task_plugin_model_configs', value, {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  })
+                }
+                models={currentModelsArray}
+                modelMapping={currentModelMapping}
+                details={discovery.modelDetails}
+                previewReady={discovery.status === 'success'}
+                disabled={!canEditSensitive}
+              />
+            )}
+
             <Separator className='my-4' />
 
             <div className='space-y-3'>
@@ -3282,7 +3322,7 @@ export function ChannelMutateDrawer({
                   <FileText className='mr-2 h-4 w-4' aria-hidden='true' />
                   {t('Fill Related Models')}
                 </Button>
-                {MODEL_FETCHABLE_TYPES.has(currentType) && (
+                {canFetchModels && (
                   <>
                     <Button
                       type='button'

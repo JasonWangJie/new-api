@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -130,8 +131,9 @@ func ListActiveTaskPlugins() ([]TaskPlugin, error) {
 }
 
 type TaskPluginSyncSnapshot struct {
-	Plugins  []TaskPlugin
-	Revision string
+	VideoModels map[string]dto.TaskVideoModelConfig
+	Plugins     []TaskPlugin
+	Revision    string
 }
 
 // GetTaskPluginSyncSnapshot returns the enabled override set together with a
@@ -174,14 +176,40 @@ func GetTaskPluginSyncSnapshot() (TaskPluginSyncSnapshot, error) {
 		}
 		return entries[i].Version < entries[j].Version
 	})
-	payload, err := common.Marshal(entries)
+	var channels []Channel
+	if err := DB.Where("type = ?", constant.ChannelTypeTaskPlugin).Select("id", "status", "setting", "models", "model_mapping").Order("id").Find(&channels).Error; err != nil {
+		return TaskPluginSyncSnapshot{}, err
+	}
+	videoModels, err := taskVideoModelCatalog(channels)
+	if err != nil {
+		return TaskPluginSyncSnapshot{}, err
+	}
+	type videoBinding struct {
+		ID      int
+		Status  int
+		Models  string
+		Mapping string
+		Configs map[string]dto.TaskVideoModelConfig
+	}
+	bindings := []videoBinding{}
+	for _, channel := range channels {
+		if settings := channel.GetSetting(); settings.TaskPluginKey == "sudashui" {
+			bindings = append(bindings, videoBinding{channel.Id, channel.Status, channel.Models, channel.GetModelMapping(), settings.TaskPluginModelConfigs})
+		}
+	}
+	payload, err := common.Marshal(struct {
+		Plugins       []revisionEntry
+		VideoModels   map[string]dto.TaskVideoModelConfig
+		VideoBindings []videoBinding
+	}{entries, videoModels, bindings})
 	if err != nil {
 		return TaskPluginSyncSnapshot{}, err
 	}
 	digest := sha256.Sum256(payload)
 	return TaskPluginSyncSnapshot{
-		Plugins:  enabledPlugins,
-		Revision: hex.EncodeToString(digest[:]),
+		VideoModels: videoModels,
+		Plugins:     enabledPlugins,
+		Revision:    hex.EncodeToString(digest[:]),
 	}, nil
 }
 

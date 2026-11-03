@@ -81,6 +81,8 @@ export type Channel = z.infer<typeof channelSchema>
 
 export interface ChannelSettings {
   task_plugin_key?: string
+  task_plugin_model_source_url?: string
+  task_plugin_model_configs?: Record<string, TaskVideoModelConfig>
   force_format?: boolean
   thinking_to_content?: boolean
   image_max_reference_images?: number
@@ -274,6 +276,33 @@ export interface FetchModelsResponse {
   success: boolean
   message?: string
   data?: string[]
+  model_details?: Record<string, TaskVideoModelDetail> | null
+}
+
+export interface TaskVideoModelConfig {
+  duration: {
+    min?: number
+    max?: number
+    step?: number
+    values?: number[]
+    default?: number
+  }
+  resolutions: string[]
+  aspect_ratios: string[]
+  modes: string[]
+  references: {
+    images: number | null
+    videos: number | null
+    audios: number | null
+  }
+  billing_mode: string
+}
+
+export interface TaskVideoModelDetail extends TaskVideoModelConfig {
+  display_name?: string
+  price?: number
+  final_price?: number
+  currency?: string
 }
 
 export interface CopyChannelResponse {

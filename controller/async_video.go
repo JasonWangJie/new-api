@@ -321,6 +321,7 @@ func RouteAsyncVideo(c *gin.Context) {
 	}
 	resolution := service.VideoPoolResolution(videoResolution)
 	constraints := service.GetChannelConstraints(c)
+	constraints.AddFilter(service.ConfiguredTaskVideoFilter(c))
 	forced, hasForced, _ := constraints.ResolvedPin()
 	var capabilityErr error
 	for _, binding := range pinned.Candidates {
@@ -396,7 +397,14 @@ func RouteAsyncVideo(c *gin.Context) {
 					service.ApplyMediaChannelPoolWeight(&channel, pools[index].Priority)
 					weight = channel.GetWeight()
 				}
-				choices = append(choices, choice{channel: channel, group: group, binding: binding, weight: weight})
+				selectedBinding := binding
+				selectedPlugin, err := service.ChannelTaskVideoPlugin(binding.Plugin, &channel, pinned.Model)
+				if err != nil {
+					capabilityErr = err
+					continue
+				}
+				selectedBinding.Plugin = selectedPlugin
+				choices = append(choices, choice{channel: channel, group: group, binding: selectedBinding, weight: weight})
 			}
 		}
 	}
@@ -475,12 +483,22 @@ func AcceptAsyncVideo(c *gin.Context) {
 			return
 		}
 	}
-	selected, err := model.CacheGetChannel(job.ChannelId)
-	if err != nil {
-		AsyncImagePublicError(c, 503, "channel_unavailable", "Video channel is unavailable")
-		return
+	var channel model.Channel
+	if c.GetString("task_plugin_key") == "sudashui" {
+		value, _ := c.Get("task_video_channel_snapshot")
+		data, _ := value.([]byte)
+		if common.Unmarshal(data, &channel) != nil || channel.Id != job.ChannelId {
+			AsyncImagePublicError(c, 503, "channel_unavailable", "Selected video channel snapshot is unavailable")
+			return
+		}
+	} else {
+		selected, err := model.CacheGetChannel(job.ChannelId)
+		if err != nil {
+			AsyncImagePublicError(c, 503, "channel_unavailable", "Video channel is unavailable")
+			return
+		}
+		channel = *selected
 	}
-	channel := *selected
 	channel.Key, channel.Keys, channel.ChannelInfo = common.GetContextKeyString(c, constant.ContextKeyChannelKey), nil, model.ChannelInfo{}
 	channelData, err := common.Marshal(channel)
 	if err == nil {
@@ -667,10 +685,19 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				return
 			}
 		}
-		var ability model.Ability
-		if err := model.DB.WithContext(ctx).Where(map[string]any{"channel_id": job.ChannelId, "group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Take(&ability).Error; err != nil {
-			executionErr = errors.New("selected video model is unavailable")
-			return
+		if job.Provider == "sudashui" {
+			// Model selection and capabilities were frozen at admission. Keep
+			// checking live group access without consulting the edited model list.
+			if !slices.Contains(strings.Split(liveChannel.Group, ","), job.Group) {
+				executionErr = errors.New("selected video channel group is unavailable")
+				return
+			}
+		} else {
+			var ability model.Ability
+			if err := model.DB.WithContext(ctx).Where(map[string]any{"channel_id": job.ChannelId, "group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Take(&ability).Error; err != nil {
+				executionErr = errors.New("selected video model is unavailable")
+				return
+			}
 		}
 		if setupErr := middleware.SetupContextForSelectedChannel(c, &request.Channel, job.Model); setupErr != nil {
 			executionErr = setupErr

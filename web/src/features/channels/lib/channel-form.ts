@@ -295,6 +295,21 @@ export const channelFormSchema = z
     type: z.number().min(0, ERROR_MESSAGES.REQUIRED_TYPE),
     base_url: z.string().optional(),
     task_plugin_key: z.string().optional(),
+    task_plugin_model_source_url: z.string().optional(),
+    task_plugin_model_configs: z
+      .string()
+      .optional()
+      .refine((value) => {
+        if (!value?.trim()) return true
+        try {
+          const parsed: unknown = JSON.parse(value)
+          return (
+            !!parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          )
+        } catch {
+          return false
+        }
+      }, 'Invalid JSON format'),
     key: z.string(),
     openai_organization: z.string().optional(),
     models: z.string().min(1, ERROR_MESSAGES.REQUIRED_MODELS),
@@ -554,6 +569,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   type: 1,
   base_url: '',
   task_plugin_key: '',
+  task_plugin_model_source_url: '',
+  task_plugin_model_configs: '{}',
   key: '',
   openai_organization: '',
   models: '',
@@ -629,6 +646,8 @@ export function transformChannelToFormDefaults(
   // Parse channel extra settings from setting field
   let extraSettings = {
     task_plugin_key: '',
+    task_plugin_model_source_url: '',
+    task_plugin_model_configs: '{}',
     force_format: false,
     thinking_to_content: false,
     proxy: '',
@@ -667,6 +686,12 @@ export function transformChannelToFormDefaults(
       )
       extraSettings = {
         task_plugin_key: parsed.task_plugin_key || '',
+        task_plugin_model_source_url: parsed.task_plugin_model_source_url || '',
+        task_plugin_model_configs: JSON.stringify(
+          parsed.task_plugin_model_configs || {},
+          null,
+          2
+        ),
         video_reference_transport_mode:
           parsed.video_reference_transport_mode === 'inline'
             ? 'inline'
@@ -833,6 +858,16 @@ export function transformChannelToFormDefaults(
  */
 export function buildSettingJSON(formData: ChannelFormValues): string {
   const settingObj: Record<string, unknown> = {
+    task_plugin_model_source_url:
+      formData.type === CHANNEL_TYPE_TASK_PLUGIN &&
+      formData.task_plugin_key === 'sudashui'
+        ? formData.task_plugin_model_source_url?.trim() || undefined
+        : undefined,
+    task_plugin_model_configs:
+      formData.type === CHANNEL_TYPE_TASK_PLUGIN &&
+      formData.task_plugin_key === 'sudashui'
+        ? JSON.parse(formData.task_plugin_model_configs || '{}')
+        : undefined,
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
         ? formData.task_plugin_key?.trim() || ''

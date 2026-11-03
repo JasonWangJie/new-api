@@ -5,6 +5,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
@@ -186,6 +187,24 @@ func pinMixedVideoCandidate(c *gin.Context, candidate service.MixedVideoCandidat
 // random picker or lets a newly configured pool take over an old task.
 func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest) {
 	if request.MixedRouting == nil {
+		if job.Provider == "sudashui" {
+			binding, err := service.FrozenTaskVideoBinding(&request.Channel, job.Model)
+			if err != nil {
+				AsyncImagePublicError(c, 400, "provider_unavailable", err.Error())
+				c.Abort()
+				return
+			}
+			upstream, _, err := request.Channel.TaskVideoModelConfig(job.Model)
+			if err != nil {
+				c.AbortWithStatus(400)
+				return
+			}
+			generation := jsplugin.DefaultRegistry.Generation()
+			c.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: job.Model, MappedModel: upstream, Candidates: []jsplugin.ProtocolBinding{binding}})
+			c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: generation, Plugin: binding.Plugin})
+			c.Next()
+			return
+		}
 		middleware.PinTaskPluginEndpoint()(c)
 		return
 	}
@@ -201,16 +220,28 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 		return
 	}
 	capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)
-	channels, err := service.MixedVideoPoolChannels(c.Request.Context(), policy, job.Model, request.MixedRouting.Resolution)
-	if err != nil {
-		c.AbortWithStatus(503)
-		return
-	}
 	var selected *model.Channel
-	for index := range channels {
-		if channels[index].Id == job.ChannelId {
-			selected = &channels[index]
-			break
+	if job.Provider == "sudashui" {
+		// The live model list may have changed after acceptance. Pool membership,
+		// channel status, group access and account access remain live controls.
+		var pool model.ImageChannelPool
+		var channel model.Channel
+		if model.DB.WithContext(c.Request.Context()).Where("binding_key = ? AND channel_id = ?", request.MixedRouting.BindingKey, job.ChannelId).Take(&pool).Error == nil &&
+			model.DB.WithContext(c.Request.Context()).Where("id = ? AND status = ?", job.ChannelId, common.ChannelStatusEnabled).Take(&channel).Error == nil &&
+			slices.Contains(strings.Split(channel.Group, ","), job.Group) && channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == job.Provider {
+			selected = &channel
+		}
+	} else {
+		channels, err := service.MixedVideoPoolChannels(c.Request.Context(), policy, job.Model, request.MixedRouting.Resolution)
+		if err != nil {
+			c.AbortWithStatus(503)
+			return
+		}
+		for index := range channels {
+			if channels[index].Id == job.ChannelId {
+				selected = &channels[index]
+				break
+			}
 		}
 	}
 	if selected == nil {
@@ -224,7 +255,11 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 		c.Abort()
 		return
 	}
-	candidate, err := service.DecodeMixedVideoCandidate(c.Request.Context(), *selected, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+	decodeChannel := *selected
+	if job.Provider == "sudashui" {
+		decodeChannel = request.Channel
+	}
+	candidate, err := service.DecodeMixedVideoCandidate(c.Request.Context(), decodeChannel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
 	if err == nil {
 		frozenModel, mappingErr := service.ResolveImageChannelUpstreamModel(request.Channel, job.Model)
 		if mappingErr != nil || candidate.UpstreamModel != frozenModel {

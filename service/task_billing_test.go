@@ -2589,6 +2589,7 @@ func TestMixedVideoReferenceInputPricing(t *testing.T) {
 	const expression = `(u("resolution") == "1080p" ? tier("1080p", u("seconds") * 1.1) : tier("720p", u("seconds") * 0.6)) * (u("video_input") == "video" ? 1.45 : 1)`
 	t.Run("provider specific video input cannot bypass public billing", func(t *testing.T) {
 		binding := jsplugin.ProtocolBinding{Model: "public-video", Plugin: &jsplugin.LoadedPlugin{Meta: jsplugin.Meta{
+			Models: []string{"public-video"},
 			VideoProfiles: []jsplugin.VideoProfile{{Models: []string{"public-video"}, Modes: []jsplugin.VideoModeProfile{{
 				Name: "reference_to_video", Inputs: []jsplugin.VideoInputProfile{{Name: "clip", Kind: "video", Sources: []string{"url"}, MaxItems: 1}},
 			}}}},

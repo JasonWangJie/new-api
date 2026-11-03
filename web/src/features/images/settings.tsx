@@ -451,7 +451,7 @@ export function ImageSettings() {
       </p>
     )
   }
-  if (configuration.isError) {
+  if (configuration.isError && !configuration.data) {
     return <p role='alert'>{configuration.error.message}</p>
   }
   if (!configuration.data) return <p role='status'>{t('Loading...')}</p>
@@ -499,7 +499,7 @@ export function ImageSettings() {
       {tab === 'video' && (
         <VideoConfiguration
           config={config}
-          onSuccess={() => configuration.refetch()}
+          onSuccess={() => configuration.refetch({ throwOnError: true })}
         />
       )}{' '}
       {tab === 'pool' && (

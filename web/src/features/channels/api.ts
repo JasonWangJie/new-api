@@ -574,6 +574,8 @@ export async function getTagModels(
  * Fetch models from the current unsaved channel form configuration.
  */
 export async function fetchModels(data: {
+  task_plugin_key?: string
+  task_plugin_model_source_url?: string
   base_url: string
   type: number
   key?: string

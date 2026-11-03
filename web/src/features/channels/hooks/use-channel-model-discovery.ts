@@ -21,10 +21,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createServerError } from '@/lib/server-error-message'
 
 import { fetchModels, fetchUpstreamModels } from '../api'
+import type { TaskVideoModelDetail } from '../types'
 
 type DiscoveryState = {
   status: 'idle' | 'loading' | 'success' | 'error' | 'stale'
   models: string[]
+  modelDetails?: Record<string, TaskVideoModelDetail>
   error?: unknown
 }
 
@@ -49,7 +51,7 @@ export function useChannelModelDiscovery(props: ChannelModelDiscoveryProps) {
     setState((previous) => {
       if (previous.status === 'idle') return previous
       if (!props.enabled) return { status: 'idle', models: [] }
-      return { status: 'stale', models: previous.models }
+      return { ...previous, status: 'stale' }
     })
     return () => {
       sequence.current += 1
@@ -59,7 +61,7 @@ export function useChannelModelDiscovery(props: ChannelModelDiscoveryProps) {
   const fetch = useCallback(async () => {
     if (!props.enabled) return
     const requestSequence = ++sequence.current
-    setState((previous) => ({ status: 'loading', models: previous.models }))
+    setState((previous) => ({ ...previous, status: 'loading' }))
     try {
       const response =
         props.request.kind === 'saved'
@@ -69,12 +71,17 @@ export function useChannelModelDiscovery(props: ChannelModelDiscoveryProps) {
       if (!response.success) {
         throw createServerError(response, 'Failed to fetch models')
       }
-      setState({ status: 'success', models: response.data ?? [] })
+      setState({
+        status: 'success',
+        models: response.data ?? [],
+        modelDetails: response.model_details ?? undefined,
+      })
     } catch (error) {
       if (requestSequence !== sequence.current) return
       setState((previous) => ({
         status: 'error',
         models: previous.models,
+        modelDetails: previous.modelDetails,
         error,
       }))
     }

@@ -641,17 +641,19 @@ func videoInputValues(name string, body, metadata map[string]any) []any {
 	case "image":
 		if body["image"] != nil {
 			appendValues(body["image"])
-		} else {
+		} else if body["input_reference"] != nil {
 			appendValues(body["input_reference"])
+		} else {
+			appendValues(body["first_frame"])
 		}
-		if images, ok := body["images"].([]any); ok && len(images) > 0 && body["image"] == nil && body["input_reference"] == nil {
+		if images, ok := body["images"].([]any); ok && len(images) > 0 && body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil {
 			appendValues(images[0])
 		}
 	case "reference_images":
 		appendValues(body[name])
 		if images, ok := body["images"].([]any); ok {
 			start := 0
-			if body["image"] == nil && body["input_reference"] == nil && len(images) > 0 {
+			if body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil && len(images) > 0 {
 				start = 1
 			}
 			for _, image := range images[start:] {
@@ -661,7 +663,7 @@ func videoInputValues(name string, body, metadata map[string]any) []any {
 	default:
 		appendValues(body[name])
 	}
-	firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["images"]) > 0
+	firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["first_frame"]) > 0 || videoValueCount(body["images"]) > 0
 	for _, source := range []map[string]any{body, metadata} {
 		content, _ := source["content"].([]any)
 		for _, raw := range content {
@@ -841,7 +843,7 @@ func videoInputCounts(body, metadata map[string]any, files []map[string]any) map
 		"reference_audios": videoValueCount(body["reference_audios"]),
 		"last_frame":       videoValueCount(body["last_frame"]),
 	}
-	counts["image"] = max(videoValueCount(body["image"]), videoValueCount(body["input_reference"]))
+	counts["image"] = max(videoValueCount(body["image"]), videoValueCount(body["input_reference"]), videoValueCount(body["first_frame"]))
 	if images := videoValueCount(body["images"]); images > 0 {
 		if counts["image"] == 0 {
 			counts["image"] = 1

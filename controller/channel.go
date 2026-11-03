@@ -302,6 +302,7 @@ func applyFetchModelsHeaderOverrides(channel *model.Channel, key string, headers
 }
 
 func FetchUpstreamModels(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		common.ApiError(c, err)
@@ -314,7 +315,7 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	ids, err := fetchChannelUpstreamModelIDs(channel)
+	ids, details, err := fetchChannelModelPreview(c.Request.Context(), channel)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -323,11 +324,15 @@ func FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	result := gin.H{
 		"success": true,
 		"message": "",
 		"data":    ids,
-	})
+	}
+	if details != nil {
+		result["model_details"] = details
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 func FixChannelsAbilities(c *gin.Context) {
@@ -531,6 +536,9 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 		return fmt.Errorf("渠道额外设置[channel setting] 格式错误：%s", err.Error())
 	}
 	if channel.Type == constant.ChannelTypeTaskPlugin {
+		if err := channel.ValidateTaskVideoModelBindings(); err != nil {
+			return err
+		}
 		pluginKey := strings.TrimSpace(channel.GetSetting().TaskPluginKey)
 		if pluginKey == "" {
 			return fmt.Errorf("task plugin key is required")
@@ -792,6 +800,7 @@ func AddChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	refreshTaskVideoRouting()
 	createAudit := map[string]any{
 		"name":  addChannelRequest.Channel.Name,
 		"type":  addChannelRequest.Channel.Type,
@@ -826,6 +835,7 @@ func DeleteChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	if channelLookupFailed {
 		service.ResetProxyClientCache()
 	} else {
@@ -857,6 +867,7 @@ func DeleteDisabledChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	if rows > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -906,6 +917,7 @@ func DisableTagChannels(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	recordManageAudit(c, "channel.tag_disable", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -933,6 +945,7 @@ func EnableTagChannels(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	recordManageAudit(c, "channel.tag_enable", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -993,6 +1006,7 @@ func EditTagChannels(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	recordManageAudit(c, "channel.tag_edit", map[string]any{
 		"tag": channelTag.Tag,
 	})
@@ -1024,6 +1038,7 @@ func DeleteChannelBatch(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	if deletedCount > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -1085,16 +1100,6 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	baseURLFromPluginDefault := channel.Type == constant.ChannelTypeTaskPlugin &&
-		(channel.BaseURL == nil || strings.TrimSpace(*channel.BaseURL) == "")
-	// 使用统一的校验函数
-	if err := validateChannel(&channel.Channel, false); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
 	// Preserve existing ChannelInfo to ensure multi-key channels keep correct state even if the client does not send ChannelInfo in the request.
 	originChannel, err := model.GetChannelById(channel.Id, true)
 	if err != nil {
@@ -1105,6 +1110,38 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	originProxy := originChannel.GetSetting().Proxy
+	validation := channel.Channel
+	if originChannel.Type == constant.ChannelTypeTaskPlugin && (channel.Type == 0 || channel.Type == constant.ChannelTypeTaskPlugin) {
+		// Match GORM struct Updates: zero strings and nil pointers retain the
+		// persisted value. Validate the resulting binding, not the partial body.
+		validation.Type = originChannel.Type
+		if validation.Setting == nil {
+			validation.Setting = originChannel.Setting
+		}
+		if validation.Models == "" {
+			validation.Models = originChannel.Models
+		}
+		if validation.ModelMapping == nil {
+			validation.ModelMapping = originChannel.ModelMapping
+		}
+		if validation.BaseURL == nil {
+			validation.BaseURL = originChannel.BaseURL
+		}
+		if channel.Type == 0 && validation.GetSetting().TaskPluginKey != "sudashui" {
+			// Preserve legacy partial updates for other plugins, including edits
+			// while their runtime is unavailable.
+			validation.Type = 0
+		}
+	}
+	baseURLFromPluginDefault := validation.Type == constant.ChannelTypeTaskPlugin &&
+		(validation.BaseURL == nil || strings.TrimSpace(*validation.BaseURL) == "")
+	if err := validateChannel(&validation, false); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if baseURLFromPluginDefault {
+		channel.BaseURL = validation.BaseURL
+	}
 	proxyChanged := false
 	if _, settingProvided := requestData["setting"]; settingProvided {
 		newProxy, _ := service.NormalizeProxyURL(channel.GetSetting().Proxy)
@@ -1212,6 +1249,7 @@ func UpdateChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	if proxyChanged {
 		service.InvalidateProxyClient(originProxy)
 	}
@@ -1265,6 +1303,7 @@ func UpdateChannelStatus(c *gin.Context) {
 	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
 	if changed {
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		if req.Status != common.ChannelStatusEnabled {
 			closeActiveChannelWebSockets([]int{id})
 		}
@@ -1299,6 +1338,7 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	}
 	if changedCount > 0 {
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 	}
 	if len(disabledIDs) > 0 {
 		closeActiveChannelWebSockets(disabledIDs)
@@ -1331,13 +1371,15 @@ func equalStringPtr(a, b *string) bool {
 }
 
 type fetchModelsRequest struct {
-	ChannelID      int     `json:"channel_id"`
-	BaseURL        *string `json:"base_url"`
-	Type           int     `json:"type"`
-	Key            string  `json:"key"`
-	AdvancedCustom *string `json:"advanced_custom"`
-	HeaderOverride *string `json:"header_override"`
-	Proxy          *string `json:"proxy"`
+	TaskPluginKey            string  `json:"task_plugin_key"`
+	TaskPluginModelSourceURL *string `json:"task_plugin_model_source_url"`
+	ChannelID                int     `json:"channel_id"`
+	BaseURL                  *string `json:"base_url"`
+	Type                     int     `json:"type"`
+	Key                      string  `json:"key"`
+	AdvancedCustom           *string `json:"advanced_custom"`
+	HeaderOverride           *string `json:"header_override"`
+	Proxy                    *string `json:"proxy"`
 }
 
 func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Channel, error) {
@@ -1409,6 +1451,7 @@ func buildAdvancedCustomModelPreviewChannel(req fetchModelsRequest) (*model.Chan
 }
 
 func FetchModels(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var req fetchModelsRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1420,7 +1463,14 @@ func FetchModels(c *gin.Context) {
 	}
 
 	var channel *model.Channel
-	if req.Type == constant.ChannelTypeAdvancedCustom || req.ChannelID > 0 {
+	if req.Type == constant.ChannelTypeTaskPlugin && req.TaskPluginKey == "sudashui" {
+		var err error
+		channel, err = buildSudashuiModelPreviewChannel(req)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	} else if req.Type == constant.ChannelTypeAdvancedCustom || req.ChannelID > 0 {
 		var err error
 		channel, err = buildAdvancedCustomModelPreviewChannel(req)
 		if err != nil {
@@ -1448,9 +1498,14 @@ func FetchModels(c *gin.Context) {
 			Key:     key,
 			BaseURL: &baseURL,
 		}
+		if req.Type == constant.ChannelTypeTaskPlugin {
+			settings := channel.GetSetting()
+			settings.TaskPluginKey = req.TaskPluginKey
+			channel.SetSetting(settings)
+		}
 	}
 
-	models, err := fetchChannelUpstreamModelIDs(channel)
+	models, details, err := fetchChannelModelPreview(c.Request.Context(), channel)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -1458,11 +1513,15 @@ func FetchModels(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	result := gin.H{
 		"success": true,
 		"message": "",
 		"data":    models,
-	})
+	}
+	if details != nil {
+		result["model_details"] = details
+	}
+	c.JSON(http.StatusOK, result)
 }
 
 func BatchSetChannelTag(c *gin.Context) {
@@ -1481,6 +1540,7 @@ func BatchSetChannelTag(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	recordManageAudit(c, "channel.tag_batch_set", map[string]any{
 		"count": len(channelBatch.Ids),
 	})
@@ -1592,6 +1652,7 @@ func CopyChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	refreshTaskVideoRouting()
 	recordManageAudit(c, "channel.copy", map[string]any{
 		"sourceId": id,
 		"id":       clone.Id,
@@ -1826,6 +1887,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -1872,6 +1934,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": "密钥已启用",
@@ -1897,6 +1960,7 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": fmt.Sprintf("已启用 %d 个密钥", enabledCount),
@@ -1944,6 +2008,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -2027,6 +2092,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}
@@ -2098,6 +2164,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 		model.InitChannelCache()
+		refreshTaskVideoRouting()
 		if shouldCloseWebSocket {
 			closeActiveChannelWebSockets([]int{channel.Id})
 		}

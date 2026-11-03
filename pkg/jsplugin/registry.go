@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -157,15 +158,36 @@ type VideoOptionsProfile struct {
 // must be resolved by the host before lookup. Older plugins return false and
 // continue to use the host's generic video form.
 func (m Meta) VideoProfileForModel(model string) (VideoProfile, bool) {
-	folded := asciiFold(model)
+	declaredModel, found := m.declaredModel(model)
+	if !found {
+		return VideoProfile{}, false
+	}
 	for _, profile := range m.VideoProfiles {
-		for _, declared := range profile.Models {
-			if asciiFold(declared) == folded {
-				return CloneVideoProfile(profile), true
-			}
+		if slices.Contains(profile.Models, declaredModel) {
+			return CloneVideoProfile(profile), true
 		}
 	}
 	return VideoProfile{}, false
+}
+
+// declaredModel follows routing's exact-name precedence. Case folding is safe
+// only when it identifies one spelling, including models with default profiles.
+func (m Meta) declaredModel(model string) (string, bool) {
+	if slices.Contains(m.Models, model) {
+		return model, true
+	}
+	folded := asciiFold(model)
+	canonical := ""
+	for _, declared := range m.Models {
+		if asciiFold(declared) != folded {
+			continue
+		}
+		if canonical != "" && canonical != declared {
+			return "", false
+		}
+		canonical = declared
+	}
+	return canonical, canonical != ""
 }
 
 // CloneVideoProfile returns an independent capability profile for policy and
@@ -202,12 +224,13 @@ type UsageProfile struct {
 // must be resolved by the host first; an unknown or ambiguous model uses the
 // plugin defaults. Profile examples never inherit the default examples.
 func (m Meta) UsageForModel(model string) (map[string]UsageFieldSchema, []UsageExample) {
-	folded := asciiFold(model)
+	declaredModel, found := m.declaredModel(model)
+	if !found {
+		return m.UsageSchema, m.UsageExamples
+	}
 	for _, profile := range m.UsageProfiles {
-		for _, declared := range profile.Models {
-			if asciiFold(declared) == folded {
-				return profile.Schema, profile.Examples
-			}
+		if slices.Contains(profile.Models, declaredModel) {
+			return profile.Schema, profile.Examples
 		}
 	}
 	return m.UsageSchema, m.UsageExamples
@@ -285,6 +308,8 @@ type RoutingStatus struct {
 type RoutingGenerationPreparer func(candidate, current *RoutingGeneration) (PreparedRoutingGeneration, error)
 
 type Registry struct {
+	videoModels     map[string]dto.TaskVideoModelConfig
+	videoRevision   string
 	mu              sync.RWMutex
 	factory         map[string]*LoadedPlugin
 	override        map[string]*LoadedPlugin
@@ -655,6 +680,18 @@ func (r *Registry) Unregister(key string) error {
 
 // ReplaceOverrides atomically publishes a complete override layer.
 func (r *Registry) ReplaceOverrides(plugins []*LoadedPlugin) error {
+	return r.replaceOverrides(plugins, nil, false, "")
+}
+
+func (r *Registry) ReplaceOverridesWithVideoModels(plugins []*LoadedPlugin, configs map[string]dto.TaskVideoModelConfig, revisions ...string) error {
+	revision := ""
+	if len(revisions) > 0 {
+		revision = revisions[0]
+	}
+	return r.replaceOverrides(plugins, configs, true, revision)
+}
+
+func (r *Registry) replaceOverrides(plugins []*LoadedPlugin, configs map[string]dto.TaskVideoModelConfig, replaceModels bool, revision string) error {
 	overridePlugins := make(map[string]*LoadedPlugin, len(plugins))
 	for _, plugin := range plugins {
 		if plugin == nil {
@@ -668,12 +705,21 @@ func (r *Registry) ReplaceOverrides(plugins []*LoadedPlugin) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if samePluginMap(r.override, overridePlugins) {
+	modelsChanged := replaceModels && (!reflect.DeepEqual(r.videoModels, configs) || r.videoRevision != revision)
+	if samePluginMap(r.override, overridePlugins) && !modelsChanged {
 		return nil
+	}
+	previousModels := r.videoModels
+	previousRevision := r.videoRevision
+	if replaceModels {
+		r.videoModels = configs
+		r.videoRevision = revision
 	}
 	retainCurrent := pluginMapKeys(overridePlugins)
 	generation, routingErrors, err := r.prepareGeneration(filterDisabledFactory(r.factory, r.disabledFactory), overridePlugins, true, retainCurrent)
 	if err != nil {
+		r.videoModels = previousModels
+		r.videoRevision = previousRevision
 		r.recordRebuildFailure(err)
 		return err
 	}
@@ -752,6 +798,8 @@ func (r *Registry) prepareGeneration(
 	tolerateConflicts bool,
 	retainCurrent map[string]struct{},
 ) (*RoutingGeneration, map[string]string, error) {
+	factory = configuredVideoPlugins(factory, r.videoModels)
+	override = configuredVideoPlugins(override, r.videoModels)
 	if !r.masterEnabled.Load() {
 		factory = map[string]*LoadedPlugin{}
 		override = map[string]*LoadedPlugin{}
@@ -1040,7 +1088,7 @@ func (r *Registry) resolveActiveOverrides(
 		if !hasOverride {
 			continue
 		}
-		if plugin == desired || plugin == r.activeOverride[plugin.Meta.Key] {
+		if plugin == desired || plugin == r.activeOverride[plugin.Meta.Key] || plugin.Meta.Key == "sudashui" && plugin.Engine == desired.Engine {
 			active[plugin.Meta.Key] = plugin
 		}
 	}

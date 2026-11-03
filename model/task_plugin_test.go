@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -17,7 +18,7 @@ func setupTaskPluginModelTest(t *testing.T) {
 	var err error
 	DB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, DB.AutoMigrate(&TaskPlugin{}))
+	require.NoError(t, DB.AutoMigrate(&TaskPlugin{}, &Channel{}))
 }
 
 func TestTaskPluginVersionActivationAndSourceImmutability(t *testing.T) {
@@ -160,9 +161,14 @@ func TestTaskPluginOrderSQLQuotesMySQLKeyColumn(t *testing.T) {
 	_, err = GetTaskPluginSyncSnapshot()
 	require.NoError(t, err)
 
-	require.Len(t, sqls, 2)
+	pluginQueries := 0
 	for _, sql := range sqls {
+		if !strings.Contains(sql, "task_plugins") {
+			continue
+		}
+		pluginQueries++
 		assert.Contains(t, sql, "`key`")
 		assert.NotRegexp(t, `(?i)ORDER BY[[:space:]]+key([[:space:],]|$)`, sql)
 	}
+	assert.Equal(t, 2, pluginQueries)
 }

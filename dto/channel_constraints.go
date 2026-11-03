@@ -1,5 +1,7 @@
 package dto
 
+import kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+
 type ChannelPinSource string
 
 const (
@@ -36,12 +38,14 @@ type ChannelPin struct {
 type ChannelFilterKind string
 
 const (
-	FilterRequestPath        ChannelFilterKind = "request_path"
-	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
-	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
+	FilterRequestPath         ChannelFilterKind = "request_path"
+	FilterTaskPluginIdentity  ChannelFilterKind = "task_plugin_identity"
+	FilterResponsesWebSocket  ChannelFilterKind = "responses_websocket"
+	FilterTaskVideoCapability ChannelFilterKind = "task_video_capability"
 )
 
 type ChannelFilter struct {
+	TaskVideoValidator     func(kitdto.ChannelSettings, string) bool
 	Kind                   ChannelFilterKind
 	RequestPath            string
 	TaskPluginKey          string

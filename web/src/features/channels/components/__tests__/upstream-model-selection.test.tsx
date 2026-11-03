@@ -25,13 +25,79 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { api } from '@/lib/api'
 
 import { fetchModels } from '../../api'
+import {
+  importMissingTaskVideoModels,
+  taskVideoCatalogConfig,
+} from '../../lib/task-video-models'
 import { ChannelsProvider } from '../channels-provider'
 import { FetchModelsDialog } from '../dialogs/fetch-models-dialog'
+import { TaskVideoModelEditor } from '../task-video-model-editor'
 import { UpstreamModelSelection } from '../upstream-model-selection'
 
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+})
+
+test('catalog capability previews preserve manual edits and import only missing selections', async () => {
+  const upstream = {
+    ...taskVideoCatalogConfig(),
+    duration: { values: [5, 10] },
+    resolutions: ['720p'],
+    billing_mode: 'per_request',
+  }
+  const manual = {
+    ...upstream,
+    duration: { values: [5] },
+    billing_mode: 'per_second',
+  }
+  const onChange = vi.fn()
+  const details = {
+    existing: { ...upstream, final_price: 8.16, currency: 'CNY' },
+    future: upstream,
+  }
+  const imported = importMissingTaskVideoModels(
+    { existing: manual },
+    ['existing', 'future'],
+    details
+  )
+  expect(imported.existing).toEqual(manual)
+  expect(imported.future).toEqual(upstream)
+  expect(imported.future).not.toHaveProperty('final_price')
+  const user = userEvent.setup()
+  const view = render(
+    <TaskVideoModelEditor
+      sourceURL=''
+      onSourceURLChange={vi.fn()}
+      value={JSON.stringify({ existing: manual })}
+      onChange={onChange}
+      models={['existing', 'future']}
+      details={details}
+      previewReady
+    />
+  )
+  expect(onChange).not.toHaveBeenCalled()
+  expect(screen.getAllByText(/Catalog capability changes/)).toHaveLength(2)
+  await user.click(
+    screen.getByRole('button', {
+      name: 'Initialize missing model capabilities',
+    })
+  )
+  expect(JSON.parse(onChange.mock.lastCall?.[0] as string)).toEqual(imported)
+  view.rerender(
+    <TaskVideoModelEditor
+      sourceURL=''
+      onSourceURLChange={vi.fn()}
+      value={JSON.stringify({ existing: manual })}
+      onChange={onChange}
+      models={['existing']}
+      details={details}
+      previewReady={false}
+    />
+  )
+  expect(
+    screen.queryByRole('button', { name: 'Use catalog capabilities' })
+  ).not.toBeInTheDocument()
 })
 
 test.each([

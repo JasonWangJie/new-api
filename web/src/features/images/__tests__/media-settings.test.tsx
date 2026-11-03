@@ -878,6 +878,97 @@ test('inherited mixed pricing reflects refreshed model prices without saving an 
   )
 })
 
+test('mixed pricing keeps its draft and reports a refresh failure after saving through media settings', async () => {
+  const configuration: ImageAdminConfiguration = {
+    runtime: imageRuntimeSettings,
+    storage_profiles: [],
+    pools: [],
+    storage_providers: [],
+    policies: [
+      {
+        id: 1,
+        group: 'default',
+        platform: 'mixed',
+        enabled: true,
+        async_enabled: true,
+        pool_mode: 'model',
+        models: '[{"id":"shared-video","media_type":"video"}]',
+        version: 1,
+      },
+    ],
+    mixed_video_usage_schema: mixedVideoPricingSchema,
+    mixed_video_model_billing_expr: {
+      'shared-video': 'tier("s", u("seconds") * 0.8)',
+    },
+    mixed_video_billing_expr: {
+      'shared-video': 'tier("s", u("seconds") * 0.8) * 1.45',
+    },
+  }
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'pricing-admin', role: 100 })
+  let refreshFailed = false
+  vi.mocked(imageRequest).mockImplementation(async (url, method, body) => {
+    if (url === '/api/option/images') {
+      if (refreshFailed) throw new Error('Configuration refresh failed')
+      return structuredClone(configuration)
+    }
+    if (url === '/api/option/images/media') return mediaSettings
+    if (url === '/api/option/images/runtime-status') {
+      return {
+        node: 'test',
+        effective: { running: false, active_workers: 0, worker_concurrency: 0 },
+        configured: { worker_concurrency: 0, recovery_interval_seconds: 30 },
+      }
+    }
+    if (url === '/api/option/' && method === 'PUT') {
+      configuration.mixed_video_billing_expr = JSON.parse(
+        (body as { value: string }).value
+      )
+      return {}
+    }
+    throw new Error(`Unexpected request: ${method} ${url}`)
+  })
+  const errorToast = vi.spyOn(toast, 'error').mockReturnValue('refresh-error')
+  const successToast = vi.spyOn(toast, 'success').mockReturnValue('saved')
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ImageSettings />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('tab', { name: 'Video configuration' })
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Provider' }))
+  await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+  await user.click(
+    screen.getByRole('combobox', { name: 'Mixed video price source' })
+  )
+  await user.click(screen.getByRole('option', { name: 'Use model pricing' }))
+  refreshFailed = true
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() =>
+    expect(errorToast).toHaveBeenCalledWith('Configuration refresh failed')
+  )
+  expect(successToast).not.toHaveBeenCalled()
+  expect(
+    screen.getByRole('combobox', { name: 'Mixed video price source' })
+  ).toHaveTextContent('Use model pricing')
+  expect(configuration.mixed_video_billing_expr).toEqual({})
+  refreshFailed = false
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() => expect(successToast).toHaveBeenCalledWith('Saved'))
+})
+
 test.each([undefined, 'tier("tokens", u("tokens") * 0.1)'])(
   'inherited missing or incompatible model price is shown as needing configuration: %s',
   (expression) => {

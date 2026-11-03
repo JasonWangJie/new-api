@@ -16,10 +16,12 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 // MixedVideoRouting is server-owned admission state. Provider continues to name
@@ -71,12 +73,21 @@ func MixedVideoChannelBinding(channel model.Channel, publicModel, operation stri
 	if generation == nil {
 		return jsplugin.ProtocolBinding{}, "", errors.New("video plugins are unavailable")
 	}
+	if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "sudashui" && (operation == "" || operation == "create") {
+		binding, err := FrozenTaskVideoBinding(&channel, publicModel)
+		return binding, upstream, err
+	}
 	for _, binding := range generation.LookupEndpointCandidates(http.MethodPost, path, upstream) {
 		if binding.Plugin == nil || binding.Protocol != "openai_video" {
 			continue
 		}
 		filter := dto.ChannelFilter{Kind: dto.FilterTaskPluginIdentity, TaskPluginKey: binding.Plugin.Meta.Key, TaskPluginChannelTypes: binding.Plugin.Meta.ChannelTypes}
 		if matches, _ := model.ChannelSatisfiesFilters(&channel, publicModel, []dto.ChannelFilter{filter}); matches {
+			selected, err := ChannelTaskVideoPlugin(binding.Plugin, &channel, publicModel)
+			if err != nil {
+				return jsplugin.ProtocolBinding{}, "", err
+			}
+			binding.Plugin = selected
 			return binding, upstream, nil
 		}
 	}
@@ -704,6 +715,23 @@ func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCan
 		*execution = *request.Execution
 	}
 	meta := candidate.Binding.Plugin.Meta
+	if meta.Key == "sudashui" {
+		config, exists := candidate.Channel.GetSetting().TaskPluginModelConfigs[candidate.UpstreamModel]
+		if !exists {
+			return errors.New("saved video model configuration is unavailable")
+		}
+		data, err := common.Marshal(config)
+		if err != nil {
+			return err
+		}
+		var frozen kitdto.TaskVideoModelConfig
+		if err := common.Unmarshal(data, &frozen); err != nil {
+			return err
+		}
+		execution.VideoModelConfig = &frozen
+	} else {
+		execution.VideoModelConfig = nil
+	}
 	execution.TaskPlugin = &model.TaskPluginSnapshot{Key: meta.Key, Name: meta.Name, Version: meta.Version, Author: &model.TaskPluginAuthorSnapshot{Name: meta.Author.Name, URL: meta.Author.URL}, APIVersion: meta.APIVersion, Generation: jsplugin.DefaultRegistry.Generation().Number}
 	request.Execution = execution
 	request.InlineReferenceInputs = nil

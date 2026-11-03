@@ -126,6 +126,15 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	request, hasRequest := c.Get("task_request")
+	if a.plugin.Meta.Key == "sudashui" && hasRequest {
+		profile, exists := a.plugin.Meta.VideoProfileForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
+		if !exists {
+			return service.TaskErrorWrapperLocal(fmt.Errorf("missing saved video model configuration"), "plugin_request_invalid", http.StatusBadRequest)
+		}
+		if err := service.ValidateVideoProfileRequest(profile, info.Action, request, nil); err != nil {
+			return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+		}
+	}
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
 	if hasRequest && !hasUsageProfiles {
 		if err := a.validateResolvedUsageRequest(request, ""); err != nil {
@@ -156,6 +165,22 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *TaskAdaptor) EstimateBillingValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]float64, error) {
+	if a.plugin.Meta.Key == "sudashui" {
+		facts, err := a.ExtractUsageFactsValidated(c, info)
+		if err != nil {
+			return nil, err
+		}
+		schema, _ := a.plugin.Meta.UsageForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
+		ratios := map[string]float64{}
+		for name, field := range schema {
+			if field.Type == "number" {
+				if value, ok := usageNumber(facts[name], false); ok {
+					ratios[name] = value
+				}
+			}
+		}
+		return ratios, nil
+	}
 	usageContext := a.submitContext(c, info)
 	usageContext["usagePurpose"] = "billing_ratios"
 	return a.usageRatios(c.Request.Context(), cmp.Or(info.UpstreamModelName, info.OriginModelName), "extractUsage", usageContext)
@@ -186,6 +211,14 @@ func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycomm
 	facts, ok := value.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("plugin usage hook must return an object")
+	}
+	if a.plugin.Meta.Key == "sudashui" {
+		schema, _ := a.plugin.Meta.UsageForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
+		for _, key := range []string{"seconds", "requests"} {
+			if _, declared := schema[key]; !declared {
+				delete(facts, key)
+			}
+		}
 	}
 	if _, err = a.validatedUsageRatios(facts, cmp.Or(info.UpstreamModelName, info.OriginModelName)); err != nil {
 		return nil, err

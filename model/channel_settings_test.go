@@ -18,6 +18,68 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestSudashuiSettingsAndTaskSnapshotDatabaseRoundTrip(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				driver = sqlite.Open(filepath.Join(t.TempDir(), "sudashui.db"))
+			case "mysql":
+				if os.Getenv("TEST_MYSQL_DSN") == "" {
+					t.Skip("TEST_MYSQL_DSN is not configured")
+				}
+				driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+			case "postgres":
+				if os.Getenv("TEST_POSTGRES_DSN") == "" {
+					t.Skip("TEST_POSTGRES_DSN is not configured")
+				}
+				driver = postgres.Open(os.Getenv("TEST_POSTGRES_DSN"))
+			}
+			db, err := gorm.Open(driver, &gorm.Config{})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			channels, tasks := db.Table("sudashui_config_channels").Session(&gorm.Session{}), db.Table("sudashui_config_tasks").Session(&gorm.Session{})
+			require.NoError(t, channels.AutoMigrate(&Channel{}))
+			require.NoError(t, tasks.AutoMigrate(&Task{}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Migrator().DropTable("sudashui_config_tasks", "sudashui_config_channels"))
+			})
+			images, videos, audios := 3, 0, 0
+			config := dto.TaskVideoModelConfig{Duration: dto.TaskVideoDuration{Values: []int{4, 8}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video", "reference_to_video"}, References: dto.TaskVideoReferences{Images: &images, Videos: &videos, Audios: &audios}, BillingMode: "per_request"}
+			channel := Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Models: "future-video"}
+			channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "sudashui", TaskPluginModelSourceURL: dto.DefaultSudashuiCatalogURL, TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-video": config}})
+			require.NoError(t, channel.ValidateSettings())
+			require.NoError(t, channels.Create(&channel).Error)
+			task := Task{TaskID: "task_sudashui_snapshot", Platform: "sudashui", PrivateData: TaskPrivateData{Execution: &TaskExecutionSnapshot{TaskPlugin: &TaskPluginSnapshot{Key: "sudashui", Version: "1.0.0"}, VideoModelConfig: &config}}}
+			require.NoError(t, tasks.Create(&task).Error)
+			// Existing tables and JSON data survive a second startup/migration.
+			require.NoError(t, channels.AutoMigrate(&Channel{}))
+			require.NoError(t, tasks.AutoMigrate(&Task{}))
+			var loaded Channel
+			require.NoError(t, channels.First(&loaded, channel.Id).Error)
+			assert.Equal(t, channel.GetSetting(), loaded.GetSetting())
+			changed := config
+			changed.BillingMode, changed.Duration = "per_second", dto.TaskVideoDuration{Values: []int{4}}
+			loaded.SetSetting(dto.ChannelSettings{TaskPluginKey: "sudashui", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-video": changed}})
+			require.NoError(t, channels.Where("id = ?", channel.Id).Update("setting", loaded.Setting).Error)
+			var frozen Task
+			require.NoError(t, tasks.First(&frozen, task.ID).Error)
+			require.NotNil(t, frozen.PrivateData.Execution.VideoModelConfig)
+			assert.Equal(t, config, *frozen.PrivateData.Execution.VideoModelConfig)
+			var version string
+			query := "SELECT version()"
+			if dialect == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(query).Scan(&version).Error)
+			t.Logf("%s version: %s", dialect, version)
+		})
+	}
+}
+
 func TestChannelValidateSettingsRejectsInvalidHTTPTransport(t *testing.T) {
 	tests := []struct {
 		name    string

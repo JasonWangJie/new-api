@@ -994,6 +994,34 @@ type scriptedCompletionUsageAdaptor struct {
 	usageFacts map[string]any
 }
 
+func TestSudashuiPollingDoesNotBypassPluginValidation(t *testing.T) {
+	setupTaskPollingDatabase(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.Option{}, &model.AsyncMediaEvent{}))
+	t.Cleanup(func() {
+		assert.NoError(t, model.DB.Migrator().DropTable(&model.Token{}, &model.Option{}, &model.AsyncMediaEvent{}))
+	})
+	const userID, tokenID, channelID = 515, 515, 515
+	seedUser(t, userID, 10000)
+	seedToken(t, tokenID, userID, "sk-sudashui-poll", 10000)
+	task := makeTask(userID, channelID, 100, tokenID, BillingSourceWallet, 0)
+	task.Platform = "sudashui"
+	task.PrivateData.AsyncMedia = true
+	task.PrivateData.UpstreamTaskID = "sudashui-upstream"
+	require.NoError(t, model.DB.Create(task).Error)
+	adaptor := &scriptedPollingAdaptor{
+		body:     []byte(`{"code":"success","data":{"task_id":"wrong-task","status":"FAILURE","fail_reason":"must not refund"}}`),
+		parseErr: fmt.Errorf("Sudashui task id mismatch"),
+	}
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Status: common.ChannelStatusEnabled}
+	require.NoError(t, updateVideoSingleTask(t.Context(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task}))
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.Equal(t, task.Status, persisted.Status)
+	assert.Equal(t, 1, persisted.PrivateData.PollFailures)
+	assert.Equal(t, 10000, getUserQuota(t, userID))
+	assert.Equal(t, int64(0), countLogs(t))
+}
+
 func (a *scriptedCompletionUsageAdaptor) ApplyCompletionUsage(_ *model.Task, _ *http.Response, _ []byte, result *relaycommon.TaskInfo) error {
 	result.UsageFacts = a.usageFacts
 	return nil

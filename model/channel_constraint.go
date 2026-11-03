@@ -12,6 +12,7 @@ import (
 var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
+	dto.FilterTaskVideoCapability,
 	dto.FilterResponsesWebSocket,
 }
 
@@ -91,6 +92,12 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
+	case dto.FilterTaskVideoCapability:
+		if ch.Type != constant.ChannelTypeTaskPlugin || ch.GetSetting().TaskPluginKey != "sudashui" || filter.TaskVideoValidator == nil {
+			return true
+		}
+		upstream, _, err := ch.TaskVideoModelConfig(modelName)
+		return err == nil && filter.TaskVideoValidator(ch.GetSetting(), upstream)
 	case dto.FilterRequestPath:
 		if filter.RequestPath == "" {
 			return true

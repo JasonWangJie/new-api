@@ -646,8 +646,12 @@ func GetTaskPluginOptions(c *gin.Context) {
 			if layer == 1 && setting.IsTaskPluginFactoryDisabled(meta.Key) {
 				continue
 			}
-			if _, ok := jsplugin.DefaultRegistry.Get(meta.Key); !ok {
+			active, ok := jsplugin.DefaultRegistry.Get(meta.Key)
+			if !ok {
 				continue
+			}
+			if meta.Key == "sudashui" {
+				meta = active.Meta
 			}
 			seen[meta.Key] = true
 			hasIcon := false
@@ -783,7 +787,7 @@ func syncTaskPluginsOnceContext(ctx context.Context) error {
 			plugin.Version,
 		)
 	}
-	if err = jsplugin.DefaultRegistry.ReplaceOverrides(nextOverrides); err != nil {
+	if err = jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nextOverrides, databaseSnapshot.VideoModels, databaseSnapshot.Revision); err != nil {
 		syncErr := fmt.Errorf("publish task plugin generation: %w", err)
 		taskPluginSyncState.lastRebuild = taskPluginRebuildOutcome{
 			Status:           "failed",
@@ -800,6 +804,9 @@ func syncTaskPluginsOnceContext(ctx context.Context) error {
 			time.Since(started).Milliseconds(),
 		)
 		return syncErr
+	}
+	if taskPluginSyncState.lastRebuild.DatabaseRevision != databaseSnapshot.Revision {
+		model.InitChannelCache()
 	}
 	taskPluginSyncState.hashes = nextHashes
 	for key := range taskPluginSyncState.errors {

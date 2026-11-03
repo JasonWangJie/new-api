@@ -45,17 +45,56 @@ import {
 } from '../../constants'
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
+  buildSettingJSON,
   channelFormSchema,
   transformChannelToFormDefaults,
   transformFormDataToCreatePayload,
   transformFormDataToUpdatePayload,
 } from '../../lib/channel-form'
+import { taskVideoCatalogConfig } from '../../lib/task-video-models'
 import { channelSchema, type Channel } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelsProvider } from '../channels-provider'
 import { ChannelMutateDrawer } from '../drawers/channel-mutate-drawer'
 
 const originalAuth = useAuthStore.getState().auth
+
+test('Sudashui channel form persists independent catalog and capability settings', () => {
+  const config = {
+    ...taskVideoCatalogConfig(),
+    duration: { values: [4, 8] },
+    resolutions: ['720p'],
+    billing_mode: 'per_request',
+  }
+  const form = {
+    ...CHANNEL_FORM_DEFAULT_VALUES,
+    type: 61,
+    task_plugin_key: 'sudashui',
+    task_plugin_model_source_url: 'https://catalog.example/v1/models',
+    task_plugin_model_configs: JSON.stringify({ future: config }),
+  }
+  const setting = buildSettingJSON(form)
+  expect(JSON.parse(setting)).toMatchObject({
+    task_plugin_model_source_url: form.task_plugin_model_source_url,
+    task_plugin_model_configs: { future: config },
+  })
+  const reloaded = transformChannelToFormDefaults({
+    ...editingChannel,
+    id: 99,
+    type: 61,
+    models: 'future',
+    setting,
+  })
+  expect(reloaded.task_plugin_model_source_url).toBe(
+    form.task_plugin_model_source_url
+  )
+  expect(JSON.parse(reloaded.task_plugin_model_configs || '{}')).toEqual({
+    future: config,
+  })
+  expect(
+    JSON.parse(buildSettingJSON({ ...form, task_plugin_key: 'other' }))
+  ).not.toHaveProperty('task_plugin_model_configs')
+})
 let client: QueryClient
 let editingChannel: Channel
 let pluginOptions: TaskPluginOption[]

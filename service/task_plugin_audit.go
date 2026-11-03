@@ -4,6 +4,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
 )
 
@@ -29,6 +30,15 @@ func TaskExecutionSnapshotFromContext(ctx *gin.Context) *model.TaskExecutionSnap
 				generation = pinned.Generation.Number
 			}
 			meta := pinned.Plugin.Meta
+			if meta.Key == "sudashui" {
+				if value, exists := ctx.Get("task_video_model_config"); exists {
+					data, _ := common.Marshal(value)
+					var frozen kitdto.TaskVideoModelConfig
+					if common.Unmarshal(data, &frozen) == nil {
+						snapshot.VideoModelConfig = &frozen
+					}
+				}
+			}
 			snapshot.TaskPlugin = &model.TaskPluginSnapshot{
 				Key:     meta.Key,
 				Name:    meta.Name,
