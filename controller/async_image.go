@@ -151,11 +151,11 @@ func SubmitAsyncImage(c *gin.Context) {
 		task.Provider, task.ExecutionProtocol, task.ChannelId = capability.Provider, capability.Protocol, selected.Id
 		if request.MixedRouting == nil {
 			request.Provider = capability.Provider
-		}
-		if capability.Protocol == "gemini_native" {
-			request.Platform = "gemini"
-		} else {
-			request.Platform = "openai"
+			if capability.Protocol == "gemini_native" {
+				request.Platform = "gemini"
+			} else {
+				request.Platform = "openai"
+			}
 		}
 		channelData, err := common.Marshal(selected)
 		if err == nil {

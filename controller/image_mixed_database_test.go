@@ -38,6 +38,134 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestAsyncImageAdmissionPreservesMixedRouting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	previousDB, previousType := model.DB, common.MainDatabaseType()
+	previousRedis, previousRDB := common.RedisEnabled, common.RDB
+	previousCapability, previousValidate := service.ImageChannelCapabilityFunc, service.ValidateMixedImageChannelRequestFunc
+	previousEstimate, previousFreeze, previousExecute := service.EstimateAsyncImageQuotaFunc, service.FreezeAsyncImageBillingFunc, service.ExecuteAsyncImageFunc
+	previousGroups, previousRatios := setting.UserUsableGroups2JSONString(), ratio_setting.GroupRatio2JSONString()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	model.DB, common.RDB, common.RedisEnabled = db, client, true
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB, common.RDB, common.RedisEnabled = previousDB, previousRDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		service.ImageChannelCapabilityFunc, service.ValidateMixedImageChannelRequestFunc = previousCapability, previousValidate
+		service.EstimateAsyncImageQuotaFunc, service.FreezeAsyncImageBillingFunc, service.ExecuteAsyncImageFunc = previousEstimate, previousFreeze, previousExecute
+		assert.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousGroups))
+		assert.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
+		assert.NoError(t, client.Close())
+	})
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "admission:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "admission")
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}, &model.ImageInputAlias{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+	require.NoError(t, model.InitializeMediaRetryPolicy(db))
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.AsyncEnabled = true
+	require.NoError(t, service.SaveImageRuntimeConfig(t.Context(), cfg))
+	service.ImageChannelCapabilityFunc = func(channel model.Channel, _ string) dto.ImageCapability {
+		if channel.Type == constant.ChannelTypeGemini {
+			return dto.ImageCapability{Provider: "gemini", Protocol: "gemini_native", Generate: true, Edit: true}
+		}
+		return dto.ImageCapability{Provider: "openai", Protocol: "openai_images", Generate: true, Edit: true}
+	}
+	service.ValidateMixedImageChannelRequestFunc = nil
+	service.EstimateAsyncImageQuotaFunc = func(context.Context, model.Token, service.AsyncImageRequest, string) (int, error) { return 0, nil }
+	service.FreezeAsyncImageBillingFunc = func(context.Context, model.Token, service.AsyncImageRequest, string, *model.Channel) (service.MediaBillingSnapshot, error) {
+		return service.MediaBillingSnapshot{}, nil
+	}
+	user := model.User{Username: "mixed-admission", Group: "default", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "fixture-mixed-admission", Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, db.Create(&token).Error)
+	require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "admission-local", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}).Error)
+	const publicModel = "seedream-5-pro"
+	for _, platform := range []string{"mixed", "gemini"} {
+		policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", platform), Group: "default", Platform: platform, Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"seedream-5-pro","resolutions":["1K"],"max_output_images":1,"max_reference_images":8}]`}
+		require.NoError(t, db.Create(&policy).Error)
+	}
+	channels := []model.Channel{
+		{Id: 1, Type: constant.ChannelTypeOpenAI, Key: "fixture-openai", Models: publicModel, Group: "default", Status: common.ChannelStatusEnabled},
+		{Id: 24, Type: constant.ChannelTypeGemini, Key: "fixture-gemini", Models: publicModel, Group: "default", Status: common.ChannelStatusEnabled, ModelMapping: common.GetPointer(`{"seedream-5-pro":"gemini-3.1-flash-image-preview"}`)},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for _, channel := range channels {
+		require.NoError(t, db.Create(&model.Ability{Group: "default", Model: publicModel, ChannelId: channel.Id, Enabled: true}).Error)
+	}
+	for _, test := range []struct {
+		name, provider, platform, policyPlatform, executionProvider, protocol, size string
+		channelID                                                                   int
+	}{
+		{name: "mixed Gemini", platform: "openai", policyPlatform: "mixed", executionProvider: "gemini", protocol: "gemini_native", size: "2384x1024", channelID: 24},
+		{name: "mixed OpenAI", platform: "openai", policyPlatform: "mixed", executionProvider: "openai", protocol: "openai_images", size: "2384x1024", channelID: 1},
+		{name: "explicit Gemini", provider: "gemini", platform: "gemini", policyPlatform: "gemini", executionProvider: "gemini", protocol: "gemini_native", size: "1K", channelID: 24},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.NoError(t, db.Where("1 = 1").Delete(&model.ImageChannelPool{}).Error)
+			for _, platform := range []string{"mixed", "gemini"} {
+				policy := model.ImageGroupPolicy{Group: "default", Platform: platform, PoolMode: "model_resolution"}
+				require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.ImagePoolBindingKey(policy, publicModel, "1K"), Group: "default", Platform: platform, Mode: "model_resolution", Model: publicModel, Resolution: "1K", ChannelId: test.channelID, Priority: 1}).Error)
+			}
+			body := map[string]any{"model": publicModel, "prompt": "A wide landscape", "size": test.size, "resolution": "1K", "aspect_ratio": "21:9", "image": []string{"https://reference.example/input.png"}}
+			if test.provider != "" {
+				body["provider"] = test.provider
+			}
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations_async", bytes.NewReader(raw))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("id", user.Id)
+			c.Set("token_id", token.Id)
+			SubmitAsyncImage(c)
+			require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+			var accepted struct {
+				TaskID string `json:"task_id"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &accepted))
+			require.NotEmpty(t, accepted.TaskID)
+			var task model.AsyncImageTask
+			require.NoError(t, db.Where("task_id = ?", accepted.TaskID).Take(&task).Error)
+			encoded, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+			require.NoError(t, err)
+			var request service.AsyncImageRequest
+			require.NoError(t, common.Unmarshal(encoded, &request))
+			assert.Equal(t, test.platform, request.Platform)
+			assert.Equal(t, test.policyPlatform, request.PolicyPlatform)
+			assert.Equal(t, test.provider, request.Provider)
+			assert.Equal(t, test.platform, task.Platform)
+			assert.Equal(t, test.executionProvider, task.Provider)
+			assert.Equal(t, test.protocol, task.ExecutionProtocol)
+			assert.Equal(t, 1, request.ReferenceImageCount())
+			assert.Equal(t, test.size, request.Size)
+			assert.Equal(t, test.provider == "", request.MixedRouting != nil)
+			calls := 0
+			service.ExecuteAsyncImageFunc = func(ctx context.Context, current model.AsyncImageTask, outbound service.AsyncImageRequest, channel *model.Channel, _ service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+				calls++
+				assert.Equal(t, test.channelID, channel.Id)
+				assert.Equal(t, request.Platform, outbound.Platform)
+				assert.Equal(t, request.MixedRouting, outbound.MixedRouting)
+				require.NoError(t, beforeInvoke(), "persisted admission state must pass both worker eligibility checks")
+				require.NoError(t, db.Model(&model.AsyncImageTask{}).Where("task_id = ?", current.TaskId).Update("upstream_task_id", "fixture-accepted").Error)
+				return nil, model.AsyncImageBill{}, &service.AsyncImagePending{TaskId: "fixture-accepted"}
+			}
+			require.NoError(t, service.RunAsyncImageTask(t.Context(), task.TaskId))
+			assert.Equal(t, 1, calls)
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskInvoking, task.Status)
+			assert.Positive(t, task.DispatchedAt)
+			assert.Equal(t, "fixture-accepted", task.UpstreamTaskId)
+			assert.Empty(t, task.ErrorCode)
+		})
+	}
+}
+
 func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
