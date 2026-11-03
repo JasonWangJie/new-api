@@ -39,15 +39,37 @@ export function splitPluginBillingExprKey(
 // remains authoritative for expression validation and pricing compatibility.
 export function taskExpressionCompatible(
   expression: string,
-  schema: BillingUsageSchema
+  schema: BillingUsageSchema,
+  options: { usageOnly?: boolean } = {}
 ): boolean | undefined {
   if (!expression.trim()) return false
   const compiled = compileBillingExpression(expression)
   if (compiled.status !== 'ready') return undefined
+  if (
+    options.usageOnly &&
+    (compiled.variables.size > 0 ||
+      [...compiled.functions].some(
+        (name) =>
+          !['u', 'tier', 'max', 'min', 'ceil', 'floor', 'abs', 'has'].includes(
+            name
+          )
+      ))
+  ) {
+    return false
+  }
   let compatible = !compiled.functions.has('fixed')
   visitExpression(compiled.ast, (node) => {
     if (node.kind !== 'call' || node.name !== 'u') return
     const key = node.args[0]
+    if (
+      options.usageOnly &&
+      (node.args.length !== 1 ||
+        key?.kind !== 'literal' ||
+        typeof key.value !== 'string')
+    ) {
+      compatible = false
+      return
+    }
     if (
       key?.kind === 'literal' &&
       typeof key.value === 'string' &&

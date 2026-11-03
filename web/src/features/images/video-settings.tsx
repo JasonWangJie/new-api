@@ -17,13 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Braces, CircleCheck, CircleX } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
-import { JsonCodeEditor } from '@/components/json-code-editor'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -36,6 +35,7 @@ import { markServerErrorHandled } from '@/lib/handle-server-error'
 import { imageRequest } from './api'
 import { ConfigurationConflict } from './components/configuration-conflict'
 import { ImageSelect } from './components/image-select'
+import { MixedVideoPricing } from './components/mixed-video-pricing'
 import { isConfigurationConflict } from './lib/configuration-conflict'
 import {
   isVideoModelEntry,
@@ -265,10 +265,6 @@ export function VideoConfiguration(props: {
   const [editingPolicy, setEditingPolicy] = useState(initialPolicy)
   const [saveError, setSaveError] = useState<unknown>(null)
   const [busy, setBusy] = useState(false)
-  const [pricing, setPricing] = useState(() =>
-    JSON.stringify(props.config.mixed_video_billing_expr || {}, null, 2)
-  )
-  const [pricingBusy, setPricingBusy] = useState(false)
   const template = templates.find((item) => item.provider === provider)
   const selectPolicy = (
     nextGroup: string,
@@ -298,43 +294,6 @@ export function VideoConfiguration(props: {
       setModels(JSON.stringify(catalog.filter(isVideoModelEntry), null, 2))
     } catch {
       setModels(saved)
-    }
-  }
-
-  useEffect(() => {
-    setPricing(
-      JSON.stringify(props.config.mixed_video_billing_expr || {}, null, 2)
-    )
-  }, [props.config.mixed_video_billing_expr])
-
-  const savePricing = async () => {
-    setPricingBusy(true)
-    try {
-      const parsed: unknown = JSON.parse(pricing)
-      if (
-        !parsed ||
-        typeof parsed !== 'object' ||
-        Array.isArray(parsed) ||
-        Object.values(parsed).some((value) => typeof value !== 'string')
-      ) {
-        throw new Error(
-          t(
-            'Mixed video prices must map public model names to billing expressions.'
-          )
-        )
-      }
-      await imageRequest('/api/option/', 'PUT', {
-        key: 'billing_setting.mixed_video_billing_expr',
-        value: JSON.stringify(parsed),
-      })
-      await props.onSuccess()
-      toast.success(t('Saved'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Invalid video policy')
-      )
-    } finally {
-      setPricingBusy(false)
     }
   }
 
@@ -615,36 +574,13 @@ export function VideoConfiguration(props: {
           />
         </form>
       </SettingsCard>
-      {provider === 'mixed' && (
-        <SettingsCard
-          title={t('Mixed video pricing')}
-          description={t(
-            'Set one billing expression per public video model. Mixed video never falls back to a plugin price.'
-          )}
-        >
-          <form
-            className='space-y-3'
-            onSubmit={(event) => {
-              event.preventDefault()
-              void savePricing()
-            }}
-          >
-            <Label htmlFor='mixed-video-prices'>
-              {t('Public video model billing expressions')}
-            </Label>
-            <JsonCodeEditor
-              id='mixed-video-prices'
-              ariaLabel={t('Public video model billing expressions')}
-              value={pricing}
-              onChange={setPricing}
-              disabled={pricingBusy}
-            />
-            <Button type='submit' disabled={pricingBusy}>
-              {t('Save mixed video prices')}
-            </Button>
-          </form>
-        </SettingsCard>
-      )}
+      <div hidden={provider !== 'mixed'}>
+        <MixedVideoPricing
+          config={props.config}
+          catalog={models}
+          onSuccess={props.onSuccess}
+        />
+      </div>
     </div>
   )
 }

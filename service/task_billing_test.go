@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -2449,6 +2452,10 @@ func TestMixedVideoPublicBillingContract(t *testing.T) {
 	}{
 		{name: "request price", expression: `tier("request", u("requests") * 0.5)`},
 		{name: "duration and conditions", expression: `u("resolution") == "1080p" && u("action") == "generate" ? tier("hd", u("seconds") * 0.2) : tier("base", u("requests") * 0.3)`},
+		{name: "reference video multipliers", expression: `tier("seconds", u("seconds") * 0.6) * (u("video_input") == "video" ? 1.45 : 1)`},
+		{name: "negative reference price forbidden", expression: `u("video_input") == "video" ? tier("video", -1) : tier("none", 1)`, wantError: true},
+		{name: "negative no reference price forbidden", expression: `u("video_input") == "none" ? tier("none", -1) : tier("video", 1)`, wantError: true},
+		{name: "infinite reference price forbidden", expression: `u("video_input") == "video" ? tier("video", 1e308 * 1e308) : tier("none", 1)`, wantError: true},
 		{name: "provider tokens forbidden", expression: `tier("tokens", u("tokens"))`, wantError: true},
 		{name: "unreachable provider tokens forbidden", expression: `true ? tier("request", u("requests")) : tier("tokens", u("tokens"))`, wantError: true},
 		{name: "dynamic usage forbidden", expression: `tier("dynamic", u("sec" + "onds"))`, wantError: true},
@@ -2474,6 +2481,7 @@ func TestMixedVideoPublicBillingContract(t *testing.T) {
 	facts := map[string]any{"requests": float64(1), "seconds": float64(4), "resolution": "720p", "action": "generate"}
 	frozen, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 1})
 	require.NoError(t, err)
+	require.NoError(t, ValidateFrozenMixedVideoBilling(frozen.Tiered), "historical snapshots without video_input remain valid")
 	assert.True(t, frozen.Tiered.MixedVideoBilling)
 	assert.Equal(t, billing_setting.MixedVideoBillingSchemaVersion, frozen.Tiered.MixedVideoSchemaVersion)
 	assert.Equal(t, common.QuotaRound(common.QuotaPerUnit), frozen.Price.Quota)
@@ -2518,35 +2526,148 @@ func TestMixedVideoPublicBillingContract(t *testing.T) {
 	assert.NotNil(t, saturated.Clamp)
 }
 
+func TestMixedVideoReferenceInputPricing(t *testing.T) {
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previous := settings.MixedVideoBillingExpr
+	t.Cleanup(func() { settings.MixedVideoBillingExpr = previous })
+	const expression = `(u("resolution") == "1080p" ? tier("1080p", u("seconds") * 1.1) : tier("720p", u("seconds") * 0.6)) * (u("video_input") == "video" ? 1.45 : 1)`
+	t.Run("provider specific video input cannot bypass public billing", func(t *testing.T) {
+		binding := jsplugin.ProtocolBinding{Model: "public-video", Plugin: &jsplugin.LoadedPlugin{Meta: jsplugin.Meta{
+			VideoProfiles: []jsplugin.VideoProfile{{Models: []string{"public-video"}, Modes: []jsplugin.VideoModeProfile{{
+				Name: "reference_to_video", Inputs: []jsplugin.VideoInputProfile{{Name: "clip", Kind: "video", Sources: []string{"url"}, MaxItems: 1}},
+			}}}},
+		}}}
+		_, err := EffectiveMixedVideoProfile(binding, "public-video", VideoModelOverrides{})
+		require.ErrorContains(t, err, "must use video or reference_videos")
+	})
+	for _, tc := range []struct {
+		name      string
+		body      string
+		operation string
+		upload    string
+		wantVideo bool
+	}{
+		{name: "text only", body: `{}`},
+		{name: "images and audio only", body: `{"reference_images":["https://cdn.example/image.png"],"reference_audios":["https://cdn.example/audio.mp3"]}`},
+		{name: "reference video URL", body: `{"reference_videos":["https://cdn.example/video.mp4"]}`, wantVideo: true},
+		{name: "canonical reference", body: `{"references":[{"type":"video","source":"https://cdn.example/video.mp4"}]}`, wantVideo: true},
+		{name: "content video", body: `{"content":[{"type":"video_url","video_url":{"url":"https://cdn.example/video.mp4"}}]}`, wantVideo: true},
+		{name: "metadata video", body: `{"metadata":{"content":[{"type":"video_url","role":"reference_video","video_url":{"url":"https://cdn.example/video.mp4"}}]}}`, wantVideo: true},
+		{name: "edit source video", body: `{"video":"https://cdn.example/video.mp4"}`, operation: "edit", wantVideo: true},
+		{name: "extend source video", body: `{"video":{"url":"https://cdn.example/video.mp4"}}`, operation: "extend", wantVideo: true},
+		{name: "empty references", body: `{"reference_videos":[]}`},
+		{name: "spoofed no video", body: `{"video_input":"none","reference_videos":["https://cdn.example/video.mp4"]}`, wantVideo: true},
+		{name: "spoofed with video", body: `{"video_input":"video","metadata":{"video_input":"video"}}`},
+		{name: "uploaded image", body: `{}`, upload: "input_reference"},
+		{name: "uploaded reference video", body: `{"video_input":"none"}`, upload: "reference_videos", wantVideo: true},
+		{name: "uploaded primary video", body: `{}`, upload: "video", wantVideo: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings.MixedVideoBillingExpr = map[string]string{"public-video": expression}
+			body := map[string]any{"model": "public-video", "seconds": float64(5), "resolution": "720p"}
+			require.NoError(t, common.UnmarshalJsonStr(tc.body, &body))
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			contentType := "application/json"
+			if tc.upload != "" {
+				var data bytes.Buffer
+				writer := multipart.NewWriter(&data)
+				for field, value := range body {
+					text, err := common.Marshal(value)
+					require.NoError(t, err)
+					if literal, ok := value.(string); ok {
+						text = []byte(literal)
+					}
+					require.NoError(t, writer.WriteField(field, string(text)))
+				}
+				file, err := writer.CreateFormFile(tc.upload, "reference.bin")
+				require.NoError(t, err)
+				_, err = file.Write([]byte("bounded-upload-fixture"))
+				require.NoError(t, err)
+				require.NoError(t, writer.Close())
+				raw, contentType = data.Bytes(), writer.FormDataContentType()
+			}
+			view, body, err := MixedVideoRequestContext(raw, contentType, tc.operation)
+			require.NoError(t, err)
+			facts, err := MixedVideoPublicFacts(body, tc.operation, view.Files)
+			require.NoError(t, err)
+			wantInput, wantCost := "none", 3.0
+			if tc.wantVideo {
+				wantInput, wantCost = "video", 4.35
+			}
+			assert.Equal(t, wantInput, facts["video_input"])
+			frozen, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 2})
+			require.NoError(t, err)
+			assert.Equal(t, common.QuotaRound(wantCost*common.QuotaPerUnit*2), frozen.Price.Quota)
+			facts["video_input"] = "changed"
+			settings.MixedVideoBillingExpr["public-video"] = `tier("changed", u("requests") * 999)`
+			encoded, err := common.Marshal(frozen.Tiered)
+			require.NoError(t, err)
+			var restored billingexpr.BillingSnapshot
+			require.NoError(t, common.Unmarshal(encoded, &restored))
+			require.NoError(t, ValidateFrozenMixedVideoBilling(&restored))
+			result, usage, err := EvaluateTaskCompletionUsage(&restored, map[string]any{"video_input": "none", "seconds": float64(1)})
+			require.NoError(t, err)
+			assert.Equal(t, frozen.Price.Quota, result.ActualQuotaAfterGroup)
+			assert.Equal(t, wantInput, usage["video_input"], "provider usage cannot replace frozen input facts")
+		})
+	}
+	facts := map[string]any{"requests": float64(1), "seconds": float64(5), "resolution": "720p", "action": "generate"}
+	require.ErrorContains(t, billing_setting.ValidateMixedVideoBillingFacts(expression, facts), "cannot be determined")
+	facts["video_input"] = "invalid"
+	require.ErrorContains(t, billing_setting.ValidateMixedVideoBillingFacts(expression, facts), "invalid mixed video billing fact")
+	settings.MixedVideoBillingExpr["public-video"] = `tier("seconds", u("seconds") * 0.6) * (u("video_input") == "video" ? 1.45 : 0)`
+	facts["video_input"] = "none"
+	free, err := FreezeMixedVideoBilling("public-video", facts, types.GroupRatioInfo{GroupRatio: 1})
+	require.NoError(t, err)
+	assert.Zero(t, free.Price.Quota)
+	assert.True(t, free.Price.FreeModel)
+}
+
 func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		measured bool
-		failed   bool
+		name       string
+		measured   bool
+		failed     bool
+		videoInput string
 	}{
 		{name: "normal completion"},
 		{name: "measured channel completion", measured: true},
 		{name: "terminal failure", failed: true},
+		{name: "no reference video", videoInput: "none"},
+		{name: "reference video completion", videoInput: "video"},
+		{name: "reference video measured completion", videoInput: "video", measured: true},
+		{name: "reference video failure", videoInput: "video", failed: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setupMeasuredTaskBillingDB(t)
-			const id, reserved = 981, 4000
-			seedUser(t, id, 6000)
-			seedToken(t, id, id, "sk-mixed-public-billing", 6000)
+			const id = 981
+			reserved := 4000
+			if tc.videoInput == "video" {
+				reserved = 5800
+			}
+			seedUser(t, id, 10000-reserved)
+			seedToken(t, id, id, "sk-mixed-public-billing", 10000-reserved)
 			seedChannel(t, id)
 			seedChargedAccounting(t, id, id, id, reserved, 1)
 			task := makeTask(id, id, reserved, id, BillingSourceWallet, 0)
 			task.PrivateData.DurableBilling = true
 			task.PrivateData.SubmitAccountingRecorded = true
 			expression := `tier("seconds", u("seconds"))`
+			facts := map[string]any{"requests": float64(1), "seconds": float64(4), "action": "generate"}
+			if tc.videoInput != "" {
+				expression += ` * (u("video_input") == "video" ? 1.45 : 1)`
+				facts["video_input"] = tc.videoInput
+			}
 			task.PrivateData.BillingContext.TieredSnapshot = &billingexpr.BillingSnapshot{
 				ModelName: "public-video", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
 				GroupRatio: 1, QuotaPerUnit: 1000, ExprVersion: 1, TaskUsageBilling: true,
 				EstimatedQuotaAfterGroup: reserved,
 				MixedVideoBilling:        true, MixedVideoSchemaVersion: billing_setting.MixedVideoBillingSchemaVersion,
-				UsageFacts: map[string]any{"requests": float64(1), "seconds": float64(4), "action": "generate"},
+				UsageFacts: facts,
 			}
 			require.NoError(t, model.DB.Create(task).Error)
+			require.NoError(t, model.DB.First(task, task.ID).Error)
 			stale := *task
 			task.Status = model.TaskStatusSuccess
 			if tc.failed {
@@ -2555,13 +2676,13 @@ func TestMixedVideoSettlementPreservesRequestPriceAndRefundsOnce(t *testing.T) {
 			var won bool
 			var err error
 			if tc.measured {
-				won, err = SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 2000, map[string]any{"seconds": float64(2)}, nil)
+				won, err = SettleMeasuredVideoTask(t.Context(), task, model.TaskStatusInProgress, 2000, map[string]any{"seconds": float64(2), "video_input": "none"}, nil)
 			} else {
-				won, err = SettleTaskBillingOnComplete(t.Context(), nil, task, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(2)}})
+				won, err = SettleTaskBillingOnComplete(t.Context(), nil, task, model.TaskStatusInProgress, &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": float64(2), "video_input": "none"}})
 			}
 			require.NoError(t, err)
 			require.True(t, won)
-			wantQuota, wantBalance := reserved, 6000
+			wantQuota, wantBalance := reserved, 10000-reserved
 			if tc.failed {
 				wantQuota, wantBalance = 0, 10000
 			}

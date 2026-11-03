@@ -32,7 +32,7 @@ func ValidateMixedVideoProfilePricing(expression string, profiles []jsplugin.Vid
 			if len(mode.Resolutions) > 0 {
 				body["resolution"] = mode.DefaultResolution
 			}
-			facts, err := MixedVideoPublicFacts(body, operation, profile)
+			facts, err := MixedVideoPublicFacts(body, operation, nil, profile)
 			if err == nil {
 				err = billing_setting.ValidateMixedVideoBillingFacts(expression, facts)
 			}

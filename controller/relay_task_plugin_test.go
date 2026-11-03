@@ -407,7 +407,7 @@ func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
 			assert.Equal(t, tc.ratio, body["aspect_ratio"])
 			candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, operation, normalized, service.VideoModelOverrides{}, 1, "application/json")
 			require.NoError(t, err)
-			facts, err := service.MixedVideoPublicFacts(body, operation, profile)
+			facts, err := service.MixedVideoPublicFacts(body, operation, nil, profile)
 			require.NoError(t, err)
 			publicResolution := tc.resolution
 			if publicResolution == "720px" {
@@ -423,7 +423,7 @@ func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
 			assert.Equal(t, tc.resolution, wire["resolution"])
 			assert.Equal(t, tc.ratio, wire["aspect_ratio"])
 			if tc.resolution == "720px" {
-				_, err := service.MixedVideoPublicFacts(body, operation)
+				_, err := service.MixedVideoPublicFacts(body, operation, nil)
 				require.ErrorContains(t, err, "resolution is invalid", "720px requires the actual bound model profile")
 			}
 			if tc.operation == "edit" {
@@ -497,7 +497,7 @@ func TestMixedVideoGooglePublicParametersAndUploads(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			facts, err := service.MixedVideoPublicFacts(body, "create", profile)
+			facts, err := service.MixedVideoPublicFacts(body, "create", nil, profile)
 			require.NoError(t, err)
 			assert.EqualValues(t, tc.seconds, facts["seconds"])
 			if tc.ratio == "" {
@@ -2173,7 +2173,7 @@ func TestMixedVideoBuiltinInputProjection(t *testing.T) {
 			if normalizeErr == nil {
 				candidate, decodeErr = service.DecodeMixedVideoCandidate(t.Context(), channel, public, "create", normalized, service.VideoModelOverrides{}, 0)
 			}
-			facts, _ := service.MixedVideoPublicFacts(publicBody, "create", profile)
+			facts, _ := service.MixedVideoPublicFacts(publicBody, "create", nil, profile)
 			t.Logf("key=%s input=%s native.action=%v native.wire=%v native.usage=%v mixed.body=%v mixed.facts=%v mixed.intent=%v error=%v", tc.key, raw, intent["action"], wire, usage, publicBody, facts, candidate.Intent, decodeErr)
 			require.NoError(t, decodeErr, "a real builtin's supported request must survive mixed admission")
 			driver["requestBody"], driver["action"] = candidate.Intent["requestBody"], candidate.Intent["action"]
@@ -2272,7 +2272,7 @@ func TestMixedVideoSoraPublicDimensions(t *testing.T) {
 			require.NoError(t, err)
 			candidate, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", normalized, service.VideoModelOverrides{}, 0)
 			require.NoError(t, err)
-			facts, err := service.MixedVideoPublicFacts(body, "create", profile)
+			facts, err := service.MixedVideoPublicFacts(body, "create", nil, profile)
 			require.NoError(t, err)
 			assert.Equal(t, "720p", facts["resolution"])
 			assert.EqualValues(t, tc.seconds, facts["seconds"])

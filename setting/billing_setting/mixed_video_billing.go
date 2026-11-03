@@ -14,6 +14,8 @@ import (
 	"github.com/expr-lang/expr/parser"
 )
 
+// Adding optional host facts preserves version 1 snapshots whose expressions
+// do not reference them. Never infer missing input facts for historical tasks.
 const MixedVideoBillingSchemaVersion = 1
 
 // MixedVideoUsageSchema describes request facts owned by the host. Provider
@@ -24,6 +26,14 @@ func MixedVideoUsageSchema() map[string]jsplugin.UsageFieldSchema {
 		"seconds":    {Type: "number", Unit: "second", Description: jsplugin.LocalizedText{"en": "Video duration unit price", "zh": "视频时长单价"}},
 		"resolution": {Enum: []string{"480p", "720p", "1080p", "2k", "4k"}, Description: jsplugin.LocalizedText{"en": "Output video resolution", "zh": "输出视频分辨率"}},
 		"action":     {Enum: []string{"generate", "edit", "extend"}, Description: jsplugin.LocalizedText{"en": "Video operation", "zh": "视频操作"}},
+		"video_input": {
+			Enum:        []string{"none", "video"},
+			Description: jsplugin.LocalizedText{"en": "Reference video input", "zh": "参考视频输入"},
+			EnumLabels: map[string]jsplugin.LocalizedText{
+				"none":  {"en": "No reference video", "zh": "无参考视频"},
+				"video": {"en": "With reference video", "zh": "有参考视频"},
+			},
+		},
 	}
 }
 
@@ -50,13 +60,15 @@ func ValidateMixedVideoBillingExpr(expression string) error {
 	for _, seconds := range []float64{0, 1, relaycommon.MaxTaskDurationSeconds} {
 		for _, resolution := range schema["resolution"].Enum {
 			for _, action := range schema["action"].Enum {
-				facts := map[string]any{"requests": float64(1), "seconds": seconds, "resolution": resolution, "action": action}
-				cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
-				if err != nil {
-					return err
-				}
-				if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
-					return fmt.Errorf("mixed video billing cost must be finite and non-negative")
+				for _, videoInput := range schema["video_input"].Enum {
+					facts := map[string]any{"requests": float64(1), "seconds": seconds, "resolution": resolution, "action": action, "video_input": videoInput}
+					cost, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+					if err != nil {
+						return err
+					}
+					if math.IsNaN(cost) || math.IsInf(cost, 0) || cost < 0 {
+						return fmt.Errorf("mixed video billing cost must be finite and non-negative")
+					}
 				}
 			}
 		}

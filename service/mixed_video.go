@@ -95,6 +95,13 @@ func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel st
 		if overrides.Modes != nil && !slices.Contains(overrides.Modes, mode.Name) {
 			continue
 		}
+		for _, input := range mode.Inputs {
+			// Public billing and media conservation use these host-owned video
+			// slots; a provider-specific name has no portable billing meaning.
+			if input.Kind == "video" && input.Name != "video" && input.Name != "reference_videos" {
+				return profile, fmt.Errorf("mixed video input %q must use video or reference_videos", input.Name)
+			}
+		}
 		if overrides.Resolutions != nil && len(mode.Resolutions) > 0 {
 			mode.Resolutions = slices.DeleteFunc(mode.Resolutions, func(value string) bool { return !slices.Contains(overrides.Resolutions, value) })
 			if len(mode.Resolutions) == 0 {
@@ -176,12 +183,19 @@ func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel st
 
 // MixedVideoPublicFacts is deliberately strict: defaults must be public and
 // independent of the eventual provider. No provider usage becomes retail usage.
-func MixedVideoPublicFacts(body map[string]any, operation string, profiles ...jsplugin.VideoProfile) (map[string]any, error) {
+func MixedVideoPublicFacts(body map[string]any, operation string, files []map[string]any, profiles ...jsplugin.VideoProfile) (map[string]any, error) {
 	action := operation
 	if action == "" || action == "create" {
 		action = "generate"
 	}
-	facts := map[string]any{"requests": float64(1), "action": action}
+	videoInput := "none"
+	for identity := range videoMediaInventory(body, files) {
+		if strings.HasPrefix(identity, "video:") {
+			videoInput = "video"
+			break
+		}
+	}
+	facts := map[string]any{"requests": float64(1), "action": action, "video_input": videoInput}
 	metadata, _ := body["metadata"].(map[string]any)
 	if _, _, err := mixedVideoAspectRatio(body, metadata, profiles...); err != nil {
 		return nil, err
@@ -355,7 +369,7 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 	if err != nil {
 		return candidate, err
 	}
-	if _, err := MixedVideoPublicFacts(body, operation, profile); err != nil {
+	if _, err := MixedVideoPublicFacts(body, operation, view.Files, profile); err != nil {
 		return candidate, err
 	}
 	if mixedVideoDurationUnitControl(body) && (binding.Plugin.Meta.Key != "tianyue" || strings.HasSuffix(upstream, "-se")) {
@@ -404,15 +418,15 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 			if !maps.Equal(videoMediaInventory(body, view.Files), videoMediaInventory(normalizedBody, view.Files)) {
 				return candidate, errors.New("video decoder changed the input media identities or counts")
 			}
-			publicFacts, err := MixedVideoPublicFacts(body, operation, profile)
+			publicFacts, err := MixedVideoPublicFacts(body, operation, view.Files, profile)
 			if err != nil {
 				return candidate, err
 			}
-			decodedFacts, err := MixedVideoPublicFacts(normalizedBody, operation, profile)
+			decodedFacts, err := MixedVideoPublicFacts(normalizedBody, operation, view.Files, profile)
 			if err != nil {
 				return candidate, err
 			}
-			for _, field := range []string{"seconds", "resolution"} {
+			for _, field := range []string{"seconds", "resolution", "video_input"} {
 				if expected, present := publicFacts[field]; present {
 					if actual, decoded := decodedFacts[field]; decoded && actual != expected {
 						return candidate, fmt.Errorf("video decoder changed the public %s", field)
@@ -527,7 +541,7 @@ func NormalizeMixedVideoDefaults(raw []byte, contentType, operation string, prof
 	if err != nil {
 		return nil, "", nil, err
 	}
-	facts, err := MixedVideoPublicFacts(original, operation, profiles...)
+	facts, err := MixedVideoPublicFacts(original, operation, view.Files, profiles...)
 	if err != nil {
 		return nil, "", nil, err
 	}

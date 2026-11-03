@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { AlertTriangle } from 'lucide-react'
-import { memo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -50,6 +50,7 @@ import {
   getTaskUsagePriceUnitLabelKey,
   getTaskUsageQuantityUnitLabelKey,
 } from '@/features/pricing/lib/dynamic-price'
+import { taskExpressionCompatible } from '@/features/pricing/lib/plugin-pricing'
 import {
   createDefaultTaskMatrixConfig,
   evaluateTaskVisualConfig,
@@ -82,6 +83,7 @@ import { TaskPricingMatrix } from './task-pricing-matrix'
 import { TaskVideoMultiplierFields } from './task-video-multiplier-fields'
 
 type TaskUsagePricingEditorProps = {
+  allowRequestRules?: boolean
   currency?: PricingCurrency
   billingExpr: string
   requestRuleExpr: string
@@ -287,29 +289,33 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   props: TaskUsagePricingEditorProps
 ) {
   const { t, i18n } = useTranslation()
+  const allowRequestRules = props.allowRequestRules !== false
+  const incomingMatrix = useMemo(() => {
+    if (
+      !allowRequestRules &&
+      taskExpressionCompatible(props.billingExpr, props.usageSchema, {
+        usageOnly: true,
+      }) !== true
+    ) {
+      return null
+    }
+    return tryParseTaskMatrixConfig(props.billingExpr, props.usageSchema)
+  }, [allowRequestRules, props.billingExpr, props.usageSchema])
   const [editorMode, setEditorMode] = useState<EditorMode>(() =>
-    props.billingExpr &&
-    !tryParseTaskMatrixConfig(props.billingExpr, props.usageSchema)
-      ? 'raw'
-      : 'visual'
+    props.billingExpr && !incomingMatrix ? 'raw' : 'visual'
   )
-  const [matrixRows, setMatrixRows] = useState<TaskMatrixRow[]>(() => {
-    const parsed = tryParseTaskMatrixConfig(
-      props.billingExpr,
-      props.usageSchema
-    )
-    return (parsed ?? createDefaultTaskMatrixConfig(props.usageSchema)).rows
-  })
+  const [matrixRows, setMatrixRows] = useState<TaskMatrixRow[]>(
+    () =>
+      (incomingMatrix ?? createDefaultTaskMatrixConfig(props.usageSchema)).rows
+  )
   const [videoInputMultipliers, setVideoInputMultipliers] = useState<
     TaskVideoInputMultipliers | undefined
-  >(
-    () =>
-      tryParseTaskMatrixConfig(props.billingExpr, props.usageSchema)
-        ?.videoInputMultipliers
-  )
+  >(() => incomingMatrix?.videoInputMultipliers)
   const [confirmVisualSwitch, setConfirmVisualSwitch] = useState(false)
   const [rawExpr, setRawExpr] = useState(() =>
-    combineBillingExpr(props.billingExpr, props.requestRuleExpr)
+    allowRequestRules
+      ? combineBillingExpr(props.billingExpr, props.requestRuleExpr)
+      : props.billingExpr
   )
   const [previewSample, setPreviewSample] = useState<
     Record<string, number | string>
@@ -330,6 +336,11 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
   const numberFields = getTaskNumberFields(props.usageSchema)
   const combinations = getTaskEnumCombinations(props.usageSchema)
   const visualTiers = taskMatrixToTiers({ rows: matrixRows }, props.usageSchema)
+  const rawHasUnsupportedInputs =
+    !allowRequestRules &&
+    taskExpressionCompatible(rawExpr, props.usageSchema, {
+      usageOnly: true,
+    }) !== true
 
   let previewConfig: TaskVisualConfig | null = null
   let previewRequestRuleExpr = props.requestRuleExpr
@@ -351,11 +362,12 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       matchedRowIndex = nextMatchedRowIndex
     }
   } else {
-    const split = splitBillingExprAndRequestRules(rawExpr)
-    previewConfig = tryParseTaskVisualConfig(
-      split.billingExpr,
-      props.usageSchema
-    )
+    const split = allowRequestRules
+      ? splitBillingExprAndRequestRules(rawExpr)
+      : { billingExpr: rawExpr, requestRuleExpr: '' }
+    previewConfig = rawHasUnsupportedInputs
+      ? null
+      : tryParseTaskVisualConfig(split.billingExpr, props.usageSchema)
     previewRequestRuleExpr = split.requestRuleExpr
   }
 
@@ -410,16 +422,21 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
 
   const handleRawChange = (value: string) => {
     setRawExpr(value)
+    if (!allowRequestRules) {
+      props.onBillingExprChange(value)
+      return
+    }
     const split = splitBillingExprAndRequestRules(value)
     props.onBillingExprChange(split.billingExpr)
     props.onRequestRuleExprChange(split.requestRuleExpr)
   }
 
-  const rawSplit = splitBillingExprAndRequestRules(rawExpr)
-  const rawMatrix = tryParseTaskMatrixConfig(
-    rawSplit.billingExpr,
-    props.usageSchema
-  )
+  const rawSplit = allowRequestRules
+    ? splitBillingExprAndRequestRules(rawExpr)
+    : { billingExpr: rawExpr, requestRuleExpr: '' }
+  const rawMatrix = rawHasUnsupportedInputs
+    ? null
+    : tryParseTaskMatrixConfig(rawSplit.billingExpr, props.usageSchema)
 
   const handleModeChange = (nextMode: EditorMode) => {
     if (nextMode === editorMode) return
@@ -427,7 +444,11 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
       setConfirmVisualSwitch(true)
       return
     }
-    setRawExpr(combineBillingExpr(props.billingExpr, props.requestRuleExpr))
+    setRawExpr(
+      allowRequestRules
+        ? combineBillingExpr(props.billingExpr, props.requestRuleExpr)
+        : props.billingExpr
+    )
     setEditorMode('raw')
   }
 
@@ -682,24 +703,26 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
               onSampleReplace={setPreviewSample}
             />
 
-            <Field className='gap-2 border-t pt-3'>
-              <FieldLabel>{t('Request rule pricing')}</FieldLabel>
-              <Textarea
-                value={props.requestRuleExpr}
-                onChange={(event) =>
-                  props.onRequestRuleExprChange(event.target.value)
-                }
-                placeholder='(header("x-priority") == "high" ? 2 : 1)'
-                rows={3}
-                className='font-mono text-xs'
-                spellCheck={false}
-              />
-              <FieldDescription>
-                {t(
-                  'Optional request-rule multiplier expression. Leave empty when no request rule applies.'
-                )}
-              </FieldDescription>
-            </Field>
+            {allowRequestRules && (
+              <Field className='gap-2 border-t pt-3'>
+                <FieldLabel>{t('Request rule pricing')}</FieldLabel>
+                <Textarea
+                  value={props.requestRuleExpr}
+                  onChange={(event) =>
+                    props.onRequestRuleExprChange(event.target.value)
+                  }
+                  placeholder='(header("x-priority") == "high" ? 2 : 1)'
+                  rows={3}
+                  className='font-mono text-xs'
+                  spellCheck={false}
+                />
+                <FieldDescription>
+                  {t(
+                    'Optional request-rule multiplier expression. Leave empty when no request rule applies.'
+                  )}
+                </FieldDescription>
+              </Field>
+            )}
           </>
         ) : (
           <div className='space-y-3'>
@@ -714,7 +737,16 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
                 </div>
                 <div>
                   {t('Functions')}: <code>tier(name, value)</code>,{' '}
-                  <code>header(name)</code>, <code>param(path)</code>
+                  {allowRequestRules ? (
+                    <>
+                      <code>header(name)</code>, <code>param(path)</code>
+                    </>
+                  ) : (
+                    <>
+                      <code>min</code>, <code>max</code>, <code>ceil</code>,{' '}
+                      <code>floor</code>, <code>abs</code>
+                    </>
+                  )}
                 </div>
                 {!rawMatrix ? (
                   <div>
@@ -747,23 +779,25 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
           </div>
         )}
       </div>
-      <RequestSimulation
-        expression={
-          editorMode === 'raw'
-            ? rawExpr
-            : combineBillingExpr(
-                generateTaskExprFromConfig(
-                  { tiers: visualTiers, videoInputMultipliers },
-                  props.usageSchema
-                ),
-                props.requestRuleExpr
-              )
-        }
-        usage={previewSample}
-        usageSchema={props.usageSchema}
-        currency={props.currency}
-        mode='task'
-      />
+      {allowRequestRules && (
+        <RequestSimulation
+          expression={
+            editorMode === 'raw'
+              ? rawExpr
+              : combineBillingExpr(
+                  generateTaskExprFromConfig(
+                    { tiers: visualTiers, videoInputMultipliers },
+                    props.usageSchema
+                  ),
+                  props.requestRuleExpr
+                )
+          }
+          usage={previewSample}
+          usageSchema={props.usageSchema}
+          currency={props.currency}
+          mode='task'
+        />
+      )}
     </div>
   )
 })

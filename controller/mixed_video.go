@@ -36,7 +36,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 			return
 		}
 		raw, err := storage.Bytes()
-		_, body, parseErr := service.MixedVideoRequestContext(raw, c.GetHeader("Content-Type"), c.GetString("async_media_operation"))
+		view, body, parseErr := service.MixedVideoRequestContext(raw, c.GetHeader("Content-Type"), c.GetString("async_media_operation"))
 		if err != nil || parseErr != nil {
 			ordinary(c)
 			return
@@ -96,7 +96,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		c.Set(common.KeyBodyStorage, normalizedStorage)
 		c.Request.Body, c.Request.ContentLength = io.NopCloser(normalizedStorage), int64(len(raw))
 		c.Request.Header.Set("Content-Type", contentType)
-		facts, err := service.MixedVideoPublicFacts(body, operation, profiles...)
+		facts, err := service.MixedVideoPublicFacts(body, operation, view.Files, profiles...)
 		if err != nil {
 			AsyncImagePublicError(c, 400, "invalid_request", err.Error())
 			c.Abort()

@@ -26,10 +26,14 @@ import userEvent from '@testing-library/user-event'
 import { toast } from 'sonner'
 import { afterEach, expect, test, vi } from 'vitest'
 
+import { evaluateBillingExpression } from '@/features/pricing/lib/billing-expression/runtime'
+import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getGroups } from '@/features/users/api'
+import { api } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from '../api'
+import { MixedVideoPricing } from '../components/mixed-video-pricing'
 import { MediaSettingsCard } from '../media-settings'
 import { ImageSettings } from '../settings'
 import type { ImageAdminConfiguration } from '../types'
@@ -646,6 +650,14 @@ test('mixed video configuration preserves images and saves separate public model
             },
           ],
           mixed_video_billing_expr: { 'shared-video': '1' },
+          video_plugin_templates: [
+            {
+              provider: 'drama',
+              name: 'Drama',
+              models: [],
+              video_profiles: [],
+            },
+          ],
         }}
         onSuccess={vi.fn().mockResolvedValue(undefined)}
       />
@@ -678,6 +690,15 @@ test('mixed video configuration preserves images and saves separate public model
   })
   expect(prices).toHaveValue(JSON.stringify({ 'shared-video': '1' }, null, 2))
   fireEvent.input(prices, { target: { value: '{"shared-video":"2"}' } })
+  await user.click(screen.getByRole('combobox', { name: 'Provider' }))
+  await user.click(screen.getByRole('option', { name: 'Drama · drama' }))
+  await user.click(screen.getByRole('combobox', { name: 'Provider' }))
+  await user.click(screen.getByRole('option', { name: 'Mixed scheduling' }))
+  expect(
+    screen.getByRole('textbox', {
+      name: 'Public video model billing expressions',
+    })
+  ).toHaveValue('{"shared-video":"2"}')
   await user.click(
     screen.getByRole('button', { name: 'Save mixed video prices' })
   )
@@ -687,6 +708,305 @@ test('mixed video configuration preserves images and saves separate public model
       value: '{"shared-video":"2"}',
     })
   )
+})
+
+const mixedVideoPricingSchema: BillingUsageSchema = {
+  requests: {
+    type: 'number',
+    unit: 'count',
+    description: 'Video operation unit price',
+  },
+  seconds: {
+    type: 'number',
+    unit: 'second',
+    description: 'Video duration unit price',
+  },
+  resolution: {
+    enum: ['720p', '1080p'],
+    description: 'Output video resolution',
+  },
+  action: { enum: ['generate', 'edit', 'extend'] },
+  video_input: {
+    enum: ['none', 'video'],
+    description: 'Reference video input',
+    enumLabels: { none: 'No reference video', video: 'With reference video' },
+  },
+}
+
+test('mixed visual pricing edits reference multipliers once and retains the draft across configuration refreshes', async () => {
+  const expression =
+    '(u("resolution") == "720p" ? tier("720p", u("requests") * 6) : tier("1080p", u("requests") * 9)) * (u("video_input") == "video" ? 1.5 : 1.25)'
+  const config: ImageAdminConfiguration = {
+    runtime: {},
+    storage_profiles: [],
+    pools: [],
+    storage_providers: [],
+    policies: [],
+    mixed_video_usage_schema: mixedVideoPricingSchema,
+    mixed_video_billing_expr: {
+      'shared-video': expression,
+      'custom-video': 'max(1, u("seconds"))',
+    },
+  }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const renderPricing = (current: ImageAdminConfiguration) => (
+    <QueryClientProvider client={client}>
+      <MixedVideoPricing
+        config={current}
+        catalog='[]'
+        onSuccess={vi.fn().mockResolvedValue(undefined)}
+      />
+    </QueryClientProvider>
+  )
+  vi.mocked(imageRequest).mockResolvedValue({})
+  const view = render(renderPricing(config))
+  const user = userEvent.setup()
+  expect(
+    screen.getByRole('textbox', { name: 'Without reference video multiplier' })
+  ).toHaveValue('1.25')
+  expect(screen.queryByText('Request rule pricing')).not.toBeInTheDocument()
+  expect(imageRequest).not.toHaveBeenCalled()
+  const multiplier = screen.getByRole('textbox', {
+    name: 'With reference video multiplier',
+  })
+  await user.clear(multiplier)
+  await user.type(multiplier, '1.8')
+  view.rerender(
+    renderPricing({
+      ...config,
+      mixed_video_billing_expr: { 'shared-video': '1' },
+    })
+  )
+  expect(multiplier).toHaveValue('1.8')
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video prices' })
+  )
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/',
+      'PUT',
+      expect.objectContaining({
+        key: 'billing_setting.mixed_video_billing_expr',
+      })
+    )
+  )
+  const saved = vi
+    .mocked(imageRequest)
+    .mock.calls.find(([url]) => url === '/api/option/')?.[2] as {
+    value: string
+  }
+  const prices = JSON.parse(saved.value) as Record<string, string>
+  expect(prices['custom-video']).toBe('max(1, u("seconds"))')
+  expect(prices['shared-video']).not.toContain('u("seconds")')
+  for (const [resolution, video_input, cost] of [
+    ['720p', 'none', 7.5],
+    ['720p', 'video', 10.8],
+    ['1080p', 'none', 11.25],
+    ['1080p', 'video', 16.2],
+  ] as const) {
+    const result = evaluateBillingExpression(prices['shared-video'], {
+      usage: { requests: 1, resolution, video_input },
+    })
+    expect(result.status).toBe('success')
+    if (result.status === 'success') expect(result.cost).toBeCloseTo(cost)
+  }
+})
+
+test.each([
+  '  tier("custom", ceil(u("seconds") / 5) * 2)  ',
+  'tier("s", u("seconds") * 0.6) * (header("x-priority") == "high" ? 2 : 1)',
+  'tier("s", u("seconds") * (header("x-priority") == "high" ? 2 : 1))',
+  'tier("s", u("seconds") * (param("priority") == "high" ? 2 : 1))',
+])(
+  'mixed custom expression remains raw and intact when opened and saved: %s',
+  async (expression) => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    vi.mocked(imageRequest).mockResolvedValue({})
+    render(
+      <QueryClientProvider client={client}>
+        <MixedVideoPricing
+          config={{
+            runtime: {},
+            storage_profiles: [],
+            pools: [],
+            storage_providers: [],
+            policies: [],
+            mixed_video_usage_schema: mixedVideoPricingSchema,
+            mixed_video_billing_expr: { custom: expression },
+          }}
+          catalog='[]'
+          onSuccess={vi.fn().mockResolvedValue(undefined)}
+        />
+      </QueryClientProvider>
+    )
+    expect(
+      screen.getByRole('textbox', { name: 'Billing expression' })
+    ).toHaveValue(expression)
+    expect(
+      screen.queryByRole('textbox', { name: 'With reference video multiplier' })
+    ).not.toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('combobox', { name: 'Editor mode' }))
+    await user.click(screen.getByRole('option', { name: 'Visual editor' }))
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      'Switching discards the entire expression'
+    )
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(
+      screen.getByRole('textbox', { name: 'Billing expression' })
+    ).toHaveValue(expression)
+    await user.click(
+      screen.getByRole('button', { name: 'Save mixed video prices' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith('/api/option/', 'PUT', {
+        key: 'billing_setting.mixed_video_billing_expr',
+        value: JSON.stringify({ custom: expression }),
+      })
+    )
+  }
+)
+
+test('mixed pricing copies only the selected complete provider expression without saving or multiplying the existing price', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'pricing-admin', role: 100 })
+  const copied =
+    'tier("seconds", u("seconds") * 0.6) * (u("video_input") == "video" ? 1.65 : 1.45)'
+  const load = vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        entries: [
+          {
+            model_name: 'seedance2.0-A',
+            version: 'v1',
+            configured: {},
+            effective: {
+              'billing_setting.billing_mode': 'tiered_expr',
+              'billing_setting.billing_expr':
+                'tier("default", u("seconds") * 1)',
+            },
+            plugin_variants: [
+              {
+                plugin_key: 'drama',
+                plugin_name: 'Drama',
+                configured: copied,
+                effective: copied,
+                compatible: true,
+                usage_schema: mixedVideoPricingSchema,
+              },
+              {
+                plugin_key: 'request-rules',
+                plugin_name: 'Request rules',
+                configured: '',
+                effective:
+                  'tier("s", u("seconds") * 0.6) * (header("x-priority") == "high" ? 2 : 1)',
+                compatible: true,
+                usage_schema: mixedVideoPricingSchema,
+              },
+              ...[
+                {
+                  plugin_key: 'nested-header',
+                  plugin_name: 'Nested header',
+                  effective:
+                    'tier("s", u("seconds") * (header("x-priority") == "high" ? 2 : 1))',
+                },
+                {
+                  plugin_key: 'nested-param',
+                  plugin_name: 'Nested parameter',
+                  effective:
+                    'tier("s", u("seconds") * (param("priority") == "high" ? 2 : 1))',
+                },
+                {
+                  plugin_key: 'token-input',
+                  plugin_name: 'Token input',
+                  effective: 'tier("s", p * 0.6)',
+                },
+                {
+                  plugin_key: 'dynamic-usage',
+                  plugin_name: 'Dynamic usage key',
+                  effective: 'tier("s", u("sec" + "onds") * 0.6)',
+                },
+              ].map((variant) => ({
+                ...variant,
+                configured: '',
+                compatible: true,
+                usage_schema: mixedVideoPricingSchema,
+              })),
+            ],
+          },
+        ],
+        options: {},
+        empty_version: 'empty',
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <MixedVideoPricing
+        config={{
+          runtime: {},
+          storage_profiles: [],
+          pools: [],
+          storage_providers: [],
+          policies: [],
+          mixed_video_usage_schema: mixedVideoPricingSchema,
+          mixed_video_billing_expr: {
+            'seedance2.0-A': 'tier("old", u("seconds") * 0.6) * 1.45',
+          },
+        }}
+        catalog='[]'
+        onSuccess={vi.fn().mockResolvedValue(undefined)}
+      />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  expect(load).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Load existing prices' }))
+  await user.click(
+    await screen.findByRole('combobox', { name: 'Price source' })
+  )
+  expect(
+    screen.queryByRole('option', { name: 'Request rules' })
+  ).not.toBeInTheDocument()
+  for (const name of [
+    'Nested header',
+    'Nested parameter',
+    'Token input',
+    'Dynamic usage key',
+  ]) {
+    expect(screen.queryByRole('option', { name })).not.toBeInTheDocument()
+  }
+  await user.click(screen.getByRole('option', { name: 'Drama' }))
+  await user.click(screen.getByRole('button', { name: 'Copy existing price' }))
+  expect(
+    screen.getByRole('textbox', { name: 'Without reference video multiplier' })
+  ).toHaveValue('1.45')
+  expect(
+    screen.getByRole('textbox', { name: 'With reference video multiplier' })
+  ).toHaveValue('1.65')
+  expect(imageRequest).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('button', {
+      name: 'Public video model billing expressions',
+    })
+  )
+  expect(
+    screen.getByRole('textbox', {
+      name: 'Public video model billing expressions',
+    })
+  ).toHaveValue(JSON.stringify({ 'seedance2.0-A': copied }, null, 2))
 })
 
 test.each(['selecting the mixed platform', 'replacing the image catalog'])(

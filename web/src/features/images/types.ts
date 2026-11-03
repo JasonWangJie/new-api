@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { BillingUsageSchema } from '@/features/pricing/types'
+
 export type ImagePlatform = string
 export type VideoModeName =
   | 'text_to_video'
@@ -415,6 +417,7 @@ export type VideoPluginTemplate = {
 }
 export type ImageAdminConfiguration = {
   mixed_video_billing_expr?: Record<string, string>
+  mixed_video_usage_schema?: BillingUsageSchema
   routing_platforms?: string[]
   image_providers?: string[]
   media_providers?: string[]
