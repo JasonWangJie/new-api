@@ -18,7 +18,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
@@ -28,6 +30,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/mewkiz/flac"
@@ -655,4 +659,149 @@ func TestMediaInputDeclaredSlotsPreserveBodyAndReuseDownloadedFiles(t *testing.T
 	tampered.Body = bytes.Replace(body, []byte("first.png"), []byte("changed.png"), -1)
 	_, err = PrepareAsyncVideoLocalReferences(t.Context(), job, tampered)
 	assert.ErrorIs(t, err, ErrMediaInputUnavailable)
+}
+
+func legacyDramaRetryPluginFixture(t *testing.T, key, declaration string) *jsplugin.LoadedPlugin {
+	t.Helper()
+	previousRegistry, previousTimeout := jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes
+	jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes = jsplugin.NewRegistry(), 60
+	t.Cleanup(func() { jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes = previousRegistry, previousTimeout })
+	sourcePath := os.Getenv("NEWAPI_DRAMA_PLUGIN_SOURCE")
+	if sourcePath == "" {
+		sourcePath = filepath.Join("..", "plugins", "tasks", "drama", "plugin.js")
+	}
+	source, err := os.ReadFile(sourcePath)
+	require.NoError(t, err)
+	legacy := regexp.MustCompile(`(?s)\s*videoRetryInputs:\s*\[.*?\],`).ReplaceAllString(string(source), "")
+	if key != "" {
+		legacy = strings.Replace(legacy, `key: "drama"`, `key: "`+key+`"`, 1)
+	}
+	legacy = strings.Replace(legacy, "export const meta = {", "export const meta = {"+declaration, 1)
+	plugin, err := jsplugin.DefaultRegistry.Register(legacy, jsplugin.Options{})
+	require.NoError(t, err)
+	return plugin
+}
+
+func TestLegacyDramaMixedVideoReferenceSlots(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, declaration, body string
+		paths, kinds, roles          []string
+		unsupported                  bool
+	}{
+		{name: "ordered references", body: `{"model":"seedance2.5-A","prompt":"@图片1 @视频1 @图片2","seconds":5,"resolution":"720p","references":[{"type":"image","role":"reference","source":"https://source.example/first.png"},{"type":"video","role":"reference","source":"https://source.example/clip.mp4"},{"type":"image","role":"reference","source":"https://source.example/last.png"}]}`, paths: []string{"/references/0/source", "/references/1/source", "/references/2/source"}, kinds: []string{"image", "video", "image"}, roles: []string{"reference", "reference", "reference"}},
+		{name: "pinned frame roles", body: `{"model":"seedance2.0-A","prompt":"first and last frame","references":[{"type":"image","role":"first_frame","source":"https://source.example/first.png"},{"type":"image","role":"last_frame","source":"https://source.example/last.png"}]}`, paths: []string{"/references/0/source", "/references/1/source"}, kinds: []string{"image", "image"}, roles: []string{"first_frame", "last_frame"}},
+		{name: "legacy arrays", body: `{"reference_images":["https://source.example/image.png"],"reference_videos":["https://source.example/clip.mp4"],"reference_audios":["https://source.example/audio.wav"]}`, paths: []string{"/reference_images/0", "/reference_videos/0", "/reference_audios/0"}, kinds: []string{"image", "video", "audio"}},
+		{name: "frame aliases", body: `{"first_image":"https://source.example/first.png","last_image":"https://source.example/last.png"}`, paths: []string{"/first_image", "/last_image"}, kinds: []string{"image", "image"}},
+		{name: "video edit", body: `{"video":"https://source.example/clip.mp4","image":"https://source.example/image.png"}`, paths: []string{"/image", "/video"}, kinds: []string{"image", "video"}},
+		{name: "inline and private assets", body: `{"references":[{"type":"image","source":"data:image/png;base64,aW1hZ2U="},{"type":"video","source":"asset://private"}],"prompt":"https://source.example/prompt.png"}`},
+		{name: "unsupported media", body: `{"references":[{"type":"file","source":"https://source.example/private"}]}`, unsupported: true},
+		{name: "explicit declaration remains authoritative", declaration: `videoRetryInputs:[{path:"/image",kind:"image"}],`, body: `{"image":"https://source.example/image.png","references":[{"type":"video","source":"https://source.example/clip.mp4"}]}`, paths: []string{"/image"}, kinds: []string{"image"}},
+		{name: "other plugins do not inherit Drama compatibility", key: "another-video", body: `{"references":[{"type":"image","source":"https://source.example/image.png"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := legacyDramaRetryPluginFixture(t, tc.key, tc.declaration)
+			if tc.declaration == "" {
+				require.Empty(t, plugin.Meta.VideoRetryInputs)
+			}
+			now := time.Now().Unix()
+			request := AsyncVideoRequest{Body: []byte(tc.body), ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key, Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: "public-video"}}
+			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, now+5*86400))
+			require.Equal(t, 2, request.ReferenceRecoveryVersion)
+			assert.Equal(t, []byte(tc.body), request.Body)
+			assert.Equal(t, []byte(tc.body), request.OriginalBody)
+			for _, rebound := range []bool{false, true} {
+				if rebound {
+					// A channel change rebuilds slots from the original public body.
+					request.Body = []byte(`{"references":[]}`)
+					require.NoError(t, RebindMixedVideoRequest(&request, MixedVideoCandidate{Binding: jsplugin.ProtocolBinding{Plugin: plugin}}, now+5*86400))
+				}
+				require.Len(t, request.ReferenceInputs, len(tc.paths))
+				assert.Equal(t, tc.unsupported, request.ReferenceLocalizationUnsupported)
+				for index, input := range request.ReferenceInputs {
+					assert.Equal(t, tc.paths[index], input.Path)
+					assert.Equal(t, tc.kinds[index], input.Kind)
+					if tc.roles != nil {
+						assert.Equal(t, tc.roles[index], input.Role)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
+	job, cfg, imageCfg := mediaInputFixture(t)
+	plugin := legacyDramaRetryPluginFixture(t, "", "")
+	require.Empty(t, plugin.Meta.VideoRetryInputs)
+	body := []byte(`{"model":"seedance2.5-A","prompt":"@图片1 preserve https://source.example/image.png literally","seconds":5,"resolution":"720p","references":[{"type":"image","role":"reference","source":"https://source.example/image.png"}]}`)
+	request := AsyncVideoRequest{Body: body, ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: "seedance2.5-A", Group: "default"}}
+	require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, job.ExpiresAt))
+	request.Details = request.RequestDetails()
+	encoded, err := common.Marshal(request)
+	require.NoError(t, err)
+	job.RequestCipher, err = EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	require.NoError(t, err)
+	job.ChannelId, job.Provider, job.Model, job.Quota, job.BillingStatus, job.AttemptGeneration = 22, "drama", "seedance2.5-A", 100, "reserved", 0
+	require.NoError(t, model.DB.Save(&job).Error)
+	task := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Status: model.TaskStatusSubmitted, Quota: job.Quota, Properties: model.Properties{OriginModelName: job.Model, UpstreamModelName: job.Model}}
+	task.PrivateData = model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, TokenId: job.TokenId, UpstreamTaskID: "native-original", CurrentAttempt: &model.VideoTaskAttempt{MixedVideo: true, PluginKey: "drama"}}
+	require.NoError(t, model.DB.Create(&task).Error)
+	policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "download", Name: "Local reference recovery", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"素材下载超时"}}, Steps: []mediaretry.Step{{ID: "local", Action: mediaretry.LocalSameChannel, MaxAttempts: 1}}}}}
+	_, err = model.SaveMediaRetryPolicy(t.Context(), policy, 0, job.UserId, nil)
+	require.NoError(t, err)
+	const reason = "（图片1）素材下载超时，请联系管理员处理"
+	scheduled, err := TryAsyncVideoReferenceRecovery(t.Context(), task, &relaycommon.TaskInfo{TaskID: "native-original", Status: string(model.TaskStatusFailure), Reason: reason}, 200, []byte(`{"id":"native-original","status":"failed","metadata":{"url":"`+reason+`"}}`))
+	require.NoError(t, err)
+	require.True(t, scheduled)
+	require.NoError(t, model.DB.First(&task, task.ID).Error)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	require.NotNil(t, task.PrivateData.MediaRetryDecision)
+	assert.Equal(t, mediaretry.LocalSameChannel, task.PrivateData.MediaRetryDecision.Action)
+	assert.Empty(t, task.PrivateData.MediaRetryDecision.BlockedReason)
+	assert.Equal(t, "prepare", job.ReferenceRecoveryStage)
+	assert.Equal(t, "reserved", job.BillingStatus)
+	assert.Equal(t, 100, job.Quota)
+	assert.Equal(t, int64(1), task.AttemptGeneration)
+	require.Len(t, task.PrivateData.VideoAttempts, 1)
+	assert.Equal(t, "native-original", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+	// Recovery survives persistence without falling back to display-only details.
+	plain, err := DecryptImagePayload(retainAsyncVideoRequestDetails(job), "media-request:"+job.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, common.Unmarshal(plain, &request))
+	require.Len(t, request.ReferenceInputs, 1)
+	payload := asyncImageBytesFixture(t).Data
+	var remaining atomic.Int64
+	remaining.Store(cfg.MaxFileBytes)
+	downloads := 0
+	client := &http.Client{Transport: mediaInputRoundTripper(func(req *http.Request) (*http.Response, error) {
+		downloads++
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Request: req}, nil
+	})}
+	_, err = downloadMediaInput(t.Context(), job, request.ReferenceInputs[0], cfg, imageCfg, request.ReferenceURLExpiresAt, &remaining, client)
+	require.NoError(t, err)
+	prepared, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+	require.NoError(t, err)
+	assert.True(t, prepared.LocalReferencesReady)
+	var preparedBody map[string]any
+	require.NoError(t, common.Unmarshal(prepared.Body, &preparedBody))
+	var expectedBody map[string]any
+	require.NoError(t, common.Unmarshal(body, &expectedBody))
+	localSource := preparedBody["references"].([]any)[0].(map[string]any)["source"]
+	assert.Contains(t, localSource, "/api/media-inputs/")
+	expectedBody["references"].([]any)[0].(map[string]any)["source"] = localSource
+	assert.Equal(t, expectedBody, preparedBody, "only the frozen source changes; prompt, order, roles and generation parameters survive")
+	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": job.Model, "body": map[string]any{"kind": "json", "value": preparedBody}})
+	require.NoError(t, err)
+	intent, ok := value.(map[string]any)
+	require.True(t, ok)
+	value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": job.Model, "baseUrl": "https://upstream.example", "apiKey": "test", "requestBody": intent["requestBody"]})
+	require.NoError(t, err)
+	encoded, err = common.Marshal(value)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "/api/media-inputs/")
+	assert.Contains(t, string(encoded), "source.example/image.png literally")
+	reused, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(prepared.Body), string(reused.Body))
+	assert.Equal(t, 1, downloads)
 }
