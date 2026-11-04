@@ -169,6 +169,35 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 	return nil
 }
 
+// videoRetryInputSelectors keeps reference freezing and retry channel admission
+// consistent for older Drama site overrides that predate videoRetryInputs.
+func videoRetryInputSelectors(meta jsplugin.Meta) []jsplugin.VideoRetryInput {
+	if len(meta.VideoRetryInputs) > 0 || meta.Key != "drama" {
+		return meta.VideoRetryInputs
+	}
+	return []jsplugin.VideoRetryInput{
+		{Path: "/references/*/source", Kind: "media"},
+		{Path: "/reference_images/*", Kind: "image"},
+		{Path: "/images/*", Kind: "image"},
+		{Path: "/image_urls/*", Kind: "image"},
+		{Path: "/referenceImages/*", Kind: "image"},
+		{Path: "/reference_videos/*", Kind: "video"},
+		{Path: "/videos/*", Kind: "video"},
+		{Path: "/video_urls/*", Kind: "video"},
+		{Path: "/referenceVideos/*", Kind: "video"},
+		{Path: "/reference_audios/*", Kind: "audio"},
+		{Path: "/audios/*", Kind: "audio"},
+		{Path: "/audio_urls/*", Kind: "audio"},
+		{Path: "/referenceAudios/*", Kind: "audio"},
+		{Path: "/image", Kind: "image"},
+		{Path: "/input_reference", Kind: "image"},
+		{Path: "/first_image", Kind: "image"},
+		{Path: "/last_frame", Kind: "image"},
+		{Path: "/last_image", Kind: "image"},
+		{Path: "/video", Kind: "video"},
+	}
+}
+
 func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 	plugin, found := jsplugin.DefaultRegistry.Get(request.Execution.TaskPlugin.Key)
 	if !found || constant.TaskTimeoutMinutes <= 0 {
@@ -186,36 +215,9 @@ func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 	if err := common.Unmarshal(request.Body, &body); err != nil {
 		return err
 	}
-	selectors := plugin.Meta.VideoRetryInputs
-	if len(selectors) == 0 && plugin.Meta.Key == "drama" {
-		// Older site overrides predate videoRetryInputs. Mixed routing must
-		// still freeze their known public input fields before the first submit.
-		// Keep explicit declarations authoritative and other plugins opt-in.
-		selectors = []jsplugin.VideoRetryInput{
-			{Path: "/references/*/source", Kind: "media"},
-			{Path: "/reference_images/*", Kind: "image"},
-			{Path: "/images/*", Kind: "image"},
-			{Path: "/image_urls/*", Kind: "image"},
-			{Path: "/referenceImages/*", Kind: "image"},
-			{Path: "/reference_videos/*", Kind: "video"},
-			{Path: "/videos/*", Kind: "video"},
-			{Path: "/video_urls/*", Kind: "video"},
-			{Path: "/referenceVideos/*", Kind: "video"},
-			{Path: "/reference_audios/*", Kind: "audio"},
-			{Path: "/audios/*", Kind: "audio"},
-			{Path: "/audio_urls/*", Kind: "audio"},
-			{Path: "/referenceAudios/*", Kind: "audio"},
-			{Path: "/image", Kind: "image"},
-			{Path: "/input_reference", Kind: "image"},
-			{Path: "/first_image", Kind: "image"},
-			{Path: "/last_frame", Kind: "image"},
-			{Path: "/last_image", Kind: "image"},
-			{Path: "/video", Kind: "video"},
-		}
-	}
 	seen := make(map[string]bool)
 	counts := make(map[string]int)
-	for _, selector := range selectors {
+	for _, selector := range videoRetryInputSelectors(plugin.Meta) {
 		slots := []videoRetrySlot{{Value: body}}
 		for part := range strings.SplitSeq(strings.TrimPrefix(selector.Path, "/"), "/") {
 			var next []videoRetrySlot

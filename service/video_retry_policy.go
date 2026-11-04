@@ -179,7 +179,7 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 				return true
 			}
 			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
-			return err != nil || (decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel) && len(candidate.Binding.Plugin.Meta.VideoRetryInputs) == 0
+			return err != nil || (decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel) && len(videoRetryInputSelectors(candidate.Binding.Plugin.Meta)) == 0
 		})
 		return channels, MediaPoolBindingKey(policy, job.Model, request.MixedRouting.Resolution, "video"), nil
 	}
