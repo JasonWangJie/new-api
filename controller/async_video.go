@@ -31,6 +31,7 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -484,7 +485,7 @@ func AcceptAsyncVideo(c *gin.Context) {
 		}
 	}
 	var channel model.Channel
-	if c.GetString("task_plugin_key") == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(c.GetString("task_plugin_key")) {
 		value, _ := c.Get("task_video_channel_snapshot")
 		data, _ := value.([]byte)
 		if common.Unmarshal(data, &channel) != nil || channel.Id != job.ChannelId {
@@ -691,7 +692,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				return
 			}
 		}
-		if job.Provider == "sudashui" {
+		if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
 			// Model selection and capabilities were frozen at admission. Keep
 			// checking live group access without consulting the edited model list.
 			if !slices.Contains(strings.Split(liveChannel.Group, ","), job.Group) {

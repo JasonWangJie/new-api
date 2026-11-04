@@ -552,6 +552,9 @@ export function ChannelMutateDrawer({
   const isSudashui =
     currentType === CHANNEL_TYPE_TASK_PLUGIN &&
     currentTaskPluginKey === 'sudashui'
+  const isHuahuoVideo =
+    currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+    currentTaskPluginKey === 'huahuo-video'
   const canFetchModels = MODEL_FETCHABLE_TYPES.has(currentType) || isSudashui
   const currentModelSourceURL = formValues.task_plugin_model_source_url
   const currentKey = formValues.key
@@ -781,7 +784,10 @@ export function ChannelMutateDrawer({
         if (!isEditing && !providerTarget && !form.getValues('name').trim()) {
           form.setValue('name', plugin.name)
         }
-        if (plugin.models.length && plugin.key !== 'sudashui') {
+        if (
+          plugin.models.length &&
+          !['sudashui', 'huahuo-image', 'huahuo-video'].includes(plugin.key)
+        ) {
           form.setValue('models', formatModelsArray(plugin.models), {
             shouldDirty: true,
           })
@@ -3277,8 +3283,9 @@ export function ChannelMutateDrawer({
               </div>
             )}
 
-            {isSudashui && (
+            {(isSudashui || isHuahuoVideo) && (
               <TaskVideoModelEditor
+                manualOnly={isHuahuoVideo}
                 sourceURL={currentModelSourceURL || ''}
                 onSourceURLChange={(value) =>
                   form.setValue('task_plugin_model_source_url', value, {

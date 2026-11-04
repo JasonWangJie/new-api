@@ -652,7 +652,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 			return types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
 		candidate.Plugin = selected
-		if selected.Meta.Key == "sudashui" {
+		if dto.ChannelConfiguredTaskVideoPlugin(selected.Meta.Key) {
 			_, config, _ := channel.TaskVideoModelConfig(executionModel)
 			c.Set("task_video_model_config", config)
 		}
@@ -720,7 +720,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
-	if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "sudashui" {
+	if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
 		// Admission must freeze the same channel that supplied the model profile,
 		// mapping and price, even if an administrator saves it before admission.
 		frozen := *channel

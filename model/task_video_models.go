@@ -31,7 +31,7 @@ func (channel *Channel) TaskVideoModelConfig(publicModel string) (string, dto.Ta
 	if !exists {
 		return "", config, fmt.Errorf("model %s requires a saved capability configuration", upstream)
 	}
-	return upstream, config, config.Validate(relaycommon.MaxTaskDurationSeconds)
+	return upstream, config, config.ValidateForPlugin(settings.TaskPluginKey, relaycommon.MaxTaskDurationSeconds)
 }
 
 // ValidateTaskVideoModelBindings prevents one retail model from changing units
@@ -41,7 +41,8 @@ func (channel *Channel) ValidateTaskVideoModelBindings() error {
 }
 
 func (channel *Channel) validateTaskVideoModelBindings(db *gorm.DB) error {
-	if channel.Type != constant.ChannelTypeTaskPlugin || channel.GetSetting().TaskPluginKey != "sudashui" {
+	pluginKey := channel.GetSetting().TaskPluginKey
+	if channel.Type != constant.ChannelTypeTaskPlugin || !dto.ChannelConfiguredTaskVideoPlugin(pluginKey) {
 		return nil
 	}
 	units := map[string]string{}
@@ -64,7 +65,7 @@ func (channel *Channel) validateTaskVideoModelBindings(db *gorm.DB) error {
 		return err
 	}
 	for _, other := range others {
-		if other.GetSetting().TaskPluginKey != "sudashui" {
+		if other.GetSetting().TaskPluginKey != pluginKey {
 			continue
 		}
 		for name := range strings.SplitSeq(other.Models, ",") {
@@ -81,12 +82,12 @@ func (channel *Channel) validateTaskVideoModelBindings(db *gorm.DB) error {
 	return nil
 }
 
-func taskVideoModelCatalog(channels []Channel) (map[string]dto.TaskVideoModelConfig, error) {
+func taskVideoModelCatalog(channels []Channel, pluginKey string) (map[string]dto.TaskVideoModelConfig, error) {
 	catalog := map[string]dto.TaskVideoModelConfig{}
 	publicCatalog := map[string]dto.TaskVideoModelConfig{}
 	units := map[string]string{}
 	for _, channel := range channels {
-		if channel.Status != common.ChannelStatusEnabled || channel.GetSetting().TaskPluginKey != "sudashui" {
+		if channel.Status != common.ChannelStatusEnabled || channel.GetSetting().TaskPluginKey != pluginKey {
 			continue
 		}
 		for name := range strings.SplitSeq(channel.Models, ",") {

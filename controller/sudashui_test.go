@@ -26,6 +26,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -48,6 +49,97 @@ func sudashuiFixture(t *testing.T) (*jsplugin.LoadedPlugin, dto.TaskVideoModelCo
 	config := dto.TaskVideoModelConfig{Duration: dto.TaskVideoDuration{Min: 4, Max: 10, Step: 2}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame"}, References: dto.TaskVideoReferences{Images: &images, Videos: &videos, Audios: &audios}, BillingMode: "per_second"}
 	require.NoError(t, config.Validate(relaycommon.MaxTaskDurationSeconds))
 	return plugin, config
+}
+
+func TestHuahuoDynamicVideoModelBindings(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	_, config := sudashuiFixture(t)
+	source, err := plugins.Source("huahuo-video")
+	require.NoError(t, err)
+	_, err = jsplugin.CompilePlugin(source, jsplugin.Options{Key: "huahuo-video"})
+	require.ErrorContains(t, err, "models must contain at least one model")
+	plugin, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "huahuo-video"})
+	require.NoError(t, err)
+	require.Empty(t, plugin.Meta.Models)
+
+	const publicModel, upstream = "my-huahuo-video", "vendor/future-video"
+	mapping := `{"my-huahuo-video":"vendor/future-video"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Models: publicModel, Status: common.ChannelStatusEnabled, ModelMapping: &mapping}
+	config.Resolutions = []string{"540p", "720p", "1080p"}
+	config.DurationsByResolution = map[string]dto.TaskVideoDuration{
+		"1080p": {Values: []int{8, 10}, Default: 10},
+		"540p":  {Values: []int{4}},
+	}
+	config.References.ImageUpload = true
+	config.References.ImageDataURI = true
+	settings := dto.ChannelSettings{TaskPluginKey: "huahuo-video", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{upstream: config}}
+	channel.SetSetting(settings)
+	require.NoError(t, channel.ValidateSettings())
+	require.NoError(t, channel.ValidateTaskVideoModelBindings())
+	require.NoError(t, model.DB.Create(&channel).Error)
+	snapshot, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+	binding, ok := jsplugin.DefaultRegistry.Generation().LookupEndpoint("POST", "/v1/videos", publicModel)
+	require.True(t, ok)
+	assert.Equal(t, "huahuo-video", binding.Plugin.Meta.Key)
+	assert.NotContains(t, snapshot.VideoModels["sudashui"], publicModel)
+	selected, err := service.ChannelTaskVideoPlugin(binding.Plugin, &channel, publicModel)
+	require.NoError(t, err)
+	profile, found := selected.Meta.VideoProfileForModel(upstream)
+	require.True(t, found)
+	request := map[string]any{"model": publicModel, "prompt": "Draw the sky", "seconds": 6, "resolution": "720p", "aspect_ratio": "16:9"}
+	require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil))
+	request["resolution"] = "1080p"
+	require.ErrorContains(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil), "duration is outside")
+	request["seconds"] = 8
+	require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil))
+	request["image"] = "https://cdn.example/start.png"
+	require.NoError(t, service.ValidateVideoProfileRequest(profile, "first_last_frame", request, nil))
+	request["last_frame"] = "https://cdn.example/end.png"
+	require.NoError(t, service.ValidateVideoProfileRequest(profile, "first_last_frame", request, nil))
+	request["last_frame"] = "data:image/png;base64,YQ=="
+	require.ErrorContains(t, service.ValidateVideoProfileRequest(profile, "first_last_frame", request, nil), "does not allow source")
+	mixedBody := []byte(`{"model":"my-huahuo-video","prompt":"Animate this frame","size":"16:9","resolution":"1080p","start_frame":"https://cdn.example/start.png"}`)
+	normalized, contentType, defaults, err := service.NormalizeMixedVideoDefaults(mixedBody, "application/json", "create", []jsplugin.VideoProfile{profile})
+	require.NoError(t, err)
+	assert.Equal(t, float64(10), defaults["seconds"])
+	mixed, err := service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", normalized, service.VideoModelOverrides{}, 1, contentType)
+	require.NoError(t, err)
+	assert.Equal(t, "first_last_frame", mixed.Intent["action"])
+	assert.Equal(t, upstream, mixed.UpstreamModel)
+	direct := map[string]any{"seconds": 4, "resolution": "540p", "aspect_ratio": "16:9"}
+	require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", direct, nil))
+	channelBinding, _, err := service.MixedVideoChannelBinding(channel, publicModel, "create")
+	require.NoError(t, err)
+	mixedProfile, err := service.EffectiveMixedVideoProfile(channelBinding, publicModel, service.VideoModelOverrides{})
+	require.NoError(t, err)
+	assert.Equal(t, "720p", mixedProfile.Modes[0].DefaultResolution)
+	assert.NotContains(t, mixedProfile.Modes[0].Resolutions, "540p")
+	nonRetailResolution := []byte(`{"model":"my-huahuo-video","prompt":"Generate a short video","size":"16:9","resolution":"540p","seconds":4}`)
+	_, err = service.DecodeMixedVideoCandidate(t.Context(), channel, publicModel, "create", nonRetailResolution, service.VideoModelOverrides{}, 1, "application/json")
+	require.ErrorContains(t, err, "output resolution is invalid")
+
+	frozen := channel
+	require.NoError(t, model.DB.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	disabled, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, disabled.VideoModels))
+	assert.Empty(t, jsplugin.DefaultRegistry.Generation().LookupEndpointCandidates("POST", "/v1/videos", publicModel))
+	_, err = service.FrozenTaskVideoBinding(&frozen, publicModel)
+	require.NoError(t, err)
+
+	previousPrices := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"my-huahuo-video":0.02}`))
+	withTieredBillingConfig(t, nil, nil)
+	assert.Equal(t, "needs_configuration", videoPricingStatus("huahuo-video", publicModel, publicModel, selected, &frozen))
+	withTieredBillingConfig(t, map[string]string{publicModel: "tiered_expr"}, map[string]string{publicModel: "0.02"})
+	assert.Equal(t, "invalid_configuration", videoPricingStatus("huahuo-video", publicModel, publicModel, selected, &frozen))
+	withTieredBillingConfig(t, map[string]string{publicModel: "tiered_expr"}, map[string]string{publicModel: `u("seconds") * 0.02`})
+	assert.Equal(t, "configured", videoPricingStatus("huahuo-video", publicModel, publicModel, selected, &frozen))
+	withTieredBillingConfig(t, map[string]string{upstream: "tiered_expr"}, map[string]string{upstream: `u("seconds") * 0.02`})
+	assert.Equal(t, "configured", videoPricingStatus("huahuo-video", publicModel, publicModel, selected, &frozen))
 }
 
 func TestSudashuiDynamicChannelModelsAndFrozenTasks(t *testing.T) {
@@ -110,7 +202,7 @@ func TestSudashuiDynamicChannelModelsAndFrozenTasks(t *testing.T) {
 	assert.Equal(t, gatewaydto.FilterTaskVideoCapability, kind)
 	require.Error(t, service.ValidateVideoProfileRequest(profile, "text_to_video", map[string]any{"seconds": 5, "resolution": "720p"}, nil))
 	// The previously selected engine/profile remains executable after publication.
-	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]dto.TaskVideoModelConfig{}))
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]map[string]dto.TaskVideoModelConfig{}))
 	assert.Empty(t, jsplugin.DefaultRegistry.Generation().LookupEndpointCandidates("POST", "/v1/videos", "public-video"))
 	require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil))
 	assert.Same(t, plugin.Engine, binding.Plugin.Engine)
@@ -287,7 +379,7 @@ func TestSudashuiQueuedMixedTaskRetainsRemovedModel(t *testing.T) {
 	job := model.AsyncMediaJob{Model: route.Model, Group: "default", ChannelId: channel.Id, UserId: user.Id, TokenId: token.Id, Provider: "sudashui"}
 	request := service.AsyncVideoRequest{Channel: channel, Body: []byte(`{"model":"frozen-video","prompt":"test","seconds":6,"resolution":"720p"}`), ContentType: "application/json", Operation: "create", PluginHash: plugin.Engine.SourceFingerprint(), MixedRouting: route}
 	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"models": "", "setting": `{"task_plugin_key":"sudashui"}`}).Error)
-	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]dto.TaskVideoModelConfig{}))
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]map[string]dto.TaskVideoModelConfig{}))
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest("POST", "/v1/videos", nil)
@@ -371,7 +463,7 @@ func TestSudashuiCatalogReadsAndTagWrites(t *testing.T) {
 	require.NoError(t, video.Insert())
 	before, err := model.GetTaskPluginSyncSnapshot()
 	require.NoError(t, err)
-	assert.Contains(t, before.VideoModels, video.Models)
+	assert.Contains(t, before.VideoModels["sudashui"], video.Models)
 
 	missingMapping := `{"public-video":"missing-video"}`
 	renamed := "new-tag"
@@ -397,7 +489,7 @@ func TestSudashuiCatalogReadsAndTagWrites(t *testing.T) {
 	after, err = model.GetTaskPluginSyncSnapshot()
 	require.NoError(t, err)
 	assert.NotEqual(t, before.Revision, after.Revision)
-	assert.Contains(t, after.VideoModels, updatedModels)
+	assert.Contains(t, after.VideoModels["sudashui"], updatedModels)
 	var abilities []model.Ability
 	require.NoError(t, db.Where("channel_id = ?", video.Id).Find(&abilities).Error)
 	require.Len(t, abilities, 1)
@@ -892,7 +984,7 @@ func TestSudashuiRoutedSubmitPollAndFrozenBilling(t *testing.T) {
 			assert.Equal(t, quota, task.Quota)
 			// A live model removal cannot change an accepted task's execution or price.
 			require.NoError(t, model.DB.Model(&channel).Updates(map[string]any{"models": "", "setting": `{"task_plugin_key":"sudashui"}`}).Error)
-			require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]dto.TaskVideoModelConfig{}))
+			require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, map[string]map[string]dto.TaskVideoModelConfig{}))
 			previousAdaptor := service.GetTaskAdaptorFunc
 			service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
 			t.Cleanup(func() { service.GetTaskAdaptorFunc = previousAdaptor })

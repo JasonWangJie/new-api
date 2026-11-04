@@ -349,7 +349,7 @@ func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dt
 		}
 		var image ImageBytes
 		if credentialless {
-			image, err = downloadPublicUpstreamAsyncImage(ctx, raw, cfg)
+			image, err = downloadPublicUpstreamAsyncImage(ctx, raw, cfg, false)
 		} else {
 			image, err = downloadCredentialedUpstreamAsyncImage(ctx, raw, baseURL, proxy, headers, cfg)
 		}
@@ -362,11 +362,19 @@ func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dt
 }
 
 var ErrUpstreamAsyncImageTransport = errors.New("image result transport failed")
+var ErrHuahuoImageResultURLExpired = errors.New("Huahuo image delivery URL may have expired")
 
-func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+func DownloadHuahuoImageResult(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
+	return downloadPublicUpstreamAsyncImage(ctx, raw, cfg, true)
+}
+
+func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg ImageRuntimeConfig, httpsOnly bool) (ImageBytes, error) {
 	parsed, err := validatePublicUpstreamAsyncImageURL(raw)
 	if err != nil {
 		return ImageBytes{}, err
+	}
+	if httpsOnly && parsed.Scheme != "https" {
+		return ImageBytes{}, errors.New("Huahuo image delivery requires HTTPS")
 	}
 	dialer := &net.Dialer{Timeout: time.Duration(cfg.DownloadTimeout) * time.Second}
 	baseClient := imageReferenceClient(cfg, net.DefaultResolver, dialer.DialContext)
@@ -375,11 +383,22 @@ func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg Image
 		if len(via) > cfg.DownloadRedirects {
 			return errors.New("image result redirect limit exceeded")
 		}
+		if httpsOnly && request.URL.Scheme != "https" {
+			return errors.New("Huahuo image delivery requires HTTPS")
+		}
 		_, err := validatePublicUpstreamAsyncImageURL(request.URL.String())
 		return err
 	}
 	defer client.CloseIdleConnections()
-	return downloadUpstreamAsyncImage(ctx, &client, parsed.String(), nil, cfg)
+	image, err := downloadUpstreamAsyncImage(ctx, &client, parsed.String(), nil, cfg)
+	var statusErr *upstreamImageDownloadStatusError
+	if httpsOnly && errors.As(err, &statusErr) {
+		switch statusErr.status {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+			return ImageBytes{}, ErrHuahuoImageResultURLExpired
+		}
+	}
+	return image, err
 }
 
 func downloadCredentialedUpstreamAsyncImage(ctx context.Context, raw, baseURL, proxy string, headers map[string]string, cfg ImageRuntimeConfig) (ImageBytes, error) {
@@ -429,7 +448,7 @@ func downloadCredentialedUpstreamAsyncImage(ctx context.Context, raw, baseURL, p
 			}
 			anonymous := cfg
 			anonymous.DownloadRedirects = cfg.DownloadRedirects - redirects - 1
-			return downloadPublicUpstreamAsyncImage(ctx, location.String(), anonymous)
+			return downloadPublicUpstreamAsyncImage(ctx, location.String(), anonymous, false)
 		default:
 			defer response.Body.Close()
 			return readUpstreamAsyncImageResponse(response, cfg)
@@ -456,12 +475,18 @@ func downloadUpstreamAsyncImage(ctx context.Context, client *http.Client, raw st
 	return readUpstreamAsyncImageResponse(response, cfg)
 }
 
+type upstreamImageDownloadStatusError struct{ status int }
+
+func (err *upstreamImageDownloadStatusError) Error() string {
+	return fmt.Sprintf("image result returned HTTP %d", err.status)
+}
+
 func readUpstreamAsyncImageResponse(response *http.Response, cfg ImageRuntimeConfig) (ImageBytes, error) {
 	if response.StatusCode != http.StatusOK {
 		if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
 			return ImageBytes{}, ErrUpstreamAsyncImageTransport
 		}
-		return ImageBytes{}, fmt.Errorf("image result returned HTTP %d", response.StatusCode)
+		return ImageBytes{}, &upstreamImageDownloadStatusError{status: response.StatusCode}
 	}
 	if response.ContentLength > cfg.DownloadMaxBytes {
 		return ImageBytes{}, newImageValidationError("image result byte limit exceeded")

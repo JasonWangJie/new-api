@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/QuantumNous/new-api/dto"
@@ -15,30 +16,44 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 	filter := dto.ChannelFilter{Kind: dto.FilterTaskVideoCapability}
 	value, exists := c.Get(jsplugin.ContextKeyProtocolRequest)
 	request, valid := value.(jsplugin.ProtocolRequestContext)
-	plugin, found := jsplugin.DefaultRegistry.Get("sudashui")
-	if !exists || !valid || !found || request.Protocol != "openai_video" {
+	if !exists || !valid || request.Protocol != "openai_video" {
 		return filter
 	}
-	decoded, err := plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, request.JSValue())
-	body, ok := decoded.(map[string]any)
+	type decodedVideo struct {
+		plugin *jsplugin.LoadedPlugin
+		intent map[string]any
+	}
+	decoded := make(map[string]decodedVideo)
+	for _, key := range []string{"sudashui", "huahuo-video"} {
+		plugin, found := jsplugin.DefaultRegistry.Get(key)
+		if !found {
+			continue
+		}
+		result, err := plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, request.JSValue())
+		intent, ok := result.(map[string]any)
+		if err == nil && ok && intent["kind"] == "submit" && intent["model"] == request.Model {
+			decoded[key] = decodedVideo{plugin, intent}
+		}
+	}
 	filter.TaskVideoValidator = func(settings kitdto.ChannelSettings, upstream string) bool {
-		if err != nil || !ok {
+		body, ok := decoded[settings.TaskPluginKey]
+		if !ok {
 			return false
 		}
 		config, exists := settings.TaskPluginModelConfigs[upstream]
 		if !exists {
 			return false
 		}
-		selected := jsplugin.WithTaskVideoModels(plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})
+		selected := jsplugin.WithTaskVideoModels(body.plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})
 		profile, exists := selected.Meta.VideoProfileForModel(upstream)
-		action, _ := body["action"].(string)
-		return exists && ValidateVideoProfileRequest(profile, action, body["requestBody"], nil) == nil
+		action, _ := body.intent["action"].(string)
+		return exists && ValidateVideoProfileRequest(profile, action, body.intent["requestBody"], request.Files) == nil
 	}
 	return filter
 }
 
 func ChannelTaskVideoPlugin(plugin *jsplugin.LoadedPlugin, channel *model.Channel, publicModel string) (*jsplugin.LoadedPlugin, error) {
-	if plugin == nil || plugin.Meta.Key != "sudashui" {
+	if plugin == nil || !kitdto.ChannelConfiguredTaskVideoPlugin(plugin.Meta.Key) {
 		return plugin, nil
 	}
 	upstream, config, err := channel.TaskVideoModelConfig(publicModel)
@@ -52,9 +67,13 @@ func ChannelTaskVideoPlugin(plugin *jsplugin.LoadedPlugin, channel *model.Channe
 // snapshot even if that model was subsequently removed from live discovery.
 func FrozenTaskVideoBinding(channel *model.Channel, publicModel string) (jsplugin.ProtocolBinding, error) {
 	generation := jsplugin.DefaultRegistry.Generation()
-	plugin, found := generation.Get("sudashui")
+	key := channel.GetSetting().TaskPluginKey
+	if generation == nil || !kitdto.ChannelConfiguredTaskVideoPlugin(key) {
+		return jsplugin.ProtocolBinding{}, errors.New("configured video plugin is unavailable")
+	}
+	plugin, found := generation.Get(key)
 	if !found {
-		return jsplugin.ProtocolBinding{}, fmt.Errorf("Sudashui plugin is unavailable")
+		return jsplugin.ProtocolBinding{}, fmt.Errorf("video plugin %s is unavailable", key)
 	}
 	selected, err := ChannelTaskVideoPlugin(plugin, channel, publicModel)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 )
 
 var filterEvalOrder = []dto.ChannelFilterKind{
@@ -93,7 +94,7 @@ func candidatePassesKindFilters(ch *Channel, exists bool, modelName string, kind
 func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilter) bool {
 	switch filter.Kind {
 	case dto.FilterTaskVideoCapability:
-		if ch.Type != constant.ChannelTypeTaskPlugin || ch.GetSetting().TaskPluginKey != "sudashui" || filter.TaskVideoValidator == nil {
+		if ch.Type != constant.ChannelTypeTaskPlugin || !kitdto.ChannelConfiguredTaskVideoPlugin(ch.GetSetting().TaskPluginKey) || filter.TaskVideoValidator == nil {
 			return true
 		}
 		upstream, _, err := ch.TaskVideoModelConfig(modelName)
@@ -103,6 +104,9 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 			return true
 		}
 		if filter.RequestPath == "/v1/images/generations" || filter.RequestPath == "/v1/images/edits" {
+			if ch.Type == constant.ChannelTypeTaskPlugin && ch.GetSetting().TaskPluginKey == constant.HuahuoImagePluginKey {
+				return false
+			}
 			upstreamModel := modelName
 			if mappingJSON := ch.GetModelMapping(); mappingJSON != "" && mappingJSON != "{}" {
 				mapping := make(map[string]string)

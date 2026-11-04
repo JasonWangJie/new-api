@@ -49,6 +49,7 @@ export type VideoInputCapability = {
 export type VideoModeCapability = {
   name: VideoModeName
   duration?: VideoDurationCapability
+  durationsByResolution?: Record<string, VideoDurationCapability>
   resolutions?: string[]
   defaultResolution?: string
   aspectRatios?: string[]

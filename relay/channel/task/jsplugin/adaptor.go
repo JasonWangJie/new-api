@@ -126,12 +126,18 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	request, hasRequest := c.Get("task_request")
-	if a.plugin.Meta.Key == "sudashui" && hasRequest {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) && hasRequest {
 		profile, exists := a.plugin.Meta.VideoProfileForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
 		if !exists {
 			return service.TaskErrorWrapperLocal(fmt.Errorf("missing saved video model configuration"), "plugin_request_invalid", http.StatusBadRequest)
 		}
-		if err := service.ValidateVideoProfileRequest(profile, info.Action, request, nil); err != nil {
+		var files []map[string]any
+		if value, exists := c.Get(pluginruntime.ContextKeyProtocolRequest); exists {
+			if protocol, valid := value.(pluginruntime.ProtocolRequestContext); valid {
+				files = protocol.Files
+			}
+		}
+		if err := service.ValidateVideoProfileRequest(profile, info.Action, request, files); err != nil {
 			return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
 		}
 	}
@@ -165,7 +171,7 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *TaskAdaptor) EstimateBillingValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]float64, error) {
-	if a.plugin.Meta.Key == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) {
 		facts, err := a.ExtractUsageFactsValidated(c, info)
 		if err != nil {
 			return nil, err
@@ -212,7 +218,7 @@ func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycomm
 	if !ok {
 		return nil, fmt.Errorf("plugin usage hook must return an object")
 	}
-	if a.plugin.Meta.Key == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) {
 		schema, _ := a.plugin.Meta.UsageForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
 		for _, key := range []string{"seconds", "requests"} {
 			if _, declared := schema[key]; !declared {
@@ -262,12 +268,26 @@ func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, erro
 	return a.submit.URL, pluginruntime.ValidateRequestURL(a.submit.URL, info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts)
 }
 
-func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *relaycommon.RelayInfo) error {
+func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) error {
 	if a.submit == nil {
 		return fmt.Errorf("plugin submit request was not built")
 	}
 	for name, value := range a.submit.Headers {
 		req.Header.Set(name, value)
+	}
+	if a.submit.BodyType == "multipart" {
+		req.Header.Set("Content-Type", c.GetHeader("Content-Type"))
+	}
+	if a.plugin.Meta.Key == constant.TaskPlatformHuahuoVideo {
+		if req.Method != http.MethodPost || info.PublicTaskID == "" || info.ApiKey == "" {
+			return fmt.Errorf("invalid HUAHUO video submission request")
+		}
+		req.Header.Set("Authorization", "Bearer "+info.ApiKey)
+		req.Header.Set("Idempotency-Key", info.PublicTaskID)
+		req.Header.Del("X-Idempotency-Key")
+		// The key identifies an uncertain paid send for reconciliation. A body
+		// factory would also let net/http replay it on a reused connection.
+		req.GetBody = nil
 	}
 	return nil
 }
@@ -302,28 +322,27 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 				}
 				continue
 			}
-			field := strings.TrimPrefix(part.FileRef, "request_file:")
-			files := form.File[field]
-			if len(files) == 0 {
+			header := taskMultipartFile(form, part.FileRef)
+			if header == nil {
 				return nil, fmt.Errorf("unknown file reference %q", part.FileRef)
 			}
-			file, openErr := files[0].Open()
+			file, openErr := header.Open()
 			if openErr != nil {
 				return nil, openErr
 			}
 			filename := part.Filename
 			if filename == "" {
-				filename = files[0].Filename
+				filename = header.Filename
 			}
-			header := make(textproto.MIMEHeader)
+			partHeader := make(textproto.MIMEHeader)
 			disposition := mime.FormatMediaType("form-data", map[string]string{"name": part.Name, "filename": filename})
 			if disposition == "" {
 				file.Close()
 				return nil, fmt.Errorf("invalid multipart name or filename")
 			}
-			header.Set("Content-Disposition", disposition)
-			header.Set("Content-Type", files[0].Header.Get("Content-Type"))
-			destination, copyErr := writer.CreatePart(header)
+			partHeader.Set("Content-Disposition", disposition)
+			partHeader.Set("Content-Type", header.Header.Get("Content-Type"))
+			destination, copyErr := writer.CreatePart(partHeader)
 			if copyErr == nil {
 				_, copyErr = io.Copy(destination, file)
 			}
@@ -446,30 +465,10 @@ func encodeFilePlaceholder(placeholder map[string]any, form *multipart.Form, lim
 	if encoding != "base64" && encoding != "dataUrl" {
 		return "", fmt.Errorf("file placeholder encoding must be \"base64\" or \"dataUrl\"")
 	}
-	if form == nil {
+	header := taskMultipartFile(form, ref)
+	if header == nil {
 		return "", fmt.Errorf("unknown file reference %q", ref)
 	}
-	field := strings.TrimPrefix(ref, "request_file:")
-	fileIndex := 0
-	files := form.File[field]
-	if len(files) == 0 {
-		if base, found := strings.CutSuffix(field, ":0"); found {
-			field, files = base, form.File[base]
-		} else if separator := strings.LastIndexByte(field, ':'); separator > 0 {
-			if index, parseErr := strconv.Atoi(field[separator+1:]); parseErr == nil && index >= 0 {
-				field = field[:separator]
-				files = form.File[field]
-				fileIndex = index
-			}
-		}
-	}
-	if len(files) == 0 {
-		return "", fmt.Errorf("unknown file reference %q", ref)
-	}
-	if fileIndex >= len(files) {
-		return "", fmt.Errorf("unknown file reference %q", ref)
-	}
-	header := files[fileIndex]
 	maxBytes := limit
 	if raw, exists := placeholder["maxBytes"]; exists {
 		n, ok := usageNumber(raw, false)
@@ -510,6 +509,26 @@ func encodeFilePlaceholder(placeholder map[string]any, form *multipart.Form, lim
 		mimeType = contentType
 	}
 	return "data:" + mimeType + ";base64," + encoded, nil
+}
+
+func taskMultipartFile(form *multipart.Form, ref string) *multipart.FileHeader {
+	if form == nil {
+		return nil
+	}
+	field := strings.TrimPrefix(ref, "request_file:")
+	if files := form.File[field]; len(files) > 0 {
+		return files[0]
+	}
+	separator := strings.LastIndexByte(field, ':')
+	if separator <= 0 {
+		return nil
+	}
+	index, err := strconv.Atoi(field[separator+1:])
+	files := form.File[field[:separator]]
+	if err != nil || index < 0 || index >= len(files) {
+		return nil
+	}
+	return files[index]
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error) {
@@ -727,6 +746,11 @@ func (a *TaskAdaptor) doFetchDescriptorContext(ctx context.Context, baseURL, pro
 	client, err := service.GetHttpClientWithProxy(proxy)
 	if err != nil {
 		return nil, err
+	}
+	if a.plugin.Meta.Key == constant.TaskPlatformHuahuoVideo {
+		pollClient := *client
+		pollClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &pollClient
 	}
 	started := time.Now()
 	resp, err := client.Do(req)
@@ -1434,6 +1458,13 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 	if err = pluginruntime.ValidateRequestURL(descriptor.URL, info.ChannelBaseUrl, a.plugin.Meta.AllowedHosts); err != nil {
 		logger.LogDebug(c, "task_plugin subsystem=adaptor event=build_submit_failed plugin=%q stage=validate_url reason=url_not_allowed", a.plugin.Meta.Key)
 		return nil, err
+	}
+	if a.plugin.Meta.Key == constant.TaskPlatformHuahuoVideo {
+		address, parseErr := url.Parse(descriptor.URL)
+		if parseErr != nil || address.Scheme != "https" || address.User != nil || address.Fragment != "" || address.RawQuery != "" || address.ForceQuery ||
+			descriptor.Method != http.MethodPost || descriptor.URL != strings.TrimRight(info.ChannelBaseUrl, "/")+"/v1/videos" {
+			return nil, fmt.Errorf("HUAHUO video must submit to the channel HTTPS /v1/videos endpoint")
+		}
 	}
 	if descriptor.Action != "" {
 		info.Action = descriptor.Action

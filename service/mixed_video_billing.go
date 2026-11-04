@@ -26,8 +26,8 @@ func ValidateMixedVideoProfilePricing(expression string, profiles []jsplugin.Vid
 				operation = "extend"
 			}
 			body := make(map[string]any)
-			if mode.Duration != nil {
-				body["seconds"] = float64(mode.Duration.Default)
+			if duration := mode.DurationForResolution(mode.DefaultResolution); duration != nil {
+				body["seconds"] = float64(duration.Default)
 			}
 			if len(mode.Resolutions) > 0 {
 				body["resolution"] = mode.DefaultResolution

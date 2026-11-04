@@ -25,7 +25,22 @@ var ErrVideoCompatibleChannelsUnavailable = errors.New("no compatible video chan
 // VideoSubmissionRequiresReconciliation preserves reservations for providers
 // whose submission failures may leave a billable operation running upstream.
 func VideoSubmissionRequiresReconciliation(provider string, mixed ...bool) bool {
-	return provider == "nldw" || provider == "yuxibox" || len(mixed) > 0 && mixed[0]
+	return provider == "nldw" || provider == "yuxibox" || provider == constant.TaskPlatformHuahuoVideo || len(mixed) > 0 && mixed[0]
+}
+
+// Huahuo binds a stable idempotency key to each generation. Recovery may
+// inspect the same upstream job but cannot create another under that key.
+func guardHuahuoVideoReplay(fact mediaretry.Fact, decision mediaretry.Decision) mediaretry.Decision {
+	if fact.Provider == constant.TaskPlatformHuahuoVideo && mediaretry.IsResubmission(decision.Action) {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "huahuo_video_submission_not_replayable"
+		if fact.Terminal && !fact.Unknown && !fact.HasOutput {
+			decision.Action = mediaretry.Stop
+		} else if fact.HasUpstreamTask && !fact.HasOutput {
+			decision.Action = mediaretry.PollSameJob
+			decision.DelaySeconds = max(5, decision.DelaySeconds)
+		}
+	}
+	return decision
 }
 
 func VideoJobRequiresReconciliation(job model.AsyncMediaJob) bool {
@@ -44,6 +59,7 @@ func VideoJobRequiresReconciliation(job model.AsyncMediaJob) bool {
 // Only the captured legacy protocol evidence can grant its existing exception.
 func PlanInitialVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {
 	decision, err := mediaretry.Evaluate(policy, fact, state)
+	decision = guardHuahuoVideoReplay(fact, decision)
 	if err != nil || decision.Matched {
 		return decision, err
 	}
@@ -139,6 +155,9 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 	decision := request.PendingDecision
 	if decision == nil || request.RetryFact == nil || !mediaretry.IsResubmission(decision.Action) {
 		return nil, "", errors.New("video recovery is missing an executable decision")
+	}
+	if job.Provider == constant.TaskPlatformHuahuoVideo {
+		return nil, "", errors.New("HUAHUO video submission cannot be replayed")
 	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
@@ -470,6 +489,7 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 // ApplyConfiguredVideoDecision executes only the currently matched unknown-result
 // action. The captured protocol evidence remains unchanged in the retry record.
 func ApplyConfiguredVideoDecision(ctx context.Context, task model.Task, job model.AsyncMediaJob, fact mediaretry.Fact, decision *mediaretry.Decision, state mediaretry.State) (bool, error) {
+	*decision = guardHuahuoVideoReplay(fact, *decision)
 	if task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) && mediaretry.IsResubmission(decision.Action) {
 		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "mixed_video_unknown_not_replayable"
 		return false, nil
@@ -839,5 +859,6 @@ func evaluateVideoRetry(ctx context.Context, fact mediaretry.Fact, state *mediar
 		return mediaretry.Decision{}, err
 	}
 	state.TotalLimit = min(state.TotalLimit, cfg.TotalRetries)
-	return EvaluateMediaRetry(ctx, fact, *state)
+	decision, err := EvaluateMediaRetry(ctx, fact, *state)
+	return guardHuahuoVideoReplay(fact, decision), err
 }

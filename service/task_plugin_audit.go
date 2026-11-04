@@ -30,7 +30,7 @@ func TaskExecutionSnapshotFromContext(ctx *gin.Context) *model.TaskExecutionSnap
 				generation = pinned.Generation.Number
 			}
 			meta := pinned.Plugin.Meta
-			if meta.Key == "sudashui" {
+			if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
 				if value, exists := ctx.Get("task_video_model_config"); exists {
 					data, _ := common.Marshal(value)
 					var frozen kitdto.TaskVideoModelConfig

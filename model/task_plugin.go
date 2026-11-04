@@ -131,7 +131,7 @@ func ListActiveTaskPlugins() ([]TaskPlugin, error) {
 }
 
 type TaskPluginSyncSnapshot struct {
-	VideoModels map[string]dto.TaskVideoModelConfig
+	VideoModels map[string]map[string]dto.TaskVideoModelConfig
 	Plugins     []TaskPlugin
 	Revision    string
 }
@@ -180,26 +180,31 @@ func GetTaskPluginSyncSnapshot() (TaskPluginSyncSnapshot, error) {
 	if err := DB.Where("type = ?", constant.ChannelTypeTaskPlugin).Select("id", "status", "setting", "models", "model_mapping").Order("id").Find(&channels).Error; err != nil {
 		return TaskPluginSyncSnapshot{}, err
 	}
-	videoModels, err := taskVideoModelCatalog(channels)
-	if err != nil {
-		return TaskPluginSyncSnapshot{}, err
+	videoModels := make(map[string]map[string]dto.TaskVideoModelConfig)
+	for _, key := range []string{"sudashui", "huahuo-video"} {
+		catalog, err := taskVideoModelCatalog(channels, key)
+		if err != nil {
+			return TaskPluginSyncSnapshot{}, err
+		}
+		videoModels[key] = catalog
 	}
 	type videoBinding struct {
 		ID      int
 		Status  int
+		Plugin  string
 		Models  string
 		Mapping string
 		Configs map[string]dto.TaskVideoModelConfig
 	}
 	bindings := []videoBinding{}
 	for _, channel := range channels {
-		if settings := channel.GetSetting(); settings.TaskPluginKey == "sudashui" {
-			bindings = append(bindings, videoBinding{channel.Id, channel.Status, channel.Models, channel.GetModelMapping(), settings.TaskPluginModelConfigs})
+		if settings := channel.GetSetting(); dto.ChannelConfiguredTaskVideoPlugin(settings.TaskPluginKey) {
+			bindings = append(bindings, videoBinding{channel.Id, channel.Status, settings.TaskPluginKey, channel.Models, channel.GetModelMapping(), settings.TaskPluginModelConfigs})
 		}
 	}
 	payload, err := common.Marshal(struct {
 		Plugins       []revisionEntry
-		VideoModels   map[string]dto.TaskVideoModelConfig
+		VideoModels   map[string]map[string]dto.TaskVideoModelConfig
 		VideoBindings []videoBinding
 	}{entries, videoModels, bindings})
 	if err != nil {

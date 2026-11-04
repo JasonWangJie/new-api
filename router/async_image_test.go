@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -1575,6 +1576,111 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Model(&model.AsyncMediaJob{}).Count(&jobsAfter).Error)
 		assert.Equal(t, jobsBefore, jobsAfter, "invalid requests must fail before creating a job")
 		assert.EqualValues(t, 4, calls.Load(), "replays and rejected requests must not submit more operations")
+	})
+	t.Run("Huahuo image submits once and reconciles by the persisted key", func(t *testing.T) {
+		const imageAlias = "huahuo-image-test-alias"
+		const upstreamModel = "future-huahuo-image-id"
+		const upstreamKey = "offline-huahuo-image-key"
+		imageUser := model.User{Username: "huahuo-image-router", AffCode: "hhim", Group: "default", Status: common.UserStatusEnabled, Quota: 10000}
+		require.NoError(t, model.DB.Create(&imageUser).Error)
+		imageToken := model.Token{UserId: imageUser.Id, Key: "huahuoimageroutertoken", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 10000, Group: "default"}
+		require.NoError(t, model.DB.Create(&imageToken).Error)
+		prices := ratio_setting.GetModelPriceCopy()
+		prices[imageAlias] = 0.0002
+		encodedPrices, err := common.Marshal(prices)
+		require.NoError(t, err)
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encodedPrices)))
+		var sends, polls atomic.Int64
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer "+upstreamKey, r.Header.Get("Authorization"))
+			if r.Method == http.MethodPost {
+				attempt := sends.Add(1)
+				assert.Equal(t, "/v1/images/generations", r.URL.Path)
+				var dispatched model.AsyncImageTask
+				if assert.NoError(t, model.DB.Where("upstream_task_id = ? AND provider = ?", r.Header.Get("Idempotency-Key"), constant.HuahuoImagePluginKey).Take(&dispatched).Error) {
+					assert.Positive(t, dispatched.DispatchedAt, "generation starts only after the key is durable")
+					assert.Equal(t, dispatched.HuahuoImageRequestKey(), r.Header.Get("Idempotency-Key"))
+				}
+				var sent map[string]any
+				if assert.NoError(t, common.DecodeJson(r.Body, &sent)) {
+					assert.Equal(t, upstreamModel, sent["model"])
+					assert.Equal(t, "url", sent["response_format"])
+					assert.Equal(t, "2K", sent["resolution"])
+					if attempt == 1 {
+						assert.Equal(t, "5:4", sent["size"])
+					} else {
+						assert.Equal(t, "1000x1437", sent["size"])
+					}
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":{"code":"ambiguous"}}`))
+				return
+			}
+			polls.Add(1)
+			assert.Equal(t, http.MethodGet, r.Method)
+			const prefix = "/v1/images/requests/"
+			assert.True(t, strings.HasPrefix(r.URL.Path, prefix))
+			var dispatched model.AsyncImageTask
+			requestKey := strings.TrimPrefix(r.URL.Path, prefix)
+			assert.NoError(t, model.DB.Where("upstream_task_id = ?", requestKey).Take(&dispatched).Error)
+			_, _ = w.Write([]byte(`{"status":"failed","delivery_status":"failed","request_id":"` + requestKey + `"}`))
+		}))
+		t.Cleanup(upstream.Close)
+		mapping := `{"` + imageAlias + `":"` + upstreamModel + `"}`
+		huahuo := model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: upstreamKey, BaseURL: &upstream.URL, Models: imageAlias, ModelMapping: &mapping, Group: "default"}
+		huahuo.SetSetting(relaydto.ChannelSettings{TaskPluginKey: constant.HuahuoImagePluginKey})
+		require.NoError(t, model.DB.Create(&huahuo).Error)
+		require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: imageAlias, ChannelId: huahuo.Id, Enabled: true}).Error)
+		models, err := common.Marshal([]service.ImageModelCapability{{Id: imageAlias, MaxOutputImages: 1, Resolutions: []string{"2K"}}})
+		require.NoError(t, err)
+		for _, platform := range []string{constant.HuahuoImagePluginKey, "mixed"} {
+			policy := model.ImageGroupPolicy{PolicyKey: service.ImageIdentityHash("default", platform), Group: "default", Platform: platform, Enabled: true, AsyncEnabled: true, PoolMode: "resolution", Models: string(models), Version: 1}
+			require.NoError(t, model.DB.Create(&policy).Error)
+			if platform == "mixed" {
+				bindingKey := service.ImagePoolBindingKey(policy, imageAlias, "2K")
+				require.NoError(t, model.DB.Create(&model.ImageChannelPool{BindingKey: bindingKey, Group: "default", Platform: "mixed", Mode: "resolution", Model: imageAlias, Resolution: "2K", ChannelId: huahuo.Id}).Error)
+			}
+		}
+		previous, previousBilling := service.ExecuteAsyncImageFunc, service.FreezeAsyncImageBillingFunc
+		service.ExecuteAsyncImageFunc = relay.ExecuteAsyncImage
+		service.FreezeAsyncImageBillingFunc = relay.FreezeAsyncImageBilling
+		t.Cleanup(func() {
+			service.ExecuteAsyncImageFunc = previous
+			service.FreezeAsyncImageBillingFunc = previousBilling
+		})
+		invalid := request(http.MethodPost, "/v1/images/generations_async", `{"model":"`+imageAlias+`","provider":"huahuo-image","prompt":"draw a river","n":2}`, "", imageToken.Key)
+		require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
+		for _, details := range []string{`,"provider":"huahuo-image","aspect_ratio":"5:4"`, `,"size":"1000x1437"`} {
+			accepted := request(http.MethodPost, "/v1/images/generations_async", `{"model":"`+imageAlias+`","prompt":"draw a river","resolution":"2K"`+details+`}`, "", imageToken.Key)
+			require.Equal(t, http.StatusAccepted, accepted.Code, accepted.Body.String())
+			var payload struct {
+				TaskID string `json:"task_id"`
+			}
+			require.NoError(t, common.Unmarshal(accepted.Body.Bytes(), &payload))
+			require.NoError(t, service.RunAsyncImageTask(t.Context(), payload.TaskID))
+			var task model.AsyncImageTask
+			require.NoError(t, model.DB.Where("task_id = ?", payload.TaskID).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskInvoking, task.Status)
+			assert.Equal(t, constant.HuahuoImagePluginKey, task.Provider)
+			require.NotEmpty(t, task.UpstreamTaskId)
+			require.NoError(t, model.DB.Model(&task).Update("next_attempt_at", time.Now().Unix()-1).Error)
+			require.NoError(t, model.DB.Model(&huahuo).Update("key", "changed-after-dispatch").Error)
+			require.NoError(t, service.RunAsyncImageTask(t.Context(), payload.TaskID))
+			require.NoError(t, model.DB.Model(&huahuo).Update("key", upstreamKey).Error)
+			require.NoError(t, model.DB.Where("task_id = ?", payload.TaskID).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
+			assert.Equal(t, "upstream_unconfirmed", task.ReconciliationStatus)
+			var bill model.AsyncImageBill
+			require.NoError(t, model.DB.Where("task_id = ?", payload.TaskID).Take(&bill).Error)
+			assert.Equal(t, "reserved", bill.Status)
+			assert.Positive(t, bill.ReservedQuota)
+			result := request(http.MethodGet, "/v1/images/tasks_async/"+payload.TaskID, "", "", imageToken.Key)
+			require.Equal(t, http.StatusOK, result.Code, result.Body.String())
+			assert.NotContains(t, result.Body.String(), task.UpstreamTaskId)
+			assert.NotContains(t, result.Body.String(), upstreamKey)
+		}
+		assert.EqualValues(t, 2, sends.Load())
+		assert.EqualValues(t, 2, polls.Load())
 	})
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("status", common.UserStatusDisabled).Error)
 	assert.Equal(t, 401, request("GET", "/v1/images/tasks_async/"+payload.TaskId, "", "", token.Key).Code)

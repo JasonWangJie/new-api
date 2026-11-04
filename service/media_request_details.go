@@ -247,11 +247,11 @@ func (sanitizer *asyncVideoRequestSanitizer) sanitize(value any, depth int) any 
 
 func asyncVideoReferenceType(name string) string {
 	switch strings.ToLower(name) {
-	case "image", "images", "image_url", "img_url", "input_image", "input_reference", "image_tail", "first_frame", "last_frame", "first_frame_url", "last_frame_url", "reference_image", "reference_images":
+	case "image", "images", "image_url", "img_url", "input_image", "input_images", "input_reference", "input_reference[]", "image_tail", "first_frame", "last_frame", "start_frame", "end_frame", "first_frame_url", "last_frame_url", "reference_image", "reference_images":
 		return "image"
-	case "video", "videos", "video_url", "input_video", "reference_video", "reference_videos":
+	case "video", "videos", "video_url", "input_video", "input_videos", "reference_video", "reference_videos", "video_reference":
 		return "video"
-	case "audio", "audios", "audio_url", "input_audio", "reference_audio", "reference_audios", "driving_audio":
+	case "audio", "audios", "audio_url", "input_audio", "input_audios", "reference_audio", "reference_audios", "audio_references", "driving_audio":
 		return "audio"
 	default:
 		return ""

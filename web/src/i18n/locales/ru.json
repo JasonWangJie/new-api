@@ -7420,6 +7420,7 @@
     "Use channel type {{type}}": "Использовать тип канала {{type}}",
     "Use default": "Использовать значение по умолчанию",
     "Use disk cache when request body exceeds this size": "Использовать дисковый кэш, когда тело запроса превышает этот размер",
+    "Use either image links or uploaded files for reference images.": "Для референсных изображений используйте либо ссылки, либо загруженные файлы.",
     "Use exact client model names, separated by commas. Prefixes and wildcards are not supported.": "Укажите точные имена моделей клиента через запятую. Префиксы и подстановочные знаки не поддерживаются.",
     "Use exact model names such as gpt-4o, or regex rules prefixed with re: such as re:^gemini-.": "Используйте точные имена моделей, например gpt-4o, или regex-правила с префиксом re:, например re:^gemini-.",
     "Use expression pricing when a dependent price is non-zero and its base price is zero.": "Используйте выражение, если зависимая цена ненулевая, а базовая цена равна нулю.",

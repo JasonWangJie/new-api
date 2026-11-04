@@ -363,12 +363,13 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
 
 func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 	if channel.Type == constant.ChannelTypeTaskPlugin {
-		if channel.GetSetting().TaskPluginKey == "sudashui" {
+		pluginKey := channel.GetSetting().TaskPluginKey
+		if dto.ChannelConfiguredTaskVideoPlugin(pluginKey) || pluginKey == "huahuo-image" {
 			return normalizeModelNames(channel.GetModels()), nil
 		}
-		plugin, ok := jsplugin.DefaultRegistry.Get(channel.GetSetting().TaskPluginKey)
+		plugin, ok := jsplugin.DefaultRegistry.Get(pluginKey)
 		if !ok {
-			return nil, fmt.Errorf("task plugin %q is not registered", channel.GetSetting().TaskPluginKey)
+			return nil, fmt.Errorf("task plugin %q is not registered", pluginKey)
 		}
 		return normalizeModelNames(plugin.Meta.Models), nil
 	}

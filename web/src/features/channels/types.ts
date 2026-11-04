@@ -287,6 +287,7 @@ export interface TaskVideoModelConfig {
     values?: number[]
     default?: number
   }
+  durations_by_resolution?: Record<string, TaskVideoModelConfig['duration']>
   resolutions: string[]
   aspect_ratios: string[]
   modes: string[]
@@ -294,6 +295,8 @@ export interface TaskVideoModelConfig {
     images: number | null
     videos: number | null
     audios: number | null
+    image_upload?: boolean
+    image_data_uri?: boolean
   }
   billing_mode: string
 }

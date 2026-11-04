@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -73,7 +74,7 @@ func MixedVideoChannelBinding(channel model.Channel, publicModel, operation stri
 	if generation == nil {
 		return jsplugin.ProtocolBinding{}, "", errors.New("video plugins are unavailable")
 	}
-	if channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == "sudashui" && (operation == "" || operation == "create") {
+	if channel.Type == constant.ChannelTypeTaskPlugin && kitdto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) && (operation == "" || operation == "create") {
 		binding, err := FrozenTaskVideoBinding(&channel, publicModel)
 		return binding, upstream, err
 	}
@@ -105,6 +106,16 @@ func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel st
 	for _, mode := range profile.Modes {
 		if overrides.Modes != nil && !slices.Contains(overrides.Modes, mode.Name) {
 			continue
+		}
+		if binding.Plugin.Meta.Key == constant.TaskPlatformHuahuoVideo && len(mode.Resolutions) > 0 {
+			// The mixed retail price only accepts canonical resolution facts.
+			// Channel-specific labels remain available on explicit provider routes.
+			mode.Resolutions = slices.DeleteFunc(mode.Resolutions, func(resolution string) bool {
+				return NormalizeVideoResolution(resolution) != resolution
+			})
+			if len(mode.Resolutions) == 0 {
+				continue
+			}
 		}
 		for _, input := range mode.Inputs {
 			// Public billing and media conservation use these host-owned video
@@ -153,6 +164,9 @@ func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel st
 			if !slices.Contains(values, mode.Duration.Default) {
 				mode.Duration.Default = values[0]
 			}
+		}
+		if !retainVideoResolutionDurations(&mode, overrides.Duration) {
+			continue
 		}
 		if len(mode.Resolutions) > 0 {
 			if slices.Contains(mode.Resolutions, overrides.DefaultResolution) {
@@ -230,6 +244,9 @@ func MixedVideoPublicFacts(body map[string]any, operation string, files []map[st
 		for _, key := range []string{"resolution", "size"} {
 			if raw, supplied := source[key]; supplied {
 				value, ok := raw.(string)
+				if key == "size" && ok && mixedVideoSizeAspectRatio(value) != "" {
+					continue
+				}
 				resolution := NormalizeVideoResolution(value)
 				if ok && resolution == "" && strings.EqualFold(strings.TrimSpace(value), "720px") {
 					// 720px is a model-specific wire value. Only a profile from an
@@ -269,7 +286,7 @@ func mixedVideoDurationUnitControl(body map[string]any) bool {
 // provider's original request intact. Final admission requires the decoder to
 // demonstrate the same media identity in the projected role. A nil decoded
 // body is used only to discover a possible public variant before decoding.
-func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[string]any) map[string]any {
+func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[string]any, files []map[string]any) map[string]any {
 	view := mixedVideoMediaAliases(body)
 	hasPrimary := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "image" })
 	hasReferences := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "reference_images" })
@@ -291,16 +308,37 @@ func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[
 			view["reference_images"] = append(references, images...)
 			delete(view, "images")
 		}
+		for _, file := range files {
+			field, _ := file["field"].(string)
+			ref, _ := file["ref"].(string)
+			if ref == "" || field != "input_reference" && field != "input_reference[]" {
+				continue
+			}
+			if decoded != nil && !slices.ContainsFunc(videoMediaValues("reference_images", decoded), func(value any) bool { return videoInputFileRef(value) == ref }) {
+				continue
+			}
+			items := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
+			view["reference_images"] = append(items, map[string]any{"__fileRef": ref})
+		}
 	}
 	primary := view["image"]
 	if primary == nil {
 		primary = view["input_reference"]
 	}
 	if hasReferences && !hasPrimary && primary != nil {
-		identity := videoMediaIdentity(primary)
-		if decoded == nil || identity != "" && slices.ContainsFunc(videoMediaValues("reference_images", decoded), func(value any) bool { return videoMediaIdentity(value) == identity }) {
+		images := videoInputValues("image", map[string]any{"image": primary}, nil)
+		decodedReferences := videoMediaValues("reference_images", decoded)
+		matches := true
+		for _, image := range images {
+			identity := videoMediaIdentity(image)
+			if decoded != nil && (identity == "" || !slices.ContainsFunc(decodedReferences, func(value any) bool { return videoMediaIdentity(value) == identity })) {
+				matches = false
+				break
+			}
+		}
+		if matches {
 			references := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
-			view["reference_images"] = append(references, primary)
+			view["reference_images"] = append(references, images...)
 			delete(view, "image")
 			delete(view, "input_reference")
 		}
@@ -326,15 +364,23 @@ func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[
 // used by profile validation and billing. The provider receives the original body.
 func mixedVideoMediaAliases(body map[string]any) map[string]any {
 	view := maps.Clone(body)
+	for _, field := range []string{"input_reference", "input_reference[]", "input_images", "input_videos", "input_audios", "video_reference", "audio_references"} {
+		if raw, ok := view[field].(string); ok && strings.HasPrefix(strings.TrimSpace(raw), "[") {
+			var values []string
+			if common.UnmarshalJsonStr(raw, &values) == nil && len(values) <= 64 {
+				view[field] = values
+			}
+		}
+	}
 	for _, group := range []struct {
 		name    string
 		aliases []string
 	}{
-		{"reference_images", []string{"image_urls", "referenceImages"}},
-		{"reference_videos", []string{"videos", "video_urls", "referenceVideos"}},
-		{"reference_audios", []string{"audios", "audio_urls", "referenceAudios"}},
-		{"image", []string{"first_image"}},
-		{"last_frame", []string{"last_image"}},
+		{"reference_images", []string{"image_urls", "referenceImages", "input_images", "input_reference[]"}},
+		{"reference_videos", []string{"videos", "video_urls", "referenceVideos", "video_reference", "input_videos"}},
+		{"reference_audios", []string{"audios", "audio_urls", "referenceAudios", "audio_references", "input_audios"}},
+		{"image", []string{"first_image", "start_frame"}},
+		{"last_frame", []string{"last_image", "end_frame"}},
 	} {
 		for _, alias := range group.aliases {
 			value, exists := view[alias]
@@ -355,6 +401,22 @@ func mixedVideoMediaAliases(body map[string]any) map[string]any {
 		}
 	}
 	return view
+}
+
+func mixedVideoSizeAspectRatio(size string) string {
+	if size == "adaptive" {
+		return size
+	}
+	left, right, found := strings.Cut(size, ":")
+	if !found || len(left) > 3 || len(right) > 3 || strings.HasPrefix(left, "0") || strings.HasPrefix(right, "0") {
+		return ""
+	}
+	width, widthErr := strconv.ParseUint(left, 10, 16)
+	height, heightErr := strconv.ParseUint(right, 10, 16)
+	if widthErr == nil && heightErr == nil && width > 0 && height > 0 {
+		return size
+	}
+	return ""
 }
 
 func mixedVideoAspectRatio(body, metadata map[string]any, profiles ...jsplugin.VideoProfile) (string, bool, error) {
@@ -378,6 +440,13 @@ func mixedVideoAspectRatio(body, metadata map[string]any, profiles ...jsplugin.V
 	pixelRatio := ""
 	for _, source := range []map[string]any{body, metadata} {
 		size, _ := source["size"].(string)
+		if explicit := mixedVideoSizeAspectRatio(size); explicit != "" {
+			if supplied && ratio != explicit || pixelRatio != "" && pixelRatio != explicit {
+				return "", false, errors.New("conflicting mixed video size aspect ratios")
+			}
+			ratio, supplied = explicit, true
+			continue
+		}
 		left, right, pixels := strings.Cut(strings.ReplaceAll(strings.ToLower(strings.TrimSpace(size)), "*", "x"), "x")
 		width, widthErr := strconv.ParseUint(left, 10, 32)
 		height, heightErr := strconv.ParseUint(right, 10, 32)
@@ -464,7 +533,7 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 		return candidate, fmt.Errorf("video mode %q is not enabled", action)
 	}
 	decoded, _ := intent["requestBody"].(map[string]any)
-	if err := ValidateVideoProfileRequest(profile, action, mixedVideoValidationBody(profile.Modes[modeIndex], body, decoded), view.Files); err != nil {
+	if err := ValidateVideoProfileRequest(profile, action, mixedVideoValidationBody(profile.Modes[modeIndex], body, decoded, view.Files), view.Files); err != nil {
 		return candidate, err
 	}
 	if normalized, present := intent["requestBody"]; present {
@@ -636,8 +705,11 @@ func NormalizeMixedVideoDefaults(raw []byte, contentType, operation string, prof
 						body["seconds"] = seconds
 					}
 				}
-			} else if mode.Duration != nil {
-				body["seconds"] = float64(mode.Duration.Default)
+			} else {
+				resolution, _ := facts["resolution"].(string)
+				if duration := mode.DurationForResolution(cmp.Or(resolution, mode.DefaultResolution)); duration != nil {
+					body["seconds"] = float64(duration.Default)
+				}
 			}
 			if _, present := facts["resolution"]; !present && len(mode.Resolutions) > 0 {
 				body["resolution"] = mode.DefaultResolution
@@ -650,7 +722,7 @@ func NormalizeMixedVideoDefaults(raw []byte, contentType, operation string, prof
 			if mode.Name == "extend_video" && firstVideoValue(body, metadata, "extension_direction") == nil && mode.DefaultExtensionDirection != "" {
 				body["extension_direction"] = mode.DefaultExtensionDirection
 			}
-			if err := ValidateVideoProfileRequest(profile, mode.Name, mixedVideoValidationBody(mode, body, nil), view.Files); err != nil {
+			if err := ValidateVideoProfileRequest(profile, mode.Name, mixedVideoValidationBody(mode, body, nil, view.Files), view.Files); err != nil {
 				continue
 			}
 			normalized = body
@@ -769,7 +841,7 @@ func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCan
 		*execution = *request.Execution
 	}
 	meta := candidate.Binding.Plugin.Meta
-	if meta.Key == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
 		config, exists := candidate.Channel.GetSetting().TaskPluginModelConfigs[candidate.UpstreamModel]
 		if !exists {
 			return errors.New("saved video model configuration is unavailable")

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
@@ -648,6 +649,9 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	if request.Prompt == "" || len(request.Prompt) > 64<<10 {
 		return request, errors.New("prompt is required and must not exceed 64 KiB")
 	}
+	if request.Provider == constant.HuahuoImagePluginKey && (request.Dialect != "async" || request.Count != 1) {
+		return request, errors.New("Huahuo images require an asynchronous request with n=1")
+	}
 	references := request.ReferenceImageCount()
 	if references > cfg.MaxReferences {
 		return request, errors.New("too_many_reference_images_for_model")
@@ -697,8 +701,8 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	}
 	if request.Platform == "openai" {
 		halfK := strings.EqualFold(strings.TrimSpace(request.Resolution), "0.5K") || strings.EqualFold(strings.TrimSpace(request.Size), "0.5K")
-		if request.Dialect == "async" && request.Provider == "tabtab" {
-			// TabTab models include fixed-size and extreme-ratio image APIs.
+		if request.Dialect == "async" && (request.Provider == "tabtab" || request.Provider == constant.HuahuoImagePluginKey) {
+			// Some providers accept fixed sizes and aspect ratios outside the OpenAI presets.
 			// Preserve their dimensions until the selected channel mapping is
 			// known; its shared admission/submission validator owns the limits.
 			request.Size = strings.TrimSpace(request.Size)

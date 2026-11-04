@@ -945,7 +945,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		// These drivers validate native task identity and terminal evidence;
 		// the legacy proxy envelope must not bypass their contract.
 		var responseItems taskdto.TaskResponse[model.Task]
-		if task.Platform != "yuxibox" && task.Platform != "sudashui" && common.Unmarshal(responseBody, &responseItems) == nil && responseItems.IsSuccess() {
+		if task.Platform != "yuxibox" && task.Platform != "sudashui" && task.Platform != constant.TaskPlatformHuahuoVideo && common.Unmarshal(responseBody, &responseItems) == nil && responseItems.IsSuccess() {
 			logger.LogDebug(ctx, "updateVideoSingleTask parsed as new api response format: %+v", responseItems)
 			t := responseItems.Data
 			taskResult.TaskID = t.TaskID
@@ -967,7 +967,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task.PrivateData.AsyncMedia && classifyPollHTTP(resp.StatusCode) != pollClassOK {
 		return recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, "")
 	}
-	if parsedStatus == model.TaskStatusFailure && task.PrivateData.VideoReconciliation == nil {
+	if parsedStatus == model.TaskStatusFailure && (task.PrivateData.VideoReconciliation == nil || task.Platform == constant.TaskPlatformHuahuoVideo) {
 		scheduled, recoveryErr := TryAsyncVideoReferenceRecovery(ctx, *task, taskResult, resp.StatusCode, responseBody)
 		if recoveryErr != nil {
 			return recoveryErr

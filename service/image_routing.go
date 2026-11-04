@@ -476,7 +476,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				if !ImageCapabilitySupportsRequest(capability, imageRequest) {
 					candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
 				}
-				if input.Platform == "mixed" && !MixedImageChannelRequestSupported(channel, imageRequest) {
+				if !synchronous && (input.Platform == "mixed" || capability.Provider == constant.HuahuoImagePluginKey) && !MixedImageChannelRequestSupported(channel, imageRequest) {
 					candidate.Reasons = append(candidate.Reasons, "image_parameters_not_supported")
 				}
 				if synchronous {
@@ -1096,7 +1096,7 @@ func eligibleImageChannels(ctx context.Context, policy model.ImageGroupPolicy, r
 		if request.Provider != "" && capability.Provider != request.Provider {
 			return true
 		}
-		if policy.Platform == "mixed" || channel.Type == constant.ChannelTypeTabTab || channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility {
+		if policy.Platform == "mixed" || capability.Provider == constant.HuahuoImagePluginKey || channel.Type == constant.ChannelTypeTabTab || channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility {
 			return !MixedImageChannelRequestSupported(channel, request)
 		}
 		return !ImageCapabilitySupportsRequest(capability, request)
@@ -1644,7 +1644,7 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 		if request.Provider != "" && capability.Provider != request.Provider {
 			return true
 		}
-		if policy.Platform == "mixed" || ch.Type == constant.ChannelTypeTabTab || ch.Type == constant.ChannelTypeNewAPI && ch.GetSetting().TianyueMediaCompatibility {
+		if policy.Platform == "mixed" || capability.Provider == constant.HuahuoImagePluginKey || ch.Type == constant.ChannelTypeTabTab || ch.Type == constant.ChannelTypeNewAPI && ch.GetSetting().TianyueMediaCompatibility {
 			return !MixedImageChannelRequestSupported(ch, request)
 		}
 		return !ImageCapabilitySupportsRequest(capability, request)

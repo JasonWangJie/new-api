@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -206,7 +207,7 @@ func pinMixedVideoCandidate(c *gin.Context, candidate service.MixedVideoCandidat
 // random picker or lets a newly configured pool take over an old task.
 func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest) {
 	if request.MixedRouting == nil {
-		if job.Provider == "sudashui" {
+		if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
 			binding, err := service.FrozenTaskVideoBinding(&request.Channel, job.Model)
 			if err != nil {
 				AsyncImagePublicError(c, 400, "provider_unavailable", err.Error())
@@ -247,7 +248,7 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 	}
 	capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)
 	var selected *model.Channel
-	if job.Provider == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
 		// The live model list may have changed after acceptance. Pool membership,
 		// channel status, group access and account access remain live controls.
 		var pool model.ImageChannelPool
@@ -282,7 +283,7 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 		return
 	}
 	decodeChannel := *selected
-	if job.Provider == "sudashui" {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
 		decodeChannel = request.Channel
 	}
 	candidate, err := service.DecodeMixedVideoCandidate(c.Request.Context(), decodeChannel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)

@@ -149,6 +149,56 @@ func asyncImageWorkerQuotaCacheFixture(t *testing.T, task model.AsyncImageTask) 
 	require.NoError(t, common.RDB.HSet(t.Context(), "token:"+common.GenerateHMAC(token.Key), "Id", token.Id, "RemainQuota", token.RemainQuota, "UsedQuota", token.UsedQuota).Err())
 }
 
+func TestHuahuoImageDispatchRecoversOriginalAttempt(t *testing.T) {
+	db, task, _, cfg, alternate := asyncImageWorkerFixture(t)
+	asyncImageWorkerQuotaCacheFixture(t, task)
+	task.Provider = constant.HuahuoImagePluginKey
+	key := task.HuahuoImageRequestKey()
+	require.NoError(t, db.Model(&task).Update("provider", task.Provider).Error)
+	require.NoError(t, model.ReserveAsyncImageQuota(t.Context(), task, 100, model.ImageFundingSelection{Source: "wallet"}))
+	require.NoError(t, model.MarkAsyncImageDispatched(t.Context(), task, task.ChannelId))
+	require.ErrorIs(t, model.MarkAsyncImageDispatched(t.Context(), task, alternate.Id), model.ErrImageConflict)
+	var stored model.AsyncImageTask
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, key, stored.UpstreamTaskId)
+	assert.Equal(t, task.ChannelId, stored.ChannelId)
+	assert.Positive(t, stored.DispatchedAt)
+	require.NoError(t, db.Model(&stored).Update("lease_expires_at", time.Now().Unix()-1).Error)
+	require.NoError(t, model.RecoverAsyncImageTasks(t.Context(), 5, cfg.ExecutionTimeout, 0))
+	recovered, err := model.ClaimAsyncImageTask(t.Context(), task.TaskId, "huahuo-recovered-lease", cfg.WorkerLease)
+	require.NoError(t, err)
+	assert.Equal(t, key, recovered.UpstreamTaskId)
+	assert.Equal(t, task.ChannelId, recovered.ChannelId)
+	policy, err := model.GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	policy.Rules = []mediaretry.Rule{{ID: "replace", Name: "Replace failed image", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"delivery timeout"}}, Steps: []mediaretry.Step{{ID: "other", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}
+	_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+	require.NoError(t, err)
+	rejected, err := buildImageFailurePlan(t.Context(), recovered, &AsyncImageFailure{Code: 603, InternalCode: "upstream_job_failed", Message: "delivery timeout fixture conclusively rejected", UpstreamTerminal: true}, cfg, nil)
+	require.NoError(t, err)
+	assert.Equal(t, model.ImageTaskFailed, rejected.Updates["status"])
+	assert.Empty(t, rejected.OutboxKind, "even a confirmed rejection cannot create a replacement generation")
+	polls := 0
+	ExecuteAsyncImageFunc = func(_ context.Context, current model.AsyncImageTask, _ AsyncImageRequest, channel *model.Channel, _ ImageRuntimeConfig, _ func() error) (*AsyncImageOutput, model.AsyncImageBill, error) {
+		polls++
+		assert.Equal(t, key, current.UpstreamTaskId)
+		assert.Equal(t, task.ChannelId, channel.Id)
+		assert.Equal(t, "upstream-key-a", channel.Key)
+		return nil, model.AsyncImageBill{}, &AsyncImageFailure{Code: 608, InternalCode: "huahuo_delivery_timeout", Message: "delivery timeout", ExecutionUnknown: true}
+	}
+	require.NoError(t, invokeAsyncImageTask(t.Context(), &recovered, cfg))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&stored).Error)
+	assert.Equal(t, 1, polls)
+	assert.Equal(t, model.ImageTaskExecutionUnknown, stored.Status)
+	assert.Equal(t, "upstream_unconfirmed", stored.ReconciliationStatus)
+	assert.Equal(t, key, stored.UpstreamTaskId)
+	assert.Zero(t, stored.RetryCount)
+	var bill model.AsyncImageBill
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+	assert.Equal(t, "reserved", bill.Status)
+	assert.Equal(t, 100, bill.ReservedQuota)
+}
+
 func TestImagePoolFallbackChannelRouting(t *testing.T) {
 	for _, scenario := range []string{
 		"first request", "legacy retry", "configured retry", "mixed retry", "mixed other namespace", "historical fallback failure",

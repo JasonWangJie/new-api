@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -276,7 +277,7 @@ func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.T
 			message: "Artifact channel is unavailable", err: err,
 		}
 	}
-	publicHTTPSOnly := task.Platform == "yuxibox"
+	publicHTTPSOnly := task.Platform == "yuxibox" || task.Platform == constant.TaskPlatformHuahuoVideo
 	if publicHTTPSOnly {
 		baseURL, parseErr := url.Parse(channel.GetBaseURL())
 		if parseErr != nil || parsedURL.Scheme != "https" || !sameTaskMediaOrigin(baseURL, parsedURL) {

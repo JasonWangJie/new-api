@@ -865,7 +865,8 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
         : undefined,
     task_plugin_model_configs:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN &&
-      formData.task_plugin_key === 'sudashui'
+      (formData.task_plugin_key === 'sudashui' ||
+        formData.task_plugin_key === 'huahuo-video')
         ? JSON.parse(formData.task_plugin_model_configs || '{}')
         : undefined,
     task_plugin_key:

@@ -95,6 +95,36 @@ test('Sudashui channel form persists independent catalog and capability settings
     JSON.parse(buildSettingJSON({ ...form, task_plugin_key: 'other' }))
   ).not.toHaveProperty('task_plugin_model_configs')
 })
+
+test('Huahuo video stores manually configured models and never saves a catalog URL', () => {
+  const config = {
+    ...taskVideoCatalogConfig(undefined, true),
+    duration: { values: [5, 10] },
+    durations_by_resolution: { '1080p': { values: [5] } },
+    references: { images: 2, videos: 0, audios: 1, image_upload: true },
+    resolutions: ['720p', '1080p'],
+    aspect_ratios: ['16:9'],
+    modes: ['reference_to_video'],
+    billing_mode: 'per_second',
+  }
+  const form = {
+    ...CHANNEL_FORM_DEFAULT_VALUES,
+    type: 61,
+    task_plugin_key: 'huahuo-video',
+    task_plugin_model_source_url: 'https://catalog.example/v1/models',
+    task_plugin_model_configs: JSON.stringify({
+      'inmind/video/future': config,
+    }),
+  }
+  const setting = JSON.parse(buildSettingJSON(form))
+  expect(setting.task_plugin_model_configs).toEqual({
+    'inmind/video/future': config,
+  })
+  expect(setting).not.toHaveProperty('task_plugin_model_source_url')
+  expect(
+    JSON.parse(buildSettingJSON({ ...form, task_plugin_key: 'huahuo-image' }))
+  ).not.toHaveProperty('task_plugin_model_configs')
+})
 let client: QueryClient
 let editingChannel: Channel
 let pluginOptions: TaskPluginOption[]

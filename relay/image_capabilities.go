@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"maps"
@@ -34,6 +35,20 @@ func init() {
 // validateMixedImageChannelRequest performs no I/O. It checks provider limits
 // before a mixed pool assigns weight to a channel that cannot execute the input.
 func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncImageRequest) error {
+	if ch.Type == constant.ChannelTypeTaskPlugin && ch.GetSetting().TaskPluginKey == constant.HuahuoImagePluginKey {
+		plugin, ok := pluginruntime.DefaultRegistry.Get(constant.HuahuoImagePluginKey)
+		if !ok {
+			return fmt.Errorf("Huahuo image plugin is unavailable")
+		}
+		if err := validateMixedImageTokenUsage(request.Billing, dto.ImageCapability{}, nil); err != nil {
+			return err
+		}
+		if request.Prompt == "" {
+			request.Prompt = "image routing preview"
+		}
+		_, err := buildHuahuoImageSubmit(context.Background(), plugin, ch, request, nil, "image-routing-preview", "")
+		return err
+	}
 	settings := dto.ChannelSettings{}
 	if ch.Setting != nil && *ch.Setting != "" {
 		if err := common.UnmarshalJsonStr(*ch.Setting, &settings); err != nil {
@@ -418,6 +433,13 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 		return dto.ImageCapability{}
 	}
 	if ch.Type == constant.ChannelTypeTaskPlugin {
+		if ch.GetSetting().TaskPluginKey == constant.HuahuoImagePluginKey && slices.Contains(ch.GetModels(), modelName) {
+			if _, enabled := pluginruntime.DefaultRegistry.Get(constant.HuahuoImagePluginKey); enabled {
+				if upstream, err := service.ResolveImageChannelUpstreamModel(ch, modelName); err == nil {
+					return dto.ImageCapability{Provider: constant.HuahuoImagePluginKey, Protocol: "openai_images", Models: []string{upstream}, Generate: true, Edit: true, EditFormat: "json", ReferenceField: "images", Parameters: []string{"quality"}}
+				}
+			}
+		}
 		return dto.ImageCapability{}
 	}
 	// Independent task protocols do not become image adaptors merely because

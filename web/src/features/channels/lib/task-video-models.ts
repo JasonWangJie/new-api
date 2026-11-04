@@ -19,7 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TaskVideoModelConfig, TaskVideoModelDetail } from '../types'
 
 export function taskVideoCatalogConfig(
-  detail?: TaskVideoModelDetail
+  detail?: TaskVideoModelDetail,
+  manualOnly = false
 ): TaskVideoModelConfig {
   return {
     duration: detail?.duration ?? {},
@@ -30,20 +31,23 @@ export function taskVideoCatalogConfig(
       images: null,
       videos: null,
       audios: null,
+      ...(manualOnly ? { image_upload: false, image_data_uri: false } : {}),
     },
     billing_mode: detail?.billing_mode ?? '',
+    ...(manualOnly ? { durations_by_resolution: {} } : {}),
   }
 }
 
 export function importMissingTaskVideoModels(
   current: Record<string, TaskVideoModelConfig>,
   models: string[],
-  details?: Record<string, TaskVideoModelDetail>
+  details?: Record<string, TaskVideoModelDetail>,
+  manualOnly = false
 ): Record<string, TaskVideoModelConfig> {
   const next = { ...current }
   for (const model of models) {
     if (!Object.hasOwn(next, model)) {
-      next[model] = taskVideoCatalogConfig(details?.[model])
+      next[model] = taskVideoCatalogConfig(details?.[model], manualOnly)
     }
   }
   return next

@@ -7420,6 +7420,7 @@
     "Use channel type {{type}}": "使用渠道类型 {{type}}",
     "Use default": "使用默认值",
     "Use disk cache when request body exceeds this size": "请求体超过此大小时使用磁盘缓存",
+    "Use either image links or uploaded files for reference images.": "参考图片请选择链接或本地上传，两种方式不能混用。",
     "Use exact client model names, separated by commas. Prefixes and wildcards are not supported.": "填写客户端请求里的精确 model 名，多个用英文逗号分隔。不支持前缀或通配符。",
     "Use exact model names such as gpt-4o, or regex rules prefixed with re: such as re:^gemini-.": "可以填写 gpt-4o 这类精确模型名，也可以填写 re:^gemini- 这类以 re: 开头的正则规则。",
     "Use expression pricing when a dependent price is non-zero and its base price is zero.": "基础价格为零而关联价格非零时，请使用表达式定价。",

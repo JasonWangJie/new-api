@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
@@ -326,6 +327,70 @@ export function parseTaskResult(){return {status:"IN_PROGRESS"};}
 				assert.Contains(t, taskErr.Message, "submission validation reached")
 			})
 		}
+	}
+}
+
+func TestHuahuoVideoRequiresConfiguredSitePrice(t *testing.T) {
+	const modelName = "huahuo-pricing-fixture"
+	source, err := builtinplugins.Source(constant.TaskPlatformHuahuoVideo)
+	require.NoError(t, err)
+	registry := pluginruntime.NewRegistry()
+	plugin, err := registry.RegisterFactory(source, pluginruntime.Options{Key: constant.TaskPlatformHuahuoVideo})
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name, unit, expression string
+		fixed                  bool
+		quota                  int
+	}{
+		{name: "missing per-request price with unset-ratio permission", unit: "per_request"},
+		{name: "fixed price cannot replace a seconds expression", unit: "per_second", fixed: true},
+		{name: "per-second expression must use seconds", unit: "per_second", expression: "0.02"},
+		{name: "per-request expression cannot meter seconds", unit: "per_request", expression: `u("seconds") * 0.02`},
+		{name: "configured per-request price", unit: "per_request", fixed: true, quota: 10_000},
+		{name: "configured per-second expression", unit: "per_second", expression: `u("seconds") * 0.02`, quota: 50_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saveBillingConfig(t)
+			previousPrices := ratio_setting.ModelPrice2JSONString()
+			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
+			prices := "{}"
+			if tc.fixed {
+				prices = `{"huahuo-pricing-fixture":0.02}`
+			}
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices))
+			if tc.expression != "" {
+				expressions, err := common.Marshal(map[string]string{modelName: tc.expression})
+				require.NoError(t, err)
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+					"billing_setting.billing_mode": `{"huahuo-pricing-fixture":"tiered_expr"}`,
+					"billing_setting.billing_expr": string(expressions),
+				}))
+			}
+			zero := 0
+			configs := map[string]kitdto.TaskVideoModelConfig{modelName: {
+				Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"},
+				AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, BillingMode: tc.unit,
+				References: kitdto.TaskVideoReferences{Images: &zero, Videos: &zero, Audios: &zero},
+			}}
+			c, info := newTaskSubmitContext(t, modelName, "")
+			c.Set("async_media_prepare", true)
+			c.Set("task_request", map[string]any{"prompt": "smoke", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"})
+			c.Set("task_action", "text_to_video")
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: pluginruntime.WithTaskVideoModels(plugin, configs)})
+			common.SetContextKey(c, constant.ContextKeyChannelSetting, kitdto.ChannelSettings{TaskPluginKey: constant.TaskPlatformHuahuoVideo, TaskPluginModelConfigs: configs})
+			common.SetContextKey(c, constant.ContextKeyChannelKey, "test-key")
+			info.OriginModelName, info.Action, info.UsingGroup = modelName, "text_to_video", "default"
+			info.UserSetting.AcceptUnsetRatioModel = true
+			_, taskErr := RelayTaskSubmit(c, info)
+			if tc.quota == 0 {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, "model_price_error", taskErr.Code)
+				assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
+				return
+			}
+			require.Nil(t, taskErr)
+			assert.Equal(t, tc.quota, info.PriceData.Quota)
+		})
 	}
 }
 

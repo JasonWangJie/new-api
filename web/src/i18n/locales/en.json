@@ -7420,6 +7420,7 @@
     "Use channel type {{type}}": "Use channel type {{type}}",
     "Use default": "Use default",
     "Use disk cache when request body exceeds this size": "Use disk cache when request body exceeds this size",
+    "Use either image links or uploaded files for reference images.": "Use either image links or uploaded files for reference images.",
     "Use exact client model names, separated by commas. Prefixes and wildcards are not supported.": "Use exact client model names, separated by commas. Prefixes and wildcards are not supported.",
     "Use exact model names such as gpt-4o, or regex rules prefixed with re: such as re:^gemini-.": "Use exact model names such as gpt-4o, or regex rules prefixed with re: such as re:^gemini-.",
     "Use expression pricing when a dependent price is non-zero and its base price is zero.": "Use expression pricing when a dependent price is non-zero and its base price is zero.",

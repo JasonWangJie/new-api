@@ -130,6 +130,15 @@ type VideoModeProfile struct {
 	DefaultExtensionDirection string                `json:"defaultExtensionDirection,omitempty"`
 	Inputs                    []VideoInputProfile   `json:"inputs,omitempty"`
 	Options                   VideoOptionsProfile   `json:"options,omitempty"`
+	// Populated by the host for channel-configured models.
+	DurationsByResolution map[string]VideoDurationProfile `json:"durationsByResolution,omitempty"`
+}
+
+func (m VideoModeProfile) DurationForResolution(resolution string) *VideoDurationProfile {
+	if duration, exists := m.DurationsByResolution[strings.ToLower(resolution)]; exists {
+		return &duration
+	}
+	return m.Duration
 }
 
 type VideoDurationProfile struct {
@@ -201,6 +210,13 @@ func CloneVideoProfile(profile VideoProfile) VideoProfile {
 			duration := *mode.Duration
 			duration.Values = slices.Clone(duration.Values)
 			mode.Duration = &duration
+		}
+		if mode.DurationsByResolution != nil {
+			mode.DurationsByResolution = maps.Clone(mode.DurationsByResolution)
+			for resolution, duration := range mode.DurationsByResolution {
+				duration.Values = slices.Clone(duration.Values)
+				mode.DurationsByResolution[resolution] = duration
+			}
 		}
 		mode.Resolutions = slices.Clone(mode.Resolutions)
 		mode.AspectRatios = slices.Clone(mode.AspectRatios)
@@ -308,7 +324,7 @@ type RoutingStatus struct {
 type RoutingGenerationPreparer func(candidate, current *RoutingGeneration) (PreparedRoutingGeneration, error)
 
 type Registry struct {
-	videoModels     map[string]dto.TaskVideoModelConfig
+	videoModels     map[string]map[string]dto.TaskVideoModelConfig
 	videoRevision   string
 	mu              sync.RWMutex
 	factory         map[string]*LoadedPlugin
@@ -352,7 +368,7 @@ func (r *Registry) RegisterFactory(source string, options Options) (*LoadedPlugi
 }
 
 func (r *Registry) register(source string, options Options, factory bool) (*LoadedPlugin, error) {
-	plugin, err := CompilePlugin(source, options)
+	plugin, err := compilePlugin(source, options, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -385,6 +401,10 @@ func (r *Registry) register(source string, options Options, factory bool) (*Load
 // multiple plugins use this together with ReplaceOverrides so readers observe a
 // single generation transition.
 func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
+	return compilePlugin(source, options, false)
+}
+
+func compilePlugin(source string, options Options, factory bool) (*LoadedPlugin, error) {
 	engine, err := Compile(source, options)
 	if err != nil {
 		return nil, err
@@ -397,7 +417,8 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = normalizeV1Meta(&meta); err != nil {
+	channelModelsOnly := factory && options.Key == meta.Key && (meta.Key == "huahuo-image" || meta.Key == "huahuo-video")
+	if err = normalizeV1Meta(&meta, channelModelsOnly); err != nil {
 		return nil, err
 	}
 	engine.key = meta.Key
@@ -683,7 +704,7 @@ func (r *Registry) ReplaceOverrides(plugins []*LoadedPlugin) error {
 	return r.replaceOverrides(plugins, nil, false, "")
 }
 
-func (r *Registry) ReplaceOverridesWithVideoModels(plugins []*LoadedPlugin, configs map[string]dto.TaskVideoModelConfig, revisions ...string) error {
+func (r *Registry) ReplaceOverridesWithVideoModels(plugins []*LoadedPlugin, configs map[string]map[string]dto.TaskVideoModelConfig, revisions ...string) error {
 	revision := ""
 	if len(revisions) > 0 {
 		revision = revisions[0]
@@ -691,7 +712,7 @@ func (r *Registry) ReplaceOverridesWithVideoModels(plugins []*LoadedPlugin, conf
 	return r.replaceOverrides(plugins, configs, true, revision)
 }
 
-func (r *Registry) replaceOverrides(plugins []*LoadedPlugin, configs map[string]dto.TaskVideoModelConfig, replaceModels bool, revision string) error {
+func (r *Registry) replaceOverrides(plugins []*LoadedPlugin, configs map[string]map[string]dto.TaskVideoModelConfig, replaceModels bool, revision string) error {
 	overridePlugins := make(map[string]*LoadedPlugin, len(plugins))
 	for _, plugin := range plugins {
 		if plugin == nil {
@@ -1088,7 +1109,7 @@ func (r *Registry) resolveActiveOverrides(
 		if !hasOverride {
 			continue
 		}
-		if plugin == desired || plugin == r.activeOverride[plugin.Meta.Key] || plugin.Meta.Key == "sudashui" && plugin.Engine == desired.Engine {
+		if plugin == desired || plugin == r.activeOverride[plugin.Meta.Key] || dto.ChannelConfiguredTaskVideoPlugin(plugin.Meta.Key) && plugin.Engine == desired.Engine {
 			active[plugin.Meta.Key] = plugin
 		}
 	}
@@ -1308,10 +1329,10 @@ func decodeMeta(value any) (Meta, error) {
 // docs/plugin-api/v1.schema.json to administrator uploads.
 func ValidateV1Meta(meta Meta) error {
 	meta = cloneMeta(meta)
-	return normalizeV1Meta(&meta)
+	return normalizeV1Meta(&meta, false)
 }
 
-func normalizeV1Meta(meta *Meta) error {
+func normalizeV1Meta(meta *Meta, channelModelsOnly bool) error {
 	seenCapabilities := make(map[string]bool, len(meta.RequiredCapabilities))
 	for _, name := range meta.RequiredCapabilities {
 		if !HasCapability(name) || seenCapabilities[name] {
@@ -1408,7 +1429,7 @@ func normalizeV1Meta(meta *Meta) error {
 	if meta.FetchMode != "per_task" && meta.FetchMode != "batch" {
 		return fmt.Errorf("plugin meta fetchMode must be per_task or batch")
 	}
-	if len(meta.Models) == 0 {
+	if len(meta.Models) == 0 && !channelModelsOnly {
 		return fmt.Errorf("plugin meta models must contain at least one model")
 	}
 	seenChannelTypes := make(map[int]struct{}, len(meta.ChannelTypes))

@@ -11,7 +11,7 @@ import (
 // WithTaskVideoModels creates immutable channel-specific metadata while sharing
 // the compiled engine. Existing pins continue to own their previous metadata.
 func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoModelConfig) *LoadedPlugin {
-	if plugin == nil || plugin.Meta.Key != "sudashui" {
+	if plugin == nil || !dto.ChannelConfiguredTaskVideoPlugin(plugin.Meta.Key) {
 		return plugin
 	}
 	copy := *plugin
@@ -33,15 +33,23 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 			}
 		}
 		profile := VideoProfile{Models: []string{name}}
-		duration := &VideoDurationProfile{Min: config.Duration.Min, Max: config.Duration.Max, Step: config.Duration.Step, Values: slices.Clone(config.Duration.Values), Default: config.Duration.Default}
-		if duration.Default == 0 {
-			duration.Default = duration.Min
-			if len(duration.Values) > 0 {
-				duration.Default = duration.Values[0]
+		duration := taskVideoDurationProfile(config.Duration)
+		var durationsByResolution map[string]VideoDurationProfile
+		if len(config.DurationsByResolution) > 0 {
+			durationsByResolution = make(map[string]VideoDurationProfile, len(config.DurationsByResolution))
+			for resolution, capability := range config.DurationsByResolution {
+				durationsByResolution[resolution] = taskVideoDurationProfile(capability)
 			}
 		}
+		imageSources := []string{"url"}
+		if config.References.ImageDataURI {
+			imageSources = append(imageSources, "data_uri")
+		}
+		if config.References.ImageUpload {
+			imageSources = append(imageSources, "upload")
+		}
 		for _, name := range config.Modes {
-			mode := VideoModeProfile{Name: name, Duration: duration, Resolutions: slices.Clone(resolutions), AspectRatios: slices.Clone(config.AspectRatios)}
+			mode := VideoModeProfile{Name: name, Duration: &duration, Resolutions: slices.Clone(resolutions), AspectRatios: slices.Clone(config.AspectRatios), DurationsByResolution: durationsByResolution}
 			if len(mode.Resolutions) > 0 {
 				mode.DefaultResolution = mode.Resolutions[0]
 			}
@@ -50,16 +58,25 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 			}
 			switch name {
 			case "image_to_video":
-				mode.Inputs = []VideoInputProfile{{Name: "image", Kind: "image", Sources: []string{"url"}, MaxItems: 1, Required: true}}
+				mode.Inputs = []VideoInputProfile{{Name: "image", Kind: "image", Sources: imageSources, MaxItems: 1, Required: true}}
 			case "first_last_frame":
-				mode.Inputs = []VideoInputProfile{{Name: "image", Kind: "image", Sources: []string{"url"}, MaxItems: 1, Required: true}, {Name: "last_frame", Kind: "image", Sources: []string{"url"}, MaxItems: 1, Required: true}}
+				// Huahuo enables inline frames separately from ordinary image references.
+				frameSources := []string{"url"}
+				mode.Inputs = []VideoInputProfile{{Name: "image", Kind: "image", Sources: frameSources, MaxItems: 1, Required: true}}
+				if plugin.Meta.Key == "sudashui" || config.References.Images != nil && *config.References.Images >= 2 {
+					mode.Inputs = append(mode.Inputs, VideoInputProfile{Name: "last_frame", Kind: "image", Sources: frameSources, MaxItems: 1, Required: plugin.Meta.Key == "sudashui"})
+				}
 			case "reference_to_video":
 				for _, input := range []struct {
 					name, kind string
 					count      *int
 				}{{"reference_images", "image", config.References.Images}, {"reference_videos", "video", config.References.Videos}, {"reference_audios", "audio", config.References.Audios}} {
 					if input.count != nil && *input.count > 0 {
-						mode.Inputs = append(mode.Inputs, VideoInputProfile{Name: input.name, Kind: input.kind, Sources: []string{"url"}, MaxItems: *input.count})
+						sources := []string{"url"}
+						if input.kind == "image" {
+							sources = imageSources
+						}
+						mode.Inputs = append(mode.Inputs, VideoInputProfile{Name: input.name, Kind: input.kind, Sources: sources, MaxItems: *input.count})
 					}
 				}
 			}
@@ -79,9 +96,31 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 	return &copy
 }
 
+func taskVideoDurationProfile(config dto.TaskVideoDuration) VideoDurationProfile {
+	duration := VideoDurationProfile{Min: config.Min, Max: config.Max, Step: config.Step, Values: slices.Clone(config.Values), Default: config.Default}
+	if duration.Default == 0 {
+		duration.Default = duration.Min
+		if len(duration.Values) > 0 {
+			duration.Default = duration.Values[0]
+		}
+	}
+	return duration
+}
+
 // MergeTaskVideoModel describes the union for discovery. Admission always uses
 // the selected channel's unmerged config, never this permissive catalog union.
 func MergeTaskVideoModel(a, b dto.TaskVideoModelConfig, maxSeconds int) dto.TaskVideoModelConfig {
+	if len(a.DurationsByResolution)+len(b.DurationsByResolution) > 0 {
+		durations := make(map[string]dto.TaskVideoDuration)
+		for _, resolution := range slices.Concat(a.Resolutions, b.Resolutions) {
+			key := strings.ToLower(resolution)
+			if _, exists := durations[key]; exists {
+				continue
+			}
+			durations[key] = mergeResolutionDuration(a, b, key, maxSeconds)
+		}
+		a.DurationsByResolution = durations
+	}
 	values := []int{}
 	for i := 1; i <= maxSeconds; i++ {
 		if a.AllowsDuration(i) || b.AllowsDuration(i) {
@@ -113,19 +152,60 @@ func MergeTaskVideoModel(a, b dto.TaskVideoModelConfig, maxSeconds int) dto.Task
 			*limit.target = &value
 		}
 	}
+	a.References.ImageUpload = a.References.ImageUpload || b.References.ImageUpload
+	a.References.ImageDataURI = a.References.ImageDataURI || b.References.ImageDataURI
 	if a.BillingMode != b.BillingMode {
 		a.BillingMode = "mixed"
 	}
 	return a
 }
 
-func configuredVideoPlugins(plugins map[string]*LoadedPlugin, configs map[string]dto.TaskVideoModelConfig) map[string]*LoadedPlugin {
+func mergeResolutionDuration(a, b dto.TaskVideoModelConfig, resolution string, maxSeconds int) dto.TaskVideoDuration {
+	var duration dto.TaskVideoDuration
+	seen := make([]bool, maxSeconds+1)
+	for _, config := range []dto.TaskVideoModelConfig{a, b} {
+		if !slices.ContainsFunc(config.Resolutions, func(value string) bool { return strings.EqualFold(value, resolution) }) {
+			continue
+		}
+		options, exists := config.DurationsByResolution[resolution]
+		if !exists {
+			options = config.Duration
+		}
+		if duration.Default == 0 {
+			duration.Default = taskVideoDurationProfile(options).Default
+		}
+		if len(options.Values) > 0 {
+			for _, seconds := range options.Values {
+				if seconds > 0 && seconds <= maxSeconds {
+					seen[seconds] = true
+				}
+			}
+			continue
+		}
+		if options.Step <= 0 {
+			continue
+		}
+		for seconds := max(1, options.Min); seconds <= min(maxSeconds, options.Max); seconds += options.Step {
+			seen[seconds] = true
+		}
+	}
+	for seconds := 1; seconds <= maxSeconds; seconds++ {
+		if seen[seconds] {
+			duration.Values = append(duration.Values, seconds)
+		}
+	}
+	return duration
+}
+
+func configuredVideoPlugins(plugins map[string]*LoadedPlugin, configs map[string]map[string]dto.TaskVideoModelConfig) map[string]*LoadedPlugin {
 	if configs == nil {
 		return plugins
 	}
-	if plugin := plugins["sudashui"]; plugin != nil {
-		plugins = maps.Clone(plugins)
-		plugins["sudashui"] = WithTaskVideoModels(plugin, configs)
+	configured := maps.Clone(plugins)
+	for key, plugin := range plugins {
+		if dto.ChannelConfiguredTaskVideoPlugin(key) {
+			configured[key] = WithTaskVideoModels(plugin, configs[key])
+		}
 	}
-	return plugins
+	return configured
 }

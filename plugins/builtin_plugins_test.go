@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "jimeng", "kling", "nldw", "sora", "sudashui", "sunoapi", "tabtab", "tianyue", "vertex-ai", "vidu", "xai", "yali", "yuxibox"}
+var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "huahuo-image", "huahuo-video", "jimeng", "kling", "nldw", "sora", "sudashui", "sunoapi", "tabtab", "tianyue", "vertex-ai", "vidu", "xai", "yali", "yuxibox"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -91,6 +91,18 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 			plugin, registerErr := registry.RegisterFactory(source, jsplugin.Options{Key: key})
 			require.NoError(t, registerErr)
 
+			switch key {
+			case "huahuo-image":
+				assert.Empty(t, plugin.Meta.Protocols)
+				assert.Empty(t, plugin.Meta.Routes)
+				return
+			case "huahuo-video":
+				require.Len(t, plugin.Meta.Protocols, 1)
+				assert.Equal(t, "openai_video", plugin.Meta.Protocols[0].Name)
+				assert.Empty(t, plugin.Meta.Routes)
+				return
+			}
+
 			if key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" {
 				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/videos", plugin.Meta.Models[0])
 				require.True(t, claimed)
@@ -140,8 +152,8 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 	bodyOverrides := map[string]map[string]any{}
 	for _, key := range expectedKeys {
 		t.Run(key, func(t *testing.T) {
-			if key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" {
-				t.Skip("This plugin exposes only the host-owned OpenAI Video protocol")
+			if key == "huahuo-image" || key == "huahuo-video" || key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" {
+				t.Skip("This plugin does not expose the Responses protocol")
 			}
 			source, sourceErr := Source(key)
 			require.NoError(t, sourceErr)

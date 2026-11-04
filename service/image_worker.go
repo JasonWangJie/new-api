@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"github.com/go-redis/redis/v8"
@@ -825,7 +826,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if policyPlatform == "" {
 			policyPlatform = request.Platform
 		}
-		legacyTimeout := livePolicy.LegacyTimeoutEnabled && slices.Contains(livePolicy.LegacyTimeoutScopeKeys, ImageIdentityHash(task.Group, policyPlatform)) && (request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled)
+		legacyTimeout := capability.Provider != constant.HuahuoImagePluginKey && livePolicy.LegacyTimeoutEnabled && slices.Contains(livePolicy.LegacyTimeoutScopeKeys, ImageIdentityHash(task.Group, policyPlatform)) && (request.MixedRouting == nil || cfg.MixedTimeoutRetryEnabled)
 		attempts = append(attempts, ImageChannelAttempt{AuditVersion: 1, Decision: &selection, Provider: capability.Provider, Protocol: capability.Protocol, UpstreamModel: upstreamModel, ChannelId: channel.Id, KeyFingerprint: account.Fingerprint, CredentialFingerprint: account.CredentialFingerprint, RetryOnTimeout: legacyTimeout, RetryReferenceTimeoutLocally: channel.GetSetting().ImageReferenceTimeoutRetrySameChannel, KeyIndex: account.Index, StartedAt: now, ReferenceMode: mode, ReferenceFallback: referenceFallback})
 		encoded, err := common.Marshal(attempts)
 		if err != nil {
@@ -987,7 +988,8 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 			failure.ExecutionUnknown = true
 		}
-		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown {
+		requiresHuahuoReview := failure.InternalCode == "huahuo_delivery_timeout" || failure.InternalCode == "huahuo_charge_unconfirmed"
+		if task.UpstreamSucceededAt == 0 && task.UpstreamTaskId != "" && failure.ExecutionUnknown && !requiresHuahuoReview {
 			plan, planErr := buildImageFailurePlan(context.WithoutCancel(ctx), *task, failure, cfg, nil)
 			if planErr != nil {
 				return planErr
@@ -1182,6 +1184,8 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 		}
 	}
 	deadlineFailover := false
+	huahuoDispatched := task.Provider == constant.HuahuoImagePluginKey && task.UpstreamTaskId != ""
+	huahuoRecovery := huahuoDispatched && !acceptedOutput
 	policyCheckpoint, policyErr := ImageRetryFailureContext(task, failure, replayRequest, cfg)
 	if policyErr != nil {
 		return imageFailurePlan{}, policyErr
@@ -1193,12 +1197,16 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 		updates["retry_count"] = task.RetryCount
 	}
 	livePolicy := mediaretry.Policy{}
-	if policyOverride == nil {
+	if huahuoRecovery {
+		// Once dispatched, this task may query its original operation or end.
+		// A subsequent generation requires a new client task.
+		policyCheckpoint.Decision = mediaretry.Decision{}
+	} else if policyOverride == nil {
 		livePolicy, policyErr = GetMediaRetryPolicy(ctx)
 	} else {
 		livePolicy = *policyOverride
 	}
-	if policyErr == nil {
+	if !huahuoRecovery && policyErr == nil {
 		policyCheckpoint.Decision, policyErr = evaluateMediaRetryPolicy(livePolicy, policyCheckpoint.Fact, policyCheckpoint.State)
 	}
 	if policyErr != nil {
@@ -1382,6 +1390,9 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 	} else if failure.ExecutionUnknown {
 		status = model.ImageTaskExecutionUnknown
 		updates["public_error_code"] = 608
+		if huahuoRecovery {
+			updates["reconciliation_status"] = "upstream_unconfirmed"
+		}
 	} else if task.UpstreamTaskId != "" && !failure.UpstreamTerminal && (failure.InternalCode == "execution_deadline" || task.StartedAt > 0 && time.Now().Unix() >= model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout) || failure.Code != 605 && failure.Code != 606) {
 		// An expired or unreadable poll cannot prove that the accepted job
 		// stopped. Keep its financial hold for administrator reconciliation.
@@ -1393,7 +1404,7 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 		resubmit := task.UpstreamTaskId == ""
 		if failure.UpstreamTerminal || submissionResponseRetry {
 			resubmit = false
-			if !compatibilityFailure && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
+			if !huahuoDispatched && !compatibilityFailure && (failure.Code == 602 || failure.Code == 603 || failure.Code == 605 || failure.Code == 606) {
 				var err error
 				resubmit, err = canRetryAsyncImageSubmission(ctx, task, cfg)
 				if err != nil {

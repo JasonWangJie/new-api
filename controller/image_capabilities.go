@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	gatewaydto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -381,7 +383,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 					"mode":                 "async",
 					"available":            available,
 					"availability_reason":  availabilityReason,
-					"pricing_status":       videoPricingStatus(provider, ability.Model, candidate.Model, candidate.Plugin),
+					"pricing_status":       videoPricingStatus(provider, ability.Model, candidate.Model, candidate.Plugin, channel),
 					"capability":           profile,
 					"supported_parameters": []string{"model", "prompt", "seconds", "duration", "size", "resolution", "aspect_ratio", "generate_audio", "image", "input_reference", "last_frame", "reference_images", "reference_videos", "reference_audios", "provider_extensions"},
 					"max_duration_seconds": videoProfileMaxDuration(profile),
@@ -509,14 +511,35 @@ func videoProfileMaxDuration(profile pluginruntime.VideoProfile) int {
 	return maximum
 }
 
-func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginruntime.LoadedPlugin) string {
+func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginruntime.LoadedPlugin, channel *model.Channel) string {
+	huahuo := provider == constant.TaskPlatformHuahuoVideo
+	requiresSeconds := false
+	if huahuo {
+		upstream, config, err := channel.TaskVideoModelConfig(modelName)
+		if err != nil {
+			return "invalid_configuration"
+		}
+		mappedModel = upstream
+		requiresSeconds = config.BillingMode == "per_second"
+		plugin = pluginruntime.WithTaskVideoModels(plugin, map[string]dto.TaskVideoModelConfig{upstream: config})
+	}
 	expression, exists := billing_setting.ResolveTaskBillingExpr(provider, modelName, mappedModel)
 	if exists {
 		schema, _ := plugin.Meta.UsageForModel(mappedModel)
-		if billing_setting.TaskExprCompatible(expression, schema) {
-			return "configured"
+		if !billing_setting.TaskExprCompatible(expression, schema) || huahuo && (billingexpr.UsesFixedPricing(expression) || requiresSeconds && !billingexpr.UsedUsageKeys(expression)["seconds"]) {
+			return "invalid_configuration"
 		}
-		return "invalid_configuration"
+		return "configured"
+	}
+	if huahuo {
+		if !requiresSeconds && billing_setting.GetBillingMode(modelName) != billing_setting.BillingModeTieredExpr {
+			_, configured := ratio_setting.GetModelPrice(modelName, false)
+			_, builtIn := ratio_setting.GetDefaultModelPriceMap()[modelName]
+			if configured || builtIn {
+				return "configured"
+			}
+		}
+		return "needs_configuration"
 	}
 	for _, name := range []string{modelName, mappedModel} {
 		if name == "" {

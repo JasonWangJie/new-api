@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -30,6 +31,10 @@ func ImageChannelCapability(channel model.Channel, modelName string) dto.ImageCa
 func RegisteredImageProvider(provider string) bool {
 	if provider == "openai" || provider == "gemini" {
 		return true
+	}
+	if provider == constant.HuahuoImagePluginKey {
+		_, enabled := jsplugin.DefaultRegistry.Get(provider)
+		return enabled
 	}
 	for channelType := range constant.ChannelTypeDummy {
 		capability := ImageChannelCapability(model.Channel{Type: channelType}, "")
@@ -69,6 +74,9 @@ func RegisteredImageProviders() []string {
 			providers = append(providers, capability.Provider)
 			seen[capability.Provider] = true
 		}
+	}
+	if RegisteredImageProvider(constant.HuahuoImagePluginKey) {
+		providers = append(providers, constant.HuahuoImagePluginKey)
 	}
 	return providers
 }
@@ -269,6 +277,9 @@ func ApplyVideoModelOverrides(profile jsplugin.VideoProfile, overrides VideoMode
 			}
 			mode.Resolutions = values
 		}
+		if !retainVideoResolutionDurations(mode, overrides.Duration) {
+			return profile, fmt.Errorf("video_overrides leaves no resolution with a valid duration for %s", mode.Name)
+		}
 		if overrides.DefaultResolution != "" && len(mode.Resolutions) > 0 {
 			if !slices.Contains(mode.Resolutions, overrides.DefaultResolution) {
 				return profile, fmt.Errorf("video_overrides default_resolution is unavailable for %s", mode.Name)
@@ -361,12 +372,63 @@ func narrowVideoChoices(upstream, requested []string, label string) ([]string, e
 	return slices.Clone(requested), nil
 }
 
+// retainVideoResolutionDurations intersects channel duration constraints with
+// the already-narrowed public profile, dropping resolutions with no valid pair.
+func retainVideoResolutionDurations(mode *jsplugin.VideoModeProfile, override *VideoDurationOverrides) bool {
+	if len(mode.DurationsByResolution) == 0 {
+		return true
+	}
+	if mode.Duration == nil {
+		return false
+	}
+	if override == nil {
+		maps.DeleteFunc(mode.DurationsByResolution, func(resolution string, _ jsplugin.VideoDurationProfile) bool {
+			return !slices.Contains(mode.Resolutions, resolution)
+		})
+		return len(mode.Resolutions) > 0
+	}
+	allowed := make([]bool, relaycommon.MaxTaskDurationSeconds+1)
+	for seconds := 1; seconds <= relaycommon.MaxTaskDurationSeconds; seconds++ {
+		allowed[seconds] = videoDurationAllowed(*mode.Duration, seconds)
+	}
+	mode.Resolutions = slices.DeleteFunc(mode.Resolutions, func(resolution string) bool {
+		duration, exists := mode.DurationsByResolution[resolution]
+		if !exists {
+			return false
+		}
+		values := make([]int, 0)
+		for seconds := 1; seconds <= relaycommon.MaxTaskDurationSeconds; seconds++ {
+			if allowed[seconds] && videoDurationAllowed(duration, seconds) {
+				values = append(values, seconds)
+			}
+		}
+		if len(values) == 0 {
+			return true
+		}
+		if override.Default != nil && slices.Contains(values, *override.Default) {
+			duration.Default = *override.Default
+		} else if !slices.Contains(values, duration.Default) {
+			duration.Default = values[0]
+		}
+		mode.DurationsByResolution[resolution] = jsplugin.VideoDurationProfile{Values: values, Default: duration.Default}
+		return false
+	})
+	maps.DeleteFunc(mode.DurationsByResolution, func(resolution string, _ jsplugin.VideoDurationProfile) bool {
+		return !slices.Contains(mode.Resolutions, resolution)
+	})
+	return len(mode.Resolutions) > 0
+}
+
+func videoDurationAllowed(duration jsplugin.VideoDurationProfile, seconds int) bool {
+	if len(duration.Values) > 0 {
+		return slices.Contains(duration.Values, seconds)
+	}
+	return duration.Step > 0 && seconds >= duration.Min && seconds <= duration.Max && (seconds-duration.Min)%duration.Step == 0
+}
+
 func narrowVideoDuration(duration *jsplugin.VideoDurationProfile, override VideoDurationOverrides) error {
 	allows := func(value int) bool {
-		if len(duration.Values) > 0 {
-			return slices.Contains(duration.Values, value)
-		}
-		return value >= duration.Min && value <= duration.Max && (value-duration.Min)%duration.Step == 0
+		return videoDurationAllowed(*duration, value)
 	}
 	if override.Values != nil {
 		if len(override.Values) == 0 {
@@ -484,24 +546,36 @@ func ValidateVideoProfileRequest(profile jsplugin.VideoProfile, action string, r
 		return fmt.Errorf("video duration and seconds cannot both be provided")
 	}
 	durationValue := firstVideoValue(body, metadata, "duration", "seconds")
-	if mode.Duration == nil {
+	resolution := videoStringValue(body, metadata, "resolution")
+	if resolution == "" {
+		size := videoStringValue(body, metadata, "size")
+		resolution = NormalizeVideoResolution(size)
+		if declared := strings.ToLower(size); resolution == "" && slices.Contains(mode.Resolutions, declared) {
+			resolution = declared
+		}
+	}
+	if resolution == "" {
+		resolution = mode.DefaultResolution
+	}
+	resolution = strings.ToLower(resolution)
+	durationProfile := mode.DurationForResolution(resolution)
+	if durationProfile == nil {
 		if hasField("duration", "seconds") {
 			return fmt.Errorf("video duration is fixed by the provider or source")
 		}
 	} else {
-		duration := mode.Duration.Default
+		duration := durationProfile.Default
 		if durationValue != nil {
 			number, valid := videoNumber(durationValue)
 			if !valid || number != math.Trunc(number) {
 				return fmt.Errorf("video duration must be an integer")
 			}
-			duration = int(number)
-		}
-		if len(mode.Duration.Values) > 0 {
-			if !slices.Contains(mode.Duration.Values, duration) {
+			if number < 1 || number > relaycommon.MaxTaskDurationSeconds {
 				return fmt.Errorf("video duration is outside the enabled capability")
 			}
-		} else if duration < mode.Duration.Min || duration > mode.Duration.Max || (duration-mode.Duration.Min)%mode.Duration.Step != 0 {
+			duration = int(number)
+		}
+		if !videoDurationAllowed(*durationProfile, duration) {
 			return fmt.Errorf("video duration is outside the enabled capability")
 		}
 	}
@@ -510,14 +584,6 @@ func ValidateVideoProfileRequest(profile jsplugin.VideoProfile, action string, r
 			return fmt.Errorf("video resolution is fixed by the provider or source")
 		}
 	} else {
-		resolution := videoStringValue(body, metadata, "resolution")
-		if resolution == "" {
-			resolution = NormalizeVideoResolution(videoStringValue(body, metadata, "size"))
-		}
-		if resolution == "" {
-			resolution = mode.DefaultResolution
-		}
-		resolution = strings.ToLower(resolution)
 		if !slices.Contains(mode.Resolutions, resolution) {
 			return fmt.Errorf("video resolution %q is not enabled", resolution)
 		}
@@ -747,7 +813,7 @@ func videoInputSources(name string, body, metadata map[string]any, files []map[s
 		field, _ := file["field"].(string)
 		if field == name || name == "image" && (field == "image" || field == "input_reference") {
 			ref, _ := file["ref"].(string)
-			if ref == "" || !slices.ContainsFunc(values, func(value any) bool { return videoInputFileRef(value) == ref }) {
+			if ref == "" || !videoRequestHasFileRef(body, metadata, field, ref, name) {
 				values = append(values, videoUploadedFileSource{})
 			}
 		}
@@ -756,7 +822,7 @@ func videoInputSources(name string, body, metadata map[string]any, files []map[s
 	for _, value := range values {
 		if ref := videoInputFileRef(value); ref != "" && slices.ContainsFunc(files, func(file map[string]any) bool {
 			field, _ := file["field"].(string)
-			return file["ref"] == ref && (field == name || name == "image" && (field == "image" || field == "input_reference"))
+			return file["ref"] == ref && (field == name || (name == "image" || name == "reference_images") && videoImageUploadField(field))
 		}) {
 			sources = append(sources, "upload")
 		} else {
@@ -764,6 +830,21 @@ func videoInputSources(name string, body, metadata map[string]any, files []map[s
 		}
 	}
 	return sources
+}
+
+func videoImageUploadField(field string) bool {
+	return field == "image" || field == "input_reference" || field == "input_reference[]" || field == "reference_images"
+}
+
+func videoRequestHasFileRef(body, metadata map[string]any, field, ref, name string) bool {
+	containsRef := func(value any) bool { return videoInputFileRef(value) == ref }
+	if slices.ContainsFunc(videoInputValues(name, body, metadata), containsRef) {
+		return true
+	}
+	// A decoder may assign an uploaded image to the primary image slot or to
+	// ordinary references regardless of which supported alias carried the file.
+	return videoImageUploadField(field) && (slices.ContainsFunc(videoInputValues("image", body, metadata), containsRef) ||
+		slices.ContainsFunc(videoInputValues("reference_images", body, metadata), containsRef))
 }
 
 type videoUploadedFileSource struct{}
@@ -911,7 +992,7 @@ func videoInputCounts(body, metadata map[string]any, files []map[string]any) map
 			name = "image"
 		}
 		ref, _ := file["ref"].(string)
-		if ref != "" && slices.ContainsFunc(videoInputValues(name, body, metadata), func(value any) bool { return videoInputFileRef(value) == ref }) {
+		if ref != "" && videoRequestHasFileRef(body, metadata, field, ref, name) {
 			continue
 		}
 		switch field {
@@ -977,7 +1058,7 @@ func videoMediaInventory(body map[string]any, files []map[string]any) map[string
 		field, _ := file["field"].(string)
 		kind := ""
 		switch field {
-		case "image", "input_reference", "last_frame", "reference_images":
+		case "image", "input_reference", "input_reference[]", "last_frame", "reference_images":
 			kind = "image"
 		case "video", "reference_videos":
 			kind = "video"

@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type {
+  VideoDurationCapability,
   VideoInputCapability,
   VideoModeCapability,
   VideoModeName,
@@ -31,6 +32,53 @@ export type VideoSelection = {
   extensionDirection: string
   inputs: Record<string, string>
   options: Record<string, boolean>
+}
+
+export function videoDurationForResolution(
+  mode: VideoModeCapability,
+  resolution: string
+): VideoDurationCapability | undefined {
+  const selected = resolution || mode.defaultResolution || ''
+  return mode.durationsByResolution?.[selected] ?? mode.duration
+}
+
+export function videoDurationAllows(
+  duration: VideoDurationCapability,
+  seconds: number
+): boolean {
+  if (!Number.isInteger(seconds)) return false
+  if (duration.values) return duration.values.includes(seconds)
+  const minimum = duration.min ?? 1
+  return (
+    seconds >= minimum &&
+    seconds <= (duration.max ?? Infinity) &&
+    (seconds - minimum) % (duration.step ?? 1) === 0
+  )
+}
+
+function mergeDurations(
+  profiles: (VideoDurationCapability | undefined)[],
+  maximumSeconds: number
+): VideoDurationCapability | undefined {
+  const durations = new Set<number>()
+  for (const profile of profiles) {
+    if (!profile) continue
+    if (profile.values) {
+      for (const value of profile.values) durations.add(value)
+      continue
+    }
+    const maximum = Math.min(profile.max ?? maximumSeconds, maximumSeconds)
+    for (
+      let value = profile.min ?? 1;
+      value <= maximum;
+      value += profile.step ?? 1
+    ) {
+      durations.add(value)
+    }
+  }
+  if (!durations.size) return undefined
+  const values = [...durations].sort((a, b) => a - b)
+  return { values, default: profiles[0]?.default ?? values[0] }
 }
 
 export function videoCapabilityModes(model: VideoModel): VideoModeCapability[] {
@@ -62,36 +110,27 @@ export function videoCapabilityModes(model: VideoModel): VideoModeCapability[] {
         ),
       })
     }
-    const durations = new Set<number>()
-    for (const mode of modes) {
-      if (!mode.duration) continue
-      if (mode.duration.values) {
-        for (const value of mode.duration.values) durations.add(value)
-      } else {
-        const maximum = Math.min(
-          mode.duration.max ?? model.max_duration_seconds,
-          model.max_duration_seconds
-        )
-        for (
-          let value = mode.duration.min ?? 1;
-          value <= maximum;
-          value += mode.duration.step ?? 1
-        ) {
-          durations.add(value)
-        }
+    const resolutions = [
+      ...new Set(modes.flatMap((mode) => mode.resolutions || [])),
+    ]
+    const durationsByResolution: Record<string, VideoDurationCapability> = {}
+    if (modes.some((mode) => mode.durationsByResolution)) {
+      for (const resolution of resolutions) {
+        const profiles = modes
+          .filter((mode) => mode.resolutions?.includes(resolution))
+          .map((mode) => videoDurationForResolution(mode, resolution))
+        const duration = mergeDurations(profiles, model.max_duration_seconds)
+        if (duration) durationsByResolution[resolution] = duration
       }
     }
     return {
       ...first,
-      duration: durations.size
-        ? {
-            values: [...durations].sort((a, b) => a - b),
-            default: first.duration?.default ?? 0,
-          }
-        : undefined,
-      resolutions: [
-        ...new Set(modes.flatMap((mode) => mode.resolutions || [])),
-      ],
+      duration: mergeDurations(
+        modes.map((mode) => mode.duration),
+        model.max_duration_seconds
+      ),
+      durationsByResolution,
+      resolutions,
       aspectRatios: [
         ...new Set(modes.flatMap((mode) => mode.aspectRatios || [])),
       ],
@@ -116,18 +155,9 @@ export function videoSelectionMatches(
 ): boolean {
   if (mode.name !== selection.mode) return false
   if (selection.seconds) {
-    const duration = mode.duration
+    const duration = videoDurationForResolution(mode, selection.resolution)
     const seconds = Number(selection.seconds)
-    if (!duration || !Number.isInteger(seconds)) return false
-    if (duration.values) {
-      if (!duration.values.includes(seconds)) return false
-    } else if (
-      seconds < (duration.min ?? 1) ||
-      seconds > (duration.max ?? Infinity) ||
-      (seconds - (duration.min ?? 1)) % (duration.step ?? 1) !== 0
-    ) {
-      return false
-    }
+    if (!duration || !videoDurationAllows(duration, seconds)) return false
   }
   if (
     selection.resolution &&

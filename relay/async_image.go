@@ -163,7 +163,13 @@ func FreezeAsyncImageBilling(ctx context.Context, token model.Token, request ser
 			return service.MediaBillingSnapshot{}, err
 		}
 	}
-	return service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup}, nil
+	snapshot := service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp, ImageQuotaBeforeGroup: info.ImageQuotaBeforeGroup}
+	if selected != nil && selected.Type == constant.ChannelTypeTaskPlugin && selected.GetSetting().TaskPluginKey == constant.HuahuoImagePluginKey {
+		if err := validateMixedImageTokenUsage(&snapshot, dto.ImageCapability{}, nil); err != nil {
+			return service.MediaBillingSnapshot{}, err
+		}
+	}
+	return snapshot, nil
 }
 
 func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request service.AsyncImageRequest, group string) (int, error) {
@@ -175,6 +181,13 @@ func EstimateAsyncImageQuota(ctx context.Context, token model.Token, request ser
 }
 
 func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+	return executeAsyncImage(ctx, task, request, channel, cfg, beforeInvoke, service.DownloadHuahuoImageResult)
+}
+
+type huahuoImageDownloader func(context.Context, string, service.ImageRuntimeConfig) (service.ImageBytes, error)
+
+func executeAsyncImage(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error, downloadHuahuo huahuoImageDownloader) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+	huahuo := channel.Type == constant.ChannelTypeTaskPlugin && channel.GetSetting().TaskPluginKey == constant.HuahuoImagePluginKey
 	postprocessParent := request.PostprocessContext
 	if postprocessParent == nil {
 		postprocessParent = context.WithoutCancel(ctx)
@@ -290,7 +303,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 			return nil, model.AsyncImageBill{}, errors.New("completed upstream image request is missing its billing reservation")
 		}
 		funding := model.ImageFundingSelection{Source: request.Reservation.FundingSource, SubscriptionId: request.Reservation.SubscriptionId}
-		return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, *completion, cfg, funding)
+		return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, *completion, cfg, funding, downloadHuahuo)
 	}
 	if request.MixedRouting != nil || len(channel.GetSetting().ImageResolutionModelMapping[request.Model]) > 0 {
 		mapped := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model}}
@@ -611,7 +624,26 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		dispatched = true
 		return nil
 	}
-	if request.Platform == "openai" {
+	if huahuo {
+		if err := helper.ModelMappedHelper(c, info, parsed); err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
+		billing := service.MediaBillingSnapshot{Price: info.PriceData, Tiered: info.TieredBillingSnapshot}
+		if err := validateMixedImageTokenUsage(&billing, dto.ImageCapability{}, nil); err != nil {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 604, InternalCode: "invalid_request", Message: err.Error(), HTTPStatus: http.StatusBadRequest}
+		}
+		resultURL, err := executeHuahuoImageRequest(ctx, task, request, *channel, info, submitImageURLs, upstreamBeforeInvoke)
+		if err != nil {
+			return nil, model.AsyncImageBill{}, err
+		}
+		if task.UpstreamTaskId == "" {
+			task.UpstreamTaskId = task.HuahuoImageRequestKey()
+		}
+		_, _ = writer.Write([]byte("{}"))
+		c.Set(contextKeyUpstreamAsyncImageURLs, []string{resultURL})
+		c.Set(contextKeyUpstreamAsyncImageProfile, &huahuoImageDownloadProfile)
+		usage = &dto.Usage{UsageSource: "upstream_async"}
+	} else if request.Platform == "openai" {
 		result, apiErr := ExecuteImageRequest(c, info, false, upstreamBeforeInvoke)
 		if apiErr != nil {
 			var pending *service.AsyncImagePending
@@ -940,7 +972,7 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 	if err := service.PersistAsyncImageCompletion(postprocessCtx, &task, request, completion); err != nil {
 		if errors.Is(err, service.ErrAsyncImageCompletionTooLarge) {
 			common.SysLog("async image completion exceeds its durable checkpoint limit: " + task.TaskId)
-			output, bill, finalizeErr := finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding)
+			output, bill, finalizeErr := finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding, downloadHuahuo)
 			if finalizeErr != nil {
 				// No response was saved. A local failure cannot authorize another
 				// generation; a known provider job can still be queried in place.
@@ -950,12 +982,12 @@ func ExecuteAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		}
 		return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 608, InternalCode: "completion_persist_failed", Message: "Upstream image completion could not be durably persisted", ExecutionUnknown: true}
 	}
-	return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding)
+	return finalizeAsyncImageCompletion(postprocessCtx, c, task, info, request, completion, cfg, funding, downloadHuahuo)
 }
 
 // finalizeAsyncImageCompletion consumes durable upstream evidence and never
 // crosses the submission barrier, including after a worker restart.
-func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task model.AsyncImageTask, info *relaycommon.RelayInfo, request service.AsyncImageRequest, completion service.AsyncImageCompletion, cfg service.ImageRuntimeConfig, funding model.ImageFundingSelection) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task model.AsyncImageTask, info *relaycommon.RelayInfo, request service.AsyncImageRequest, completion service.AsyncImageCompletion, cfg service.ImageRuntimeConfig, funding model.ImageFundingSelection, downloadHuahuo huahuoImageDownloader) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
 	c.Request = c.Request.WithContext(ctx)
 	if request.MixedRouting != nil && completion.UsageFields != nil {
 		if completion.UsageFields["invalid_upstream_usage"] {
@@ -981,7 +1013,30 @@ func finalizeAsyncImageCompletion(ctx context.Context, c *gin.Context, task mode
 	var images []service.ImageBytes
 	var upstreamURLs []string
 	var err error
-	if profile := completion.Profile; profile != nil {
+	if completion.Profile != nil && completion.Profile.ID == constant.HuahuoImagePluginKey && info.ChannelType == constant.ChannelTypeTaskPlugin && info.ChannelSetting.TaskPluginKey == constant.HuahuoImagePluginKey {
+		if len(completion.URLs) != 1 {
+			return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 607, InternalCode: "output_parse_failed", Message: "Huahuo image result is missing"}
+		}
+		image, downloadErr := downloadHuahuo(ctx, completion.URLs[0], cfg)
+		if errors.Is(downloadErr, service.ErrHuahuoImageResultURLExpired) && task.UpstreamTaskId != "" {
+			resultURL, pollErr := executeHuahuoImageRequest(ctx, task, request, model.Channel{}, info, nil, nil)
+			if pollErr != nil || resultURL == completion.URLs[0] {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_download_failed", Message: "Huahuo image delivery URL could not be refreshed"}
+			}
+			completion.URLs = []string{resultURL}
+			if persistErr := service.PersistAsyncImageCompletion(ctx, &task, request, completion); persistErr != nil {
+				return nil, model.AsyncImageBill{}, &service.AsyncImageFailure{Code: 606, InternalCode: "result_download_failed", Message: "Refreshed Huahuo image URL could not be saved"}
+			}
+			image, downloadErr = downloadHuahuo(ctx, resultURL, cfg)
+		}
+		if errors.Is(downloadErr, service.ErrHuahuoImageResultURLExpired) {
+			downloadErr = service.ErrUpstreamAsyncImageTransport
+		}
+		if downloadErr == nil {
+			images = []service.ImageBytes{image}
+		}
+		err = downloadErr
+	} else if profile := completion.Profile; profile != nil {
 		urls := completion.URLs
 		c.Set(contextKeyUpstreamAsyncImageProfile, profile)
 		c.Set(contextKeyUpstreamAsyncImageURLs, urls)

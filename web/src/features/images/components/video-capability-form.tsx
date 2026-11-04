@@ -32,6 +32,8 @@ import { Textarea } from '@/components/ui/textarea'
 import { imageLabel } from '../lib/image-labels'
 import {
   videoCapabilityModes,
+  videoDurationAllows,
+  videoDurationForResolution,
   videoSelectionMatches,
 } from '../lib/video-capabilities'
 import type {
@@ -89,11 +91,13 @@ const PROTECTED_FIELDS = new Set([
 ])
 
 function modeDefaults(mode: VideoModeCapability): VideoFormValues {
+  const resolution = mode.defaultResolution || ''
+  const duration = videoDurationForResolution(mode, resolution)
   return {
     mode: mode.name,
     prompt: '',
-    seconds: mode.duration?.default ? String(mode.duration.default) : '',
-    resolution: mode.defaultResolution || '',
+    seconds: duration?.default ? String(duration.default) : '',
+    resolution,
     aspectRatio: mode.defaultAspectRatio || '',
     extensionDirection: mode.defaultExtensionDirection || '',
     inputs: {},
@@ -163,34 +167,28 @@ function formSchema(
         return
       }
       if (
-        ['text_to_video', 'edit_video', 'extend_video'].includes(mode.name) &&
+        (model.provider === 'huahuo-video' ||
+          ['text_to_video', 'edit_video', 'extend_video'].includes(
+            mode.name
+          )) &&
         !values.prompt.trim()
       ) {
         context.addIssue({ code: 'custom', path: ['prompt'], message: invalid })
       }
+      const duration = videoDurationForResolution(mode, values.resolution)
       if (
-        mode.duration &&
-        (model.routing_platform !== 'mixed' || values.seconds)
+        duration &&
+        (model.routing_platform !== 'mixed' || values.seconds) &&
+        !videoDurationAllows(
+          { ...duration, max: duration.max ?? model.max_duration_seconds },
+          Number(values.seconds)
+        )
       ) {
-        const seconds = Number(values.seconds)
-        const valuesList = mode.duration.values
-        const minimum = mode.duration.min ?? 1
-        const maximum = mode.duration.max ?? model.max_duration_seconds
-        const step = mode.duration.step ?? 1
-        if (
-          !Number.isInteger(seconds) ||
-          (valuesList
-            ? !valuesList.includes(seconds)
-            : seconds < minimum ||
-              seconds > maximum ||
-              (seconds - minimum) % step !== 0)
-        ) {
-          context.addIssue({
-            code: 'custom',
-            path: ['seconds'],
-            message: invalid,
-          })
-        }
+        context.addIssue({
+          code: 'custom',
+          path: ['seconds'],
+          message: invalid,
+        })
       }
       if (
         mode.resolutions?.length &&
@@ -231,8 +229,16 @@ function formSchema(
         if (!extra || typeof extra !== 'object' || Array.isArray(extra)) {
           throw new Error(invalid)
         }
+        const startFrameField =
+          model.routing_platform === 'mixed' &&
+          mode.name === 'first_last_frame' &&
+          values.inputs.image?.trim() &&
+          !values.inputs.last_frame?.trim()
         for (const field of Object.keys(extra)) {
-          if (PROTECTED_FIELDS.has(field)) {
+          if (
+            PROTECTED_FIELDS.has(field) ||
+            (startFrameField && field === 'start_frame')
+          ) {
             context.addIssue({
               code: 'custom',
               path: ['additional'],
@@ -306,6 +312,7 @@ export function VideoCapabilityForm(props: {
   const inputValues = form.watch('inputs')
   const options = form.watch('options')
   const selection = form.watch()
+  const duration = videoDurationForResolution(mode, selection.resolution)
   const variants = props.model.capability_variants?.length
     ? props.model.capability_variants
     : [props.model.capability]
@@ -344,7 +351,7 @@ export function VideoCapabilityForm(props: {
         ...(!mixed ? { provider: props.model.provider } : {}),
       }
       if (values.prompt.trim()) body.prompt = values.prompt.trim()
-      if (mode.duration && values.seconds) body.seconds = Number(values.seconds)
+      if (duration && values.seconds) body.seconds = Number(values.seconds)
       if (mode.resolutions?.length && values.resolution) {
         body.resolution = values.resolution
       }
@@ -354,6 +361,13 @@ export function VideoCapabilityForm(props: {
       if (mode.name === 'extend_video') {
         body.extension_direction = values.extensionDirection
       }
+      if (
+        !mixed &&
+        props.model.provider === 'huahuo-video' &&
+        mode.name === 'first_last_frame'
+      ) {
+        body.mode = mode.name
+      }
       const files: VideoFormSubmission['files'] = []
       for (const input of mode.inputs || []) {
         const lines = (values.inputs[input.name] || '')
@@ -361,6 +375,16 @@ export function VideoCapabilityForm(props: {
           .map((line) => line.trim())
           .filter(Boolean)
         const inputFiles = uploads[input.name] || []
+        if (
+          props.model.provider === 'huahuo-video' &&
+          input.kind === 'image' &&
+          lines.length > 0 &&
+          inputFiles.length > 0
+        ) {
+          throw new Error(
+            t('Use either image links or uploaded files for reference images.')
+          )
+        }
         if (
           input.required &&
           lines.length + inputFiles.length === 0 &&
@@ -404,6 +428,15 @@ export function VideoCapabilityForm(props: {
           body[input.name] = arrayInput ? parsedValues : parsedValues[0]
         }
         for (const file of inputFiles) files.push({ field: input.name, file })
+      }
+      if (
+        mixed &&
+        mode.name === 'first_last_frame' &&
+        body.image !== undefined &&
+        body.last_frame === undefined
+      ) {
+        body.start_frame = body.image
+        delete body.image
       }
       if (
         mode.options?.generateAudio &&
@@ -472,9 +505,10 @@ export function VideoCapabilityForm(props: {
             'Describe the scene, motion, and visual style you have in mind.'
           )}
           {...form.register('prompt')}
-          required={['text_to_video', 'edit_video', 'extend_video'].includes(
-            mode.name
-          )}
+          required={
+            props.model.provider === 'huahuo-video' ||
+            ['text_to_video', 'edit_video', 'extend_video'].includes(mode.name)
+          }
           disabled={props.busy}
         />
       </div>
@@ -490,13 +524,13 @@ export function VideoCapabilityForm(props: {
           {t('Generation settings')}
         </h4>
         <div className='grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-2'>
-          {mode.duration?.values && (
+          {duration?.values && (
             <ImageSelect
               label={t('Duration (seconds)')}
               value={form.watch('seconds')}
               options={[
                 ...(mixed ? [{ value: '', label: t('Default') }] : []),
-                ...mode.duration.values.map((value) => ({
+                ...duration.values.map((value) => ({
                   value: String(value),
                   label: String(value),
                 })),
@@ -508,15 +542,15 @@ export function VideoCapabilityForm(props: {
               disabled={props.busy}
             />
           )}
-          {mode.duration && !mode.duration.values && (
+          {duration && !duration.values && (
             <div className='space-y-2'>
               <Label htmlFor='video-seconds'>{t('Duration (seconds)')}</Label>
               <Input
                 id='video-seconds'
                 type='number'
-                min={mode.duration.min}
-                max={mode.duration.max}
-                step={mode.duration.step}
+                min={duration.min}
+                max={duration.max}
+                step={duration.step}
                 {...form.register('seconds')}
                 disabled={props.busy}
               />
@@ -535,6 +569,18 @@ export function VideoCapabilityForm(props: {
               ]}
               onChange={(value) => {
                 form.setValue('resolution', value, { shouldDirty: true })
+                const nextDuration = videoDurationForResolution(mode, value)
+                if (
+                  nextDuration &&
+                  selection.seconds &&
+                  !videoDurationAllows(nextDuration, Number(selection.seconds))
+                ) {
+                  form.setValue(
+                    'seconds',
+                    nextDuration.default ? String(nextDuration.default) : '',
+                    { shouldDirty: true }
+                  )
+                }
                 props.onChanged()
               }}
               disabled={props.busy}
@@ -577,7 +623,7 @@ export function VideoCapabilityForm(props: {
               />
             )}
         </div>
-        {(!mode.duration ||
+        {(!duration ||
           !mode.resolutions?.length ||
           !mode.aspectRatios?.length) && (
           <p className='text-muted-foreground text-xs leading-relaxed'>

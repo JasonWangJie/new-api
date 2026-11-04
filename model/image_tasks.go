@@ -2,10 +2,14 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -243,6 +247,11 @@ func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelI
 	now := time.Now().Unix()
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{"channel_id": channelId, "dispatched_at": now, "progress": 20, "version": task.Version + 1, "updated_at": now}
+		query := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND status = ? AND version = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, ImageTaskInvoking, task.Version, task.LeaseToken, now)
+		if task.Provider == constant.HuahuoImagePluginKey {
+			updates["upstream_task_id"] = task.HuahuoImageRequestKey()
+			query = query.Where("dispatched_at = ? AND upstream_task_id = ?", 0, "")
+		}
 		var checkpoint ImageRetryPolicyState
 		recordExecution := false
 		if task.RetryPolicyState != "" {
@@ -267,7 +276,7 @@ func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelI
 		if task.Attempts != "" {
 			updates["attempts"] = task.Attempts
 		}
-		result := tx.Model(&AsyncImageTask{}).Where("task_id = ? AND status = ? AND version = ? AND lease_token = ? AND lease_expires_at > ?", task.TaskId, ImageTaskInvoking, task.Version, task.LeaseToken, now).Updates(updates)
+		result := query.Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -281,6 +290,13 @@ func MarkAsyncImageDispatched(ctx context.Context, task AsyncImageTask, channelI
 		}
 		return tx.Create(&AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: "upstream_dispatched", Status: ImageTaskInvoking, CreatedAt: now}).Error
 	})
+}
+
+// HuahuoImageRequestKey is the recovery handle for one generation attempt.
+// Persist it with the dispatch barrier before handing the request to HTTP.
+func (task AsyncImageTask) HuahuoImageRequestKey() string {
+	sum := sha256.Sum256([]byte("huahuo-image-request\x00" + task.TaskId + "\x00" + strconv.Itoa(task.RetryCount)))
+	return hex.EncodeToString(sum[:])
 }
 
 // StartImageRetryPolicyAction records a poll/download/billing attempt at its

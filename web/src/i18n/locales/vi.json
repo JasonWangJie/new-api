@@ -7420,6 +7420,7 @@
     "Use channel type {{type}}": "Sử dụng loại kênh {{type}}",
     "Use default": "Dùng mặc định",
     "Use disk cache when request body exceeds this size": "Sử dụng bộ nhớ đệm đĩa khi nội dung yêu cầu vượt quá kích thước này",
+    "Use either image links or uploaded files for reference images.": "Với ảnh tham chiếu, hãy dùng liên kết hoặc tệp tải lên.",
     "Use exact client model names, separated by commas. Prefixes and wildcards are not supported.": "Nhập tên model chính xác từ yêu cầu client, ngăn cách bằng dấu phẩy. Không hỗ trợ tiền tố hoặc ký tự đại diện.",
     "Use exact model names such as gpt-4o, or regex rules prefixed with re: such as re:^gemini-.": "Dùng tên model chính xác như gpt-4o, hoặc quy tắc regex có tiền tố re: như re:^gemini-.",
     "Use expression pricing when a dependent price is non-zero and its base price is zero.": "Dùng biểu thức khi giá phụ thuộc khác không nhưng giá cơ sở bằng không.",

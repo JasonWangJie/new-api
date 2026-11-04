@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/plugins"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -650,7 +651,7 @@ func GetTaskPluginOptions(c *gin.Context) {
 			if !ok {
 				continue
 			}
-			if meta.Key == "sudashui" {
+			if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
 				meta = active.Meta
 			}
 			seen[meta.Key] = true

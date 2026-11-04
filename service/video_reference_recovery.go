@@ -369,7 +369,8 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 	} else if isAsyncVideoBusyFailure(fact.Message) {
 		fact.Category = "capacity"
 	}
-	output, conflict := videoRecoveryResponseEvidence(response, task.PrivateData.UpstreamTaskID, result.Reason)
+	// Huahuo identifies the video by id. Its request_id can trace the HTTP call.
+	output, conflict := videoRecoveryResponseEvidence(response, task.PrivateData.UpstreamTaskID, result.Reason, task.Platform != constant.TaskPlatformHuahuoVideo)
 	fact.HasOutput = output || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != ""
 	fact.Unknown = conflict || fact.HasOutput || result.TaskID != "" && result.TaskID != task.PrivateData.UpstreamTaskID
 	if fact.Unknown {
@@ -519,7 +520,7 @@ func videoRetryState(task model.Task, job model.AsyncMediaJob) mediaretry.State 
 
 // videoRecoveryResponseEvidence checks protocol evidence, not error keywords.
 // Input echoes are excluded so a reference URL is never mistaken for an output.
-func videoRecoveryResponseEvidence(response []byte, upstreamID, diagnostic string) (bool, bool) {
+func videoRecoveryResponseEvidence(response []byte, upstreamID, diagnostic string, requestIDIsTaskID bool) (bool, bool) {
 	var root map[string]any
 	if len(response) > 2<<20 || common.Unmarshal(response, &root) != nil || root == nil {
 		return false, true
@@ -551,7 +552,7 @@ func videoRecoveryResponseEvidence(response []byte, upstreamID, diagnostic strin
 				case "prompt", "input", "request", "references", "parameters", "inputimage", "inputreference":
 					continue
 				}
-				if current.depth == 0 && (name == "id" || name == "taskid" || name == "requestid") {
+				if current.depth == 0 && (name == "id" || name == "taskid" || name == "requestid" && requestIDIsTaskID) {
 					if id, ok := child.(string); !ok || id != upstreamID {
 						conflict = true
 					}

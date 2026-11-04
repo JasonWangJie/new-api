@@ -1094,6 +1094,53 @@ test('mixed video keeps complete capability combinations and submits without a p
   })
 })
 
+test('video workbench uses the duration allowed by the chosen resolution', async () => {
+  const model: VideoModel = {
+    ...capabilityModel,
+    provider: 'huahuo-video',
+    capability: {
+      ...capabilityModel.capability,
+      modes: [
+        {
+          name: 'text_to_video',
+          resolutions: ['720p', '1080p'],
+          defaultResolution: '720p',
+          duration: { values: [5, 10], default: 10 },
+          durationsByResolution: { '1080p': { values: [5], default: 5 } },
+        },
+      ],
+    },
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={model}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('Prompt'), 'A city at dawn')
+  await user.click(screen.getByRole('combobox', { name: 'Resolution' }))
+  await user.click(screen.getByRole('option', { name: '1080p' }))
+  await user.click(screen.getByRole('combobox', { name: 'Duration (seconds)' }))
+  expect(screen.queryByRole('option', { name: '10' })).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: '5' }))
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit).toHaveBeenCalledWith({
+    mode: 'text_to_video',
+    body: {
+      model: model.id,
+      prompt: 'A city at dawn',
+      provider: 'huahuo-video',
+      resolution: '1080p',
+      seconds: 5,
+    },
+    files: [],
+  })
+})
+
 test('mixed video preserves omitted booleans and explicit false without changing reference arrays', async () => {
   const mode = {
     name: 'reference_to_video' as const,
@@ -1329,6 +1376,124 @@ test('allows an xAI last-frame request without a prompt or first frame', async (
       last_frame: 'https://cdn.example/last.png',
     },
     files: [],
+  })
+})
+
+test.each(['mixed', 'huahuo-video'])(
+  'preserves a single start frame for %s routing',
+  async (provider) => {
+    const mixed = provider === 'mixed'
+    const profile: VideoModel['capability'] = {
+      models: [capabilityModel.id],
+      modes: [
+        {
+          name: 'first_last_frame',
+          inputs: [
+            {
+              name: 'image',
+              kind: 'image',
+              sources: ['url'],
+              maxItems: 1,
+              required: true,
+            },
+          ],
+        },
+      ],
+    }
+    const model: VideoModel = {
+      ...capabilityModel,
+      provider: mixed ? '' : provider,
+      routing_platform: mixed ? 'mixed' : undefined,
+      capability: profile,
+      capability_variants: mixed ? [profile] : undefined,
+    }
+    const onSubmit = vi.fn()
+    render(
+      <VideoCapabilityForm
+        model={model}
+        busy={false}
+        onChanged={vi.fn()}
+        onSubmit={onSubmit}
+      />
+    )
+    const user = userEvent.setup()
+    const start = 'https://cdn.example/start.png'
+    await user.type(
+      screen.getByLabelText('First frame or reference image *'),
+      start
+    )
+    if (!mixed) {
+      expect(screen.getByLabelText('Prompt')).toBeRequired()
+      await user.click(screen.getByRole('button', { name: 'Generate video' }))
+      expect(onSubmit).not.toHaveBeenCalled()
+    }
+    await user.type(screen.getByLabelText('Prompt'), 'Start from the image')
+    await user.click(screen.getByRole('button', { name: 'Generate video' }))
+    expect(onSubmit).toHaveBeenCalledWith({
+      mode: 'first_last_frame',
+      body: {
+        model: model.id,
+        prompt: 'Start from the image',
+        ...(mixed
+          ? { start_frame: start }
+          : { provider, mode: 'first_last_frame', image: start }),
+      },
+      files: [],
+    })
+  }
+)
+
+test('Huahuo rejects combining reference image links and uploaded files in the workbench', async () => {
+  const model: VideoModel = {
+    ...capabilityModel,
+    provider: 'huahuo-video',
+    capability: {
+      ...capabilityModel.capability,
+      modes: [
+        {
+          name: 'reference_to_video',
+          inputs: [
+            {
+              name: 'reference_images',
+              kind: 'image',
+              sources: ['url', 'upload'],
+              maxItems: 2,
+            },
+          ],
+        },
+      ],
+    },
+  }
+  const onSubmit = vi.fn()
+  render(
+    <VideoCapabilityForm
+      model={model}
+      busy={false}
+      onChanged={vi.fn()}
+      onSubmit={onSubmit}
+    />
+  )
+  const user = userEvent.setup()
+  await user.type(screen.getByLabelText('Prompt'), 'Use a reference image')
+  const links = screen.getByLabelText('Reference images', { exact: true })
+  await user.type(links, 'https://cdn.example/reference.png')
+  const file = new File(['image'], 'reference.png', { type: 'image/png' })
+  await user.upload(screen.getByLabelText('Upload Reference images'), file)
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(screen.getByRole('alert')).toHaveTextContent(
+    'Use either image links or uploaded files for reference images.'
+  )
+  expect(onSubmit).not.toHaveBeenCalled()
+  await user.clear(links)
+  await user.click(screen.getByRole('button', { name: 'Generate video' }))
+  expect(onSubmit).toHaveBeenCalledWith({
+    mode: 'reference_to_video',
+    body: {
+      model: model.id,
+      provider: 'huahuo-video',
+      prompt: 'Use a reference image',
+    },
+    files: [{ field: 'reference_images', file }],
   })
 })
 

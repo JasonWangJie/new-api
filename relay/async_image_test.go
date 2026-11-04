@@ -37,8 +37,10 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -119,6 +121,258 @@ func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHuahuoImagePluginRoutesAndReceipts(t *testing.T) {
+	task := model.AsyncImageTask{TaskId: "huahuo-image-test"}
+	key := task.HuahuoImageRequestKey()
+	const imageURL = "https://images.example/result.png?signature=private"
+	for _, tc := range []struct {
+		name, body, result string
+		status             int
+		query              bool
+	}{
+		{name: "immediate output", status: 200, body: `{"task_id":"vendor-id","data":[{"url":"` + imageURL + `"}]}`, result: "success"},
+		{name: "unreadable submit response", status: 502, body: `<html>bad gateway</html>`},
+		{name: "explicit capacity rejection", status: 429, body: `{"error":{"code":"image_concurrency_limit"}}`, result: "failure"},
+		{name: "conflicting capacity receipt", status: 429, body: `{"task_id":"accepted","error":{"code":"image_concurrency_limit"}}`},
+		{name: "temporary missing receipt", status: 404, body: `{"error":{"code":"not_found"}}`, query: true},
+		{name: "output pending", status: 409, body: `{"error":{"code":"output_pending"}}`, query: true},
+		{name: "in progress", status: 200, body: `{"status":"in_progress"}`, query: true},
+		{name: "completed output", status: 200, body: `{"status":"completed","data":[{"url":"` + imageURL + `"}]}`, query: true, result: "success"},
+		{name: "result belongs to another request", status: 200, body: `{"status":"completed","request_id":"another-key","data":[{"url":"` + imageURL + `"}]}`, query: true},
+		{name: "completed without output", status: 200, body: `{"status":"completed"}`, query: true},
+		{name: "output host is private", status: 200, body: `{"status":"completed","data":[{"url":"https://127.0.0.1/private"}]}`, query: true},
+		{name: "terminal generation failure", status: 200, body: `{"status":"failed","error":{"code":"generation_failed"}}`, query: true, result: "failure"},
+		{name: "failure belongs to another request", status: 200, body: `{"status":"failed","request_id":"another-key"}`, query: true},
+		{name: "conflicting failed receipt", status: 200, body: `{"status":"failed","data":[{"url":"` + imageURL + `"}]}`, query: true},
+		{name: "failed receipt with charge evidence", status: 200, body: `{"status":"failed","credit_state":"reserved","credit_amount":2}`, query: true, result: "review"},
+		{name: "unsubmitted", status: 200, body: `{"status":"not_submitted"}`, query: true, result: "failure"},
+		{name: "delivery timeout receipt", status: 200, body: `{"status":"failed","delivery_status":"failed","request_id":"` + key + `"}`, query: true, result: "review"},
+		{name: "delivery timeout with a separate trace ID", status: 408, body: `{"request_id":"trace-id","error":{"code":"delivery_timeout"}}`, result: "review"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current := task
+			if tc.query {
+				current.UpstreamTaskId = key
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "Bearer offline-fixture", r.Header.Get("Authorization"))
+				if tc.query {
+					assert.Equal(t, http.MethodGet, r.Method)
+					assert.Equal(t, "/v1/images/requests/"+key, r.URL.Path)
+					assert.Empty(t, r.Header.Get("Idempotency-Key"))
+				} else {
+					assert.Equal(t, http.MethodPost, r.Method)
+					assert.Equal(t, "/v1/images/generations", r.URL.Path)
+					assert.Equal(t, key, r.Header.Get("Idempotency-Key"))
+					var payload map[string]any
+					if assert.NoError(t, common.DecodeJson(r.Body, &payload)) {
+						assert.Equal(t, map[string]any{
+							"model": "future-upstream-id", "prompt": "one illustration", "n": float64(1),
+							"size": "16:9", "resolution": "2K", "quality": "high", "response_format": "url",
+							"images": []any{"https://images.example/input.png"},
+						}, payload)
+					}
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(upstream.Close)
+			mapping := `{"public-alias":"future-upstream-id"}`
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Models: "public-alias", ModelMapping: &mapping, BaseURL: &upstream.URL}
+			channel.SetSetting(dto.ChannelSettings{TaskPluginKey: constant.HuahuoImagePluginKey})
+			request := service.AsyncImageRequest{
+				Dialect: "async", Model: "public-alias", Prompt: "one illustration", Count: 1, Kind: "image_to_image",
+				AspectRatio: "16:9", Resolution: "2K", Native: map[string]common.RawMessage{"quality": []byte(`"high"`)},
+				Parts: []service.AsyncImageInputPart{{Type: "image_url", URL: "https://images.example/input.png"}},
+			}
+			assert.True(t, service.ImageChannelSupportsPlatform(channel, request.Model, "mixed"))
+			assert.True(t, service.MixedImageChannelRequestSupported(channel, request))
+			assert.False(t, service.SynchronousImageChannelSupported(channel, request.Model, "/v1/images/generations"))
+			unsupported := request
+			unsupported.Count = 2
+			assert.False(t, service.MixedImageChannelRequestSupported(channel, unsupported))
+			conflicting := request
+			conflicting.Size = "1000x1437"
+			assert.False(t, service.MixedImageChannelRequestSupported(channel, conflicting))
+			matching := request
+			matching.Size = "1600x900"
+			assert.True(t, service.MixedImageChannelRequestSupported(channel, matching))
+			info := &relaycommon.RelayInfo{OriginModelName: request.Model, ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "offline-fixture", ChannelBaseUrl: upstream.URL, UpstreamModelName: "future-upstream-id"}}
+			dispatches := 0
+			result, err := executeHuahuoImageRequest(t.Context(), current, request, channel, info, []string{"https://images.example/input.png"}, func() error { dispatches++; return nil })
+			if tc.query {
+				assert.Zero(t, dispatches)
+			} else {
+				assert.Equal(t, 1, dispatches)
+			}
+			switch tc.result {
+			case "success":
+				require.NoError(t, err)
+				assert.Equal(t, imageURL, result)
+			case "failure", "review":
+				var failure *service.AsyncImageFailure
+				require.ErrorAs(t, err, &failure)
+				assert.Equal(t, tc.result == "failure", failure.UpstreamTerminal)
+				assert.Equal(t, tc.result == "review", failure.ExecutionUnknown)
+				assert.Empty(t, result)
+			default:
+				var pending *service.AsyncImagePending
+				require.ErrorAs(t, err, &pending)
+				assert.Equal(t, key, pending.TaskId)
+				assert.Empty(t, result)
+			}
+		})
+	}
+}
+
+func TestHuahuoImageCompletionRefreshAfterWorkerRestart(t *testing.T) {
+	ctx := t.Context()
+	var dialector gorm.Dialector = sqlite.Open(filepath.Join(t.TempDir(), "huahuo-success.db"))
+	if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_MYSQL_DSN"); dsn != "" {
+		require.Contains(t, dsn, "/new_api_image_job_test")
+		dialector = mysql.Open(dsn)
+	} else if dsn := os.Getenv("IMAGE_UPSTREAM_JOB_TEST_PG_DSN"); dsn != "" {
+		require.True(t, strings.Contains(dsn, "dbname=new_api_image_job_test") || strings.Contains(dsn, "/new_api_image_job_test"))
+		dialector = postgres.Open(dsn)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	previousDB, previousLogs, previousRedis := model.DB, model.LOG_DB, common.RDB
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousCount, previousRedisEnabled, previousBatch := constant.CountToken, common.RedisEnabled, common.BatchUpdateEnabled
+	previousExecute := service.ExecuteAsyncImageFunc
+	redisServer := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	model.DB, model.LOG_DB, common.RDB = db, db, redisClient
+	dialect := common.DatabaseType(db.Dialector.Name())
+	common.SetDatabaseTypes(dialect, dialect)
+	constant.CountToken, common.RedisEnabled, common.BatchUpdateEnabled = false, true, false
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RDB = previousDB, previousLogs, previousRedis
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		constant.CountToken, common.RedisEnabled, common.BatchUpdateEnabled = previousCount, previousRedisEnabled, previousBatch
+		service.ExecuteAsyncImageFunc = previousExecute
+		assert.NoError(t, redisClient.Close())
+		assert.NoError(t, connection.Close())
+	})
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "huahuo-fixture:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "huahuo-fixture")
+	t.Setenv("LOG_SQL_DSN", "")
+	master := common.IsMasterNode
+	common.IsMasterNode = false
+	err = model.InitLogDB()
+	common.IsMasterNode = master
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.Channel{}, &model.Option{}, &model.Log{}))
+	require.NoError(t, model.MigrateImageModels(db))
+	require.NoError(t, model.MigrateImageLogs(db))
+	require.NoError(t, model.InitializeMediaRetryPolicy(db))
+	cfg := service.DefaultImageRuntimeConfig()
+	cfg.AsyncEnabled, cfg.AutoArchive = true, false
+	require.NoError(t, service.SaveImageRuntimeConfig(ctx, cfg))
+	root := t.TempDir()
+	_, err = service.SaveImageStorageProfile(ctx, model.ImageStorageProfile{Class: "temporary", Backend: "local", Provider: "local", Root: root, Active: true}, nil)
+	require.NoError(t, err)
+	user := model.User{Username: "hh-image-" + common.GetUUID()[:8], AffCode: common.GetUUID()[:8], Group: "default", Status: common.UserStatusEnabled, Quota: 10000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: common.GetUUID(), Group: "default", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 10000}
+	require.NoError(t, db.Create(&token).Error)
+	now := time.Now().Unix()
+	task := model.AsyncImageTask{TaskId: "huahuo-success-" + common.GetUUID(), UserId: user.Id, TokenId: token.Id, Group: "default", Provider: constant.HuahuoImagePluginKey, ExecutionProtocol: "openai_images", Model: "test-alias", Platform: "openai", Dialect: "async", Status: model.ImageTaskInvoking, Version: 1, CreatedAt: now, StartedAt: now, LeaseToken: "original-worker", LeaseExpiresAt: now + 120, ExpiresAt: now + 3600}
+	key := task.HuahuoImageRequestKey()
+	const staleURL = "https://images.example/generated.png?signature=stale"
+	const freshURL = "https://images.example/generated.png?signature=fresh"
+	requests := make(chan string, 3)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Method + " " + r.URL.Path
+		assert.Equal(t, "Bearer offline-huahuo-channel", r.Header.Get("Authorization"))
+		switch r.Method {
+		case http.MethodPost:
+			assert.Equal(t, key, r.Header.Get("Idempotency-Key"))
+			_, _ = fmt.Fprintf(w, `{"task_id":"vendor-image","request_id":%q,"data":[{"url":%q}]}`, key, staleURL)
+		case http.MethodGet:
+			assert.Empty(t, r.Header.Get("Idempotency-Key"))
+			_, _ = fmt.Fprintf(w, `{"status":"completed","task_id":"vendor-image","request_id":%q,"data":[{"url":%q}]}`, key, freshURL)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	mapping := `{"test-alias":"vendor-future-model"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "offline-huahuo-channel", BaseURL: &upstream.URL, Models: task.Model, ModelMapping: &mapping, Group: task.Group}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: constant.HuahuoImagePluginKey})
+	require.NoError(t, db.Create(&channel).Error)
+	task.ChannelId = channel.Id
+	request := service.AsyncImageRequest{Model: task.Model, Platform: "openai", Dialect: "async", Count: 1, Kind: "text_to_image", Prompt: "test image", SourcePath: "/v1/images/generations_async", Billing: &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.0002, QuotaToPreConsume: 100, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+	encoded, err := common.Marshal(request)
+	require.NoError(t, err)
+	task.RequestCipher, err = service.EncryptImagePayload(encoded, "task:"+task.TaskId)
+	require.NoError(t, err)
+	encoded, err = common.Marshal(channel)
+	require.NoError(t, err)
+	task.SelectedChannelCipher, err = service.EncryptImagePayload(encoded, "image-channel:"+task.TaskId)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&task).Error)
+	_, _, err = executeAsyncImage(ctx, task, request, &channel, cfg, func() error {
+		return model.MarkAsyncImageDispatched(ctx, task, channel.Id)
+	}, func(_ context.Context, signedURL string, _ service.ImageRuntimeConfig) (service.ImageBytes, error) {
+		assert.Equal(t, staleURL, signedURL)
+		return service.ImageBytes{}, service.ErrUpstreamAsyncImageTransport
+	})
+	var failure *service.AsyncImageFailure
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, "result_download_failed", failure.InternalCode)
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	require.Positive(t, task.UpstreamSucceededAt)
+	assert.Equal(t, key, task.UpstreamTaskId)
+	assert.NotContains(t, string(task.RequestCipher), staleURL)
+	require.NoError(t, db.Model(&task).Update("lease_expires_at", now-1).Error)
+	require.NoError(t, model.RecoverAsyncImageTasks(ctx, 10, cfg.ExecutionTimeout, cfg.FailedRequestRetentionHours))
+	var bitmap bytes.Buffer
+	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
+	validImage, err := service.ValidateImageBytes(bitmap.Bytes(), "image/png", 1<<20, 100)
+	require.NoError(t, err)
+	var downloadURLs []string
+	service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, request service.AsyncImageRequest, channel *model.Channel, cfg service.ImageRuntimeConfig, beforeInvoke func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+		require.NotNil(t, request.Completion)
+		assert.Equal(t, []string{staleURL}, request.Completion.URLs)
+		assert.Equal(t, "vendor-future-model", request.Completion.UpstreamModel)
+		return executeAsyncImage(ctx, task, request, channel, cfg, beforeInvoke, func(_ context.Context, signedURL string, _ service.ImageRuntimeConfig) (service.ImageBytes, error) {
+			downloadURLs = append(downloadURLs, signedURL)
+			if signedURL == staleURL {
+				return service.ImageBytes{}, service.ErrHuahuoImageResultURLExpired
+			}
+			assert.Equal(t, freshURL, signedURL)
+			return validImage, nil
+		})
+	}
+	require.NoError(t, service.RunAsyncImageTask(ctx, task.TaskId))
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+	require.Equal(t, model.ImageTaskSucceeded, task.Status, "%s %s", task.ErrorCode, task.ErrorMessage)
+	assert.Equal(t, []string{staleURL, freshURL}, downloadURLs)
+	require.Len(t, requests, 2)
+	assert.Equal(t, "POST /v1/images/generations", <-requests)
+	assert.Equal(t, "GET /v1/images/requests/"+key, <-requests)
+	assert.Equal(t, 1, task.ResultCount)
+	assert.Equal(t, 100, task.Quota)
+	var bill model.AsyncImageBill
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&bill).Error)
+	assert.Equal(t, "applied", bill.Status)
+	assert.Equal(t, 100, bill.ReservedQuota)
+	assert.Equal(t, 100, bill.Quota)
+	var result model.AsyncImageResult
+	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&result).Error)
+	var object model.ImageStorageObject
+	require.NoError(t, db.Where("object_id = ?", result.ObjectId).Take(&object).Error)
+	stored, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(object.ObjectKey)))
+	require.NoError(t, err)
+	assert.Equal(t, validImage.Data, stored)
+	assert.Empty(t, task.RequestCipher)
+	assert.NotContains(t, bill.LogPayload, "signature=")
 }
 
 func TestTabtabImageModelContracts(t *testing.T) {

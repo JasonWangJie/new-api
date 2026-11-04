@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
@@ -2238,6 +2239,234 @@ func TestYuxiboxPollingHonorsPluginContractDatabase(t *testing.T) {
 			}
 			assert.EqualValues(t, 1, submits.Load())
 			assert.EqualValues(t, 2, polls.Load(), "terminal or reconciled tasks do not poll again immediately")
+		})
+	}
+}
+
+type huahuoVideoRoundTrip func(*http.Request) (*http.Response, error)
+
+func (roundTrip huahuoVideoRoundTrip) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func TestHuahuoVideoDurableLifecycle(t *testing.T) {
+	const publicModel, upstreamModel = "huahuo-public-fixture", "inmind/video/new-test-model"
+	for _, scenario := range []string{"completed", "concurrency rejection", "lost receipt"} {
+		t.Run(scenario, func(t *testing.T) {
+			user, token := setupResponsesWSRequestTest(t)
+			db := setupVideoRetryTestDatabase(t, user, token)
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "huahuo-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "huahuo-test")
+			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
+			previousAdaptor, previousPersist := service.GetTaskAdaptorFunc, service.PersistAsyncVideoFunc
+			previousSecret, previousEnabled := common.CryptoSecret, constant.TaskPluginEnabled
+			previousBatch, previousLogs := common.BatchUpdateEnabled, common.LogConsumeEnabled
+			pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = pluginruntime.NewRegistry(), ExecuteAsyncVideo
+			service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
+			service.PersistAsyncVideoFunc = PersistAsyncVideo
+			common.CryptoSecret, constant.TaskPluginEnabled = "huahuo-test-signing", true
+			common.BatchUpdateEnabled, common.LogConsumeEnabled = false, true
+			t.Cleanup(func() {
+				pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = previousRegistry, previousSubmit
+				service.GetTaskAdaptorFunc, service.PersistAsyncVideoFunc = previousAdaptor, previousPersist
+				common.CryptoSecret, constant.TaskPluginEnabled = previousSecret, previousEnabled
+				common.BatchUpdateEnabled, common.LogConsumeEnabled = previousBatch, previousLogs
+			})
+			redisServer := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() { assert.NoError(t, client.Close()) })
+			cfg := service.DefaultMediaRuntimeConfig()
+			cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+			require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+			source, err := builtinplugins.Source(constant.TaskPlatformHuahuoVideo)
+			require.NoError(t, err)
+			_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: constant.TaskPlatformHuahuoVideo})
+			require.NoError(t, err)
+
+			const origin, cdn = "https://8.8.8.8", "https://1.1.1.1"
+			baseURL, mapping := origin, `{"`+publicModel+`":"`+upstreamModel+`"}`
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "Huahuo video fixture", Key: "huahuo-origin-key", BaseURL: &baseURL, ModelMapping: &mapping, Models: publicModel, Group: "default", Status: common.ChannelStatusEnabled}
+			zero := 0
+			channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: constant.TaskPlatformHuahuoVideo, TaskPluginModelConfigs: map[string]relaydto.TaskVideoModelConfig{
+				upstreamModel: {Duration: relaydto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, References: relaydto.TaskVideoReferences{Images: &zero, Videos: &zero, Audios: &zero}, BillingMode: "per_second"},
+			}})
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: publicModel, Enabled: true}).Error)
+			snapshot, err := model.GetTaskPluginSyncSnapshot()
+			require.NoError(t, err)
+			require.NoError(t, pluginruntime.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+			withTieredBillingConfig(t, map[string]string{publicModel: "tiered_expr"}, map[string]string{publicModel: `u("seconds") * 0.00004`})
+			_, err = model.SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "replay", Name: "Replay", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"not submitted", "EOF"}}, Steps: []mediaretry.Step{{ID: "same", Action: mediaretry.SameChannel, MaxAttempts: 1}}}}}, 0, user.Id, nil)
+			require.NoError(t, err)
+
+			var job model.AsyncMediaJob
+			var submits, polls, downloads atomic.Int32
+			fixture := huahuoVideoRoundTrip(func(request *http.Request) (*http.Response, error) {
+				if request.Body != nil {
+					defer request.Body.Close()
+				}
+				recorder := httptest.NewRecorder()
+				recorder.Header().Set("Content-Type", "application/json")
+				switch request.Method + " " + request.URL.String() {
+				case "POST " + origin + "/v1/videos":
+					submits.Add(1)
+					assert.Equal(t, "Bearer huahuo-origin-key", request.Header.Get("Authorization"))
+					assert.Equal(t, job.TaskId, request.Header.Get("Idempotency-Key"))
+					var body map[string]any
+					assert.NoError(t, common.DecodeJson(request.Body, &body))
+					assert.Equal(t, upstreamModel, body["model"])
+					assert.Equal(t, "5", body["seconds"])
+					assert.Equal(t, "16:9", body["size"])
+					switch scenario {
+					case "lost receipt":
+						return nil, io.ErrUnexpectedEOF
+					case "concurrency rejection":
+						recorder.WriteHeader(http.StatusTooManyRequests)
+						_, _ = io.WriteString(recorder, `{"error":{"code":"video_concurrency_limit","type":"rate_limit_error","message":"not submitted","limit":10}}`)
+					default:
+						_, _ = io.WriteString(recorder, `{"id":"vendor-private-task","status":"queued"}`)
+					}
+				case "GET " + origin + "/v1/videos/vendor-private-task":
+					assert.Equal(t, "Bearer huahuo-origin-key", request.Header.Get("Authorization"))
+					switch polls.Add(1) {
+					case 1:
+						recorder.WriteHeader(http.StatusNotFound)
+					case 2:
+						_, _ = io.WriteString(recorder, `{"id":"vendor-private-task","status":"failed","credit_state":"refunded","result":{"url":"https://example.invalid/result.mp4"}}`)
+					default:
+						_, _ = io.WriteString(recorder, `{"id":"vendor-private-task","status":"completed","progress":100}`)
+					}
+				case "GET " + origin + "/v1/videos/vendor-private-task/content":
+					assert.Equal(t, "Bearer huahuo-origin-key", request.Header.Get("Authorization"))
+					recorder.Header().Set("Location", cdn+"/private-signed.mp4?signature=fixture")
+					recorder.WriteHeader(http.StatusFound)
+				case "GET " + cdn + "/private-signed.mp4?signature=fixture":
+					assert.Empty(t, request.Header.Get("Authorization"))
+					if downloads.Add(1) == 1 {
+						recorder.WriteHeader(http.StatusServiceUnavailable)
+						break
+					}
+					recorder.Header().Set("Content-Type", "video/mp4")
+					_, _ = recorder.Write(taskMediaMP4Fixture())
+				default:
+					t.Errorf("unexpected Huahuo request %s %s", request.Method, request.URL)
+					recorder.WriteHeader(http.StatusNotFound)
+				}
+				return recorder.Result(), nil
+			})
+			fetch := system_setting.GetFetchSetting()
+			previousFetch := *fetch
+			fetch.EnableSSRFProtection, fetch.AllowPrivateIp, fetch.ApplyIPFilterForDomain = true, false, true
+			t.Cleanup(func() { *fetch = previousFetch })
+			service.InitHttpClient()
+			relayClient, contentClient := service.GetHttpClient(), service.GetSSRFProtectedHTTPClient()
+			oldRelayTransport, oldContentTransport := relayClient.Transport, contentClient.Transport
+			relayClient.Transport, contentClient.Transport = fixture, fixture
+			t.Cleanup(func() { relayClient.Transport, contentClient.Transport = oldRelayTransport, oldContentTransport })
+
+			engine := gin.New()
+			engine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), AcceptAsyncVideo)
+			submit := func(prompt string) *httptest.ResponseRecorder {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"provider":"huahuo-video","model":"`+publicModel+`","prompt":"`+prompt+`","seconds":5,"resolution":"720p","aspect_ratio":"16:9"}`))
+				request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Idempotency-Key", "huahuo-client-fixture")
+				engine.ServeHTTP(recorder, request)
+				return recorder
+			}
+			recorder := submit("fixture")
+			require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+			require.NoError(t, db.Where("user_id = ?", user.Id).Take(&job).Error)
+			if scenario == "completed" {
+				repeated := submit("fixture")
+				require.Equal(t, http.StatusAccepted, repeated.Code, repeated.Body.String())
+				assert.Contains(t, repeated.Body.String(), job.TaskId)
+				conflicting := submit("different request")
+				require.Equal(t, http.StatusConflict, conflicting.Code, conflicting.Body.String())
+			}
+			assert.Zero(t, submits.Load())
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "huahuo-submit", 120)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			processErr := service.ProcessAsyncMediaJob(t.Context(), job, cfg)
+			if scenario == "completed" {
+				require.NoError(t, processErr)
+			} else {
+				require.Error(t, processErr)
+			}
+			require.NoError(t, db.First(&job, job.ID).Error)
+			assert.EqualValues(t, 1, submits.Load())
+			if scenario != "completed" {
+				if scenario == "concurrency rejection" {
+					assert.Equal(t, "failed", job.Status)
+					assert.Equal(t, "refunded", job.BillingStatus)
+				} else {
+					assert.Equal(t, "execution_unknown", job.Status)
+					assert.Equal(t, "unknown", job.BillingStatus)
+				}
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+				assert.EqualValues(t, 1, submits.Load())
+				require.NoError(t, db.First(token, token.Id).Error)
+				assert.Equal(t, map[string]int{"concurrency rejection": 100, "lost receipt": 0}[scenario], token.RemainQuota)
+				return
+			}
+			var task model.Task
+			require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+			assert.Equal(t, publicModel, task.Properties.OriginModelName)
+			assert.Equal(t, upstreamModel, task.Properties.UpstreamModelName)
+			assert.Equal(t, 100, task.Quota)
+			for phase := range 4 {
+				id := task.GetUpstreamTaskID()
+				require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{channel.Id: {id}}, map[string]*model.Task{id: &task}))
+				require.NoError(t, db.First(&task, task.ID).Error)
+				if phase < 2 {
+					assert.NotEqual(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+					assert.Equal(t, 100, task.Quota)
+					require.NotNil(t, task.PrivateData.VideoReconciliation)
+					assert.False(t, task.PrivateData.VideoReconciliation.ManualRequired)
+					before := task.Snapshot()
+					task.PrivateData.VideoReconciliation.NextPollAt = time.Now().Unix() - 1
+					updated, updateErr := task.UpdatePollingState(t.Context(), before)
+					require.NoError(t, updateErr)
+					require.True(t, updated)
+				}
+			}
+			require.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+			require.NoError(t, db.First(&job, job.ID).Error)
+			for _, stage := range []string{"ready", "failed", "succeeded"} {
+				require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+				job.NextAttemptAt = 0
+				claimed, err = model.ClaimAsyncMediaJob(t.Context(), &job, "huahuo-"+stage, 120)
+				require.NoError(t, err)
+				require.True(t, claimed)
+				storageErr := service.ProcessAsyncMediaJob(t.Context(), job, cfg)
+				if stage == "failed" {
+					require.Error(t, storageErr)
+				} else {
+					require.NoError(t, storageErr)
+				}
+				require.NoError(t, db.First(&job, job.ID).Error)
+				require.Equal(t, stage, job.StorageStatus, job.ErrorMessage)
+			}
+			assert.Equal(t, "succeeded", job.Status, job.ErrorMessage)
+			assert.EqualValues(t, 2, downloads.Load())
+			assert.EqualValues(t, 1, submits.Load())
+			view, _, err := videoJobView(taskSubmissionTestContext(), job, false)
+			require.NoError(t, err)
+			encoded, err := common.Marshal(view)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), job.TaskId)
+			assert.NotContains(t, string(encoded), "vendor-private-task")
+			assert.NotContains(t, string(encoded), "private-signed.mp4")
+			assert.NotContains(t, string(encoded), "huahuo-origin-key")
+			require.NoError(t, db.First(token, token.Id).Error)
+			assert.Zero(t, token.RemainQuota)
+			var consumes int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Count(&consumes).Error)
+			assert.EqualValues(t, 1, consumes)
 		})
 	}
 }

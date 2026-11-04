@@ -334,7 +334,7 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 				if capability.Provider != provider || !ImageCapabilitySupportsRequest(capability, request) {
 					continue
 				}
-				if channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility && !MixedImageChannelRequestSupported(channel, request) {
+				if (capability.Provider == constant.HuahuoImagePluginKey || channel.Type == constant.ChannelTypeNewAPI && channel.GetSetting().TianyueMediaCompatibility) && !MixedImageChannelRequestSupported(channel, request) {
 					continue
 				}
 				supportsReferenceCount := imageChannelSupportsReferenceCount(channel, referenceCount)

@@ -156,7 +156,7 @@ func (snapshot imageExecutionSnapshot) candidates(policy model.ImageGroupPolicy,
 		if !capability.Generate || synchronous && !SynchronousImageChannelSupported(mapped, name, "/v1/images/generations") {
 			continue
 		}
-		if !synchronous && (policy.Platform == "mixed" || mapped.Type == constant.ChannelTypeTabTab) {
+		if !synchronous && (policy.Platform == "mixed" || capability.Provider == constant.HuahuoImagePluginKey || mapped.Type == constant.ChannelTypeTabTab) {
 			size, err := MapOpenAIImageDimensions(resolution, "")
 			if err != nil || !MixedImageChannelRequestSupported(mapped, AsyncImageRequest{Platform: "openai", Dialect: "async", SourcePath: "/v1/images/generations_async", Model: name, Kind: "text_to_image", Count: 1, Size: size, Resolution: resolution, ExplicitTier: true}) {
 				continue

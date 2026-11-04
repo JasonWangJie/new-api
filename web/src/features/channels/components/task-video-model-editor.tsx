@@ -30,6 +30,7 @@ import {
 import type { TaskVideoModelConfig, TaskVideoModelDetail } from '../types'
 
 interface TaskVideoModelEditorProps {
+  manualOnly?: boolean
   sourceURL: string
   onSourceURLChange: (value: string) => void
   value: string
@@ -73,7 +74,8 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
       })
     ),
   ]
-  const preview = props.previewReady ? props.details : undefined
+  const preview =
+    !props.manualOnly && props.previewReady ? props.details : undefined
   const changed = upstreamModels.filter(
     (model) =>
       preview?.[model] &&
@@ -83,19 +85,25 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
 
   return (
     <div className='mt-4 space-y-3 rounded-lg border p-4'>
-      <Label htmlFor='task-video-model-source'>{t('Model catalog URL')}</Label>
-      <Input
-        id='task-video-model-source'
-        value={props.sourceURL}
-        disabled={props.disabled}
-        placeholder='https://catalog.sudashuiapi.com/v1/models'
-        onChange={(event) => props.onSourceURLChange(event.target.value)}
-      />
-      <p className='text-muted-foreground text-xs'>
-        {t(
-          'Catalog fetches are previews. Manual capabilities are preserved until you explicitly replace them and save the channel.'
-        )}
-      </p>
+      {!props.manualOnly && (
+        <>
+          <Label htmlFor='task-video-model-source'>
+            {t('Model catalog URL')}
+          </Label>
+          <Input
+            id='task-video-model-source'
+            value={props.sourceURL}
+            disabled={props.disabled}
+            placeholder='https://catalog.sudashuiapi.com/v1/models'
+            onChange={(event) => props.onSourceURLChange(event.target.value)}
+          />
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'Catalog fetches are previews. Manual capabilities are preserved until you explicitly replace them and save the channel.'
+            )}
+          </p>
+        </>
+      )}
       <Button
         type='button'
         variant='outline'
@@ -104,7 +112,12 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
         onClick={() =>
           props.onChange(
             JSON.stringify(
-              importMissingTaskVideoModels(configs, upstreamModels, preview),
+              importMissingTaskVideoModels(
+                configs,
+                upstreamModels,
+                preview,
+                props.manualOnly
+              ),
               null,
               2
             )
@@ -125,7 +138,9 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
         valueType='any'
         keyLabel={t('Upstream model')}
         valueLabel={t('Model capabilities')}
-        template={{ 'upstream-model': taskVideoCatalogConfig() }}
+        template={{
+          'upstream-model': taskVideoCatalogConfig(undefined, props.manualOnly),
+        }}
       />
       {changed.map((model) => (
         <div key={model} className='space-y-2 rounded-md border p-3'>

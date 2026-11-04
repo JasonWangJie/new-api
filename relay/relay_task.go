@@ -345,6 +345,12 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 		exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 		useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
+		if platform == constant.TaskPlatformHuahuoVideo {
+			config := info.ChannelSetting.TaskPluginModelConfigs[info.UpstreamModelName]
+			if config.BillingMode == "per_second" && (!exists || !billingexpr.UsedUsageKeys(exprStr)["seconds"]) {
+				return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO per-second video pricing requires an expression using seconds"), "model_price_error", http.StatusBadRequest)
+			}
+		}
 		if useTiered {
 			provider, supported := adaptor.(channel.TaskUsageFactsProvider)
 			if billingexpr.UsesFixedPricing(exprStr) {
@@ -354,7 +360,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				return nil, service.TaskErrorWrapper(fmt.Errorf("task model %s has no usage expression or meter", modelName), "model_price_error", http.StatusBadRequest)
 			}
 			sharedModel := pinnedPlugin.Generation.SharedModel(modelName) || pinnedPlugin.Generation.SharedModel(info.UpstreamModelName)
-			if sharedModel && pinnedPlugin.Plugin != nil {
+			if (sharedModel || platform == constant.TaskPlatformHuahuoVideo) && pinnedPlugin.Plugin != nil {
 				schema, _ := pinnedPlugin.Plugin.Meta.UsageForModel(info.UpstreamModelName)
 				if !billing_setting.TaskExprCompatible(exprStr, schema) {
 					return nil, service.TaskErrorWrapper(fmt.Errorf("task model %s pricing is not configured for plugin %s", modelName, pluginKey), "model_price_error", http.StatusBadRequest)
@@ -404,6 +410,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			if err != nil {
 				return nil, service.TaskErrorWrapper(err, "model_price_error", http.StatusBadRequest)
 			}
+			if platform == constant.TaskPlatformHuahuoVideo && !priceData.UsePrice {
+				return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO per-request video pricing requires a configured price"), "model_price_error", http.StatusBadRequest)
+			}
 		}
 		info.PriceData = priceData
 
@@ -446,6 +455,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.UpstreamModelName,
 		service.UpstreamAsyncOperation(info.Action),
 	)
+	if platform == constant.TaskPlatformHuahuoVideo && hasAsyncProfile {
+		return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO video requires its native submission and polling protocol"), "upstream_async_profile_conflict", http.StatusBadRequest)
+	}
 	measuredVideo := hasAsyncProfile && asyncProfile.Poll.Response.ActualSecondsPath != "" && !mixedVideoBilling
 	if measuredVideo {
 		pinnedValue, _ := c.Get(jsplugin.ContextKeyPinnedPlugin)
@@ -633,8 +645,18 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			if message == "" {
 				message = "upstream task submission failed"
 			}
-			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), "fail_to_fetch_task", resp.StatusCode)
-			if c.GetBool("async_media_execution") && isConfirmedAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) {
+			code := "fail_to_fetch_task"
+			confirmed := isConfirmedAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody)
+			if platform == constant.TaskPlatformHuahuoVideo {
+				if explicitCode := huahuoVideoSubmissionRejection(resp.StatusCode, httpErrorBody); explicitCode != "" {
+					code, confirmed = explicitCode, true
+				} else if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError {
+					confirmed = false
+				}
+			}
+			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), code, resp.StatusCode)
+			failure.NoRetry = platform == constant.TaskPlatformHuahuoVideo
+			if c.GetBool("async_media_execution") && confirmed {
 				c.Set("async_media_submission_rejected", true)
 				c.Set("async_media_submission_retry_reason", message)
 			}
@@ -710,6 +732,58 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		UpstreamAsync:         asyncProfile,
 		UpstreamAsyncResponse: upstreamAsyncResponse,
 	}, nil
+}
+
+// Huahuo documents only these rejection codes as proof of an unsubmitted job
+// in capacity and service failures. A receipt or other state evidence wins.
+func huahuoVideoSubmissionRejection(status int, body []byte) string {
+	if status < http.StatusBadRequest {
+		return ""
+	}
+	var envelope map[string]any
+	if common.Unmarshal(body, &envelope) != nil {
+		return ""
+	}
+	for key, value := range envelope {
+		if key == "error" {
+			continue
+		}
+		if key != "request_id" && key != "trace_id" {
+			return ""
+		}
+		if _, ok := value.(string); !ok {
+			return ""
+		}
+	}
+	upstream, _ := envelope["error"].(map[string]any)
+	for key, value := range upstream {
+		switch key {
+		case "code", "type", "message":
+			if _, ok := value.(string); !ok {
+				return ""
+			}
+		case "param":
+			if _, ok := value.(string); value != nil && !ok {
+				return ""
+			}
+		case "limit":
+			if limit, ok := value.(float64); !ok || limit < 1 || limit != math.Trunc(limit) {
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
+	code, _ := upstream["code"].(string)
+	switch code {
+	case "video_concurrency_limit":
+		if status == http.StatusTooManyRequests && upstream["type"] == "rate_limit_error" {
+			return code
+		}
+	case "storage_capacity_exceeded", "storage_check_unavailable":
+		return code
+	}
+	return ""
 }
 
 var (
