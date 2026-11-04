@@ -150,7 +150,7 @@ export type ImageTask = {
   result_expired?: boolean
   id: string
   task_id: string
-  platform: ImagePlatform
+  platform?: ImagePlatform
   protocol: string
   model: string
   request_type: string

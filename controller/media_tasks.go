@@ -201,6 +201,34 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, err
 	}
+	routing := task.PrivateData.VideoRouting
+	if routing == nil && len(job.RequestCipher) > 0 {
+		if plain, decryptErr := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId); decryptErr == nil {
+			var request service.AsyncVideoRequest
+			if common.Unmarshal(plain, &request) == nil && request.ConditionalRouting != nil {
+				executionModel, _ := service.ResolveImageChannelUpstreamModel(request.Channel, job.Model)
+				routing = request.ConditionalRouting.Audit(executionModel)
+				if details := request.RequestDetails(); details != nil && details.RequestedResolution != "" {
+					view["requested_resolution"] = details.RequestedResolution
+				}
+			}
+		}
+	}
+	if routing != nil {
+		if _, present := view["requested_resolution"]; !present {
+			view["requested_resolution"] = routing.SourceResolution
+		}
+		view["execution_resolution"] = routing.ExecutionResolution
+		view["requested_size"], view["actual_size"] = view["requested_resolution"], routing.ExecutionResolution
+		if admin {
+			view["video_routing"] = routing
+		}
+	}
+	hideExecution := !admin && (routing != nil || errors.Is(err, gorm.ErrRecordNotFound) && len(job.RequestCipher) == 0 && (job.ExpiresAt <= now || job.Status == "failed" || job.Status == "expired"))
+	if hideExecution {
+		delete(view, "platform")
+		delete(view, "provider")
+	}
 	if job.Provider == "drama" && job.ExpiresAt <= now && job.Status != "failed" && job.Status != "succeeded" && (err != nil || task.Status != model.TaskStatusFailure) {
 		view["status"], view["stage"], view["progress"] = "expired", "failed", 100
 	}
@@ -212,6 +240,11 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		view["can_terminate"] = false
 		if reconciliation := task.PrivateData.VideoReconciliation; reconciliation != nil {
 			view["video_reconciliation"] = reconciliation
+			if hideExecution {
+				publicReconciliation := *reconciliation
+				publicReconciliation.Reason = ""
+				view["video_reconciliation"] = &publicReconciliation
+			}
 			view["can_resume"] = admin && reconciliation.ManualRequired && ownerErr == nil
 			view["next_attempt_at"] = reconciliation.NextPollAt
 			view["error_message"] = ""
@@ -253,6 +286,11 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 			view["error_detail"] = notice.Detail
 			view["error_message"] = service.VideoTaskFailureReason(reason)
 		}
+	}
+	if reason, _ := view["error_message"].(string); hideExecution && reason != "" {
+		notice := service.PublicVideoRoutingFailureNotice(reason)
+		view["error_summary"], view["error_suggestion"], view["error_detail"] = notice.Summary, notice.Suggestion, ""
+		view["error_message"] = service.PublicVideoRoutingFailureReason(reason)
 	}
 	results := make([]gin.H, 0)
 	if ownerErr != nil || resultExpired || err == nil && task.Status == model.TaskStatusFailure {

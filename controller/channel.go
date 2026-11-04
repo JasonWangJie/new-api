@@ -1111,10 +1111,13 @@ func UpdateChannel(c *gin.Context) {
 	}
 	originProxy := originChannel.GetSetting().Proxy
 	validation := channel.Channel
-	if originChannel.Type == constant.ChannelTypeTaskPlugin && (channel.Type == 0 || channel.Type == constant.ChannelTypeTaskPlugin) {
+	updatesPlugin := originChannel.Type == constant.ChannelTypeTaskPlugin &&
+		(channel.Type == 0 || channel.Type == constant.ChannelTypeTaskPlugin)
+	convertsToSudashui := channel.Type == constant.ChannelTypeTaskPlugin && validation.GetSetting().TaskPluginKey == "sudashui"
+	if updatesPlugin || convertsToSudashui {
 		// Match GORM struct Updates: zero strings and nil pointers retain the
 		// persisted value. Validate the resulting binding, not the partial body.
-		validation.Type = originChannel.Type
+		validation.Type = constant.ChannelTypeTaskPlugin
 		if validation.Setting == nil {
 			validation.Setting = originChannel.Setting
 		}
@@ -1124,7 +1127,7 @@ func UpdateChannel(c *gin.Context) {
 		if validation.ModelMapping == nil {
 			validation.ModelMapping = originChannel.ModelMapping
 		}
-		if validation.BaseURL == nil {
+		if validation.BaseURL == nil && updatesPlugin {
 			validation.BaseURL = originChannel.BaseURL
 		}
 		if channel.Type == 0 && validation.GetSetting().TaskPluginKey != "sudashui" {

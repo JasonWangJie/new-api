@@ -62,18 +62,24 @@ func GetTask(c *gin.Context) {
 		createdAt = task.SubmitTime
 	}
 	failReason := service.PublicTaskFailureReason(task)
+	if task.PrivateData.VideoRouting != nil {
+		failReason = service.PublicVideoRoutingFailureReason(failReason)
+	}
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""
 	}
-	c.JSON(http.StatusOK, gin.H{
+	view := gin.H{
 		"task_id":     task.TaskID,
-		"platform":    task.Platform,
 		"status":      task.Status,
 		"progress":    task.Progress,
 		"fail_reason": failReason,
 		"created_at":  createdAt,
 		"finished_at": task.FinishTime,
-	})
+	}
+	if task.PrivateData.VideoRouting == nil {
+		view["platform"] = task.Platform
+	}
+	c.JSON(http.StatusOK, view)
 }
 
 func GetTaskArtifacts(c *gin.Context) {
@@ -596,7 +602,15 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		if viewerRole >= common.RoleAdminUser {
-			adminInfo := &dto.TaskAdminInfo{}
+			adminInfo := &dto.TaskAdminInfo{VideoRouting: task.PrivateData.VideoRouting}
+			if adminInfo.VideoRouting != nil {
+				if task.Status != model.TaskStatusSuccess {
+					item.FailReason = service.PublicTaskFailureReason(task)
+				}
+				item.Data = task.Data
+				item.Platform = string(task.Platform)
+				item.ChannelId = task.ChannelId
+			}
 			if execution := task.PrivateData.Execution; execution != nil {
 				adminInfo.RequestID = execution.RequestID
 				adminInfo.RequestPath = execution.RequestPath
@@ -614,7 +628,7 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 					}
 				}
 			}
-			if adminInfo.RequestID != "" || adminInfo.RequestPath != "" || adminInfo.TaskPlugin != nil {
+			if adminInfo.RequestID != "" || adminInfo.RequestPath != "" || adminInfo.TaskPlugin != nil || adminInfo.VideoRouting != nil {
 				item.AdminInfo = adminInfo
 			}
 		}

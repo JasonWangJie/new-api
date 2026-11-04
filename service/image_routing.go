@@ -52,15 +52,19 @@ type ImagePoolSelectionOptions struct {
 }
 
 type MediaRoutingPreviewRequest struct {
-	ExecutionMode string `json:"execution_mode"`
-	Group         string `json:"group"`
-	Platform      string `json:"platform"`
-	MediaType     string `json:"media_type"`
-	Model         string `json:"model"`
-	Resolution    string `json:"resolution"`
-	Operation     string `json:"operation"`
-	Seconds       *int   `json:"seconds,omitempty"`
-	TokenID       int    `json:"token_id,omitempty"`
+	Provider           string                    `json:"provider,omitempty"`
+	Mode               string                    `json:"mode,omitempty"`
+	VideoInput         string                    `json:"video_input,omitempty"`
+	VideoRoutingConfig *model.VideoRoutingConfig `json:"video_routing_config,omitempty"`
+	ExecutionMode      string                    `json:"execution_mode"`
+	Group              string                    `json:"group"`
+	Platform           string                    `json:"platform"`
+	MediaType          string                    `json:"media_type"`
+	Model              string                    `json:"model"`
+	Resolution         string                    `json:"resolution"`
+	Operation          string                    `json:"operation"`
+	Seconds            *int                      `json:"seconds,omitempty"`
+	TokenID            int                       `json:"token_id,omitempty"`
 }
 
 type MediaRoutingPreviewChannel struct {
@@ -80,6 +84,7 @@ type MediaRoutingPreviewChannel struct {
 }
 
 type MediaRoutingPreview struct {
+	ConditionalRouting *VideoRoutingPreview `json:"conditional_routing,omitempty"`
 	MediaRoutingPreviewRequest
 	BindingKey    string                       `json:"binding_key"`
 	BindingFound  bool                         `json:"binding_found"`
@@ -96,6 +101,12 @@ type MediaRoutingPreview struct {
 // PreviewMediaRouting reads configuration only. It deliberately avoids the
 // random picker, quota reservation, circuit probes and concurrency acquisition.
 func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) (MediaRoutingPreview, error) {
+	if input.MediaType == "video" && input.Mode != "" {
+		input.Operation = input.Mode
+	}
+	if input.MediaType == "video" && input.Provider != "" {
+		input.Platform = input.Provider
+	}
 	if input.ExecutionMode == "" {
 		input.ExecutionMode = "async"
 	}
@@ -313,6 +324,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 	var videoParameters map[string]any
 	if input.Platform == "mixed" && input.MediaType == "video" && capabilityIndex >= 0 {
 		profiles := make([]jsplugin.VideoProfile, 0)
+		profilesByGroup := make(map[string][]jsplugin.VideoProfile, len(routingGroups))
 		for _, group := range routingGroups {
 			poolPolicy := policy
 			poolPolicy.Group = group
@@ -321,14 +333,11 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				continue
 			}
 			for _, profile := range variants {
-				modes := make([]jsplugin.VideoModeProfile, 0)
-				for _, mode := range profile.Modes {
-					if mode.Name == input.Operation {
-						mode.Inputs = nil // Preview checks dimensions, without submitting reference material.
-						modes = append(modes, mode)
-					}
+				profile, err := videoRoutingPreviewProfileForInputs(profile, input.Operation, input.VideoInput)
+				if err != nil {
+					continue
 				}
-				profile.Modes = modes
+				profilesByGroup[group] = append(profilesByGroup[group], profile)
 				profiles = append(profiles, profile)
 			}
 		}
@@ -349,7 +358,19 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		} else if input.Operation == "extend_video" {
 			operation = "extend"
 		}
-		_, _, videoParameters, err = NormalizeMixedVideoDefaults(raw, "application/json", operation, profiles)
+		if operation == "create" {
+			config, configErr := model.GetVideoRoutingConfig(ctx)
+			if input.VideoRoutingConfig != nil {
+				config, configErr = *input.VideoRoutingConfig, nil
+			}
+			if configErr != nil {
+				return preview, configErr
+			}
+			input.VideoRoutingConfig = &config
+			_, _, videoParameters, err = NormalizeVideoRoutingAdmissionDefaults(config, input.Model, routingGroups, raw, "application/json", operation, profilesByGroup, input.VideoInput)
+		} else {
+			_, _, videoParameters, err = NormalizeMixedVideoDefaults(raw, "application/json", operation, profiles)
+		}
 		if err != nil {
 			policyReasons = append(policyReasons, "video_parameters_not_supported")
 		} else {
@@ -361,6 +382,12 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 		}
 	}
 	preview.Reasons, preview.RoutingGroups = policyReasons, routingGroups
+	if handled, err := PreviewConditionalVideoRouting(ctx, input, &preview, routingGroups, videoParameters); err != nil || handled {
+		return preview, err
+	}
+	if preview.ConditionalRouting != nil && preview.ConditionalRouting.IsFallback {
+		routingGroups = preview.RoutingGroups
+	}
 	for _, group := range routingGroups {
 		poolPolicy := policy
 		poolPolicy.Group = group

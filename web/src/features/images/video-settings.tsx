@@ -43,6 +43,7 @@ import {
 } from './lib/image-labels'
 import { MediaSettingsCard } from './media-settings'
 import type { ImageAdminConfiguration, VideoPluginTemplate } from './types'
+import { VideoRoutingSettings } from './video-routing'
 
 const XAI_EXAMPLES = `# Platform policy
 [
@@ -581,6 +582,7 @@ export function VideoConfiguration(props: {
           onSuccess={props.onSuccess}
         />
       </div>
+      {provider === 'mixed' && <VideoRoutingSettings config={props.config} />}
     </div>
   )
 }

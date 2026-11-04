@@ -200,7 +200,7 @@ func MixedVideoPublicFacts(body map[string]any, operation string, files []map[st
 		action = "generate"
 	}
 	videoInput := "none"
-	for identity := range videoMediaInventory(body, files) {
+	for identity := range videoMediaInventory(mixedVideoMediaAliases(body), files) {
 		if strings.HasPrefix(identity, "video:") {
 			videoInput = "video"
 			break
@@ -270,24 +270,31 @@ func mixedVideoDurationUnitControl(body map[string]any) bool {
 // demonstrate the same media identity in the projected role. A nil decoded
 // body is used only to discover a possible public variant before decoding.
 func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[string]any) map[string]any {
-	view := maps.Clone(body)
+	view := mixedVideoMediaAliases(body)
 	hasPrimary := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "image" })
 	hasReferences := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "reference_images" })
-	primary := body["image"]
+	primary := view["image"]
 	if primary == nil {
-		primary = body["input_reference"]
+		primary = view["input_reference"]
+	}
+	images, _ := view["images"].([]any)
+	if primary == nil && view["first_frame"] == nil && len(images) > 0 {
+		primary = images[0]
+		images = images[1:]
 	}
 	if hasReferences && !hasPrimary && primary != nil {
 		identity := videoMediaIdentity(primary)
 		if decoded == nil || identity != "" && slices.ContainsFunc(videoMediaValues("reference_images", decoded), func(value any) bool { return videoMediaIdentity(value) == identity }) {
-			references := videoInputValues("reference_images", map[string]any{"reference_images": body["reference_images"]}, nil)
+			references := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
+			references = append(references, images...)
 			view["reference_images"] = append(references, primary)
 			delete(view, "image")
 			delete(view, "input_reference")
+			delete(view, "images")
 		}
 	}
-	if hasPrimary && !hasReferences && len(videoMediaValues("image", body)) == 0 {
-		references := videoInputValues("reference_images", map[string]any{"reference_images": body["reference_images"]}, nil)
+	if hasPrimary && !hasReferences && len(videoMediaValues("image", view)) == 0 {
+		references := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
 		if len(references) == 1 {
 			identity := videoMediaIdentity(references[0])
 			if decoded == nil || identity != "" && slices.ContainsFunc(videoMediaValues("image", decoded), func(value any) bool { return videoMediaIdentity(value) == identity }) {
@@ -299,6 +306,41 @@ func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[
 	if mixedVideoDurationUnitControl(body) {
 		view["seconds"], _ = videoNumber(body["video_duration"])
 		delete(view, "duration")
+	}
+	return view
+}
+
+// mixedVideoMediaAliases projects protocol aliases into the public input names
+// used by profile validation and billing. The provider receives the original body.
+func mixedVideoMediaAliases(body map[string]any) map[string]any {
+	view := maps.Clone(body)
+	for _, group := range []struct {
+		name    string
+		aliases []string
+	}{
+		{"reference_images", []string{"image_urls", "referenceImages"}},
+		{"reference_videos", []string{"videos", "video_urls", "referenceVideos"}},
+		{"reference_audios", []string{"audios", "audio_urls", "referenceAudios"}},
+		{"image", []string{"first_image"}},
+		{"last_frame", []string{"last_image"}},
+	} {
+		for _, alias := range group.aliases {
+			value, exists := view[alias]
+			if !exists {
+				continue
+			}
+			existing := view[group.name]
+			if group.name == "image" && existing == nil {
+				existing = firstVideoValue(view, nil, "input_reference", "first_frame")
+			}
+			if existing == nil {
+				view[group.name] = value
+			} else {
+				values := videoInputValues(group.name, map[string]any{group.name: existing}, nil)
+				view[group.name] = append(values, videoInputValues(group.name, map[string]any{group.name: value}, nil)...)
+			}
+			delete(view, alias)
+		}
 	}
 	return view
 }
@@ -426,7 +468,7 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 					return candidate, errors.New("Sora mixed routing requires a 1280x720 or 720x1280 output size")
 				}
 			}
-			if !maps.Equal(videoMediaInventory(body, view.Files), videoMediaInventory(normalizedBody, view.Files)) {
+			if !maps.Equal(videoMediaInventory(mixedVideoMediaAliases(body), view.Files), videoMediaInventory(normalizedBody, view.Files)) {
 				return candidate, errors.New("video decoder changed the input media identities or counts")
 			}
 			publicFacts, err := MixedVideoPublicFacts(body, operation, view.Files, profile)

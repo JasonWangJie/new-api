@@ -165,6 +165,14 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 		if request.RetryFact.Unknown || request.RetryFact.HasOutput || !request.RetryFact.Terminal && request.RetryFact.Accepted {
 			return nil, "", errors.New("unknown mixed video execution cannot be resubmitted")
 		}
+		if request.ConditionalRouting != nil {
+			channels, originalRoute, err := ConditionalVideoRetryCandidates(ctx, job, request, policy, catalog)
+			bindingKey := ""
+			if originalRoute {
+				bindingKey = MediaPoolBindingKey(policy, job.Model, request.MixedRouting.Resolution, "video")
+			}
+			return channels, bindingKey, err
+		}
 		channels, err := MixedVideoPoolChannels(ctx, policy, job.Model, request.MixedRouting.Resolution)
 		if err != nil {
 			return nil, "", err
@@ -179,7 +187,14 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 				return true
 			}
 			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
-			return err != nil || (decision.Action == mediaretry.LocalSameChannel || decision.Action == mediaretry.LocalOtherChannel) && len(candidate.Binding.Plugin.Meta.VideoRetryInputs) == 0
+			if err != nil {
+				return true
+			}
+			if decision.Action != mediaretry.LocalSameChannel && decision.Action != mediaretry.LocalOtherChannel {
+				return false
+			}
+			selectors, _ := videoRetryInputSelectors(candidate.Binding.Plugin)
+			return len(selectors) == 0
 		})
 		return channels, MediaPoolBindingKey(policy, job.Model, request.MixedRouting.Resolution, "video"), nil
 	}
@@ -244,6 +259,16 @@ func PickVideoRetryChannel(ctx context.Context, job model.AsyncMediaJob, request
 	channels, bindingKey, err := videoRetryCandidateChannels(ctx, job, request, upstreamModel)
 	if err != nil {
 		return nil, err
+	}
+	if request.ConditionalRouting != nil && bindingKey == "" {
+		for _, channel := range channels {
+			key, _, err := channel.GetNextEnabledKey()
+			if err == nil && key != "" {
+				channel.Key, channel.Keys, channel.ChannelInfo = key, nil, model.ChannelInfo{}
+				return &channel, nil
+			}
+		}
+		return nil, ErrVideoCompatibleChannelsUnavailable
 	}
 	fallbackID := 0
 	if request.PendingDecision.Action == mediaretry.OtherChannel || request.PendingDecision.Action == mediaretry.LocalOtherChannel {
@@ -541,7 +566,7 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 			return err
 		}
 		capability, _ := MixedVideoPolicyCapability(catalog, job.Model)
-		decoded, err := DecodeMixedVideoCandidate(ctx, *candidate, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+		decoded, err := RebindConditionalVideoRequest(ctx, *job, request, *candidate, capability.VideoOverrides)
 		if err != nil {
 			return err
 		}
@@ -561,6 +586,7 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 	}
 	selected.PrivateData.UpstreamAsync, _ = candidate.GetOtherSettings().UpstreamAsync.Match("video", upstream, UpstreamAsyncOperation(selected.Action))
 	request.Channel = *candidate
+	selected.PrivateData.VideoRouting = request.ConditionalRouting.Audit(upstream)
 	encoded, err := common.Marshal(request)
 	if err != nil {
 		return err

@@ -1175,6 +1175,11 @@ export const native = {status: function(ctx, task) { return {id: task.task_id}; 
 	insertTaskPluginRouteTask(t, &model.Task{
 		TaskID: "legacy-task", UserId: 7, Platform: constant.TaskPlatform("651"),
 	})
+	insertTaskPluginRouteTask(t, &model.Task{
+		TaskID: "conditional-task", UserId: 7, Platform: constant.TaskPlatform("route-static-query-test"),
+		PrivateData: model.TaskPrivateData{AsyncMedia: true, VideoRouting: &dto.VideoRoutingAudit{RuleID: "private-rule"}},
+		Data:        []byte(`{"model":"private-model","provider":"private-provider"}`),
+	})
 
 	router := gin.New()
 	router.GET("/vendor/jobs/:id",
@@ -1192,7 +1197,7 @@ export const native = {status: function(ctx, task) { return {id: task.task_id}; 
 	assert.JSONEq(t, `{"id":"legacy-task"}`, legacyRecorder.Body.String())
 
 	var firstBody string
-	for _, taskID := range []string{"missing-task", "foreign-task", "wrong-platform", "wrong-legacy-platform"} {
+	for _, taskID := range []string{"missing-task", "foreign-task", "wrong-platform", "wrong-legacy-platform", "conditional-task"} {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/vendor/jobs/"+taskID, nil))
 		assert.Equal(t, http.StatusNotFound, recorder.Code)

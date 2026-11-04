@@ -29,7 +29,8 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
-	MixedRouting                     *MixedVideoRouting `json:"mixed_routing,omitempty"`
+	ConditionalRouting               *VideoRoutingSnapshot `json:"conditional_routing,omitempty"`
+	MixedRouting                     *MixedVideoRouting    `json:"mixed_routing,omitempty"`
 	Body                             []byte
 	ContentType                      string
 	ClientIP                         string
@@ -210,6 +211,15 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			if refundLogErr != nil {
 				common.SysError("media refund log delivery: " + refundLogErr.Error())
 			}
+			if now := time.Now(); !now.Before(nextRetryEventCleanup) {
+				cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
+				cleanupErr := model.PruneExpiredMediaRetryEvents(cleanupCtx, now, 1000)
+				cleanupCancel()
+				nextRetryEventCleanup = now.Add(time.Minute)
+				if cleanupErr != nil {
+					common.SysError("media recovery event cleanup: " + cleanupErr.Error())
+				}
+			}
 			cfg, err := GetMediaRuntimeConfig(ctx)
 			if err != nil {
 				common.SysError("media configuration: " + err.Error())
@@ -220,15 +230,6 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			}
 			if err := CleanupMediaInputs(ctx, time.Now().Unix()); err != nil {
 				common.SysError("media input cleanup: " + err.Error())
-			}
-			if now := time.Now(); !now.Before(nextRetryEventCleanup) {
-				cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
-				cleanupErr := model.PruneMediaRetryEvents(cleanupCtx, now.Add(-90*24*time.Hour).Unix(), 1000)
-				cleanupCancel()
-				nextRetryEventCleanup = now.Add(time.Minute)
-				if cleanupErr != nil {
-					common.SysError("media recovery event cleanup: " + cleanupErr.Error())
-				}
 			}
 			if _, err := DispatchAsyncMediaJobs(ctx, cfg); err != nil {
 				common.SysError("media queue: " + err.Error())

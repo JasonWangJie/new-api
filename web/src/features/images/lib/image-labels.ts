@@ -119,6 +119,9 @@ export const IMAGE_LABELS: Record<string, string> = {
   token_group_not_allowed: 'API key does not allow this group',
   user_disabled: 'User is disabled',
   channel_disabled: 'Channel is disabled',
+  target_channel_unavailable: 'Channel unavailable',
+  target_model_or_group_unavailable:
+    'This target is unavailable for the selected groups. Check its channel and model.',
   model_not_enabled: 'Model is not enabled on this channel',
   platform_mismatch: 'Channel provider does not match',
   resolution_mapping_missing: 'Resolution mapping is missing',
@@ -127,6 +130,7 @@ export const IMAGE_LABELS: Record<string, string> = {
   video_parameters_not_supported: 'Video parameters are not supported',
   not_in_pool: 'Channel is outside this pool',
   no_enabled_account: 'No enabled account is available',
+  no_available_accounts: 'No enabled account is available',
   lower_priority: 'A higher priority channel is available',
   zero_weight: 'Channel has zero weight',
   invalid_model_mapping: 'Model mapping is invalid',

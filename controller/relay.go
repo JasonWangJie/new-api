@@ -694,6 +694,11 @@ func executeTaskSubmissionWith(
 			task.PrivateData.CurrentAttempt = attempt
 		}
 	}
+	if value, exists := c.Get(service.VideoRoutingContextKey); exists {
+		if routing, ok := value.(*service.VideoRoutingSnapshot); ok {
+			task.PrivateData.VideoRouting = routing.Audit(relayInfo.UpstreamModelName)
+		}
+	}
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.UpstreamAsync = result.UpstreamAsync
 	task.PrivateData.UpstreamAsyncResponse = result.UpstreamAsyncResponse

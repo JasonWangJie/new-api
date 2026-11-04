@@ -1169,7 +1169,7 @@ func renderTaskPluginQuery(
 	views := make([]map[string]any, 0, len(taskIDs))
 	for _, taskID := range taskIDs {
 		task := tasksByID[taskID]
-		if !service.CanvasTaskAccess(c, task) {
+		if !service.CanvasTaskAccess(c, task) || task.PrivateData.VideoRouting != nil {
 			logger.LogDebug(
 				c,
 				"task_plugin subsystem=query event=lookup_failed generation=%d plugin=%q reason=task_not_found requested=%d found=%d",

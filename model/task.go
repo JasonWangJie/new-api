@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	hostdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
@@ -128,7 +129,8 @@ type TaskPrivateData struct {
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
 	// CurrentAttempt is mutable execution identity; Execution retains the original provenance.
-	CurrentAttempt *VideoTaskAttempt `json:"current_attempt,omitempty"`
+	CurrentAttempt *VideoTaskAttempt          `json:"current_attempt,omitempty"`
+	VideoRouting   *hostdto.VideoRoutingAudit `json:"video_routing,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
 	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款

@@ -38,10 +38,7 @@ func fetchChannelModelPreview(ctx context.Context, channel *model.Channel) ([]st
 		ids, err := fetchChannelUpstreamModelIDs(channel)
 		return ids, nil, err
 	}
-	address := settings.TaskPluginModelSourceURL
-	if address == "" {
-		address = dto.DefaultSudashuiCatalogURL
-	}
+	address := sudashuiCatalogURL(settings.TaskPluginModelSourceURL)
 	if err := settings.ValidateTaskVideoModels(relaycommon.MaxTaskDurationSeconds); err != nil {
 		return nil, nil, err
 	}
@@ -129,23 +126,34 @@ func fetchChannelModelPreview(ctx context.Context, channel *model.Channel) ([]st
 	return normalizeModelNames(ids), details, nil
 }
 
+func sudashuiCatalogURL(address string) string {
+	if address == "" {
+		return dto.DefaultSudashuiCatalogURL
+	}
+	return address
+}
+
 func buildSudashuiModelPreviewChannel(req fetchModelsRequest) (*model.Channel, error) {
-	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: strings.TrimSpace(strings.Split(req.Key, "\n")[0])}
+	key, _, _ := strings.Cut(strings.TrimSpace(req.Key), "\n")
+	key = strings.TrimSpace(key)
+	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin}
+	var savedSettings dto.ChannelSettings
 	if req.ChannelID > 0 {
-		saved, err := model.GetChannelById(req.ChannelID, true)
+		saved, err := model.GetChannelById(req.ChannelID, key == "")
 		if err != nil {
 			return nil, err
 		}
-		if saved.Type != constant.ChannelTypeTaskPlugin || saved.GetSetting().TaskPluginKey != "sudashui" {
+		savedSettings = saved.GetSetting()
+		if saved.Type != constant.ChannelTypeTaskPlugin || savedSettings.TaskPluginKey != "sudashui" {
 			return nil, fmt.Errorf("channel is not a Sudashui channel")
 		}
 		channel = saved
-		if strings.TrimSpace(req.Key) != "" {
-			channel.Key = strings.TrimSpace(strings.Split(req.Key, "\n")[0])
-			channel.ChannelInfo.IsMultiKey = false
-		}
 	}
-	settings := channel.GetSetting()
+	if key != "" {
+		channel.Key = key
+		channel.ChannelInfo = model.ChannelInfo{}
+	}
+	settings := savedSettings
 	settings.TaskPluginKey = "sudashui"
 	if req.TaskPluginModelSourceURL != nil {
 		settings.TaskPluginModelSourceURL = strings.TrimSpace(*req.TaskPluginModelSourceURL)
@@ -153,7 +161,11 @@ func buildSudashuiModelPreviewChannel(req fetchModelsRequest) (*model.Channel, e
 	if req.Proxy != nil {
 		settings.Proxy = strings.TrimSpace(*req.Proxy)
 	}
-	// A preview does not validate or mutate the saved model capabilities.
+	if req.ChannelID > 0 && key == "" &&
+		(sudashuiCatalogURL(settings.TaskPluginModelSourceURL) != sudashuiCatalogURL(savedSettings.TaskPluginModelSourceURL) || settings.Proxy != savedSettings.Proxy) {
+		return nil, fmt.Errorf("enter an API key to preview a different model catalog URL or proxy")
+	}
+	// Preview reads the catalog without using or saving the channel's capability configuration.
 	settings.TaskPluginModelConfigs = nil
 	channel.SetSetting(settings)
 	return channel, nil

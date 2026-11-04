@@ -18,6 +18,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestDistributeAllowsTaskRoutesWithoutChannelSelection(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		path   string
+		url    string
+	}{
+		{http.MethodGet, "/v1/videos/:task_id", "/v1/videos/task_local"},
+		{http.MethodGet, "/v1/video/generations/:task_id", "/v1/video/generations/task_local"},
+		{http.MethodPost, "/v1/videos/:video_id/remix", "/v1/videos/task_local/remix"},
+		{http.MethodGet, "/mj/task/:id/fetch", "/mj/task/task_local/fetch"},
+		{http.MethodGet, "/mj/task/:id/image-seed", "/mj/task/task_local/image-seed"},
+		{http.MethodPost, "/mj/task/list-by-condition", "/mj/task/list-by-condition"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			app := gin.New()
+			app.Handle(tc.method, tc.path, Distribute(), func(c *gin.Context) {
+				_, exists := c.Get("original_model")
+				assert.True(t, exists)
+				c.Status(http.StatusNoContent)
+			})
+			recorder := httptest.NewRecorder()
+			app.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.url, nil))
+			assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+		})
+	}
+}
+
 func TestChannelMatchesExpectedTaskPluginUsesGenericChannelSetting(t *testing.T) {
 	channel := &model.Channel{Type: constant.ChannelTypeTaskPlugin}
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "generic-alpha"})

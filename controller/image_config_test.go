@@ -41,6 +41,90 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+func TestVideoRoutingManagementAPI(t *testing.T) {
+	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
+	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	previousDB, previousLogDB, previousType := model.DB, model.LOG_DB, common.MainDatabaseType()
+	previousRedis, previousRegistry := common.RedisEnabled, jsplugin.DefaultRegistry
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	common.SetMainDatabaseType(common.DatabaseType(dialect))
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		jsplugin.DefaultRegistry = previousRegistry
+		common.SetMainDatabaseType(previousType)
+		connection, err := db.DB()
+		if assert.NoError(t, err) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.User{}, &model.AuditLog{}, &model.Log{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}))
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "routing-admin", Role: common.RoleRootUser, Status: common.UserStatusEnabled}).Error)
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "drama", "plugin.js"))
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	pluginSetting, mapping := `{"task_plugin_key":"drama"}`, `{"target-E":"seedance2.5-E"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Name: "Economy", Models: "target-E", Group: "default", Key: "routing-private-key", Setting: &pluginSetting, ModelMapping: &mapping}
+	require.NoError(t, db.Create(&channel).Error)
+	request := func(method, path string, body any, role int) *httptest.ResponseRecorder {
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		router := gin.New()
+		router.Use(func(c *gin.Context) { c.Set("id", 1); c.Set("role", role) })
+		router.GET("/rules", middleware.RequirePermission(authz.ImageConfigRead), GetVideoRoutingConfig)
+		router.PUT("/rules", middleware.RequirePermission(authz.ImageConfigManage), UpdateVideoRoutingConfig)
+		router.GET("/options", middleware.RequirePermission(authz.ImageConfigRead), GetVideoRoutingOptions)
+		router.POST("/preview", middleware.RequirePermission(authz.ImageConfigRead), PreviewMediaRouting)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(method, path, bytes.NewReader(encoded)))
+		return recorder
+	}
+	for _, route := range []struct{ method, path string }{{http.MethodGet, "/rules"}, {http.MethodPut, "/rules"}, {http.MethodGet, "/options"}, {http.MethodPost, "/preview"}} {
+		assert.Equal(t, http.StatusForbidden, request(route.method, route.path, nil, common.RoleCommonUser).Code)
+	}
+	initial := request(http.MethodGet, "/rules", nil, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, initial.Code, initial.Body.String())
+	var response struct {
+		Data model.VideoRoutingConfig `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(initial.Body.Bytes(), &response))
+	assert.Equal(t, model.VideoRoutingConfig{Version: 1, Rules: []model.VideoRoutingRule{}}, response.Data)
+	assert.Equal(t, http.StatusPreconditionRequired, request(http.MethodPut, "/rules", gin.H{"version": 1, "enabled": false, "rules": []any{}}, common.RoleRootUser).Code)
+	config := response.Data
+	saved := request(http.MethodPut, "/rules", config, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, saved.Code, saved.Body.String())
+	require.NoError(t, common.Unmarshal(saved.Body.Bytes(), &response))
+	assert.EqualValues(t, 1, response.Data.Revision)
+	assert.Equal(t, http.StatusConflict, request(http.MethodPut, "/rules", config, common.RoleRootUser).Code)
+	stored, err := model.GetVideoRoutingConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, response.Data, stored, "a stale save must preserve the accepted configuration")
+	options := request(http.MethodGet, "/options?group=default", nil, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, options.Code, options.Body.String())
+	assert.Contains(t, options.Body.String(), `"model":"target-E"`)
+	assert.Contains(t, options.Body.String(), `"upstream_model":"seedance2.5-E"`)
+	assert.NotContains(t, options.Body.String(), "routing-private-key")
+	otherGroup := request(http.MethodGet, "/options?group=other", nil, common.RoleRootUser)
+	require.Equal(t, http.StatusOK, otherGroup.Code)
+	assert.NotContains(t, otherGroup.Body.String(), "target-E")
+	for _, tc := range []struct {
+		name   string
+		config model.VideoRoutingConfig
+	}{
+		{name: "unsupported draft version", config: model.VideoRoutingConfig{Version: 2}},
+		{name: "invalid target in disabled draft", config: model.VideoRoutingConfig{Version: 1, Rules: []model.VideoRoutingRule{{ID: "invalid", Name: "Invalid", OnExhausted: "original", Targets: []model.VideoRoutingTarget{{ChannelID: 0, Model: "target-E"}}}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			preview := request(http.MethodPost, "/preview", service.MediaRoutingPreviewRequest{Group: "default", Platform: "mixed", MediaType: "video", Model: "seedance2.5-A", Resolution: "480p", Seconds: common.GetPointer(20), VideoRoutingConfig: &tc.config}, common.RoleRootUser)
+			assert.Equal(t, http.StatusBadRequest, preview.Code, preview.Body.String())
+			after, err := model.GetVideoRoutingConfig(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, stored, after, "preview must not save its draft")
+		})
+	}
+}
+
 func TestSynchronousImageFallbackKeyFailure(t *testing.T) {
 	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
 	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))

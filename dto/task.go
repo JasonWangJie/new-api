@@ -50,6 +50,8 @@ type TaskDto struct {
 	StartTime            int64           `json:"start_time"`
 	FinishTime           int64           `json:"finish_time"`
 	Progress             string          `json:"progress"`
+	RequestedResolution  string          `json:"requested_resolution,omitempty"`
+	ExecutionResolution  string          `json:"execution_resolution,omitempty"`
 	Properties           any             `json:"properties"`
 	Username             string          `json:"username,omitempty"`
 	Data                 json.RawMessage `json:"data"`
@@ -77,9 +79,34 @@ type TaskPluginRuntimeInfo struct {
 }
 
 type TaskAdminInfo struct {
-	RequestID   string          `json:"request_id,omitempty"`
-	RequestPath string          `json:"request_path,omitempty"`
-	TaskPlugin  *TaskPluginInfo `json:"task_plugin,omitempty"`
+	RequestID    string             `json:"request_id,omitempty"`
+	RequestPath  string             `json:"request_path,omitempty"`
+	TaskPlugin   *TaskPluginInfo    `json:"task_plugin,omitempty"`
+	VideoRouting *VideoRoutingAudit `json:"video_routing,omitempty"`
+}
+
+// VideoRoutingAudit contains the frozen administrator-owned routing decision.
+// Diagnostics must be sanitized before persistence; request bodies and channel
+// credentials do not belong in this structure.
+type VideoRoutingAudit struct {
+	Revision            int64                     `json:"revision"`
+	RuleID              string                    `json:"rule_id"`
+	RuleName            string                    `json:"rule_name"`
+	SourceModel         string                    `json:"source_model"`
+	SourceResolution    string                    `json:"source_resolution"`
+	ExecutionModel      string                    `json:"execution_model"`
+	ExecutionResolution string                    `json:"execution_resolution"`
+	TargetIndex         int                       `json:"target_index"`
+	IsFallback          bool                      `json:"is_fallback"`
+	Targets             []VideoRoutingTargetAudit `json:"targets"`
+}
+
+type VideoRoutingTargetAudit struct {
+	ChannelID     int    `json:"channel_id"`
+	Model         string `json:"model"`
+	UpstreamModel string `json:"upstream_model"`
+	Resolution    string `json:"resolution"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 type TaskRootInfo struct {

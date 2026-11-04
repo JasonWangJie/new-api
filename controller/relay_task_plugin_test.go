@@ -31,9 +31,12 @@ import (
 	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -49,7 +52,7 @@ func TestMixedVideoAdmissionAndCrossPluginRecovery(t *testing.T) {
 	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTaskTimeout })
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-test")
 	previousRegistry := pluginruntime.DefaultRegistry
@@ -331,6 +334,356 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 			won, _, err := model.SettleTaskBilling(t.Context(), &stale, model.TaskStatusUnknown, reserved, nil, "")
 			require.NoError(t, err)
 			assert.False(t, won, "a stale upstream result cannot settle after administrator reconciliation")
+		})
+	}
+}
+
+func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstCredential string
+		failures              int32
+		disableQueuedTarget   bool
+		originalFallback      bool
+		strictUnavailable     bool
+		changeQueuedConfig    bool
+		queuedRevocation      string
+		unknownFirst          bool
+	}{
+		{name: "initial target", firstCredential: "Bearer first-key"},
+		{name: "confirmed failure retry", failures: 1, firstCredential: "Bearer first-key"},
+		{name: "queued target revoked", disableQueuedTarget: true, firstCredential: "Bearer second-key"},
+		{name: "all targets failed restore original", failures: 2, originalFallback: true, firstCredential: "Bearer first-key"},
+		{name: "first strict rule cannot escape", strictUnavailable: true},
+		{name: "queued rule and price remain frozen", failures: 1, changeQueuedConfig: true, firstCredential: "Bearer first-key"},
+		{name: "queued all targets revoked strict", queuedRevocation: "all"},
+		{name: "queued all targets revoked original", queuedRevocation: "all", originalFallback: true, firstCredential: "Bearer original-key"},
+		{name: "queued source group permission revoked", queuedRevocation: "source_group"},
+		{name: "queued target ability revoked", queuedRevocation: "target_ability", firstCredential: "Bearer second-key"},
+		{name: "unknown result cannot replay matching rule", failures: 1, unknownFirst: true, firstCredential: "Bearer first-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, token := setupResponsesWSRequestTest(t)
+			db := setupVideoRetryTestDatabase(t, user, token)
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "conditional-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "conditional-test")
+			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
+			previousSecret, previousTimeout := common.CryptoSecret, constant.TaskTimeoutMinutes
+			previousBatch, previousLogs := common.BatchUpdateEnabled, common.LogConsumeEnabled
+			pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = pluginruntime.NewRegistry(), ExecuteAsyncVideo
+			common.CryptoSecret, constant.TaskTimeoutMinutes = "conditional-test-signing-secret", 10
+			common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false
+			t.Cleanup(func() {
+				pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = previousRegistry, previousSubmit
+				common.CryptoSecret, constant.TaskTimeoutMinutes = previousSecret, previousTimeout
+				common.BatchUpdateEnabled, common.LogConsumeEnabled = previousBatch, previousLogs
+			})
+			redisServer := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() { assert.NoError(t, client.Close()) })
+			cfg := service.DefaultMediaRuntimeConfig()
+			cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+			require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+			source, err := builtinplugins.Source("drama")
+			require.NoError(t, err)
+			_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "drama"})
+			require.NoError(t, err)
+			var calls atomic.Int32
+			var submitted []map[string]any
+			var credentials []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				assert.NoError(t, common.DecodeJson(r.Body, &body))
+				submitted = append(submitted, body)
+				credentials = append(credentials, r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) <= tc.failures {
+					status := http.StatusBadRequest
+					if tc.unknownFirst {
+						status = http.StatusBadGateway
+					}
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"error":{"code":"reference_not_available","message":"reference material unavailable"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"conditional-upstream","status":"queued"}`))
+			}))
+			t.Cleanup(upstream.Close)
+			setting := `{"task_plugin_key":"drama"}`
+			channels := []model.Channel{
+				{Type: constant.ChannelTypeTaskPlugin, Name: "original", Status: common.ChannelStatusEnabled, Group: "default", Models: "seedance2.5-A", Key: "original-key", Setting: &setting, BaseURL: &upstream.URL},
+				{Type: constant.ChannelTypeTaskPlugin, Name: "first-target", Status: common.ChannelStatusEnabled, Group: "default", Models: "seedance2.5-E", Key: "first-key", Setting: &setting, BaseURL: &upstream.URL},
+				{Type: constant.ChannelTypeTaskPlugin, Name: "second-target", Status: common.ChannelStatusEnabled, Group: "default", Models: "seedance2.5-E", Key: "second-key", Setting: &setting, BaseURL: &upstream.URL},
+			}
+			require.NoError(t, db.Create(&channels).Error)
+			for _, channel := range channels {
+				require.NoError(t, db.Create(&model.Ability{Group: "default", Model: channel.Models, ChannelId: channel.Id, Enabled: true}).Error)
+			}
+			policy := model.ImageGroupPolicy{Group: "default", Platform: "mixed", PolicyKey: service.ImageIdentityHash("default", "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: `[{"id":"seedance2.5-A","media_type":"video"}]`}
+			require.NoError(t, db.Create(&policy).Error)
+			require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.MediaPoolBindingKey(policy, "seedance2.5-A", "1K", "video"), Group: "default", Platform: "mixed", Mode: "model", Model: "seedance2.5-A", ChannelId: channels[0].Id, Priority: 1}).Error)
+			minimum := 15
+			routing := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "upgrade", Name: "Upgrade", Enabled: true, Match: model.VideoRoutingMatch{Models: []string{"seedance2.5-A"}, Resolutions: []string{"480p"}, Seconds: model.VideoRoutingSeconds{Min: &minimum, MinExclusive: true}}, Targets: []model.VideoRoutingTarget{{ChannelID: channels[1].Id, Model: "seedance2.5-E", Resolution: "720p"}, {ChannelID: channels[2].Id, Model: "seedance2.5-E", Resolution: "720p"}}, OnExhausted: "fail"}}}
+			if tc.originalFallback {
+				routing.Rules[0].OnExhausted = "original"
+			}
+			if tc.strictUnavailable {
+				routing.Rules = append(routing.Rules, model.VideoRoutingRule{ID: "later", Name: "Later match", Enabled: true, Match: routing.Rules[0].Match, Targets: []model.VideoRoutingTarget{{ChannelID: channels[0].Id, Model: "seedance2.5-A"}}, OnExhausted: "original"})
+			}
+			require.NoError(t, service.ValidateVideoRoutingConfig(t.Context(), routing))
+			_, err = model.SaveVideoRoutingConfig(t.Context(), routing, 0)
+			require.NoError(t, err)
+			settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+			previousPrices := settings.MixedVideoBillingExpr
+			settings.MixedVideoBillingExpr = map[string]string{"seedance2.5-A": `u("resolution") == "480p" ? tier("original", u("seconds") * 0.00001) : tier("other", u("seconds") * 0.001)`}
+			t.Cleanup(func() { settings.MixedVideoBillingExpr = previousPrices })
+			retryPolicy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "reference", Name: "Reference recovery", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"material unavailable"}}, Steps: []mediaretry.Step{{ID: "next", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}}
+			if tc.originalFallback {
+				retryPolicy.Rules[0].Steps[0].MaxAttempts = 2
+			}
+			_, err = model.SaveMediaRetryPolicy(t.Context(), retryPolicy, 0, user.Id, nil)
+			require.NoError(t, err)
+			engine := gin.New()
+			engine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), AcceptAsyncVideo)
+			if tc.strictUnavailable {
+				require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{channels[1].Id, channels[2].Id}).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			}
+			if tc.name == "initial target" {
+				providerEngine := gin.New()
+				providerEngine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), func(c *gin.Context) {
+					_, conditional := c.Get(service.VideoRoutingContextKey)
+					assert.False(t, conditional)
+					assert.False(t, c.GetBool("async_media_mixed_video"))
+					assert.Equal(t, channels[0].Id, common.GetContextKeyInt(c, constant.ContextKeyChannelId))
+					storage, err := common.GetBodyStorage(c)
+					require.NoError(t, err)
+					raw, err := storage.Bytes()
+					require.NoError(t, err)
+					assert.Contains(t, string(raw), `"resolution":"480p"`)
+					c.Status(http.StatusNoContent)
+				})
+				providerRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"provider":"drama","model":"seedance2.5-A","prompt":"explicit provider","seconds":20,"resolution":"480p","aspect_ratio":"16:9"}`))
+				providerRequest.Header.Set("Content-Type", "application/json")
+				providerRequest.Header.Set("Authorization", "Bearer sk-"+token.Key)
+				providerRecorder := httptest.NewRecorder()
+				providerEngine.ServeHTTP(providerRecorder, providerRequest)
+				require.Equal(t, http.StatusNoContent, providerRecorder.Code, providerRecorder.Body.String())
+				assert.Zero(t, calls.Load())
+			}
+			recorder := httptest.NewRecorder()
+			requestHTTP := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"seedance2.5-A","prompt":"unchanged prompt","seconds":20,"resolution":"480p","aspect_ratio":"16:9"}`))
+			requestHTTP.Header.Set("Content-Type", "application/json")
+			requestHTTP.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			engine.ServeHTTP(recorder, requestHTTP)
+			if tc.strictUnavailable {
+				require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+				assert.Contains(t, recorder.Body.String(), "no compatible conditional video target")
+				assert.Zero(t, calls.Load())
+				var jobs int64
+				require.NoError(t, db.Model(&model.AsyncMediaJob{}).Count(&jobs).Error)
+				assert.Zero(t, jobs)
+				return
+			}
+			require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+			assert.Zero(t, calls.Load(), "admission must not send a paid generation")
+			var accepted struct {
+				TaskID string `json:"task_id"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &accepted))
+			var job model.AsyncMediaJob
+			require.NoError(t, db.Where("task_id = ?", accepted.TaskID).Take(&job).Error)
+			assert.Equal(t, "seedance2.5-A", job.Model)
+			assert.Equal(t, channels[1].Id, job.ChannelId)
+			plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+			require.NoError(t, err)
+			var frozen service.AsyncVideoRequest
+			require.NoError(t, common.Unmarshal(plain, &frozen))
+			require.NotNil(t, frozen.ConditionalRouting)
+			assert.Equal(t, "480p", frozen.ConditionalRouting.SourceFacts["resolution"])
+			assert.Equal(t, "480p", frozen.Details.RequestedResolution)
+			assert.Equal(t, "seedance2.5-A", frozen.Billing.Tiered.ModelName)
+			assert.Equal(t, 100, frozen.Billing.Price.Quota)
+			assert.Contains(t, string(frozen.Body), `"resolution":"720p"`)
+			for _, admin := range []bool{false, true} {
+				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin)
+				require.NoError(t, err)
+				assert.Equal(t, "seedance2.5-A", view["model"])
+				assert.Equal(t, "480p", view["requested_resolution"])
+				assert.Equal(t, "720p", view["execution_resolution"])
+				_, hasRouting := view["video_routing"]
+				assert.Equal(t, admin, hasRouting)
+				_, hasPlatform := view["platform"]
+				_, hasProvider := view["provider"]
+				assert.Equal(t, admin, hasPlatform)
+				assert.Equal(t, admin, hasProvider)
+			}
+			if tc.name == "initial target" {
+				var nativeCount int64
+				require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&nativeCount).Error)
+				require.Zero(t, nativeCount)
+				for _, projection := range []struct {
+					status    string
+					cipher    []byte
+					expiresAt int64
+				}{
+					{status: "queued", cipher: job.RequestCipher, expiresAt: time.Now().Unix() - 1},
+					{status: "expired", expiresAt: time.Now().Unix() - 1},
+					{status: "failed", expiresAt: job.ExpiresAt},
+				} {
+					copy := job
+					copy.Status, copy.RequestCipher, copy.ExpiresAt = projection.status, projection.cipher, projection.expiresAt
+					for _, admin := range []bool{false, true} {
+						view, _, err := videoJobView(taskSubmissionTestContext(), copy, admin)
+						require.NoError(t, err)
+						assert.Equal(t, "seedance2.5-A", view["model"])
+						_, hasPlatform := view["platform"]
+						_, hasProvider := view["provider"]
+						_, hasRouting := view["video_routing"]
+						assert.Equal(t, admin, hasPlatform, "status=%s", projection.status)
+						assert.Equal(t, admin, hasProvider, "status=%s", projection.status)
+						assert.Equal(t, admin && len(projection.cipher) > 0, hasRouting)
+						if len(projection.cipher) > 0 {
+							assert.Equal(t, "480p", view["requested_resolution"])
+							assert.Equal(t, "720p", view["execution_resolution"])
+						}
+					}
+				}
+			}
+			if tc.disableQueuedTarget {
+				require.NoError(t, db.Model(&channels[1]).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			}
+			switch tc.queuedRevocation {
+			case "all":
+				require.NoError(t, db.Model(&model.Channel{}).Where("id IN ?", []int{channels[1].Id, channels[2].Id}).Update("status", common.ChannelStatusManuallyDisabled).Error)
+			case "source_group":
+				require.NoError(t, db.Model(token).Update("group", "revoked").Error)
+			case "target_ability":
+				require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channels[1].Id).Update("enabled", false).Error)
+			}
+			if tc.changeQueuedConfig {
+				latest, err := model.GetVideoRoutingConfig(t.Context())
+				require.NoError(t, err)
+				latest.Enabled = false
+				latest.Rules[0].Targets = []model.VideoRoutingTarget{{ChannelID: channels[0].Id, Model: "seedance2.5-A", Resolution: "1080p"}}
+				latest.Rules[0].OnExhausted = "original"
+				_, err = model.SaveVideoRoutingConfig(t.Context(), latest, latest.Revision)
+				require.NoError(t, err)
+				settings.MixedVideoBillingExpr = map[string]string{"seedance2.5-A": `tier("new price", 0.01)`}
+			}
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "conditional-worker", 120)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			processErr := service.ProcessAsyncMediaJob(t.Context(), job, cfg)
+			blockedBeforeSend := tc.queuedRevocation == "source_group" || tc.queuedRevocation == "all" && !tc.originalFallback
+			if blockedBeforeSend || tc.unknownFirst {
+				if blockedBeforeSend {
+					require.Error(t, processErr)
+				}
+				require.NoError(t, db.First(&job, job.ID).Error)
+				require.NoError(t, db.First(user, user.Id).Error)
+				require.NoError(t, db.First(token, token.Id).Error)
+				if tc.unknownFirst {
+					assert.EqualValues(t, 1, calls.Load(), "a matching retry rule cannot replay an uncertain execution")
+					assert.Equal(t, "execution_unknown", job.Status)
+					assert.Equal(t, "unknown", job.BillingStatus)
+					assert.Equal(t, 900, user.Quota)
+					assert.Zero(t, token.RemainQuota)
+					var uncertain model.Task
+					require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&uncertain).Error)
+					assert.Equal(t, model.TaskStatus(model.TaskStatusUnknown), uncertain.Status)
+					assert.Equal(t, 100, uncertain.Quota)
+					assert.Equal(t, "seedance2.5-A", uncertain.Properties.OriginModelName)
+					assert.Equal(t, "seedance2.5-E", uncertain.Properties.UpstreamModelName)
+					require.NotNil(t, uncertain.PrivateData.VideoRouting)
+					assert.Equal(t, "480p", uncertain.PrivateData.VideoRouting.SourceResolution)
+					assert.Equal(t, "720p", uncertain.PrivateData.VideoRouting.ExecutionResolution)
+					require.NotNil(t, uncertain.PrivateData.VideoReconciliation)
+					assert.True(t, uncertain.PrivateData.VideoReconciliation.ManualRequired)
+					require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+					assert.EqualValues(t, 1, calls.Load(), "worker recovery must also leave the uncertain attempt alone")
+					require.NoError(t, db.First(user, user.Id).Error)
+					require.NoError(t, db.First(token, token.Id).Error)
+					assert.Equal(t, 900, user.Quota)
+					assert.Zero(t, token.RemainQuota)
+				} else {
+					assert.Zero(t, calls.Load())
+					assert.Equal(t, "failed", job.Status)
+					assert.Equal(t, "not_billable", job.BillingStatus)
+					assert.Zero(t, job.DispatchedAt)
+					assert.Zero(t, job.Quota)
+					assert.Equal(t, 1000, user.Quota)
+					assert.Equal(t, 100, token.RemainQuota)
+				}
+				var nativeCount int64
+				require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", job.TaskId).Count(&nativeCount).Error)
+				if tc.unknownFirst {
+					assert.EqualValues(t, 1, nativeCount)
+				} else {
+					assert.Zero(t, nativeCount)
+				}
+				return
+			}
+			require.NoError(t, processErr)
+			require.NoError(t, db.First(&job, job.ID).Error)
+			assert.Equal(t, "submitted", job.Status)
+			expectedCalls, expectedChannel := tc.failures+1, channels[1].Id
+			if tc.failures > 0 {
+				expectedChannel = channels[2].Id
+			}
+			if tc.disableQueuedTarget || tc.queuedRevocation == "target_ability" {
+				expectedChannel = channels[2].Id
+			}
+			executionModel, executionResolution := "seedance2.5-E", "720p"
+			if tc.originalFallback {
+				expectedChannel, executionModel, executionResolution = channels[0].Id, "seedance2.5-A", "480p"
+			}
+			assert.Equal(t, expectedCalls, calls.Load())
+			require.Len(t, submitted, int(expectedCalls))
+			for index, body := range submitted {
+				modelName, resolution := "seedance2.5-E", "720p"
+				if index == len(submitted)-1 {
+					modelName, resolution = executionModel, executionResolution
+				}
+				assert.Equal(t, modelName, body["model"])
+				assert.Equal(t, resolution, body["resolution"])
+				assert.Equal(t, float64(20), body["seconds"])
+				assert.Equal(t, "unchanged prompt", body["prompt"])
+			}
+			assert.Equal(t, tc.firstCredential, credentials[0])
+			if tc.failures > 0 {
+				assert.Equal(t, "Bearer second-key", credentials[1])
+			}
+			if tc.originalFallback && tc.failures > 0 {
+				assert.Equal(t, "Bearer original-key", credentials[2])
+			}
+			var task model.Task
+			require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+			assert.Equal(t, expectedChannel, task.ChannelId)
+			assert.Equal(t, "seedance2.5-A", task.Properties.OriginModelName)
+			assert.Equal(t, executionModel, task.Properties.UpstreamModelName)
+			assert.Equal(t, 100, task.Quota)
+			require.NotNil(t, task.PrivateData.VideoRouting)
+			assert.EqualValues(t, 1, task.PrivateData.VideoRouting.Revision)
+			assert.Equal(t, "upgrade", task.PrivateData.VideoRouting.RuleID)
+			assert.Equal(t, tc.originalFallback, task.PrivateData.VideoRouting.IsFallback)
+			for _, admin := range []bool{false, true} {
+				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin)
+				require.NoError(t, err)
+				assert.Equal(t, "seedance2.5-A", view["model"])
+				assert.Equal(t, "480p", view["requested_resolution"])
+				assert.Equal(t, executionResolution, view["execution_resolution"])
+				_, hasRouting := view["video_routing"]
+				assert.Equal(t, admin, hasRouting)
+				_, hasPlatform := view["platform"]
+				_, hasProvider := view["provider"]
+				assert.Equal(t, admin, hasPlatform)
+				assert.Equal(t, admin, hasProvider)
+			}
+			require.NoError(t, db.First(user, user.Id).Error)
+			require.NoError(t, db.First(token, token.Id).Error)
+			assert.Equal(t, 900, user.Quota)
+			assert.Zero(t, token.RemainQuota)
 		})
 	}
 }

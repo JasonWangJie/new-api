@@ -345,6 +345,33 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
+test.each([false, true])(
+  'a conditional video task with private platform fields omitted still renders its public model (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const publicTask: ImageTask = {
+      ...task,
+      media_type: 'video',
+      model: 'seedance2.5-A',
+      platform: undefined,
+      provider: undefined,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [publicTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    const listTask = mobile
+      ? screen.getByRole('article', { name: task.id })
+      : screen.getByRole('row', { name: new RegExp(task.id) })
+    expect(within(listTask).getByText('seedance2.5-A')).toBeVisible()
+    expect(within(listTask).queryByText('OpenAI')).not.toBeInTheDocument()
+  }
+)
+
 test.each([
   { admin: false, mobile: false, status: 'queued', upstreamProgress: 0 },
   { admin: true, mobile: false, status: 'processing', upstreamProgress: 42.5 },

@@ -14,6 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
 
+var errNoCompatibleMixedVideoChannel = errors.New("No compatible video channel is available for the mixed model")
+
 // ValidateMixedVideoOverridesStatic validates a draft without requiring a live
 // provider. Enabling the policy additionally checks the current channel profiles.
 func ValidateMixedVideoOverridesStatic(overrides VideoModelOverrides) error {
@@ -176,7 +178,7 @@ func MixedVideoModelProfiles(ctx context.Context, policy model.ImageGroupPolicy,
 		}
 	}
 	if len(profiles) == 0 {
-		return profiles, errors.New("No compatible video channel is available for the mixed model")
+		return profiles, errNoCompatibleMixedVideoChannel
 	}
 	if !requirePool {
 		for dimension, value := range map[string]string{"resolution": overrides.DefaultResolution, "aspect_ratio": overrides.DefaultAspectRatio, "extension_direction": overrides.DefaultExtensionDirection} {

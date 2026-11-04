@@ -1,11 +1,13 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -216,6 +218,38 @@ func SaveMediaRetryPolicy(ctx context.Context, policy mediaretry.Policy, expecte
 		if len(policy.LegacyTimeoutScopeKeys) == 0 && len(policy.LegacyVideoChannelIDs) == 0 {
 			policy.LegacyTimeoutEnabled = false
 		}
+		now := time.Now()
+		if sourceRevision == nil {
+			previousRules := make(map[string]mediaretry.Rule, len(previous.Rules))
+			updatedAt := now.UnixMilli()
+			for _, rule := range previous.Rules {
+				previousRules[rule.ID] = rule
+				// Keep consecutive saves ordered even within the same millisecond.
+				updatedAt = max(updatedAt, rule.UpdatedAt+1)
+			}
+			policy.Rules = slices.Clone(policy.Rules)
+			for i, rule := range policy.Rules {
+				policy.Rules[i].UpdatedAt = updatedAt
+				oldRule, exists := previousRules[rule.ID]
+				if !exists {
+					continue
+				}
+				// Compare persisted rule content so optional empty slices and
+				// timestamps sent by the editor do not count as changes.
+				rule.UpdatedAt = oldRule.UpdatedAt
+				before, err := common.Marshal(oldRule)
+				if err != nil {
+					return err
+				}
+				after, err := common.Marshal(rule)
+				if err != nil {
+					return err
+				}
+				if bytes.Equal(before, after) {
+					policy.Rules[i].UpdatedAt = oldRule.UpdatedAt
+				}
+			}
+		}
 		encoded, err := common.Marshal(policy)
 		if err != nil {
 			return err
@@ -223,12 +257,11 @@ func SaveMediaRetryPolicy(ctx context.Context, policy mediaretry.Policy, expecte
 		if len(encoded) > 1<<20 {
 			return errors.New("recovery policy exceeds the configuration size limit")
 		}
-		now := time.Now().Unix()
-		baseline := MediaRetryPolicyVersion{Revision: previous.Revision, CreatedAt: now, Action: "baseline", Config: current.Value}
+		baseline := MediaRetryPolicyVersion{Revision: previous.Revision, CreatedAt: now.Unix(), Action: "baseline", Config: current.Value}
 		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&baseline).Error; err != nil {
 			return err
 		}
-		version := MediaRetryPolicyVersion{Revision: policy.Revision, CreatedAt: now, ActorID: actorID, Action: "save", Config: string(encoded)}
+		version := MediaRetryPolicyVersion{Revision: policy.Revision, CreatedAt: now.Unix(), ActorID: actorID, Action: "save", Config: string(encoded)}
 		if sourceRevision != nil {
 			version.Action, version.SourceRevision = "rollback", *sourceRevision
 		}
@@ -334,9 +367,12 @@ func GetMediaRetryEvent(ctx context.Context, id int64) (MediaRetryEvent, error) 
 	return event, err
 }
 
-// PruneMediaRetryEvents bounds diagnostic retention without deleting live task
-// counters, configuration history or recovery decisions on the task itself.
-func PruneMediaRetryEvents(ctx context.Context, before int64, limit int) error {
+const mediaRetryEventRetention = 7 * 24 * time.Hour
+
+// PruneExpiredMediaRetryEvents removes old error samples without deleting live
+// task counters, configuration history or decisions stored on the task itself.
+func PruneExpiredMediaRetryEvents(ctx context.Context, now time.Time, limit int) error {
+	before := now.Add(-mediaRetryEventRetention).Unix()
 	if before <= 0 || limit < 1 || limit > 1000 {
 		return errors.New("invalid recovery event retention batch")
 	}

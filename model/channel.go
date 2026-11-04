@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -881,27 +882,48 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
-	if err != nil {
-		return err
+	editsModels := updateData.Models != "" || updateData.ModelMapping != nil
+	var txOptions []*sql.TxOptions
+	if editsModels {
+		// Changes on different tags still share the public model billing units.
+		txOptions = append(txOptions, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	}
-	if shouldReCreateAbilities {
-		channels, err := GetChannelsByTag(updatedTag, false, false)
-		if err == nil {
-			for _, channel := range channels {
-				err = channel.UpdateAbilities(nil)
-				if err != nil {
-					common.SysLog(fmt.Sprintf("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
-				}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if editsModels {
+			if err := lockForUpdate(tx).Where("tag = ?", tag).
+				Select("id", "type", "setting", "models", "model_mapping").Order("id").Find(&channels).Error; err != nil {
+				return err
 			}
 		}
-	} else {
-		err := UpdateAbilityByTag(tag, newTag, priority, weight)
-		if err != nil {
+		if err := tx.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error; err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, channel := range channels {
+			if updateData.Models != "" {
+				channel.Models = updateData.Models
+			}
+			if updateData.ModelMapping != nil {
+				channel.ModelMapping = updateData.ModelMapping
+			}
+			if err := channel.validateTaskVideoModelBindings(tx); err != nil {
+				return fmt.Errorf("channel %d: %w", channel.Id, err)
+			}
+		}
+		if !shouldReCreateAbilities {
+			return updateAbilityByTag(tx, tag, newTag, priority, weight)
+		}
+		var updatedChannels []Channel
+		if err := tx.Where("tag = ?", updatedTag).Omit("key").Order("id").Find(&updatedChannels).Error; err != nil {
+			return err
+		}
+		for _, channel := range updatedChannels {
+			if err := channel.UpdateAbilities(tx); err != nil {
+				return fmt.Errorf("update abilities for channel %d: %w", channel.Id, err)
+			}
+		}
+		return nil
+	}, txOptions...)
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {
@@ -1064,14 +1086,13 @@ func (channel *Channel) GetImageMaxReferenceImages() int {
 	return *setting.ImageMaxReferenceImages
 }
 
+// GetSetting can read a projected Channel and must never persist it.
 func (channel *Channel) GetSetting() dto.ChannelSettings {
 	setting := dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {
 		err := common.Unmarshal([]byte(*channel.Setting), &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
 		}
 	}
 	return setting

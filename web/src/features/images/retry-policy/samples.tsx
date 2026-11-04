@@ -23,7 +23,7 @@ import { useTranslation } from 'react-i18next'
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
-import { formatTimestampToDate } from '@/lib/format'
+import { formatDateStr, formatTimestampToDate } from '@/lib/format'
 
 import { imageRequest } from '../api'
 import { imageLabel } from '../lib/image-labels'
@@ -48,16 +48,19 @@ export function RetrySamples(props: {
   const { t } = useTranslation()
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<RetrySample | null>(null)
-  const [filters, setFilters] = useState({
-    media_type: '',
-    provider: '',
-    model: '',
-    stage: '',
-    channel_id: '',
-    category: '',
-    matched: '',
-    start_date: '',
-    end_date: '',
+  const [filters, setFilters] = useState(() => {
+    const today = formatDateStr(new Date())
+    return {
+      media_type: '',
+      provider: '',
+      model: '',
+      stage: '',
+      channel_id: '',
+      category: '',
+      matched: '',
+      start_date: today,
+      end_date: today,
+    }
   })
   const [applied, setApplied] = useState(filters)
   const params = new URLSearchParams(

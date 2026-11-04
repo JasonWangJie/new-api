@@ -314,6 +314,8 @@ export interface TaskLog {
   finish_time?: number // seconds
   progress?: string
   progress_message_en?: string
+  requested_resolution?: string
+  execution_resolution?: string
   data?: unknown
   properties?: {
     input?: string
@@ -327,6 +329,7 @@ export interface TaskLog {
     request_id?: string
     request_path?: string
     task_plugin?: TaskPluginInfo
+    video_routing?: VideoRoutingAudit
   }
   root_info?: {
     task_plugin?: TaskPluginRuntimeInfo
@@ -342,6 +345,25 @@ export interface TaskPluginInfo {
   name: string
   version?: string
   author?: TaskPluginAuthor
+}
+
+export interface VideoRoutingAudit {
+  revision: number
+  rule_id: string
+  rule_name: string
+  source_model: string
+  source_resolution: string
+  execution_model: string
+  execution_resolution: string
+  target_index: number
+  is_fallback: boolean
+  targets: {
+    channel_id: number
+    model: string
+    upstream_model: string
+    resolution: string
+    reason?: string
+  }[]
 }
 
 export interface TaskPluginAuthor {

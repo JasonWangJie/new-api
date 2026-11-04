@@ -159,14 +159,85 @@ func TestMediaRetryPolicyPersistence(t *testing.T) {
 	require.ErrorIs(t, err, failure)
 	_, err = GetLatestMediaRetryEvent(t.Context(), "rolled-back-event")
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
-	require.NoError(t, db.Model(&MediaRetryEvent{}).Where("task_id = ?", "sample-one").Update("created_at", int64(1)).Error)
-	require.NoError(t, PruneMediaRetryEvents(t.Context(), 2, 100))
+	now := time.Date(2026, time.July, 8, 12, 0, 0, 0, time.UTC)
+	boundary := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC).Unix()
+	require.NoError(t, db.Model(&MediaRetryEvent{}).Where("task_id = ?", "sample-one").Update("created_at", boundary-1).Error)
+	require.NoError(t, db.Model(&MediaRetryEvent{}).Where("task_id = ? AND revision = ?", "sample-two", decision.Revision).Update("created_at", boundary).Error)
+	require.NoError(t, db.Model(&MediaRetryEvent{}).Where("event_key = ?", changedEvent.EventKey).Update("created_at", boundary+1).Error)
+	for range 2 {
+		require.NoError(t, PruneExpiredMediaRetryEvents(t.Context(), now, 100))
+	}
 	_, err = GetLatestMediaRetryEvent(t.Context(), "sample-one")
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
-	_, err = GetLatestMediaRetryEvent(t.Context(), "sample-two")
+	details, detailTotal, err = ListMediaRetrySampleEvents(t.Context(), samples[0].Fingerprint, MediaRetrySampleFilter{}, 1, 20)
 	require.NoError(t, err)
+	assert.EqualValues(t, 2, detailTotal)
+	require.Len(t, details, 2)
+	assert.Equal(t, boundary, details[1].CreatedAt)
+	require.NoError(t, MarkMediaRetryEventExecutedTx(db, "sample-one", decision))
+	require.NoError(t, MarkMediaRetryTaskOutcomeTx(db, "sample-one", "succeeded"))
 	_, err = GetMediaRetryPolicyVersion(t.Context(), 0)
 	require.NoError(t, err, "retention never removes policy history")
+}
+
+func TestMediaRetryRuleOperationTimes(t *testing.T) {
+	db := imageTestDatabase(t, "media-retry-rule-times")
+	previousDB, previousType := DB, common.MainDatabaseType()
+	DB = db
+	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
+	t.Cleanup(func() { DB = previousDB; common.SetMainDatabaseType(previousType) })
+	require.NoError(t, db.AutoMigrate(&Option{}, &MediaRetryPolicyVersion{}))
+	legacy := mediaretry.Rule{ID: "legacy", Name: "Legacy", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"busy"}}, Steps: []mediaretry.Step{{ID: "stop", Action: mediaretry.Stop, MaxAttempts: 1}}}
+	legacyConfig, err := common.Marshal(mediaretry.Policy{Rules: []mediaretry.Rule{legacy}})
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&Option{Key: MediaRetryPolicyOptionKey, Value: string(legacyConfig)}).Error)
+
+	policy, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	require.Len(t, policy.Rules, 1)
+	assert.Zero(t, policy.Rules[0].UpdatedAt)
+	newRule := legacy
+	newRule.ID, newRule.Name, newRule.UpdatedAt = "new", "New rule", 1
+	policy.Rules = append(policy.Rules, newRule)
+	added, err := SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
+	require.NoError(t, err)
+	assert.Zero(t, added.Rules[0].UpdatedAt)
+	require.Greater(t, added.Rules[1].UpdatedAt, int64(1))
+	addedAt := added.Rules[1].UpdatedAt
+
+	// A priority move and global settings change preserve rule timestamps.
+	added.Rules[0], added.Rules[1] = added.Rules[1], added.Rules[0]
+	added.Rules[0].UpdatedAt = 1
+	added.Rules[0].Scope.Models = []string{}
+	added.PauseResubmissions = true
+	moved, err := SaveMediaRetryPolicy(t.Context(), added, added.Revision, 1, nil)
+	require.NoError(t, err)
+	assert.Equal(t, addedAt, moved.Rules[0].UpdatedAt)
+	assert.Zero(t, moved.Rules[1].UpdatedAt)
+
+	moved.Rules[1].Name = "Edited legacy rule"
+	edited, err := SaveMediaRetryPolicy(t.Context(), moved, moved.Revision, 1, nil)
+	require.NoError(t, err)
+	assert.Equal(t, addedAt, edited.Rules[0].UpdatedAt)
+	assert.Greater(t, edited.Rules[1].UpdatedAt, addedAt)
+	compiled, err := mediaretry.Compile(edited)
+	require.NoError(t, err)
+	assert.Equal(t, newRule.ID, compiled.Evaluate(mediaretry.Fact{Message: "busy"}, mediaretry.State{TotalLimit: 1}).RuleID)
+	persisted, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, edited.Rules[1].UpdatedAt, persisted.Rules[1].UpdatedAt)
+
+	withoutRules := edited
+	withoutRules.Rules = []mediaretry.Rule{}
+	deleted, err := SaveMediaRetryPolicy(t.Context(), withoutRules, edited.Revision, 1, nil)
+	require.NoError(t, err)
+	assert.Empty(t, deleted.Rules)
+	current, err := GetMediaRetryPolicy(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, deleted, current)
+	rolledBack, err := SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{}, deleted.Revision, 1, &edited.Revision)
+	require.NoError(t, err)
+	assert.Equal(t, persisted.Rules, rolledBack.Rules)
 }
 
 func TestMediaRetryPolicyFreshDatabase(t *testing.T) {

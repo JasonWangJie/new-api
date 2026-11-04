@@ -143,8 +143,27 @@ func GetImageChannelPoolOptions(c *gin.Context) {
 
 func PreviewMediaRouting(c *gin.Context) {
 	var input service.MediaRoutingPreviewRequest
-	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<16), &input); err != nil {
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, http.StatusBadRequest, errors.New("Invalid routing preview request"))
+		return
+	}
+	if input.VideoRoutingConfig != nil {
+		// A draft must have a valid structure even if routing is disabled or
+		// its source pool is unavailable. Live target failures belong in the
+		// preview's exclusions, so do not validate external dependencies here.
+		draft := *input.VideoRoutingConfig
+		draft.Enabled = false
+		if err := service.ValidateVideoRoutingConfig(c.Request.Context(), draft); err != nil {
+			imageManagementError(c, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if input.Mode != "" && !slices.Contains([]string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame", "edit_video", "extend_video"}, input.Mode) {
+		imageManagementError(c, 400, errors.New("Invalid video generation mode"))
+		return
+	}
+	if input.VideoInput != "" && input.VideoInput != "none" && input.VideoInput != "video" {
+		imageManagementError(c, 400, errors.New("Invalid reference video condition"))
 		return
 	}
 	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)

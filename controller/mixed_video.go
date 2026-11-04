@@ -74,15 +74,28 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 			groups = service.GetRequestAutoGroups(c, owner.Group)
 		}
 		profiles := make([]jsplugin.VideoProfile, 0)
+		profilesByGroup := make(map[string][]jsplugin.VideoProfile, len(groups))
 		for _, group := range groups {
 			poolPolicy := policy
 			poolPolicy.Group = group
 			variants, err := service.MixedVideoModelProfiles(c.Request.Context(), poolPolicy, publicModel, capability.VideoOverrides, true)
 			if err == nil {
+				profilesByGroup[group] = variants
 				profiles = append(profiles, variants...)
 			}
 		}
-		raw, contentType, body, err := service.NormalizeMixedVideoDefaults(raw, c.GetHeader("Content-Type"), operation, profiles)
+		var routingConfig model.VideoRoutingConfig
+		if operation == "" || operation == "create" {
+			config, configErr := model.GetVideoRoutingConfig(c.Request.Context())
+			if configErr != nil {
+				AsyncImagePublicError(c, 503, "routing_unavailable", "Video routing rules are unavailable")
+				c.Abort()
+				return
+			}
+			c.Set("conditional_video_rules_config", config)
+			routingConfig = config
+		}
+		raw, contentType, body, err := service.NormalizeVideoRoutingAdmissionDefaults(routingConfig, publicModel, groups, raw, c.GetHeader("Content-Type"), operation, profilesByGroup, "")
 		if err != nil {
 			AsyncImagePublicError(c, 400, "invalid_request", err.Error())
 			c.Abort()
@@ -105,6 +118,9 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		resolution, _ := facts["resolution"].(string)
 		route := &service.MixedVideoRouting{Group: policy.Group, BindingKey: service.MediaPoolBindingKey(policy, publicModel, service.VideoPoolResolution(resolution), "video"), PoolMode: policy.PoolMode, Model: publicModel, Operation: operation, Resolution: service.VideoPoolResolution(resolution)}
+		if routeConditionalVideo(c, token, policy, groups, route, raw, contentType, facts) {
+			return
+		}
 		constraints := service.GetChannelConstraints(c)
 		forced, forcedOK, _ := constraints.ResolvedPin()
 		candidates := make([]service.MixedVideoCandidate, 0)
@@ -112,6 +128,9 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		weights := make([]int, 0)
 		var rejection error
 		for _, group := range groups {
+			if fallbackGroup := c.GetString("conditional_video_fallback_group"); fallbackGroup != "" && fallbackGroup != group {
+				continue
+			}
 			poolPolicy := policy
 			poolPolicy.Group = group
 			check := *route
@@ -217,6 +236,13 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 	if err != nil {
 		AsyncImagePublicError(c, 403, "provider_unavailable", err.Error())
 		c.Abort()
+		return
+	}
+	if request.ConditionalRouting != nil {
+		c.Set(service.VideoRoutingContextKey, request.ConditionalRouting)
+	}
+	if request.ConditionalRouting.ActiveTarget() != nil {
+		pinConditionalVideoWorker(c, job, request)
 		return
 	}
 	capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)

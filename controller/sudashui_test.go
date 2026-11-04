@@ -308,9 +308,10 @@ func TestSudashuiChannelPartialUpdates(t *testing.T) {
 	settingsJSON, err := common.Marshal(settings)
 	require.NoError(t, err)
 	for _, tc := range []struct {
-		name    string
-		fields  map[string]any
-		success bool
+		name         string
+		fields       map[string]any
+		originalType int
+		success      bool
 	}{
 		{name: "explicit type cannot remove configured model", fields: map[string]any{"type": 61, "setting": `{"task_plugin_key":"sudashui"}`}},
 		{name: "empty models cannot bypass validation", fields: map[string]any{"models": "", "setting": `{"task_plugin_key":"sudashui"}`}},
@@ -318,11 +319,16 @@ func TestSudashuiChannelPartialUpdates(t *testing.T) {
 		{name: "explicit type with settings preserves omitted destination", fields: map[string]any{"type": 61, "setting": string(settingsJSON)}, success: true},
 		{name: "null settings retain existing bindings", fields: map[string]any{"setting": nil, "name": "renamed"}, success: true},
 		{name: "mapping must target configured model", fields: map[string]any{"model_mapping": `{"public-partial":"missing-model"}`}},
+		{name: "conversion retains model bindings during validation", originalType: constant.ChannelTypeOpenAI, fields: map[string]any{"type": 61, "setting": `{"task_plugin_key":"sudashui"}`}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mapping, baseURL := `{"public-partial":"vendor-partial"}`, "https://custom.example"
 			channel := model.Channel{Type: 61, Key: "fixture", Models: "public-partial", Group: "default", BaseURL: &baseURL, ModelMapping: &mapping}
-			channel.SetSetting(settings)
+			if tc.originalType == 0 {
+				channel.SetSetting(settings)
+			} else {
+				channel.Type = tc.originalType
+			}
 			require.NoError(t, db.Create(&channel).Error)
 			t.Cleanup(func() { require.NoError(t, db.Delete(&model.Channel{}, channel.Id).Error) })
 			body := maps.Clone(tc.fields)
@@ -341,12 +347,68 @@ func TestSudashuiChannelPartialUpdates(t *testing.T) {
 			assert.Equal(t, tc.success, response.Success, recorder.Body.String())
 			var saved model.Channel
 			require.NoError(t, db.First(&saved, channel.Id).Error)
+			assert.Equal(t, channel.Type, saved.Type)
 			assert.Equal(t, channel.Setting, saved.Setting)
 			assert.Equal(t, channel.Models, saved.Models)
 			assert.Equal(t, channel.ModelMapping, saved.ModelMapping)
 			assert.Equal(t, baseURL, saved.GetBaseURL())
 		})
 	}
+}
+
+func TestSudashuiCatalogReadsAndTagWrites(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.TaskPlugin{}))
+	_, config := sudashuiFixture(t)
+	legacySettings := `{"task_plugin_key":"third-party","task_plugin_model_configs":"previously ignored"}`
+	tag, baseURL := "tag-video", "https://saved.example"
+	legacy := model.Channel{Type: 61, Name: "legacy", Key: "fixture-key", Group: "default", Models: "legacy-video", Tag: &tag, BaseURL: &baseURL, UsedQuota: 72, Setting: &legacySettings}
+	require.NoError(t, legacy.Insert())
+	mapping := `{"public-video":"saved-video"}`
+	video := model.Channel{Type: 61, Key: "fixture", Group: "default", Models: "public-video", Tag: &tag, ModelMapping: &mapping}
+	video.SetSetting(dto.ChannelSettings{TaskPluginKey: "sudashui", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"saved-video": config}})
+	require.NoError(t, video.Insert())
+	before, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	assert.Contains(t, before.VideoModels, video.Models)
+
+	missingMapping := `{"public-video":"missing-video"}`
+	renamed := "new-tag"
+	require.ErrorContains(t, model.EditChannelByTag(tag, &renamed, &missingMapping, nil, nil, nil, nil, nil, nil), "missing-video requires a saved capability")
+	after, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, before.Revision, after.Revision)
+	var savedLegacy, savedVideo model.Channel
+	require.NoError(t, db.First(&savedLegacy, legacy.Id).Error)
+	assert.Equal(t, legacy.Type, savedLegacy.Type)
+	assert.Equal(t, legacy.Name, savedLegacy.Name)
+	assert.Equal(t, legacy.Key, savedLegacy.Key)
+	assert.Equal(t, legacy.BaseURL, savedLegacy.BaseURL)
+	assert.Equal(t, legacy.UsedQuota, savedLegacy.UsedQuota)
+	assert.Equal(t, legacy.Setting, savedLegacy.Setting)
+	assert.Equal(t, legacy.Tag, savedLegacy.Tag)
+	require.NoError(t, db.First(&savedVideo, video.Id).Error)
+	assert.Equal(t, video.ModelMapping, savedVideo.ModelMapping)
+	assert.Equal(t, video.Tag, savedVideo.Tag)
+
+	updatedModels, updatedMapping := "new-video", `{"new-video":"saved-video"}`
+	require.NoError(t, model.EditChannelByTag(tag, nil, &updatedMapping, &updatedModels, nil, nil, nil, nil, nil))
+	after, err = model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	assert.NotEqual(t, before.Revision, after.Revision)
+	assert.Contains(t, after.VideoModels, updatedModels)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", video.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, updatedModels, abilities[0].Model)
+
+	require.NoError(t, db.Migrator().DropTable(&model.Ability{}))
+	uncommittedModel, uncommittedMapping := "uncommitted-video", `{"uncommitted-video":"saved-video"}`
+	require.ErrorContains(t, model.EditChannelByTag(tag, nil, &uncommittedMapping, &uncommittedModel, nil, nil, nil, nil, nil), "update abilities")
+	require.NoError(t, db.First(&savedVideo, video.Id).Error)
+	assert.Equal(t, updatedModels, savedVideo.Models)
+	assert.Equal(t, updatedMapping, savedVideo.GetModelMapping())
 }
 
 func TestSudashuiAsyncAdmissionFreezesSelectedChannel(t *testing.T) {
@@ -616,7 +678,7 @@ func TestSudashuiCatalogIsAnAuthenticatedPreview(t *testing.T) {
 	assert.Equal(t, before, *saved.Setting)
 	for _, suffix := range []string{"/redirect", "/failure"} {
 		address := server.URL + suffix
-		preview, err := buildSudashuiModelPreviewChannel(fetchModelsRequest{ChannelID: channel.Id, TaskPluginModelSourceURL: &address})
+		preview, err := buildSudashuiModelPreviewChannel(fetchModelsRequest{ChannelID: channel.Id, TaskPluginModelSourceURL: &address, Key: "catalog-fixture"})
 		require.NoError(t, err)
 		_, _, err = fetchChannelModelPreview(t.Context(), preview)
 		require.Error(t, err)
@@ -639,6 +701,82 @@ func TestSudashuiCatalogIsAnAuthenticatedPreview(t *testing.T) {
 	assert.Equal(t, ids, fetched.Data)
 	assert.Contains(t, fetched.ModelDetails, "future-video")
 	assert.NotContains(t, recorder.Body.String(), "catalog-fixture")
+}
+
+func TestSudashuiCatalogPreviewKeepsSavedKeyOnSavedRoute(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	fetchSetting := system_setting.GetFetchSetting()
+	previous := *fetchSetting
+	fetchSetting.EnableSSRFProtection = false
+	t.Cleanup(func() { *fetchSetting = previous })
+	service.InitHttpClient()
+
+	savedRequests := make(chan string, 4)
+	savedCatalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		savedRequests <- r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"success":true,"data":[]}`)
+	}))
+	t.Cleanup(savedCatalog.Close)
+	previewRequests := make(chan string, 4)
+	previewCatalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		previewRequests <- r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"success":true,"data":[]}`)
+	}))
+	t.Cleanup(previewCatalog.Close)
+
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "saved-fixture"}
+	channel.SetSetting(dto.ChannelSettings{
+		TaskPluginKey: "sudashui", TaskPluginModelSourceURL: savedCatalog.URL,
+	})
+	require.NoError(t, model.DB.Create(&channel).Error)
+
+	for _, tc := range []struct {
+		name, key, catalog, proxy string
+		received                  <-chan string
+		wantKey                   string
+	}{
+		{name: "saved route", catalog: savedCatalog.URL, received: savedRequests, wantKey: "saved-fixture"},
+		{name: "different URL", catalog: previewCatalog.URL},
+		{name: "different proxy", catalog: savedCatalog.URL, proxy: previewCatalog.URL},
+		{name: "caller supplied key", catalog: previewCatalog.URL, key: "preview-fixture", received: previewRequests, wantKey: "preview-fixture"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := common.Marshal(map[string]any{
+				"type": constant.ChannelTypeTaskPlugin, "task_plugin_key": "sudashui", "channel_id": channel.Id,
+				"task_plugin_model_source_url": tc.catalog, "proxy": tc.proxy, "key": tc.key,
+			})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/channel/fetch_models", bytes.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			FetchModels(c)
+
+			var result struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
+			assert.NotContains(t, recorder.Body.String(), "saved-fixture")
+			assert.Equal(t, tc.wantKey != "", result.Success)
+			if tc.wantKey == "" {
+				assert.Contains(t, result.Message, "enter an API key")
+				require.Empty(t, savedRequests)
+				require.Empty(t, previewRequests)
+				return
+			}
+			select {
+			case authorization := <-tc.received:
+				assert.Equal(t, "Bearer "+tc.wantKey, authorization)
+			default:
+				t.Error("catalog did not receive a request")
+			}
+		})
+	}
+	var saved model.Channel
+	require.NoError(t, model.DB.First(&saved, channel.Id).Error)
+	assert.Equal(t, channel.GetSetting(), saved.GetSetting())
+	assert.Equal(t, channel.Key, saved.Key)
 }
 
 func TestSudashuiRoutedSubmitPollAndFrozenBilling(t *testing.T) {

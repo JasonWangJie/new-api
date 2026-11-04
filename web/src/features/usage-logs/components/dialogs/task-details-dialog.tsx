@@ -87,6 +87,9 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
   const plugin = access.plugin
   const runtime = access.runtime
   const properties = props.log.properties
+  const routing = props.isAdmin
+    ? props.log.admin_info?.video_routing
+    : undefined
 
   return (
     <Dialog
@@ -147,10 +150,25 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
               mono
             />
           ) : null}
-          {properties?.upstream_model_name ? (
+          {properties?.upstream_model_name &&
+          !props.log.execution_resolution ? (
             <DetailRow
               label={t('Actual Model')}
               value={properties.upstream_model_name}
+              mono
+            />
+          ) : null}
+          {props.log.requested_resolution ? (
+            <DetailRow
+              label={t('Requested resolution')}
+              value={props.log.requested_resolution}
+              mono
+            />
+          ) : null}
+          {props.log.execution_resolution ? (
+            <DetailRow
+              label={t('Execution resolution')}
+              value={props.log.execution_resolution}
               mono
             />
           ) : null}
@@ -220,6 +238,64 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
                 ) : null}
               </>
             ) : null}
+          </DetailSection>
+        ) : null}
+
+        {routing ? (
+          <DetailSection label={t('Routing rule')}>
+            <DetailRow label={t('Name')} value={routing.rule_name} />
+            <DetailRow label={t('ID')} value={routing.rule_id} mono />
+            <DetailRow
+              label={t('Routing revision')}
+              value={String(routing.revision)}
+              mono
+            />
+            <DetailRow
+              label={t('Actual Model')}
+              value={routing.execution_model}
+              mono
+            />
+            <DetailRow
+              label={t('Original route fallback')}
+              value={routing.is_fallback ? t('Yes') : t('No')}
+            />
+            {!routing.is_fallback && routing.target_index >= 0 ? (
+              <DetailRow
+                label={t('Routing targets')}
+                value={t('Target {{number}}', {
+                  number: routing.target_index + 1,
+                })}
+              />
+            ) : null}
+            {routing.targets.map((target, index) => (
+              <div
+                key={`${target.channel_id}:${target.model}:${target.resolution}`}
+                className='min-w-0 space-y-1.5 border-t pt-2'
+              >
+                <p className='text-muted-foreground text-xs font-medium'>
+                  {t('Target {{number}}', { number: index + 1 })}
+                </p>
+                <DetailRow
+                  label={t('Channel')}
+                  value={`#${target.channel_id}`}
+                  mono
+                />
+                <DetailRow label={t('Model')} value={target.model} mono />
+                <DetailRow
+                  label={t('Actual Model')}
+                  value={target.upstream_model || '-'}
+                  mono
+                />
+                <DetailRow
+                  label={t('Execution resolution')}
+                  value={target.resolution || routing.source_resolution}
+                  mono
+                />
+                {target.reason ? (
+                  <DetailRow label={t('Reason')} value={target.reason} />
+                ) : null}
+              </div>
+            ))}
           </DetailSection>
         ) : null}
 

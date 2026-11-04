@@ -70,7 +70,7 @@ func Distribute() func(c *gin.Context) {
 				}
 				return
 			}
-			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
+			if ok, kind := model.ChannelSatisfiesFilters(channel, service.VideoRoutingExecutionModel(c, modelRequest.Model), constraints.Filters); !ok {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
@@ -200,7 +200,7 @@ func Distribute() func(c *gin.Context) {
 			return
 		}
 		if channel != nil {
-			if ok, kind := model.ChannelSatisfiesFilters(channel, modelRequest.Model, constraints.Filters); !ok {
+			if ok, kind := model.ChannelSatisfiesFilters(channel, service.VideoRoutingExecutionModel(c, modelRequest.Model), constraints.Filters); !ok {
 				if kind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
@@ -209,7 +209,9 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+		if channel == nil {
+			c.Set("original_model", modelRequest.Model)
+		} else if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, setupErr.Error(), setupErr.GetErrorCode())
 			return
 		}
@@ -644,13 +646,14 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		)
 	}
 	if candidate, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
-		selected, err := service.ChannelTaskVideoPlugin(candidate.Plugin, channel, modelName)
+		executionModel := service.VideoRoutingExecutionModel(c, modelName)
+		selected, err := service.ChannelTaskVideoPlugin(candidate.Plugin, channel, executionModel)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
 		candidate.Plugin = selected
 		if selected.Meta.Key == "sudashui" {
-			_, config, _ := channel.TaskVideoModelConfig(modelName)
+			_, config, _ := channel.TaskVideoModelConfig(executionModel)
 			c.Set("task_video_model_config", config)
 		}
 		if value, exists := c.Get(jsplugin.ContextKeyPinnedEndpoint); exists {

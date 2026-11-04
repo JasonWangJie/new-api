@@ -541,7 +541,10 @@ func AcceptAsyncVideo(c *gin.Context) {
 		request.MixedRouting, _ = value.(*service.MixedVideoRouting)
 		request.InitialExecution = execution
 	}
-	request.Details = request.RequestDetails()
+	if value, exists := c.Get(service.VideoRoutingContextKey); exists {
+		request.ConditionalRouting, _ = value.(*service.VideoRoutingSnapshot)
+	}
+	request.Details = service.PublicVideoRoutingBody(request).RequestDetails()
 	canonical, _ := c.Get("task_request")
 	if err := service.FreezeAsyncVideoReferenceRecovery(&request, canonical, job.ExpiresAt); err != nil {
 		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
@@ -594,6 +597,9 @@ func respondAsyncVideoAccepted(c *gin.Context, job model.AsyncMediaJob, reused b
 }
 
 func ExecuteAsyncVideo(ctx context.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest) error {
+	if err := service.RefreshConditionalVideoAdmission(ctx, &job, &request); err != nil {
+		return err
+	}
 	return executeAsyncVideoAttempt(ctx, job, request, nil)
 }
 
@@ -694,7 +700,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			}
 		} else {
 			var ability model.Ability
-			if err := model.DB.WithContext(ctx).Where(map[string]any{"channel_id": job.ChannelId, "group": job.Group, "enabled": true}).Where("model IN ?", []string{job.Model, ratio_setting.RoutingMatchModelName(job.Model)}).Take(&ability).Error; err != nil {
+			if err := model.DB.WithContext(ctx).Where(map[string]any{"channel_id": job.ChannelId, "group": job.Group, "enabled": true}).Where("model IN ?", []string{request.ExecutionModel(job.Model), ratio_setting.RoutingMatchModelName(request.ExecutionModel(job.Model))}).Take(&ability).Error; err != nil {
 				executionErr = errors.New("selected video model is unavailable")
 				return
 			}
@@ -733,6 +739,9 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		if request.MixedRouting != nil {
 			profile, profileErr = service.EffectiveMixedVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
 		}
+		if request.ConditionalRouting.ActiveTarget() != nil {
+			profile, profileErr = service.EffectiveMixedVideoProfile(endpoint.Candidates[bindingIndex], request.ExecutionModel(job.Model), service.VideoModelOverrides{})
+		}
 		if profileErr != nil {
 			executionErr = errors.New("video provider capability changed")
 			return
@@ -750,7 +759,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			executionErr = err
 			return
 		}
-		if len(pools) > 0 && !slices.ContainsFunc(pools, func(pool model.ImageChannelPool) bool { return pool.ChannelId == job.ChannelId }) {
+		if request.ConditionalRouting.ActiveTarget() == nil && len(pools) > 0 && !slices.ContainsFunc(pools, func(pool model.ImageChannelPool) bool { return pool.ChannelId == job.ChannelId }) {
 			executionErr = errors.New("video channel pool permission changed")
 			return
 		}
@@ -1105,7 +1114,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 					return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", 403)
 				}
 				capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)
-				decoded, err := service.DecodeMixedVideoCandidate(c.Request.Context(), *candidate, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+				decoded, err := service.RebindConditionalVideoRequest(c.Request.Context(), *job, request, *candidate, capability.VideoOverrides)
 				if err != nil {
 					return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", 400)
 				}
@@ -1113,6 +1122,9 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 					return nil, service.TaskErrorWrapperLocal(err, "media_retry_input_unavailable", 400)
 				}
 				job.Provider = decoded.Binding.Plugin.Meta.Key
+				if request.ConditionalRouting != nil {
+					c.Set(service.VideoRoutingContextKey, request.ConditionalRouting)
+				}
 				pinMixedVideoCandidate(c, decoded, request.MixedRouting, job.AttemptGeneration)
 				view, _, err := service.MixedVideoRequestContext(request.Body, request.ContentType, request.Operation)
 				if err != nil {

@@ -37,6 +37,7 @@ export type RetryStep = {
 export type RetryRule = {
   id: string
   name: string
+  updated_at?: number
   enabled: boolean
   category: string
   scope: {

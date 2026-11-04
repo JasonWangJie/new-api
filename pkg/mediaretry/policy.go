@@ -35,6 +35,7 @@ type Policy struct {
 type Rule struct {
 	ID                 string `json:"id"`
 	Name               string `json:"name"`
+	UpdatedAt          int64  `json:"updated_at,omitempty"` // Unix milliseconds, assigned when the rule is saved.
 	Enabled            bool   `json:"enabled"`
 	Category           string `json:"category"`
 	Scope              Scope  `json:"scope"`

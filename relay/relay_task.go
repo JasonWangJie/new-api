@@ -272,7 +272,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	mappedBeforeValidate := info.OriginModelName != ""
 	if mappedBeforeValidate {
 		info.UpstreamModelName = info.OriginModelName
-		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+		value, _ := c.Get(service.VideoRoutingContextKey)
+		routing, _ := value.(*service.VideoRoutingSnapshot)
+		if target := routing.ActiveTarget(); target != nil {
+			if routing.SourceModel != info.OriginModelName {
+				return nil, service.TaskErrorWrapperLocal(errors.New("conditional video public model changed"), "model_mapping_failed", http.StatusBadRequest)
+			}
+			info.UpstreamModelName, info.IsModelMapped = target.UpstreamModel, target.UpstreamModel != info.OriginModelName
+		} else if err := helper.ModelMappedHelper(c, info, nil); err != nil {
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}
 	}
@@ -996,9 +1003,13 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 			// contain reusable CDN capabilities that outlive this authorization.
 			video := originTask.ToOpenAIVideo()
 			if originTask.Status == model.TaskStatusFailure {
+				failureReason := service.VideoTaskFailureReason(service.PublicTaskFailureReason(originTask))
+				if originTask.PrivateData.VideoRouting != nil {
+					failureReason = service.PublicVideoRoutingFailureReason(failureReason)
+				}
 				video.Error = &kitdto.OpenAIVideoError{
 					Code:    "video_generation_failed",
-					Message: service.VideoTaskFailureReason(service.PublicTaskFailureReason(originTask)),
+					Message: failureReason,
 				}
 			}
 			respBody, err = common.Marshal(video)
@@ -1106,7 +1117,7 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 }
 
 func TaskModel2Dto(task *model.Task) *dto.TaskDto {
-	return &dto.TaskDto{
+	item := &dto.TaskDto{
 		ID:         task.ID,
 		CreatedAt:  task.CreatedAt,
 		UpdatedAt:  task.UpdatedAt,
@@ -1128,4 +1139,20 @@ func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 		Username:   task.Username,
 		Data:       task.Data,
 	}
+	if routing := task.PrivateData.VideoRouting; routing != nil {
+		properties := task.Properties
+		properties.UpstreamModelName = ""
+		item.Properties = properties
+		item.Data = nil
+		item.Platform = ""
+		item.ChannelId = 0
+		item.FailReason = service.PublicVideoRoutingFailureReason(item.FailReason)
+		item.ResultURL = ""
+		if task.Status == model.TaskStatusSuccess {
+			item.ResultURL = task.PrivateData.ResultURL
+		}
+		item.RequestedResolution = routing.SourceResolution
+		item.ExecutionResolution = routing.ExecutionResolution
+	}
+	return item
 }

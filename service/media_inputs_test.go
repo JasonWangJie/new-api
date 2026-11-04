@@ -32,6 +32,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaydto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/mewkiz/flac"
@@ -729,19 +730,103 @@ func TestLegacyDramaMixedVideoReferenceSlots(t *testing.T) {
 	}
 }
 
+func TestLegacyDramaMixedVideoReferenceAliases(t *testing.T) {
+	plugin := legacyDramaRetryPluginFixture(t, "", "")
+	for _, tc := range []struct {
+		name, model, media, videoInput, decodeError string
+		paths                                       []string
+	}{
+		{"mixed image arrays", "minimax-h3", `"images":["https://source.example/one.png"],"image_urls":[{"url":"HTTPS://source.example/two.png","source":"https://ignored.example/fallback.png"}],"referenceImages":[{"source":"https://source.example/three.png"}]`, "none", "", []string{"/images/0", "/image_urls/0/url", "/referenceImages/0/source"}},
+		{"ordered wrapped sources", "minimax-h3", `"references":[{"type":"image","role":"reference","source":{"url":"https://source.example/one.png"}},{"type":"image","role":"reference","source":{"url":"","source":"HTTPS://source.example/two.png"}}]`, "none", "", []string{"/references/0/source/url", "/references/1/source/source"}},
+		{"frames", "seedance2.0-A", `"aspect_ratio":"Auto","first_image":{"url":"https://source.example/first.png"},"last_image":"https://source.example/last.png"`, "none", "", []string{"/first_image/url", "/last_image"}},
+		{"video and audio aliases", "seedance2.5-G", `"referenceVideos":["https://source.example/video.mp4"],"audio_urls":["https://source.example/voice.wav"]`, "video", "", []string{"/referenceVideos/0", "/audio_urls/0"}},
+		{"duplicate alias URL", "minimax-h3", `"reference_images":["https://source.example/duplicate.png"],"referenceImages":["https://source.example/duplicate.png"]`, "", "Duplicate reference media source", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Models: tc.model}
+			channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+			binding, _, err := MixedVideoChannelBinding(channel, tc.model, "create")
+			require.NoError(t, err)
+			profile, err := EffectiveMixedVideoProfile(binding, tc.model, VideoModelOverrides{})
+			require.NoError(t, err)
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","seconds":5,"resolution":"720p",%s}`, tc.model, tc.media))
+			normalized, contentType, body, err := NormalizeMixedVideoDefaults(raw, "application/json", "create", []jsplugin.VideoProfile{profile})
+			require.NoError(t, err)
+			_, err = DecodeMixedVideoCandidate(t.Context(), channel, tc.model, "create", normalized, VideoModelOverrides{}, 0)
+			if tc.decodeError != "" {
+				require.ErrorContains(t, err, tc.decodeError)
+				return
+			}
+			require.NoError(t, err)
+			facts, err := MixedVideoPublicFacts(body, "create", nil, profile)
+			require.NoError(t, err)
+			assert.Equal(t, tc.videoInput, facts["video_input"])
+
+			request := AsyncVideoRequest{Body: normalized, ContentType: contentType, MixedRouting: &MixedVideoRouting{Model: tc.model}, Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key}}}
+			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, time.Now().Unix()+86400))
+			assert.Equal(t, normalized, request.Body)
+			require.Len(t, request.ReferenceInputs, len(tc.paths))
+			for index, input := range request.ReferenceInputs {
+				assert.Equal(t, tc.paths[index], input.Path)
+				assert.Contains(t, input.Source, "://source.example/")
+			}
+		})
+	}
+}
+
+func TestSudashuiVideoRetryReferenceSlots(t *testing.T) {
+	previousRegistry, previousTimeout := jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes
+	jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes = jsplugin.NewRegistry(), 60
+	t.Cleanup(func() { jsplugin.DefaultRegistry, constant.TaskTimeoutMinutes = previousRegistry, previousTimeout })
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "sudashui", "plugin.js"))
+	require.NoError(t, err)
+	plugin, err := jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, value, suffix string }{
+		{"scalars", `"HTTPS://source.example/input"`, ""},
+		{"arrays", `["https://source.example/input"]`, "/0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{"model":"sd-api-2-fast-720p","prompt":"animate","seconds":5,"resolution":"720p","reference_images":%s,"reference_videos":%s,"reference_audios":%s}`, tc.value, tc.value, tc.value))
+			view, _, err := MixedVideoRequestContext(raw, "application/json", "create")
+			require.NoError(t, err)
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, (jsplugin.ProtocolRequestContext{RouteRequestContext: view, Protocol: "openai_video", Operation: "create", Model: "sd-api-2-fast-720p"}).JSValue())
+			require.NoError(t, err)
+			request := AsyncVideoRequest{Body: raw, ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key}}}
+			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, time.Now().Unix()+86400))
+			require.Len(t, request.ReferenceInputs, 3)
+			for index, kind := range []string{"image", "video", "audio"} {
+				assert.Equal(t, "/reference_"+kind+"s"+tc.suffix, request.ReferenceInputs[index].Path)
+				assert.Equal(t, kind, request.ReferenceInputs[index].Kind)
+			}
+		})
+	}
+}
+
 func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
 	job, cfg, imageCfg := mediaInputFixture(t)
 	plugin := legacyDramaRetryPluginFixture(t, "", "")
 	require.Empty(t, plugin.Meta.VideoRetryInputs)
-	body := []byte(`{"model":"seedance2.5-A","prompt":"@图片1 preserve https://source.example/image.png literally","seconds":5,"resolution":"720p","references":[{"type":"image","role":"reference","source":"https://source.example/image.png"}]}`)
-	request := AsyncVideoRequest{Body: body, ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: "seedance2.5-A", Group: "default"}}
+	job.Group, job.Provider, job.Model = "default", "drama", "seedance2.5-A"
+	channel := model.Channel{Group: job.Group, Models: job.Model, Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "legacy-drama-test-key"}
+	channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: job.Provider})
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{Group: job.Group, Model: job.Model, ChannelId: channel.Id, Enabled: true}).Error)
+	pool := model.ImageGroupPolicy{PolicyKey: ImageIdentityHash(job.Group, "mixed"), Group: job.Group, Platform: "mixed", PoolMode: "model", Enabled: true, AsyncEnabled: true, Models: `[{"id":"seedance2.5-A","media_type":"video"}]`}
+	require.NoError(t, model.DB.Create(&pool).Error)
+	resolution := VideoPoolResolution("720p")
+	binding := MediaPoolBindingKey(pool, job.Model, resolution, "video")
+	require.NoError(t, model.DB.Create(&model.ImageChannelPool{BindingKey: binding, ChannelId: channel.Id, Priority: 1}).Error)
+
+	body := []byte(`{"model":"seedance2.5-A","prompt":"@图片1 preserve https://source.example/image.png literally","seconds":5,"resolution":"720p","aspect_ratio":"16:9","references":[{"type":"image","role":"reference","source":{"url":"HTTPS://source.example/image.png","source":"https://ignored.example/fallback.png"}}]}`)
+	request := AsyncVideoRequest{Body: body, ContentType: "application/json", Operation: "create", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: job.Provider, Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: job.Model, Group: job.Group, PoolMode: pool.PoolMode, Resolution: resolution, BindingKey: binding}}
 	require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, job.ExpiresAt))
 	request.Details = request.RequestDetails()
 	encoded, err := common.Marshal(request)
 	require.NoError(t, err)
 	job.RequestCipher, err = EncryptImagePayload(encoded, "media-request:"+job.TaskId)
 	require.NoError(t, err)
-	job.ChannelId, job.Provider, job.Model, job.Quota, job.BillingStatus, job.AttemptGeneration = 22, "drama", "seedance2.5-A", 100, "reserved", 0
+	job.ChannelId, job.Quota, job.BillingStatus, job.AttemptGeneration = channel.Id, 100, "reserved", 0
 	require.NoError(t, model.DB.Save(&job).Error)
 	task := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Status: model.TaskStatusSubmitted, Quota: job.Quota, Properties: model.Properties{OriginModelName: job.Model, UpstreamModelName: job.Model}}
 	task.PrivateData = model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, TokenId: job.TokenId, UpstreamTaskID: "native-original", CurrentAttempt: &model.VideoTaskAttempt{MixedVideo: true, PluginKey: "drama"}}
@@ -782,13 +867,30 @@ func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
 	prepared, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
 	require.NoError(t, err)
 	assert.True(t, prepared.LocalReferencesReady)
+	t.Run("ordinary pool can select the legacy channel", func(t *testing.T) {
+		channels, err := VideoRetryCandidateChannels(t.Context(), job, prepared, job.Model)
+		require.NoError(t, err)
+		require.Len(t, channels, 1)
+		assert.Equal(t, channel.Id, channels[0].Id)
+	})
+	t.Run("conditional routing can select the legacy target", func(t *testing.T) {
+		rule := model.VideoRoutingRule{ID: "legacy-local", Name: "Legacy local", OnExhausted: "fail", Targets: []model.VideoRoutingTarget{{ChannelID: channel.Id, Model: job.Model}}}
+		snapshot, _, _, _, err := PlanVideoRouting(t.Context(), model.VideoRoutingConfig{Version: 1}, rule, job.Group, job.Model, request.Operation, body, request.ContentType, map[string]any{"seconds": float64(5), "resolution": "720p"}, job.UserId, 0, nil)
+		require.NoError(t, err)
+		conditional := prepared
+		conditional.ConditionalRouting = snapshot
+		channels, err := VideoRetryCandidateChannels(t.Context(), job, conditional, job.Model)
+		require.NoError(t, err)
+		require.Len(t, channels, 1)
+		assert.Equal(t, channel.Id, channels[0].Id)
+	})
 	var preparedBody map[string]any
 	require.NoError(t, common.Unmarshal(prepared.Body, &preparedBody))
 	var expectedBody map[string]any
 	require.NoError(t, common.Unmarshal(body, &expectedBody))
-	localSource := preparedBody["references"].([]any)[0].(map[string]any)["source"]
+	localSource := preparedBody["references"].([]any)[0].(map[string]any)["source"].(map[string]any)["url"]
 	assert.Contains(t, localSource, "/api/media-inputs/")
-	expectedBody["references"].([]any)[0].(map[string]any)["source"] = localSource
+	expectedBody["references"].([]any)[0].(map[string]any)["source"].(map[string]any)["url"] = localSource
 	assert.Equal(t, expectedBody, preparedBody, "only the frozen source changes; prompt, order, roles and generation parameters survive")
 	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": job.Model, "body": map[string]any{"kind": "json", "value": preparedBody}})
 	require.NoError(t, err)

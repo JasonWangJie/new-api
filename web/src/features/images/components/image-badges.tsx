@@ -69,10 +69,11 @@ export function ImageStatusBadge(props: {
 }
 
 export function ImagePlatformBadge(props: {
-  platform: string
+  platform?: string
   className?: string
 }) {
   const { t } = useTranslation()
+  if (!props.platform) return null
   const visual = imagePlatformVisual(props.platform)
   return (
     <span

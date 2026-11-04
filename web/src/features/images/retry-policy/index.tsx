@@ -21,6 +21,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { StaticDataTable } from '@/components/data-table'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -28,6 +29,7 @@ import { Label } from '@/components/ui/label'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
 import { hasPermission } from '@/lib/admin-permissions'
+import { formatTimestampToDate } from '@/lib/format'
 import { markServerErrorHandled } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -87,6 +89,7 @@ export function RetryPolicyForm(props: {
   const [editor, setEditor] = useState<RetryRule | null>(() =>
     props.source && props.canManage ? newRetryRule(props.source) : null
   )
+  const [ruleToDelete, setRuleToDelete] = useState<RetryRule | null>(null)
   const [source, setSource] = useState(props.source)
   const [preview, setPreview] = useState(false)
   const save = useMutation({
@@ -100,6 +103,9 @@ export function RetryPolicyForm(props: {
     onError: (error) => markServerErrorHandled(error),
   })
   const editable = props.canManage && !save.isPending
+  const displayedRules = policy.rules
+    .map((rule, priorityIndex) => ({ rule, priorityIndex }))
+    .sort((a, b) => (b.rule.updated_at ?? 0) - (a.rule.updated_at ?? 0))
   function update(next: RetryPolicy) {
     setPolicy(next)
     setDirty(true)
@@ -262,8 +268,8 @@ export function RetryPolicyForm(props: {
             )}
           </div>
           <StaticDataTable
-            data={policy.rules}
-            getRowKey={(rule) => rule.id}
+            data={displayedRules}
+            getRowKey={({ rule }) => rule.id}
             emptyContent={t(
               'No custom rules. Built-in policies remain active.'
             )}
@@ -271,11 +277,15 @@ export function RetryPolicyForm(props: {
               {
                 id: 'rule',
                 header: t('Rule'),
-                cell: (rule, index) => (
+                cell: ({ rule }) => (
                   <div className='min-w-48 space-y-1'>
-                    <p className='font-medium'>
-                      {index + 1}. {rule.name}
-                    </p>
+                    <p className='font-medium'>{rule.name}</p>
+                    {!!rule.updated_at && (
+                      <p className='text-muted-foreground text-xs'>
+                        {t('Last updated')} ·{' '}
+                        {formatTimestampToDate(rule.updated_at, 'milliseconds')}
+                      </p>
+                    )}
                     <p className='text-muted-foreground text-xs'>
                       {t(CATEGORY_LABELS[rule.category] ?? rule.category)}
                     </p>
@@ -298,7 +308,7 @@ export function RetryPolicyForm(props: {
               {
                 id: 'chain',
                 header: t('Recovery steps'),
-                cell: (rule) => (
+                cell: ({ rule }) => (
                   <ol className='min-w-64 space-y-1 text-xs whitespace-normal'>
                     {rule.steps.map((step) => (
                       <li key={step.id}>
@@ -311,30 +321,82 @@ export function RetryPolicyForm(props: {
               {
                 id: 'enabled',
                 header: t('Enabled'),
-                cell: (rule) => (
+                cell: ({ rule }) => (
                   <Checkbox
                     aria-label={`${t('Enabled')}: ${rule.name}`}
                     disabled={!editable}
                     checked={rule.enabled}
-                    onCheckedChange={(enabled) =>
+                    onCheckedChange={(enabled) => {
+                      const updatedAt = Date.now()
                       update({
                         ...policy,
                         rules: policy.rules.map((item) =>
                           item.id === rule.id
-                            ? { ...item, enabled: enabled === true }
+                            ? {
+                                ...item,
+                                enabled: enabled === true,
+                                updated_at: updatedAt,
+                              }
                             : item
                         ),
                       })
-                    }
+                    }}
                   />
+                ),
+              },
+              {
+                id: 'priority',
+                header: t('Priority'),
+                cell: ({ priorityIndex }) => (
+                  <div className='flex flex-wrap items-center gap-1'>
+                    <span className='tabular-nums'>{priorityIndex + 1}</span>
+                    {editable && (
+                      <>
+                        <Button
+                          size='sm'
+                          variant='ghost'
+                          disabled={priorityIndex === 0}
+                          onClick={() =>
+                            update({
+                              ...policy,
+                              rules: moveRetryItem(
+                                policy.rules,
+                                priorityIndex,
+                                -1
+                              ),
+                            })
+                          }
+                        >
+                          {t('Move up')}
+                        </Button>
+                        <Button
+                          size='sm'
+                          variant='ghost'
+                          disabled={priorityIndex === policy.rules.length - 1}
+                          onClick={() =>
+                            update({
+                              ...policy,
+                              rules: moveRetryItem(
+                                policy.rules,
+                                priorityIndex,
+                                1
+                              ),
+                            })
+                          }
+                        >
+                          {t('Move down')}
+                        </Button>
+                      </>
+                    )}
+                  </div>
                 ),
               },
               {
                 id: 'actions',
                 header: t('Actions'),
-                cell: (rule, index) =>
+                cell: ({ rule }) =>
                   editable ? (
-                    <div className='flex max-w-72 flex-wrap gap-1'>
+                    <div className='flex flex-wrap gap-1'>
                       <Button
                         size='sm'
                         variant='ghost'
@@ -351,29 +413,10 @@ export function RetryPolicyForm(props: {
                       </Button>
                       <Button
                         size='sm'
-                        variant='ghost'
-                        disabled={index === 0}
-                        onClick={() =>
-                          update({
-                            ...policy,
-                            rules: moveRetryItem(policy.rules, index, -1),
-                          })
-                        }
+                        variant='destructive'
+                        onClick={() => setRuleToDelete(rule)}
                       >
-                        {t('Move up')}
-                      </Button>
-                      <Button
-                        size='sm'
-                        variant='ghost'
-                        disabled={index === policy.rules.length - 1}
-                        onClick={() =>
-                          update({
-                            ...policy,
-                            rules: moveRetryItem(policy.rules, index, 1),
-                          })
-                        }
-                      >
-                        {t('Move down')}
+                        {t('Delete')}
                       </Button>
                     </div>
                   ) : null,
@@ -456,18 +499,39 @@ export function RetryPolicyForm(props: {
           }}
         />
       )}
+      {ruleToDelete && (
+        <ConfirmDialog
+          open
+          destructive
+          title={`${t('Delete')} · ${ruleToDelete.name}`}
+          desc={t('Changes remain a draft until the policy is saved.')}
+          confirmText={t('Delete')}
+          disabled={!editable}
+          onOpenChange={(open) => {
+            if (!open) setRuleToDelete(null)
+          }}
+          handleConfirm={() => {
+            update({
+              ...policy,
+              rules: policy.rules.filter((rule) => rule.id !== ruleToDelete.id),
+            })
+            setRuleToDelete(null)
+          }}
+        />
+      )}
       {editor && (
         <RetryRuleEditor
           rule={editor}
           onClose={() => setEditor(null)}
           onApply={(rule) => {
+            const updated = { ...rule, updated_at: Date.now() }
             update({
               ...policy,
               rules: policy.rules.some((item) => item.id === rule.id)
                 ? policy.rules.map((item) =>
-                    item.id === rule.id ? rule : item
+                    item.id === rule.id ? updated : item
                   )
-                : [...policy.rules, rule],
+                : [...policy.rules, updated],
             })
             setEditor(null)
           }}

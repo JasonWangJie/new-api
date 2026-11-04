@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 func (channel *Channel) TaskVideoModelConfig(publicModel string) (string, dto.TaskVideoModelConfig, error) {
@@ -36,6 +37,10 @@ func (channel *Channel) TaskVideoModelConfig(publicModel string) (string, dto.Ta
 // ValidateTaskVideoModelBindings prevents one retail model from changing units
 // with channel selection. Different public aliases may use different units.
 func (channel *Channel) ValidateTaskVideoModelBindings() error {
+	return channel.validateTaskVideoModelBindings(DB)
+}
+
+func (channel *Channel) validateTaskVideoModelBindings(db *gorm.DB) error {
 	if channel.Type != constant.ChannelTypeTaskPlugin || channel.GetSetting().TaskPluginKey != "sudashui" {
 		return nil
 	}
@@ -55,7 +60,7 @@ func (channel *Channel) ValidateTaskVideoModelBindings() error {
 		units[folded] = config.BillingMode
 	}
 	var others []Channel
-	if err := DB.Where("type = ? AND id <> ?", constant.ChannelTypeTaskPlugin, channel.Id).Select("id", "setting", "models", "model_mapping").Find(&others).Error; err != nil {
+	if err := db.Where("type = ? AND id <> ?", constant.ChannelTypeTaskPlugin, channel.Id).Select("id", "setting", "models", "model_mapping").Find(&others).Error; err != nil {
 		return err
 	}
 	for _, other := range others {

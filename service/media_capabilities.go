@@ -761,10 +761,17 @@ func classifyVideoInputSource(value any, inputName string) string {
 		if text, _ := object["voice_id"].(string); strings.TrimSpace(text) != "" {
 			return "voice_id"
 		}
+		source, hasSource := object["source"].(string)
 		for _, field := range []string{"url", "image_url", "video_url", "audio_url"} {
 			if nested := object[field]; nested != nil {
+				if field == "url" && hasSource && (nested == "" || nested == false || nested == float64(0)) {
+					continue
+				}
 				return classifyVideoInputSource(nested, inputName)
 			}
+		}
+		if hasSource {
+			return classifyVideoInputSource(source, inputName)
 		}
 	}
 	text, _ := value.(string)
@@ -907,7 +914,7 @@ func videoMediaIdentity(value any) string {
 		if ref, _ := object["__fileRef"].(string); ref != "" {
 			return "upload:" + ref
 		}
-		for _, field := range []string{"url", "image_url", "video_url", "audio_url"} {
+		for _, field := range []string{"url", "image_url", "video_url", "audio_url", "source"} {
 			if identity := videoMediaIdentity(object[field]); identity != "" {
 				return identity
 			}

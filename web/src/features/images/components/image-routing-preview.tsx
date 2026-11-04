@@ -37,6 +37,11 @@ import {
   imageRoutingPlatforms,
 } from '../lib/image-labels'
 import type { ImageAdminConfiguration } from '../types'
+import { VideoRoutingPreviewResult } from '../video-routing/preview-result'
+import type {
+  ConditionalRoutingPreview,
+  VideoRoutingConfig,
+} from '../video-routing/types'
 import { ImageGroupSelect } from './image-group-select'
 import { ImageSelect } from './image-select'
 
@@ -56,6 +61,7 @@ type RouteCandidate = {
   reasons: string[]
 }
 type RoutePreview = {
+  conditional_routing?: ConditionalRoutingPreview
   routing_groups: string[]
   binding_key: string
   binding_found: boolean
@@ -68,26 +74,36 @@ type RoutePreview = {
 
 export function ImageRoutingPreview(props: {
   config: ImageAdminConfiguration
+  videoRoutingConfig?: VideoRoutingConfig
+  videoOnly?: boolean
 }) {
   const { t } = useTranslation()
+  const [previewConfig, setPreviewConfig] = useState(props.videoRoutingConfig)
   const [values, setValues] = useState({
     group: 'default',
-    platform:
-      props.config.media_providers?.[0] ||
-      props.config.image_providers?.[0] ||
-      'openai',
-    media_type: 'image',
+    platform: props.videoOnly
+      ? 'mixed'
+      : props.config.media_providers?.[0] ||
+        props.config.image_providers?.[0] ||
+        'openai',
+    media_type: props.videoOnly ? 'video' : 'image',
     execution_mode: 'async',
     model: '',
-    resolution: '1K',
-    operation: 'text_to_image',
+    resolution: props.videoOnly ? '' : '1K',
+    operation: props.videoOnly ? 'text_to_video' : 'text_to_image',
     token_id: '',
     seconds: '',
+    provider: '',
+    video_input: 'none',
   })
   const preview = useMutation({
     mutationFn: () =>
       imageRequest<RoutePreview>('/api/option/images/routing/preview', 'POST', {
-        ...values,
+        group: values.group,
+        platform: values.platform,
+        media_type: values.media_type,
+        execution_mode: values.execution_mode,
+        operation: values.operation,
         model: values.model.trim(),
         resolution: values.resolution.trim(),
         token_id: values.token_id ? Number(values.token_id) : undefined,
@@ -95,6 +111,14 @@ export function ImageRoutingPreview(props: {
           values.media_type === 'video' && values.seconds
             ? Number(values.seconds)
             : undefined,
+        ...(values.media_type === 'video'
+          ? {
+              provider: values.provider.trim() || undefined,
+              mode: values.operation,
+              video_input: values.video_input,
+              video_routing_config: props.videoRoutingConfig,
+            }
+          : {}),
       }),
   })
   const operations =
@@ -133,7 +157,10 @@ export function ImageRoutingPreview(props: {
         className='space-y-4'
         onSubmit={(event) => {
           event.preventDefault()
-          if (!preview.isPending) preview.mutate()
+          if (!preview.isPending) {
+            setPreviewConfig(props.videoRoutingConfig)
+            preview.mutate()
+          }
         }}
       >
         <fieldset
@@ -149,7 +176,7 @@ export function ImageRoutingPreview(props: {
           <ImageSelect
             label={t('Platform')}
             value={values.platform}
-            disabled={preview.isPending}
+            disabled={preview.isPending || props.videoOnly}
             options={imageRoutingPlatforms(
               props.config.routing_platforms ||
                 props.config.media_providers ||
@@ -171,7 +198,7 @@ export function ImageRoutingPreview(props: {
           <ImageSelect
             label={t('Media type')}
             value={values.media_type}
-            disabled={preview.isPending}
+            disabled={preview.isPending || props.videoOnly}
             options={[
               { value: 'image', label: t('Image') },
               { value: 'video', label: t('Video') },
@@ -260,6 +287,29 @@ export function ImageRoutingPreview(props: {
               />
             </div>
           )}
+          {values.media_type === 'video' && (
+            <>
+              <div className='space-y-2'>
+                <Label htmlFor='route-preview-provider'>
+                  {t('Explicit provider (optional)')}
+                </Label>
+                <Input
+                  id='route-preview-provider'
+                  value={values.provider}
+                  onChange={(event) => change('provider', event.target.value)}
+                />
+              </div>
+              <ImageSelect
+                label={t('Reference video')}
+                value={values.video_input}
+                options={[
+                  { value: 'none', label: t('None') },
+                  { value: 'video', label: t('Video') },
+                ]}
+                onChange={(value) => change('video_input', value)}
+              />
+            </>
+          )}
         </fieldset>
         <Button
           type='submit'
@@ -273,19 +323,31 @@ export function ImageRoutingPreview(props: {
         </Button>
       </form>
       <p className='text-muted-foreground mt-3 text-sm'>
-        {t(
-          'Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.'
-        )}
+        {props.videoOnly
+          ? t(
+              'This preview uses the routing rule draft without saving it or sending upstream requests.'
+            )
+          : t(
+              'Compare both execution modes with the same model and resolution. OpenAI synchronous preview includes compatible image providers; Gemini uses its native synchronous API.'
+            )}
       </p>
       {preview.isPending && <LoadingState size='sm' />}
-      {preview.error && (
+      {preview.error && previewConfig === props.videoRoutingConfig && (
         <ErrorState
           description={preview.error.message}
-          onRetry={() => preview.mutate()}
+          onRetry={() => {
+            setPreviewConfig(props.videoRoutingConfig)
+            preview.mutate()
+          }}
         />
       )}
-      {preview.data && (
+      {preview.data && previewConfig === props.videoRoutingConfig && (
         <div className='mt-4 space-y-3' aria-live='polite'>
+          {preview.data.conditional_routing && (
+            <VideoRoutingPreviewResult
+              result={preview.data.conditional_routing}
+            />
+          )}
           <p className='text-sm break-words'>
             {t('Routing groups')}:{' '}
             {(preview.data.routing_groups || []).join(', ') || '—'}

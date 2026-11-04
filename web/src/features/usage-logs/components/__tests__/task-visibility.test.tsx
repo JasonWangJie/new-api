@@ -25,6 +25,7 @@ import { DataTableView, DataTableViewOptions } from '@/components/data-table'
 
 import type { TaskLog } from '../../types'
 import { useTaskLogsColumns } from '../columns/task-logs-columns'
+import { TaskDetailsDialog } from '../dialogs/task-details-dialog'
 import { UsageLogsMobileList } from '../usage-logs-mobile-card'
 import { UsageLogsProvider } from '../usage-logs-provider'
 
@@ -47,6 +48,68 @@ const task: TaskLog = {
     },
   },
 }
+
+it.each([false, true])(
+  'shows requested and execution resolution while gating routing diagnostics (admin=%s)',
+  async (admin) => {
+    const routed: TaskLog = {
+      ...task,
+      requested_resolution: '480p',
+      execution_resolution: '720p',
+      properties: {
+        origin_model_name: 'public-A',
+        upstream_model_name: 'private-E',
+      },
+      admin_info: {
+        video_routing: {
+          revision: 3,
+          rule_id: 'private-rule-id',
+          rule_name: 'Private routing rule',
+          source_model: 'public-A',
+          source_resolution: '480p',
+          execution_model: 'private-E',
+          execution_resolution: '720p',
+          target_index: 0,
+          is_fallback: false,
+          targets: [
+            {
+              channel_id: 7,
+              model: 'target-alias',
+              upstream_model: 'private-E',
+              resolution: '720p',
+              reason: 'Target accepted',
+            },
+          ],
+        },
+      },
+    }
+    render(
+      <TaskDetailsDialog
+        log={routed}
+        isAdmin={admin}
+        isRoot={false}
+        open
+        onOpenChange={() => {}}
+      />
+    )
+    const dialog = await screen.findByRole('dialog', { name: /Task Details/ })
+    expect(within(dialog).getByText('public-A')).toBeVisible()
+    expect(within(dialog).getByText('Requested resolution')).toBeVisible()
+    expect(within(dialog).getByText('480p')).toBeVisible()
+    expect(within(dialog).getAllByText('720p').length).toBeGreaterThan(0)
+    if (admin) {
+      expect(within(dialog).getByText('Private routing rule')).toBeVisible()
+      expect(within(dialog).getByText('target-alias')).toBeVisible()
+      expect(within(dialog).getByText('Target accepted')).toBeVisible()
+    } else {
+      expect(
+        within(dialog).queryByText('Private routing rule')
+      ).not.toBeInTheDocument()
+      expect(within(dialog).queryByText('private-E')).not.toBeInTheDocument()
+      expect(within(dialog).queryByText('target-alias')).not.toBeInTheDocument()
+    }
+  }
+)
 
 function TaskLogsFixture(props: {
   admin: boolean

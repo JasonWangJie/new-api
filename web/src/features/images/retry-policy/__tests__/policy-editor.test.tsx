@@ -74,6 +74,74 @@ afterEach(() => {
   cleanup()
   clients.splice(0).forEach((client) => client.clear())
   vi.clearAllMocks()
+  vi.useRealTimers()
+})
+
+test('removes a rule from the draft after confirmation and saves it with the current revision', async () => {
+  const policy = fixture()
+  vi.mocked(imageRequest).mockResolvedValueOnce({
+    ...policy,
+    revision: 5,
+    rules: [],
+  })
+  show(<RetryPolicyForm initial={policy} canManage />)
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  const confirmation = await screen.findByRole('alertdialog')
+  await user.click(within(confirmation).getByRole('button', { name: 'Cancel' }))
+  expect(screen.getByRole('row', { name: /Reference repair/ })).toBeVisible()
+
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  await user.click(
+    within(await screen.findByRole('alertdialog')).getByRole('button', {
+      name: 'Delete',
+    })
+  )
+  expect(screen.queryByRole('row', { name: /Reference repair/ })).toBeNull()
+  expect(imageRequest).not.toHaveBeenCalled()
+
+  await user.click(screen.getByRole('button', { name: 'Save and activate' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(RETRY_POLICY_URL, 'PUT', {
+      ...policy,
+      rules: [],
+    })
+  )
+})
+
+test('shows recently edited rules first while moving rules by execution priority', async () => {
+  const policy = fixture()
+  const original = {
+    ...policy.rules[0],
+    updated_at: Date.UTC(2026, 10, 2),
+  }
+  const recent = {
+    ...copyRetryRule(original),
+    name: 'New reference rule',
+    updated_at: Date.UTC(2026, 10, 3),
+  }
+  policy.rules = [original, recent]
+  vi.mocked(imageRequest).mockResolvedValueOnce({
+    ...policy,
+    revision: 5,
+    rules: [recent, original],
+  })
+  show(<RetryPolicyForm initial={policy} canManage />)
+  expect(screen.getAllByRole('row')[1]).toHaveTextContent('New reference rule')
+  const user = userEvent.setup()
+  await user.click(
+    within(screen.getByRole('row', { name: /New reference rule/ })).getByRole(
+      'button',
+      { name: 'Move up' }
+    )
+  )
+  await user.click(screen.getByRole('button', { name: 'Save and activate' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(RETRY_POLICY_URL, 'PUT', {
+      ...policy,
+      rules: [recent, original],
+    })
+  )
 })
 
 test('keeps rule edits and revision after a concurrent save conflict', async () => {
@@ -242,6 +310,9 @@ test('read-only administrators can preview but cannot alter rules or global swit
     screen.queryByRole('button', { name: 'Add rule' })
   ).not.toBeInTheDocument()
   expect(
+    screen.queryByRole('button', { name: 'Delete' })
+  ).not.toBeInTheDocument()
+  expect(
     screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
   ).toHaveAttribute('aria-disabled', 'true')
   expect(
@@ -373,6 +444,36 @@ test('displays translated built-in category names while preserving their stored 
   )
 })
 
+test('initializes sample filters and the first request to today and allows a custom range', async () => {
+  vi.setSystemTime(new Date(2026, 10, 4, 12))
+  vi.mocked(imageRequest)
+    .mockResolvedValueOnce({ items: [], total: 0 })
+    .mockResolvedValueOnce({ items: [], total: 0 })
+  show(
+    <RetrySamples
+      canManage
+      policy={fixture()}
+      onDraft={vi.fn()}
+      onTest={vi.fn()}
+    />
+  )
+  const startDate = screen.getByLabelText('Start date')
+  expect(startDate).toHaveValue('2026-11-04')
+  expect(screen.getByLabelText('End date')).toHaveValue('2026-11-04')
+  expect(imageRequest).toHaveBeenCalledWith(
+    `${RETRY_POLICY_URL}/samples?start_timestamp=${Date.parse('2026-11-04T00:00:00') / 1000}&end_timestamp=${Date.parse('2026-11-04T23:59:59') / 1000}&page=1&page_size=20`
+  )
+  const user = userEvent.setup()
+  await user.clear(startDate)
+  await user.type(startDate, '2026-11-03')
+  await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenLastCalledWith(
+      `${RETRY_POLICY_URL}/samples?start_timestamp=${Date.parse('2026-11-03T00:00:00') / 1000}&end_timestamp=${Date.parse('2026-11-04T23:59:59') / 1000}&page=1&page_size=20`
+    )
+  )
+})
+
 test('opens sample occurrences and creates a draft from the selected task failure', async () => {
   const onDraft = vi.fn()
   vi.mocked(imageRequest)
@@ -435,7 +536,8 @@ test('opens sample occurrences and creates a draft from the selected task failur
       expect.objectContaining({ task_id: 'task-with-error', event_id: 7 })
     )
   )
+  const listURL = vi.mocked(imageRequest).mock.calls[0][0]
   expect(imageRequest).toHaveBeenCalledWith(
-    `${RETRY_POLICY_URL}/samples/sample-hash/events?page=1&page_size=20`
+    `${RETRY_POLICY_URL}/samples/sample-hash/events?${listURL.split('?')[1]}`
   )
 })

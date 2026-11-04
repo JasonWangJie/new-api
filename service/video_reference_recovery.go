@@ -169,6 +169,36 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 	return nil
 }
 
+// videoRetryInputSelectors gives admission and replay the same plugin capabilities.
+func videoRetryInputSelectors(plugin *jsplugin.LoadedPlugin) (selectors []jsplugin.VideoRetryInput, legacyDrama bool) {
+	if len(plugin.Meta.VideoRetryInputs) > 0 || plugin.Meta.Key != "drama" {
+		return plugin.Meta.VideoRetryInputs, false
+	}
+	// Older site overrides predate videoRetryInputs. Keep explicit declarations
+	// authoritative and other plugins opt-in.
+	return []jsplugin.VideoRetryInput{
+		{Path: "/references/*/source", Kind: "media"},
+		{Path: "/reference_images/*", Kind: "image"},
+		{Path: "/images/*", Kind: "image"},
+		{Path: "/image_urls/*", Kind: "image"},
+		{Path: "/referenceImages/*", Kind: "image"},
+		{Path: "/reference_videos/*", Kind: "video"},
+		{Path: "/videos/*", Kind: "video"},
+		{Path: "/video_urls/*", Kind: "video"},
+		{Path: "/referenceVideos/*", Kind: "video"},
+		{Path: "/reference_audios/*", Kind: "audio"},
+		{Path: "/audios/*", Kind: "audio"},
+		{Path: "/audio_urls/*", Kind: "audio"},
+		{Path: "/referenceAudios/*", Kind: "audio"},
+		{Path: "/image", Kind: "image"},
+		{Path: "/input_reference", Kind: "image"},
+		{Path: "/first_image", Kind: "image"},
+		{Path: "/last_frame", Kind: "image"},
+		{Path: "/last_image", Kind: "image"},
+		{Path: "/video", Kind: "video"},
+	}, true
+}
+
 func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 	plugin, found := jsplugin.DefaultRegistry.Get(request.Execution.TaskPlugin.Key)
 	if !found || constant.TaskTimeoutMinutes <= 0 {
@@ -186,33 +216,7 @@ func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 	if err := common.Unmarshal(request.Body, &body); err != nil {
 		return err
 	}
-	selectors := plugin.Meta.VideoRetryInputs
-	if len(selectors) == 0 && plugin.Meta.Key == "drama" {
-		// Older site overrides predate videoRetryInputs. Mixed routing must
-		// still freeze their known public input fields before the first submit.
-		// Keep explicit declarations authoritative and other plugins opt-in.
-		selectors = []jsplugin.VideoRetryInput{
-			{Path: "/references/*/source", Kind: "media"},
-			{Path: "/reference_images/*", Kind: "image"},
-			{Path: "/images/*", Kind: "image"},
-			{Path: "/image_urls/*", Kind: "image"},
-			{Path: "/referenceImages/*", Kind: "image"},
-			{Path: "/reference_videos/*", Kind: "video"},
-			{Path: "/videos/*", Kind: "video"},
-			{Path: "/video_urls/*", Kind: "video"},
-			{Path: "/referenceVideos/*", Kind: "video"},
-			{Path: "/reference_audios/*", Kind: "audio"},
-			{Path: "/audios/*", Kind: "audio"},
-			{Path: "/audio_urls/*", Kind: "audio"},
-			{Path: "/referenceAudios/*", Kind: "audio"},
-			{Path: "/image", Kind: "image"},
-			{Path: "/input_reference", Kind: "image"},
-			{Path: "/first_image", Kind: "image"},
-			{Path: "/last_frame", Kind: "image"},
-			{Path: "/last_image", Kind: "image"},
-			{Path: "/video", Kind: "video"},
-		}
-	}
+	selectors, legacyDrama := videoRetryInputSelectors(plugin)
 	seen := make(map[string]bool)
 	counts := make(map[string]int)
 	for _, selector := range selectors {
@@ -237,7 +241,17 @@ func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 		}
 		for _, slot := range slots {
 			source, ok := slot.Value.(string)
-			if !ok || seen[slot.Path] || !(strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://")) {
+			if object, wrapped := slot.Value.(map[string]any); legacyDrama && wrapped {
+				field := "url"
+				source, ok = object[field].(string)
+				if source == "" {
+					field = "source"
+					source, ok = object[field].(string)
+				}
+				slot.Path += "/" + field
+			}
+			scheme, _, absolute := strings.Cut(source, "://")
+			if !ok || seen[slot.Path] || !absolute || !(strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https")) {
 				continue
 			}
 			kind := selector.Kind

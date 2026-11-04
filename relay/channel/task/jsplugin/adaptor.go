@@ -1001,6 +1001,51 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 		failure["message"] = service.VideoTaskFailureReason(service.PublicTaskFailureReason(task))
 		rendered["error"] = failure
 	}
+	if task.PrivateData.VideoRouting != nil {
+		// Conditional routes expose the requested model and ordinary video fields,
+		// while provider extensions remain available in administrator task details.
+		public := map[string]any{
+			"id": host.ID, "object": host.Object, "model": host.Model,
+			"status": host.Status, "progress": host.Progress, "created_at": host.CreatedAt,
+		}
+		if host.CompletedAt != 0 {
+			public["completed_at"] = host.CompletedAt
+		}
+		if seconds, exists := rendered["seconds"]; exists {
+			var duration float64
+			switch value := seconds.(type) {
+			case float64:
+				duration = value
+			case string:
+				duration, _ = strconv.ParseFloat(value, 64)
+			}
+			if duration > 0 && duration <= relaycommon.MaxTaskDurationSeconds {
+				public["seconds"] = seconds
+			}
+		}
+		if size, ok := rendered["size"].(string); ok && service.NormalizeVideoResolution(size) != "" {
+			public["size"] = size
+		}
+		if expiry, ok := rendered["expires_at"].(float64); ok && expiry > 0 {
+			public["expires_at"] = expiry
+		}
+		if task.Status == model.TaskStatusSuccess {
+			for _, field := range []string{"url", "video_url", "download_url"} {
+				if link, ok := rendered[field].(string); ok {
+					if parsed, err := url.Parse(link); err == nil && parsed.User == nil && (parsed.Scheme == "https" || parsed.Scheme == "http") && parsed.Host != "" {
+						public[field] = link
+					}
+				}
+			}
+		}
+		if task.Status == model.TaskStatusFailure {
+			public["error"] = map[string]any{
+				"code":    "video_generation_failed",
+				"message": service.PublicVideoRoutingFailureReason(service.PublicTaskFailureReason(task)),
+			}
+		}
+		rendered = public
+	}
 	return common.Marshal(rendered)
 }
 

@@ -308,7 +308,7 @@ func retainAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
 		common.SysError("media task " + job.TaskId + ": request details could not be retained")
 		return nil
 	}
-	if (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2) && len(request.Body) > 0 && job.Status != "failed" && job.Status != "expired" && job.Status != "succeeded" {
+	if (request.ReferenceRecoveryVersion == 1 || request.ReferenceRecoveryVersion == 2 || request.ConditionalRouting != nil) && len(request.Body) > 0 && job.Status != "failed" && job.Status != "expired" && job.Status != "succeeded" {
 		return job.RequestCipher
 	}
 	if request.Details != nil && len(request.Body) == 0 {
