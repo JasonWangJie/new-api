@@ -643,27 +643,45 @@ func videoInputValues(name string, body, metadata map[string]any) []any {
 			appendValues(body["image"])
 		} else if body["input_reference"] != nil {
 			appendValues(body["input_reference"])
-		} else {
+		} else if body["first_frame"] != nil {
 			appendValues(body["first_frame"])
+		} else {
+			appendValues(body["first_image"])
 		}
-		if images, ok := body["images"].([]any); ok && len(images) > 0 && body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil {
+		if images, ok := body["images"].([]any); ok && len(images) > 0 && body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil && body["first_image"] == nil {
 			appendValues(images[0])
 		}
+	case "last_frame":
+		if body[name] != nil {
+			appendValues(body[name])
+		} else {
+			appendValues(body["last_image"])
+		}
 	case "reference_images":
-		appendValues(body[name])
+		for _, field := range []string{name, "image_urls", "referenceImages"} {
+			appendValues(body[field])
+		}
 		if images, ok := body["images"].([]any); ok {
 			start := 0
-			if body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil && len(images) > 0 {
+			if body["image"] == nil && body["input_reference"] == nil && body["first_frame"] == nil && body["first_image"] == nil && len(images) > 0 {
 				start = 1
 			}
 			for _, image := range images[start:] {
 				appendValues(image)
 			}
 		}
+	case "reference_videos":
+		for _, field := range []string{name, "videos", "video_urls", "referenceVideos"} {
+			appendValues(body[field])
+		}
+	case "reference_audios":
+		for _, field := range []string{name, "audios", "audio_urls", "referenceAudios"} {
+			appendValues(body[field])
+		}
 	default:
 		appendValues(body[name])
 	}
-	firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["first_frame"]) > 0 || videoValueCount(body["images"]) > 0
+	firstImageAssigned := videoValueCount(body["image"]) > 0 || videoValueCount(body["input_reference"]) > 0 || videoValueCount(body["first_frame"]) > 0 || videoValueCount(body["first_image"]) > 0 || videoValueCount(body["images"]) > 0
 	for _, source := range []map[string]any{body, metadata} {
 		content, _ := source["content"].([]any)
 		for _, raw := range content {
@@ -845,12 +863,12 @@ func videoValueCount(value any) int {
 func videoInputCounts(body, metadata map[string]any, files []map[string]any) map[string]int {
 	counts := map[string]int{
 		"video":            videoValueCount(body["video"]),
-		"reference_images": videoValueCount(body["reference_images"]),
-		"reference_videos": videoValueCount(body["reference_videos"]),
-		"reference_audios": videoValueCount(body["reference_audios"]),
-		"last_frame":       videoValueCount(body["last_frame"]),
+		"reference_images": videoValueCount(body["reference_images"]) + videoValueCount(body["image_urls"]) + videoValueCount(body["referenceImages"]),
+		"reference_videos": videoValueCount(body["reference_videos"]) + videoValueCount(body["videos"]) + videoValueCount(body["video_urls"]) + videoValueCount(body["referenceVideos"]),
+		"reference_audios": videoValueCount(body["reference_audios"]) + videoValueCount(body["audios"]) + videoValueCount(body["audio_urls"]) + videoValueCount(body["referenceAudios"]),
+		"last_frame":       max(videoValueCount(body["last_frame"]), videoValueCount(body["last_image"])),
 	}
-	counts["image"] = max(videoValueCount(body["image"]), videoValueCount(body["input_reference"]), videoValueCount(body["first_frame"]))
+	counts["image"] = max(videoValueCount(body["image"]), videoValueCount(body["input_reference"]), videoValueCount(body["first_frame"]), videoValueCount(body["first_image"]))
 	if images := videoValueCount(body["images"]); images > 0 {
 		if counts["image"] == 0 {
 			counts["image"] = 1

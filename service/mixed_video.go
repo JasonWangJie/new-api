@@ -273,24 +273,36 @@ func mixedVideoValidationBody(mode jsplugin.VideoModeProfile, body, decoded map[
 	view := mixedVideoMediaAliases(body)
 	hasPrimary := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "image" })
 	hasReferences := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool { return input.Name == "reference_images" })
+	if hasReferences && !hasPrimary {
+		images, _ := view["images"].([]any)
+		projectImages := len(images) > 0
+		if decoded != nil {
+			decodedReferences := videoMediaValues("reference_images", decoded)
+			for _, image := range images {
+				identity := videoMediaIdentity(image)
+				if identity == "" || !slices.ContainsFunc(decodedReferences, func(value any) bool { return videoMediaIdentity(value) == identity }) {
+					projectImages = false
+					break
+				}
+			}
+		}
+		if projectImages {
+			references := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
+			view["reference_images"] = append(references, images...)
+			delete(view, "images")
+		}
+	}
 	primary := view["image"]
 	if primary == nil {
 		primary = view["input_reference"]
-	}
-	images, _ := view["images"].([]any)
-	if primary == nil && view["first_frame"] == nil && len(images) > 0 {
-		primary = images[0]
-		images = images[1:]
 	}
 	if hasReferences && !hasPrimary && primary != nil {
 		identity := videoMediaIdentity(primary)
 		if decoded == nil || identity != "" && slices.ContainsFunc(videoMediaValues("reference_images", decoded), func(value any) bool { return videoMediaIdentity(value) == identity }) {
 			references := videoInputValues("reference_images", map[string]any{"reference_images": view["reference_images"]}, nil)
-			references = append(references, images...)
 			view["reference_images"] = append(references, primary)
 			delete(view, "image")
 			delete(view, "input_reference")
-			delete(view, "images")
 		}
 	}
 	if hasPrimary && !hasReferences && len(videoMediaValues("image", view)) == 0 {

@@ -803,7 +803,7 @@ func TestSudashuiVideoRetryReferenceSlots(t *testing.T) {
 	}
 }
 
-func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
+func TestLegacyDramaMixedVideoWrappedLocalRecovery(t *testing.T) {
 	job, cfg, imageCfg := mediaInputFixture(t)
 	plugin := legacyDramaRetryPluginFixture(t, "", "")
 	require.Empty(t, plugin.Meta.VideoRetryInputs)
@@ -906,4 +906,268 @@ func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, string(prepared.Body), string(reused.Body))
 	assert.Equal(t, 1, downloads)
+}
+
+func TestLegacyDramaMixedVideoAliasAdmission(t *testing.T) {
+	plugin := legacyDramaRetryPluginFixture(t, "", "")
+	setting := `{"task_plugin_key":"drama"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Models: "seedance2.5-A", Key: "test-key", Setting: &setting}
+	for _, tc := range []struct {
+		field, kind string
+	}{
+		{"image_urls", "image"}, {"referenceImages", "image"},
+		{"videos", "video"}, {"video_urls", "video"}, {"referenceVideos", "video"},
+		{"audios", "audio"}, {"audio_urls", "audio"}, {"referenceAudios", "audio"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			mention := map[string]string{"image": "@图片2", "video": "@视频1", "audio": "@音频1"}[tc.kind]
+			body := map[string]any{"model": "seedance2.5-A", "prompt": "@图片1 " + mention, "seconds": 5, "resolution": "720p", "image": "https://source.example/first.png", tc.field: []string{"https://source.example/" + tc.kind}}
+			encoded, err := common.Marshal(body)
+			require.NoError(t, err)
+			candidate, err := DecodeMixedVideoCandidate(t.Context(), channel, "seedance2.5-A", "create", encoded, VideoModelOverrides{}, 1)
+			require.NoError(t, err, "aliases accepted by the real plugin must preserve media identity in mixed admission")
+			assert.Equal(t, "reference_to_video", candidate.Intent["action"])
+			decoded, ok := candidate.Intent["requestBody"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, []any{
+				map[string]any{"type": tc.kind, "role": "reference", "source": "https://source.example/" + tc.kind},
+				map[string]any{"type": "image", "role": "reference", "source": "https://source.example/first.png"},
+			}, decoded["references"])
+			facts, err := MixedVideoPublicFacts(body, "create", nil)
+			require.NoError(t, err)
+			wantVideo := "none"
+			if tc.kind == "video" {
+				wantVideo = "video"
+			}
+			assert.Equal(t, wantVideo, facts["video_input"], "video aliases must retain their billing classification")
+
+			inputName := "reference_" + tc.kind + "s"
+			profile := jsplugin.VideoProfile{Modes: []jsplugin.VideoModeProfile{{Name: "reference_to_video", Inputs: []jsplugin.VideoInputProfile{{Name: inputName, Kind: tc.kind, Sources: []string{"url"}, MaxItems: 1, Required: true}}}}}
+			aliasBody := map[string]any{tc.field: []any{"https://source.example/" + tc.kind}}
+			require.NoError(t, ValidateVideoProfileRequest(profile, "reference_to_video", aliasBody, nil))
+			aliasBody[inputName] = []any{"https://source.example/extra"}
+			assert.ErrorContains(t, ValidateVideoProfileRequest(profile, "reference_to_video", aliasBody, nil), "exceeds the enabled limit", "aliases and canonical fields share one input limit")
+			delete(aliasBody, inputName)
+			aliasBody[tc.field] = []any{"data:" + tc.kind + "/fixture;base64,eA=="}
+			assert.ErrorContains(t, ValidateVideoProfileRequest(profile, "reference_to_video", aliasBody, nil), "does not allow source")
+			assert.ErrorContains(t, ValidateVideoProfileRequest(jsplugin.VideoProfile{Modes: []jsplugin.VideoModeProfile{{Name: "reference_to_video"}}}, "reference_to_video", aliasBody, nil), "not enabled")
+
+			request := AsyncVideoRequest{Body: encoded, ContentType: "application/json", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: "seedance2.5-A"}}
+			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, time.Now().Unix()+86400))
+			require.Len(t, request.ReferenceInputs, 2)
+			assert.Contains(t, request.ReferenceInputs, AsyncVideoReferenceInput{Index: 0, Path: "/" + tc.field + "/0", Kind: tc.kind, KindIndex: 1, Source: "https://source.example/" + tc.kind})
+		})
+	}
+	for _, primary := range []bool{false, true} {
+		t.Run(fmt.Sprintf("images array with primary %t", primary), func(t *testing.T) {
+			body := map[string]any{"model": "seedance2.5-A", "prompt": "@图片1 @图片2", "seconds": 5, "resolution": "720p", "images": []string{"https://source.example/first.png", "https://source.example/last.png"}}
+			if primary {
+				body["image"], body["prompt"] = "https://source.example/primary.png", "@图片1 @图片2 @图片3"
+			}
+			encoded, err := common.Marshal(body)
+			require.NoError(t, err)
+			candidate, err := DecodeMixedVideoCandidate(t.Context(), channel, "seedance2.5-A", "create", encoded, VideoModelOverrides{}, 1)
+			require.NoError(t, err)
+			decoded, ok := candidate.Intent["requestBody"].(map[string]any)
+			require.True(t, ok)
+			want := []any{
+				map[string]any{"type": "image", "role": "reference", "source": "https://source.example/first.png"},
+				map[string]any{"type": "image", "role": "reference", "source": "https://source.example/last.png"},
+			}
+			if primary {
+				want = append(want, map[string]any{"type": "image", "role": "reference", "source": "https://source.example/primary.png"})
+			}
+			assert.Equal(t, want, decoded["references"])
+		})
+	}
+	t.Run("paired frame aliases", func(t *testing.T) {
+		pairedChannel := channel
+		pairedChannel.Models = "seedance2.0-A"
+		body := []byte(`{"model":"seedance2.0-A","prompt":"transition","seconds":5,"resolution":"720p","first_image":"https://source.example/first.png","last_image":"https://source.example/last.png"}`)
+		candidate, err := DecodeMixedVideoCandidate(t.Context(), pairedChannel, "seedance2.0-A", "create", body, VideoModelOverrides{}, 1)
+		require.NoError(t, err)
+		assert.Equal(t, "first_last_frame", candidate.Intent["action"])
+		decoded, ok := candidate.Intent["requestBody"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, []any{
+			map[string]any{"type": "image", "role": "first_frame", "source": "https://source.example/first.png"},
+			map[string]any{"type": "image", "role": "last_frame", "source": "https://source.example/last.png"},
+		}, decoded["references"])
+	})
+}
+
+func TestLegacyDramaMixedVideoLocalRecovery(t *testing.T) {
+	for _, action := range []string{mediaretry.LocalSameChannel, mediaretry.LocalOtherChannel} {
+		t.Run(action, func(t *testing.T) {
+			job, cfg, imageCfg := mediaInputFixture(t)
+			plugin := legacyDramaRetryPluginFixture(t, "", "")
+			require.Empty(t, plugin.Meta.VideoRetryInputs)
+			policyConfig := model.ImageGroupPolicy{Group: "default", Platform: "mixed", PolicyKey: ImageIdentityHash("default", "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"seedance2.5-A","media_type":"video"}]`}
+			require.NoError(t, model.DB.Create(&policyConfig).Error)
+			bindingKey := MediaPoolBindingKey(policyConfig, "seedance2.5-A", "1K", "video")
+			setting := `{"task_plugin_key":"drama"}`
+			channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "legacy-drama", Status: common.ChannelStatusEnabled, Models: "seedance2.5-A", Group: "default", Key: "legacy-key", Setting: &setting}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			other := channel
+			other.Id, other.Key = 0, "other-legacy-key"
+			require.NoError(t, model.DB.Create(&other).Error)
+			for _, member := range []model.Channel{channel, other} {
+				require.NoError(t, model.DB.Create(&model.Ability{ChannelId: member.Id, Group: "default", Model: "seedance2.5-A", Enabled: true}).Error)
+				require.NoError(t, model.DB.Create(&model.ImageChannelPool{BindingKey: bindingKey, Group: "default", Platform: "mixed", Mode: policyConfig.PoolMode, Model: "seedance2.5-A", Resolution: "1K", ChannelId: member.Id}).Error)
+			}
+			selected := channel
+			if action == mediaretry.LocalOtherChannel {
+				selected = other
+			}
+			body := []byte(`{"model":"seedance2.5-A","prompt":"@图片1 preserve https://source.example/image.png literally","seconds":5,"resolution":"720p","references":[{"type":"image","role":"reference","source":"https://source.example/image.png"}]}`)
+			request := AsyncVideoRequest{Body: body, ContentType: "application/json", Operation: "create", PluginHash: plugin.Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "drama", Version: plugin.Meta.Version}}, MixedRouting: &MixedVideoRouting{Model: "seedance2.5-A", Group: "default", PoolMode: policyConfig.PoolMode, BindingKey: bindingKey, Resolution: "1K"}}
+			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, job.ExpiresAt))
+			request.Details = request.RequestDetails()
+			encoded, err := common.Marshal(request)
+			require.NoError(t, err)
+			job.RequestCipher, err = EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+			require.NoError(t, err)
+			job.Group = "default"
+			job.ChannelId, job.Provider, job.Model, job.Quota, job.BillingStatus, job.AttemptGeneration = channel.Id, "drama", "seedance2.5-A", 100, "reserved", 0
+			require.NoError(t, model.DB.Save(&job).Error)
+			task := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Platform: "drama", Status: model.TaskStatusSubmitted, Quota: job.Quota, Properties: model.Properties{OriginModelName: job.Model, UpstreamModelName: job.Model}}
+			task.PrivateData = model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, TokenId: job.TokenId, UpstreamTaskID: "native-original", CurrentAttempt: &model.VideoTaskAttempt{MixedVideo: true, PluginKey: "drama"}}
+			require.NoError(t, model.DB.Create(&task).Error)
+			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "download", Name: "Local reference recovery", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"素材下载超时"}}, Steps: []mediaretry.Step{{ID: "local", Action: action, MaxAttempts: 1}}}}}
+			_, err = model.SaveMediaRetryPolicy(t.Context(), policy, 0, job.UserId, nil)
+			require.NoError(t, err)
+			const reason = "（图片1）素材下载超时，请联系管理员处理"
+			scheduled, err := TryAsyncVideoReferenceRecovery(t.Context(), task, &relaycommon.TaskInfo{TaskID: "native-original", Status: string(model.TaskStatusFailure), Reason: reason}, 200, []byte(`{"id":"native-original","status":"failed","metadata":{"url":"`+reason+`"}}`))
+			require.NoError(t, err)
+			require.True(t, scheduled)
+			require.NoError(t, model.DB.First(&task, task.ID).Error)
+			require.NoError(t, model.DB.First(&job, job.ID).Error)
+			require.NotNil(t, task.PrivateData.MediaRetryDecision)
+			assert.Equal(t, action, task.PrivateData.MediaRetryDecision.Action)
+			assert.Empty(t, task.PrivateData.MediaRetryDecision.BlockedReason)
+			assert.Equal(t, "prepare", job.ReferenceRecoveryStage)
+			assert.Equal(t, "reserved", job.BillingStatus)
+			assert.Equal(t, 100, job.Quota)
+			assert.Equal(t, int64(1), task.AttemptGeneration)
+			require.Len(t, task.PrivateData.VideoAttempts, 1)
+			assert.Equal(t, "native-original", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+			// Recovery survives persistence without falling back to display-only details.
+			plain, err := DecryptImagePayload(retainAsyncVideoRequestDetails(job), "media-request:"+job.TaskId)
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(plain, &request))
+			require.Len(t, request.ReferenceInputs, 1)
+			candidates, err := VideoRetryCandidateChannels(t.Context(), job, request, job.Model)
+			require.NoError(t, err)
+			require.Len(t, candidates, 1, "the worker must accept a legacy Drama channel for local recovery")
+			assert.Equal(t, selected.Id, candidates[0].Id)
+			preview, err := PreviewVideoRetryEligibility(t.Context(), task.TaskID, *request.RetryFact, *request.PendingDecision)
+			require.NoError(t, err)
+			assert.True(t, preview.Eligible, "%+v", preview)
+			assert.Equal(t, []int{selected.Id}, preview.CandidateChannelIDs)
+			payload := asyncImageBytesFixture(t).Data
+			var remaining atomic.Int64
+			remaining.Store(cfg.MaxFileBytes)
+			downloads := 0
+			client := &http.Client{Transport: mediaInputRoundTripper(func(req *http.Request) (*http.Response, error) {
+				downloads++
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: int64(len(payload)), Request: req}, nil
+			})}
+			_, err = downloadMediaInput(t.Context(), job, request.ReferenceInputs[0], cfg, imageCfg, request.ReferenceURLExpiresAt, &remaining, client)
+			require.NoError(t, err)
+			prepared, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+			require.NoError(t, err)
+			assert.True(t, prepared.LocalReferencesReady)
+			var preparedBody map[string]any
+			require.NoError(t, common.Unmarshal(prepared.Body, &preparedBody))
+			var expectedBody map[string]any
+			require.NoError(t, common.Unmarshal(body, &expectedBody))
+			localSource := preparedBody["references"].([]any)[0].(map[string]any)["source"]
+			assert.Contains(t, localSource, "/api/media-inputs/")
+			expectedBody["references"].([]any)[0].(map[string]any)["source"] = localSource
+			assert.Equal(t, expectedBody, preparedBody, "only the frozen source changes; prompt, order, roles and generation parameters survive")
+			reused, err := PrepareAsyncVideoLocalReferences(t.Context(), job, request)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(prepared.Body), string(reused.Body))
+			assert.Equal(t, 1, downloads)
+			// Exercise both worker phases, including channel rebinding after preparation
+			// and the durable dispatch fence. The upstream is isolated to this test.
+			var submissions atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				submissions.Add(1)
+				assert.Equal(t, "/v1/videos", req.URL.Path)
+				assert.Equal(t, "Bearer "+selected.Key, req.Header.Get("Authorization"))
+				var posted map[string]any
+				if !assert.NoError(t, common.DecodeJson(req.Body, &posted)) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				assert.Equal(t, preparedBody["references"], posted["references"])
+				assert.Equal(t, preparedBody["prompt"], posted["prompt"])
+				_, _ = io.WriteString(w, `{"id":"replacement-native","status":"queued"}`)
+			}))
+			defer upstream.Close()
+			previousSubmit := SubmitAsyncVideoReferenceRetryFunc
+			t.Cleanup(func() { SubmitAsyncVideoReferenceRetryFunc = previousSubmit })
+			SubmitAsyncVideoReferenceRetryFunc = func(ctx context.Context, activeJob model.AsyncMediaJob, activeTask model.Task, activeRequest AsyncVideoRequest) error {
+				assert.Equal(t, selected.Id, activeJob.ChannelId)
+				assert.Equal(t, selected.Key, activeRequest.Channel.Key)
+				assert.Equal(t, channel.Id, activeTask.BillingChannelID(), "changing the execution channel retains the original hold")
+				assert.True(t, activeRequest.LocalReferencesReady)
+				assert.JSONEq(t, string(prepared.Body), string(activeRequest.Body))
+				intent, err := DecodeMixedVideoCandidate(ctx, activeRequest.Channel, job.Model, "create", activeRequest.Body, VideoModelOverrides{}, job.UserId, activeRequest.ContentType)
+				require.NoError(t, err)
+				pluginContext := map[string]any{"model": job.Model, "upstreamModel": intent.UpstreamModel, "baseUrl": upstream.URL, "apiKey": activeRequest.Channel.Key, "requestBody": intent.Intent["requestBody"]}
+				value, err := plugin.Engine.Call(ctx, "buildSubmitRequest", pluginContext)
+				require.NoError(t, err)
+				descriptor := value.(map[string]any)
+				payload, err := common.Marshal(descriptor["body"])
+				require.NoError(t, err)
+				req, err := http.NewRequestWithContext(ctx, descriptor["method"].(string), descriptor["url"].(string), bytes.NewReader(payload))
+				require.NoError(t, err)
+				for name, value := range descriptor["headers"].(map[string]any) {
+					req.Header.Set(name, value.(string))
+				}
+				require.NoError(t, model.DispatchAsyncVideoRecovery(ctx, activeJob, activeTask, activeRequest.PendingDecision, 0, "local_download"))
+				assert.ErrorIs(t, model.DispatchAsyncVideoRecovery(ctx, activeJob, activeTask, activeRequest.PendingDecision, 0, "local_download"), model.ErrTaskAttemptConflict)
+				response, err := upstream.Client().Do(req)
+				require.NoError(t, err)
+				defer response.Body.Close()
+				var receipt map[string]any
+				require.NoError(t, common.DecodeJson(response.Body, &receipt))
+				value, err = plugin.Engine.Call(ctx, "parseSubmitResponse", pluginContext, map[string]any{"statusCode": response.StatusCode, "body": receipt})
+				require.NoError(t, err)
+				parsed := value.(map[string]any)
+				data, err := common.Marshal(parsed["taskData"])
+				require.NoError(t, err)
+				state, err := common.Marshal(parsed["state"])
+				require.NoError(t, err)
+				won, err := model.CommitAsyncVideoReferenceSubmission(ctx, activeJob, activeTask, parsed["taskId"].(string), data, state)
+				require.NoError(t, err)
+				require.True(t, won)
+				won, err = model.CommitAsyncVideoReferenceSubmission(ctx, activeJob, activeTask, parsed["taskId"].(string), data, state)
+				require.NoError(t, err)
+				assert.False(t, won, "a duplicate receipt cannot create another attempt")
+				return nil
+			}
+			for range 2 {
+				require.NoError(t, model.DB.First(&job, job.ID).Error)
+				claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 120)
+				require.NoError(t, err)
+				require.True(t, claimed)
+				require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, cfg))
+			}
+			require.NoError(t, model.DB.First(&job, job.ID).Error)
+			require.NoError(t, model.DB.First(&task, task.ID).Error)
+			assert.EqualValues(t, 1, submissions.Load())
+			assert.Equal(t, "submitted", job.Status)
+			assert.Equal(t, "waiting", job.ReferenceRecoveryStage)
+			assert.Equal(t, "reserved", job.BillingStatus)
+			assert.Equal(t, 100, job.Quota)
+			assert.Equal(t, "replacement-native", task.PrivateData.UpstreamTaskID)
+			require.NotNil(t, task.PrivateData.MediaRetryState)
+			assert.Equal(t, 1, task.PrivateData.MediaRetryState.TotalUsed)
+			assert.EqualValues(t, 1, task.AttemptGeneration)
+			assert.Equal(t, selected.Id, task.ChannelId)
+		})
+	}
 }
