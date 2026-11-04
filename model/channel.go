@@ -1,7 +1,6 @@
 package model
 
 import (
-	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
@@ -455,29 +454,30 @@ func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil
 	}
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		for _, channel := range channels {
+			if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
+				if err := lockTaskVideoModelBindings(tx); err != nil {
+					return err
+				}
+				break
+			}
 		}
-	}()
-
-	for _, chunk := range lo.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		for _, channel_ := range chunk {
-			if err := channel_.AddAbilities(tx); err != nil {
-				tx.Rollback()
+		for _, chunk := range lo.Chunk(channels, 50) {
+			if err := tx.Create(&chunk).Error; err != nil {
 				return err
 			}
 		}
-	}
-	return tx.Commit().Error
+		for _, channel := range channels {
+			if err := channel.validateTaskVideoModelBindings(tx); err != nil {
+				return err
+			}
+			if err := channel.AddAbilities(tx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func BatchDeleteChannels(ids []int) (int64, error) {
@@ -548,61 +548,128 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
-	var err error
-	err = DB.Create(channel).Error
-	if err != nil {
-		return err
-	}
-	err = channel.AddAbilities(nil)
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
+			if err := lockTaskVideoModelBindings(tx); err != nil {
+				return err
+			}
+		}
+		if err := channel.validateTaskVideoModelBindings(tx); err != nil {
+			return err
+		}
+		if err := tx.Create(channel).Error; err != nil {
+			return err
+		}
+		return channel.AddAbilities(tx)
+	})
 }
 
 func (channel *Channel) Update() error {
-	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
-	if channel.ChannelInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
-				keyStr = existing.Key
+	var updated Channel
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		// Omitted type/settings are merged by GORM. They cannot establish that
+		// this is an ordinary channel before the binding lock has been acquired.
+		editsBindings := channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == 0 && (channel.Setting != nil || channel.Models != "" || channel.ModelMapping != nil)
+		if editsBindings && (channel.Setting == nil || dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey)) {
+			if err := lockTaskVideoModelBindings(tx); err != nil {
+				return err
 			}
 		}
-		// Parse the key list (supports newline separation or JSON array)
-		keys := []string{}
-		if keyStr != "" {
-			trimmed := strings.TrimSpace(keyStr)
-			if strings.HasPrefix(trimmed, "[") {
-				var arr []json.RawMessage
-				if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
-					keys = make([]string, len(arr))
-					for i, v := range arr {
-						keys[i] = string(v)
+		// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
+		if channel.ChannelInfo.IsMultiKey {
+			var keyStr string
+			if channel.Key != "" {
+				keyStr = channel.Key
+			} else {
+				// If key is not provided, read the existing key from the database
+				var existing Channel
+				if err := tx.First(&existing, channel.Id).Error; err != nil {
+					return err
+				}
+				keyStr = existing.Key
+			}
+			// Parse the key list (supports newline separation or JSON array)
+			keys := []string{}
+			if keyStr != "" {
+				trimmed := strings.TrimSpace(keyStr)
+				if strings.HasPrefix(trimmed, "[") {
+					var arr []json.RawMessage
+					if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
+						keys = make([]string, len(arr))
+						for i, v := range arr {
+							keys[i] = string(v)
+						}
+					}
+				}
+				if len(keys) == 0 { // fallback to newline split
+					keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
+				}
+			}
+			channel.ChannelInfo.MultiKeySize = len(keys)
+			// Clean up status data that exceeds the new key count to prevent index out of range
+			if channel.ChannelInfo.MultiKeyStatusList != nil {
+				for idx := range channel.ChannelInfo.MultiKeyStatusList {
+					if idx >= channel.ChannelInfo.MultiKeySize {
+						delete(channel.ChannelInfo.MultiKeyStatusList, idx)
 					}
 				}
 			}
-			if len(keys) == 0 { // fallback to newline split
-				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
-			}
 		}
-		channel.ChannelInfo.MultiKeySize = len(keys)
-		// Clean up status data that exceeds the new key count to prevent index out of range
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
-				}
-			}
+		if err := tx.Model(channel).Updates(channel).Error; err != nil {
+			return err
 		}
+		if err := tx.First(&updated, channel.Id).Error; err != nil {
+			return err
+		}
+		if err := updated.validateTaskVideoModelBindings(tx); err != nil {
+			return err
+		}
+		return updated.UpdateAbilities(tx)
+	})
+	if err == nil {
+		*channel = updated
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
+	return err
+}
+
+// UpdateUpstreamModelSettings persists discovery results without overwriting
+// other fields from a channel snapshot taken before the upstream request.
+// Model removals may intentionally clear the model list and all abilities.
+func (channel *Channel) UpdateUpstreamModelSettings(settings dto.ChannelOtherSettings, updateModels bool) error {
+	encoded, err := common.Marshal(settings)
 	if err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
+	updates := map[string]any{"settings": string(encoded)}
+	if !updateModels {
+		if err := DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error; err != nil {
+			return err
+		}
+		channel.OtherSettings = string(encoded)
+		return nil
+	}
+	updates["models"] = channel.Models
+	var updated Channel
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		// The channel type and capability settings may have changed while the
+		// upstream request was running; validate the current persisted values.
+		if err := lockTaskVideoModelBindings(tx); err != nil {
+			return err
+		}
+		if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&updated, channel.Id).Error; err != nil {
+			return err
+		}
+		if err := updated.validateTaskVideoModelBindings(tx); err != nil {
+			return err
+		}
+		return updated.UpdateAbilities(tx)
+	})
+	if err == nil {
+		*channel = updated
+	}
 	return err
 }
 
@@ -883,14 +950,12 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 	}
 
 	editsModels := updateData.Models != "" || updateData.ModelMapping != nil
-	var txOptions []*sql.TxOptions
-	if editsModels {
-		// Changes on different tags still share the public model billing units.
-		txOptions = append(txOptions, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var channels []Channel
 		if editsModels {
+			if err := lockTaskVideoModelBindings(tx); err != nil {
+				return err
+			}
 			if err := lockForUpdate(tx).Where("tag = ?", tag).
 				Select("id", "type", "setting", "models", "model_mapping").Order("id").Find(&channels).Error; err != nil {
 				return err
@@ -923,7 +988,7 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 			}
 		}
 		return nil
-	}, txOptions...)
+	})
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {
@@ -1107,14 +1172,13 @@ func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
 	channel.Setting = common.GetPointer[string](string(settingBytes))
 }
 
+// GetOtherSettings can read a projected Channel and must never mutate or persist it.
 func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 	setting := dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
 		err := common.UnmarshalJsonStr(channel.OtherSettings, &setting)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
-			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
 		}
 	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {

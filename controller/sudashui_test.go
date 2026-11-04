@@ -451,7 +451,7 @@ func TestSudashuiChannelPartialUpdates(t *testing.T) {
 func TestSudashuiCatalogReadsAndTagWrites(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.TaskPlugin{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.TaskPlugin{}, &model.Option{}))
 	_, config := sudashuiFixture(t)
 	legacySettings := `{"task_plugin_key":"third-party","task_plugin_model_configs":"previously ignored"}`
 	tag, baseURL := "tag-video", "https://saved.example"

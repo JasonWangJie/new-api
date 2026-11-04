@@ -17,13 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { formatDateStr, formatTimestampToDate } from '@/lib/format'
+import { getServerErrorMessage } from '@/lib/server-error-message'
 
 import { imageRequest } from '../api'
 import { imageLabel } from '../lib/image-labels'
@@ -93,26 +94,6 @@ export function RetrySamples(props: {
         items: (RetrySample & { latest_event_id: number; matched: boolean })[]
         total: number
       }>(`${RETRY_POLICY_URL}/samples?${params}`),
-  })
-  const batch = useMutation({
-    mutationFn: async () => {
-      const results = []
-      for (const sample of samples.data?.items ?? []) {
-        const result = await imageRequest<{
-          decision: RetryDecision
-          decision_source?: string
-        }>(`${RETRY_POLICY_URL}/preview`, 'POST', {
-          policy: props.policy,
-          event_id: sample.latest_event_id,
-        })
-        results.push({
-          sample,
-          decision: result.decision,
-          decisionSource: result.decision_source,
-        })
-      }
-      return results
-    },
   })
   const event = useMutation({
     mutationFn: async (input: { id: number; draft: boolean }) => {
@@ -185,73 +166,11 @@ export function RetrySamples(props: {
         />
         <Button type='submit'>{t('Apply filters')}</Button>
       </form>
-      <Button
-        variant='outline'
-        disabled={batch.isPending || !samples.data?.items.length}
-        onClick={() => batch.mutate()}
-      >
-        {t('Test visible samples')}
-      </Button>
-      {batch.data && (
-        <details className='rounded-lg border p-3'>
-          <summary className='cursor-pointer' role='status'>
-            {t('Custom rules matched {{matched}} of {{total}} samples', {
-              matched: batch.data.filter((item) => item.decision.matched)
-                .length,
-              total: batch.data.length,
-            })}
-          </summary>
-          <StaticDataTable
-            data={batch.data}
-            getRowKey={({ sample }) => sample.fingerprint}
-            columns={[
-              {
-                id: 'message',
-                header: t('Error message'),
-                className: 'min-w-48',
-                cell: ({ sample }) => (
-                  <p className='max-w-lg break-words whitespace-normal'>
-                    {sample.message}
-                  </p>
-                ),
-              },
-              {
-                id: 'rule',
-                header: t('Matched rule'),
-                cell: ({ decision, decisionSource }) =>
-                  decisionSource === 'current_builtin'
-                    ? t('Current built-in policy')
-                    : decision.rule_id || t('Unmatched'),
-              },
-              {
-                id: 'category',
-                header: t('Error category'),
-                cell: ({ decision }) =>
-                  t(
-                    CATEGORY_LABELS[decision.category ?? ''] ??
-                      decision.category ??
-                      '—'
-                  ),
-              },
-              {
-                id: 'action',
-                header: t('Planned action'),
-                cell: ({ decision }) =>
-                  t(
-                    ACTION_LABELS[decision.action as RetryAction] ??
-                      imageLabel(decision.action)
-                  ),
-              },
-              {
-                id: 'blocked',
-                header: t('Blocking reason'),
-                cell: ({ decision }) => decision.blocked_reason || '—',
-              },
-            ]}
-          />
-        </details>
-      )}
-      {batch.error && <p role='alert'>{batch.error.message}</p>}
+      <RetrySampleBatch
+        key={params.toString()}
+        policy={props.policy}
+        samples={samples.data?.items ?? []}
+      />
       {samples.isPending && <p role='status'>{t('Loading...')}</p>}
       {samples.error && <p role='alert'>{samples.error.message}</p>}
       {event.error && <p role='alert'>{event.error.message}</p>}
@@ -369,6 +288,166 @@ export function RetrySamples(props: {
         />
       )}
     </div>
+  )
+}
+
+type RetrySamplePreviewResult = {
+  sample: RetrySample
+} & (
+  | { decision: RetryDecision; decisionSource?: string; error?: never }
+  | { decision?: never; decisionSource?: never; error: unknown }
+)
+
+function RetrySampleBatch(props: {
+  policy: RetryPolicy
+  samples: (RetrySample & { latest_event_id: number })[]
+}) {
+  const { t } = useTranslation()
+  const activeBatch = useRef<AbortController | null>(null)
+  // The parent keys this interaction by the applied filters and page. Leaving
+  // that scope aborts its requests and prevents late results entering a new one.
+  useEffect(() => () => activeBatch.current?.abort(), [])
+  const batch = useMutation({
+    mutationFn: async (input: {
+      policy: RetryPolicy
+      samples: (RetrySample & { latest_event_id: number })[]
+      signal: AbortSignal
+    }) => {
+      const results: RetrySamplePreviewResult[] = []
+      let next = 0
+      await Promise.all(
+        Array.from({ length: Math.min(4, input.samples.length) }, async () => {
+          while (!input.signal.aborted && next < input.samples.length) {
+            const index = next++
+            const sample = input.samples[index]
+            try {
+              const result = await imageRequest<{
+                decision: RetryDecision
+                decision_source?: string
+              }>(
+                `${RETRY_POLICY_URL}/preview`,
+                'POST',
+                { policy: input.policy, event_id: sample.latest_event_id },
+                input.signal
+              )
+              results[index] = {
+                sample,
+                decision: result.decision,
+                decisionSource: result.decision_source,
+              }
+            } catch (error) {
+              if (input.signal.aborted) return
+              results[index] = { sample, error }
+            }
+          }
+        })
+      )
+      input.signal.throwIfAborted()
+      return results
+    },
+    onSettled: () => {
+      activeBatch.current = null
+    },
+    meta: { errorToast: false },
+  })
+  const failed = batch.data?.filter((item) => !item.decision).length ?? 0
+  return (
+    <>
+      <Button
+        variant='outline'
+        disabled={batch.isPending || !props.samples.length}
+        onClick={() => {
+          if (activeBatch.current || !props.samples.length) return
+          const controller = new AbortController()
+          activeBatch.current = controller
+          batch.mutate({
+            ...structuredClone({
+              policy: props.policy,
+              samples: props.samples,
+            }),
+            signal: controller.signal,
+          })
+        }}
+      >
+        {t('Test visible samples')}
+      </Button>
+      {batch.isPending && <p role='status'>{t('Loading...')}</p>}
+      {batch.data && (
+        <details className='rounded-lg border p-3'>
+          <summary className='cursor-pointer' role='status'>
+            {t('Custom rules matched {{matched}} of {{total}} samples', {
+              matched: batch.data.filter((item) => item.decision?.matched)
+                .length,
+              total: batch.data.length,
+            })}
+            {failed > 0 && ` · ${t('Failed')}: ${failed}`}
+          </summary>
+          <StaticDataTable
+            data={batch.data}
+            tableProps={{ 'aria-label': t('Test visible samples') }}
+            getRowKey={({ sample }) => sample.fingerprint}
+            columns={[
+              {
+                id: 'message',
+                header: t('Error message'),
+                className: 'min-w-48',
+                cell: ({ sample }) => (
+                  <p className='max-w-lg break-words whitespace-normal'>
+                    {sample.message}
+                  </p>
+                ),
+              },
+              {
+                id: 'rule',
+                header: t('Matched rule'),
+                cell: ({ decision, decisionSource }) => {
+                  if (!decision) return t('Test failed')
+                  return decisionSource === 'current_builtin'
+                    ? t('Current built-in policy')
+                    : decision.rule_id || t('Unmatched')
+                },
+              },
+              {
+                id: 'category',
+                header: t('Error category'),
+                cell: ({ decision }) =>
+                  t(
+                    CATEGORY_LABELS[decision?.category ?? ''] ??
+                      decision?.category ??
+                      '—'
+                  ),
+              },
+              {
+                id: 'action',
+                header: t('Planned action'),
+                cell: ({ decision }) =>
+                  decision
+                    ? t(
+                        ACTION_LABELS[decision.action as RetryAction] ??
+                          imageLabel(decision.action)
+                      )
+                    : '—',
+              },
+              {
+                id: 'blocked',
+                header: t('Blocking reason'),
+                cell: ({ decision, error }) =>
+                  decision ? (
+                    decision.blocked_reason || '—'
+                  ) : (
+                    <p
+                      role='alert'
+                      className='max-w-lg break-words whitespace-normal'
+                    >
+                      {getServerErrorMessage(error, t('Test failed'))}
+                    </p>
+                  ),
+              },
+            ]}
+          />
+        </details>
+      )}
+    </>
   )
 }
 

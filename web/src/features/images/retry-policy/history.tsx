@@ -25,6 +25,7 @@ import { StaticDataTable } from '@/components/data-table'
 import { Dialog } from '@/components/dialog'
 import { Button } from '@/components/ui/button'
 import { formatTimestampToDate } from '@/lib/format'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from '../api'
 import { ConfigurationConflict } from '../components/configuration-conflict'
@@ -35,12 +36,13 @@ import type { RetryPolicy, RetryVersion } from './types'
 export function RetryHistory(props: {
   policy: RetryPolicy
   canManage: boolean
-  onSaved: (policy: RetryPolicy) => void
+  onSaved: (policy: RetryPolicy) => Promise<void>
 }) {
   const { t } = useTranslation()
   const [page, setPage] = useState(1)
   const [selected, setSelected] = useState<RetryVersion | null>(null)
   const [confirm, setConfirm] = useState(false)
+  const userId = useAuthStore((state) => state.auth.user?.id)
   const versions = useQuery({
     queryKey: ['retry-policy-versions', props.policy.revision, page],
     queryFn: () =>
@@ -57,13 +59,14 @@ export function RetryHistory(props: {
       ),
   })
   const rollback = useMutation({
-    mutationFn: () =>
+    mutationKey: ['media-retry-policy-save', userId, 'rollback'],
+    mutationFn: (policy: RetryPolicy) =>
       imageRequest<RetryPolicy>(`${RETRY_POLICY_URL}/rollback`, 'POST', {
-        revision: props.policy.revision,
+        revision: policy.revision,
         target_revision: selected?.revision,
       }),
-    onSuccess: (policy) => {
-      props.onSaved(policy)
+    onSuccess: async (policy) => {
+      await props.onSaved(policy)
       setConfirm(false)
       setSelected(null)
     },
@@ -195,7 +198,9 @@ export function RetryHistory(props: {
           <ConfigurationConflict
             error={rollback.error}
             onReload={async () => {
-              props.onSaved(await imageRequest<RetryPolicy>(RETRY_POLICY_URL))
+              await props.onSaved(
+                await imageRequest<RetryPolicy>(RETRY_POLICY_URL)
+              )
               rollback.reset()
             }}
           />
@@ -211,7 +216,7 @@ export function RetryHistory(props: {
         desc={t(
           'Restoring a version creates a new revision and preserves retry counters.'
         )}
-        handleConfirm={() => rollback.mutate()}
+        handleConfirm={() => rollback.mutate(props.policy)}
         isLoading={rollback.isPending}
       />
     </div>

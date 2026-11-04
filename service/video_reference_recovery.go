@@ -377,6 +377,11 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 		fact.Terminal, fact.Stage, fact.ErrorCode = false, "poll", "upstream_result_conflicting"
 		fact.VideoEvidence = &mediaretry.VideoFailureEvidence{TerminalResponseConflict: true}
 	}
+	if task.PrivateData.VideoReconciliation != nil && !fact.Unknown {
+		// Reconciliation only observes the original operation. Its confirmed
+		// failure can settle, but must not start a new terminal recovery chain.
+		return false, false, nil
+	}
 	if requestErr != nil && !fact.Unknown {
 		if decryptErr != nil {
 			return false, false, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,12 @@ type AsyncVideoRequest struct {
 
 func (request AsyncVideoRequest) HasReferenceInputs() bool {
 	return len(request.ReferenceInputs)+len(request.InlineReferenceInputs) > 0
+}
+
+func (request AsyncVideoRequest) HasRetainedSubmissionAttempts() bool {
+	return slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
+		return !attempt.RefundOnFailure || attempt.UpstreamTaskID != ""
+	})
 }
 
 var SubmitAsyncVideoFunc func(context.Context, model.AsyncMediaJob, AsyncVideoRequest) error

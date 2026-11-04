@@ -8,6 +8,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+
+	"github.com/QuantumNous/new-api/common"
 )
 
 const (
@@ -170,7 +173,40 @@ type CompiledPolicy struct {
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+var policyCompiler struct {
+	sync.Mutex
+	document string
+	compiled *CompiledPolicy
+}
+
+// Compile shares one immutable compiled snapshot across validation and execution.
+// Content, rather than revision alone, identifies drafts and independent stores.
 func Compile(policy Policy) (*CompiledPolicy, error) {
+	encoded, err := common.Marshal(policy)
+	if err != nil {
+		return nil, err
+	}
+	document := string(encoded)
+	policyCompiler.Lock()
+	defer policyCompiler.Unlock()
+	if policyCompiler.compiled != nil && policyCompiler.document == document {
+		return policyCompiler.compiled, nil
+	}
+	// Callers may edit the original policy after compiling it. Cached matchers
+	// must never retain their mutable slices or maps.
+	var snapshot Policy
+	if err := common.Unmarshal(encoded, &snapshot); err != nil {
+		return nil, err
+	}
+	compiled, err := compilePolicy(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	policyCompiler.document, policyCompiler.compiled = document, compiled
+	return compiled, nil
+}
+
+func compilePolicy(policy Policy) (*CompiledPolicy, error) {
 	if policy.Revision < 0 || policy.Revision > 1<<53-1 || len(policy.Rules) > 200 {
 		return nil, fmt.Errorf("invalid recovery policy revision or rule count")
 	}

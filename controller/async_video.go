@@ -1050,8 +1050,8 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		}
 		retry.event = event
 		if !mediaretry.IsResubmission(decision.Action) || decision.BlockedReason != "" {
-			unknownStop := decision.Matched && decision.Action == mediaretry.Stop && decision.BlockedReason == "" && request.RetryFact.Unknown && job.DispatchedAt > 0
-			if c.GetBool("async_media_execution") && info.Billing != nil && (unknownStop || len(request.InitialUnknownAttempts) > 0) && info.Billing.GetPreConsumedQuota() > 0 {
+			unknownStop := decision.Matched && decision.Action == mediaretry.Stop && decision.BlockedReason == "" && request.RetryFact.Unknown && job.DispatchedAt > 0 && !c.GetBool("async_media_submission_refundable")
+			if c.GetBool("async_media_execution") && info.Billing != nil && (unknownStop || request.HasRetainedSubmissionAttempts()) && info.Billing.GetPreConsumedQuota() > 0 {
 				// End locally while carrying every earlier uncertain dispatch into
 				// the durable Task and its existing reservation. A later rejection
 				// does not confirm those earlier upstream operations.
@@ -1077,7 +1077,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		if retry.dispatched && request.RetryFact.Unknown && !slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
 			return attempt.Generation == int64(state.TotalUsed) && attempt.ChannelID == request.RetryFact.ChannelID
 		}) {
-			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID, Decision: &decision, Generation: int64(state.TotalUsed), Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message, StartedAt: job.DispatchedAt, FinishedAt: time.Now().Unix()})
+			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID, Decision: &decision, Generation: int64(state.TotalUsed), Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message, StartedAt: job.DispatchedAt, FinishedAt: time.Now().Unix(), RefundOnFailure: c.GetBool("async_media_submission_refundable")})
 		}
 		request.PendingDecision = &decision
 		if decision.DelaySeconds > 0 {

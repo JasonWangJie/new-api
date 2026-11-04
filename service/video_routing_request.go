@@ -96,6 +96,9 @@ func RewriteVideoRoutingRequest(raw []byte, contentType, operation, targetModel,
 				if err := common.Unmarshal(value, &original); err != nil {
 					return nil, "", fmt.Errorf("video routing %s must be a string", key)
 				}
+				if key == "size" && mixedVideoSizeAspectRatio(original) != "" {
+					continue
+				}
 				replacement, err := videoRoutingResolutionValue(original, resolution)
 				if err != nil {
 					return nil, "", err

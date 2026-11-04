@@ -7,6 +7,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCompiledPolicySnapshotIsolation(t *testing.T) {
+	policy := Policy{Revision: 7, Rules: []Rule{{ID: "retry", Name: "Retry", Enabled: true,
+		Scope: Scope{Providers: []string{"drama"}}, Match: Match{Regex: "download"},
+		Steps: []Step{{ID: "same", Action: SameChannel, MaxAttempts: 2}}, AllowedChannelIDs: []int{1}}}}
+	fact := Fact{Provider: "drama", Message: "download failed", Terminal: true}
+	state := State{TotalLimit: 4}
+	compiled, err := Compile(policy)
+	require.NoError(t, err)
+	first := compiled.Evaluate(fact, state)
+	assert.Equal(t, SameChannel, first.Action)
+	first.AllowedChannelIDs[0] = 99
+	policy.Rules[0].Steps[0].Action = OtherChannel
+	policy.Rules[0].Scope.Providers[0] = "xai"
+	policy.Rules[0].AllowedChannelIDs[0] = 2
+	assert.Equal(t, SameChannel, compiled.Evaluate(fact, state).Action)
+	assert.Equal(t, []int{1}, compiled.Evaluate(fact, state).AllowedChannelIDs)
+	// A draft can change while retaining its stored revision. Content changes
+	// must be validated and evaluated immediately, never reuse that revision.
+	changed, err := Compile(policy)
+	require.NoError(t, err)
+	assert.False(t, changed.Evaluate(fact, state).Matched)
+	fact.Provider = "xai"
+	assert.Equal(t, OtherChannel, changed.Evaluate(fact, state).Action)
+	assert.Equal(t, []int{2}, changed.Evaluate(fact, state).AllowedChannelIDs)
+	policy.PauseResubmissions = true
+	paused, err := Compile(policy)
+	require.NoError(t, err)
+	assert.Equal(t, "resubmissions_paused", paused.Evaluate(fact, state).BlockedReason)
+	policy.Rules[0].Match.Regex = "["
+	invalid, err := Compile(policy)
+	require.Error(t, err)
+	assert.Nil(t, invalid)
+	assert.Equal(t, "resubmissions_paused", paused.Evaluate(fact, state).BlockedReason)
+}
+
 func TestPolicyMatchingAndActionBudgets(t *testing.T) {
 	policy := Policy{Revision: 4, Rules: []Rule{{ID: "reference", Name: "Reference failed", Enabled: true, Category: "reference_fetch", MaxAttempts: 3,
 		Scope: Scope{MediaTypes: []string{"video"}, Providers: []string{"drama"}, Categories: []string{"upstream_error"}},

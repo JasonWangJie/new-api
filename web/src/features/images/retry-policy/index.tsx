@@ -16,7 +16,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMutation, useQuery } from '@tanstack/react-query'
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -52,13 +57,30 @@ import type { RetryDraftSource, RetryPolicy, RetryRule } from './types'
 
 export function RetryPolicyCenter(props: { source?: RetryDraftSource } = {}) {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const user = useAuthStore((state) => state.auth.user)
+  const saveKey = ['media-retry-policy-save', user?.id]
+  const saves = useMutationState({
+    filters: { mutationKey: saveKey },
+    select: (mutation) => ({
+      status: mutation.state.status,
+      variables: mutation.state.variables as RetryPolicy | undefined,
+      data: mutation.state.data as RetryPolicy | undefined,
+      error: mutation.state.error,
+    }),
+  })
+  const latestSave = saves.at(-1)
+  const [resumeSave] = useState(
+    () => latestSave?.status === 'pending' || latestSave?.status === 'error'
+  )
+  const waitingForSave = resumeSave && latestSave?.status === 'pending'
   const allowed = hasPermission(user, 'image_config', 'read')
   const canManage = hasPermission(user, 'image_config', 'manage')
   const policy = useQuery({
     queryKey: ['media-retry-policy', user?.id],
-    queryFn: () => imageRequest<RetryPolicy>(RETRY_POLICY_URL),
-    enabled: allowed,
+    queryFn: ({ signal }) =>
+      imageRequest<RetryPolicy>(RETRY_POLICY_URL, 'GET', undefined, signal),
+    enabled: allowed && !waitingForSave,
     refetchOnWindowFocus: false,
   })
   if (!allowed) {
@@ -66,13 +88,29 @@ export function RetryPolicyCenter(props: { source?: RetryDraftSource } = {}) {
       <p>{t('Media settings require administrator storage permissions.')}</p>
     )
   }
-  if (policy.error) return <p role='alert'>{policy.error.message}</p>
-  if (!policy.data) return <p role='status'>{t('Loading...')}</p>
+  const initial = resumeSave
+    ? latestSave?.data || latestSave?.variables || policy.data
+    : policy.data
+  if (policy.error && !initial) {
+    return <p role='alert'>{policy.error.message}</p>
+  }
+  if (!initial || waitingForSave) return <p role='status'>{t('Loading...')}</p>
   return (
     <RetryPolicyForm
-      initial={policy.data}
+      initial={initial}
+      initialSaveError={resumeSave ? latestSave?.error : undefined}
       canManage={canManage}
       source={props.source}
+      onSaved={async (saved) => {
+        const queryKey = ['media-retry-policy', user?.id]
+        await queryClient.cancelQueries({ queryKey })
+        queryClient.setQueryData(queryKey, saved)
+        for (const mutation of queryClient
+          .getMutationCache()
+          .findAll({ mutationKey: saveKey, status: 'error' })) {
+          queryClient.getMutationCache().remove(mutation)
+        }
+      }}
     />
   )
 }
@@ -81,10 +119,13 @@ export function RetryPolicyForm(props: {
   initial: RetryPolicy
   canManage: boolean
   source?: RetryDraftSource
+  initialSaveError?: unknown
+  onSaved?: (policy: RetryPolicy) => Promise<void>
 }) {
   const { t } = useTranslation()
   const [policy, setPolicy] = useState(() => structuredClone(props.initial))
-  const [dirty, setDirty] = useState(false)
+  const [dirty, setDirty] = useState(() => Boolean(props.initialSaveError))
+  const [resumedError, setResumedError] = useState(props.initialSaveError)
   const [tab, setTab] = useState('rules')
   const [editor, setEditor] = useState<RetryRule | null>(() =>
     props.source && props.canManage ? newRetryRule(props.source) : null
@@ -92,16 +133,21 @@ export function RetryPolicyForm(props: {
   const [ruleToDelete, setRuleToDelete] = useState<RetryRule | null>(null)
   const [source, setSource] = useState(props.source)
   const [preview, setPreview] = useState(false)
+  const userId = useAuthStore((state) => state.auth.user?.id)
   const save = useMutation({
-    mutationFn: () =>
-      imageRequest<RetryPolicy>(RETRY_POLICY_URL, 'PUT', policy),
-    onSuccess: (saved) => {
+    mutationKey: ['media-retry-policy-save', userId],
+    mutationFn: (draft: RetryPolicy) =>
+      imageRequest<RetryPolicy>(RETRY_POLICY_URL, 'PUT', draft),
+    onSuccess: async (saved) => {
+      await props.onSaved?.(saved)
       setPolicy(saved)
       setDirty(false)
+      setResumedError(undefined)
       toast.success(t('Saved'))
     },
     onError: (error) => markServerErrorHandled(error),
   })
+  const saveError = save.error || resumedError
   const editable = props.canManage && !save.isPending
   const displayedRules = policy.rules
     .map((rule, priorityIndex) => ({ rule, priorityIndex }))
@@ -167,8 +213,13 @@ export function RetryPolicyForm(props: {
             </Button>
             {editable && (
               <Button
-                disabled={save.isPending || !dirty}
-                onClick={() => save.mutate()}
+                disabled={
+                  save.isPending || !dirty || isConfigurationConflict(saveError)
+                }
+                onClick={() => {
+                  setResumedError(undefined)
+                  save.mutate(policy)
+                }}
               >
                 {t('Save and activate')}
               </Button>
@@ -223,17 +274,21 @@ export function RetryPolicyForm(props: {
           </div>
         </details>
         <ConfigurationConflict
-          error={save.error}
+          error={saveError}
           onReload={async () => {
             const saved = await imageRequest<RetryPolicy>(RETRY_POLICY_URL)
+            await props.onSaved?.(saved)
             setPolicy(saved)
             setDirty(false)
+            setResumedError(undefined)
             save.reset()
           }}
         />
-        {save.error && !isConfigurationConflict(save.error) && (
+        {!!saveError && !isConfigurationConflict(saveError) && (
           <p role='alert' className='text-destructive mt-3'>
-            {save.error.message}
+            {saveError instanceof Error
+              ? saveError.message
+              : t('An unexpected error occurred')}
           </p>
         )}
       </SettingsCard>
@@ -493,9 +548,12 @@ export function RetryPolicyForm(props: {
         <RetryHistory
           policy={policy}
           canManage={editable && !dirty}
-          onSaved={(saved) => {
+          onSaved={async (saved) => {
+            await props.onSaved?.(saved)
             setPolicy(saved)
             setDirty(false)
+            setResumedError(undefined)
+            save.reset()
           }}
         />
       )}

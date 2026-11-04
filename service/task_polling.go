@@ -967,7 +967,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task.PrivateData.AsyncMedia && classifyPollHTTP(resp.StatusCode) != pollClassOK {
 		return recordPollFailure(ctx, adaptor, task, snap, pollClassUnrecognized, resp.StatusCode, "")
 	}
-	if parsedStatus == model.TaskStatusFailure && (task.PrivateData.VideoReconciliation == nil || task.Platform == constant.TaskPlatformHuahuoVideo) {
+	if parsedStatus == model.TaskStatusFailure {
 		scheduled, recoveryErr := TryAsyncVideoReferenceRecovery(ctx, *task, taskResult, resp.StatusCode, responseBody)
 		if recoveryErr != nil {
 			return recoveryErr

@@ -157,37 +157,37 @@ func videoRoutingTargetCanMatch(match model.VideoRoutingMatch, target model.Vide
 		if mode.Name == "edit_video" || mode.Name == "extend_video" || len(match.Modes) > 0 && !slices.Contains(match.Modes, mode.Name) {
 			continue
 		}
-		resolutionAllowed := target.Resolution == "" && len(match.Resolutions) == 0
-		for _, raw := range mode.Resolutions {
+		resolutions := mode.Resolutions
+		if len(resolutions) == 0 {
+			resolutions = []string{""}
+		}
+		for _, raw := range resolutions {
 			resolution := NormalizeVideoResolution(raw)
 			if raw == "720px" {
 				resolution = "720p"
 			}
-			if target.Resolution != "" && resolution == target.Resolution || target.Resolution == "" && slices.Contains(match.Resolutions, resolution) {
-				resolutionAllowed = true
-				break
+			if target.Resolution != "" && resolution != target.Resolution || target.Resolution == "" && len(match.Resolutions) > 0 && !slices.Contains(match.Resolutions, resolution) {
+				continue
 			}
-		}
-		if !resolutionAllowed {
-			continue
-		}
-		if mode.Duration == nil {
-			if match.Seconds.Min == nil && match.Seconds.Max == nil {
-				return true
+			duration := mode.DurationForResolution(raw)
+			if duration == nil {
+				if match.Seconds.Min == nil && match.Seconds.Max == nil {
+					return true
+				}
+				continue
 			}
-			continue
-		}
-		if len(mode.Duration.Values) > 0 {
-			if slices.ContainsFunc(mode.Duration.Values, func(value int) bool { return value >= minimum && value <= maximum }) {
-				return true
+			if len(duration.Values) > 0 {
+				if slices.ContainsFunc(duration.Values, func(value int) bool { return value >= minimum && value <= maximum }) {
+					return true
+				}
+				continue
 			}
-			continue
-		}
-		lower, upper := max(minimum, mode.Duration.Min), min(maximum, mode.Duration.Max)
-		if lower <= upper && mode.Duration.Step > 0 {
-			offset := (lower - mode.Duration.Min) % mode.Duration.Step
-			if offset == 0 || mode.Duration.Step-offset <= upper-lower {
-				return true
+			lower, upper := max(minimum, duration.Min), min(maximum, duration.Max)
+			if lower <= upper && duration.Step > 0 {
+				offset := (lower - duration.Min) % duration.Step
+				if offset == 0 || duration.Step-offset <= upper-lower {
+					return true
+				}
 			}
 		}
 	}

@@ -239,6 +239,7 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
 	c.Set("async_media_retryable_submission_rejection", false)
 	c.Set("async_media_submission_rejected", false)
+	c.Set("async_media_submission_refundable", false)
 	c.Set("async_media_submission_retry_reason", "")
 	info.InitChannelMeta(c)
 
@@ -592,6 +593,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		resp, err = adaptor.DoRequest(c, info, requestBody)
 	}
 	if err != nil {
+		if c.GetBool("async_media_execution") && resp == nil && platform == "yuxibox" {
+			c.Set("async_media_submission_refundable", true)
+		}
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp == nil {
@@ -656,6 +660,13 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			}
 			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), code, resp.StatusCode)
 			failure.NoRetry = platform == constant.TaskPlatformHuahuoVideo
+			if c.GetBool("async_media_execution") && (parsed == nil || strings.TrimSpace(parsed.UpstreamTaskID) == "" && parsed.Immediate == nil) &&
+				(resp.StatusCode == http.StatusBadGateway && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) ||
+					resp.StatusCode == http.StatusServiceUnavailable && classifyAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody, false)) {
+				// Refund eligibility does not change what the retry policy knows
+				// about upstream acceptance, or permit an extra submission.
+				c.Set("async_media_submission_refundable", true)
+			}
 			if c.GetBool("async_media_execution") && confirmed {
 				c.Set("async_media_submission_rejected", true)
 				c.Set("async_media_submission_retry_reason", message)
@@ -814,7 +825,7 @@ func classifyAsyncVideoSubmissionRejection(status int, body []byte, legacy bool)
 	if legacy && status != http.StatusUnprocessableEntity && status != http.StatusTooManyRequests && status != http.StatusBadGateway && status != http.StatusServiceUnavailable {
 		return false
 	}
-	if !legacy && (status < 400 || status >= 500 || status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly) {
+	if !legacy && (status < 400 || status >= 500 && status != http.StatusServiceUnavailable || status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly) {
 		return false
 	}
 	var envelope map[string]any
@@ -915,6 +926,9 @@ func classifyAsyncVideoSubmissionRejection(status int, body []byte, legacy bool)
 		return false
 	}
 	if !legacy {
+		if status == http.StatusServiceUnavailable {
+			return strings.Contains(diagnostic, "no available channel for model")
+		}
 		return !strings.Contains(diagnostic, "unknown") && !strings.Contains(diagnostic, "未知") && !strings.Contains(diagnostic, "unconfirmed") && !strings.Contains(diagnostic, "无法确认") && !strings.Contains(diagnostic, "未确认")
 	}
 	if status == http.StatusBadGateway {

@@ -182,19 +182,20 @@ type VideoTaskReconciliation struct {
 // VideoTaskAttempt keeps the failed native operation separate from a later
 // submission. Diagnostics are sanitized by the caller before persistence.
 type VideoTaskAttempt struct {
-	PluginKey      string               `json:"plugin_key,omitempty"`
-	PluginVersion  string               `json:"plugin_version,omitempty"`
-	PluginHash     string               `json:"plugin_hash,omitempty"`
-	UpstreamModel  string               `json:"upstream_model,omitempty"`
-	MixedVideo     bool                 `json:"mixed_video,omitempty"`
-	Generation     int64                `json:"generation"`
-	ChannelID      int                  `json:"channel_id,omitempty"`
-	Decision       *mediaretry.Decision `json:"retry_decision,omitempty"`
-	UpstreamTaskID string               `json:"upstream_task_id"`
-	Status         string               `json:"status"`
-	Reason         string               `json:"reason"`
-	StartedAt      int64                `json:"started_at"`
-	FinishedAt     int64                `json:"finished_at"`
+	PluginKey       string               `json:"plugin_key,omitempty"`
+	PluginVersion   string               `json:"plugin_version,omitempty"`
+	PluginHash      string               `json:"plugin_hash,omitempty"`
+	UpstreamModel   string               `json:"upstream_model,omitempty"`
+	MixedVideo      bool                 `json:"mixed_video,omitempty"`
+	Generation      int64                `json:"generation"`
+	ChannelID       int                  `json:"channel_id,omitempty"`
+	Decision        *mediaretry.Decision `json:"retry_decision,omitempty"`
+	UpstreamTaskID  string               `json:"upstream_task_id"`
+	RefundOnFailure bool                 `json:"refund_on_failure,omitempty"`
+	Status          string               `json:"status"`
+	Reason          string               `json:"reason"`
+	StartedAt       int64                `json:"started_at"`
+	FinishedAt      int64                `json:"finished_at"`
 }
 
 // BillingChannelID identifies the immutable submission accounting owner.

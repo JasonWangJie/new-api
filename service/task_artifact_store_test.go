@@ -1373,3 +1373,212 @@ func TestConfiguredVideoRecoveryRetainsConflictingResult(t *testing.T) {
 		})
 	}
 }
+
+func TestVideoReconciliationChecksFailureEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, response, action  string
+		confirmed, replay, stop bool
+	}{
+		{name: "output conflicts with failure", response: `{"id":"native-reconciliation","status":"failed","video_url":"https://cdn.example/result.mp4"}`},
+		{name: "output blocks configured replay", response: `{"id":"native-reconciliation","status":"failed","video_url":"https://cdn.example/result.mp4"}`, action: mediaretry.SameChannel},
+		{name: "output blocks configured stop", response: `{"id":"native-reconciliation","status":"failed","video_url":"https://cdn.example/result.mp4"}`, action: mediaretry.Stop},
+		{name: "identity conflict allows configured replay", response: `{"id":"another-operation","status":"failed"}`, action: mediaretry.SameChannel, replay: true},
+		{name: "identity conflict allows configured stop", response: `{"id":"another-operation","status":"failed"}`, action: mediaretry.Stop, stop: true},
+		{name: "accepted conflict allows configured replay", response: `{"id":"native-reconciliation","status":"failed","state":"accepted"}`, action: mediaretry.SameChannel, replay: true},
+		{name: "accepted conflict allows configured stop", response: `{"id":"native-reconciliation","status":"failed","state":"accepted"}`, action: mediaretry.Stop, stop: true},
+		{name: "confirmed failure settles without configured replay", response: `{"id":"native-reconciliation","status":"failed"}`, action: mediaretry.SameChannel, confirmed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task, channel := setupVideoReconciliationTask(t)
+			asyncImageKeyFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.MediaRetryPolicyVersion{}))
+			t.Cleanup(func() {
+				assert.NoError(t, model.DB.Where(map[string]any{"key": model.MediaRetryPolicyOptionKey}).Delete(&model.Option{}).Error)
+				assert.NoError(t, model.DB.Where("1 = 1").Delete(&model.MediaRetryPolicyVersion{}).Error)
+			})
+			policy, err := model.GetMediaRetryPolicy(t.Context())
+			require.NoError(t, err)
+			if tc.action != "" {
+				policy.Rules = []mediaretry.Rule{{ID: "busy", Name: "Busy", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"server busy"}}, Steps: []mediaretry.Step{{ID: "recover", Action: tc.action, MaxAttempts: 2}}}}
+				_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, task.UserId, nil)
+				require.NoError(t, err)
+			}
+			task.Platform = "drama"
+			task.PrivateData.DurableBilling, task.PrivateData.SubmitAccountingRecorded = true, true
+			require.NoError(t, task.Update())
+			seedChargedAccounting(t, task.UserId, task.ChannelId, task.PrivateData.TokenId, task.Quota, 1)
+			channelData, err := common.Marshal(channel)
+			require.NoError(t, err)
+			channelCipher, err := EncryptImagePayload(channelData, "media-channel:"+task.TaskID)
+			require.NoError(t, err)
+			now := time.Now().Unix()
+			requestData, err := common.Marshal(AsyncVideoRequest{Body: []byte(`{"model":"test-model"}`), ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: now + 3600})
+			require.NoError(t, err)
+			requestCipher, err := EncryptImagePayload(requestData, "media-request:"+task.TaskID)
+			require.NoError(t, err)
+			job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: task.UserId, TokenId: task.PrivateData.TokenId, ChannelId: task.ChannelId, Provider: "drama", Model: "test-model", Status: "submitted", BillingStatus: "reserved", Quota: task.Quota, CreatedAt: now, ExpiresAt: now + 3600, ChannelCipher: channelCipher, RequestCipher: requestCipher}
+			require.NoError(t, model.DB.Create(&job).Error)
+			poller := &scriptedPollingAdaptor{statusCode: http.StatusNotFound, parse: &relaycommon.TaskInfo{Status: model.TaskStatusUnknown}}
+			require.NoError(t, updateVideoSingleTask(t.Context(), poller, channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			require.NotNil(t, task.PrivateData.VideoReconciliation)
+			deadline := task.PrivateData.VideoReconciliation.DeadlineAt
+			task.PrivateData.VideoReconciliation.NextPollAt = 0
+			require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+			poller.statusCode, poller.body = http.StatusOK, []byte(tc.response)
+			poller.parse = &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "server busy"}
+			require.NoError(t, updateVideoSingleTask(t.Context(), poller, channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			if tc.replay || tc.stop {
+				require.NoError(t, model.DB.First(&job, job.ID).Error)
+				assert.EqualValues(t, 1, task.AttemptGeneration)
+				assert.EqualValues(t, 1, job.AttemptGeneration)
+				assert.Nil(t, task.PrivateData.VideoReconciliation)
+				assert.Equal(t, 4000, task.Quota)
+				assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+				assert.Equal(t, 7000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+				require.NotNil(t, task.PrivateData.MediaRetryFact)
+				assert.True(t, task.PrivateData.MediaRetryFact.Unknown)
+				assert.False(t, task.PrivateData.MediaRetryFact.HasOutput)
+				if tc.replay {
+					assert.Equal(t, model.TaskStatus(model.TaskStatusQueued), task.Status)
+					assert.Equal(t, "queued", job.Status)
+					assert.Equal(t, "reserved", job.BillingStatus)
+					assert.Equal(t, 1, job.ReferenceRetryCount)
+					assert.Equal(t, "submit", job.ReferenceRecoveryStage)
+					assert.Empty(t, task.PrivateData.UpstreamTaskID)
+					require.Len(t, task.PrivateData.VideoAttempts, 1)
+					assert.Equal(t, model.TaskStatusUnknown, task.PrivateData.VideoAttempts[0].Status)
+					assert.Equal(t, "native-reconciliation", task.PrivateData.VideoAttempts[0].UpstreamTaskID)
+				} else {
+					assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+					assert.Equal(t, "failed", job.Status)
+					assert.Equal(t, "unknown", job.BillingStatus)
+					assert.Equal(t, "policy_stopped_unknown", job.ReferenceRecoveryStage)
+					assert.Zero(t, job.ReferenceRetryCount)
+				}
+				return
+			}
+			assert.Zero(t, task.AttemptGeneration)
+			assert.Equal(t, "native-reconciliation", task.PrivateData.UpstreamTaskID)
+			if tc.confirmed {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+				assert.Zero(t, task.Quota)
+				assert.Equal(t, 14000, getUserQuota(t, task.UserId))
+				assert.Equal(t, 11000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+			} else {
+				assert.Equal(t, model.TaskStatus(model.TaskStatusInProgress), task.Status)
+				assert.Equal(t, 4000, task.Quota)
+				assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+				assert.Equal(t, 7000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+				require.NotNil(t, task.PrivateData.VideoReconciliation)
+				assert.Equal(t, deadline, task.PrivateData.VideoReconciliation.DeadlineAt)
+				if tc.action == mediaretry.SameChannel {
+					stale := *task
+					stale.PrivateData.VideoReconciliation = nil
+					stale.PrivateData.MediaRetryFact = nil
+					require.NoError(t, model.DB.First(&job, job.ID).Error)
+					decision := mediaretry.Decision{Matched: true, Action: mediaretry.SameChannel}
+					fact := *task.PrivateData.MediaRetryFact
+					fact.HasOutput = false
+					won, err := model.ScheduleAsyncVideoReferenceRecovery(t.Context(), stale, job, "server busy", false, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: mediaretry.State{TotalLimit: 16}, RequestCipher: job.RequestCipher})
+					require.NoError(t, err)
+					assert.False(t, won, "a stale poller cannot replace an operation with recorded output")
+				}
+			}
+			// A later worker re-evaluates the saved conflict under the same live
+			// rule. It must not turn that reconciliation into another generation.
+			calls := poller.fetchCalls
+			require.NoError(t, updateVideoSingleTask(t.Context(), poller, channel, task.TaskID, map[string]*model.Task{task.TaskID: task}))
+			assert.Equal(t, calls, poller.fetchCalls)
+			require.NoError(t, model.DB.First(&job, job.ID).Error)
+			assert.Zero(t, job.AttemptGeneration)
+			assert.Zero(t, job.ReferenceRetryCount)
+			assert.Empty(t, job.ReferenceRecoveryStage)
+		})
+	}
+}
+
+func TestInlineVideoRecoveryPreparationFailureConsumesOnlyStep(t *testing.T) {
+	job, cfg, _ := mediaInputFixture(t)
+	const modelName = "grok-imagine-video"
+	var channel model.Channel
+	require.NoError(t, model.DB.First(&channel).Error)
+	channel.Type, channel.Models = constant.ChannelTypeXai, modelName
+	require.NoError(t, model.DB.Save(&channel).Error)
+	require.NoError(t, model.DB.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: modelName, Enabled: true}).Error)
+	now := time.Now().Unix()
+	fact := mediaretry.Fact{MediaType: "video", Provider: "xai", Model: modelName, ChannelID: channel.Id, Stage: "terminal", Category: "reference_download", Message: "reference download failed", Accepted: true, Terminal: true, HasReferences: true, LocalSupported: true, Deadline: now + 600}
+	policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "local", Name: "Local recovery", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"download failed"}}, Steps: []mediaretry.Step{{ID: "retry", Action: mediaretry.LocalSameChannel, MaxAttempts: 2}}, OnExhausted: mediaretry.Stop}}}
+	policy, err := model.SaveMediaRetryPolicy(t.Context(), policy, 0, job.UserId, nil)
+	require.NoError(t, err)
+	task := model.Task{TaskID: job.TaskId, Platform: "xai", UserId: job.UserId, ChannelId: channel.Id, Status: model.TaskStatusQueued, Quota: 100, AttemptGeneration: job.AttemptGeneration, Properties: model.Properties{OriginModelName: modelName}, PrivateData: model.TaskPrivateData{AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, MediaRetryFact: &fact, TokenId: job.TokenId}}
+	require.NoError(t, model.DB.Create(&task).Error)
+	seedChargedAccounting(t, job.UserId, channel.Id, job.TokenId, 100, 1)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", job.UserId).Update("quota", 900).Error)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", job.TokenId).Update("remain_quota", 900).Error)
+	request := AsyncVideoRequest{Body: []byte(`{"model":"grok-imagine-video","image":{"url":"https://cdn.example.com/ref.png"}}`), ContentType: "application/json", Channel: channel, Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "xai"}}, ReferenceRecoveryVersion: 2, ReferenceRecoveryDeadline: fact.Deadline, RetryFact: &fact, InlineReferenceInputs: []AsyncVideoReferenceInput{{Kind: "image", Source: "https://cdn.example.com/ref.png", Path: "/image/url"}}}
+	encoded, err := common.Marshal(request)
+	require.NoError(t, err)
+	job.RequestCipher, err = EncryptImagePayload(encoded, "media-request:"+job.TaskId)
+	require.NoError(t, err)
+	job.ChannelId, job.Provider, job.Model, job.Group = channel.Id, "xai", modelName, "default"
+	job.Status, job.BillingStatus, job.Quota = "queued", "reserved", 100
+	job.ReferenceRecoveryStage, job.ReferenceRetryCount = "submit", 1
+	job.LeaseToken, job.LeaseExpiresAt = "inline-recovery-test", now+120
+	require.NoError(t, model.DB.Save(&job).Error)
+	state := mediaretry.State{TotalLimit: 16, Now: now}
+	decision, err := PlanTerminalVideoFailure(policy, fact, state)
+	require.NoError(t, err)
+	// Expanding preparation to the submit phase must not accept a send that
+	// already crossed the dispatch barrier, even with a stale worker snapshot.
+	require.NoError(t, model.DB.Model(&job).Update("dispatched_at", now).Error)
+	won, err := model.ScheduleAsyncVideoReferenceRecovery(t.Context(), task, job, fact.Message, true, model.AsyncVideoRecoveryPlan{Decision: decision, Fact: fact, State: state, PreparationFailed: true, RequestCipher: job.RequestCipher})
+	require.NoError(t, err)
+	assert.False(t, won)
+	require.NoError(t, model.DB.Model(&job).Update("dispatched_at", 0).Error)
+	previousSubmit := SubmitAsyncVideoReferenceRetryFunc
+	t.Cleanup(func() { SubmitAsyncVideoReferenceRetryFunc = previousSubmit })
+	preparations := 0
+	SubmitAsyncVideoReferenceRetryFunc = func(_ context.Context, current model.AsyncMediaJob, _ model.Task, restored AsyncVideoRequest) error {
+		preparations++
+		assert.Zero(t, current.DispatchedAt)
+		assert.False(t, restored.LocalReferencesReady)
+		return &MediaReferencePreparationError{Code: "media_reference_download_failed", Status: http.StatusBadGateway, Cause: errors.New("reference download failed")}
+	}
+	require.NoError(t, ProcessAsyncVideoReferenceRecovery(t.Context(), job, cfg))
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	require.NoError(t, model.DB.First(&task, task.ID).Error)
+	assert.EqualValues(t, 2, job.AttemptGeneration)
+	assert.Equal(t, "queued", job.Status)
+	assert.Equal(t, "reserved", job.BillingStatus)
+	assert.Equal(t, 100, task.Quota)
+	require.NotNil(t, task.PrivateData.MediaRetryState)
+	assert.Zero(t, task.PrivateData.MediaRetryState.TotalUsed)
+	assert.Equal(t, 1, task.PrivateData.MediaRetryState.StepUses[mediaretry.StepKey("local", "retry")])
+	assert.Equal(t, 900, getUserQuota(t, job.UserId))
+	for phase := range 2 {
+		claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, common.GetUUID(), 120)
+		require.NoError(t, err)
+		require.True(t, claimed)
+		err = ProcessAsyncVideoReferenceRecovery(t.Context(), job, cfg)
+		if phase == 0 {
+			require.NoError(t, err)
+		} else {
+			require.ErrorContains(t, err, "reference download failed")
+		}
+		require.NoError(t, model.DB.First(&job, job.ID).Error)
+	}
+	require.NoError(t, model.DB.First(&task, task.ID).Error)
+	assert.Equal(t, 2, preparations)
+	assert.EqualValues(t, 2, job.AttemptGeneration)
+	assert.Zero(t, task.PrivateData.MediaRetryState.TotalUsed)
+	assert.Equal(t, 2, task.PrivateData.MediaRetryState.StepUses[mediaretry.StepKey("local", "retry")])
+	assert.Equal(t, "failed", job.Status)
+	assert.Equal(t, "refunded", job.BillingStatus)
+	assert.Zero(t, task.Quota)
+	assert.Equal(t, 1000, getUserQuota(t, job.UserId))
+	assert.Equal(t, 1000, getTokenRemainQuota(t, job.TokenId))
+	require.NoError(t, ProcessAsyncMediaJob(t.Context(), job, cfg))
+	assert.Equal(t, 1000, getUserQuota(t, job.UserId), "the exhausted task cannot refund twice")
+}

@@ -503,17 +503,6 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 	return parseOpenAIModelIDs(body)
 }
 
-func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {
-	channel.SetOtherSettings(settings)
-	updates := map[string]any{
-		"settings": channel.OtherSettings,
-	}
-	if updateModels {
-		updates["models"] = channel.Models
-	}
-	return model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(updates).Error
-}
-
 func checkAndPersistChannelUpstreamModelUpdates(
 	channel *model.Channel,
 	settings *dto.ChannelOtherSettings,
@@ -532,7 +521,7 @@ func checkAndPersistChannelUpstreamModelUpdates(
 	pendingAddModels, pendingRemoveModels, fetchErr := collectPendingUpstreamModelChanges(channel, *settings)
 	settings.UpstreamModelUpdateLastCheckTime = now
 	if fetchErr != nil {
-		if err = updateChannelUpstreamModelSettings(channel, *settings, false); err != nil {
+		if err = channel.UpdateUpstreamModelSettings(*settings, false); err != nil {
 			return false, 0, err
 		}
 		return false, 0, fetchErr
@@ -552,13 +541,8 @@ func checkAndPersistChannelUpstreamModelUpdates(
 	}
 	settings.UpstreamModelUpdateLastRemovedModels = pendingRemoveModels
 
-	if err = updateChannelUpstreamModelSettings(channel, *settings, modelsChanged); err != nil {
+	if err = channel.UpdateUpstreamModelSettings(*settings, modelsChanged); err != nil {
 		return false, autoAdded, err
-	}
-	if modelsChanged {
-		if err = channel.UpdateAbilities(nil); err != nil {
-			return true, autoAdded, err
-		}
 	}
 	return modelsChanged, autoAdded, nil
 }
@@ -997,14 +981,8 @@ func applyChannelUpstreamModelUpdates(
 	settings.UpstreamModelUpdateLastRemovedModels = remainingRemoveModels
 	settings.UpstreamModelUpdateLastCheckTime = common.GetTimestamp()
 
-	if err := updateChannelUpstreamModelSettings(channel, settings, modelsChanged); err != nil {
+	if err := channel.UpdateUpstreamModelSettings(settings, modelsChanged); err != nil {
 		return nil, nil, nil, nil, false, err
-	}
-
-	if modelsChanged {
-		if err := channel.UpdateAbilities(nil); err != nil {
-			return addModels, removeModels, remainingModels, remainingRemoveModels, true, err
-		}
 	}
 	return addModels, removeModels, remainingModels, remainingRemoveModels, modelsChanged, nil
 }

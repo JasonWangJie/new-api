@@ -124,7 +124,9 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 			return ErrTaskAttemptConflict
 		}
 		rejected := policyRecovery && plans[0].RejectedSubmission && currentJob.ReferenceRecoveryStage == "dispatched" && currentJob.DispatchedAt > 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
-		preparationFailed := policyRecovery && plans[0].PreparationFailed && currentJob.ReferenceRecoveryStage == "prepare" && currentJob.DispatchedAt == 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
+		// Inline reference preparation runs in the submit phase, before the
+		// same dispatch barrier. Only an unsent operation may advance this way.
+		preparationFailed := policyRecovery && plans[0].PreparationFailed && (currentJob.ReferenceRecoveryStage == "prepare" || currentJob.ReferenceRecoveryStage == "submit") && currentJob.DispatchedAt == 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
 		unknownStage := configuredUnknown && (currentJob.Status == "submitted" || currentJob.Status == "reconciling" || currentJob.Status == "execution_unknown" || currentJob.ReferenceRecoveryStage == "dispatched" || currentJob.ReferenceRecoveryStage == "unknown")
 		if current.Status != task.Status || current.Status == TaskStatusFailure || current.Status == TaskStatusSuccess || current.PrivateData.VideoReconciliation != nil && !configuredUnknown || current.AttemptGeneration != task.AttemptGeneration || current.AttemptGeneration < 0 || current.AttemptGeneration == math.MaxInt64 ||
 			currentJob.AttemptGeneration != job.AttemptGeneration || currentJob.AttemptGeneration != current.AttemptGeneration || (!policyRecovery && currentJob.ReferenceRetryCount != 0 || currentJob.ReferenceRetryCount >= 1000) || (!rejected && !preparationFailed && !unknownStage && currentJob.Status != "submitted") || currentJob.BillingStatus != "reserved" && !(configuredUnknown && currentJob.BillingStatus == "unknown") || currentJob.RefundLogPayload != "" || currentJob.OutputObjectKey != "" || currentJob.ArtifactKeys != "" || currentJob.ExpiresAt <= now ||

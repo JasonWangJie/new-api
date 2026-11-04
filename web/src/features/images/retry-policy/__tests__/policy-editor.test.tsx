@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -27,8 +28,10 @@ import {
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
+import { useAuthStore } from '@/stores/auth-store'
+
 import { imageRequest } from '../../api'
-import { RetryPolicyForm } from '../index'
+import { RetryPolicyCenter, RetryPolicyForm } from '../index'
 import {
   newRetryRule,
   RETRY_POLICY_URL,
@@ -38,15 +41,17 @@ import {
 import { RetryPreview } from '../preview'
 import { RetryRuleEditor } from '../rule-editor'
 import { RetrySamples } from '../samples'
-import type { RetryPolicy } from '../types'
+import type { RetryDecision, RetryPolicy, RetrySample } from '../types'
 
 vi.mock('../../api', () => ({ imageRequest: vi.fn() }))
 const clients: QueryClient[] = []
-function show(element: React.ReactNode) {
-  const client = new QueryClient({
+function show(
+  element: React.ReactNode,
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
-  clients.push(client)
+) {
+  if (!clients.includes(client)) clients.push(client)
   return render(
     <QueryClientProvider client={client}>{element}</QueryClientProvider>
   )
@@ -70,11 +75,265 @@ function fixture(): RetryPolicy {
     rules: [rule],
   }
 }
+
+function sampleFixture(count: number, first = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    fingerprint: `sample-${first + index}`,
+    latest_event_id: first + index,
+    message: `Failure ${first + index}`,
+    media_type: 'video',
+    provider: 'drama',
+    model: 'video-model',
+    channel_id: 1,
+    stage: 'poll',
+    http_status: 502,
+    error_code: 'upstream_failed',
+    category: 'unclassified',
+    count: 1,
+    task_count: 1,
+    last_seen: 1,
+    matched: false,
+  })) satisfies (RetrySample & { latest_event_id: number; matched: boolean })[]
+}
+
+function previewResponse() {
+  let resolve!: (value: { decision: RetryDecision }) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<{ decision: RetryDecision }>((yes, no) => {
+    resolve = yes
+    reject = no
+  })
+  return { promise, resolve, reject }
+}
+
+function previewDecision(id: number): { decision: RetryDecision } {
+  return {
+    decision: {
+      matched: true,
+      revision: 4,
+      action: 'same_channel',
+      rule_id: `rule-${id}`,
+    },
+  }
+}
 afterEach(() => {
   cleanup()
+  useAuthStore.getState().auth.setUser(null)
   clients.splice(0).forEach((client) => client.clear())
-  vi.clearAllMocks()
+  vi.resetAllMocks()
   vi.useRealTimers()
+})
+
+test('reopening after a successful save keeps the saved policy and revision', async () => {
+  useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 100 })
+  const policy = fixture()
+  const saved = { ...policy, revision: 5, pause_resubmissions: true }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  vi.mocked(imageRequest)
+    .mockResolvedValueOnce(policy)
+    .mockResolvedValueOnce(saved)
+  const page = show(<RetryPolicyCenter />, client)
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Pause automatic resubmissions',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Save and activate' }))
+  await screen.findByText('Version 5')
+  page.unmount()
+  show(<RetryPolicyCenter />, client)
+  expect(
+    screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+  ).toBeChecked()
+  expect(screen.getByText('Version 5')).toBeVisible()
+})
+
+test.each([200, 409, 500])(
+  'returning during a save retains its submitted draft and result (status=%s)',
+  async (status) => {
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 7, username: 'admin', role: 100 })
+    const policy = fixture()
+    const saved = { ...policy, revision: 5, pause_resubmissions: true }
+    let resolveResponse!: (policy: RetryPolicy) => void
+    let rejectResponse!: (error: Error) => void
+    const response = new Promise<RetryPolicy>((resolve, reject) => {
+      resolveResponse = resolve
+      rejectResponse = reject
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    vi.mocked(imageRequest)
+      .mockResolvedValueOnce(policy)
+      .mockReturnValueOnce(response)
+    const page = show(<RetryPolicyCenter />, client)
+    const user = userEvent.setup()
+    await user.click(
+      await screen.findByRole('checkbox', {
+        name: 'Pause automatic resubmissions',
+      })
+    )
+    await user.click(screen.getByRole('button', { name: 'Save and activate' }))
+    page.unmount()
+    const resumed = show(<RetryPolicyCenter />, client)
+    expect(
+      screen.queryByRole('button', { name: 'Save and activate' })
+    ).not.toBeInTheDocument()
+    await act(async () => {
+      if (status === 200) {
+        resolveResponse(saved)
+      } else {
+        rejectResponse(
+          Object.assign(new Error('Save unavailable'), {
+            isAxiosError: true,
+            response: { status },
+          })
+        )
+      }
+    })
+    expect(
+      await screen.findByRole('checkbox', {
+        name: 'Pause automatic resubmissions',
+      })
+    ).toBeChecked()
+    if (status === 200) {
+      expect(screen.getByText('Version 5')).toBeVisible()
+      expect(
+        screen.getByRole('button', { name: 'Save and activate' })
+      ).toBeDisabled()
+    } else {
+      expect(screen.getByText(/Version 4/)).toHaveTextContent('Unsaved changes')
+      if (status === 409) {
+        expect(
+          screen.getByRole('button', { name: 'Reload saved settings' })
+        ).toBeVisible()
+        expect(
+          screen.getByRole('button', { name: 'Save and activate' })
+        ).toBeDisabled()
+      } else {
+        expect(screen.getByRole('alert')).toHaveTextContent('Save unavailable')
+        expect(
+          screen.getByRole('button', { name: 'Save and activate' })
+        ).toBeEnabled()
+      }
+      resumed.unmount()
+      show(<RetryPolicyCenter />, client)
+      expect(
+        screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+      ).toBeChecked()
+      expect(screen.getByRole('alert')).toBeVisible()
+    }
+  }
+)
+
+test('failed conflict reload preserves the draft and successful reload survives reopening', async () => {
+  useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 100 })
+  const policy = fixture()
+  const latest = { ...policy, revision: 5 }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  vi.mocked(imageRequest)
+    .mockResolvedValueOnce(policy)
+    .mockRejectedValueOnce(
+      Object.assign(new Error('Conflict'), {
+        isAxiosError: true,
+        response: { status: 409 },
+      })
+    )
+    .mockRejectedValueOnce(new Error('Reload unavailable'))
+    .mockResolvedValueOnce(latest)
+  const page = show(<RetryPolicyCenter />, client)
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('checkbox', {
+      name: 'Pause automatic resubmissions',
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Save and activate' }))
+  const reload = await screen.findByRole('button', {
+    name: 'Reload saved settings',
+  })
+  await user.click(reload)
+  await waitFor(() => expect(reload).toBeEnabled())
+  expect(
+    screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+  ).toBeChecked()
+  expect(screen.getByText(/Version 4/)).toHaveTextContent('Unsaved changes')
+  await user.click(reload)
+  await screen.findByText('Version 5')
+  page.unmount()
+  show(<RetryPolicyCenter />, client)
+  expect(screen.getByText('Version 5')).toBeVisible()
+  expect(
+    screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+  ).not.toBeChecked()
+  expect(
+    screen.queryByRole('button', { name: 'Reload saved settings' })
+  ).not.toBeInTheDocument()
+})
+
+test('returning during a rollback adopts its saved revision and keeps it on the next visit', async () => {
+  useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 100 })
+  const policy = fixture()
+  const restored = { ...policy, revision: 5, pause_resubmissions: true }
+  let resolveResponse!: (policy: RetryPolicy) => void
+  const response = new Promise<RetryPolicy>((resolve) => {
+    resolveResponse = resolve
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  vi.mocked(imageRequest).mockImplementation(async (url) => {
+    if (url === `${RETRY_POLICY_URL}/rollback`) return response as never
+    if (url === `${RETRY_POLICY_URL}/versions/3`) {
+      return { policy: { ...restored, revision: 3 } } as never
+    }
+    if (url.includes('/versions?')) {
+      return {
+        items: [{ revision: 3, created_at: 1, actor_id: 7, action: 'save' }],
+        total: 1,
+      } as never
+    }
+    return policy as never
+  })
+  const page = show(<RetryPolicyCenter />, client)
+  const user = userEvent.setup()
+  await user.click(await screen.findByRole('tab', { name: 'Version history' }))
+  await user.click(
+    await screen.findByRole('button', { name: 'Compare version' })
+  )
+  const restore = await screen.findByRole('button', {
+    name: 'Restore this version',
+  })
+  await waitFor(() => expect(restore).toBeEnabled())
+  await user.click(restore)
+  await user.click(
+    within(await screen.findByRole('alertdialog')).getByRole('button', {
+      name: 'Continue',
+    })
+  )
+  page.unmount()
+  const resumed = show(<RetryPolicyCenter />, client)
+  expect(
+    screen.queryByRole('button', { name: 'Save and activate' })
+  ).not.toBeInTheDocument()
+  await act(async () => resolveResponse(restored))
+  expect(await screen.findByText('Version 5')).toBeVisible()
+  expect(
+    screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+  ).toBeChecked()
+  resumed.unmount()
+  show(<RetryPolicyCenter />, client)
+  expect(screen.getByText('Version 5')).toBeVisible()
+  expect(
+    screen.getByRole('checkbox', { name: 'Pause automatic resubmissions' })
+  ).toBeChecked()
 })
 
 test('removes a rule from the draft after confirmation and saves it with the current revision', async () => {
@@ -540,4 +799,240 @@ test('opens sample occurrences and creates a draft from the selected task failur
   expect(imageRequest).toHaveBeenCalledWith(
     `${RETRY_POLICY_URL}/samples/sample-hash/events?${listURL.split('?')[1]}`
   )
+})
+
+test('batch previews run at most four requests and retain sample order when one request fails', async () => {
+  const pending = new Map<number, ReturnType<typeof previewResponse>>()
+  let active = 0
+  let peak = 0
+  vi.mocked(imageRequest).mockImplementation((url, _method, data) => {
+    if (url.includes('/samples?')) {
+      return Promise.resolve({ items: sampleFixture(6), total: 6 })
+    }
+    const id = (data as { event_id: number }).event_id
+    const response = previewResponse()
+    pending.set(id, response)
+    active++
+    peak = Math.max(peak, active)
+    return response.promise.finally(() => active--)
+  })
+  show(
+    <RetrySamples
+      canManage
+      policy={fixture()}
+      onDraft={vi.fn()}
+      onTest={vi.fn()}
+    />
+  )
+  const user = userEvent.setup()
+  const button = screen.getByRole('button', { name: 'Test visible samples' })
+  expect(button).toBeDisabled()
+  await screen.findByText('Failure 6')
+  await user.click(button)
+  expect(button).toBeDisabled()
+  expect([...pending.keys()]).toEqual([1, 2, 3, 4])
+  await user.click(button)
+  expect(pending.size).toBe(4)
+  await act(async () => {
+    pending.get(3)?.reject(new Error('Preview context unavailable'))
+    pending.get(2)?.resolve(previewDecision(2))
+  })
+  expect([...pending.keys()]).toEqual([1, 2, 3, 4, 5, 6])
+  await act(async () => {
+    for (const id of [6, 4, 5, 1]) {
+      pending.get(id)?.resolve(previewDecision(id))
+    }
+  })
+  const summary = await screen.findByText(/Custom rules matched 5 of 6 samples/)
+  expect(summary).toHaveTextContent('Failed: 1')
+  await user.click(summary)
+  const rows = within(
+    screen.getByRole('table', { name: 'Test visible samples' })
+  )
+    .getAllByRole('row')
+    .slice(1)
+  expect(
+    rows.map((row) => within(row).getAllByRole('cell')[0].textContent)
+  ).toEqual([
+    'Failure 1',
+    'Failure 2',
+    'Failure 3',
+    'Failure 4',
+    'Failure 5',
+    'Failure 6',
+  ])
+  expect(within(rows[2]).getByText('Test failed')).toBeVisible()
+  expect(within(rows[2]).getByRole('alert')).toHaveTextContent(
+    'Preview context unavailable'
+  )
+  expect(within(rows[5]).getByText('rule-6')).toBeVisible()
+  expect(peak).toBe(4)
+  expect(active).toBe(0)
+  expect(button).toBeEnabled()
+})
+
+test('queued previews and results keep the policy and samples captured at the click', async () => {
+  const policy = fixture()
+  const items = sampleFixture(5)
+  const pending = new Map<number, ReturnType<typeof previewResponse>>()
+  const submitted: { policy: RetryPolicy; event_id: number }[] = []
+  vi.mocked(imageRequest).mockImplementation((url, _method, data) => {
+    if (url.includes('/samples?')) return Promise.resolve({ items, total: 5 })
+    const input = data as { policy: RetryPolicy; event_id: number }
+    submitted.push(structuredClone(input))
+    const response = previewResponse()
+    pending.set(input.event_id, response)
+    return response.promise
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  const page = show(
+    <RetrySamples
+      canManage
+      policy={policy}
+      onDraft={vi.fn()}
+      onTest={vi.fn()}
+    />,
+    client
+  )
+  const user = userEvent.setup()
+  await screen.findByText('Failure 5')
+  await user.click(screen.getByRole('button', { name: 'Test visible samples' }))
+  policy.rules[0].name = 'Edited after test started'
+  items[4].message = 'New sample contents'
+  items[4].latest_event_id = 99
+  page.rerender(
+    <QueryClientProvider client={client}>
+      <RetrySamples
+        canManage
+        policy={policy}
+        onDraft={vi.fn()}
+        onTest={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  await act(async () => pending.get(1)?.resolve(previewDecision(1)))
+  expect([...pending.keys()]).toEqual([1, 2, 3, 4, 5])
+  expect(submitted.map((input) => input.policy.rules[0].name)).toEqual(
+    Array(5).fill('Reference repair')
+  )
+  await act(async () => {
+    for (const id of [2, 3, 4, 5]) {
+      pending.get(id)?.resolve(previewDecision(id))
+    }
+  })
+  const summary = await screen.findByText('Custom rules matched 5 of 5 samples')
+  await user.click(summary)
+  const results = within(
+    screen.getByRole('table', { name: 'Test visible samples' })
+  )
+  expect(results.getByText('Failure 5')).toBeVisible()
+  expect(results.queryByText('New sample contents')).not.toBeInTheDocument()
+})
+
+test.each(['page', 'filters'])(
+  'changing %s cancels the old batch and isolates late responses from the new preview',
+  async (change) => {
+    const pending = new Map<number, ReturnType<typeof previewResponse>>()
+    const signals: AbortSignal[] = []
+    vi.mocked(imageRequest).mockImplementation((url, _method, data, signal) => {
+      if (url.includes('/samples?')) {
+        const params = new URL(url, 'https://example.test').searchParams
+        const changed =
+          params.get('page') === '2' || params.get('provider') === 'other'
+        return Promise.resolve({
+          items: changed ? sampleFixture(1, 11) : sampleFixture(5),
+          total: 21,
+        })
+      }
+      const response = previewResponse()
+      pending.set((data as { event_id: number }).event_id, response)
+      if (!signal) throw new Error('Preview cancellation signal missing')
+      signals.push(signal)
+      // Deliberately ignore cancellation to exercise late network completion.
+      return response.promise
+    })
+    show(
+      <RetrySamples
+        canManage
+        policy={fixture()}
+        onDraft={vi.fn()}
+        onTest={vi.fn()}
+      />
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Failure 5')
+    await user.click(
+      screen.getByRole('button', { name: 'Test visible samples' })
+    )
+    expect(pending.size).toBe(4)
+    if (change === 'page') {
+      await user.click(screen.getByRole('button', { name: 'Next' }))
+    } else {
+      await user.type(screen.getByLabelText('Provider'), 'other')
+      await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    }
+    expect(signals).toHaveLength(4)
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    await screen.findByText('Failure 11')
+    await user.click(
+      screen.getByRole('button', { name: 'Test visible samples' })
+    )
+    expect(signals.at(-1)?.aborted).toBe(false)
+    await act(async () => {
+      for (const id of [1, 2, 3, 4]) {
+        pending.get(id)?.resolve(previewDecision(id))
+      }
+    })
+    expect([...pending.keys()]).toEqual([1, 2, 3, 4, 11])
+    expect(screen.queryByText(/Custom rules matched/)).not.toBeInTheDocument()
+    await act(async () => pending.get(11)?.resolve(previewDecision(11)))
+    const summary = await screen.findByText(
+      'Custom rules matched 1 of 1 samples'
+    )
+    await user.click(summary)
+    const results = within(
+      screen.getByRole('table', { name: 'Test visible samples' })
+    )
+    expect(results.getByText('Failure 11')).toBeVisible()
+    expect(results.queryByText('Failure 1')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  }
+)
+
+test('unmounting cancels running previews and never starts the queued samples', async () => {
+  const pending: ReturnType<typeof previewResponse>[] = []
+  const signals: AbortSignal[] = []
+  vi.mocked(imageRequest).mockImplementation((url, _method, _data, signal) => {
+    if (url.includes('/samples?')) {
+      return Promise.resolve({ items: sampleFixture(5), total: 5 })
+    }
+    const response = previewResponse()
+    pending.push(response)
+    if (!signal) throw new Error('Preview cancellation signal missing')
+    signals.push(signal)
+    return response.promise
+  })
+  const page = show(
+    <RetrySamples
+      canManage
+      policy={fixture()}
+      onDraft={vi.fn()}
+      onTest={vi.fn()}
+    />
+  )
+  await screen.findByText('Failure 5')
+  await userEvent
+    .setup()
+    .click(screen.getByRole('button', { name: 'Test visible samples' }))
+  expect(pending).toHaveLength(4)
+  page.unmount()
+  expect(signals.every((signal) => signal.aborted)).toBe(true)
+  await act(async () => {
+    pending.forEach((response, index) =>
+      response.resolve(previewDecision(index + 1))
+    )
+  })
+  expect(pending).toHaveLength(4)
 })

@@ -1737,6 +1737,10 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "temporary upstream failure", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "bad gateway without receipt", body: `{"error":{"message":"upstream response lost"}}`, httpStatus: 502, wantCalls: 1, wantWallet: 900, wantStatus: "execution_unknown", wantBilling: "unknown"},
 				{name: "bad gateway with accepted receipt", body: `{"id":"accepted-task","status":"queued","error":{"message":"response incomplete"}}`, httpStatus: 502, wantCalls: 1, wantWallet: 900, wantStatus: "submitted", wantBilling: "reserved"},
+				{name: "submission unknown gateway error refunds", body: `{"error":{"message":"task submission state is unknown","type":"upstream_error"}}`, httpStatus: 502, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+				{name: "no upstream channel refunds", body: `{"error":{"message":"No available channel for model video under group example (distributor) (request id: example)","type":"new_api_error","code":"model_not_found"}}`, httpStatus: 503, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+				{name: "refundable submissions exhaust configured retry", body: `{"error":{"message":"task submission state is unknown","type":"upstream_error"}}`, httpStatus: 502, configured: "refundable_retry", wantCalls: 2, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
+				{name: "refundable submission cannot clear an earlier unrelated unknown", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "unrelated_first", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "explicit refusal", body: `{"error":{"code":"invalid_request","message":"unsupported prompt"}}`, httpStatus: 400, wantCalls: 1, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "dispatch barrier rejected", beforeSend: true, wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
 				{name: "custom retry cannot turn a dispatch barrier rejection into unknown execution", beforeSend: true, configured: "before_send", wantWallet: 1000, wantStatus: "failed", wantBilling: "refunded"},
@@ -1758,6 +1762,10 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 				{name: "custom unknown retry budget stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "budget", wantCalls: 2, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 				{name: "custom unknown local preparation stop retains hold", body: `{"error":{"message":"temporary failure"}}`, httpStatus: 500, configured: "local", wantCalls: 1, wantWallet: 900, wantStatus: "failed", wantBilling: "unknown"},
 			} {
+				if tc.lostReceipt && provider == "yuxibox" {
+					tc.name = "transport submission failure refunds"
+					tc.wantWallet, tc.wantStatus, tc.wantBilling = 1000, "failed", "refunded"
+				}
 				t.Run(tc.name, func(t *testing.T) {
 					user := model.User{Username: fmt.Sprintf("nldw-submission-%d", index), AffCode: common.GetUUID(), Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
 					if tc.billingFailure == "wallet_short" {
@@ -1810,6 +1818,11 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 							_, _ = w.Write([]byte(`{"error":{"code":"invalid_request","message":"unsupported prompt"}}`))
 							return
 						}
+						if tc.configured == "unrelated_first" && calls.Load() > 1 {
+							w.WriteHeader(http.StatusBadGateway)
+							_, _ = w.Write([]byte(`{"error":{"message":"task submission state is unknown"}}`))
+							return
+						}
 						w.WriteHeader(tc.httpStatus)
 						_, _ = w.Write([]byte(tc.body))
 					}))
@@ -1839,6 +1852,8 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						statuses := []int{500}
 						if tc.configured == "preconsume" {
 							statuses = []int{403, 500}
+						} else if tc.configured == "refundable_retry" {
+							statuses = []int{502}
 						}
 						policy.Rules = []mediaretry.Rule{{ID: "custom-unknown", Name: "Custom unknown", Enabled: true, Scope: mediaretry.Scope{ChannelIDs: []int{channel.Id}}, Match: mediaretry.Match{HTTPStatuses: statuses}, Steps: []mediaretry.Step{{ID: "retry", Action: action, MaxAttempts: 1}}, OnExhausted: mediaretry.Stop}}
 						_, err = model.SaveMediaRetryPolicy(t.Context(), policy, policy.Revision, 1, nil)
@@ -1959,6 +1974,14 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 					assert.Equal(t, wantToken, token.RemainQuota)
 					assert.Equal(t, tc.wantStatus, job.Status)
 					assert.Equal(t, tc.wantBilling, job.BillingStatus)
+					if tc.wantBilling == "refunded" {
+						assert.Zero(t, job.Quota)
+						assert.Zero(t, token.UsedQuota)
+						var refunds []model.Log
+						require.NoError(t, model.LOG_DB.Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Find(&refunds).Error)
+						require.Len(t, refunds, 1)
+						assert.Equal(t, 100, refunds[0].Quota)
+					}
 					if tc.subscriptionSuccess {
 						require.NoError(t, db.First(&subscription, subscription.Id).Error)
 						assert.EqualValues(t, 100, subscription.AmountUsed)
@@ -2035,7 +2058,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						assert.Equal(t, model.TaskStatusUnknown, frozen.InitialUnknownAttempts[0].Status)
 						return
 					}
-					if tc.configured != "" {
+					if tc.configured != "" && tc.wantBilling == "unknown" {
 						assert.Equal(t, "policy_stopped_unknown", job.ReferenceRecoveryStage)
 						var native model.Task
 						require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&native).Error)

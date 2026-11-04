@@ -496,17 +496,16 @@ func executeTaskSubmissionWith(
 	stage := "start"
 	defer func() {
 		if !durable && relayInfo.Billing != nil {
-			unconfirmed := c.GetBool("async_media_policy_unknown_ended") || c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected")
+			unconfirmed := c.GetBool("async_media_policy_unknown_ended") || c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected") && !c.GetBool("async_media_submission_refundable")
 			if value, exists := c.Get("async_media_initial_retry_request"); exists {
 				request, ok := value.(*service.AsyncVideoRequest)
-				unconfirmed = unconfirmed || ok && request != nil && len(request.InitialUnknownAttempts) > 0
+				unconfirmed = unconfirmed || ok && request != nil && request.HasRetainedSubmissionAttempts()
 			}
 			if unconfirmed {
 				service.RecordAsyncVideoReservationFailure(c, relayInfo)
 				// The persisted media dispatch barrier owns this reservation even
-				// when a receipt is lost or its Task row cannot be saved. Refund
-				// requires confirmation of every attempt; a later rejection cannot
-				// settle an earlier unknown submission.
+				// when a receipt is lost or its Task row cannot be saved. A later
+				// refundable error cannot settle an earlier unresolved submission.
 				logger.LogWarn(c, fmt.Sprintf("video submission requires reconciliation; retaining reservation task=%s stage=%s", relayInfo.PublicTaskID, stage))
 				return
 			}
@@ -574,11 +573,11 @@ func executeTaskSubmissionWith(
 		mixedUnconfirmed := c.GetBool("async_media_mixed_video") && c.GetBool("async_media_reconciliation_dispatched") && !c.GetBool("async_media_submission_rejected")
 		if taskErr != nil && mixedUnconfirmed {
 			// A mixed operation may already be running on its pinned provider.
-			// Neither the outer relay loop nor a local refund may replay it.
+			// The outer relay loop must not replay it.
 			taskErr.NoRetry = true
 			value, _ := c.Get("async_media_initial_retry_request")
 			request, ok := value.(*service.AsyncVideoRequest)
-			if ok && request != nil && request.RetryFact != nil && request.RetryFact.Unknown && !request.RetryFact.HasOutput && service.HasDurableTaskReservation(relayInfo, 0) {
+			if !c.GetBool("async_media_submission_refundable") && ok && request != nil && request.RetryFact != nil && request.RetryFact.Unknown && !request.RetryFact.HasOutput && service.HasDurableTaskReservation(relayInfo, 0) {
 				attempt := model.VideoTaskAttempt{ChannelID: relayInfo.ChannelId}
 				if value, exists := c.Get("async_media_current_attempt"); exists {
 					if current, valid := value.(*model.VideoTaskAttempt); valid && current != nil {

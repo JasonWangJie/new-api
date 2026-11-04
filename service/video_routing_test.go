@@ -32,6 +32,9 @@ func TestVideoRoutingRewritePreservesPublicRequest(t *testing.T) {
 		{name: "metadata only stays metadata only", body: `{"model":"A","metadata":{"resolution":"480p","seconds":20}}`, resolution: "720p", expected: `{"model":"E","metadata":{"resolution":"720p","seconds":20}}`},
 		{name: "explicit default insertion", body: `{"model":"A","seconds":20}`, resolution: "720p", expected: `{"model":"E","resolution":"720p","seconds":20}`},
 		{name: "explicit downgrade", body: `{"model":"A","resolution":"1080p","size":"1920x1080","seconds":20}`, resolution: "720p", expected: `{"model":"E","resolution":"720p","size":"1280x720","seconds":20}`},
+		{name: "preserve size aspect ratio", body: `{"model":"A","resolution":"480p","size":"16:9","seconds":20}`, resolution: "720p", expected: `{"model":"E","resolution":"720p","size":"16:9","seconds":20}`},
+		{name: "preserve metadata adaptive ratio", body: `{"model":"A","metadata":{"resolution":"480p","size":"adaptive","seconds":20}}`, resolution: "720p", expected: `{"model":"E","metadata":{"resolution":"720p","size":"adaptive","seconds":20}}`},
+		{name: "ratio does not replace explicit resolution insertion", body: `{"model":"A","size":"adaptive","seconds":20}`, resolution: "720p", expected: `{"model":"E","resolution":"720p","size":"adaptive","seconds":20}`},
 		{name: "downgrade rounding forbidden", body: `{"model":"A","size":"1280x720"}`, resolution: "480p", failure: "exact pixel aspect ratio"},
 		{name: "rounding forbidden", body: `{"model":"A","size":"853x480"}`, resolution: "720p", failure: "exact pixel aspect ratio"},
 		{name: "pixel category mismatch", body: `{"model":"A","size":"480x480"}`, resolution: "720p", failure: "does not represent"},
@@ -71,6 +74,7 @@ func TestVideoRoutingRewriteMultipartPreservesFilesAndOrder(t *testing.T) {
 	_, err = first.Write(firstBytes)
 	require.NoError(t, err)
 	require.NoError(t, writer.WriteField("resolution", "480p"))
+	require.NoError(t, writer.WriteField("size", "9:16"))
 	require.NoError(t, writer.WriteField("metadata", `{"size":"480x854","duration":20,"references":[{"role":"last_frame","source":"unchanged"}]}`))
 	second, err := writer.CreateFormFile("input_reference", "second.png")
 	require.NoError(t, err)
@@ -106,11 +110,12 @@ func TestVideoRoutingRewriteMultipartPreservesFilesAndOrder(t *testing.T) {
 		}
 		require.NoError(t, part.Close())
 	}
-	assert.Equal(t, []string{"model", "prompt", "input_reference", "resolution", "metadata", "input_reference", "seconds"}, names)
+	assert.Equal(t, []string{"model", "prompt", "input_reference", "resolution", "size", "metadata", "input_reference", "seconds"}, names)
 	assert.Equal(t, []string{"first.png", "second.png"}, filenames)
 	assert.Equal(t, [][]byte{firstBytes, secondBytes}, files)
 	assert.Equal(t, "E", fields["model"])
 	assert.Equal(t, "720p", fields["resolution"])
+	assert.Equal(t, "9:16", fields["size"])
 	assert.Equal(t, "20", fields["seconds"])
 	assert.Equal(t, "unchanged @图1 @图2 480p", fields["prompt"])
 	assert.JSONEq(t, `{"size":"720x1281","duration":20,"references":[{"role":"last_frame","source":"unchanged"}]}`, fields["metadata"])
@@ -210,6 +215,83 @@ func TestVideoRoutingTargetChecksLivePermissionsAndCapability(t *testing.T) {
 			assert.Contains(t, string(execution), `"resolution":"720p"`)
 			assert.Contains(t, string(execution), fmt.Sprintf(`"seconds":%d`, tc.seconds))
 		})
+	}
+}
+
+func TestVideoRoutingConfiguredTargetDimensions(t *testing.T) {
+	db, task, channel := videoRoutingFixture(t)
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "huahuo-video", "plugin.js"))
+	require.NoError(t, err)
+	_, err = jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: "huahuo-video"})
+	require.NoError(t, err)
+	setting := `{"task_plugin_key":"huahuo-video","task_plugin_model_configs":{"vendor-video":{"duration":{"min":4,"max":30,"step":1,"default":5},"durations_by_resolution":{"720p":{"min":4,"max":12,"step":2,"default":4},"1080p":{"values":[5,8],"default":5}},"resolutions":["480p","720p","1080p"],"aspect_ratios":["16:9","adaptive"],"modes":["text_to_video"],"references":{"images":0,"videos":0,"audios":0},"billing_mode":"per_second"}}}`
+	mapping := `{"target-alias":"vendor-video"}`
+	channel.Setting, channel.ModelMapping = &setting, &mapping
+	require.NoError(t, db.Save(&channel).Error)
+
+	for _, tc := range []struct {
+		name, targetResolution string
+		resolutions            []string
+		seconds                int
+		allowed                bool
+	}{
+		{name: "resolution value supported", targetResolution: "1080p", seconds: 8, allowed: true},
+		{name: "resolution value missing", targetResolution: "1080p", seconds: 6},
+		{name: "global range cannot expand resolution values", targetResolution: "1080p", seconds: 20},
+		{name: "resolution range supported", targetResolution: "720p", seconds: 10, allowed: true},
+		{name: "resolution range step rejected", targetResolution: "720p", seconds: 9},
+		{name: "resolution range maximum rejected", targetResolution: "720p", seconds: 14},
+		{name: "unchanged resolution uses its own duration", resolutions: []string{"1080p"}, seconds: 20},
+		{name: "all matching resolutions unavailable", resolutions: []string{"720p", "1080p"}, seconds: 20},
+		{name: "one matching resolution supported", resolutions: []string{"720p", "1080p"}, seconds: 10, allowed: true},
+		{name: "unrestricted resolutions include global range", seconds: 20, allowed: true},
+		{name: "target override selects execution duration", targetResolution: "720p", resolutions: []string{"1080p"}, seconds: 10, allowed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := model.VideoRoutingTarget{ChannelID: channel.Id, Model: "target-alias", Resolution: tc.targetResolution}
+			config := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "dimensions", Name: "Execution dimensions", Enabled: true, OnExhausted: "fail", Match: model.VideoRoutingMatch{Resolutions: tc.resolutions, Seconds: model.VideoRoutingSeconds{Min: &tc.seconds, Max: &tc.seconds}}, Targets: []model.VideoRoutingTarget{target}}}}
+			err := ValidateVideoRoutingConfig(t.Context(), config)
+			if tc.allowed {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "no compatible mode, resolution and duration")
+			}
+			if tc.targetResolution != "" {
+				raw := []byte(fmt.Sprintf(`{"model":"public-source","prompt":"test","seconds":%d,"resolution":"480p","aspect_ratio":"16:9"}`, tc.seconds))
+				_, _, _, err := DecodeVideoRoutingTarget(t.Context(), target, "default", "create", raw, "application/json", task.UserId)
+				if tc.allowed {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "duration is outside")
+				}
+			}
+		})
+	}
+
+	for _, contentType := range []string{"application/json", "multipart/form-data"} {
+		for _, ratio := range []string{"16:9", "adaptive"} {
+			t.Run(contentType+" size="+ratio, func(t *testing.T) {
+				raw := []byte(fmt.Sprintf(`{"model":"public-source","prompt":"test","seconds":8,"resolution":"480p","size":%q}`, ratio))
+				requestType := contentType
+				if contentType == "multipart/form-data" {
+					var body bytes.Buffer
+					writer := multipart.NewWriter(&body)
+					for _, field := range [][2]string{{"model", "public-source"}, {"prompt", "test"}, {"seconds", "8"}, {"resolution", "480p"}, {"size", ratio}} {
+						require.NoError(t, writer.WriteField(field[0], field[1]))
+					}
+					require.NoError(t, writer.Close())
+					raw, requestType = body.Bytes(), writer.FormDataContentType()
+				}
+				target := model.VideoRoutingTarget{ChannelID: channel.Id, Model: "target-alias", Resolution: "720p"}
+				candidate, rewritten, rewrittenType, err := DecodeVideoRoutingTarget(t.Context(), target, "default", "create", raw, requestType, task.UserId)
+				require.NoError(t, err)
+				assert.Equal(t, "vendor-video", candidate.UpstreamModel)
+				_, body, err := MixedVideoRequestContext(rewritten, rewrittenType, "create")
+				require.NoError(t, err)
+				assert.Equal(t, ratio, body["size"])
+				assert.Equal(t, "720p", body["resolution"])
+			})
+		}
 	}
 }
 

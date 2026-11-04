@@ -1552,6 +1552,23 @@ test.each([
   }
 )
 
+test('administrator can apply the Unknown billing status filter', async () => {
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  await screen.findByRole('button', { name: task.id })
+
+  await user.click(screen.getByRole('button', { name: 'More filters' }))
+  await user.click(screen.getByRole('combobox', { name: 'Billing status' }))
+  await user.click(screen.getByRole('option', { name: 'Unknown' }))
+  await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+
+  await waitFor(() =>
+    expect(
+      vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('billing_status')
+    ).toBe('unknown')
+  )
+})
+
 test.each([
   { admin: false, mobile: false },
   { admin: true, mobile: false },

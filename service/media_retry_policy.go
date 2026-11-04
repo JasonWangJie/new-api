@@ -2,18 +2,9 @@ package service
 
 import (
 	"context"
-	"sync"
-
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/mediaretry"
 )
-
-var mediaRetryCompiler struct {
-	sync.Mutex
-	document string
-	compiled *mediaretry.CompiledPolicy
-}
 
 // MediaRetryEligibility describes a read-only dispatch snapshot. The executor
 // always repeats these checks immediately before sending the request.
@@ -56,19 +47,7 @@ func EvaluateMediaRetry(ctx context.Context, fact mediaretry.Fact, state mediare
 
 func evaluateMediaRetryPolicy(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {
 	fact = NormalizeMediaRetryFact(fact)
-	encoded, err := common.Marshal(policy)
-	if err != nil {
-		return mediaretry.Decision{}, err
-	}
-	mediaRetryCompiler.Lock()
-	compiled := mediaRetryCompiler.compiled
-	if compiled == nil || mediaRetryCompiler.document != string(encoded) {
-		compiled, err = mediaretry.Compile(policy)
-		if err == nil {
-			mediaRetryCompiler.document, mediaRetryCompiler.compiled = string(encoded), compiled
-		}
-	}
-	mediaRetryCompiler.Unlock()
+	compiled, err := mediaretry.Compile(policy)
 	if err != nil {
 		return mediaretry.Decision{}, err
 	}

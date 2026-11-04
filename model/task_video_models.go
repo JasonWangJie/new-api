@@ -11,7 +11,22 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// lockTaskVideoModelBindings serializes catalog writers across processes, even
+// when no channel declares a model yet. Acquire it before reading any bindings
+// so MySQL's repeatable-read snapshot includes the preceding writer's commit.
+func lockTaskVideoModelBindings(tx *gorm.DB) error {
+	guard := Option{Key: "task_video_model_bindings_guard", Value: "{}"}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"key"}),
+	}).Create(&guard).Error; err != nil {
+		return err
+	}
+	return lockForUpdate(tx).Where(map[string]any{"key": guard.Key}).Take(&Option{}).Error
+}
 
 func (channel *Channel) TaskVideoModelConfig(publicModel string) (string, dto.TaskVideoModelConfig, error) {
 	settings := channel.GetSetting()

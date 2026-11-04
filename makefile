@@ -7,8 +7,10 @@ DEV_API_SERVICE = new-api
 DEV_POSTGRES_DB = new-api
 DEV_POSTGRES_USER = root
 DEV_SQLITE_PATH ?= one-api.db
+PYTHON ?= python3
+TEST_DATABASE_DIALECT ?= sqlite
 
-.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test
+.PHONY: all build-web build-all-web start-api dev dev-api dev-api-rebuild dev-web reset-setup test test-database
 
 all: build-all-web start-api
 
@@ -47,6 +49,9 @@ test:
 		GOWORK=off go test $$root_packages
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
+
+test-database:
+	$(PYTHON) scripts/test_database_matrix.py --dialect $(TEST_DATABASE_DIALECT)
 
 reset-setup:
 	@echo "Resetting local setup wizard state..."

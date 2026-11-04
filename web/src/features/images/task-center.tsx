@@ -765,7 +765,13 @@ function TaskCenterSession({
         className='flex flex-col gap-1.5 space-y-0'
         label={t('Billing status')}
         value={draft.billing_status}
-        options={choices(['pending', 'succeeded', 'not_billable', 'failed'])}
+        options={choices([
+          'pending',
+          'succeeded',
+          'not_billable',
+          'failed',
+          'unknown',
+        ])}
         onChange={(value) =>
           setDraft((previous) => ({
             ...previous,
