@@ -44,7 +44,7 @@ func TestYuxiboxVideoModelsDefaultsAndBilling(t *testing.T) {
 	plugin := loadYuxiboxVideoPlugin(t, nil)
 	assert.Empty(t, plugin.Meta.ChannelTypes)
 	assert.Equal(t, "https://yuxibox.xyz", plugin.Meta.BaseURL)
-	assert.Equal(t, "1.0.2", plugin.Meta.Version)
+	assert.Equal(t, "1.0.3", plugin.Meta.Version)
 	models := []struct {
 		name, resolution, quantity string
 		seconds                    int
@@ -60,6 +60,7 @@ func TestYuxiboxVideoModelsDefaultsAndBilling(t *testing.T) {
 		{"seedance-2.5-yx-g-no-face", "720p", "video_count", 30, false},
 		{"seedance-2.5-yx-sz", "720p", "seconds", 5, false},
 		{"seedance2.5-yx-count", "720p", "video_count", 30, false},
+		{"seedance2.5-yx-ml", "720p", "video_count", 30, false},
 		{"minimax-h3-quality", "768p", "seconds", 5, true},
 		{"minimax-h3-fast", "768p", "seconds", 5, true},
 		{"minimax-h3-15s", "768p", "seconds", 5, false},
@@ -95,7 +96,7 @@ func TestYuxiboxVideoModelsDefaultsAndBilling(t *testing.T) {
 			body := descriptor["body"].(map[string]any)
 			assert.Equal(t, tc.name, body["model"])
 			assert.EqualValues(t, tc.seconds, body["seconds"])
-			if tc.name == "seedance2.5-yx-count" {
+			if tc.name == "seedance2.5-yx-count" || tc.name == "seedance2.5-yx-ml" {
 				assert.NotContains(t, body, "resolution")
 			} else {
 				assert.Equal(t, tc.resolution, body["resolution"])
@@ -117,6 +118,77 @@ func TestYuxiboxVideoModelsDefaultsAndBilling(t *testing.T) {
 		})
 	}
 	assert.ElementsMatch(t, wantModels, plugin.Meta.Models)
+}
+
+func TestYuxiboxCountModelsShareVideoLimits(t *testing.T) {
+	plugin := loadYuxiboxVideoPlugin(t, nil)
+	countProfile, found := plugin.Meta.VideoProfileForModel("seedance2.5-yx-count")
+	require.True(t, found)
+	mlProfile, found := plugin.Meta.VideoProfileForModel("seedance2.5-yx-ml")
+	require.True(t, found)
+	countProfile.Models = mlProfile.Models
+	assert.Equal(t, countProfile, mlProfile)
+	countSchema, _ := plugin.Meta.UsageForModel("seedance2.5-yx-count")
+	mlSchema, _ := plugin.Meta.UsageForModel("seedance2.5-yx-ml")
+	assert.Equal(t, countSchema, mlSchema)
+
+	images, videos, audios := make([]any, 11), make([]any, 11), make([]any, 11)
+	for i := range images {
+		images[i] = "https://cdn.example/reference.png"
+		videos[i] = "https://cdn.example/reference.mp4"
+		audios[i] = "https://cdn.example/reference.mp3"
+	}
+	for _, modelName := range []string{"seedance2.5-yx-count", "seedance2.5-yx-ml"} {
+		t.Run(modelName, func(t *testing.T) {
+			for _, tc := range []struct {
+				name   string
+				fields map[string]any
+				valid  bool
+			}{
+				{name: "minimum duration", fields: map[string]any{"seconds": 5}, valid: true},
+				{name: "maximum duration and total references", fields: map[string]any{"seconds": 30, "reference_images": images[:10], "reference_videos": videos[:10], "reference_audios": audios[:10]}, valid: true},
+				{name: "duration below minimum", fields: map[string]any{"seconds": 4}},
+				{name: "duration above maximum", fields: map[string]any{"seconds": 31}},
+				{name: "unsupported resolution", fields: map[string]any{"resolution": "1080p"}},
+				{name: "total references above maximum", fields: map[string]any{"reference_images": images, "reference_videos": videos[:10], "reference_audios": audios[:10]}},
+				{name: "videos above maximum", fields: map[string]any{"reference_videos": videos}},
+				{name: "audios above maximum", fields: map[string]any{"reference_audios": audios}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					request := map[string]any{"prompt": "preserve the reference order"}
+					for key, value := range tc.fields {
+						request[key] = value
+					}
+					intent, err := decodeYuxiboxVideoRequest(t, plugin, modelName, request)
+					if !tc.valid {
+						require.Error(t, err)
+						return
+					}
+					require.NoError(t, err)
+					canonical := intent["requestBody"].(map[string]any)
+					assert.EqualValues(t, tc.fields["seconds"], canonical["seconds"])
+					assert.Equal(t, "720p", canonical["resolution"])
+					profile, found := plugin.Meta.VideoProfileForModel(modelName)
+					require.True(t, found)
+					require.NoError(t, service.ValidateVideoProfileRequest(profile, intent["action"].(string), canonical, nil))
+					ctx := map[string]any{"model": "public-alias", "upstreamModel": modelName, "requestBody": canonical, "baseUrl": "https://upstream.example", "apiKey": "key"}
+					value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+					require.NoError(t, err)
+					body := value.(map[string]any)["body"].(map[string]any)
+					assert.Equal(t, modelName, body["model"])
+					assert.NotContains(t, body, "resolution")
+					if tc.fields["reference_images"] != nil {
+						assert.Equal(t, images[:10], body["reference_images"])
+						assert.Equal(t, videos[:10], body["videos"])
+						assert.Equal(t, audios[:10], body["audios"])
+					}
+					value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+					require.NoError(t, err)
+					assert.Equal(t, map[string]any{"video_count": int64(1)}, value)
+				})
+			}
+		})
+	}
 }
 
 func TestYuxiboxVideoReferencesAndSizeAliases(t *testing.T) {
