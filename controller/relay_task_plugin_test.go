@@ -869,6 +869,165 @@ func (b *taskSubmissionTestBilling) Reserve(int) error {
 	return b.reserveErr
 }
 
+func TestMixedVideoPricingAPIThroughSubmissionAndSettlement(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	dialect := os.Getenv("RETRY_POLICY_TEST_DIALECT")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	db := modelManagementDB(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+	token.RemainQuota = 1000
+	require.NoError(t, db.Create(user).Error)
+	require.NoError(t, db.Create(token).Error)
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "pricing-chain:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "pricing-chain")
+	previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
+	previousSecret, previousTimeout := common.CryptoSecret, constant.TaskTimeoutMinutes
+	previousBatch, previousLogs, previousExport, previousUnit := common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit
+	pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = pluginruntime.NewRegistry(), ExecuteAsyncVideo
+	common.CryptoSecret, constant.TaskTimeoutMinutes = "pricing-chain-signing-secret", 10
+	common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = false, true, false, 500000
+	t.Cleanup(func() {
+		pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = previousRegistry, previousSubmit
+		common.CryptoSecret, constant.TaskTimeoutMinutes = previousSecret, previousTimeout
+		common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled, common.QuotaPerUnit = previousBatch, previousLogs, previousExport, previousUnit
+	})
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() { assert.NoError(t, client.Close()) })
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+	source, err := builtinplugins.Source("drama")
+	require.NoError(t, err)
+	_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "drama"})
+	require.NoError(t, err)
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"pricing-upstream-%d","status":"queued"}`, calls.Add(1))
+	}))
+	t.Cleanup(upstream.Close)
+	const modelName = "seedance2.5-A"
+	setting := `{"task_plugin_key":"drama"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "pricing-chain", Status: common.ChannelStatusEnabled, Group: "default", Models: modelName, Key: "fixture-key", Setting: &setting, BaseURL: &upstream.URL}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: modelName, ChannelId: channel.Id, Enabled: true}).Error)
+	for _, platform := range []string{"mixed", "drama"} {
+		policy := model.ImageGroupPolicy{Group: "default", Platform: platform, PolicyKey: service.ImageIdentityHash("default", platform), Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: `[{"id":"seedance2.5-A","media_type":"video"}]`}
+		require.NoError(t, db.Create(&policy).Error)
+		require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.MediaPoolBindingKey(policy, modelName, "1K", "video"), Group: "default", Platform: platform, Mode: "model", Model: modelName, ChannelId: channel.Id, Priority: 1}).Error)
+	}
+	const providerExpression = `tier("provider", u("seconds") * 0.00003)`
+	savePrice := func(expression string) {
+		t.Helper()
+		snapshot, err := model.GetModelPricingSnapshot([]string{modelName})
+		require.NoError(t, err)
+		require.Len(t, snapshot.Entries, 1)
+		change := model.ModelPricingChange{ModelName: modelName, ExpectedVersion: snapshot.Entries[0].Version, Pricing: model.PricingValues{
+			billing_setting.MixedVideoBillingExprOption: expression,
+			billing_setting.PluginBillingExprOption:     map[string]string{"drama": providerExpression},
+		}}
+		response := modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), `"success":true`)
+	}
+	engine := gin.New()
+	engine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), AcceptAsyncVideo)
+	accept := func(provider string, quota int, expression string) model.AsyncMediaJob {
+		t.Helper()
+		body, err := common.Marshal(gin.H{"model": modelName, "provider": provider, "prompt": "pricing chain", "seconds": 20, "resolution": "480p", "aspect_ratio": "16:9"})
+		require.NoError(t, err)
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		recorder := httptest.NewRecorder()
+		beforeCalls := calls.Load()
+		engine.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+		assert.Equal(t, beforeCalls, calls.Load(), "admission must not submit upstream")
+		var accepted struct {
+			TaskID string `json:"task_id"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &accepted))
+		var job model.AsyncMediaJob
+		require.NoError(t, db.Where("task_id = ?", accepted.TaskID).Take(&job).Error)
+		plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+		require.NoError(t, err)
+		var frozen service.AsyncVideoRequest
+		require.NoError(t, common.Unmarshal(plain, &frozen))
+		require.NotNil(t, frozen.Billing.Tiered)
+		assert.Equal(t, quota, frozen.Billing.Price.Quota)
+		assert.Equal(t, expression, frozen.Billing.Tiered.ExprString)
+		assert.Equal(t, provider == "", frozen.Billing.Tiered.MixedVideoBilling)
+		return job
+	}
+	dispatch := func(job model.AsyncMediaJob, quota int) model.Task {
+		t.Helper()
+		claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "pricing-chain-worker", 120)
+		require.NoError(t, err)
+		require.True(t, claimed)
+		require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+		var task model.Task
+		require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+		assert.Equal(t, quota, task.Quota)
+		return task
+	}
+	assertAccounting := func(balance, used int) {
+		t.Helper()
+		require.NoError(t, db.First(user, user.Id).Error)
+		require.NoError(t, db.First(token, token.Id).Error)
+		require.NoError(t, db.First(&channel, channel.Id).Error)
+		assert.Equal(t, balance, user.Quota)
+		assert.Equal(t, balance, token.RemainQuota)
+		assert.Equal(t, used, user.UsedQuota)
+		assert.Equal(t, used, token.UsedQuota)
+		assert.EqualValues(t, used, channel.UsedQuota)
+	}
+	settle := func(task model.Task, status model.TaskStatus, seconds float64, quota int) {
+		t.Helper()
+		previous := task.Status
+		task.Status = status
+		stale := task
+		result := &relaycommon.TaskInfo{UsageFacts: map[string]any{"seconds": seconds}}
+		won, err := service.SettleTaskBillingOnComplete(t.Context(), nil, &task, previous, result)
+		require.NoError(t, err)
+		require.True(t, won)
+		assert.Equal(t, quota, task.Quota)
+		won, err = service.SettleTaskBillingOnComplete(t.Context(), nil, &stale, previous, result)
+		require.NoError(t, err)
+		assert.False(t, won, "duplicate terminal updates must not charge or refund again")
+	}
+	const priceA = `tier("A", u("seconds") * 0.00001)`
+	const priceB = `tier("B", u("seconds") * 0.00002)`
+	savePrice(priceA)
+	first := accept("", 100, priceA)
+	assertAccounting(1000, 0)
+	// The accepted job must retain A even if the administrator changes the
+	// price while it is queued, before the worker reserves any funds.
+	savePrice(priceB)
+	firstTask := dispatch(first, 100)
+	assertAccounting(900, 100)
+	settle(firstTask, model.TaskStatusSuccess, 999, 100)
+	assertAccounting(900, 100)
+	secondTask := dispatch(accept("", 200, priceB), 200)
+	assertAccounting(700, 300)
+	settle(secondTask, model.TaskStatusFailure, 20, 0)
+	assertAccounting(900, 100)
+	providerTask := dispatch(accept("drama", 300, providerExpression), 300)
+	assertAccounting(600, 400)
+	settle(providerTask, model.TaskStatusSuccess, 20, 300)
+	assertAccounting(600, 400)
+	assert.EqualValues(t, 3, calls.Load())
+	var logs []model.Log
+	require.NoError(t, db.Where("user_id = ? AND type IN ?", user.Id, []int{model.LogTypeConsume, model.LogTypeRefund}).Order("id").Find(&logs).Error)
+	require.Len(t, logs, 4, "three reservations and one refund must be auditable exactly once")
+	assert.Equal(t, []int{100, 200, 200, 300}, []int{logs[0].Quota, logs[1].Quota, logs[2].Quota, logs[3].Quota})
+	assert.Equal(t, model.LogTypeRefund, logs[2].Type)
+}
+
 func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
 	previousRegistry := pluginruntime.DefaultRegistry
 	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()

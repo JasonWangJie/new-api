@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
+	"gorm.io/gorm"
 )
 
 // ValidateMixedVideoProfilePricing requires every enabled capability variant to
@@ -47,8 +48,21 @@ func ValidateMixedVideoProfilePricing(expression string, profiles []jsplugin.Vid
 // ValidateMixedVideoPricing checks the complete price draft before it becomes
 // active. Disabled policies and models without a price can be staged separately.
 func ValidateMixedVideoPricing(ctx context.Context, expressions map[string]string) error {
+	return ValidateMixedVideoPricingResolved(ctx, model.DB, func(name string) (string, bool) {
+		if expression, configured := expressions[name]; configured {
+			return expression, true
+		}
+		if billing_setting.GetBillingMode(name) == billing_setting.BillingModeTieredExpr {
+			return billing_setting.GetBillingExpr(name)
+		}
+		return "", false
+	}, nil)
+}
+
+// ValidateMixedVideoPricingResolved validates an effective transactional price draft.
+func ValidateMixedVideoPricingResolved(ctx context.Context, db *gorm.DB, resolve func(string) (string, bool), names map[string]bool) error {
 	var policies []model.ImageGroupPolicy
-	if err := model.DB.WithContext(ctx).Where("platform = ? AND enabled = ? AND async_enabled = ?", "mixed", true, true).Find(&policies).Error; err != nil {
+	if err := db.WithContext(ctx).Where("platform = ? AND enabled = ? AND async_enabled = ?", "mixed", true, true).Find(&policies).Error; err != nil {
 		return err
 	}
 	for _, policy := range policies {
@@ -57,17 +71,17 @@ func ValidateMixedVideoPricing(ctx context.Context, expressions map[string]strin
 			return err
 		}
 		for _, capability := range catalog {
-			expression, configured := expressions[capability.Id]
-			if !configured && billing_setting.GetBillingMode(capability.Id) == billing_setting.BillingModeTieredExpr {
-				expression, configured = billing_setting.GetBillingExpr(capability.Id)
+			if names != nil && !names[capability.Id] {
+				continue
 			}
+			expression, configured := resolve(capability.Id)
 			if capability.MediaType != "video" || !configured {
 				continue
 			}
 			if err := billing_setting.ValidateMixedVideoBillingExpr(expression); err != nil {
 				return fmt.Errorf("mixed video model %s in group %s: %w", capability.Id, policy.Group, err)
 			}
-			profiles, err := MixedVideoModelProfiles(ctx, policy, capability.Id, capability.VideoOverrides, false)
+			profiles, err := mixedVideoModelProfilesDB(ctx, db, policy, capability.Id, capability.VideoOverrides, false)
 			if err == nil {
 				err = ValidateMixedVideoProfilePricing(expression, profiles)
 			}

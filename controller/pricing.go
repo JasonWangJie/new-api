@@ -1,15 +1,79 @@
 package controller
 
 import (
+	"context"
 	"maps"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 )
+
+// addMixedVideoPricing describes default group policy routing. A token-specific
+// platform mapping or explicit provider can select a different route.
+func addMixedVideoPricing(ctx context.Context, pricing []model.Pricing, usableGroups map[string]string) error {
+	var policies []model.ImageGroupPolicy
+	if err := model.DB.WithContext(ctx).Where("platform = ?", "mixed").Find(&policies).Error; err != nil {
+		return err
+	}
+	groupsByModel := make(map[string][]model.ImageGroupPolicy)
+	for _, policy := range policies {
+		if _, usable := usableGroups[policy.Group]; !usable {
+			continue
+		}
+		var catalog []service.ImageModelCapability
+		if err := common.UnmarshalJsonStr(policy.Models, &catalog); err != nil {
+			return err
+		}
+		for _, capability := range catalog {
+			if capability.MediaType == "video" {
+				groupsByModel[capability.Id] = append(groupsByModel[capability.Id], policy)
+			}
+		}
+	}
+	if len(groupsByModel) == 0 {
+		return nil
+	}
+	cfg, err := service.GetMediaRuntimeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	overrides := billing_setting.GetMixedVideoBillingExprCopy()
+	for i := range pricing {
+		groupPolicies := groupsByModel[pricing[i].ModelName]
+		if len(groupPolicies) == 0 {
+			continue
+		}
+		mixed := &model.PricingMixedVideo{Groups: []string{}, EnabledGroups: []string{}, Source: "unconfigured", BillingUsageSchema: billing_setting.MixedVideoUsageSchema()}
+		expression, configured := billing_setting.GetMixedVideoBillingExpr(pricing[i].ModelName)
+		if configured && billing_setting.ValidateMixedVideoBillingExpr(expression) == nil {
+			mixed.Source = "model"
+			if _, overridden := overrides[pricing[i].ModelName]; overridden {
+				mixed.Source = "override"
+			}
+			mixed.BillingMode = billing_setting.BillingModeTieredExpr
+			mixed.BillingExpr = expression
+		}
+		for _, policy := range groupPolicies {
+			group := policy.Group
+			if !slices.Contains(mixed.Groups, group) {
+				mixed.Groups = append(mixed.Groups, group)
+			}
+			if cfg.VideoAsyncEnabled && policy.Enabled && policy.AsyncEnabled && !slices.Contains(mixed.EnabledGroups, group) {
+				mixed.EnabledGroups = append(mixed.EnabledGroups, group)
+			}
+		}
+		slices.Sort(mixed.Groups)
+		slices.Sort(mixed.EnabledGroups)
+		pricing[i].MixedVideoPricing = mixed
+	}
+	return nil
+}
 
 func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string]string) []model.Pricing {
 	if len(pricing) == 0 {
@@ -57,6 +121,10 @@ func GetPricing(c *gin.Context) {
 
 	usableGroup = service.GetUserUsableGroups(group)
 	pricing = filterPricingByUsableGroups(pricing, usableGroup)
+	if err := addMixedVideoPricing(c.Request.Context(), pricing, usableGroup); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	// check groupRatio contains usableGroup
 	for group := range ratio_setting.GetGroupRatioCopy() {
 		if _, ok := usableGroup[group]; !ok {

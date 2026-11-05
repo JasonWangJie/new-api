@@ -67,6 +67,13 @@ export type ModelPricingEntry = ModelPricingDescription & {
   version: string
   configured: PricingValues
   usage_schema?: BillingUsageSchema
+  mixed_video?: {
+    eligible: boolean
+    valid: boolean
+    expression: string
+    source: 'override' | 'model' | 'unconfigured'
+    usage_schema: BillingUsageSchema
+  }
 }
 
 export type ModelPricingConfig = {
@@ -150,6 +157,7 @@ export async function invalidateModelPricing(client: QueryClient) {
     client.invalidateQueries({ queryKey: ['model-pricing-config'] }),
     client.invalidateQueries({ queryKey: ['model-pricing-preview'] }),
     client.invalidateQueries({ queryKey: ['image-configuration'] }),
+    client.invalidateQueries({ queryKey: ['image-capabilities'] }),
     client.invalidateQueries({ queryKey: ['system-options'] }),
     client.invalidateQueries({ queryKey: ['pricing'] }),
     client.invalidateQueries({ queryKey: ['models'] }),

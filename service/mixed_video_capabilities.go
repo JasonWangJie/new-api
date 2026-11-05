@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"gorm.io/gorm"
 )
 
 var errNoCompatibleMixedVideoChannel = errors.New("No compatible video channel is available for the mixed model")
@@ -78,12 +79,16 @@ func ValidateMixedVideoOverridesStatic(overrides VideoModelOverrides) error {
 // relationships between duration, resolution and inputs. Pool filtering is used
 // for public capabilities, while configuration discovery also permits new pools.
 func MixedVideoModelProfiles(ctx context.Context, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, error) {
+	return mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool)
+}
+
+func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, error) {
 	if err := ValidateMixedVideoOverridesStatic(overrides); err != nil {
 		return nil, err
 	}
 	group := policy.Group
 	var abilities []model.Ability
-	query := model.DB.WithContext(ctx).Where("enabled = ?", true).Where("model IN ?", []string{publicModel, ratio_setting.RoutingMatchModelName(publicModel)})
+	query := db.WithContext(ctx).Where("enabled = ?", true).Where("model IN ?", []string{publicModel, ratio_setting.RoutingMatchModelName(publicModel)})
 	if group != "auto" || requirePool {
 		query = query.Where(map[string]any{"group": group})
 	}
@@ -96,13 +101,13 @@ func MixedVideoModelProfiles(ctx context.Context, policy model.ImageGroupPolicy,
 	}
 	var channels []model.Channel
 	if len(ids) > 0 {
-		if err := model.DB.WithContext(ctx).Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Order("id").Find(&channels).Error; err != nil {
+		if err := db.WithContext(ctx).Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Order("id").Find(&channels).Error; err != nil {
 			return nil, err
 		}
 	}
 	var pools []model.ImageChannelPool
 	if requirePool {
-		if err := model.DB.WithContext(ctx).Where(map[string]any{"group": group, "platform": "mixed"}).Where("channel_id > ?", 0).Find(&pools).Error; err != nil {
+		if err := db.WithContext(ctx).Where(map[string]any{"group": group, "platform": "mixed"}).Where("channel_id > ?", 0).Find(&pools).Error; err != nil {
 			return nil, err
 		}
 	}

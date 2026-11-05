@@ -56,6 +56,15 @@ export type BillingPluginVariant = {
 }
 
 export type PricingModel = {
+  /** Public price for the viewer's default mixed-video routing groups. */
+  mixed_video_pricing?: {
+    billing_expr?: string
+    billing_mode?: 'tiered_expr'
+    billing_usage_schema: BillingUsageSchema
+    source: 'override' | 'model' | 'unconfigured'
+    groups: string[]
+    enabled_groups?: string[]
+  }
   billing_plugin_variants?: BillingPluginVariant[]
   id: number
   model_name: string

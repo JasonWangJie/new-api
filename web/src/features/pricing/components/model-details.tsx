@@ -78,8 +78,12 @@ import {
   type DynamicPriceEntry,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { getAvailableGroups, isTokenBasedModel } from '../lib/model-helpers'
-import { withPluginPricing } from '../lib/plugin-pricing'
+import {
+  getAvailableGroups,
+  getConfiguredGroupRatio,
+  isTokenBasedModel,
+} from '../lib/model-helpers'
+import { withPluginPricing, withPublicPricing } from '../lib/plugin-pricing'
 import { formatFixedPrice, formatGroupPrice } from '../lib/price'
 import {
   evaluateTaskUsageExamples,
@@ -1015,6 +1019,44 @@ type GroupPricingSectionProps = {
 
 function GroupPricingSection(props: GroupPricingSectionProps) {
   const { t } = useTranslation()
+  const mixedModel = withPublicPricing(props.model)
+  if (mixedModel === props.model) {
+    return <DirectGroupPricingSection {...props} />
+  }
+  const availableGroups = props.model.mixed_video_pricing?.enabled_groups
+  const disabledGroups = availableGroups
+    ? mixedModel.enable_groups.filter(
+        (group) => !availableGroups.includes(group)
+      )
+    : []
+  return (
+    <div className='space-y-5'>
+      <section aria-label={t('Mixed video public price')}>
+        <SectionTitle>{t('Mixed video public price')}</SectionTitle>
+        <p className='text-muted-foreground mb-3 text-xs'>
+          {t(
+            'Applies to the default mixed routing for these groups. Selecting a provider uses its separate price.'
+          )}
+        </p>
+        {disabledGroups.length > 0 && (
+          <p className='text-muted-foreground mb-3 text-xs'>
+            {t('Mixed routing disabled in: {{groups}}', {
+              groups: disabledGroups.join(', '),
+            })}
+          </p>
+        )}
+        <ProviderGroupPricingSection {...props} model={mixedModel} hideTitle />
+      </section>
+      <section aria-label={t('Provider pricing')}>
+        <SectionTitle>{t('Provider pricing')}</SectionTitle>
+        <DirectGroupPricingSection {...props} />
+      </section>
+    </div>
+  )
+}
+
+function DirectGroupPricingSection(props: GroupPricingSectionProps) {
+  const { t } = useTranslation()
   const variants = props.model.billing_plugin_variants
   if (!variants?.length) {
     return <ProviderGroupPricingSection {...props} />
@@ -1200,7 +1242,7 @@ function ProviderGroupPricingSection(
     })
     const formattedPricesByGroup = new Map(
       availableGroups.map((group) => {
-        const ratio = props.groupRatio[group] || 1
+        const ratio = getConfiguredGroupRatio(props.groupRatio, group)
         return [
           group,
           getDynamicFormattedPricesByTier(dynamicTiers, {
@@ -1223,7 +1265,7 @@ function ProviderGroupPricingSection(
         <AutoGroupChain model={props.model} autoGroups={props.autoGroups} />
         <div className='space-y-3'>
           {availableGroups.map((group) => {
-            const ratio = props.groupRatio[group] || 1
+            const ratio = getConfiguredGroupRatio(props.groupRatio, group)
             const formattedPricesByTier =
               formattedPricesByGroup.get(group) ??
               new Map<DynamicPricingTier, Map<string, string>>()
@@ -1429,7 +1471,8 @@ function ProviderGroupPricingSection(
             header: t('Ratio'),
             className: thClass,
             cellClassName: 'text-muted-foreground py-2.5 font-mono',
-            cell: (group) => `${props.groupRatio[group] || 1}x`,
+            cell: (group) =>
+              `${getConfiguredGroupRatio(props.groupRatio, group)}x`,
           },
           ...(isTokenBased
             ? [
@@ -1504,19 +1547,21 @@ export interface ModelDetailsContentProps {
 export function ModelDetailsContent(props: ModelDetailsContentProps) {
   const { t } = useTranslation()
   const showRechargePrice = props.showRechargePrice ?? false
+  const priceModel = withPublicPricing(props.model)
+  const isMixed = priceModel !== props.model
 
   const isDynamic =
-    props.model.billing_mode === 'tiered_expr' &&
-    Boolean(props.model.billing_expr)
+    priceModel.billing_mode === 'tiered_expr' &&
+    Boolean(priceModel.billing_expr)
 
-  const simpleTaskPricing = hasSimpleTaskPricing(props.model)
+  const simpleTaskPricing = hasSimpleTaskPricing(priceModel)
   const taskTiers = getTaskPricingDisplayTiers(
-    props.model.billing_expr,
-    props.model.billing_usage_schema,
+    priceModel.billing_expr,
+    priceModel.billing_usage_schema,
     true
   )
   const showBasePrices =
-    !props.model.billing_usage_schema ||
+    !priceModel.billing_usage_schema ||
     simpleTaskPricing ||
     taskTiers.length === 0
 
@@ -1545,10 +1590,23 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
           <OverviewSummaryGrid model={props.model} />
 
           <section className='bg-card/60 space-y-5 rounded-xl border p-4 shadow-sm'>
-            <SectionTitle>{t('Pricing')}</SectionTitle>
+            <SectionTitle>
+              {isMixed ? t('Mixed video public price') : t('Pricing')}
+            </SectionTitle>
+            {isMixed && (
+              <p className='text-muted-foreground text-xs'>
+                {props.model.mixed_video_pricing?.source === 'model'
+                  ? t('Using model pricing')
+                  : t(
+                      props.model.mixed_video_pricing?.source === 'unconfigured'
+                        ? 'No mixed video price configured'
+                        : 'Custom mixed video price'
+                    )}
+              </p>
+            )}
             {showBasePrices && (
               <PriceSection
-                model={props.model}
+                model={priceModel}
                 priceRate={props.priceRate}
                 usdExchangeRate={props.usdExchangeRate}
                 tokenUnit={props.tokenUnit}
@@ -1558,8 +1616,8 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
             {isDynamic && !simpleTaskPricing && (
               <DynamicPricingBreakdown
                 publishedPricesOnly
-                billingExpr={props.model.billing_expr}
-                usageSchema={props.model.billing_usage_schema}
+                billingExpr={priceModel.billing_expr}
+                usageSchema={priceModel.billing_usage_schema}
                 taskPriceOptions={{
                   showRechargePrice,
                   priceRate: props.priceRate,

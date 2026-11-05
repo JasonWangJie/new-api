@@ -25,7 +25,20 @@ type PricingPluginVariant struct {
 	BillingUsageExamples []jsplugin.UsageExample              `json:"billing_usage_examples,omitempty"`
 }
 
+// PricingMixedVideo describes the host-owned price for providerless mixed video
+// requests under the listed default group policies.
+// EnabledGroups reflects configuration switches, not live channel readiness.
+type PricingMixedVideo struct {
+	Groups             []string                             `json:"groups"`
+	EnabledGroups      []string                             `json:"enabled_groups"`
+	Source             string                               `json:"source"`
+	BillingMode        string                               `json:"billing_mode,omitempty"`
+	BillingExpr        string                               `json:"billing_expr,omitempty"`
+	BillingUsageSchema map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema"`
+}
+
 type Pricing struct {
+	MixedVideoPricing      *PricingMixedVideo                   `json:"mixed_video_pricing,omitempty"`
 	BillingPluginVariants  []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
 	ModelName              string                               `json:"model_name"`
 	Description            string                               `json:"description,omitempty"`

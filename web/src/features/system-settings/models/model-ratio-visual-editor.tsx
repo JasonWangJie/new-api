@@ -46,8 +46,18 @@ import {
   DataTableView,
   useDataTable,
 } from '@/components/data-table'
+import { sideDrawerContentClassName } from '@/components/drawer-layout'
+import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { useModelPricing } from '@/features/model-pricing/api'
+import { ModelPricingPanel } from '@/features/model-pricing/model-pricing-panel'
 import {
   applyPricingDraft,
   pricingOptions,
@@ -154,6 +164,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
   const [sheetOpen, setSheetOpen] = useState(false)
   const [editorOpen, setEditorOpen] = useState(false)
   const [editData, setEditData] = useState<ModelRatioData | null>(null)
+  const [unifiedDirty, setUnifiedDirty] = useState(false)
   const pricingConfig = useModelPricing(
     editData?.name ? [editData.name] : [],
     Boolean(editData?.name)
@@ -330,6 +341,12 @@ const ModelRatioVisualEditorComponent = forwardRef<
 
   const handleEdit = useCallback(
     (model: ModelRow) => {
+      if (unifiedDirty) {
+        toast.error(
+          t('Save or discard pricing changes before switching models.')
+        )
+        return
+      }
       const editableModel = model.draft ?? model.saved ?? model
       let editBillingMode: PricingMode = 'per-token'
       if (editableModel.billingMode === 'tiered_expr') {
@@ -355,7 +372,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       setEditorOpen(true)
       if (isMobile) setSheetOpen(true)
     },
-    [isMobile]
+    [isMobile, unifiedDirty, t]
   )
 
   const handleAdd = useCallback(() => {
@@ -609,6 +626,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
     ref,
     () => ({
       commitOpenEditor: async () => {
+        if (unifiedDirty) return false
         if (!editorOpen || !editorPanelRef.current) return true
         const data = await editorPanelRef.current.commitDraft()
         if (!data) return false
@@ -617,10 +635,19 @@ const ModelRatioVisualEditorComponent = forwardRef<
         return true
       },
     }),
-    [editorOpen, persistPricingData]
+    [editorOpen, persistPricingData, unifiedDirty]
   )
 
   const hasRows = table.getRowModel().rows.length > 0
+  const selectedPricing = pricingConfig.data?.entries.find(
+    (entry) => entry.model_name === editData?.name
+  )
+  const pricingLoading = pricingConfig.isFetching && !pricingConfig.data
+  const unified = Boolean(
+    selectedPricing?.mixed_video?.eligible ||
+    selectedPricing?.configured['billing_setting.mixed_video_billing_expr'] !==
+      undefined
+  )
 
   let emptyStateText = t('No models configured. Use Add model to get started.')
   if (table.getState().globalFilter) {
@@ -739,7 +766,21 @@ const ModelRatioVisualEditorComponent = forwardRef<
         </div>
 
         <div className='hidden min-h-0 min-w-0 md:block'>
-          {editorOpen ? (
+          {!isMobile && editorOpen && pricingLoading && <LoadingState />}
+          {!isMobile &&
+            editorOpen &&
+            !pricingLoading &&
+            unified &&
+            editData && (
+              <div className='h-full overflow-auto rounded-xl border p-4'>
+                <ModelPricingPanel
+                  key={editData.name}
+                  modelName={editData.name}
+                  onDirtyChange={setUnifiedDirty}
+                />
+              </div>
+            )}
+          {!isMobile && editorOpen && !pricingLoading && !unified && (
             <ModelPricingEditorPanel
               ref={editorPanelRef}
               editData={editData}
@@ -757,7 +798,8 @@ const ModelRatioVisualEditorComponent = forwardRef<
               isSaving={isSaving}
               className='h-full min-h-0'
             />
-          ) : (
+          )}
+          {!editorOpen && (
             <div className='bg-card text-muted-foreground flex h-full min-h-0 flex-col items-center justify-center gap-3 rounded-xl border border-dashed p-6 text-center'>
               <div className='text-foreground text-base font-medium'>
                 {t('Select a model to edit pricing')}
@@ -787,25 +829,55 @@ const ModelRatioVisualEditorComponent = forwardRef<
         </Button>
       </DataTableBulkActions>
 
-      {isMobile && (
-        <ModelPricingSheet
-          ref={editorPanelRef}
+      {isMobile && (unified || pricingLoading) && editData ? (
+        <Sheet
           open={sheetOpen}
-          onOpenChange={setSheetOpen}
-          editData={editData}
-          pluginVariants={
-            pricingConfig.data?.entries.find(
-              (entry) => entry.model_name === editData?.name
-            )?.plugin_variants
-          }
-          usageSchema={
-            pricingConfig.data?.entries.find(
-              (entry) => entry.model_name === editData?.name
-            )?.usage_schema
-          }
-          onSave={onSave}
-          isSaving={isSaving}
-        />
+          onOpenChange={(open) => {
+            if (!unifiedDirty) setSheetOpen(open)
+          }}
+        >
+          <SheetContent
+            side='right'
+            className={sideDrawerContentClassName(
+              'overflow-y-auto p-4 pt-12 sm:max-w-2xl'
+            )}
+          >
+            <SheetHeader className='sr-only'>
+              <SheetTitle>{t('Edit model pricing')}</SheetTitle>
+              <SheetDescription>{editData.name}</SheetDescription>
+            </SheetHeader>
+            {pricingLoading ? (
+              <LoadingState />
+            ) : (
+              <ModelPricingPanel
+                key={editData.name}
+                modelName={editData.name}
+                onDirtyChange={setUnifiedDirty}
+              />
+            )}
+          </SheetContent>
+        </Sheet>
+      ) : (
+        isMobile && (
+          <ModelPricingSheet
+            ref={editorPanelRef}
+            open={sheetOpen}
+            onOpenChange={setSheetOpen}
+            editData={editData}
+            pluginVariants={
+              pricingConfig.data?.entries.find(
+                (entry) => entry.model_name === editData?.name
+              )?.plugin_variants
+            }
+            usageSchema={
+              pricingConfig.data?.entries.find(
+                (entry) => entry.model_name === editData?.name
+              )?.usage_schema
+            }
+            onSave={onSave}
+            isSaving={isSaving}
+          />
+        )
       )}
     </div>
   )

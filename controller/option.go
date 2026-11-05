@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 var completionRatioMetaOptionKeys = []string{
@@ -190,7 +191,7 @@ func UpdateOption(c *gin.Context) {
 		})
 		return
 	}
-	if option.Key == billing_setting.MixedVideoBillingExprOption {
+	if model.IsModelPricingOption(option.Key) {
 		mixedVideoConfigurationMu.Lock()
 		defer mixedVideoConfigurationMu.Unlock()
 	}
@@ -437,18 +438,12 @@ func UpdateOption(c *gin.Context) {
 			common.ApiErrorMsg(c, "mixed video billing expressions must be a JSON object")
 			return
 		}
-		for name, expression := range expressions {
-			if err = service.ValidateImageModelName(name); err == nil {
-				err = billing_setting.ValidateMixedVideoBillingExpr(expression)
-			}
+		for name := range expressions {
+			err = service.ValidateImageModelName(name)
 			if err != nil {
 				common.ApiErrorMsg(c, fmt.Sprintf("mixed video model %s: %v", name, err))
 				return
 			}
-		}
-		if err = service.ValidateMixedVideoPricing(c.Request.Context(), expressions); err != nil {
-			common.ApiErrorMsg(c, err.Error())
-			return
 		}
 	case billing_setting.PluginBillingExprOption:
 		var expressions map[string]string
@@ -517,7 +512,14 @@ func UpdateOption(c *gin.Context) {
 		common.ApiSuccess(c, change)
 		return
 	}
-	err = model.UpdateOption(option.Key, option.Value.(string))
+	if model.IsModelPricingOption(option.Key) {
+		validator := func(tx *gorm.DB, resolve func(string) (string, bool)) error {
+			return service.ValidateMixedVideoPricingResolved(c.Request.Context(), tx, resolve, nil)
+		}
+		err = model.UpdateModelPricingOptions(map[string]string{option.Key: option.Value.(string)}, validator)
+	} else {
+		err = model.UpdateOption(option.Key, option.Value.(string))
+	}
 	if err != nil {
 		if errors.Is(err, system_setting.ErrPasskeyRPIDInvalid) {
 			writeSecurityOperationError(c, err)

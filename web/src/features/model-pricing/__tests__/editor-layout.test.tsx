@@ -29,6 +29,9 @@ import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { ModelPriceCell } from '@/features/pricing/components/model-price-cell'
+import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
+import { evaluateBillingExpression } from '@/features/pricing/lib/billing-expression/runtime'
 import { SettingsPageProvider } from '@/features/system-settings/components/settings-page-context'
 import { ModelPricingEditorPanel } from '@/features/system-settings/models/model-pricing-sheet'
 import { ModelRatioForm } from '@/features/system-settings/models/model-ratio-form'
@@ -40,6 +43,466 @@ import { ModelPricingPanel } from '../model-pricing-panel'
 import type { PricingValues } from '../pricing'
 
 const clients: QueryClient[] = []
+
+it('refreshes an already mounted public price after saving mixed-price inheritance', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  let configured: PricingValues = {
+    'billing_setting.billing_mode': 'tiered_expr',
+    'billing_setting.billing_expr': 'tier("base", u("requests") * 3)',
+    'billing_setting.mixed_video_billing_expr':
+      'tier("mixed", u("requests") * 7)',
+  }
+  const usageSchema = { requests: { type: 'number', unit: 'count' } }
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/status') {
+      return {
+        data: { success: true, data: { price: 1, usd_exchange_rate: 1 } },
+      }
+    }
+    const mixedExpression =
+      configured['billing_setting.mixed_video_billing_expr'] ??
+      configured['billing_setting.billing_expr']
+    if (url === '/api/pricing') {
+      return {
+        data: {
+          success: true,
+          vendors: [],
+          group_ratio: { default: 1 },
+          data: [
+            {
+              id: 1,
+              model_name: 'video',
+              quota_type: 0,
+              model_ratio: 1,
+              completion_ratio: 1,
+              enable_groups: ['default'],
+              mixed_video_pricing: {
+                groups: ['default'],
+                enabled_groups: ['default'],
+                source: 'override',
+                billing_mode: 'tiered_expr',
+                billing_expr: mixedExpression,
+                billing_usage_schema: usageSchema,
+              },
+            },
+          ],
+        },
+      }
+    }
+    expect(url).toBe('/api/option/model_pricing')
+    return {
+      data: {
+        success: true,
+        data: {
+          entries: [
+            {
+              model_name: 'video',
+              version: 'v1',
+              configured,
+              effective: configured,
+              mixed_video: {
+                eligible: true,
+                valid: true,
+                source: 'override',
+                expression: mixedExpression,
+                usage_schema: usageSchema,
+              },
+            },
+          ],
+        },
+      },
+    }
+  })
+  vi.spyOn(api, 'patch').mockImplementation(async (_url, body) => {
+    configured = (body as { changes: { pricing: PricingValues }[] })
+      .changes[0].pricing
+    return { data: { success: true } }
+  })
+  function PublicPrice() {
+    const pricing = usePricingData()
+    return (
+      <section aria-label='Public model price'>
+        {pricing.models[0] && (
+          <ModelPriceCell
+            model={pricing.models[0]}
+            options={{ selectedGroup: 'default' }}
+          />
+        )}
+      </section>
+    )
+  }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <PublicPrice />
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const publicPrice = screen.getByRole('region', { name: 'Public model price' })
+  await waitFor(() => expect(publicPrice).toHaveTextContent('7/unit'))
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Use model pricing' }))
+  await user.click(screen.getByRole('button', { name: 'Save mixed video price' }))
+  await waitFor(() => expect(publicPrice).toHaveTextContent('3/unit'))
+  expect(publicPrice).not.toHaveTextContent('7/unit')
+})
+
+it('removes a mixed video override through the single-model versioned save without changing provider prices', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const configured = {
+    'billing_setting.billing_mode': 'tiered_expr',
+    'billing_setting.billing_expr': 'u("seconds")',
+    'billing_setting.plugin_billing_expr': { wolong: 'u("video_count")' },
+    'billing_setting.mixed_video_billing_expr': 'u("requests")',
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        entries: [
+          {
+            model_name: 'video',
+            version: 'v1',
+            configured,
+            effective: configured,
+            mixed_video: {
+              eligible: true,
+              source: 'override',
+              expression: 'u("requests")',
+              usage_schema: { requests: { type: 'number', unit: 'count' } },
+            },
+          },
+        ],
+      },
+    },
+  })
+  const patch = vi
+    .spyOn(api, 'patch')
+    .mockResolvedValue({ data: { success: true } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('button', { name: 'Use model pricing' })
+  )
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
+  await waitFor(() =>
+    expect(patch).toHaveBeenCalledWith('/api/option/model_pricing', {
+      changes: [
+        {
+          model_name: 'video',
+          expected_version: 'v1',
+          pricing: {
+            'billing_setting.billing_mode': 'tiered_expr',
+            'billing_setting.billing_expr': 'u("seconds")',
+            'billing_setting.plugin_billing_expr': {
+              wolong: 'u("video_count")',
+            },
+          },
+        },
+      ],
+    })
+  )
+})
+
+it('previews the model price when switching from a mixed override to inheritance', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const configured = {
+    'billing_setting.mixed_video_billing_expr':
+      'tier("old", u("seconds") * 0.6)',
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        entries: [
+          {
+            model_name: 'video',
+            version: 'v1',
+            configured,
+            effective: {
+              'billing_setting.billing_mode': 'tiered_expr',
+              'billing_setting.billing_expr':
+                'tier("base", u("seconds") * 9.2)',
+            },
+            mixed_video: {
+              eligible: true,
+              valid: true,
+              source: 'override',
+              expression:
+                configured['billing_setting.mixed_video_billing_expr'],
+              usage_schema: { seconds: { type: 'number', unit: 'second' } },
+            },
+          },
+        ],
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('button', { name: 'Use model pricing' })
+  )
+  const section = screen.getByRole('region', {
+    name: 'Mixed video public price',
+  })
+  expect(section).toHaveTextContent('9.2')
+  expect(section).not.toHaveTextContent('0.6')
+})
+
+it('keeps a mixed price draft after a version conflict and offers confirmed reload', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const configured = {
+    'billing_setting.mixed_video_billing_expr':
+      'tier("old", u("requests") * 2)',
+  }
+  const entry = {
+    model_name: 'video',
+    version: 'v1',
+    configured,
+    effective: {},
+    mixed_video: {
+      eligible: true,
+      valid: true,
+      source: 'override',
+      expression: configured['billing_setting.mixed_video_billing_expr'],
+      usage_schema: { requests: { type: 'number', unit: 'count' } },
+    },
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { entries: [entry] } },
+  })
+  vi.spyOn(api, 'patch').mockResolvedValue({
+    data: { success: false, message: 'Price changed' },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('button', { name: 'Use model pricing' })
+  )
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
+  expect(await screen.findByText('Price changed')).toHaveAttribute(
+    'role',
+    'alert'
+  )
+  expect(screen.getByText('No mixed video price configured')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Reload pricing' }))
+  const dialog = screen.getByRole('alertdialog')
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Reload pricing' })
+  )
+  expect(
+    await screen.findByRole('button', { name: 'Custom mixed video price' })
+  ).toBeVisible()
+})
+
+it('copies a compatible provider price while excluding request rules and saves the expression unchanged', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const copied =
+    'tier("seconds", u("seconds") * 0.6) * (u("video_input") == "video" ? 1.65 : 1.45)'
+  const schema = {
+    seconds: { type: 'number', unit: 'second' },
+    video_input: { enum: ['none', 'video'] },
+  }
+  const configured = {
+    'billing_setting.mixed_video_billing_expr':
+      'tier("old", u("seconds") * 0.3)',
+  }
+  const entry = {
+    model_name: 'video',
+    version: 'v1',
+    configured,
+    effective: {},
+    mixed_video: {
+      eligible: true,
+      valid: true,
+      source: 'override',
+      expression: configured['billing_setting.mixed_video_billing_expr'],
+      usage_schema: schema,
+    },
+    plugin_variants: [
+      {
+        plugin_key: 'drama',
+        plugin_name: 'Drama',
+        effective: copied,
+        usage_schema: schema,
+      },
+      {
+        plugin_key: 'rules',
+        plugin_name: 'Request rules',
+        effective: 'u("seconds") * (header("x") == "a" ? 2 : 1)',
+        usage_schema: schema,
+      },
+      {
+        plugin_key: 'dynamic',
+        plugin_name: 'Dynamic usage key',
+        effective: 'u("sec" + "onds")',
+        usage_schema: schema,
+      },
+    ],
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: { success: true, data: { entries: [entry] } },
+  })
+  const patch = vi
+    .spyOn(api, 'patch')
+    .mockResolvedValue({ data: { success: true } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  await user.click(
+    await screen.findByRole('button', { name: 'Load existing prices' })
+  )
+  await user.click(
+    await screen.findByRole('combobox', { name: 'Price source' })
+  )
+  expect(
+    screen.queryByRole('option', { name: 'Request rules' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByRole('option', { name: 'Dynamic usage key' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('option', { name: 'Drama' }))
+  await user.click(screen.getByRole('button', { name: 'Copy existing price' }))
+  expect(patch).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
+  await waitFor(() =>
+    expect(patch).toHaveBeenCalledWith('/api/option/model_pricing', {
+      changes: [
+        {
+          model_name: 'video',
+          expected_version: 'v1',
+          pricing: { 'billing_setting.mixed_video_billing_expr': copied },
+        },
+      ],
+    })
+  )
+})
+
+it('edits reference multipliers without adding an unused seconds meter', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const expression =
+    '(u("resolution") == "720p" ? tier("720p", u("requests") * 6) : tier("1080p", u("requests") * 9)) * (u("video_input") == "video" ? 1.5 : 1.25)'
+  const configured = { 'billing_setting.mixed_video_billing_expr': expression }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        entries: [
+          {
+            model_name: 'video',
+            version: 'v1',
+            configured,
+            effective: {},
+            mixed_video: {
+              eligible: true,
+              valid: true,
+              source: 'override',
+              expression,
+              usage_schema: {
+                requests: { type: 'number', unit: 'count' },
+                seconds: { type: 'number', unit: 'second' },
+                resolution: { enum: ['720p', '1080p'] },
+                video_input: { enum: ['none', 'video'] },
+              },
+            },
+          },
+        ],
+      },
+    },
+  })
+  const patch = vi
+    .spyOn(api, 'patch')
+    .mockResolvedValue({ data: { success: true } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelPricingPanel modelName='video' />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  const multiplier = await screen.findByRole('textbox', {
+    name: 'With reference video multiplier',
+  })
+  await user.clear(multiplier)
+  await user.type(multiplier, '1.8')
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
+  await waitFor(() => expect(patch).toHaveBeenCalled())
+  const body = patch.mock.calls[0][1] as {
+    changes: { pricing: PricingValues }[]
+  }
+  const saved =
+    body.changes[0].pricing['billing_setting.mixed_video_billing_expr'] ?? ''
+  expect(saved).not.toContain('u("seconds")')
+  for (const [resolution, video_input, cost] of [
+    ['720p', 'none', 7.5],
+    ['720p', 'video', 10.8],
+    ['1080p', 'none', 11.25],
+    ['1080p', 'video', 16.2],
+  ] as const) {
+    const result = evaluateBillingExpression(saved, {
+      usage: { requests: 1, resolution, video_input },
+    })
+    expect(result.status).toBe('success')
+    if (result.status === 'success') expect(result.cost).toBeCloseTo(cost)
+  }
+})
 const originalColumnVisibility = localStorage.getItem(
   'model-ratio-column-visibility'
 )
@@ -392,5 +855,85 @@ it.each(['default', 'unset'] as const)(
       expect.objectContaining({ ExposeRatioEnabled: variant === 'default' }),
       undefined
     )
+  }
+)
+
+it.each([false, true])(
+  'waits for pricing metadata and mounts one editor with mobile=%s',
+  async (mobile) => {
+    const matchMedia = window.matchMedia
+    vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: mobile && query === '(max-width: 767px)',
+    }))
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+    let release: (() => void) | undefined
+    const ready = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      if (url === '/api/option/model_pricing') {
+        await ready
+        return {
+          data: {
+            success: true,
+            data: {
+              entries: [
+                {
+                  model_name: 'example-model',
+                  version: 'v1',
+                  configured: {},
+                  effective: {},
+                  mixed_video: {
+                    eligible: true,
+                    valid: false,
+                    expression: '',
+                    source: 'unconfigured',
+                    usage_schema: {
+                      requests: { type: 'number', unit: 'count' },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        }
+      }
+      return {
+        data: {
+          success: true,
+          data: url === '/api/channel/models_enabled' ? ['example-model'] : [],
+          vendors: [],
+        },
+      }
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    render(
+      <QueryClientProvider client={client}>
+        <PricingFormFixture variant='default' onSave={async () => undefined} />
+      </QueryClientProvider>
+    )
+    const user = userEvent.setup()
+    await waitFor(() => expect(client.isFetching()).toBe(0))
+    await user.click(await screen.findByRole('button', { name: 'Edit' }))
+    expect(await screen.findByText('Loading...')).toBeVisible()
+    expect(
+      screen.queryByRole('region', { name: 'Edit model pricing' })
+    ).not.toBeInTheDocument()
+    release?.()
+    expect(
+      await screen.findByRole('region', { name: 'Mixed video public price' })
+    ).toBeVisible()
+    expect(
+      screen.getAllByRole('region', { name: 'Mixed video public price' })
+    ).toHaveLength(1)
+    if (mobile) {
+      expect(screen.getByRole('dialog')).toHaveClass('w-full', 'p-4', 'pt-12')
+    }
   }
 )

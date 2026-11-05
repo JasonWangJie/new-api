@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { FILTER_ALL } from '../constants'
 import type {
   BillingPluginVariant,
   BillingUsageSchema,
@@ -23,6 +24,32 @@ import type {
 } from '../types'
 import { compileBillingExpression } from './billing-expression/parser'
 import { visitExpression } from './billing-expression/types'
+
+export function withPublicPricing(
+  model: PricingModel,
+  selectedGroup?: string
+): PricingModel {
+  const mixed = model.mixed_video_pricing
+  if (!mixed?.groups.length) return model
+  if (
+    selectedGroup &&
+    selectedGroup !== FILTER_ALL &&
+    !mixed.groups.includes(selectedGroup)
+  ) {
+    return model
+  }
+  return {
+    ...model,
+    quota_type: 0,
+    billing_mode: 'tiered_expr',
+    billing_expr: mixed.billing_expr ?? '',
+    billing_usage_schema: mixed.billing_usage_schema,
+    billing_usage_examples: undefined,
+    billing_plugin_variants: undefined,
+    mixed_video_pricing: undefined,
+    enable_groups: mixed.groups,
+  }
+}
 
 export function splitPluginBillingExprKey(
   key: string
@@ -93,6 +120,7 @@ export function withPluginPricing(
     billing_usage_schema: variant.billing_usage_schema,
     billing_usage_examples: variant.billing_usage_examples,
     billing_plugin_variants: undefined,
+    mixed_video_pricing: undefined,
   }
 }
 

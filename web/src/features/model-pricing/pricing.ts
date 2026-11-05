@@ -50,6 +50,7 @@ export type PricingValues = Partial<
   >
 > & {
   'billing_setting.plugin_billing_expr'?: Record<string, string>
+  'billing_setting.mixed_video_billing_expr'?: string
 }
 export type PricingOptions = Record<PricingKey, string>
 

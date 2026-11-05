@@ -6,7 +6,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func GetModelPricingConfig(c *gin.Context) {
@@ -64,7 +66,16 @@ func UpdateModelPricingConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
 		return
 	}
-	if err := model.UpdateModelPricing(request.Changes); err != nil {
+	mixedVideoConfigurationMu.Lock()
+	defer mixedVideoConfigurationMu.Unlock()
+	namesToValidate := make(map[string]bool, len(request.Changes))
+	for _, change := range request.Changes {
+		namesToValidate[change.ModelName] = true
+	}
+	validator := func(tx *gorm.DB, resolve func(string) (string, bool)) error {
+		return service.ValidateMixedVideoPricingResolved(c.Request.Context(), tx, resolve, namesToValidate)
+	}
+	if err := model.UpdateModelPricing(request.Changes, validator); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, model.ErrModelPricingConflict) {
 			status = http.StatusConflict

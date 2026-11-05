@@ -34,11 +34,20 @@ type ModelPricingChange struct {
 
 type ModelPricingEntry struct {
 	ModelPricingDescription
+	MixedVideo     ModelPricingMixedVideo               `json:"mixed_video"`
 	PluginVariants []ModelPricingPluginVariant          `json:"plugin_variants,omitempty"`
 	ModelName      string                               `json:"model_name"`
 	Version        string                               `json:"version"`
 	Configured     PricingValues                        `json:"configured"`
 	UsageSchema    map[string]jsplugin.UsageFieldSchema `json:"usage_schema,omitempty"`
+}
+
+type ModelPricingMixedVideo struct {
+	Eligible    bool                                 `json:"eligible"`
+	Valid       bool                                 `json:"valid"`
+	Expression  string                               `json:"expression"`
+	Source      string                               `json:"source"`
+	UsageSchema map[string]jsplugin.UsageFieldSchema `json:"usage_schema"`
 }
 
 type ModelPricingPluginVariant struct {
@@ -66,7 +75,7 @@ var ErrModelPricingConflict = errors.New("model pricing changed; reload before s
 var modelPricingOptionKeys = []string{
 	"AudioCompletionRatio", "AudioRatio", "CacheRatio", "CompletionRatio",
 	"CreateCacheRatio", "ImageRatio", "ModelPrice", "ModelRatio",
-	"billing_setting.billing_expr", "billing_setting.billing_mode", billing_setting.PluginBillingExprOption,
+	"billing_setting.billing_expr", "billing_setting.billing_mode", billing_setting.MixedVideoBillingExprOption, billing_setting.PluginBillingExprOption,
 }
 
 var modelPricingMutationMu sync.Mutex
@@ -95,7 +104,7 @@ func defaultPricingMaps() map[string]map[string]any {
 
 func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bool, []string, error) {
 	var rows []Option
-	if err := db.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Find(&rows).Error; err != nil {
+	if err := db.Where(map[string]any{"key": modelPricingOptionKeys}).Find(&rows).Error; err != nil {
 		return nil, nil, nil, err
 	}
 	values := defaultPricingMaps()
@@ -264,11 +273,41 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 	}
 	sort.Strings(names)
 	result := &ModelPricingSnapshot{Entries: make([]ModelPricingEntry, 0, len(names)), Options: make(map[string]string), EmptyVersion: ModelPricingVersion(PricingValues{})}
+	eligibleMixed := make(map[string]bool)
+	if DB.Migrator().HasTable(&ImageGroupPolicy{}) {
+		var policies []ImageGroupPolicy
+		if err := DB.Where("platform = ?", "mixed").Find(&policies).Error; err != nil {
+			return nil, err
+		}
+		for _, policy := range policies {
+			var catalog []struct {
+				ID        string `json:"id"`
+				MediaType string `json:"media_type"`
+			}
+			if err := common.UnmarshalJsonStr(policy.Models, &catalog); err != nil {
+				return nil, err
+			}
+			for _, capability := range catalog {
+				if capability.MediaType == "video" {
+					eligibleMixed[capability.ID] = true
+				}
+			}
+		}
+	}
 	generation := jsplugin.DefaultRegistry.Generation()
 	for _, name := range names {
 		configured := modelPricingValues(values, name)
 		entry := ModelPricingEntry{ModelName: name, Version: ModelPricingVersion(configured), Configured: configured,
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
+		entry.MixedVideo = ModelPricingMixedVideo{Eligible: eligibleMixed[name], Source: "unconfigured", UsageSchema: billing_setting.MixedVideoUsageSchema()}
+		if expression, ok := configured[billing_setting.MixedVideoBillingExprOption].(string); ok {
+			entry.MixedVideo.Expression, entry.MixedVideo.Source = expression, "override"
+		} else if entry.Effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
+			if expression, ok := entry.Effective["billing_setting.billing_expr"].(string); ok {
+				entry.MixedVideo.Expression, entry.MixedVideo.Source = expression, "model"
+			}
+		}
+		entry.MixedVideo.Valid = (entry.MixedVideo.Eligible || entry.MixedVideo.Source == "override") && entry.MixedVideo.Source != "unconfigured" && billing_setting.ValidateMixedVideoBillingExpr(entry.MixedVideo.Expression) == nil
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
 		if plugin, ok := generation.GetByModel(name); ok {
@@ -364,6 +403,28 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("model name is required")
 	}
+	currentMixedValue, currentMixedExists := values[billing_setting.MixedVideoBillingExprOption]
+	previousMixedValue, previousMixedExists := previous[billing_setting.MixedVideoBillingExprOption]
+	currentMixed, _ := common.Marshal(currentMixedValue)
+	previousMixed, _ := common.Marshal(previousMixedValue)
+	mixedChanged := currentMixedExists != previousMixedExists || string(currentMixed) != string(previousMixed)
+	if currentMixedExists && mixedChanged {
+		expression, ok := currentMixedValue.(string)
+		if !ok {
+			return fmt.Errorf("model %s: mixed video billing expression must be a string", name)
+		}
+		if err := billing_setting.ValidateMixedVideoBillingExpr(expression); err != nil {
+			return fmt.Errorf("model %s: mixed video billing: %w", name, err)
+		}
+	}
+	standard, oldStandard := maps.Clone(values), maps.Clone(previous)
+	delete(standard, billing_setting.MixedVideoBillingExprOption)
+	delete(oldStandard, billing_setting.MixedVideoBillingExprOption)
+	currentJSON, _ := common.Marshal(standard)
+	previousJSON, _ := common.Marshal(oldStandard)
+	if string(currentJSON) == string(previousJSON) && mixedChanged {
+		return nil
+	}
 	generation := jsplugin.DefaultRegistry.Generation()
 	previousVariants, _ := previous[billing_setting.PluginBillingExprOption].(map[string]any)
 	variants := map[string]any{}
@@ -392,7 +453,7 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 		}
 	}
 	for key, value := range values {
-		if key == billing_setting.PluginBillingExprOption {
+		if key == billing_setting.PluginBillingExprOption || key == billing_setting.MixedVideoBillingExprOption {
 			continue
 		}
 		if !IsModelPricingOption(key) {
@@ -458,7 +519,36 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 	return nil
 }
 
-func UpdateModelPricing(changes []ModelPricingChange) error {
+type MixedVideoPricingValidator func(tx *gorm.DB, resolve func(string) (string, bool)) error
+
+func validateMixedVideoPricingDraft(tx *gorm.DB, values, previous map[string]map[string]any, validators []MixedVideoPricingValidator) error {
+	resolve := func(prices map[string]map[string]any, name string) (string, bool) {
+		if expression, ok := prices[billing_setting.MixedVideoBillingExprOption][name].(string); ok {
+			return expression, true
+		}
+		effective := effectiveModelPricing(prices, name)
+		if effective["billing_setting.billing_mode"] != billing_setting.BillingModeTieredExpr {
+			return "", false
+		}
+		expression, ok := effective["billing_setting.billing_expr"].(string)
+		return expression, ok
+	}
+	for _, validate := range validators {
+		if err := validate(tx, func(name string) (string, bool) {
+			expression, ok := resolve(values, name)
+			oldExpression, oldOK := resolve(previous, name)
+			if expression == oldExpression && ok == oldOK {
+				return "", false
+			}
+			return expression, ok
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func UpdateModelPricing(changes []ModelPricingChange, validators ...MixedVideoPricingValidator) error {
 	if len(changes) == 0 {
 		return errors.New("select model pricing changes before saving")
 	}
@@ -472,7 +562,11 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 			return ErrModelPricingConflict
 		}
 	}
-	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
+	return mutateModelPricingOptions(func(tx *gorm.DB, values map[string]map[string]any) error {
+		previousValues := make(map[string]map[string]any, len(values))
+		for key, entries := range values {
+			previousValues[key] = maps.Clone(entries)
+		}
 		defaults := defaultPricingMaps()
 		for _, change := range changes {
 			previous := modelPricingValues(values, change.ModelName)
@@ -488,14 +582,14 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 			}
 			replaceModelPricing(values, change.ModelName, pricing)
 		}
-		return nil
+		return validateMixedVideoPricingDraft(tx, values, previousValues, validators)
 	})
 }
 
 // UpdateModelPricingOptions keeps legacy single-option callers on the same
 // locking, validation and transaction path as the model-level API.
-func UpdateModelPricingOptions(updates map[string]string) error {
-	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
+func UpdateModelPricingOptions(updates map[string]string, validators ...MixedVideoPricingValidator) error {
+	return mutateModelPricingOptions(func(tx *gorm.DB, values map[string]map[string]any) error {
 		previous := maps.Clone(values)
 		names := make(map[string]bool)
 		for key, raw := range updates {
@@ -524,11 +618,32 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 			values[key] = entries
 		}
 		for name := range names {
+			if len(updates) == 1 {
+				if _, mixedOnly := updates[billing_setting.MixedVideoBillingExprOption]; mixedOnly {
+					oldValue, oldExists := previous[billing_setting.MixedVideoBillingExprOption][name]
+					currentValue, currentExists := values[billing_setting.MixedVideoBillingExprOption][name]
+					old, _ := common.Marshal(oldValue)
+					current, _ := common.Marshal(currentValue)
+					if oldExists == currentExists && string(old) == string(current) {
+						continue
+					}
+					if expression, exists := values[billing_setting.MixedVideoBillingExprOption][name]; exists {
+						text, ok := expression.(string)
+						if !ok {
+							return fmt.Errorf("model %s: mixed video billing expression must be a string", name)
+						}
+						if err := billing_setting.ValidateMixedVideoBillingExpr(text); err != nil {
+							return fmt.Errorf("model %s: mixed video billing: %w", name, err)
+						}
+					}
+					continue
+				}
+			}
 			if err := validateModelPricing(name, modelPricingValues(values, name), modelPricingValues(previous, name)); err != nil {
 				return err
 			}
 		}
-		return nil
+		return validateMixedVideoPricingDraft(tx, values, previous, validators)
 	})
 }
 
@@ -566,7 +681,7 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 			if err != nil {
 				return err
 			}
-			if err := tx.Model(&Option{}).Where(commonKeyCol+" = ?", key).Update("value", string(encoded)).Error; err != nil {
+			if err := tx.Model(&Option{}).Where(map[string]any{"key": key}).Update("value", string(encoded)).Error; err != nil {
 				return err
 			}
 		}

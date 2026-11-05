@@ -166,6 +166,56 @@ func TestAsyncImageAdmissionPreservesMixedRouting(t *testing.T) {
 	}
 }
 
+func testMixedVideoPublicPricingUsesGroupPolicyAndHostSchema(t *testing.T, db *gorm.DB) {
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where("policy_key IN ?", []string{"one", "two", "three"}).Delete(&model.ImageGroupPolicy{}).Error)
+	})
+	for _, policy := range []model.ImageGroupPolicy{
+		{PolicyKey: "one", Group: "default", Platform: "mixed", Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"video-a","media_type":"video"},{"id":"video-b","media_type":"video"},{"id":"image-a","media_type":"image"}]`},
+		{PolicyKey: "two", Group: "private", Platform: "mixed", Enabled: true, AsyncEnabled: true, Models: `[{"id":"video-a","media_type":"video"}]`},
+		{PolicyKey: "three", Group: "disabled", Platform: "mixed", Enabled: false, AsyncEnabled: true, Models: `[{"id":"video-a","media_type":"video"}]`},
+	} {
+		require.NoError(t, db.Create(&policy).Error)
+	}
+	settings := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previous := *settings
+	t.Cleanup(func() { *settings = previous })
+	settings.BillingMode = map[string]string{"video-a": "tiered_expr", "video-b": "tiered_expr"}
+	settings.BillingExpr = map[string]string{"video-a": `tier("base", u("requests") * 1)`, "video-b": `tier("invalid", u("video_count"))`}
+	settings.MixedVideoBillingExpr = map[string]string{"video-a": `tier("mixed", u("requests") * 2)`}
+	prices := []model.Pricing{{ModelName: "video-a", BillingExpr: "provider", BillingPluginVariants: []model.PricingPluginVariant{{PluginKey: "vendor"}}}, {ModelName: "video-b"}, {ModelName: "image-a"}}
+	groups := map[string]string{"default": "Default", "disabled": "Disabled"}
+	require.NoError(t, addMixedVideoPricing(t.Context(), prices, groups))
+	require.NotNil(t, prices[0].MixedVideoPricing)
+	assert.Equal(t, []string{"default", "disabled"}, prices[0].MixedVideoPricing.Groups)
+	assert.Empty(t, prices[0].MixedVideoPricing.EnabledGroups)
+	assert.Equal(t, "override", prices[0].MixedVideoPricing.Source)
+	assert.Equal(t, settings.MixedVideoBillingExpr["video-a"], prices[0].MixedVideoPricing.BillingExpr)
+	assert.Contains(t, prices[0].MixedVideoPricing.BillingUsageSchema, "video_input")
+	assert.Equal(t, "provider", prices[0].BillingExpr)
+	assert.Equal(t, "vendor", prices[0].BillingPluginVariants[0].PluginKey)
+	require.NotNil(t, prices[1].MixedVideoPricing)
+	assert.Equal(t, "unconfigured", prices[1].MixedVideoPricing.Source)
+	assert.Nil(t, prices[2].MixedVideoPricing)
+	delete(settings.MixedVideoBillingExpr, "video-a")
+	require.NoError(t, addMixedVideoPricing(t.Context(), prices, groups))
+	assert.Equal(t, "model", prices[0].MixedVideoPricing.Source)
+	assert.Equal(t, settings.BillingExpr["video-a"], prices[0].MixedVideoPricing.BillingExpr)
+
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled = true
+	encoded, err := common.Marshal(cfg)
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&model.Option{Key: "media_runtime_config", Value: string(encoded)}).Error)
+	t.Cleanup(func() {
+		assert.NoError(t, db.Where(map[string]any{"key": "media_runtime_config"}).Delete(&model.Option{}).Error)
+	})
+	require.NoError(t, addMixedVideoPricing(t.Context(), prices, groups))
+	assert.Equal(t, []string{"default"}, prices[0].MixedVideoPricing.EnabledGroups)
+	assert.Equal(t, []string{"default"}, prices[1].MixedVideoPricing.EnabledGroups)
+
+}
+
 func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
@@ -231,6 +281,7 @@ func TestMixedImageConfigurationDatabaseMatrix(t *testing.T) {
 			})
 			require.NoError(t, db.AutoMigrate(entities...))
 			require.NoError(t, db.AutoMigrate(entities...))
+			t.Run("mixed video public pricing", func(t *testing.T) { testMixedVideoPublicPricingUsesGroupPolicyAndHostSchema(t, db) })
 			var version string
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("Database version: %s", version)

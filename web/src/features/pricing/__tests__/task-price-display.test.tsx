@@ -100,6 +100,100 @@ const model: PricingModel = {
 }
 const clients: QueryClient[] = []
 
+const mixedVideoModel = {
+  ...model,
+  model_name: 'seedance2.5-E',
+  enable_groups: ['default', 'direct'],
+  group_ratio: { default: 2, direct: 1 },
+  mixed_video_pricing: {
+    billing_mode: 'tiered_expr' as const,
+    billing_expr: 'tier("video", u("requests") * 7)',
+    billing_usage_schema: {
+      requests: { type: 'number' as const, unit: 'count' as const },
+    },
+    source: 'override' as const,
+    groups: ['default'],
+  },
+}
+
+it('shows the mixed public price for its group and preserves direct pricing for other groups', () => {
+  const { rerender } = render(
+    <ModelPriceCell
+      model={mixedVideoModel}
+      options={{ selectedGroup: 'default' }}
+    />
+  )
+  expect(screen.getByText('14/unit')).toBeVisible()
+  expect(screen.getByText(/Mixed public price/)).toBeVisible()
+  rerender(
+    <ModelPriceCell
+      model={mixedVideoModel}
+      options={{ selectedGroup: 'direct' }}
+    />
+  )
+  expect(screen.getByText('0.22/unit')).toBeVisible()
+  expect(screen.queryByText(/Mixed public price/)).not.toBeInTheDocument()
+})
+
+it('uses only mixed groups for the card quote and does not fall back when mixed pricing is missing', () => {
+  const { rerender } = render(
+    <ModelCard model={mixedVideoModel} onClick={vi.fn()} />
+  )
+  expect(screen.getByText('$14')).toBeVisible()
+  expect(screen.getByText(/Mixed public price/)).toBeVisible()
+  rerender(
+    <ModelCard
+      model={{
+        ...mixedVideoModel,
+        mixed_video_pricing: {
+          ...mixedVideoModel.mixed_video_pricing,
+          billing_expr: '',
+          source: 'unconfigured',
+        },
+      }}
+      onClick={vi.fn()}
+    />
+  )
+  expect(
+    screen.getByText('Usage-based billing · price not configured')
+  ).toBeVisible()
+  expect(screen.queryByText('$0.22')).not.toBeInTheDocument()
+})
+
+it('keeps mixed and explicit provider prices separate in model details and preserves free group ratios', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={mixedVideoModel}
+        groupRatio={{ default: 0, direct: 1 }}
+        usableGroup={{
+          default: { desc: '', ratio: 0 },
+          direct: { desc: '', ratio: 1 },
+        }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  const mixed = within(
+    screen.getByRole('region', { name: 'Mixed video public price' })
+  )
+  expect(mixed.getByText('$0')).toBeVisible()
+  expect(mixed.queryByText('direct')).not.toBeInTheDocument()
+  const provider = within(
+    screen.getByRole('region', { name: 'Provider pricing' })
+  )
+  expect(provider.getByText('$0.22')).toBeVisible()
+})
+
 it('preserves complete multiline model restrictions in the details header', () => {
   vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
   const client = new QueryClient({

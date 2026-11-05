@@ -31,6 +31,7 @@ import {
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
 import { isTokenBasedModel } from '../lib/model-helpers'
+import { withPublicPricing } from '../lib/plugin-pricing'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import { taskUsageUnitLabel } from '../lib/task-price-display'
 import type { PricingModel, TokenUnit } from '../types'
@@ -53,12 +54,17 @@ export function ModelPriceCell(props: {
   const currencyLabel =
     currency.quotaDisplayType === 'TOKENS' ? 'USD' : getCurrencyLabel()
   const options = props.options ?? {}
+  const priceModel = useMemo(
+    () => withPublicPricing(props.model, options.selectedGroup),
+    [props.model, options.selectedGroup]
+  )
+  const isMixed = priceModel !== props.model
   const tokenUnit = options.tokenUnit ?? DEFAULT_TOKEN_UNIT
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
-  const billingTime = useBillingTime(props.model.billing_expr)
+  const billingTime = useBillingTime(priceModel.billing_expr)
   const dynamic = useMemo(
     () =>
-      getDynamicPricingSummary(props.model, {
+      getDynamicPricingSummary(priceModel, {
         priceRate: options.priceRate,
         usdExchangeRate: options.usdExchangeRate,
         showRechargePrice: options.showRechargePrice,
@@ -66,14 +72,14 @@ export function ModelPriceCell(props: {
         tokenUnit,
         showCurrencySymbol: false,
         groupRatioMultiplier: getDynamicDisplayGroupRatio(
-          props.model,
+          priceModel,
           options.selectedGroup
         ),
       }),
     // Currency is read indirectly by the price formatter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
-      props.model,
+      priceModel,
       tokenUnit,
       options.priceRate,
       options.usdExchangeRate,
@@ -168,17 +174,17 @@ export function ModelPriceCell(props: {
       caption += ` · ${t('{{count}} tiers', { count: dynamic.tierCount })}`
     }
   } else {
-    if (isUnconfiguredTaskUsageModel(props.model)) {
+    if (isUnconfiguredTaskUsageModel(priceModel)) {
       return (
         <span className='text-muted-foreground text-sm'>
           {t('Not configured')}
         </span>
       )
     }
-    const tokenBased = isTokenBasedModel(props.model)
+    const tokenBased = isTokenBasedModel(priceModel)
     if (
       !Number.isFinite(
-        tokenBased ? props.model.model_ratio : props.model.model_price
+        tokenBased ? priceModel.model_ratio : priceModel.model_price
       )
     ) {
       return (
@@ -192,7 +198,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Input'),
           value: formatPrice(
-            props.model,
+            priceModel,
             'input',
             tokenUnit,
             options.showRechargePrice,
@@ -205,7 +211,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Output'),
           value: formatPrice(
-            props.model,
+            priceModel,
             'output',
             tokenUnit,
             options.showRechargePrice,
@@ -221,7 +227,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Per-request'),
           value: formatRequestPrice(
-            props.model,
+            priceModel,
             options.showRechargePrice,
             options.priceRate,
             options.usdExchangeRate,
@@ -232,6 +238,9 @@ export function ModelPriceCell(props: {
       ]
       caption = `${currencyLabel} / ${t('request')}`
     }
+  }
+  if (isMixed) {
+    caption += ` · ${t('Mixed public price · {{groups}}', { groups: priceModel.enable_groups.join(', ') })}`
   }
   return (
     <span className='block w-full max-w-full min-w-0 space-y-1.5'>

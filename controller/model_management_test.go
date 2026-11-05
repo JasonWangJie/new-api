@@ -64,11 +64,11 @@ func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 	require.NoError(t, model.InitDB())
 	database = model.DB
 	model.LOG_DB = database
-	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}))
+	require.NoError(t, database.AutoMigrate(&model.Model{}, &model.Vendor{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.AuditLog{}, &model.ImageGroupPolicy{}))
 	for _, value := range restoreRatios {
 		require.NoError(t, value.restore("{}"))
 	}
-	config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": "{}", "billing_expr": "{}", "plugin_billing_expr": "{}"})
+	config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": "{}", "billing_expr": "{}", "plugin_billing_expr": "{}", "mixed_video_billing_expr": "{}"})
 	var version string
 	query := "SELECT version()"
 	if kind == "sqlite" {
@@ -80,7 +80,7 @@ func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 		for _, value := range restoreRatios {
 			require.NoError(t, value.restore(value.value))
 		}
-		config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": previousConfig["billing_setting.billing_mode"], "billing_expr": previousConfig["billing_setting.billing_expr"], "plugin_billing_expr": previousConfig[billing_setting.PluginBillingExprOption]})
+		config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": previousConfig["billing_setting.billing_mode"], "billing_expr": previousConfig["billing_setting.billing_expr"], "plugin_billing_expr": previousConfig[billing_setting.PluginBillingExprOption], "mixed_video_billing_expr": previousConfig[billing_setting.MixedVideoBillingExprOption]})
 		common.OptionMap = previousOptions
 		common.IsMasterNode, common.SQLitePath = previousMaster, previousSQLite
 		common.RedisEnabled, common.MemoryCacheEnabled = previousRedis, previousMemory
@@ -765,6 +765,94 @@ export function parseTaskResult() { return {}; }
 				require.NoError(t, db.Callback().Query().Remove("fail_listing_channels"))
 				assert.False(t, failed.Success, "a channel lookup failure must not look like an empty configuration")
 
+			})
+
+			t.Run("mixed video pricing API validates and preserves independent price", func(t *testing.T) {
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				sqlDB.SetMaxOpenConns(1)
+				t.Cleanup(func() { sqlDB.SetMaxOpenConns(0) })
+				const name = "matrix-public-video"
+				const mixed = `tier("mixed", u("requests") * (u("video_input") == "video" ? 2 : 1))`
+				policy := model.ImageGroupPolicy{PolicyKey: "matrix-mixed-video", Group: "matrix-mixed", Platform: "mixed", Enabled: true, AsyncEnabled: true, Models: `[{"id":"matrix-public-video","media_type":"video"}]`}
+				require.NoError(t, db.Create(&policy).Error)
+				t.Cleanup(func() { require.NoError(t, db.Delete(&policy).Error) })
+				before, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.True(t, before.Entries[0].MixedVideo.Eligible)
+				change := model.ModelPricingChange{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: model.PricingValues{billing_setting.MixedVideoBillingExprOption: mixed}}
+				response := modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "No compatible video channel")
+				source := `
+export const meta = {apiVersion:1,key:"matrix-video",name:"Video",version:"1.0.0",author:{name:"Test"},models:["matrix-public-video"],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:["matrix-public-video"],modes:[{name:"text_to_video",duration:{min:1,max:10,step:1,default:5},resolutions:["720p"],defaultResolution:"720p"}]}]};
+export function buildSubmitRequest(){return {};}; export function parseSubmitResponse(){return {};}; export function buildQueryRequest(){return {};}; export function parseTaskResult(){return {};};
+export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};
+export function listArtifacts(){return [];}; export function buildContentRequest(){return {};};`
+				_, err = jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("matrix-video") })
+				channel := model.Channel{Type: 61, Name: "matrix-video", Key: "fixture-key", Status: common.ChannelStatusEnabled, Models: name, Group: policy.Group}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "matrix-video"})
+				require.NoError(t, db.Create(&channel).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: policy.Group, Model: name, ChannelId: channel.Id, Enabled: true}).Error)
+				t.Cleanup(func() {
+					require.NoError(t, db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+					require.NoError(t, db.Delete(&channel).Error)
+				})
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				after, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, mixed, after.Entries[0].MixedVideo.Expression)
+				assert.Equal(t, "override", after.Entries[0].MixedVideo.Source)
+				change.ExpectedVersion = after.Entries[0].Version
+				change.Pricing[billing_setting.MixedVideoBillingExprOption] = `u("unknown")`
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusBadRequest, response.Code)
+				afterInvalid, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, after.Entries[0].Version, afterInvalid.Entries[0].Version)
+				change.Pricing = model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `p * 2`}
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				change.Pricing["billing_setting.billing_expr"] = `1`
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				inherited, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, "model", inherited.Entries[0].MixedVideo.Source)
+				assert.Equal(t, "1", inherited.Entries[0].MixedVideo.Expression)
+				assert.True(t, inherited.Entries[0].MixedVideo.Valid)
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusConflict, response.Code)
+				change.ExpectedVersion = inherited.Entries[0].Version
+				change.Pricing[billing_setting.MixedVideoBillingExprOption] = nil
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "must be a string")
+				delete(change.Pricing, billing_setting.MixedVideoBillingExprOption)
+				response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: billing_setting.MixedVideoBillingExprOption, Value: `{"matrix-public-video":null}`}, nil)
+				assert.Contains(t, response.Body.String(), `"success":false`, response.Body.String())
+				legacy := OptionUpdateRequest{Key: "billing_setting.billing_expr", Value: `{"matrix-public-video":"p * 2"}`}
+				response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", legacy, nil)
+				assert.Contains(t, response.Body.String(), `"success":false`)
+				unchanged, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, inherited.Entries[0].Version, unchanged.Entries[0].Version)
+				// A pre-existing invalid mixed override must not prevent repairing an
+				// unrelated provider/model price when the mixed price does not change.
+				require.NoError(t, db.Model(&model.Option{}).Where(&model.Option{Key: billing_setting.MixedVideoBillingExprOption}).Update("value", `{"matrix-public-video":"u(\"unknown\")"}`).Error)
+				invalidExisting, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.False(t, invalidExisting.Entries[0].MixedVideo.Valid)
+				change.ExpectedVersion = invalidExisting.Entries[0].Version
+				change.Pricing = model.PricingValues{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": "2", billing_setting.MixedVideoBillingExprOption: `u("unknown")`}
+				response = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", gin.H{"changes": []model.ModelPricingChange{change}}, nil)
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				legacy.Value = `{"matrix-public-video":"3"}`
+				response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", legacy, nil)
+				assert.Contains(t, response.Body.String(), `"success":true`, response.Body.String())
 			})
 
 			t.Run("pricing_saves_zero_switches_modes_and_rejects_stale_batches", func(t *testing.T) {
@@ -1546,6 +1634,35 @@ func TestSharedModelPluginPricingDatabaseMatrix(t *testing.T) {
 			assert.True(t, before.Entries[0].PluginVariants[0].Compatible)
 			assert.False(t, before.Entries[0].PluginVariants[1].Compatible)
 			assert.Equal(t, base, before.Entries[0].PluginVariants[1].Effective)
+			mixed := `tier("mixed", u("requests") * (u("video_input") == "video" ? 2 : 1))`
+			mixedChange := model.ModelPricingChange{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: model.PricingValues{
+				"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base,
+				billing_setting.MixedVideoBillingExprOption: mixed,
+			}}
+			validator := func(_ *gorm.DB, resolve func(string) (string, bool)) error {
+				expression, exists := resolve(name)
+				assert.True(t, exists)
+				assert.Equal(t, mixed, expression)
+				return nil
+			}
+			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{mixedChange}, validator))
+			withMixed, err := model.GetModelPricingSnapshot([]string{name})
+			require.NoError(t, err)
+			assert.Equal(t, "override", withMixed.Entries[0].MixedVideo.Source)
+			assert.Equal(t, mixed, withMixed.Entries[0].MixedVideo.Expression)
+			assert.Contains(t, withMixed.Entries[0].MixedVideo.UsageSchema, "video_input")
+			assert.ErrorIs(t, model.UpdateModelPricing([]model.ModelPricingChange{mixedChange}), model.ErrModelPricingConflict)
+			mixedChange.ExpectedVersion = withMixed.Entries[0].Version
+			mixedChange.Pricing["billing_setting.billing_expr"] = mixed
+			require.ErrorContains(t, model.UpdateModelPricing([]model.ModelPricingChange{mixedChange}), "is not declared")
+			mixedChange.Pricing["billing_setting.billing_expr"] = base
+			mixedChange.Pricing[billing_setting.MixedVideoBillingExprOption] = `u("unknown")`
+			require.Error(t, model.UpdateModelPricing([]model.ModelPricingChange{mixedChange}))
+			delete(mixedChange.Pricing, billing_setting.MixedVideoBillingExprOption)
+			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{mixedChange}))
+			before, err = model.GetModelPricingSnapshot([]string{name})
+			require.NoError(t, err)
+			assert.Equal(t, "model", before.Entries[0].MixedVideo.Source)
 			change := model.ModelPricingChange{ModelName: name, ExpectedVersion: before.Entries[0].Version, Pricing: model.PricingValues{
 				"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": base,
 				billing_setting.PluginBillingExprOption: map[string]any{"matrix-beta": variant},
