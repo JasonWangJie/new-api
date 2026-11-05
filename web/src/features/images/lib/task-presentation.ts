@@ -233,6 +233,15 @@ export function imageTaskElapsedSeconds(
   return Math.max(0, (task.finished_at || now) - task.created_at)
 }
 
+export function imageTaskCost(task: ImageTask): number | null {
+  if (task.billing_status === 'refunded') return task.refunded_cost ?? null
+  return ['succeeded', 'not_billable', 'settled', 'reserved'].includes(
+    task.billing_status
+  )
+    ? task.cost
+    : null
+}
+
 export function imageTaskSpecifications(task: ImageTask): string {
   const requested = task.requested_resolution || task.requested_size
   if (requested && task.actual_size && requested !== task.actual_size) {

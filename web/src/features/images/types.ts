@@ -162,6 +162,7 @@ export type ImageTask = {
   image_count: number
   result_count: number
   cost: number
+  refunded_cost?: number | null
   prompt_summary: string
   requested_size: string
   requested_resolution?: string

@@ -2808,10 +2808,11 @@ func TestHuahuoVideoDurableLifecycle(t *testing.T) {
 func TestWolongVideoDurableLifecycle(t *testing.T) {
 	const publicModel = "wolong-public-fixture"
 	for _, tc := range []struct {
-		scenario, billingMode    string
-		aliasDefaults, reference bool
+		scenario, billingMode                 string
+		aliasDefaults, reference, reconciling bool
 	}{
 		{scenario: "completed"}, {scenario: "refunded"}, {scenario: "balance rejection"}, {scenario: "lost receipt"},
+		{scenario: "refunded", reconciling: true},
 		{scenario: "completed", billingMode: "per_request"}, {scenario: "completed", billingMode: "per_second"},
 		{scenario: "completed", aliasDefaults: true}, {scenario: "completed", aliasDefaults: true, reference: true},
 	} {
@@ -2821,6 +2822,9 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 		}
 		if tc.reference {
 			name += " image reference"
+		}
+		if tc.reconciling {
+			name += " after reconciliation"
 		}
 		t.Run(name, func(t *testing.T) {
 			scenario, upstreamModel := tc.scenario, "haya-mo-seedance-25"
@@ -2918,8 +2922,11 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 					}
 				case "GET " + origin + "/v1/tasks/task_vendor_private":
 					phase := polls.Add(1)
-					if scenario == "refunded" {
-						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"failed","error":"fixture failure","charged_amount":60,"refunded_amount":60,"refunded":true}}`)
+					if tc.reconciling && phase == 1 {
+						recorder.WriteHeader(http.StatusNotFound)
+						_, _ = io.WriteString(recorder, `{"ok":false,"error":"fixture query unavailable"}`)
+					} else if scenario == "refunded" {
+						_, _ = fmt.Fprintf(recorder, `{"ok":true,"request_id":"req_poll_%d","task":{"id":"task_vendor_private","status":"failed","error":"fixture failure","data":[],"charged_amount":60,"refunded_amount":60,"refunded":true}}`, phase)
 					} else if phase == 1 {
 						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"needs_review","progress":25.5}}`)
 					} else if phase == 2 {
@@ -2989,14 +2996,20 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 				phases := 3
 				if scenario == "refunded" {
 					phases = 1
+					if tc.reconciling {
+						phases = 2
+					}
 				}
 				for phase := range phases {
 					id := task.GetUpstreamTaskID()
 					require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{ch.Id: {id}}, map[string]*model.Task{id: &task}))
 					require.NoError(t, db.First(&task, task.ID).Error)
-					if scenario == "completed" && phase < 2 {
+					if scenario == "completed" && phase < 2 || tc.reconciling && phase == 0 {
 						assert.Equal(t, 100, task.Quota)
 						assert.NotEqual(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+						if tc.reconciling {
+							require.NotNil(t, task.PrivateData.VideoReconciliation)
+						}
 						if task.PrivateData.VideoReconciliation != nil {
 							before := task.Snapshot()
 							task.PrivateData.VideoReconciliation.NextPollAt = time.Now().Unix() - 1
@@ -3008,6 +3021,23 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 				}
 				if scenario == "refunded" {
 					assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+					assert.Zero(t, task.Quota)
+					assert.Equal(t, "fixture failure", task.FailReason)
+					assert.True(t, task.PrivateData.VideoTerminalConfirmed)
+					assert.Nil(t, task.PrivateData.VideoReconciliation)
+					require.NoError(t, db.Model(&job).Update("next_attempt_at", 0).Error)
+					require.NoError(t, db.First(&job, job.ID).Error)
+					claimed, err = model.ClaimAsyncMediaJob(t.Context(), &job, "wolong-finalize", 120)
+					require.NoError(t, err)
+					require.True(t, claimed)
+					require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+					require.NoError(t, db.First(&job, job.ID).Error)
+					assert.Equal(t, "failed", job.Status)
+					assert.Equal(t, "refunded", job.BillingStatus)
+					assert.Zero(t, job.Quota)
+					id, previousPolls := task.GetUpstreamTaskID(), polls.Load()
+					require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{ch.Id: {id}}, map[string]*model.Task{id: &task}))
+					assert.Equal(t, previousPolls, polls.Load(), "terminal tasks must not be queried or refunded again")
 				} else {
 					assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
 				}
@@ -3017,6 +3047,18 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 			refunded := scenario == "refunded" || scenario == "balance rejection"
 			if refunded {
 				assert.Equal(t, 100, token.RemainQuota)
+				assert.Zero(t, token.UsedQuota)
+				require.NoError(t, db.First(user, user.Id).Error)
+				assert.Equal(t, 1000, user.Quota)
+				assert.Zero(t, user.UsedQuota)
+				require.NoError(t, db.First(&ch, ch.Id).Error)
+				assert.Zero(t, ch.UsedQuota)
+				quota, err := model.GetUserQuota(user.Id, false)
+				require.NoError(t, err)
+				assert.Equal(t, user.Quota, quota)
+				cachedToken, err := model.GetTokenByKey(token.Key, false)
+				require.NoError(t, err)
+				assert.Equal(t, token.RemainQuota, cachedToken.RemainQuota)
 			} else {
 				assert.Zero(t, token.RemainQuota)
 			}
@@ -3025,6 +3067,9 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refunds).Error)
 			assert.LessOrEqual(t, consumes, int64(1))
 			assert.LessOrEqual(t, refunds, int64(1))
+			if refunded {
+				assert.EqualValues(t, 1, refunds)
+			}
 			if scenario == "completed" {
 				assert.EqualValues(t, 1, consumes)
 				assert.Zero(t, refunds)

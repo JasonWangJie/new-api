@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"math"
 	"net/http"
@@ -18,6 +19,32 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// attachVideoRefundCosts uses one bounded history lookup for the displayed
+// page. The log database is optional: unavailable history must not hide tasks.
+func attachVideoRefundCosts(ctx context.Context, jobs []model.AsyncMediaJob, views map[string]gin.H) {
+	missing := make([]model.AsyncMediaJob, 0, len(jobs))
+	for _, job := range jobs {
+		view := views[job.TaskId]
+		if view["billing_status"] != "refunded" || view["refunded_cost"] != nil {
+			continue
+		}
+		missing = append(missing, job)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	quotas, err := model.AsyncMediaRefundQuotas(lookupCtx, missing)
+	if err != nil {
+		common.SysError("media task refund amount history unavailable: " + err.Error())
+		return
+	}
+	for id, quota := range quotas {
+		views[id]["refunded_cost"] = float64(quota) / common.QuotaPerUnit
+	}
+}
 
 // mediaTaskSearchPattern keeps keywords literal and matches ASCII names
 // without depending on a database's default LIKE collation.
@@ -292,6 +319,10 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 		view["error_summary"], view["error_suggestion"], view["error_detail"] = notice.Summary, notice.Suggestion, ""
 		view["error_message"] = service.PublicVideoRoutingFailureReason(reason)
 	}
+	if view["billing_status"] == "refunded" && err == nil && task.PrivateData.TokenId == job.TokenId &&
+		task.PrivateData.RefundedQuota != nil && *task.PrivateData.RefundedQuota >= 0 {
+		view["refunded_cost"] = float64(*task.PrivateData.RefundedQuota) / common.QuotaPerUnit
+	}
 	results := make([]gin.H, 0)
 	if ownerErr != nil || resultExpired || err == nil && task.Status == model.TaskStatusFailure {
 		return view, results, nil
@@ -537,6 +568,7 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		imageManagementError(c, http.StatusServiceUnavailable, err)
 		return
 	}
+	attachVideoRefundCosts(c.Request.Context(), []model.AsyncMediaJob{job}, map[string]gin.H{job.TaskId: view})
 	imageManagementData(c, gin.H{"task": view, "results": results, "events": events})
 }
 
@@ -1133,6 +1165,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		}
 		byID[job.TaskId] = view
 	}
+	attachVideoRefundCosts(c.Request.Context(), jobs, byID)
 	ordered := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
 		ordered = append(ordered, byID[row.TaskId])

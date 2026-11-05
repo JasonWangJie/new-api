@@ -2,11 +2,90 @@ package model
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
 )
+
+// AsyncMediaRefundQuotas recovers one confirmed full refund per task from the
+// historical log store. Callers pass only tasks already known to be refunded.
+// Partial settlements, conflicting refunds and missing records remain unknown.
+func AsyncMediaRefundQuotas(ctx context.Context, jobs []AsyncMediaJob) (map[string]int, error) {
+	amounts := make(map[string]int)
+	if len(jobs) == 0 || LOG_DB == nil {
+		return amounts, nil
+	}
+	if len(jobs) > 100 {
+		return nil, errors.New("refund lookup exceeds the media task page limit")
+	}
+	byID := make(map[string]AsyncMediaJob, len(jobs))
+	userIDs := make([]int, 0, len(jobs))
+	since := jobs[0].CreatedAt
+	conditions := LOG_DB.Session(&gorm.Session{NewDB: true})
+	for _, job := range jobs {
+		byID[job.TaskId] = job
+		userIDs = append(userIDs, job.UserId)
+		since = min(since, job.CreatedAt)
+		pattern := "%" + strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(job.TaskId) + "%"
+		predicate := "other LIKE ? ESCAPE '!'"
+		if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+			pattern = "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(job.TaskId) + "%"
+			predicate = "other LIKE ?"
+		}
+		conditions = conditions.Or(predicate, pattern)
+	}
+	// Bound result processing even for malformed or unusually verbose history.
+	// Reaching the limit leaves the amount unknown rather than selecting a
+	// possibly incomplete subset of conflicting records.
+	const maxRefundLogs = 1000
+	var logs []Log
+	if err := imageConsumeLogsQuery(LOG_DB.WithContext(ctx)).
+		Select("user_id", "token_id", "quota", "other", "content", "request_id", "created_at").
+		Where("type = ? AND user_id IN ? AND created_at >= ?", LogTypeRefund, userIDs, since).
+		Where(conditions).Limit(maxRefundLogs + 1).Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	if len(logs) > maxRefundLogs {
+		return nil, errors.New("refund log history exceeds the lookup limit")
+	}
+	requests := make(map[string]string)
+	ambiguous := make(map[string]bool)
+	for _, log := range logs {
+		var other struct {
+			TaskID           string `json:"task_id"`
+			Reason           string `json:"reason"`
+			ActualQuota      *int   `json:"actual_quota"`
+			PreConsumedQuota *int   `json:"pre_consumed_quota"`
+		}
+		if common.UnmarshalJsonStr(log.Other, &other) != nil || log.Quota <= 0 || log.RequestId == "" {
+			continue
+		}
+		job, found := byID[other.TaskID]
+		if !found || job.UserId != log.UserId || job.TokenId != log.TokenId || log.CreatedAt < job.CreatedAt {
+			continue
+		}
+		if other.ActualQuota != nil {
+			if *other.ActualQuota != 0 || other.PreConsumedQuota == nil || *other.PreConsumedQuota != log.Quota || other.Reason == "" {
+				continue
+			}
+		} else if other.Reason != "Task submission failed; reserved quota returned" &&
+			(other.Reason == "" || other.PreConsumedQuota != nil || log.Content != "") {
+			// Legacy full-failure refunds have a reason and no settlement
+			// quantities. Other unclassified records cannot prove a full refund.
+			continue
+		}
+		if previous, exists := amounts[job.TaskId]; exists && (previous != log.Quota || requests[job.TaskId] != log.RequestId) {
+			ambiguous[job.TaskId] = true
+		}
+		amounts[job.TaskId], requests[job.TaskId] = log.Quota, log.RequestId
+	}
+	for id := range ambiguous {
+		delete(amounts, id)
+	}
+	return amounts, nil
+}
 
 func MigrateImageLogs(db *gorm.DB) error {
 	if !common.UsingLogDatabase(common.DatabaseTypeClickHouse) {

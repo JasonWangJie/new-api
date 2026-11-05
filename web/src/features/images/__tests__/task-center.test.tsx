@@ -2310,6 +2310,89 @@ test('mobile administrator cards highlight selection and enable the existing bat
   expect(within(card).getByRole('checkbox')).not.toBeChecked()
 })
 
+test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'refunded costs remain visible with a red strikethrough in the list and details (admin=$admin, mobile=$mobile)',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    const refunded = {
+      ...task,
+      status: 'failed',
+      billing_status: 'refunded',
+      cost: 0,
+      refunded_cost: 0.12,
+    }
+    const items = [
+      refunded,
+      { ...refunded, id: 'asyncimg_refunded_zero', refunded_cost: 0 },
+      {
+        ...refunded,
+        id: 'asyncimg_refunded_missing',
+        refunded_cost: undefined,
+      },
+      {
+        ...refunded,
+        id: 'asyncimg_failed_pending',
+        billing_status: 'pending',
+        cost: 0.23,
+      },
+      {
+        ...task,
+        id: 'asyncimg_settled',
+        status: 'succeeded',
+        billing_status: 'settled',
+        cost: 0.34,
+      },
+    ]
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items,
+      total: items.length,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: refunded,
+      results: [],
+    })
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: refunded.id })
+    for (const [id, amount] of [
+      [refunded.id, '$0.12'],
+      ['asyncimg_refunded_zero', '$0'],
+      ['asyncimg_settled', '$0.34'],
+    ]) {
+      const container = mobile
+        ? screen.getByRole('article', { name: id })
+        : screen.getByRole('row', { name: new RegExp(id) })
+      const cost = within(container).getByText(amount)
+      expect(cost).toBeVisible()
+      if (id === 'asyncimg_settled') {
+        expect(cost).not.toHaveClass('text-destructive', 'line-through')
+      } else {
+        expect(cost).toHaveClass('text-destructive', 'line-through')
+      }
+    }
+    expect(screen.queryByText('$0.23')).not.toBeInTheDocument()
+    const unavailable = mobile
+      ? screen.getByRole('article', { name: 'asyncimg_refunded_missing' })
+      : screen.getByRole('row', { name: /asyncimg_refunded_missing/ })
+    expect(within(unavailable).queryByText(/^\$/)).not.toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: refunded.id }))
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    const cost = await within(dialog).findByText('$0.12')
+    expect(cost).toBeVisible()
+    expect(cost).toHaveClass('text-destructive', 'line-through')
+  }
+)
+
 test('mobile cards distinguish pending charges from a completed free task', async () => {
   setMobileViewport()
   vi.mocked(getImageTasks).mockResolvedValue({

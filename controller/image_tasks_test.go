@@ -149,6 +149,170 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageObject{ObjectId: "presentation-output", ProfileId: "presentation-profile", ObjectKey: "private-object-canary", Width: 2048, Height: 1186, Status: "active"}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: "presentation-output"}).Error)
+			t.Run("refunded task costs", func(t *testing.T) {
+				images := []model.AsyncImageTask{
+					{TaskId: "asyncimg_refund_cost_confirmed", BillingStatus: "refunded"},
+					{TaskId: "asyncimg_refund_cost_zero", BillingStatus: "refunded"},
+					{TaskId: "asyncimg_refund_cost_missing", BillingStatus: "refunded"},
+					{TaskId: "asyncimg_refund_cost_foreign_bill", BillingStatus: "refunded"},
+					{TaskId: "asyncimg_refund_cost_unconfirmed", BillingStatus: "refunded"},
+				}
+				for i := range images {
+					images[i].UserId, images[i].TokenId, images[i].Group = 101, 201, "refund-cost"
+					images[i].Status, images[i].CreatedAt = model.ImageTaskFailed, now-30
+				}
+				require.NoError(t, db.Create(&images).Error)
+				bills := []model.AsyncImageBill{
+					{TaskId: images[0].TaskId, UserId: 101, TokenId: 201, Status: "refunded", ReservedQuota: 250000, ReservedAt: now - 20, BillingRequestId: "refund-cost-confirmed"},
+					{TaskId: images[1].TaskId, UserId: 101, TokenId: 201, Status: "refunded", ReservedQuota: 0, ReservedAt: now - 20, BillingRequestId: "refund-cost-zero"},
+					{TaskId: images[3].TaskId, UserId: 102, TokenId: 202, Status: "refunded", ReservedQuota: 999999, ReservedAt: now - 20, BillingRequestId: "refund-cost-foreign"},
+					{TaskId: images[4].TaskId, UserId: 101, TokenId: 201, Status: "reserved", ReservedQuota: 999999, ReservedAt: now - 20, BillingRequestId: "refund-cost-unconfirmed"},
+				}
+				require.NoError(t, db.Create(&bills).Error)
+				videoIDs := []string{"video_refund_cost_full", "video_refund_cost_legacy", "video_refund_cost_partial", "video_refund_cost_ambiguous", "video_refund_cost_foreign", "video_refund_cost_missing"}
+				jobs := make([]model.AsyncMediaJob, 0, len(videoIDs))
+				for _, id := range videoIDs {
+					jobs = append(jobs, model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Group: "refund-cost", Status: "failed", BillingStatus: "refunded", CreatedAt: now - 30, ExpiresAt: now + 3600})
+				}
+				require.NoError(t, db.Create(&jobs).Error)
+				logs := []model.Log{
+					{Other: `{"task_id":"video_refund_cost_full","reason":"generation failed","actual_quota":0,"pre_consumed_quota":125000}`, Quota: 125000, RequestId: "refund-cost-full"},
+					{Other: `{"task_id":"video_refund_cost_full","reason":"generation failed","actual_quota":0,"pre_consumed_quota":125000}`, Quota: 125000, RequestId: "refund-cost-full"},
+					{Other: `{"task_id":"video_refund_cost_legacy","reason":"generation failed"}`, Quota: 62500, RequestId: "refund-cost-legacy"},
+					{Other: `{"task_id":"video_refund_cost_partial","actual_quota":5000,"pre_consumed_quota":10000}`, Quota: 5000, RequestId: "refund-cost-partial"},
+					{Other: `{"task_id":"video_refund_cost_ambiguous","reason":"generation failed","actual_quota":0,"pre_consumed_quota":125000}`, Quota: 125000, RequestId: "refund-cost-ambiguous-one"},
+					{Other: `{"task_id":"video_refund_cost_ambiguous","reason":"generation failed","actual_quota":0,"pre_consumed_quota":250000}`, Quota: 250000, RequestId: "refund-cost-ambiguous-two"},
+					{Other: `{"task_id":"video_refund_cost_foreign","reason":"generation failed"}`, Quota: 999999, RequestId: "refund-cost-foreign", TokenId: 202},
+					{Other: `{"task_id":"videoXrefundXcostXmissing","reason":"generation failed"}`, Quota: 999999, RequestId: "refund-cost-wildcard-decoy"},
+				}
+				for i := range logs {
+					logs[i].Type, logs[i].UserId, logs[i].CreatedAt = model.LogTypeRefund, 101, now-10
+					if logs[i].TokenId == 0 {
+						logs[i].TokenId = 201
+					}
+				}
+				require.NoError(t, logDB.Create(&logs).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&images).Error)
+					assert.NoError(t, db.Delete(&bills).Error)
+					assert.NoError(t, db.Delete(&jobs).Error)
+					assert.NoError(t, logDB.Delete(&logs).Error)
+				})
+				known := map[string]float64{images[0].TaskId: 0.5, images[1].TaskId: 0, videoIDs[0]: 0.25, videoIDs[1]: 0.125}
+				type refundCostView struct {
+					TaskID       string   `json:"task_id"`
+					Cost         float64  `json:"cost"`
+					RefundedCost *float64 `json:"refunded_cost"`
+				}
+				for _, admin := range []bool{false, true} {
+					t.Run(fmt.Sprintf("admin=%t", admin), func(t *testing.T) {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Request = httptest.NewRequest(http.MethodGet, "/?group=refund-cost", nil)
+						ListMediaTasks(c, admin)
+						require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						var response struct {
+							Data struct{ Items []refundCostView }
+						}
+						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+						require.Len(t, response.Data.Items, len(images)+len(jobs))
+						for _, item := range response.Data.Items {
+							assert.Zero(t, item.Cost, "the actual charge remains zero after a refund")
+							amount, found := known[item.TaskID]
+							if found {
+								require.NotNil(t, item.RefundedCost, item.TaskID)
+								assert.Equal(t, amount, *item.RefundedCost, item.TaskID)
+							} else {
+								assert.Nil(t, item.RefundedCost, item.TaskID)
+							}
+							recorder = httptest.NewRecorder()
+							c, _ = gin.CreateTestContext(recorder)
+							c.Set("id", 101)
+							c.Params = gin.Params{{Key: "task_id", Value: item.TaskID}}
+							c.Request = httptest.NewRequest(http.MethodGet, "/"+item.TaskID, nil)
+							GetMediaTask(c, admin)
+							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							var detail struct{ Data struct{ Task refundCostView } }
+							require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &detail))
+							assert.Equal(t, item, detail.Data.Task)
+						}
+					})
+				}
+				t.Run("durable refund amount survives missing history", func(t *testing.T) {
+					previousRedis := common.RedisEnabled
+					common.RedisEnabled = false
+					defer func() { common.RedisEnabled = previousRedis }()
+					payer := model.User{Id: 103, Username: "refund-payer", AffCode: "refund-payer", Quota: 750000, UsedQuota: 250000}
+					key := model.Token{Id: 203, UserId: payer.Id, Key: "refund-cost-payer-key", RemainQuota: 750000, UsedQuota: 250000}
+					channel := model.Channel{Id: 303, Name: "refund-cost-payer-channel", UsedQuota: 250000}
+					require.NoError(t, db.Create(&payer).Error)
+					require.NoError(t, db.Create(&key).Error)
+					require.NoError(t, db.Create(&channel).Error)
+					job := model.AsyncMediaJob{TaskId: "video_refund_cost_persisted", IdentityHash: "refund-cost-persisted", UserId: payer.Id, TokenId: key.Id, ChannelId: channel.Id, Status: "submitted", BillingStatus: "reserved", Quota: 250000, CreatedAt: now - 30, ExpiresAt: now + 3600}
+					native := model.Task{TaskID: job.TaskId, UserId: payer.Id, ChannelId: channel.Id, Status: model.TaskStatusSubmitted, Quota: job.Quota, SubmitTime: job.CreatedAt,
+						PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: key.Id, DurableBilling: true, SubmitAccountingRecorded: true}}
+					require.NoError(t, db.Create(&job).Error)
+					require.NoError(t, db.Create(&native).Error)
+					t.Cleanup(func() {
+						assert.NoError(t, db.Delete(&native).Error)
+						assert.NoError(t, db.Delete(&job).Error)
+						assert.NoError(t, db.Delete(&key).Error)
+						assert.NoError(t, db.Delete(&payer).Error)
+						assert.NoError(t, db.Delete(&channel).Error)
+					})
+					native.Status, native.FailReason = model.TaskStatusFailure, "generation failed"
+					replay := native
+					won, _, err := model.SettleTaskBilling(t.Context(), &native, model.TaskStatusSubmitted, 0, nil, "")
+					require.NoError(t, err)
+					require.True(t, won)
+					var saved model.Task
+					require.NoError(t, db.Take(&saved, native.ID).Error)
+					assert.Zero(t, saved.Quota)
+					require.NotNil(t, saved.PrivateData.RefundedQuota)
+					assert.Equal(t, 250000, *saved.PrivateData.RefundedQuota)
+					won, _, err = model.SettleTaskBilling(t.Context(), &replay, model.TaskStatusSubmitted, 0, nil, "")
+					require.NoError(t, err)
+					assert.False(t, won, "retaining the amount must not permit another refund")
+					require.NoError(t, db.Take(&payer, payer.Id).Error)
+					assert.Equal(t, 1000000, payer.Quota)
+					previousLogs := model.LOG_DB
+					model.LOG_DB = nil
+					defer func() { model.LOG_DB = previousLogs }()
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", payer.Id)
+					c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/"+job.TaskId, nil)
+					GetMediaTask(c, false)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var detail struct{ Data struct{ Task refundCostView } }
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &detail))
+					require.NotNil(t, detail.Data.Task.RefundedCost)
+					assert.Equal(t, 0.5, *detail.Data.Task.RefundedCost)
+				})
+				t.Run("unavailable refund history keeps task lists available", func(t *testing.T) {
+					require.NoError(t, logDB.Migrator().RenameTable(&model.Log{}, "unavailable_refund_history"))
+					defer func() { require.NoError(t, logDB.Migrator().RenameTable("unavailable_refund_history", &model.Log{})) }()
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Request = httptest.NewRequest(http.MethodGet, "/?group=refund-cost", nil)
+					ListMediaTasks(c, false)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct{ Items []refundCostView }
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					require.Len(t, response.Data.Items, len(images)+len(jobs))
+					for _, item := range response.Data.Items {
+						if strings.HasPrefix(item.TaskID, "video_") {
+							assert.Nil(t, item.RefundedCost, item.TaskID)
+						}
+					}
+				})
+			})
+
 			t.Run("public image query failure semantics", func(t *testing.T) {
 				for _, tc := range []struct {
 					name, status, action, summary string

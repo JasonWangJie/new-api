@@ -249,8 +249,28 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 	for _, object := range storage {
 		providers[object.TaskId] = append(providers[object.TaskId], object.Provider)
 	}
+	refundedIDs := make([]string, 0)
+	for _, task := range tasks {
+		if task.BillingStatus == "refunded" {
+			refundedIDs = append(refundedIDs, task.TaskId)
+		}
+	}
+	refundedBills := make(map[string]model.AsyncImageBill, len(refundedIDs))
+	if len(refundedIDs) > 0 {
+		var bills []model.AsyncImageBill
+		if err := model.DB.WithContext(ctx).Select("task_id", "user_id", "token_id", "reserved_quota").
+			Where("task_id IN ? AND status = ? AND reserved_at > 0 AND reserved_quota >= 0", refundedIDs, "refunded").Find(&bills).Error; err != nil {
+			return nil, err
+		}
+		for _, bill := range bills {
+			refundedBills[bill.TaskId] = bill
+		}
+	}
 	for _, task := range tasks {
 		data := imageTaskDTO(task, admin)
+		if bill, found := refundedBills[task.TaskId]; found && bill.UserId == task.UserId && bill.TokenId == task.TokenId {
+			data["refunded_cost"] = float64(bill.ReservedQuota) / common.QuotaPerUnit
+		}
 		data["api_key_name"] = ""
 		if token, found := tokenNames[task.TokenId]; found && token.UserId == task.UserId {
 			data["api_key_name"] = token.Name

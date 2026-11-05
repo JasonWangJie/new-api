@@ -137,6 +137,9 @@ type TaskPrivateData struct {
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	// RefundedQuota retains the confirmed full refund after the live hold is cleared.
+	// Nil identifies historical tasks whose original amount is unknown.
+	RefundedQuota *int `json:"refunded_quota,omitempty"`
 	// BillingChannelID remains the channel credited by submission accounting,
 	// even when a later attempt executes on another compatible channel.
 	BillingChannelID   int                  `json:"billing_channel_id,omitempty"`
@@ -283,7 +286,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if !p.AsyncMedia && p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.UpstreamAsync == nil && len(p.UpstreamAsyncResponse) == 0 && p.BillingSource == "" && p.SubscriptionId == 0 &&
-		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && p.BillingChannelID == 0 && p.MediaRetryFact == nil && p.MediaRetryFailedAt == 0 && p.MediaRetryState == nil && p.MediaRetryDecision == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
+		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && p.RefundedQuota == nil && p.BillingChannelID == 0 && p.MediaRetryFact == nil && p.MediaRetryFailedAt == 0 && p.MediaRetryState == nil && p.MediaRetryDecision == nil && !p.SubmitAccountingRecorded && !p.DurableBilling && p.SubscriptionPeriodStart == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 && len(p.VideoAttempts) == 0 && !p.VideoTerminalConfirmed && p.VideoReconciliation == nil {
 		return nil, nil
 	}

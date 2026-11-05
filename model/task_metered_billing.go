@@ -339,6 +339,9 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 				}
 			}
 		}
+		if updated.Status == TaskStatusFailure && updated.Quota == 0 {
+			updated.PrivateData.RefundedQuota = common.GetPointer(reservedQuota)
+		}
 		claim := tx.Model(&Task{}).Where("id = ? AND status = ? AND quota = ? AND attempt_generation = ?", task.ID, fromStatus, reservedQuota, task.AttemptGeneration).Select("*").Updates(&updated)
 		if claim.Error != nil {
 			return claim.Error

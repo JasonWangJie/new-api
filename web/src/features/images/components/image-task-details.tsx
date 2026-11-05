@@ -52,6 +52,7 @@ import {
 import { terminalImageStatus } from '../lib/image-request'
 import { imageDetailHeaderClass } from '../lib/image-visuals'
 import {
+  imageTaskCost,
   imageTaskElapsedSeconds,
   imageTaskSpecifications,
   imageTaskIssue,
@@ -290,6 +291,7 @@ export function ImageTaskDetails(props: {
         : 5000,
   })
   const data = task.data?.task
+  const cost = data ? imageTaskCost(data) : null
   const now = useMediaRetentionClock(data ? [data] : undefined)
   const resultExpired = data ? imageTaskResultExpired(data, now) : false
   const results = task.data?.results || []
@@ -674,18 +676,20 @@ export function ImageTaskDetails(props: {
                 },
                 {
                   label: t('Actual cost'),
-                  value: [
-                    'succeeded',
-                    'not_billable',
-                    'settled',
-                    'reserved',
-                  ].includes(data.billing_status) ? (
-                    <span className='text-emerald-700 dark:text-emerald-400'>
-                      {`$${data.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
-                    </span>
-                  ) : (
-                    '—'
-                  ),
+                  value:
+                    cost !== null ? (
+                      <span
+                        className={
+                          data.billing_status === 'refunded'
+                            ? 'text-destructive line-through'
+                            : 'text-emerald-700 dark:text-emerald-400'
+                        }
+                      >
+                        {`$${cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
+                      </span>
+                    ) : (
+                      '—'
+                    ),
                 },
                 { label: t('Retries'), value: String(data.retry_count) },
               ]}

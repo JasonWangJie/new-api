@@ -77,6 +77,7 @@ import { ImageTaskRefreshActions } from './components/image-task-refresh-actions
 import { useMediaRetentionClock } from './hooks/use-media-retention-clock'
 import { imageLabel } from './lib/image-labels'
 import {
+  imageTaskCost,
   imageTaskElapsedSeconds,
   imageTaskListSpecifications,
   imageTaskSuccessRate,
@@ -425,23 +426,26 @@ function TaskCenterSession({
         header: ({ column }) => (
           <DataTableColumnHeader column={column} title={t('Actual cost')} />
         ),
-        cell: ({ row }) => (
-          <span
-            className={
-              ['succeeded', 'not_billable'].includes(
-                row.original.billing_status
-              )
-                ? 'font-mono text-xs text-emerald-700 dark:text-emerald-400'
-                : 'text-muted-foreground font-mono text-xs'
-            }
-          >
-            {['succeeded', 'not_billable', 'settled', 'reserved'].includes(
-              row.original.billing_status
-            )
-              ? `$${row.original.cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`
-              : '—'}
-          </span>
-        ),
+        cell: ({ row }) => {
+          const cost = imageTaskCost(row.original)
+          return (
+            <span
+              className={cn(
+                'text-muted-foreground font-mono text-xs',
+                ['succeeded', 'not_billable'].includes(
+                  row.original.billing_status
+                ) && 'text-emerald-700 dark:text-emerald-400',
+                row.original.billing_status === 'refunded' &&
+                  cost !== null &&
+                  'text-destructive line-through'
+              )}
+            >
+              {cost === null
+                ? '—'
+                : `$${cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`}
+            </span>
+          )
+        },
         size: 86,
       },
       {

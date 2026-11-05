@@ -369,8 +369,9 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 	} else if isAsyncVideoBusyFailure(fact.Message) {
 		fact.Category = "capacity"
 	}
-	// Huahuo identifies the video by id. Its request_id can trace the HTTP call.
-	output, conflict := videoRecoveryResponseEvidence(response, task.PrivateData.UpstreamTaskID, result.Reason, task.Platform != constant.TaskPlatformHuahuoVideo)
+	// Huahuo and native Wolong use request_id to trace the HTTP call, not the task.
+	requestIDIsTaskID := task.Platform != constant.TaskPlatformHuahuoVideo && (task.Platform != "wolong" || task.PrivateData.UpstreamAsync != nil)
+	output, conflict := videoRecoveryResponseEvidence(response, task.PrivateData.UpstreamTaskID, result.Reason, requestIDIsTaskID)
 	fact.HasOutput = output || result.Url != "" || result.RemoteUrl != "" || task.PrivateData.ResultURL != ""
 	fact.Unknown = conflict || fact.HasOutput || result.TaskID != "" && result.TaskID != task.PrivateData.UpstreamTaskID
 	if fact.Unknown {
