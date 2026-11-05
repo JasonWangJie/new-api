@@ -344,9 +344,11 @@ func RouteAsyncVideo(c *gin.Context) {
 			capabilityErr = profileErr
 			continue
 		}
-		if profileErr = service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
-			capabilityErr = profileErr
-			continue
+		if provider != "wolong" {
+			if profileErr = service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
+				capabilityErr = profileErr
+				continue
+			}
 		}
 		groups := []string{policy.Group}
 		if policy.Group == "auto" {
@@ -388,14 +390,49 @@ func RouteAsyncVideo(c *gin.Context) {
 				if matches, _ := model.ChannelSatisfiesFilters(&channel, pinned.Model, append(slices.Clone(constraints.Filters), filter)); !matches {
 					continue
 				}
+				candidatePools := pools
+				if provider == "wolong" {
+					// A public alias can resolve to different model semantics and
+					// defaults. Apply policy limits after resolving this channel.
+					upstream, _, err := channel.TaskVideoModelConfig(pinned.Model)
+					if err != nil {
+						capabilityErr = err
+						continue
+					}
+					value, _ := c.Get(pluginruntime.ContextKeyProtocolRequest)
+					request, valid := value.(pluginruntime.ProtocolRequestContext)
+					if !valid {
+						continue
+					}
+					request.UpstreamModel = upstream
+					decoded, err := binding.Plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, request.JSValue())
+					intent, valid := decoded.(map[string]any)
+					if err != nil || !valid {
+						continue
+					}
+					action, _ := intent["action"].(string)
+					if err := service.ValidateVideoProfileRequest(profile, action, intent["requestBody"], videoFiles); err != nil {
+						capabilityErr = err
+						continue
+					}
+					body, _ := intent["requestBody"].(map[string]any)
+					resolvedResolution, _ := body["resolution"].(string)
+					if selectedResolution := service.VideoPoolResolution(resolvedResolution); selectedResolution != resolution {
+						candidatePools = nil
+						if err := model.DB.WithContext(c.Request.Context()).Where("binding_key = ?", service.ImagePoolBindingKey(poolPolicy, pinned.Model, selectedResolution)).Find(&candidatePools).Error; err != nil {
+							c.AbortWithStatus(503)
+							return
+						}
+					}
+				}
 				// Automatic video routing retains its minimum global weight of one.
 				weight := max(1, min(channel.GetWeight(), 1_000_000_000))
-				if len(pools) > 0 {
-					index := slices.IndexFunc(pools, func(pool model.ImageChannelPool) bool { return pool.ChannelId == channel.Id })
+				if len(candidatePools) > 0 {
+					index := slices.IndexFunc(candidatePools, func(pool model.ImageChannelPool) bool { return pool.ChannelId == channel.Id })
 					if index < 0 {
 						continue
 					}
-					service.ApplyMediaChannelPoolWeight(&channel, pools[index].Priority)
+					service.ApplyMediaChannelPoolWeight(&channel, candidatePools[index].Priority)
 					weight = channel.GetWeight()
 				}
 				selectedBinding := binding
@@ -1437,8 +1474,27 @@ func PersistAsyncVideo(ctx context.Context, job model.AsyncMediaJob, task *model
 	originalTask := task
 	copyTask := *task
 	task = &copyTask
-	restoreErr := service.RestoreAsyncMediaOutput(ctx, job, task)
-	refreshResult := task.PrivateData.UpstreamAsync != nil && (job.StorageStatus == "failed" || job.StorageStatus == "saving")
+	if task.Platform == "wolong" {
+		ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
+		if err != nil {
+			return err
+		}
+		if ref == nil {
+			adaptor, err := initTaskArtifactAdaptor(task)
+			if err != nil {
+				return err
+			}
+			task, err = refreshWolongVideoContent(ctx, task, adaptor)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	var restoreErr error
+	if task.Platform != "wolong" {
+		restoreErr = service.RestoreAsyncMediaOutput(ctx, job, task)
+	}
+	refreshResult := task.Platform != "wolong" && task.PrivateData.UpstreamAsync != nil && (job.StorageStatus == "failed" || job.StorageStatus == "saving")
 	if restoreErr != nil && !errors.Is(restoreErr, os.ErrNotExist) && !refreshResult {
 		return restoreErr
 	}

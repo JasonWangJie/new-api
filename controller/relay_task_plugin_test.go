@@ -2494,6 +2494,237 @@ func TestHuahuoVideoDurableLifecycle(t *testing.T) {
 	}
 }
 
+func TestWolongVideoDurableLifecycle(t *testing.T) {
+	const publicModel = "wolong-public-fixture"
+	for _, tc := range []struct {
+		scenario, billingMode    string
+		aliasDefaults, reference bool
+	}{
+		{scenario: "completed"}, {scenario: "refunded"}, {scenario: "balance rejection"}, {scenario: "lost receipt"},
+		{scenario: "completed", billingMode: "per_request"}, {scenario: "completed", billingMode: "per_second"},
+		{scenario: "completed", aliasDefaults: true}, {scenario: "completed", aliasDefaults: true, reference: true},
+	} {
+		name := strings.TrimSpace(tc.scenario + " " + tc.billingMode)
+		if tc.aliasDefaults {
+			name += " alias defaults"
+		}
+		if tc.reference {
+			name += " image reference"
+		}
+		t.Run(name, func(t *testing.T) {
+			scenario, upstreamModel := tc.scenario, "haya-mo-seedance-25"
+			if tc.billingMode != "" {
+				upstreamModel = "future-wolong-model"
+			}
+			user, token := setupResponsesWSRequestTest(t)
+			db := setupVideoRetryTestDatabase(t, user, token)
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "wolong-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "wolong-test")
+			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
+			previousAdaptor := service.GetTaskAdaptorFunc
+			previousSecret, previousEnabled := common.CryptoSecret, constant.TaskPluginEnabled
+			previousBatch, previousLogs := common.BatchUpdateEnabled, common.LogConsumeEnabled
+			pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = pluginruntime.NewRegistry(), ExecuteAsyncVideo
+			service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor { return relay.GetTaskAdaptor(platform) }
+			common.CryptoSecret, constant.TaskPluginEnabled = "wolong-test-signing", true
+			common.BatchUpdateEnabled, common.LogConsumeEnabled = false, true
+			t.Cleanup(func() {
+				pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = previousRegistry, previousSubmit
+				service.GetTaskAdaptorFunc = previousAdaptor
+				common.CryptoSecret, constant.TaskPluginEnabled = previousSecret, previousEnabled
+				common.BatchUpdateEnabled, common.LogConsumeEnabled = previousBatch, previousLogs
+			})
+			redisServer := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() { assert.NoError(t, client.Close()) })
+			cfg := service.DefaultMediaRuntimeConfig()
+			cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+			require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+			source, err := builtinplugins.Source("wolong")
+			require.NoError(t, err)
+			_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "wolong"})
+			require.NoError(t, err)
+			const origin = "https://8.8.8.8"
+			baseURL, mapping := origin, `{"`+publicModel+`":"`+upstreamModel+`"}`
+			ch := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "Wolong fixture", Key: "wl_fixture", BaseURL: &baseURL, ModelMapping: &mapping, Models: publicModel, Group: "default", Status: common.ChannelStatusEnabled}
+			settings := relaydto.ChannelSettings{TaskPluginKey: "wolong"}
+			if tc.billingMode != "" {
+				zero := 0
+				settings.TaskPluginModelConfigs = map[string]relaydto.TaskVideoModelConfig{upstreamModel: {
+					Duration:    relaydto.TaskVideoDuration{Values: []int{5, 10}, Default: 5},
+					Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"},
+					References: relaydto.TaskVideoReferences{Images: &zero, Videos: &zero, Audios: &zero}, BillingMode: tc.billingMode,
+				}}
+			}
+			ch.SetSetting(settings)
+			require.NoError(t, ch.ValidateTaskVideoModelBindings())
+			require.NoError(t, db.Create(&ch).Error)
+			require.NoError(t, db.Create(&model.Ability{ChannelId: ch.Id, Group: "default", Model: publicModel, Enabled: true}).Error)
+			snapshot, err := model.GetTaskPluginSyncSnapshot()
+			require.NoError(t, err)
+			require.NoError(t, pluginruntime.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+			expression := `u("video_count") * 0.0002`
+			if tc.billingMode == "per_second" {
+				expression = `u("seconds") * 0.00004`
+			}
+			withTieredBillingConfig(t, map[string]string{publicModel: "tiered_expr"}, map[string]string{publicModel: expression})
+			_, err = model.SaveMediaRetryPolicy(t.Context(), mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "replay", Name: "Replay", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"fixture", "EOF"}}, Steps: []mediaretry.Step{{ID: "same", Action: mediaretry.SameChannel, MaxAttempts: 1}}}}}, 0, user.Id, nil)
+			require.NoError(t, err)
+			var job model.AsyncMediaJob
+			var submits, polls atomic.Int32
+			service.InitHttpClient()
+			httpClient := service.GetHttpClient()
+			oldTransport := httpClient.Transport
+			httpClient.Transport = huahuoVideoRoundTrip(func(request *http.Request) (*http.Response, error) {
+				if request.Body != nil {
+					defer request.Body.Close()
+				}
+				recorder := httptest.NewRecorder()
+				recorder.Header().Set("Content-Type", "application/json")
+				assert.Equal(t, "Bearer wl_fixture", request.Header.Get("Authorization"))
+				switch request.Method + " " + request.URL.String() {
+				case "POST " + origin + "/v1/videos/generations":
+					submits.Add(1)
+					assert.Equal(t, job.TaskId, request.Header.Get("Idempotency-Key"))
+					var body map[string]any
+					assert.NoError(t, common.DecodeJson(request.Body, &body))
+					assert.Equal(t, upstreamModel, body["model"])
+					assert.EqualValues(t, 5, body["duration"])
+					if tc.reference {
+						assert.Equal(t, []any{"https://media.example.com/reference.png"}, body["image_urls"])
+					}
+					switch scenario {
+					case "lost receipt":
+						return nil, io.ErrUnexpectedEOF
+					case "balance rejection":
+						recorder.WriteHeader(http.StatusPaymentRequired)
+						_, _ = io.WriteString(recorder, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"fixture balance insufficient","need":60,"balance":3}`)
+					default:
+						recorder.WriteHeader(http.StatusInternalServerError)
+						_, _ = io.WriteString(recorder, `{"ok":false,"error":"fixture accepted receipt","task":{"id":"task_vendor_private","status":"running"}}`)
+					}
+				case "GET " + origin + "/v1/tasks/task_vendor_private":
+					phase := polls.Add(1)
+					if scenario == "refunded" {
+						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"failed","error":"fixture failure","charged_amount":60,"refunded_amount":60,"refunded":true}}`)
+					} else if phase == 1 {
+						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"needs_review","progress":25.5}}`)
+					} else if phase == 2 {
+						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"failed","error":"fixture partial refund","charged_amount":60,"refunded_amount":20,"refunded":false}}`)
+					} else {
+						_, _ = io.WriteString(recorder, `{"ok":true,"task":{"id":"task_vendor_private","status":"succeeded","progress":100,"data":[{"url":"/media/video.mp4?e=fixture","mime":"video/mp4"}]}}`)
+					}
+				default:
+					t.Errorf("unexpected Wolong request %s %s", request.Method, request.URL)
+					recorder.WriteHeader(http.StatusNotFound)
+				}
+				return recorder.Result(), nil
+			})
+			t.Cleanup(func() { httpClient.Transport = oldTransport })
+			engine := gin.New()
+			engine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), AcceptAsyncVideo)
+			input := map[string]any{"provider": "wolong", "model": publicModel, "prompt": "fixture"}
+			if !tc.aliasDefaults {
+				input["seconds"], input["resolution"], input["aspect_ratio"] = 5, "720p", "16:9"
+			}
+			if tc.reference {
+				input["input_reference"] = "https://media.example.com/reference.png"
+				input["mode"] = "reference_to_video"
+			}
+			inputJSON, err := common.Marshal(input)
+			require.NoError(t, err)
+			for range 2 {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", bytes.NewReader(inputJSON))
+				request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Idempotency-Key", "wolong-client-fixture")
+				engine.ServeHTTP(recorder, request)
+				require.Equal(t, http.StatusAccepted, recorder.Code, recorder.Body.String())
+			}
+			require.NoError(t, db.Where("user_id = ?", user.Id).Take(&job).Error)
+			if tc.billingMode != "" {
+				// Accepted requests retain their capability and pricing snapshots
+				// when an administrator later changes the channel and unit price.
+				changed := settings.TaskPluginModelConfigs[upstreamModel]
+				changed.Duration = relaydto.TaskVideoDuration{Values: []int{10}, Default: 10}
+				settings.TaskPluginModelConfigs[upstreamModel] = changed
+				ch.SetSetting(settings)
+				require.NoError(t, db.Model(&ch).Update("setting", ch.Setting).Error)
+				snapshot, err := model.GetTaskPluginSyncSnapshot()
+				require.NoError(t, err)
+				require.NoError(t, pluginruntime.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+				withTieredBillingConfig(t, map[string]string{publicModel: "tiered_expr"}, map[string]string{publicModel: expression + " * 100"})
+			}
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "wolong-submit", 120)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			processErr := service.ProcessAsyncMediaJob(t.Context(), job, cfg)
+			if scenario == "balance rejection" || scenario == "lost receipt" {
+				require.Error(t, processErr)
+				require.NoError(t, db.First(&job, job.ID).Error)
+				if scenario == "balance rejection" {
+					assert.Equal(t, "refunded", job.BillingStatus)
+				} else {
+					assert.Equal(t, "unknown", job.BillingStatus)
+				}
+				require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+			} else {
+				require.NoError(t, processErr)
+				var task model.Task
+				require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+				phases := 3
+				if scenario == "refunded" {
+					phases = 1
+				}
+				for phase := range phases {
+					id := task.GetUpstreamTaskID()
+					require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{ch.Id: {id}}, map[string]*model.Task{id: &task}))
+					require.NoError(t, db.First(&task, task.ID).Error)
+					if scenario == "completed" && phase < 2 {
+						assert.Equal(t, 100, task.Quota)
+						assert.NotEqual(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+						if task.PrivateData.VideoReconciliation != nil {
+							before := task.Snapshot()
+							task.PrivateData.VideoReconciliation.NextPollAt = time.Now().Unix() - 1
+							updated, updateErr := task.UpdatePollingState(t.Context(), before)
+							require.NoError(t, updateErr)
+							require.True(t, updated)
+						}
+					}
+				}
+				if scenario == "refunded" {
+					assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), task.Status)
+				} else {
+					assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+				}
+			}
+			assert.EqualValues(t, 1, submits.Load(), "no retry rule may regenerate the same Wolong task")
+			require.NoError(t, db.First(token, token.Id).Error)
+			refunded := scenario == "refunded" || scenario == "balance rejection"
+			if refunded {
+				assert.Equal(t, 100, token.RemainQuota)
+			} else {
+				assert.Zero(t, token.RemainQuota)
+			}
+			var consumes, refunds int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Count(&consumes).Error)
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refunds).Error)
+			assert.LessOrEqual(t, consumes, int64(1))
+			assert.LessOrEqual(t, refunds, int64(1))
+			if scenario == "completed" {
+				assert.EqualValues(t, 1, consumes)
+				assert.Zero(t, refunds)
+			}
+			if scenario == "lost receipt" {
+				assert.Zero(t, refunds)
+			}
+		})
+	}
+}
+
 func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB

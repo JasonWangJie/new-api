@@ -42,11 +42,34 @@ func (channel *Channel) TaskVideoModelConfig(publicModel string) (string, dto.Ta
 			return "", dto.TaskVideoModelConfig{}, fmt.Errorf("cyclic model mapping")
 		}
 	}
+	config, err := ResolveTaskVideoModelConfig(settings, upstream)
+	return upstream, config, err
+}
+
+// ResolveTaskVideoModelConfig preserves factory defaults for Wolong channels
+// created before optional channel capability settings existed.
+func ResolveTaskVideoModelConfig(settings dto.ChannelSettings, upstream string) (dto.TaskVideoModelConfig, error) {
 	config, exists := settings.TaskPluginModelConfigs[upstream]
-	if !exists {
-		return "", config, fmt.Errorf("model %s requires a saved capability configuration", upstream)
+	if settings.TaskPluginKey == "wolong" {
+		for _, meta := range jsplugin.DefaultRegistry.Snapshot().Factory {
+			if meta.Key == "wolong" {
+				defaults, known := jsplugin.TaskVideoModelConfigFromMeta(meta, upstream)
+				if known {
+					if exists && config.BillingMode != defaults.BillingMode {
+						return config, fmt.Errorf("model %s must retain its built-in billing unit", upstream)
+					}
+					if !exists {
+						config, exists = defaults, true
+					}
+				}
+				break
+			}
+		}
 	}
-	return upstream, config, config.ValidateForPlugin(settings.TaskPluginKey, relaycommon.MaxTaskDurationSeconds)
+	if !exists {
+		return config, fmt.Errorf("model %s requires a saved capability configuration", upstream)
+	}
+	return config, config.ValidateForPlugin(settings.TaskPluginKey, relaycommon.MaxTaskDurationSeconds)
 }
 
 // ValidateTaskVideoModelBindings prevents one retail model from changing units

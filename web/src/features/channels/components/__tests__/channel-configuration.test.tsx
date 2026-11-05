@@ -96,35 +96,47 @@ test('Sudashui channel form persists independent catalog and capability settings
   ).not.toHaveProperty('task_plugin_model_configs')
 })
 
-test('Huahuo video stores manually configured models and never saves a catalog URL', () => {
-  const config = {
-    ...taskVideoCatalogConfig(undefined, true),
-    duration: { values: [5, 10] },
-    durations_by_resolution: { '1080p': { values: [5] } },
-    references: { images: 2, videos: 0, audios: 1, image_upload: true },
-    resolutions: ['720p', '1080p'],
-    aspect_ratios: ['16:9'],
-    modes: ['reference_to_video'],
-    billing_mode: 'per_second',
-  }
-  const form = {
-    ...CHANNEL_FORM_DEFAULT_VALUES,
-    type: 61,
-    task_plugin_key: 'huahuo-video',
-    task_plugin_model_source_url: 'https://catalog.example/v1/models',
-    task_plugin_model_configs: JSON.stringify({
+test.each(['huahuo-video', 'wolong'])(
+  '%s stores manually configured models and never saves a catalog URL',
+  (pluginKey) => {
+    const config = {
+      ...taskVideoCatalogConfig(undefined, true),
+      duration: { values: [5, 10] },
+      durations_by_resolution: { '1080p': { values: [5] } },
+      references: { images: 2, videos: 0, audios: 1, image_upload: true },
+      resolutions: ['720p', '1080p'],
+      aspect_ratios: ['16:9'],
+      modes: ['reference_to_video'],
+      billing_mode: 'per_second',
+    }
+    const form = {
+      ...CHANNEL_FORM_DEFAULT_VALUES,
+      type: 61,
+      task_plugin_key: pluginKey,
+      task_plugin_model_source_url: 'https://catalog.example/v1/models',
+      task_plugin_model_configs: JSON.stringify({
+        'inmind/video/future': config,
+      }),
+    }
+    const setting = JSON.parse(buildSettingJSON(form))
+    expect(setting.task_plugin_model_configs).toEqual({
       'inmind/video/future': config,
-    }),
+    })
+    expect(setting).not.toHaveProperty('task_plugin_model_source_url')
+    const reloaded = transformChannelToFormDefaults({
+      ...editingChannel,
+      type: 61,
+      models: 'inmind/video/future',
+      setting: JSON.stringify(setting),
+    })
+    expect(JSON.parse(reloaded.task_plugin_model_configs || '{}')).toEqual(
+      setting.task_plugin_model_configs
+    )
+    expect(
+      JSON.parse(buildSettingJSON({ ...form, task_plugin_key: 'huahuo-image' }))
+    ).not.toHaveProperty('task_plugin_model_configs')
   }
-  const setting = JSON.parse(buildSettingJSON(form))
-  expect(setting.task_plugin_model_configs).toEqual({
-    'inmind/video/future': config,
-  })
-  expect(setting).not.toHaveProperty('task_plugin_model_source_url')
-  expect(
-    JSON.parse(buildSettingJSON({ ...form, task_plugin_key: 'huahuo-image' }))
-  ).not.toHaveProperty('task_plugin_model_configs')
-})
+)
 let client: QueryClient
 let editingChannel: Channel
 let pluginOptions: Array<
@@ -275,6 +287,119 @@ test('opening channel creation allows selecting a plugin with no registered mode
   )
 
   expect(screen.getByLabelText('Name *')).toHaveValue('Huahuo Image')
+})
+
+test('Wolong adds a custom model while preserving preset choices and saves only manually initialized capabilities', async () => {
+  pluginOptions = [
+    ...plugins,
+    {
+      key: 'wolong',
+      name: 'Wolong Video',
+      baseUrl: 'https://wolongvideo.com',
+      models: ['haya-mo-seedance-25', 'czniu-seedance-20-stable'],
+    },
+  ]
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness />)
+  await user.click(
+    await screen.findByRole('option', { name: 'Wolong Video Plugin wolong' })
+  )
+  fireEvent.change(screen.getByLabelText('API Key *'), {
+    target: { value: 'wl_test' },
+  })
+  const models = screen.getByRole('combobox', {
+    name: 'Select models or add custom ones',
+  })
+  await user.type(models, 'wolong-future,')
+  await user.keyboard('{Escape}')
+  expect(
+    screen.queryByRole('button', { name: 'Fetch from Upstream' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Model catalog URL')).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', {
+      name: 'Initialize missing model capabilities',
+    })
+  )
+  expect(screen.getByDisplayValue('wolong-future')).toBeVisible()
+  expect(
+    screen.queryByDisplayValue('haya-mo-seedance-25')
+  ).not.toBeInTheDocument()
+  const config = {
+    ...taskVideoCatalogConfig(undefined, true),
+    duration: { values: [5] },
+    resolutions: ['720p'],
+    aspect_ratios: ['16:9'],
+    modes: ['text_to_video'],
+    references: {
+      images: 0,
+      videos: 0,
+      audios: 0,
+      image_upload: false,
+      image_data_uri: false,
+    },
+    billing_mode: 'per_request',
+  }
+  fireEvent.change(
+    screen.getByDisplayValue(
+      JSON.stringify(taskVideoCatalogConfig(undefined, true))
+    ),
+    { target: { value: JSON.stringify(config) } }
+  )
+  await user.click(models)
+  await user.click(screen.getByRole('option', { name: 'haya-mo-seedance-25' }))
+  expect(
+    screen.getByRole('option', { name: 'haya-mo-seedance-25' })
+  ).toBeVisible()
+  await user.click(screen.getByRole('option', { name: 'haya-mo-seedance-25' }))
+  await user.keyboard('{Escape}')
+  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+  await waitFor(() => expect(post).toHaveBeenCalledOnce())
+  const payload = post.mock.calls[0][1] as {
+    channel: { models: string; setting: string }
+  }
+  expect(payload.channel.models.split(',')).toEqual(
+    expect.arrayContaining([
+      'haya-mo-seedance-25',
+      'czniu-seedance-20-stable',
+      'wolong-future',
+    ])
+  )
+  expect(JSON.parse(payload.channel.setting)).toMatchObject({
+    task_plugin_key: 'wolong',
+    task_plugin_model_configs: { 'wolong-future': config },
+  })
+})
+
+test('switching away from Wolong clears its custom model capabilities from the next provider draft', async () => {
+  pluginOptions = [
+    { key: 'wolong', name: 'Wolong Video', models: ['haya-mo-seedance-25'] },
+    { key: 'huahuo-video', name: 'Huahuo Video', models: [] },
+  ]
+  const user = userEvent.setup()
+  render(<ConfigurationHarness />)
+  await user.click(
+    await screen.findByRole('option', { name: 'Wolong Video Plugin wolong' })
+  )
+  await user.type(
+    screen.getByRole('combobox', { name: 'Select models or add custom ones' }),
+    'wolong-future,'
+  )
+  await user.keyboard('{Escape}')
+  await user.click(
+    screen.getByRole('button', {
+      name: 'Initialize missing model capabilities',
+    })
+  )
+  expect(screen.getByDisplayValue('wolong-future')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Change provider' }))
+  await user.click(
+    screen.getByRole('option', { name: 'Huahuo Video Plugin huahuo-video' })
+  )
+  expect(screen.queryByDisplayValue('wolong-future')).not.toBeInTheDocument()
 })
 
 test('changing built-in providers updates server-provided URL placeholders without replacing the draft address', async () => {

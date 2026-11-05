@@ -7,7 +7,7 @@ import "github.com/QuantumNous/new-api/pkg/mediaretry"
 // administrator-supplied keywords cannot create that evidence.
 func PlanTerminalVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {
 	decision, err := mediaretry.Evaluate(policy, fact, state)
-	decision = guardHuahuoVideoReplay(fact, decision)
+	decision = guardIdempotentVideoReplay(fact, decision)
 	if err != nil {
 		return decision, err
 	}

@@ -51,6 +51,118 @@ func sudashuiFixture(t *testing.T) (*jsplugin.LoadedPlugin, dto.TaskVideoModelCo
 	return plugin, config
 }
 
+func TestWolongDynamicVideoModelBindings(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.TaskPlugin{}, &model.Option{}))
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+	source, err := plugins.Source("wolong")
+	require.NoError(t, err)
+	factory, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "wolong"})
+	require.NoError(t, err)
+
+	const publicModel, upstream, builtIn = "my-wolong-video", "future-seedance-video", "mili-bd-seedance-25"
+	images, videos, audios := 2, 1, 0
+	config := dto.TaskVideoModelConfig{Duration: dto.TaskVideoDuration{Values: []int{5, 10}, Default: 5}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video", "reference_to_video", "first_last_frame"}, References: dto.TaskVideoReferences{Images: &images, Videos: &videos, Audios: &audios}, BillingMode: "per_request"}
+	mapping := `{"my-wolong-video":"future-seedance-video"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Models: publicModel + "," + builtIn, Status: common.ChannelStatusEnabled, ModelMapping: &mapping}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{upstream: config}})
+	require.NoError(t, channel.ValidateSettings())
+	require.NoError(t, channel.ValidateTaskVideoModelBindings())
+	require.NoError(t, db.Create(&channel).Error)
+	var persisted model.Channel
+	require.NoError(t, db.First(&persisted, channel.Id).Error)
+	assert.Equal(t, config, persisted.GetSetting().TaskPluginModelConfigs[upstream])
+	_, defaults, err := persisted.TaskVideoModelConfig(builtIn)
+	require.NoError(t, err)
+	assert.Equal(t, "16:9", defaults.AspectRatios[0])
+	assert.Equal(t, "per_request", defaults.BillingMode)
+	snapshot, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+	active, found := jsplugin.DefaultRegistry.Get("wolong")
+	require.True(t, found)
+	for _, name := range factory.Meta.Models {
+		assert.Contains(t, active.Meta.Models, name)
+	}
+	binding, found := jsplugin.DefaultRegistry.Generation().LookupEndpoint("POST", "/v1/videos", publicModel)
+	require.True(t, found)
+	schema, _ := binding.Plugin.Meta.UsageForModel(publicModel)
+	assert.Contains(t, schema, "video_count")
+	assert.NotContains(t, schema, "requests")
+	assert.NotContains(t, schema, "seconds")
+	optionsRecorder := httptest.NewRecorder()
+	optionsContext, _ := gin.CreateTestContext(optionsRecorder)
+	optionsContext.Request = httptest.NewRequest(http.MethodGet, "/api/task_plugin_options", nil)
+	GetTaskPluginOptions(optionsContext)
+	var options struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			Key    string   `json:"key"`
+			Models []string `json:"models"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(optionsRecorder.Body.Bytes(), &options))
+	require.True(t, options.Success)
+	require.Len(t, options.Data, 1)
+	assert.Equal(t, "wolong", options.Data[0].Key)
+	assert.Len(t, options.Data[0].Models, 10)
+	assert.ElementsMatch(t, factory.Meta.Models, options.Data[0].Models)
+	assert.NotContains(t, options.Data[0].Models, upstream)
+	assert.NotContains(t, options.Data[0].Models, publicModel)
+
+	request := map[string]any{"model": publicModel, "prompt": "Animate the scene", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"}
+	for _, tc := range []struct {
+		name   string
+		fields map[string]any
+		valid  bool
+	}{
+		{name: "text", valid: true},
+		{name: "references", fields: map[string]any{"reference_images": []string{"https://cdn.example/one.png", "https://cdn.example/two.png"}}, valid: true},
+		{name: "first and last", fields: map[string]any{"image": "https://cdn.example/one.png", "last_frame": "https://cdn.example/two.png"}, valid: true},
+		{name: "duration outside channel profile", fields: map[string]any{"seconds": 6}},
+		{name: "resolution outside channel profile", fields: map[string]any{"resolution": "1080p"}},
+		{name: "too many channel references", fields: map[string]any{"reference_images": []string{"https://cdn.example/one.png", "https://cdn.example/two.png", "https://cdn.example/three.png"}}},
+		{name: "disabled image mode", fields: map[string]any{"image": "https://cdn.example/one.png"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := maps.Clone(request)
+			maps.Copy(body, tc.fields)
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			_, err = service.DecodeMixedVideoCandidate(t.Context(), persisted, publicModel, "create", raw, service.VideoModelOverrides{}, user.Id, "application/json")
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/videos", nil)
+			c.Set(jsplugin.ContextKeyProtocolRequest, jsplugin.ProtocolRequestContext{Model: publicModel, Protocol: "openai_video", Operation: "create", RouteRequestContext: jsplugin.RouteRequestContext{Body: map[string]any{"kind": "json", "value": body}}})
+			matches, _ := model.ChannelSatisfiesFilters(&persisted, publicModel, []gatewaydto.ChannelFilter{service.ConfiguredTaskVideoFilter(c)})
+			assert.Equal(t, tc.valid, matches)
+		})
+	}
+
+	raw, err := common.Marshal(request)
+	require.NoError(t, err)
+	candidate, err := service.DecodeMixedVideoCandidate(t.Context(), persisted, publicModel, "create", raw, service.VideoModelOverrides{}, user.Id, "application/json")
+	require.NoError(t, err)
+	frozen := service.AsyncVideoRequest{Body: raw, ContentType: "application/json"}
+	require.NoError(t, service.RebindMixedVideoRequest(&frozen, candidate, common.GetTimestamp()+600))
+	require.NotNil(t, frozen.Execution.VideoModelConfig)
+	assert.Equal(t, config, *frozen.Execution.VideoModelConfig)
+	require.NoError(t, db.Model(&channel).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	disabled, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, disabled.VideoModels))
+	assert.Empty(t, jsplugin.DefaultRegistry.Generation().LookupEndpointCandidates("POST", "/v1/videos", publicModel))
+	_, err = service.FrozenTaskVideoBinding(&frozen.Channel, publicModel)
+	require.NoError(t, err)
+}
+
 func TestHuahuoDynamicVideoModelBindings(t *testing.T) {
 	setupTaskPluginControllerTest(t)
 	_, config := sudashuiFixture(t)

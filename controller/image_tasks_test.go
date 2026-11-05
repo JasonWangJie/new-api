@@ -1061,6 +1061,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "zero task quota cannot clear known billing failure", taskStatus: model.TaskStatusFailure, taskProgress: "100%", jobBilling: "failed", billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "expiry takes precedence", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "expired", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(0)},
 					{name: "other providers retain their status", taskStatus: model.TaskStatusQueued, provider: "sora", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "invoking", stage: "generating", progress: 14},
+					{name: "Wolong zero upstream progress", taskStatus: model.TaskStatusInProgress, provider: "wolong", taskProgress: "0%", data: `{"ok":true,"task":{"status":"running","progress":0}}`, status: "invoking", stage: "generating", progress: 10, upstreamProgress: float64(0)},
+					{name: "Wolong fractional upstream progress", taskStatus: model.TaskStatusInProgress, provider: "wolong", taskProgress: "37%", data: `{"ok":true,"task":{"status":"running","progress":37.5}}`, status: "invoking", stage: "generating", progress: 25, upstreamProgress: 37.5},
+					{name: "Wolong unknown progress is omitted", taskStatus: model.TaskStatusInProgress, provider: "wolong", taskProgress: "37%", data: `{"ok":true,"task":{"status":"running","progress":null}}`, status: "invoking", stage: "generating", progress: 25},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
 						job.Status, job.StorageStatus, job.Provider, job.ExpiresAt, job.DispatchedAt = "submitted", "pending", "drama", now+3600, now-5

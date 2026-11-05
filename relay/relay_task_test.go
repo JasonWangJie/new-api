@@ -298,19 +298,23 @@ func newTaskSubmitContext(t *testing.T, originalModel, mapping string) (*gin.Con
 }
 
 func TestRelayTaskSubmitRequiresDurableVideoAdmission(t *testing.T) {
-	for _, provider := range []string{"nldw", "yuxibox", "ordinary-video"} {
+	for _, provider := range []string{"nldw", "yuxibox", "wolong", "ordinary-video"} {
 		for _, admission := range []string{"", "async_media_prepare", "async_media_execution"} {
 			t.Run(provider+"/"+admission, func(t *testing.T) {
 				source := fmt.Sprintf(`
-export const meta = {apiVersion:1,key:%q,name:"Admission fixture",version:"1.0.0",author:{name:"Test"},models:["admission-model"],fetchMode:"per_task"};
+export const meta = {apiVersion:1,key:%q,name:"Admission fixture",version:"1.0.0",author:{name:"Test"},models:["admission-model"],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:["admission-model"],modes:[{name:"text_to_video"}]}]};
+export const protocols = {openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,action:"text_to_video",requestBody:ctx.body.value};},render(){return {};}}};
 export function buildSubmitRequest(){throw new Error("submission validation reached");}
 export function parseSubmitResponse(){return {taskId:"unused"};}
 export function buildQueryRequest(){return {url:"https://provider.example/query"};}
 export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+export function listArtifacts(){return [];}
+export function buildContentRequest(){return {url:"https://provider.example/video"};}
 `, provider)
 				c, info := newTaskSubmitContext(t, "admission-model", "")
 				pinMappingOrderPlugin(t, c, source)
 				info.OriginModelName = "admission-model"
+				info.Action = "text_to_video"
 				if admission != "" {
 					c.Set(admission, true)
 				}
@@ -332,65 +336,67 @@ export function parseTaskResult(){return {status:"IN_PROGRESS"};}
 
 func TestHuahuoVideoRequiresConfiguredSitePrice(t *testing.T) {
 	const modelName = "huahuo-pricing-fixture"
-	source, err := builtinplugins.Source(constant.TaskPlatformHuahuoVideo)
-	require.NoError(t, err)
-	registry := pluginruntime.NewRegistry()
-	plugin, err := registry.RegisterFactory(source, pluginruntime.Options{Key: constant.TaskPlatformHuahuoVideo})
-	require.NoError(t, err)
-	for _, tc := range []struct {
-		name, unit, expression string
-		fixed                  bool
-		quota                  int
-	}{
-		{name: "missing per-request price with unset-ratio permission", unit: "per_request"},
-		{name: "fixed price cannot replace a seconds expression", unit: "per_second", fixed: true},
-		{name: "per-second expression must use seconds", unit: "per_second", expression: "0.02"},
-		{name: "per-request expression cannot meter seconds", unit: "per_request", expression: `u("seconds") * 0.02`},
-		{name: "configured per-request price", unit: "per_request", fixed: true, quota: 10_000},
-		{name: "configured per-second expression", unit: "per_second", expression: `u("seconds") * 0.02`, quota: 50_000},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			saveBillingConfig(t)
-			previousPrices := ratio_setting.ModelPrice2JSONString()
-			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
-			prices := "{}"
-			if tc.fixed {
-				prices = `{"huahuo-pricing-fixture":0.02}`
-			}
-			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices))
-			if tc.expression != "" {
-				expressions, err := common.Marshal(map[string]string{modelName: tc.expression})
-				require.NoError(t, err)
-				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-					"billing_setting.billing_mode": `{"huahuo-pricing-fixture":"tiered_expr"}`,
-					"billing_setting.billing_expr": string(expressions),
-				}))
-			}
-			zero := 0
-			configs := map[string]kitdto.TaskVideoModelConfig{modelName: {
-				Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"},
-				AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, BillingMode: tc.unit,
-				References: kitdto.TaskVideoReferences{Images: &zero, Videos: &zero, Audios: &zero},
-			}}
-			c, info := newTaskSubmitContext(t, modelName, "")
-			c.Set("async_media_prepare", true)
-			c.Set("task_request", map[string]any{"prompt": "smoke", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"})
-			c.Set("task_action", "text_to_video")
-			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: pluginruntime.WithTaskVideoModels(plugin, configs)})
-			common.SetContextKey(c, constant.ContextKeyChannelSetting, kitdto.ChannelSettings{TaskPluginKey: constant.TaskPlatformHuahuoVideo, TaskPluginModelConfigs: configs})
-			common.SetContextKey(c, constant.ContextKeyChannelKey, "test-key")
-			info.OriginModelName, info.Action, info.UsingGroup = modelName, "text_to_video", "default"
-			info.UserSetting.AcceptUnsetRatioModel = true
-			_, taskErr := RelayTaskSubmit(c, info)
-			if tc.quota == 0 {
-				require.NotNil(t, taskErr)
-				assert.Equal(t, "model_price_error", taskErr.Code)
-				assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
-				return
-			}
-			require.Nil(t, taskErr)
-			assert.Equal(t, tc.quota, info.PriceData.Quota)
-		})
+	for _, provider := range []string{constant.TaskPlatformHuahuoVideo, "wolong"} {
+		source, err := builtinplugins.Source(provider)
+		require.NoError(t, err)
+		registry := pluginruntime.NewRegistry()
+		plugin, err := registry.RegisterFactory(source, pluginruntime.Options{Key: provider})
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			name, unit, expression string
+			fixed                  bool
+			quota                  int
+		}{
+			{name: "missing per-request price with unset-ratio permission", unit: "per_request"},
+			{name: "fixed price cannot replace a seconds expression", unit: "per_second", fixed: true},
+			{name: "per-second expression must use seconds", unit: "per_second", expression: "0.02"},
+			{name: "per-request expression cannot meter seconds", unit: "per_request", expression: `u("seconds") * 0.02`},
+			{name: "configured per-request price", unit: "per_request", fixed: true, quota: 10_000},
+			{name: "configured per-second expression", unit: "per_second", expression: `u("seconds") * 0.02`, quota: 50_000},
+		} {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				saveBillingConfig(t)
+				previousPrices := ratio_setting.ModelPrice2JSONString()
+				t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(previousPrices)) })
+				prices := "{}"
+				if tc.fixed {
+					prices = `{"huahuo-pricing-fixture":0.02}`
+				}
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices))
+				if tc.expression != "" {
+					expressions, err := common.Marshal(map[string]string{modelName: tc.expression})
+					require.NoError(t, err)
+					require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+						"billing_setting.billing_mode": `{"huahuo-pricing-fixture":"tiered_expr"}`,
+						"billing_setting.billing_expr": string(expressions),
+					}))
+				}
+				zero := 0
+				configs := map[string]kitdto.TaskVideoModelConfig{modelName: {
+					Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"},
+					AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, BillingMode: tc.unit,
+					References: kitdto.TaskVideoReferences{Images: &zero, Videos: &zero, Audios: &zero},
+				}}
+				c, info := newTaskSubmitContext(t, modelName, "")
+				c.Set("async_media_prepare", true)
+				c.Set("task_request", map[string]any{"prompt": "smoke", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"})
+				c.Set("task_action", "text_to_video")
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: pluginruntime.WithTaskVideoModels(plugin, configs)})
+				common.SetContextKey(c, constant.ContextKeyChannelSetting, kitdto.ChannelSettings{TaskPluginKey: provider, TaskPluginModelConfigs: configs})
+				common.SetContextKey(c, constant.ContextKeyChannelKey, "test-key")
+				info.OriginModelName, info.Action, info.UsingGroup = modelName, "text_to_video", "default"
+				info.UserSetting.AcceptUnsetRatioModel = true
+				_, taskErr := RelayTaskSubmit(c, info)
+				if tc.quota == 0 {
+					require.NotNil(t, taskErr)
+					assert.Equal(t, "model_price_error", taskErr.Code)
+					assert.Equal(t, http.StatusBadRequest, taskErr.StatusCode)
+					return
+				}
+				require.Nil(t, taskErr)
+				assert.Equal(t, tc.quota, info.PriceData.Quota)
+			})
+		}
 	}
 }
 
@@ -939,6 +945,31 @@ export function parseTaskResult(){return {status:"IN_PROGRESS"};}
 }
 
 func TestAsyncVideoSubmissionRetryRequiresCompleteSupplierError(t *testing.T) {
+	t.Run("Wolong pre-admission rejection evidence", func(t *testing.T) {
+		for _, tc := range []struct {
+			name       string
+			status     int
+			body, code string
+		}{
+			{"balance", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"积分不够","message":"积分不够","need":60,"balance":3,"request_id":"req_1"}`, "INSUFFICIENT_CREDITS"},
+			{"rate limit", 429, `{"ok":false,"code":"RATE_LIMIT","error":"调用太快","limit":120}`, "RATE_LIMIT"},
+			{"parameter", 400, `{"ok":false,"code":"HTTP_400","error":"不支持所选时长"}`, "HTTP_400"},
+			{"receipt wins", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"积分不够","task":{"id":"task_received"}}`, ""},
+			{"state wins", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"积分不够","charged_amount":60}`, ""},
+			{"conflict unknown", 409, `{"ok":false,"code":"IDEMPOTENCY_CONFLICT","error":"conflict"}`, ""},
+			{"server failure", 500, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"积分不够"}`, ""},
+			{"wrong status", 401, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"积分不够"}`, ""},
+			{"accepted message", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"accepted but balance insufficient"}`, ""},
+			{"unknown generic rejection", 400, `{"ok":false,"code":"HTTP_400","error":"upstream submission result unknown"}`, ""},
+			{"unknown balance rejection", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":"结果未确认"}`, ""},
+			{"generic failure has no parameter evidence", 400, `{"ok":false,"code":"HTTP_400","error":"request failed"}`, ""},
+			{"malformed", 402, `{"ok":false,"code":"INSUFFICIENT_CREDITS","error":{}}`, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.Equal(t, tc.code, wolongVideoSubmissionRejection(tc.status, []byte(tc.body)))
+			})
+		}
+	})
 	for _, sample := range []struct {
 		status   int
 		body     string

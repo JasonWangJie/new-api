@@ -39,6 +39,42 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+test('manual capability initialization preserves configured models and leaves mapped preset capabilities to the provider', async () => {
+  const manual = {
+    ...taskVideoCatalogConfig(undefined, true),
+    duration: { values: [5] },
+    billing_mode: 'per_request',
+  }
+  const onChange = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <TaskVideoModelEditor
+      manualOnly
+      defaultModels={['seedance-preset']}
+      sourceURL=''
+      onSourceURLChange={vi.fn()}
+      value={JSON.stringify({ existing: manual })}
+      onChange={onChange}
+      models={['public-preset', 'public-future', 'existing']}
+      modelMapping={JSON.stringify({
+        'public-preset': 'seedance-preset',
+        'public-future': 'seedance-future',
+      })}
+      previewReady={false}
+    />
+  )
+  expect(screen.queryByLabelText('Model catalog URL')).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', {
+      name: 'Initialize missing model capabilities',
+    })
+  )
+  expect(JSON.parse(onChange.mock.lastCall?.[0] as string)).toEqual({
+    existing: manual,
+    'seedance-future': taskVideoCatalogConfig(undefined, true),
+  })
+})
+
 test('catalog capability previews preserve manual edits and import only missing selections', async () => {
   const upstream = {
     ...taskVideoCatalogConfig(),

@@ -137,6 +137,26 @@ func VideoProxy(c *gin.Context) {
 		return
 	}
 	var descriptor *relaychannel.TaskContentRequest
+	if task.Platform == "wolong" {
+		store := service.GetTaskArtifactStore()
+		if ref, resolveErr := store.Resolve(task, "video"); resolveErr != nil {
+			writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_unavailable", "Video is unavailable")
+			return
+		} else if ref != nil {
+			if serveErr := store.Serve(c, task, ref); serveErr != nil && !c.Writer.Written() {
+				writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Video is unavailable")
+			}
+			return
+		}
+		adaptor, refreshErr := initTaskArtifactAdaptor(task)
+		if refreshErr == nil {
+			task, refreshErr = refreshWolongVideoContent(c.Request.Context(), task, adaptor)
+		}
+		if refreshErr != nil {
+			writeTaskArtifactError(c, http.StatusBadGateway, "artifact_upstream_error", "Completed video result is unavailable")
+			return
+		}
+	}
 	if taskHasPluginExecution(task) {
 		artifacts, projectionErr := projectTaskArtifacts(task)
 		if projectionErr == nil {
@@ -181,6 +201,65 @@ func VideoProxy(c *gin.Context) {
 	if err := proxyTaskMedia(c, task, descriptor); err != nil {
 		writeTaskMediaProxyError(c, err)
 	}
+}
+
+// refreshWolongVideoContent obtains a fresh signed URL without changing the
+// settled task or submitting another generation. Callers check local storage
+// first; only the request-local copy receives the new upstream snapshot.
+func refreshWolongVideoContent(ctx context.Context, task *model.Task, adaptor relaychannel.TaskAdaptor) (*model.Task, error) {
+	if task == nil || task.Platform != "wolong" || task.Status != model.TaskStatusSuccess || task.PrivateData.UpstreamAsync != nil {
+		return nil, errors.New("completed video result is unavailable")
+	}
+	poller, ok := adaptor.(service.TaskContextPollingAdaptor)
+	if !ok {
+		return nil, errors.New("video provider does not support bounded content polling")
+	}
+	channel, err := service.FrozenAsyncMediaChannel(ctx, task)
+	if err != nil {
+		return nil, errors.New("video channel is unavailable")
+	}
+	if channel == nil {
+		channel, err = model.CacheGetChannel(task.ChannelId)
+		if err != nil {
+			return nil, errors.New("video channel is unavailable")
+		}
+	}
+	key := task.PrivateData.Key
+	if key == "" {
+		key = channel.Key
+	}
+	cfg, err := service.GetMediaRuntimeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pollContext, cancel := context.WithTimeout(ctx, time.Duration(cfg.PollTimeout)*time.Second)
+	defer cancel()
+	response, err := poller.FetchTaskContext(pollContext, channel.GetBaseURL(), key, task, channel.GetSetting().Proxy)
+	if err != nil {
+		return nil, errors.Join(service.ErrAsyncMediaDownloadTransport, errors.New("completed video query failed"))
+	}
+	if response == nil || response.Body == nil {
+		return nil, errors.New("completed video result is unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, errors.New("completed video result is unavailable")
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 {
+		return nil, errors.New("completed video result is unavailable")
+	}
+	refreshed := *task
+	result, err := adaptor.ParseTaskResult(&refreshed, response, body)
+	if err != nil || result == nil || model.TaskStatus(result.Status) != model.TaskStatusSuccess {
+		return nil, errors.New("completed video result is unavailable")
+	}
+	refreshed.Data = body
+	if len(result.PluginState) > 0 {
+		refreshed.PrivateData.PluginState = result.PluginState
+	}
+	refreshed.PrivateData.ResultURL = result.Url
+	return &refreshed, nil
 }
 
 func proxyTaskMedia(c *gin.Context, task *model.Task, descriptor *relaychannel.TaskContentRequest) error {

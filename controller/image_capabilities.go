@@ -512,9 +512,9 @@ func videoProfileMaxDuration(profile pluginruntime.VideoProfile) int {
 }
 
 func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginruntime.LoadedPlugin, channel *model.Channel) string {
-	huahuo := provider == constant.TaskPlatformHuahuoVideo
+	configuredPricing := provider == constant.TaskPlatformHuahuoVideo || provider == "wolong"
 	requiresSeconds := false
-	if huahuo {
+	if configuredPricing {
 		upstream, config, err := channel.TaskVideoModelConfig(modelName)
 		if err != nil {
 			return "invalid_configuration"
@@ -526,12 +526,12 @@ func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginr
 	expression, exists := billing_setting.ResolveTaskBillingExpr(provider, modelName, mappedModel)
 	if exists {
 		schema, _ := plugin.Meta.UsageForModel(mappedModel)
-		if !billing_setting.TaskExprCompatible(expression, schema) || huahuo && (billingexpr.UsesFixedPricing(expression) || requiresSeconds && !billingexpr.UsedUsageKeys(expression)["seconds"]) {
+		if !billing_setting.TaskExprCompatible(expression, schema) || configuredPricing && (billingexpr.UsesFixedPricing(expression) || requiresSeconds && !billingexpr.UsedUsageKeys(expression)["seconds"]) {
 			return "invalid_configuration"
 		}
 		return "configured"
 	}
-	if huahuo {
+	if configuredPricing {
 		if !requiresSeconds && billing_setting.GetBillingMode(modelName) != billing_setting.BillingModeTieredExpr {
 			_, configured := ratio_setting.GetModelPrice(modelName, false)
 			_, builtIn := ratio_setting.GetDefaultModelPriceMap()[modelName]

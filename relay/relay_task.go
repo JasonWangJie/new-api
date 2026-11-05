@@ -346,10 +346,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 		exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 		useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
-		if platform == constant.TaskPlatformHuahuoVideo {
-			config := info.ChannelSetting.TaskPluginModelConfigs[info.UpstreamModelName]
-			if config.BillingMode == "per_second" && (!exists || !billingexpr.UsedUsageKeys(exprStr)["seconds"]) {
-				return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO per-second video pricing requires an expression using seconds"), "model_price_error", http.StatusBadRequest)
+		configuredVideoPricing := platform == constant.TaskPlatformHuahuoVideo || platform == "wolong"
+		if configuredVideoPricing && pinnedPlugin.Plugin != nil {
+			schema, _ := pinnedPlugin.Plugin.Meta.UsageForModel(info.UpstreamModelName)
+			if _, perSecond := schema["seconds"]; perSecond && (!exists || !billingexpr.UsedUsageKeys(exprStr)["seconds"]) {
+				return nil, service.TaskErrorWrapperLocal(fmt.Errorf("%s per-second video pricing requires an expression using seconds", platform), "model_price_error", http.StatusBadRequest)
 			}
 		}
 		if useTiered {
@@ -361,7 +362,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				return nil, service.TaskErrorWrapper(fmt.Errorf("task model %s has no usage expression or meter", modelName), "model_price_error", http.StatusBadRequest)
 			}
 			sharedModel := pinnedPlugin.Generation.SharedModel(modelName) || pinnedPlugin.Generation.SharedModel(info.UpstreamModelName)
-			if (sharedModel || platform == constant.TaskPlatformHuahuoVideo) && pinnedPlugin.Plugin != nil {
+			if (sharedModel || configuredVideoPricing) && pinnedPlugin.Plugin != nil {
 				schema, _ := pinnedPlugin.Plugin.Meta.UsageForModel(info.UpstreamModelName)
 				if !billing_setting.TaskExprCompatible(exprStr, schema) {
 					return nil, service.TaskErrorWrapper(fmt.Errorf("task model %s pricing is not configured for plugin %s", modelName, pluginKey), "model_price_error", http.StatusBadRequest)
@@ -411,8 +412,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			if err != nil {
 				return nil, service.TaskErrorWrapper(err, "model_price_error", http.StatusBadRequest)
 			}
-			if platform == constant.TaskPlatformHuahuoVideo && !priceData.UsePrice {
-				return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO per-request video pricing requires a configured price"), "model_price_error", http.StatusBadRequest)
+			if configuredVideoPricing && !priceData.UsePrice {
+				return nil, service.TaskErrorWrapperLocal(fmt.Errorf("%s per-request video pricing requires a configured price", platform), "model_price_error", http.StatusBadRequest)
 			}
 		}
 		info.PriceData = priceData
@@ -456,8 +457,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.UpstreamModelName,
 		service.UpstreamAsyncOperation(info.Action),
 	)
-	if platform == constant.TaskPlatformHuahuoVideo && hasAsyncProfile {
-		return nil, service.TaskErrorWrapperLocal(errors.New("HUAHUO video requires its native submission and polling protocol"), "upstream_async_profile_conflict", http.StatusBadRequest)
+	if (platform == constant.TaskPlatformHuahuoVideo || platform == "wolong") && hasAsyncProfile {
+		return nil, service.TaskErrorWrapperLocal(fmt.Errorf("%s video requires its native submission and polling protocol", platform), "upstream_async_profile_conflict", http.StatusBadRequest)
 	}
 	measuredVideo := hasAsyncProfile && asyncProfile.Poll.Response.ActualSecondsPath != "" && !mixedVideoBilling
 	if measuredVideo {
@@ -658,9 +659,16 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 					confirmed = false
 				}
 			}
+			if platform == "wolong" {
+				explicitCode := wolongVideoSubmissionRejection(resp.StatusCode, httpErrorBody)
+				confirmed = explicitCode != ""
+				if confirmed {
+					code = explicitCode
+				}
+			}
 			failure := service.TaskErrorWrapper(fmt.Errorf("upstream task submission returned HTTP %d: %s", resp.StatusCode, message), code, resp.StatusCode)
-			failure.NoRetry = platform == constant.TaskPlatformHuahuoVideo
-			if c.GetBool("async_media_execution") && (parsed == nil || strings.TrimSpace(parsed.UpstreamTaskID) == "" && parsed.Immediate == nil) &&
+			failure.NoRetry = platform == constant.TaskPlatformHuahuoVideo || platform == "wolong"
+			if platform != "wolong" && c.GetBool("async_media_execution") && (parsed == nil || strings.TrimSpace(parsed.UpstreamTaskID) == "" && parsed.Immediate == nil) &&
 				(resp.StatusCode == http.StatusBadGateway && isRetryableAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody) ||
 					resp.StatusCode == http.StatusServiceUnavailable && classifyAsyncVideoSubmissionRejection(resp.StatusCode, httpErrorBody, false)) {
 				// Refund eligibility does not change what the retry policy knows
@@ -792,6 +800,70 @@ func huahuoVideoSubmissionRejection(status int, body []byte) string {
 			return code
 		}
 	case "storage_capacity_exceeded", "storage_check_unavailable":
+		return code
+	}
+	return ""
+}
+
+// Only documented pre-admission errors prove that Wolong did not create a paid
+// task. Receipts, additional state, conflicts and server failures stay uncertain.
+func wolongVideoSubmissionRejection(status int, body []byte) string {
+	var envelope map[string]any
+	if common.Unmarshal(body, &envelope) != nil || envelope["ok"] != false {
+		return ""
+	}
+	hasMessage := false
+	parameterRejection := false
+	for key, value := range envelope {
+		switch key {
+		case "ok":
+		case "code", "request_id", "error", "message":
+			text, ok := value.(string)
+			if !ok {
+				return ""
+			}
+			if key == "error" || key == "message" {
+				diagnostic := strings.ToLower(text)
+				uncertain := slices.ContainsFunc([]string{"unknown", "unconfirmed", "needs_review", "未知", "未确认", "无法确认", "待确认", "待核对"}, func(word string) bool { return strings.Contains(diagnostic, word) })
+				if uncertain || videoSubmissionPlainEvidencePattern.MatchString(diagnostic) || videoSubmissionAcceptedPattern.MatchString(diagnostic) {
+					return ""
+				}
+				parameter := slices.ContainsFunc([]string{"画质", "时长", "比例", "参考", "duration", "quality", "resolution", "ratio", "reference"}, func(word string) bool { return strings.Contains(diagnostic, word) })
+				rejected := slices.ContainsFunc([]string{"不支持", "最多", "至少", "必须", "不能", "不允许", "不合法", "超过", "超出", "invalid", "unsupported", "must", "maximum", "minimum"}, func(word string) bool { return strings.Contains(diagnostic, word) })
+				parameterRejection = parameterRejection || parameter && rejected
+				hasMessage = hasMessage || strings.TrimSpace(text) != ""
+			}
+		case "need", "balance", "limit":
+			amount, ok := value.(float64)
+			if !ok || math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 {
+				return ""
+			}
+		default:
+			return ""
+		}
+	}
+	if !hasMessage {
+		return ""
+	}
+	code, _ := envelope["code"].(string)
+	valid := false
+	switch status {
+	case http.StatusBadRequest:
+		valid = slices.Contains([]string{"MODEL_NOT_FOUND", "BAD_KIND", "BAD_CHARS", "BAD_IDEMPOTENCY_KEY", "BAD_PRICING"}, code) || code == "HTTP_400" && parameterRejection
+	case http.StatusUnauthorized:
+		valid = code == "NO_KEY" || code == "BAD_KEY"
+	case http.StatusPaymentRequired:
+		valid = code == "INSUFFICIENT_CREDITS"
+	case http.StatusForbidden:
+		valid = code == "HTTP_403"
+	case http.StatusRequestEntityTooLarge:
+		valid = code == "HTTP_413"
+	case http.StatusUnsupportedMediaType:
+		valid = code == "HTTP_415"
+	case http.StatusTooManyRequests:
+		valid = code == "RATE_LIMIT"
+	}
+	if valid {
 		return code
 	}
 	return ""

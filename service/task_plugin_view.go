@@ -13,14 +13,17 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// PublicTaskUpstreamProgress exposes only a valid Drama provider percentage,
+// PublicTaskUpstreamProgress exposes only a valid provider percentage,
 // independently of the host's lifecycle and settlement progress.
 func PublicTaskUpstreamProgress(task *model.Task) (float64, bool) {
-	if task == nil || task.Platform != "drama" {
+	if task == nil || task.Platform != "drama" && task.Platform != "wolong" {
 		return 0, false
 	}
 	snapshot := task.Data
 	path := "progress"
+	if task.Platform == "wolong" {
+		path = "task.progress"
+	}
 	configured := task.PrivateData.UpstreamAsync != nil
 	if configured {
 		path = strings.TrimSpace(task.PrivateData.UpstreamAsync.Poll.Response.ProgressPath)

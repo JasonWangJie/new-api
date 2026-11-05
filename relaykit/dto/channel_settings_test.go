@@ -47,6 +47,33 @@ func TestChannelImageExecutionSettings(t *testing.T) {
 	}
 }
 
+func TestWolongChannelVideoCapabilities(t *testing.T) {
+	two, zero := 2, 0
+	base := TaskVideoModelConfig{Duration: TaskVideoDuration{Values: []int{5, 10}, Default: 5}, Resolutions: []string{"1440p"}, AspectRatios: []string{"auto", "3:2"}, Modes: []string{"text_to_video", "first_last_frame"}, References: TaskVideoReferences{Images: &two, Videos: &zero, Audios: &zero}, BillingMode: "per_request"}
+	settings := ChannelSettings{TaskPluginKey: "wolong", TaskPluginModelConfigs: map[string]TaskVideoModelConfig{"future-wolong": base}}
+	require.NoError(t, settings.ValidateTaskVideoModels(3600))
+	for _, change := range []func(*TaskVideoModelConfig){
+		func(c *TaskVideoModelConfig) { c.AspectRatios = []string{"adaptive"} },
+		func(c *TaskVideoModelConfig) { c.Resolutions = []string{"bad/size"} },
+		func(c *TaskVideoModelConfig) { c.Resolutions = []string{"-invalid"} },
+		func(c *TaskVideoModelConfig) { c.References.ImageUpload = true },
+		func(c *TaskVideoModelConfig) { c.References.ImageDataURI = true },
+		func(c *TaskVideoModelConfig) { one := 1; c.References.Images = &one },
+	} {
+		config := base
+		change(&config)
+		assert.Error(t, config.ValidateForPlugin("wolong", 3600))
+	}
+	for _, name := range []string{"-model", "vendor/model", "模型", strings.Repeat("a", 255)} {
+		settings.TaskPluginModelConfigs = map[string]TaskVideoModelConfig{name: base}
+		assert.NoError(t, settings.ValidateTaskVideoModels(3600))
+	}
+	for _, name := range []string{"", " model", "model ", "model,name", "model*", "model\nname", strings.Repeat("a", 256), strings.Repeat("图", 86)} {
+		settings.TaskPluginModelConfigs = map[string]TaskVideoModelConfig{name: base}
+		assert.Error(t, settings.ValidateTaskVideoModels(3600))
+	}
+}
+
 func TestChannelImageResolutionModelMapping(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

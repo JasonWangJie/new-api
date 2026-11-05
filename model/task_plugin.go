@@ -181,7 +181,7 @@ func GetTaskPluginSyncSnapshot() (TaskPluginSyncSnapshot, error) {
 		return TaskPluginSyncSnapshot{}, err
 	}
 	videoModels := make(map[string]map[string]dto.TaskVideoModelConfig)
-	for _, key := range []string{"sudashui", "huahuo-video"} {
+	for _, key := range []string{"sudashui", "huahuo-video", "wolong"} {
 		catalog, err := taskVideoModelCatalog(channels, key)
 		if err != nil {
 			return TaskPluginSyncSnapshot{}, err

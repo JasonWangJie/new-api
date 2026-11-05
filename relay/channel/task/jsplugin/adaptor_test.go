@@ -17,6 +17,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	hostdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -781,6 +782,77 @@ func TestTaskAdaptorRejectsNonObjectOpenAIVideoRendererOutput(t *testing.T) {
 			require.NoError(t, err)
 			_, err = New(plugin).ConvertToOpenAIVideo(&model.Task{TaskID: "task_public"})
 			require.ErrorContains(t, err, "invalid OpenAI video object")
+		})
+	}
+}
+
+func TestTaskAdaptorPreservesWolongUpstreamProgress(t *testing.T) {
+	source := strings.Replace(mockPlugin, `key: "mock-task"`, `key: "wolong"`, 1)
+	source = strings.Replace(source, `return {id: task.task_id, status: "completed"};`, `return {upstream_progress: 999};`, 1)
+	plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	for _, tc := range []struct {
+		name, snapshot string
+		want           any
+	}{
+		{"zero", `{"task":{"progress":0}}`, float64(0)},
+		{"fraction", `{"task":{"progress":37.5}}`, 37.5},
+		{"complete", `{"task":{"progress":100}}`, float64(100)},
+		{"missing", `{"task":{}}`, nil},
+		{"wrong level", `{"progress":37.5}`, nil},
+		{"negative", `{"task":{"progress":-1}}`, nil},
+		{"over limit", `{"task":{"progress":101}}`, nil},
+		{"string", `{"task":{"progress":"37.5"}}`, nil},
+		{"null", `{"task":{"progress":null}}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mixed := range []bool{false, true} {
+				task := &model.Task{TaskID: "public-video", Platform: "wolong", Status: model.TaskStatusInProgress, Progress: "37%", Data: []byte(tc.snapshot)}
+				if mixed {
+					task.PrivateData.VideoRouting = &hostdto.VideoRoutingAudit{}
+				}
+				body, err := adaptor.ConvertToOpenAIVideo(task)
+				require.NoError(t, err)
+				var view map[string]any
+				require.NoError(t, common.Unmarshal(body, &view))
+				assert.Equal(t, float64(37), view["progress"])
+				assert.Equal(t, "in_progress", view["status"])
+				if tc.want == nil {
+					assert.NotContains(t, view, "upstream_progress")
+				} else {
+					assert.Equal(t, tc.want, view["upstream_progress"])
+				}
+			}
+		})
+	}
+}
+
+func TestTaskAdaptorPinsIdempotentVideoSubmissionHeaders(t *testing.T) {
+	for _, key := range []string{"huahuo-video", "wolong"} {
+		t.Run(key, func(t *testing.T) {
+			source := strings.Replace(mockPlugin, `key: "mock-task"`, `key: "`+key+`"`, 1)
+			plugin, err := pluginruntime.NewRegistry().Register(source, pluginruntime.Options{})
+			require.NoError(t, err)
+			adaptor := New(plugin)
+			adaptor.submit = &requestDescriptor{Headers: map[string]string{
+				"Authorization": "Bearer untrusted", "Idempotency-Key": "different-job",
+				"X-Idempotency-Key": "alias", "X-Client-Request-Id": "client-alias",
+			}}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "channel-secret"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"}}
+			request, err := http.NewRequest(http.MethodPost, "https://provider.example/videos", strings.NewReader(`{}`))
+			require.NoError(t, err)
+			require.NotNil(t, request.GetBody)
+			require.NoError(t, adaptor.BuildRequestHeader(nil, request, info))
+			assert.Equal(t, "Bearer channel-secret", request.Header.Get("Authorization"))
+			assert.Equal(t, "task_public", request.Header.Get("Idempotency-Key"))
+			assert.Empty(t, request.Header.Get("X-Idempotency-Key"))
+			if key == "wolong" {
+				assert.Empty(t, request.Header.Get("X-Client-Request-Id"))
+			} else {
+				assert.Equal(t, "client-alias", request.Header.Get("X-Client-Request-Id"))
+			}
+			assert.Nil(t, request.GetBody)
 		})
 	}
 }

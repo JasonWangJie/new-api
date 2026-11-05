@@ -3,6 +3,7 @@ package dto
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,8 +40,10 @@ type TaskVideoReferences struct {
 
 const DefaultSudashuiCatalogURL = "https://catalog.sudashuiapi.com/v1/models"
 
+var wolongTaskVideoResolutionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`)
+
 func ChannelConfiguredTaskVideoPlugin(key string) bool {
-	return key == "sudashui" || key == "huahuo-video"
+	return key == "sudashui" || key == "huahuo-video" || key == "wolong"
 }
 
 func (c TaskVideoModelConfig) Validate(maxSeconds int) error {
@@ -60,6 +63,9 @@ func (c TaskVideoModelConfig) ValidateForPlugin(pluginKey string, maxSeconds int
 	for _, resolution := range c.Resolutions {
 		if resolution == "" || len(resolution) > 32 || strings.ContainsFunc(resolution, unicode.IsSpace) || strings.ContainsFunc(resolution, unicode.IsControl) {
 			return fmt.Errorf("invalid resolution")
+		}
+		if pluginKey == "wolong" && !wolongTaskVideoResolutionPattern.MatchString(resolution) {
+			return fmt.Errorf("invalid Wolong resolution")
 		}
 	}
 	resolutions := make(map[string]bool, len(c.Resolutions))
@@ -85,7 +91,13 @@ func (c TaskVideoModelConfig) ValidateForPlugin(pluginKey string, maxSeconds int
 	}
 	for _, ratio := range c.AspectRatios {
 		valid := slices.Contains([]string{"1:1", "3:4", "4:3", "9:16", "16:9", "21:9", "adaptive"}, ratio)
-		if !valid && pluginKey == "huahuo-video" {
+		if pluginKey == "wolong" && ratio == "adaptive" {
+			valid = false
+		}
+		if pluginKey == "wolong" && ratio == "auto" {
+			valid = true
+		}
+		if !valid && (pluginKey == "huahuo-video" || pluginKey == "wolong") {
 			left, right, ratioFormat := strings.Cut(ratio, ":")
 			valid = ratioFormat && taskVideoRatioComponent(left) && taskVideoRatioComponent(right)
 		}
@@ -101,12 +113,18 @@ func (c TaskVideoModelConfig) ValidateForPlugin(pluginKey string, maxSeconds int
 	if (c.References.ImageUpload || c.References.ImageDataURI) && *c.References.Images == 0 {
 		return fmt.Errorf("image uploads or data URIs require reference image support")
 	}
+	if pluginKey == "wolong" && (c.References.ImageUpload || c.References.ImageDataURI) {
+		return fmt.Errorf("Wolong references require public URLs")
+	}
 	for _, mode := range c.Modes {
 		if !slices.Contains([]string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame"}, mode) {
 			return fmt.Errorf("invalid mode: %s", mode)
 		}
 		if mode == "image_to_video" && *c.References.Images < 1 {
 			return fmt.Errorf("image_to_video requires image support")
+		}
+		if pluginKey == "wolong" && mode == "first_last_frame" && *c.References.Images < 2 {
+			return fmt.Errorf("first_last_frame requires at least two images")
 		}
 		if mode == "reference_to_video" && *c.References.Images+*c.References.Videos+*c.References.Audios == 0 {
 			return fmt.Errorf("reference_to_video requires reference support")
@@ -171,7 +189,7 @@ func (s *ChannelSettings) ValidateTaskVideoModels(maxSeconds int) error {
 		return nil
 	}
 	if !ChannelConfiguredTaskVideoPlugin(s.TaskPluginKey) {
-		return fmt.Errorf("dynamic video model settings require the sudashui or huahuo-video plugin")
+		return fmt.Errorf("dynamic video model settings require the sudashui, huahuo-video or wolong plugin")
 	}
 	if s.TaskPluginModelSourceURL != "" {
 		if s.TaskPluginKey != "sudashui" {

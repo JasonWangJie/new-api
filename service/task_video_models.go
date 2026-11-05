@@ -24,9 +24,13 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 		intent map[string]any
 	}
 	decoded := make(map[string]decodedVideo)
-	for _, key := range []string{"sudashui", "huahuo-video"} {
+	for _, key := range []string{"sudashui", "huahuo-video", "wolong"} {
 		plugin, found := jsplugin.DefaultRegistry.Get(key)
 		if !found {
+			continue
+		}
+		if key == "wolong" {
+			decoded[key] = decodedVideo{plugin: plugin}
 			continue
 		}
 		result, err := plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, request.JSValue())
@@ -40,8 +44,18 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 		if !ok {
 			return false
 		}
-		config, exists := settings.TaskPluginModelConfigs[upstream]
-		if !exists {
+		if settings.TaskPluginKey == "wolong" {
+			candidateRequest := request
+			candidateRequest.UpstreamModel = upstream
+			result, err := body.plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, candidateRequest.JSValue())
+			intent, valid := result.(map[string]any)
+			if err != nil || !valid || intent["kind"] != "submit" || intent["model"] != request.Model {
+				return false
+			}
+			body.intent = intent
+		}
+		config, err := model.ResolveTaskVideoModelConfig(settings, upstream)
+		if err != nil {
 			return false
 		}
 		selected := jsplugin.WithTaskVideoModels(body.plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})

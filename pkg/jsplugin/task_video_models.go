@@ -2,6 +2,7 @@ package jsplugin
 
 import (
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -16,14 +17,34 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 	}
 	copy := *plugin
 	meta := plugin.Meta
-	meta.Models, meta.VideoProfiles, meta.UsageProfiles = nil, nil, nil
-	copy.Meta = cloneMeta(meta)
-	copy.Meta.Models = make([]string, 0, len(configs))
-	for name := range configs {
-		copy.Meta.Models = append(copy.Meta.Models, name)
+	if plugin.Meta.Key != "wolong" {
+		meta.Models, meta.VideoProfiles, meta.UsageProfiles = nil, nil, nil
 	}
-	slices.Sort(copy.Meta.Models)
-	for _, name := range copy.Meta.Models {
+	copy.Meta = cloneMeta(meta)
+	names := make([]string, 0, len(configs))
+	for name := range configs {
+		if plugin.Meta.Key == "wolong" {
+			if defaults, found := TaskVideoModelConfigFromMeta(plugin.Meta, name); found && reflect.DeepEqual(defaults, configs[name]) {
+				continue
+			}
+		}
+		names = append(names, name)
+	}
+	if plugin.Meta.Key == "wolong" {
+		for i := range copy.Meta.VideoProfiles {
+			copy.Meta.VideoProfiles[i].Models = slices.DeleteFunc(copy.Meta.VideoProfiles[i].Models, func(name string) bool { return slices.Contains(names, name) })
+		}
+		copy.Meta.VideoProfiles = slices.DeleteFunc(copy.Meta.VideoProfiles, func(profile VideoProfile) bool { return len(profile.Models) == 0 })
+		for i := range copy.Meta.UsageProfiles {
+			copy.Meta.UsageProfiles[i].Models = slices.DeleteFunc(copy.Meta.UsageProfiles[i].Models, func(name string) bool { return slices.Contains(names, name) })
+		}
+		copy.Meta.UsageProfiles = slices.DeleteFunc(copy.Meta.UsageProfiles, func(profile UsageProfile) bool { return len(profile.Models) == 0 })
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if !slices.Contains(copy.Meta.Models, name) {
+			copy.Meta.Models = append(copy.Meta.Models, name)
+		}
 		config := configs[name]
 		resolutions := make([]string, 0, len(config.Resolutions))
 		for _, resolution := range config.Resolutions {
@@ -64,7 +85,7 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 				frameSources := []string{"url"}
 				mode.Inputs = []VideoInputProfile{{Name: "image", Kind: "image", Sources: frameSources, MaxItems: 1, Required: true}}
 				if plugin.Meta.Key == "sudashui" || config.References.Images != nil && *config.References.Images >= 2 {
-					mode.Inputs = append(mode.Inputs, VideoInputProfile{Name: "last_frame", Kind: "image", Sources: frameSources, MaxItems: 1, Required: plugin.Meta.Key == "sudashui"})
+					mode.Inputs = append(mode.Inputs, VideoInputProfile{Name: "last_frame", Kind: "image", Sources: frameSources, MaxItems: 1, Required: plugin.Meta.Key != "huahuo-video"})
 				}
 			case "reference_to_video":
 				for _, input := range []struct {
@@ -88,12 +109,56 @@ func WithTaskVideoModels(plugin *LoadedPlugin, configs map[string]dto.TaskVideoM
 			schema["seconds"] = UsageFieldSchema{Type: "number", Unit: "second", Description: LocalizedText{"en": "Video generation unit price", "zh": "视频生成单价"}}
 		}
 		if config.BillingMode != "per_second" {
-			schema["requests"] = UsageFieldSchema{Type: "number", Unit: "count", UnitLabel: LocalizedText{"en": "video", "zh": "条"}, Description: LocalizedText{"en": "Video generation unit price", "zh": "视频生成单价"}}
+			key := "requests"
+			if plugin.Meta.Key == "wolong" {
+				key = "video_count"
+			}
+			schema[key] = UsageFieldSchema{Type: "number", Unit: "count", UnitLabel: LocalizedText{"en": "video", "zh": "条"}, Description: LocalizedText{"en": "Video generation unit price", "zh": "视频生成单价"}}
 		}
 		schema["resolution"] = UsageFieldSchema{Enum: resolutions, Description: LocalizedText{"en": "Output video resolution", "zh": "输出视频分辨率"}}
 		copy.Meta.UsageProfiles = append(copy.Meta.UsageProfiles, UsageProfile{Models: []string{name}, Schema: schema})
 	}
 	return &copy
+}
+
+// TaskVideoModelConfigFromMeta projects the factory capability contract without
+// duplicating provider model tables in host code.
+func TaskVideoModelConfigFromMeta(meta Meta, name string) (dto.TaskVideoModelConfig, bool) {
+	profile, found := meta.VideoProfileForModel(name)
+	if !found || len(profile.Modes) == 0 || profile.Modes[0].Duration == nil {
+		return dto.TaskVideoModelConfig{}, false
+	}
+	mode := profile.Modes[0]
+	duration := mode.Duration
+	config := dto.TaskVideoModelConfig{
+		Duration:    dto.TaskVideoDuration{Min: duration.Min, Max: duration.Max, Step: duration.Step, Values: slices.Clone(duration.Values), Default: duration.Default},
+		Resolutions: slices.Clone(mode.Resolutions), AspectRatios: slices.Clone(mode.AspectRatios), BillingMode: "per_request",
+	}
+	for _, dimension := range []struct {
+		values    *[]string
+		preferred string
+	}{{&config.Resolutions, mode.DefaultResolution}, {&config.AspectRatios, mode.DefaultAspectRatio}} {
+		if i := slices.Index(*dimension.values, dimension.preferred); i > 0 {
+			values := *dimension.values
+			copy(values[1:i+1], values[:i])
+			values[0] = dimension.preferred
+		}
+	}
+	images, videos, audios := 0, 0, 0
+	for _, mode := range profile.Modes {
+		config.Modes = append(config.Modes, mode.Name)
+		counts := map[string]int{}
+		for _, input := range mode.Inputs {
+			counts[input.Kind] += input.MaxItems
+		}
+		images, videos, audios = max(images, counts["image"]), max(videos, counts["video"]), max(audios, counts["audio"])
+	}
+	config.References = dto.TaskVideoReferences{Images: &images, Videos: &videos, Audios: &audios}
+	schema, _ := meta.UsageForModel(name)
+	if _, perSecond := schema["seconds"]; perSecond {
+		config.BillingMode = "per_second"
+	}
+	return config, true
 }
 
 func taskVideoDurationProfile(config dto.TaskVideoDuration) VideoDurationProfile {

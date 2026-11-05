@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	filterdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -34,6 +35,44 @@ func taskVideoBindingTestChannel(name, unit string) Channel {
 	mapping, _ := common.Marshal(map[string]string{name: "vendor-model"})
 	channel.ModelMapping = common.GetPointer(string(mapping))
 	return channel
+}
+
+func TestWolongModelDefaultsAndConfiguredCatalog(t *testing.T) {
+	previous := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previous })
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "wolong", "plugin.js"))
+	require.NoError(t, err)
+	plugin, err := jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: "wolong"})
+	require.NoError(t, err)
+	channel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: "haya-mo-seedance-25"}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong"})
+	_, defaults, err := channel.TaskVideoModelConfig(channel.Models)
+	require.NoError(t, err)
+	assert.Equal(t, "per_request", defaults.BillingMode)
+	assert.Equal(t, 5, defaults.Duration.Default)
+	assert.Equal(t, "16:9", defaults.AspectRatios[0])
+	_, _, err = channel.TaskVideoModelConfig("future-model")
+	require.ErrorContains(t, err, "requires a saved capability")
+	custom := defaults
+	custom.BillingMode = "per_second"
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-model": custom, channel.Models: custom}})
+	_, _, err = channel.TaskVideoModelConfig(channel.Models)
+	require.ErrorContains(t, err, "built-in billing unit")
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-model": custom}})
+	channel.Models = "haya-mo-seedance-25,public-future"
+	mapping := `{"public-future":"future-model"}`
+	channel.ModelMapping = &mapping
+	catalog, err := taskVideoModelCatalog([]Channel{channel}, "wolong")
+	require.NoError(t, err)
+	assert.Equal(t, defaults, catalog["haya-mo-seedance-25"])
+	assert.Equal(t, custom, catalog["public-future"])
+	assert.Equal(t, custom, catalog["future-model"])
+	mutated := jsplugin.WithTaskVideoModels(plugin, catalog)
+	assert.Contains(t, mutated.Meta.Models, "public-future")
+	_, config, err := channel.TaskVideoModelConfig("haya-mo-seedance-25")
+	require.NoError(t, err)
+	assert.Equal(t, defaults, config)
 }
 
 func TestTaskVideoModelBindingWrites(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "huahuo-image", "huahuo-video", "jimeng", "kling", "nldw", "sora", "sudashui", "sunoapi", "tabtab", "tianyue", "vertex-ai", "vidu", "xai", "yali", "yuxibox"}
+var expectedKeys = []string{"alibaba", "doubao", "drama", "google", "hailuo", "huahuo-image", "huahuo-video", "jimeng", "kling", "nldw", "sora", "sudashui", "sunoapi", "tabtab", "tianyue", "vertex-ai", "vidu", "wolong", "xai", "yali", "yuxibox"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -103,7 +103,7 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 				return
 			}
 
-			if key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" {
+			if key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" || key == "wolong" {
 				binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/videos", plugin.Meta.Models[0])
 				require.True(t, claimed)
 				assert.Same(t, plugin, binding.Plugin)
@@ -152,7 +152,7 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 	bodyOverrides := map[string]map[string]any{}
 	for _, key := range expectedKeys {
 		t.Run(key, func(t *testing.T) {
-			if key == "huahuo-image" || key == "huahuo-video" || key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" {
+			if key == "huahuo-image" || key == "huahuo-video" || key == "sudashui" || key == "xai" || key == "drama" || key == "yali" || key == "tianyue" || key == "tabtab" || key == "nldw" || key == "yuxibox" || key == "wolong" {
 				t.Skip("This plugin does not expose the Responses protocol")
 			}
 			source, sourceErr := Source(key)

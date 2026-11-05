@@ -485,6 +485,13 @@ func TaskArtifactContent(c *gin.Context) {
 		writeTaskArtifactError(c, http.StatusServiceUnavailable, "artifact_plugin_unavailable", "Artifact content plugin is unavailable")
 		return
 	}
+	if task.Platform == "wolong" {
+		task, err = refreshWolongVideoContent(c.Request.Context(), task, adaptor)
+		if err != nil {
+			writeTaskArtifactError(c, http.StatusBadGateway, "artifact_upstream_error", "Completed video result is unavailable")
+			return
+		}
+	}
 	clientRequest := relaychannel.TaskArtifactClientRequest{
 		Method:  c.Request.Method,
 		Headers: taskArtifactClientHeaders(c.Request.Header),

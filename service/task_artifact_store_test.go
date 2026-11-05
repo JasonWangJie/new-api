@@ -934,6 +934,30 @@ func TestAsyncVideoReferenceRecoveryLifecycle(t *testing.T) {
 }
 
 func TestVideoRecoveryRechecksLivePolicyWithoutResettingUse(t *testing.T) {
+	t.Run("Wolong stable idempotency prohibits replay", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, want                         string
+			unknown, terminal, receipt, legacy bool
+		}{
+			{name: "unknown without receipt", unknown: true, want: mediaretry.ManualReview},
+			{name: "unknown with receipt", unknown: true, receipt: true, want: mediaretry.PollSameJob},
+			{name: "confirmed failure", terminal: true, receipt: true, want: mediaretry.Stop},
+			{name: "legacy fallback cannot replay", unknown: true, legacy: true, want: mediaretry.ManualReview},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				policy := mediaretry.Policy{Revision: 1, LegacyTimeoutEnabled: true, LegacyVideoChannelIDs: []int{1}}
+				if !tc.legacy {
+					policy.Rules = []mediaretry.Rule{{ID: "replay", Name: "Replay", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"fixture"}}, Steps: []mediaretry.Step{{ID: "send", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}
+				}
+				fact := mediaretry.Fact{MediaType: "video", Provider: "wolong", ChannelID: 1, Stage: "submit", Message: "fixture", Unknown: tc.unknown, Terminal: tc.terminal, HasUpstreamTask: tc.receipt, Deadline: 1000, VideoEvidence: &mediaretry.VideoFailureEvidence{LegacySubmissionRejected: true, SubmissionStartedAt: 100}}
+				decision, err := PlanInitialVideoFailure(policy, fact, mediaretry.State{Now: 110, TotalLimit: 16})
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, decision.Action)
+				assert.Equal(t, "wolong_video_submission_not_replayable", decision.BlockedReason)
+				assert.True(t, VideoSubmissionRequiresReconciliation("wolong"))
+			})
+		}
+	})
 	t.Run("initial legacy planner uses typed evidence and live controls", func(t *testing.T) {
 		for _, tc := range []struct {
 			name, want string

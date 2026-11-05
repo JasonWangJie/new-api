@@ -555,6 +555,9 @@ export function ChannelMutateDrawer({
   const isHuahuoVideo =
     currentType === CHANNEL_TYPE_TASK_PLUGIN &&
     currentTaskPluginKey === 'huahuo-video'
+  const isWolong =
+    currentType === CHANNEL_TYPE_TASK_PLUGIN &&
+    currentTaskPluginKey === 'wolong'
   const canFetchModels = MODEL_FETCHABLE_TYPES.has(currentType) || isSudashui
   const currentModelSourceURL = formValues.task_plugin_model_source_url
   const currentKey = formValues.key
@@ -770,6 +773,9 @@ export function ChannelMutateDrawer({
         setChoosingProvider(false)
         return
       }
+      const shouldResetTaskVideoModels =
+        form.getValues('task_plugin_key') === 'wolong' ||
+        (target.kind === 'plugin' && target.key === 'wolong')
       if (target.kind === 'plugin') {
         if (!canBindTaskPlugin) return
         const plugin = taskPluginOptionsQuery.data?.find(
@@ -818,6 +824,9 @@ export function ChannelMutateDrawer({
           )?.label
           form.setValue('name', label ? t(label) : `#${target.type}`)
         }
+      }
+      if (shouldResetTaskVideoModels) {
+        form.setValue('task_plugin_model_configs', '{}', { shouldDirty: true })
       }
       setProviderTarget(target)
       if (
@@ -873,6 +882,7 @@ export function ChannelMutateDrawer({
     const allModels = new Set([
       ...allModelsList,
       ...currentModelsArray,
+      ...(boundTaskPlugin?.models ?? []),
       ...(getChannelTypeConfig(currentType).supportedModels ?? []),
       ...pluginExtensions.flatMap((plugin) => plugin.models),
     ])
@@ -880,7 +890,13 @@ export function ChannelMutateDrawer({
       value: model,
       label: model,
     }))
-  }, [allModelsList, currentModelsArray, currentType, pluginExtensions])
+  }, [
+    allModelsList,
+    currentModelsArray,
+    boundTaskPlugin?.models,
+    currentType,
+    pluginExtensions,
+  ])
 
   const modelMappingGuardrail = useMemo<ModelMappingGuardrail>(() => {
     if (!currentModelMapping?.trim()) {
@@ -3283,9 +3299,10 @@ export function ChannelMutateDrawer({
               </div>
             )}
 
-            {(isSudashui || isHuahuoVideo) && (
+            {(isSudashui || isHuahuoVideo || isWolong) && (
               <TaskVideoModelEditor
-                manualOnly={isHuahuoVideo}
+                manualOnly={isHuahuoVideo || isWolong}
+                defaultModels={isWolong ? boundTaskPlugin?.models : undefined}
                 sourceURL={currentModelSourceURL || ''}
                 onSourceURLChange={(value) =>
                   form.setValue('task_plugin_model_source_url', value, {
@@ -3303,7 +3320,7 @@ export function ChannelMutateDrawer({
                 modelMapping={currentModelMapping}
                 details={discovery.modelDetails}
                 previewReady={discovery.status === 'success'}
-                disabled={!canEditSensitive}
+                disabled={!canEditSensitive || (isWolong && !boundTaskPlugin)}
               />
             )}
 

@@ -49,7 +49,7 @@ export function CreateRetryRuleFromError(props: { source: RetryDraftSource }) {
           open
           onOpenChange={setOpen}
           title={t('Error and retry rules')}
-          contentClassName='sm:max-w-6xl'
+          contentClassName='sm:max-w-[min(90rem,calc(100%-2rem))]'
         >
           <Suspense fallback={<p role='status'>{t('Loading...')}</p>}>
             <RetryPolicyCenter source={props.source} />

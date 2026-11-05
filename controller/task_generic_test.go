@@ -988,6 +988,153 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	assert.EqualValues(t, len(video), ref.Size)
 }
 
+func TestWolongVideoContentRefreshesSignedResults(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	previousRegistry, previousCache := pluginruntime.DefaultRegistry, common.MemoryCacheEnabled
+	pluginruntime.DefaultRegistry, common.MemoryCacheEnabled = pluginruntime.NewRegistry(), false
+	t.Cleanup(func() { pluginruntime.DefaultRegistry, common.MemoryCacheEnabled = previousRegistry, previousCache })
+	source, err := builtinplugins.Source("wolong")
+	require.NoError(t, err)
+	plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "wolong"})
+	require.NoError(t, err)
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "wolong-storage")
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "wolong-storage:"+base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))))
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+
+	baseURL, setting := "https://8.8.8.8", `{"task_plugin_key":"wolong"}`
+	frozen := model.Channel{Id: task.ChannelId, Type: constant.ChannelTypeTaskPlugin, Key: "original-key", BaseURL: &baseURL, Setting: &setting}
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"type": frozen.Type, "base_url": baseURL, "key": frozen.Key, "setting": setting}).Error)
+	task.Platform, task.Quota = "wolong", 1234
+	task.Properties.OriginModelName, task.Properties.UpstreamModelName = "haya-mo-seedance-25", "haya-mo-seedance-25"
+	task.PrivateData = model.TaskPrivateData{Key: "original-key", UpstreamTaskID: "upstream-wolong", ResultURL: baseURL + "/expired.mp4", Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: "wolong", Version: plugin.Meta.Version, APIVersion: 1}}}
+	task.Data = []byte(`{"ok":true,"task":{"id":"upstream-wolong","status":"succeeded","data":[{"mime":"video/mp4","url":"/expired.mp4?token=expired"}]}}`)
+	require.NoError(t, model.DB.Save(task).Error)
+	before := append([]byte(nil), task.Data...)
+
+	video := taskMediaMP4Fixture()
+	polls, downloads, rejectedCalls := 0, 0, 0
+	queryStatus, queryID := "succeeded", "upstream-wolong"
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/tasks/upstream-wolong":
+			polls++
+			assert.Equal(t, http.MethodGet, r.Method)
+			assert.Equal(t, "Bearer original-key", r.Header.Get("Authorization"))
+			assert.Empty(t, r.Header.Get("Range"), "client ranges apply only to media bytes")
+			_, _ = fmt.Fprintf(w, `{"ok":true,"task":{"id":%q,"status":%q,"progress":100,"data":[{"mime":"video/mp4","url":"/media/fresh.mp4?token=fresh-%d"}]}}`, queryID, queryStatus, polls)
+		case "/media/fresh.mp4":
+			downloads++
+			assert.Contains(t, []string{http.MethodGet, http.MethodHead}, r.Method)
+			assert.Equal(t, fmt.Sprintf("fresh-%d", polls), r.URL.Query().Get("token"))
+			assert.Empty(t, r.Header.Get("Authorization"))
+			assert.Empty(t, r.Header.Get("Cookie"))
+			w.Header().Set("Content-Type", "video/mp4")
+			if r.Header.Get("Range") != "" {
+				assert.Equal(t, "bytes=0-3", r.Header.Get("Range"))
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-3/%d", len(video)))
+				w.Header().Set("Content-Length", "4")
+				w.WriteHeader(http.StatusPartialContent)
+				if r.Method != http.MethodHead {
+					_, _ = w.Write(video[:4])
+				}
+				return
+			}
+			_, _ = w.Write(video)
+		default:
+			rejectedCalls++
+			w.WriteHeader(http.StatusGone)
+		}
+	}))
+	defer upstream.Close()
+	previousFetch := *system_setting.GetFetchSetting()
+	*system_setting.GetFetchSetting() = system_setting.FetchSetting{EnableSSRFProtection: true, ApplyIPFilterForDomain: true, AllowedPorts: []string{"443"}}
+	t.Cleanup(func() { *system_setting.GetFetchSetting() = previousFetch })
+	service.InitHttpClient()
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = upstream.Certificate().DNSNames[0]
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", upstream.Listener.Addr().String())
+	}
+	protected, relayClient := service.GetSSRFProtectedHTTPClient(), service.GetHttpClient()
+	previousProtected, previousRelay := protected.Transport, relayClient.Transport
+	protected.Transport, relayClient.Transport = transport, transport
+	t.Cleanup(func() {
+		protected.Transport, relayClient.Transport = previousProtected, previousRelay
+		transport.CloseIdleConnections()
+	})
+
+	for _, surface := range []string{"artifact", "video"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			t.Run(surface+method, func(t *testing.T) {
+				beforePolls := polls
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", task.UserId)
+				c.Params = gin.Params{{Key: "key", Value: task.TaskID}, {Key: "task_id", Value: task.TaskID}, {Key: "artifact_key", Value: "video"}}
+				c.Request = httptest.NewRequest(method, "/v1/videos/"+task.TaskID+"/content", nil)
+				c.Request.Header.Set("Range", "bytes=0-3")
+				if surface == "artifact" {
+					TaskArtifactContent(c)
+				} else {
+					VideoProxy(c)
+				}
+				require.Equal(t, http.StatusPartialContent, recorder.Code, recorder.Body.String())
+				assert.Equal(t, beforePolls+1, polls)
+				assert.Equal(t, fmt.Sprintf("bytes 0-3/%d", len(video)), recorder.Header().Get("Content-Range"))
+				assert.NotContains(t, recorder.Header(), "Location")
+				if method == http.MethodHead {
+					assert.Empty(t, recorder.Body.Bytes())
+				} else {
+					assert.Equal(t, video[:4], recorder.Body.Bytes())
+				}
+			})
+		}
+	}
+	adaptor, err := initTaskArtifactAdaptor(task)
+	require.NoError(t, err)
+	for _, sample := range []struct{ id, status string }{{"different-job", "succeeded"}, {"upstream-wolong", "needs_review"}} {
+		queryID, queryStatus = sample.id, sample.status
+		_, err := refreshWolongVideoContent(t.Context(), task, adaptor)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "original-key")
+	}
+	queryID, queryStatus = "upstream-wolong", "succeeded"
+
+	channelBytes, err := common.Marshal(frozen)
+	require.NoError(t, err)
+	channelCipher, err := service.EncryptImagePayload(channelBytes, "media-channel:"+task.TaskID)
+	require.NoError(t, err)
+	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "wolong-storage", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Provider: "wolong", Model: task.Properties.OriginModelName, Status: "submitted", StorageStatus: "failed", BillingStatus: "settled", ChannelCipher: channelCipher, ExpiresAt: time.Now().Unix() + 3600}
+	require.NoError(t, model.DB.Create(&job).Error)
+	task.PrivateData.AsyncMedia = true
+	require.NoError(t, model.DB.Save(task).Error)
+	captured, err := service.CaptureAsyncMediaOutput(t.Context(), task)
+	require.NoError(t, err)
+	require.True(t, captured)
+	require.NoError(t, model.DB.First(&job, job.ID).Error)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", task.ChannelId).Updates(map[string]any{"key": "rotated-key", "base_url": "https://9.9.9.9"}).Error)
+	beforePolls, beforeDownloads := polls, downloads
+	require.NoError(t, PersistAsyncVideo(t.Context(), job, task))
+	assert.Equal(t, beforePolls+1, polls)
+	assert.Equal(t, beforeDownloads+1, downloads)
+	ref, err := service.GetTaskArtifactStore().Resolve(task, "video")
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+	assert.EqualValues(t, len(video), ref.Size)
+	require.NoError(t, PersistAsyncVideo(t.Context(), job, task), "existing local video is reusable even before artifact_keys is reloaded")
+	assert.Equal(t, beforePolls+1, polls)
+	assert.Equal(t, beforeDownloads+1, downloads)
+	assert.Zero(t, rejectedCalls, "never submit generation or request the expired signed URL")
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.JSONEq(t, string(before), string(persisted.Data), "content refresh must not rewrite stored task snapshots")
+	assert.Equal(t, 1234, persisted.Quota, "content reads must not settle again")
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), persisted.Status)
+}
+
 func TestDynamicUpstreamVideoUsesPublicURLAfterStorageRetries(t *testing.T) {
 	task := setupGenericTaskTest(t)
 	connection, err := model.DB.DB()

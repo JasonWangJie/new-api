@@ -99,6 +99,9 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin == a.plugin {
 			if protocolValue, present := c.Get(pluginruntime.ContextKeyProtocolRequest); present {
 				if protocolContext, valid := protocolValue.(pluginruntime.ProtocolRequestContext); valid {
+					if a.plugin.Meta.Key == "wolong" {
+						protocolContext.UpstreamModel = info.UpstreamModelName
+					}
 					resolvedValue, callErr := a.plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{pinned.Protocol, "decodeRequest"}, protocolContext.JSValue())
 					resolved, resolvedOK := resolvedValue.(map[string]any)
 					resolvedModel, modelOK := resolved["model"].(string)
@@ -220,7 +223,7 @@ func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycomm
 	}
 	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) {
 		schema, _ := a.plugin.Meta.UsageForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
-		for _, key := range []string{"seconds", "requests"} {
+		for _, key := range []string{"seconds", "requests", "video_count"} {
 			if _, declared := schema[key]; !declared {
 				delete(facts, key)
 			}
@@ -278,13 +281,19 @@ func (a *TaskAdaptor) BuildRequestHeader(c *gin.Context, req *http.Request, info
 	if a.submit.BodyType == "multipart" {
 		req.Header.Set("Content-Type", c.GetHeader("Content-Type"))
 	}
-	if a.plugin.Meta.Key == constant.TaskPlatformHuahuoVideo {
+	if a.plugin.Meta.Key == constant.TaskPlatformHuahuoVideo || a.plugin.Meta.Key == "wolong" {
 		if req.Method != http.MethodPost || info.PublicTaskID == "" || info.ApiKey == "" {
+			if a.plugin.Meta.Key == "wolong" {
+				return fmt.Errorf("invalid Wolong video submission request")
+			}
 			return fmt.Errorf("invalid HUAHUO video submission request")
 		}
 		req.Header.Set("Authorization", "Bearer "+info.ApiKey)
 		req.Header.Set("Idempotency-Key", info.PublicTaskID)
 		req.Header.Del("X-Idempotency-Key")
+		if a.plugin.Meta.Key == "wolong" {
+			req.Header.Del("X-Client-Request-Id")
+		}
 		// The key identifies an uncertain paid send for reconciliation. A body
 		// factory would also let net/http replay it on a reused connection.
 		req.GetBody = nil
@@ -1003,7 +1012,7 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	delete(rendered, "task_id")
 	rendered["status"] = host.Status
 	rendered["progress"] = host.Progress
-	if a.plugin.Meta.Key == "drama" {
+	if a.plugin.Meta.Key == "drama" || a.plugin.Meta.Key == "wolong" {
 		if progress, ok := service.PublicTaskUpstreamProgress(task); ok {
 			rendered["upstream_progress"] = progress
 		} else {
@@ -1031,6 +1040,9 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 		public := map[string]any{
 			"id": host.ID, "object": host.Object, "model": host.Model,
 			"status": host.Status, "progress": host.Progress, "created_at": host.CreatedAt,
+		}
+		if progress, ok := service.PublicTaskUpstreamProgress(task); ok {
+			public["upstream_progress"] = progress
 		}
 		if host.CompletedAt != 0 {
 			public["completed_at"] = host.CompletedAt

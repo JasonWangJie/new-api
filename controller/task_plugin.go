@@ -651,7 +651,9 @@ func GetTaskPluginOptions(c *gin.Context) {
 			if !ok {
 				continue
 			}
-			if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
+			// Wolong retains its declared presets; channel-specific additions are
+			// entered manually and must not be mistaken for built-in defaults.
+			if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) && meta.Key != "wolong" {
 				meta = active.Meta
 			}
 			seen[meta.Key] = true

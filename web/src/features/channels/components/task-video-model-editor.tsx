@@ -31,6 +31,7 @@ import type { TaskVideoModelConfig, TaskVideoModelDetail } from '../types'
 
 interface TaskVideoModelEditorProps {
   manualOnly?: boolean
+  defaultModels?: readonly string[]
   sourceURL: string
   onSourceURLChange: (value: string) => void
   value: string
@@ -114,7 +115,9 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
             JSON.stringify(
               importMissingTaskVideoModels(
                 configs,
-                upstreamModels,
+                upstreamModels.filter(
+                  (model) => !props.defaultModels?.includes(model)
+                ),
                 preview,
                 props.manualOnly
               ),

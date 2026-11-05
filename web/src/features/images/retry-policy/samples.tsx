@@ -178,14 +178,15 @@ export function RetrySamples(props: {
         data={samples.data?.items ?? []}
         emptyContent={t('No error samples')}
         getRowKey={(sample) => sample.fingerprint}
+        tableClassName='[&_th]:whitespace-normal'
         columns={[
           {
             id: 'message',
             header: t('Error message'),
             className: 'min-w-64',
             cell: (sample) => (
-              <div className='max-w-lg space-y-1 whitespace-normal'>
-                <p className='break-words'>{sample.message}</p>
+              <div className='max-w-lg space-y-1 wrap-anywhere whitespace-normal'>
+                <p>{sample.message}</p>
                 <p className='text-muted-foreground text-xs'>
                   {sample.media_type} · {sample.provider} · {sample.model} ·{' '}
                   {sample.stage}
@@ -209,7 +210,11 @@ export function RetrySamples(props: {
           {
             id: 'rule',
             header: t('Matched rule'),
-            cell: (sample) => sample.rule_id || t('Unmatched'),
+            cell: (sample) => (
+              <p className='max-w-40 wrap-anywhere whitespace-normal'>
+                {sample.rule_id || t('Unmatched')}
+              </p>
+            ),
           },
           {
             id: 'executed',

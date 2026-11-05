@@ -842,9 +842,9 @@ func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCan
 	}
 	meta := candidate.Binding.Plugin.Meta
 	if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
-		config, exists := candidate.Channel.GetSetting().TaskPluginModelConfigs[candidate.UpstreamModel]
-		if !exists {
-			return errors.New("saved video model configuration is unavailable")
+		config, err := model.ResolveTaskVideoModelConfig(candidate.Channel.GetSetting(), candidate.UpstreamModel)
+		if err != nil {
+			return err
 		}
 		data, err := common.Marshal(config)
 		if err != nil {

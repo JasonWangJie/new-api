@@ -31,6 +31,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from '../../api'
+import { CreateRetryRuleFromError } from '../create-from-error'
 import { RetryPolicyCenter, RetryPolicyForm } from '../index'
 import {
   newRetryRule,
@@ -701,6 +702,40 @@ test('displays translated built-in category names while preserving their stored 
       expect.anything()
     )
   )
+})
+
+test('opens error samples in a wider viewport-bounded dialog and wraps long values', async () => {
+  useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 100 })
+  const policy = fixture()
+  const [sample] = sampleFixture(1)
+  sample.message = `Upstream returned ${'unbroken-error-context'.repeat(12)}`
+  const ruleId = policy.rules[0].id
+  vi.mocked(imageRequest)
+    .mockResolvedValueOnce(policy)
+    .mockResolvedValueOnce({
+      items: [{ ...sample, matched: true, rule_id: ruleId }],
+      total: 1,
+    })
+  const user = userEvent.setup()
+  show(<CreateRetryRuleFromError source={{ fact: sample }} />)
+
+  await user.click(
+    screen.getByRole('button', { name: 'Create rule from error' })
+  )
+  const editor = await screen.findByRole('dialog', { name: 'Edit retry rule' })
+  await user.click(within(editor).getByRole('button', { name: 'Cancel' }))
+  const dialog = await screen.findByRole('dialog', {
+    name: 'Error and retry rules',
+  })
+  await user.click(within(dialog).getByRole('tab', { name: 'Error samples' }))
+
+  const message = await within(dialog).findByText(sample.message)
+  const table = within(dialog).getByRole('table')
+  expect(dialog).toHaveClass('sm:max-w-[min(90rem,calc(100%-2rem))]')
+  expect(table).toHaveClass('[&_th]:whitespace-normal')
+  expect(message.parentElement).toHaveClass('wrap-anywhere')
+  expect(within(table).getByText(ruleId)).toHaveClass('wrap-anywhere')
+  expect(within(table).getByRole('button', { name: 'Details' })).toBeVisible()
 })
 
 test('initializes sample filters and the first request to today and allows a custom range', async () => {

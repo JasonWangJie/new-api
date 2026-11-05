@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +23,52 @@ func TestRegistryOverrideTakesPrecedenceOverFactory(t *testing.T) {
 	plugin, ok := registry.Get("test")
 	require.True(t, ok)
 	assert.Equal(t, "1.0.0-override", plugin.Meta.Version)
+}
+
+func TestWolongConfiguredModelsPreserveFactoryCapabilities(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "plugins", "tasks", "wolong", "plugin.js"))
+	require.NoError(t, err)
+	registry := NewRegistry()
+	plugin, err := registry.RegisterFactory(string(source), Options{Key: "wolong"})
+	require.NoError(t, err)
+	defaults := map[string]kitdto.TaskVideoModelConfig{}
+	for _, name := range plugin.Meta.Models {
+		config, found := TaskVideoModelConfigFromMeta(plugin.Meta, name)
+		require.True(t, found)
+		require.NoError(t, config.ValidateForPlugin("wolong", 3600))
+		defaults[name] = config
+	}
+	unchanged := WithTaskVideoModels(plugin, defaults)
+	assert.Equal(t, plugin.Meta.VideoProfiles, unchanged.Meta.VideoProfiles)
+	assert.Equal(t, plugin.Meta.UsageProfiles, unchanged.Meta.UsageProfiles)
+	assert.Equal(t, plugin.Meta.Models, WithTaskVideoModels(plugin, nil).Meta.Models)
+	custom := defaults["haya-mo-seedance-25"]
+	custom.Duration = kitdto.TaskVideoDuration{Values: []int{8, 16}, Default: 8}
+	custom.Resolutions, custom.AspectRatios = []string{"1440p"}, []string{"3:2"}
+	custom.Modes = []string{"text_to_video", "first_last_frame"}
+	configured := WithTaskVideoModels(plugin, map[string]kitdto.TaskVideoModelConfig{"future-wolong": custom})
+	assert.Contains(t, configured.Meta.Models, "future-wolong")
+	assert.Len(t, configured.Meta.Models, len(plugin.Meta.Models)+1)
+	for _, name := range plugin.Meta.Models {
+		original, _ := plugin.Meta.VideoProfileForModel(name)
+		preserved, found := configured.Meta.VideoProfileForModel(name)
+		require.True(t, found)
+		assert.Equal(t, original, preserved)
+	}
+	schema, _ := configured.Meta.UsageForModel("future-wolong")
+	assert.Contains(t, schema, "video_count")
+	assert.NotContains(t, schema, "requests")
+	assert.NotContains(t, schema, "seconds")
+	profile, found := configured.Meta.VideoProfileForModel("future-wolong")
+	require.True(t, found)
+	require.Len(t, profile.Modes[1].Inputs, 2)
+	assert.True(t, profile.Modes[1].Inputs[1].Required)
+	custom.BillingMode = "per_second"
+	changed := WithTaskVideoModels(configured, map[string]kitdto.TaskVideoModelConfig{"future-wolong": custom})
+	schema, _ = changed.Meta.UsageForModel("future-wolong")
+	assert.Contains(t, schema, "seconds")
+	assert.NotContains(t, schema, "video_count")
+	assert.NotContains(t, plugin.Meta.Models, "future-wolong", "channel pinning must not mutate factory metadata")
 }
 
 func TestRegistryUnregisterFallsBackToFactory(t *testing.T) {
