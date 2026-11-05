@@ -345,6 +345,76 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
+test.each([
+  { mediaType: 'image', mobile: false },
+  { mediaType: 'image', mobile: true },
+  { mediaType: 'video', mobile: false },
+  { mediaType: 'video', mobile: true },
+] as const)(
+  'administrator $mediaType details show and copy the full upstream task ID (mobile=$mobile)',
+  async ({ mediaType, mobile }) => {
+    if (mobile) setMobileViewport()
+    const upstreamTaskId = `provider-task-${'a'.repeat(220)}`
+    const user = userEvent.setup()
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      results: [],
+      task: {
+        ...task,
+        media_type: mediaType,
+        upstream_task_id: upstreamTaskId,
+      },
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin
+        userId={101}
+        canManage={false}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    const label = await screen.findByText('Upstream Task ID')
+    const field = label.parentElement
+    assert(field)
+    expect(within(field).getByText(upstreamTaskId)).toHaveClass('break-all')
+    expect(screen.getByText(task.id)).toBeVisible()
+    await user.click(
+      within(field).getByRole('button', { name: 'Copy Task ID' })
+    )
+    expect(await navigator.clipboard.readText()).toBe(upstreamTaskId)
+  }
+)
+
+test.each([
+  { admin: false, upstreamTaskId: 'private-provider-task' },
+  { admin: true, upstreamTaskId: undefined },
+  { admin: true, upstreamTaskId: '' },
+])(
+  'task details omit the upstream ID when unauthorized or unavailable (admin=$admin, id=$upstreamTaskId)',
+  async ({ admin, upstreamTaskId }) => {
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      results: [],
+      task: { ...task, upstream_task_id: upstreamTaskId },
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={admin}
+        userId={101}
+        canManage={false}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+    await screen.findByText(task.id)
+    expect(screen.queryByText('Upstream Task ID')).not.toBeInTheDocument()
+    expect(screen.queryByText('private-provider-task')).not.toBeInTheDocument()
+  }
+)
+
 test.each([false, true])(
   'a conditional video task with private platform fields omitted still renders its public model (mobile=%s)',
   async (mobile) => {

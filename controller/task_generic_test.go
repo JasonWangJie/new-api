@@ -159,7 +159,7 @@ func TestAsyncVideoReconciliationManagementRetainsReservation(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(recorder)
 		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-		view, _, err := videoJobView(c, job, admin)
+		view, _, err := videoJobView(c, job, admin, false)
 		require.NoError(t, err)
 		assert.Equal(t, "invoking", view["status"])
 		assert.Equal(t, "reserved", view["billing_status"])

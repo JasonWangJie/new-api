@@ -140,7 +140,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.Channel{Id: 301, Name: "Sunburst upstream", Key: "channel-secret-canary"}).Error)
 			attempts, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: 301, KeyFingerprint: "fingerprint-canary", KeyIndex: 2, StartedAt: now - 40, FinishedAt: now - 10, Dispatched: true, HTTPStatus: http.StatusBadRequest, ErrorMessage: `{"message":"sanitized provider detail","input":"history-private-prompt"}`, ProviderCode: "invalid_request", ProviderStatus: "INVALID_ARGUMENT", UpstreamRequestID: "provider-request-1"}})
 			require.NoError(t, err)
-			task := model.AsyncImageTask{TaskId: "asyncimg_success", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "bb", RequestType: "image_to_image", Model: "gpt-image-2.5-sunburst", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 1, ResultCount: 1, CreatedAt: now - 50, StartedAt: now - 40, FinishedAt: now - 10, Attempts: string(attempts), ReferenceUrls: `["https://example.com/private-reference"]`, RequestedResolution: "2K", ActualSize: "2048x1186"}
+			task := model.AsyncImageTask{TaskId: "asyncimg_success", UpstreamTaskId: "private-upstream-image", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "bb", RequestType: "image_to_image", Model: "gpt-image-2.5-sunburst", Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 1, ResultCount: 1, CreatedAt: now - 50, StartedAt: now - 40, FinishedAt: now - 10, Attempts: string(attempts), ReferenceUrls: `["https://example.com/private-reference"]`, RequestedResolution: "2K", ActualSize: "2048x1186"}
 			require.NoError(t, db.Create(&task).Error)
 			polling := model.AsyncImageTask{TaskId: "asyncimg_upstream_polling", UserId: 101, TokenId: 201, ChannelId: 301, Group: "default", Platform: "openai", Dialect: "async", RequestType: "text_to_image", Model: "async-image-model", Status: model.ImageTaskQueued, UpstreamTaskId: "private-upstream-job", DispatchedAt: now - 20, StartedAt: now - 20, NextAttemptAt: now + 10, CreatedAt: now - 20}
 			require.NoError(t, db.Create(&polling).Error)
@@ -844,6 +844,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Equal(t, float64(0), list.Data.Stats["queued"])
 					}
 					for _, item := range list.Data.Items {
+						assert.NotContains(t, item, "upstream_task_id")
 						if item["id"] == polling.TaskId {
 							assert.Equal(t, model.ImageTaskInvoking, item["status"])
 							assert.Equal(t, "generating", item["stage"])
@@ -883,6 +884,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					assert.Equal(t, "Studio Key", detail.Data.Task["api_key_name"])
 					assert.Len(t, detail.Data.Results, 1)
 					if admin {
+						assert.Equal(t, task.UpstreamTaskId, detail.Data.Task["upstream_task_id"])
 						history, historyErr := common.Marshal(detail.Data.Task["attempt_history"])
 						assert.Contains(t, detailRecorder.Body.String(), "routing-event-canary")
 						require.NoError(t, historyErr)
@@ -895,10 +897,15 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.NotContains(t, string(history), "fingerprint-canary")
 						assert.NotContains(t, detailRecorder.Body.String(), "history-private-prompt", "both readable and legacy serialized history must redact echoed input")
 					} else {
+						assert.NotContains(t, detail.Data.Task, "upstream_task_id")
+						assert.NotContains(t, detailRecorder.Body.String(), task.UpstreamTaskId)
 						assert.NotContains(t, detailRecorder.Body.String(), "Sunburst upstream")
 						assert.NotContains(t, detailRecorder.Body.String(), "routing-event-canary")
 						assert.NotContains(t, detailRecorder.Body.String(), "fingerprint-canary")
 						assert.NotContains(t, detailRecorder.Body.String(), "provider-request-1")
+					}
+					for _, secret := range []string{"password-secret-canary", "token-secret-canary", "channel-secret-canary", "private-storage-canary", "private-object-canary"} {
+						assert.NotContains(t, detailRecorder.Body.String(), secret)
 					}
 				})
 			}
@@ -926,6 +933,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			GetImageTask(denied, false)
 			assert.Equal(t, http.StatusNotFound, deniedRecorder.Code)
 			assert.False(t, strings.Contains(deniedRecorder.Body.String(), "Studio Key"))
+			assert.NotContains(t, deniedRecorder.Body.String(), task.UpstreamTaskId)
 
 			recoverable := model.AsyncImageTask{TaskId: "asyncimg_recoverable", UserId: 101, TokenId: 201, Status: model.ImageTaskStorageFailed, ImageCount: 1, CreatedAt: now}
 			require.NoError(t, db.Create(&recoverable).Error)
@@ -1745,6 +1753,9 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks/"+job.TaskId, nil)
 					GetMediaTask(c, admin)
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					for _, secret := range []string{"audit-native-secret", "audit-plugin-state-secret", "audit-upstream-response-secret", `"private_data"`} {
+						assert.NotContains(t, recorder.Body.String(), secret)
+					}
 					var response struct {
 						Data struct {
 							Task   gin.H
@@ -1755,6 +1766,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					return response.Data.Task, response.Data.Events
 				}
 				view, events := readDetail(102, true)
+				assert.NotContains(t, view, "upstream_task_id", "unaccepted tasks have no upstream identifier")
 				assert.Empty(t, view["attempt_history"])
 				assert.Equal(t, false, view["attempt_history_unavailable"])
 				require.Len(t, events, 1)
@@ -1762,7 +1774,11 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitting"}))
 				require.NoError(t, model.DispatchAsyncMediaJob(t.Context(), job, map[string]any{"dispatched_at": now, "billing_status": "reserved"}, 2, "original"))
 				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "submitted"}))
+				native := model.Task{TaskID: job.TaskId, UserId: job.UserId, ChannelId: job.ChannelId, Status: model.TaskStatusNotStart, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: job.TokenId, UpstreamTaskID: "private-upstream-video", Key: "audit-native-secret", PluginState: []byte(`{"private":"audit-plugin-state-secret"}`), UpstreamAsyncResponse: []byte(`{"private":"audit-upstream-response-secret"}`)}}
+				require.NoError(t, db.Create(&native).Error)
+				t.Cleanup(func() { require.NoError(t, db.Delete(&native).Error) })
 				view, events = readDetail(102, true)
+				assert.Equal(t, native.PrivateData.UpstreamTaskID, view["upstream_task_id"])
 				history := view["attempt_history"].([]any)
 				require.Len(t, history, 1)
 				attempt := history[0].(map[string]any)
@@ -1778,6 +1794,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				_, events = readDetail(102, true)
 				assert.Len(t, events, before, "polls and identical transitions must not add timeline noise")
 				owner, ownerEvents := readDetail(101, false)
+				assert.NotContains(t, owner, "upstream_task_id")
 				assert.NotContains(t, owner, "attempt_history")
 				assert.NotContains(t, owner, "reconciliation_status")
 				require.NotEmpty(t, ownerEvents)
@@ -1788,6 +1805,32 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.NotContains(t, event, field)
 					}
 				}
+				for _, admin := range []bool{true, false} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", job.UserId)
+					c.Request = httptest.NewRequest(http.MethodGet, "/api/media-tasks?media_type=video&task_id="+job.TaskId, nil)
+					ListMediaTasks(c, admin)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var list struct {
+						Data struct{ Items []gin.H }
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &list))
+					require.Len(t, list.Data.Items, 1)
+					assert.Equal(t, job.TaskId, list.Data.Items[0]["task_id"])
+					assert.NotContains(t, recorder.Body.String(), "upstream_task_id")
+					assert.NotContains(t, recorder.Body.String(), native.PrivateData.UpstreamTaskID)
+				}
+				publicRecorder := httptest.NewRecorder()
+				public, _ := gin.CreateTestContext(publicRecorder)
+				public.Set("id", job.UserId)
+				public.Set("token_id", job.TokenId)
+				public.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
+				public.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+job.TaskId, nil)
+				QueryAsyncMedia(public)
+				require.Equal(t, http.StatusOK, publicRecorder.Code, publicRecorder.Body.String())
+				assert.NotContains(t, publicRecorder.Body.String(), "upstream_task_id")
+				assert.NotContains(t, publicRecorder.Body.String(), native.PrivateData.UpstreamTaskID)
 				require.NoError(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"status": "failed", "billing_status": "unknown", "error_message": "submission receipt lost; authorization: Bearer audit-secret-canary; https://private.example/ref.png?signature=audit-url-canary"}))
 				view, _ = readDetail(102, true)
 				history = view["attempt_history"].([]any)
@@ -1807,6 +1850,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				GetMediaTask(other, false)
 				assert.Equal(t, http.StatusNotFound, recorder.Code)
 				assert.NotContains(t, recorder.Body.String(), "attempt_history")
+				assert.NotContains(t, recorder.Body.String(), native.PrivateData.UpstreamTaskID)
 				legacy := model.AsyncMediaJob{TaskId: "task_video_audit_legacy", IdentityHash: "video-audit-legacy", UserId: 101, TokenId: 201, ChannelId: 301, Provider: "sora", Model: "sora-2", Status: "failed", BillingStatus: "unknown", CreatedAt: now - 100, ExpiresAt: now + 3600}
 				require.NoError(t, db.Create(&legacy).Error)
 				job = legacy
@@ -2673,7 +2717,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						native := model.Task{TaskID: id, UserId: 101, Status: nativeStatus, AttemptGeneration: 1}
 						require.NoError(t, db.Create(&job).Error)
 						require.NoError(t, db.Create(&native).Error)
-						view, _, err := videoJobView(c, job, true)
+						view, _, err := videoJobView(c, job, true, false)
 						require.NoError(t, err)
 						expectedStatus := "failed"
 						if item.succeeded {
@@ -2763,7 +2807,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						}
 						c.Params = gin.Params{{Key: "task_id", Value: job.TaskId}}
 						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+job.TaskId+"/terminate", strings.NewReader(item.body))
-						view, _, err := videoJobView(c, job, item.admin)
+						view, _, err := videoJobView(c, job, item.admin, false)
 						require.NoError(t, err)
 						assert.Equal(t, item.terminable, view["can_terminate"])
 						if item.provider != "" {
@@ -2792,7 +2836,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						} else {
 							assert.Equal(t, "not_billable", stored.BillingStatus)
 						}
-						view, _, err = videoJobView(c, stored, item.admin)
+						view, _, err = videoJobView(c, stored, item.admin, false)
 						require.NoError(t, err)
 						assert.Equal(t, "failed", view["status"])
 						assert.Equal(t, false, view["can_terminate"])

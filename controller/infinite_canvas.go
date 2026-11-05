@@ -199,7 +199,7 @@ func CanvasHistoryTask(c *gin.Context) {
 			return
 		}
 		c.Set(service.CanvasGrantContextKey, grant)
-		_, data, err := videoJobView(c, job, false)
+		_, data, err := videoJobView(c, job, false, false)
 		if err != nil {
 			c.Status(503)
 			return

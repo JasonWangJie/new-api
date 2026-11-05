@@ -481,6 +481,28 @@ export function ImageTaskDetails(props: {
                 className='size-8 shrink-0'
               />
             </div>
+            {props.admin && data.upstream_task_id ? (
+              <TaskDetailFields
+                className='grid-cols-1 md:grid-cols-1'
+                items={[
+                  {
+                    label: t('Upstream Task ID'),
+                    value: (
+                      <div className='flex min-w-0 items-center gap-2'>
+                        <span className='min-w-0 font-mono text-xs break-all'>
+                          {data.upstream_task_id}
+                        </span>
+                        <CopyButton
+                          value={data.upstream_task_id}
+                          tooltip={t('Copy Task ID')}
+                          className='size-8 shrink-0'
+                        />
+                      </div>
+                    ),
+                  },
+                ]}
+              />
+            ) : null}
             {upstreamProgress !== null && (
               <p className='text-muted-foreground text-xs wrap-anywhere tabular-nums'>
                 {t('Upstream progress')} {upstreamProgress}%

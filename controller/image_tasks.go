@@ -575,6 +575,9 @@ func GetImageTask(c *gin.Context, admin bool) {
 		imageManagementError(c, 503, err)
 		return
 	}
+	if admin && task.UpstreamTaskId != "" {
+		items[0]["upstream_task_id"] = task.UpstreamTaskId
+	}
 	imageManagementData(c, gin.H{"task": items[0], "results": results, "events": events})
 }
 

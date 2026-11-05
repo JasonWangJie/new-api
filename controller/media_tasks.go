@@ -93,7 +93,7 @@ func QueryAsyncMedia(c *gin.Context) {
 			return
 		}
 	}
-	view, results, err := videoJobView(c, job, false)
+	view, results, err := videoJobView(c, job, false, false)
 	if err != nil {
 		AsyncImagePublicError(c, 503, "storage_unavailable", "Media results are unavailable")
 		return
@@ -103,7 +103,7 @@ func QueryAsyncMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, view)
 }
 
-func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, []gin.H, error) {
+func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (gin.H, []gin.H, error) {
 	managed, ownerErr := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId)
 	if ownerErr != nil && !errors.Is(ownerErr, service.ErrCanvasAuthorization) && !errors.Is(ownerErr, model.ErrCanvasBillingOwner) {
 		return nil, nil, ownerErr
@@ -179,6 +179,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin bool) (gin.H, [
 	if err == nil {
 		if admin {
 			view["billing_channel_id"] = task.BillingChannelID()
+			if detail && task.PrivateData.UpstreamTaskID != "" {
+				view["upstream_task_id"] = task.PrivateData.UpstreamTaskID
+			}
 			view["media_retry_decision"] = task.PrivateData.MediaRetryDecision
 		}
 		if job.Status == "expired" && task.Status == model.TaskStatusSuccess {
@@ -541,7 +544,7 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		imageManagementError(c, status, errors.New("Media task is unavailable"))
 		return
 	}
-	view, results, err := videoJobView(c, job, admin)
+	view, results, err := videoJobView(c, job, admin, true)
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
@@ -1150,7 +1153,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		}
 	}
 	for _, job := range jobs {
-		view, _, err := videoJobView(c, job, admin)
+		view, _, err := videoJobView(c, job, admin, false)
 		if err != nil {
 			imageManagementError(c, 503, err)
 			return

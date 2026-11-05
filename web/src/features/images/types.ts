@@ -151,6 +151,7 @@ export type ImageTask = {
   result_expired?: boolean
   id: string
   task_id: string
+  upstream_task_id?: string
   platform?: ImagePlatform
   protocol: string
   model: string

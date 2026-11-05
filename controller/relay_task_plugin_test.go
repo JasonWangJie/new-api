@@ -366,7 +366,7 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 			if tc.paused {
 				assert.Equal(t, "resubmissions_paused", native.PrivateData.MediaRetryDecision.BlockedReason)
 			}
-			view, _, err := videoJobView(taskSubmissionTestContext(), initialJob, true)
+			view, _, err := videoJobView(taskSubmissionTestContext(), initialJob, true, false)
 			require.NoError(t, err)
 			assert.Equal(t, true, view["can_terminate"])
 			stale := native
@@ -653,7 +653,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 			assert.Equal(t, 100, frozen.Billing.Price.Quota)
 			assert.Contains(t, string(frozen.Body), `"resolution":"720p"`)
 			for _, admin := range []bool{false, true} {
-				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin)
+				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin, false)
 				require.NoError(t, err)
 				assert.Equal(t, "seedance2.5-A", view["model"])
 				assert.Equal(t, "480p", view["requested_resolution"])
@@ -681,7 +681,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 					copy := job
 					copy.Status, copy.RequestCipher, copy.ExpiresAt = projection.status, projection.cipher, projection.expiresAt
 					for _, admin := range []bool{false, true} {
-						view, _, err := videoJobView(taskSubmissionTestContext(), copy, admin)
+						view, _, err := videoJobView(taskSubmissionTestContext(), copy, admin, false)
 						require.NoError(t, err)
 						assert.Equal(t, "seedance2.5-A", view["model"])
 						_, hasPlatform := view["platform"]
@@ -821,7 +821,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 			assert.Equal(t, "upgrade", task.PrivateData.VideoRouting.RuleID)
 			assert.Equal(t, tc.originalFallback, task.PrivateData.VideoRouting.IsFallback)
 			for _, admin := range []bool{false, true} {
-				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin)
+				view, _, err := videoJobView(taskSubmissionTestContext(), job, admin, false)
 				require.NoError(t, err)
 				assert.Equal(t, "seedance2.5-A", view["model"])
 				assert.Equal(t, "480p", view["requested_resolution"])
@@ -2375,7 +2375,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&native).Error)
 						require.NotEmpty(t, native.PrivateData.VideoAttempts)
 						assert.Equal(t, model.TaskStatusUnknown, native.PrivateData.VideoAttempts[0].Status)
-						view, _, err := videoJobView(taskSubmissionTestContext(), job, true)
+						view, _, err := videoJobView(taskSubmissionTestContext(), job, true, false)
 						require.NoError(t, err)
 						assert.Equal(t, true, view["can_terminate"])
 						require.NoError(t, service.ReconcileTerminatedAsyncMediaReservation(t.Context(), job))
@@ -2392,7 +2392,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 						require.NoError(t, common.Unmarshal(plain, &frozen))
 						assert.Equal(t, request.Body, frozen.Body)
 						viewContext := taskSubmissionTestContext()
-						view, _, err := videoJobView(viewContext, job, true)
+						view, _, err := videoJobView(viewContext, job, true, false)
 						require.NoError(t, err)
 						assert.Equal(t, true, view["can_terminate"], "administrators can reconcile and end this retained operation")
 						require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
@@ -2429,7 +2429,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 							assert.Equal(t, "expired", terminal.StorageStatus, "confirmed financial completion still permits retention cleanup")
 							assert.Empty(t, terminal.RequestCipher)
 							assert.Empty(t, terminal.ChannelCipher)
-							view, _, err = videoJobView(viewContext, job, true)
+							view, _, err = videoJobView(viewContext, job, true, false)
 							require.NoError(t, err)
 							assert.Equal(t, true, view["can_terminate"], "retention must not remove administrator reconciliation")
 							for _, attempt := range []struct {
@@ -2788,7 +2788,7 @@ func TestHuahuoVideoDurableLifecycle(t *testing.T) {
 			assert.Equal(t, "succeeded", job.Status, job.ErrorMessage)
 			assert.EqualValues(t, 2, downloads.Load())
 			assert.EqualValues(t, 1, submits.Load())
-			view, _, err := videoJobView(taskSubmissionTestContext(), job, false)
+			view, _, err := videoJobView(taskSubmissionTestContext(), job, false, false)
 			require.NoError(t, err)
 			encoded, err := common.Marshal(view)
 			require.NoError(t, err)
