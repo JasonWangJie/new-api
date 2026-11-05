@@ -99,7 +99,7 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Plugin == a.plugin {
 			if protocolValue, present := c.Get(pluginruntime.ContextKeyProtocolRequest); present {
 				if protocolContext, valid := protocolValue.(pluginruntime.ProtocolRequestContext); valid {
-					if a.plugin.Meta.Key == "wolong" {
+					if kitdto.PresetTaskVideoPlugin(a.plugin.Meta.Key) {
 						protocolContext.UpstreamModel = info.UpstreamModelName
 					}
 					resolvedValue, callErr := a.plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{pinned.Protocol, "decodeRequest"}, protocolContext.JSValue())
@@ -130,18 +130,21 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	}
 	request, hasRequest := c.Get("task_request")
 	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) && hasRequest {
-		profile, exists := a.plugin.Meta.VideoProfileForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
-		if !exists {
+		modelName := cmp.Or(info.UpstreamModelName, info.OriginModelName)
+		profile, exists := a.plugin.Meta.VideoProfileForModel(modelName)
+		if !exists && (a.plugin.Meta.Key == "wolong" || !pluginruntime.HasPresetTaskVideoModel(a.plugin, modelName)) {
 			return service.TaskErrorWrapperLocal(fmt.Errorf("missing saved video model configuration"), "plugin_request_invalid", http.StatusBadRequest)
 		}
-		var files []map[string]any
-		if value, exists := c.Get(pluginruntime.ContextKeyProtocolRequest); exists {
-			if protocol, valid := value.(pluginruntime.ProtocolRequestContext); valid {
-				files = protocol.Files
+		if exists {
+			var files []map[string]any
+			if value, exists := c.Get(pluginruntime.ContextKeyProtocolRequest); exists {
+				if protocol, valid := value.(pluginruntime.ProtocolRequestContext); valid {
+					files = protocol.Files
+				}
 			}
-		}
-		if err := service.ValidateVideoProfileRequest(profile, info.Action, request, files); err != nil {
-			return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+			if err := service.ValidateVideoProfileRequest(profile, info.Action, request, files); err != nil {
+				return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+			}
 		}
 	}
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
@@ -174,7 +177,9 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 }
 
 func (a *TaskAdaptor) EstimateBillingValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]float64, error) {
-	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) {
+	useConfiguredUnits := a.plugin.Meta.Key == "wolong" || !kitdto.PresetTaskVideoPlugin(a.plugin.Meta.Key) ||
+		pluginruntime.IsCustomTaskVideoModel(a.plugin, cmp.Or(info.UpstreamModelName, info.OriginModelName))
+	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) && useConfiguredUnits {
 		facts, err := a.ExtractUsageFactsValidated(c, info)
 		if err != nil {
 			return nil, err
@@ -221,7 +226,9 @@ func (a *TaskAdaptor) ExtractUsageFactsValidated(c *gin.Context, info *relaycomm
 	if !ok {
 		return nil, fmt.Errorf("plugin usage hook must return an object")
 	}
-	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) {
+	useConfiguredUnits := a.plugin.Meta.Key == "wolong" || !kitdto.PresetTaskVideoPlugin(a.plugin.Meta.Key) ||
+		pluginruntime.IsCustomTaskVideoModel(a.plugin, cmp.Or(info.UpstreamModelName, info.OriginModelName))
+	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) && useConfiguredUnits {
 		schema, _ := a.plugin.Meta.UsageForModel(cmp.Or(info.UpstreamModelName, info.OriginModelName))
 		for _, key := range []string{"seconds", "requests", "video_count"} {
 			if _, declared := schema[key]; !declared {

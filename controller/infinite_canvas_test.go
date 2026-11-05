@@ -577,9 +577,9 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 	require.NoError(t, f.db.First(&record, "id = ?", grant.GrantID).Error)
 	profile := model.ImageStorageProfile{ProfileId: "canvas-results", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}
 	require.NoError(t, f.db.Create(&profile).Error)
-	content := []byte("private-canvas-image-content")
-	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, "result.png"), content, 0600))
-	object := model.ImageStorageObject{ObjectId: "canvas-result", ProfileId: profile.ProfileId, ObjectKey: "result.png", ContentType: "image/png", ByteSize: int64(len(content)), Status: "active", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	content := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="2" height="3"><path d="M0 0L2 3"/></svg>`)
+	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, "result.svg"), content, 0600))
+	object := model.ImageStorageObject{ObjectId: "canvas-result", ProfileId: profile.ProfileId, ObjectKey: "result.svg", ContentType: "image/svg+xml", ByteSize: int64(len(content)), Status: "active", ExpiresAt: time.Now().Add(time.Hour).Unix()}
 	require.NoError(t, f.db.Create(&object).Error)
 	task := model.AsyncImageTask{TaskId: "asyncimg_canvas_content", UserId: f.user.Id, TokenId: record.TokenID, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ResultCount: 1, ExpiresAt: object.ExpiresAt}
 	require.NoError(t, f.db.Create(&task).Error)
@@ -602,7 +602,10 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 		response = f.request(method, contentPath, "", f.proof, "", grant.GrantID)
 		require.Equal(t, 200, response.Code, response.Body.String())
 		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
-		assert.Equal(t, "image/png", response.Header().Get("Content-Type"))
+		assert.Equal(t, "image/svg+xml", response.Header().Get("Content-Type"))
+		assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
+		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "sandbox;")
+		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'none'")
 		if method == http.MethodGet {
 			assert.Equal(t, content, response.Body.Bytes())
 		} else {
@@ -694,7 +697,7 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 	ordinary := model.Token{UserId: f.user.Id, Key: "ordinary" + common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true, Group: "default"}
 	require.NoError(t, f.db.Create(&ordinary).Error)
 	ordinaryObject := object
-	ordinaryObject.Id, ordinaryObject.ObjectId, ordinaryObject.IdentityHash, ordinaryObject.ObjectKey = 0, "ordinary-result", "ordinary-result-identity", "ordinary.png"
+	ordinaryObject.Id, ordinaryObject.ObjectId, ordinaryObject.IdentityHash, ordinaryObject.ObjectKey = 0, "ordinary-result", "ordinary-result-identity", "ordinary.svg"
 	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, ordinaryObject.ObjectKey), content, 0600))
 	require.NoError(t, f.db.Create(&ordinaryObject).Error)
 	ordinaryTask := task
@@ -709,6 +712,9 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 	response = f.request("GET", manifest.Data[0].URL, "", "", "", "")
 	require.Equal(t, 200, response.Code, response.Body.String())
 	assert.Equal(t, content, response.Body.Bytes())
+	assert.Equal(t, "image/svg+xml", response.Header().Get("Content-Type"))
+	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "sandbox;")
+	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'none'")
 	assert.Equal(t, 307, f.request("GET", "/api/user/async-image-tasks/"+ordinaryTask.TaskId+"/results/0/view", "", "Bearer "+jwt, "", "").Code)
 	assert.Equal(t, 404, f.request("GET", "/v1/images/tasks_async/"+ordinaryTask.TaskId, "", "Bearer "+current.APIKey, f.proof, "").Code)
 	assert.Equal(t, 404, f.request("GET", queryPath, "", "Bearer "+ordinary.Key, "", "").Code)

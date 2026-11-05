@@ -140,8 +140,10 @@ export function imageFileExtension(mime: string): string {
         'image/jpeg': 'jpg',
         'image/png': 'png',
         'image/webp': 'webp',
+        'image/gif': 'gif',
+        'image/svg+xml': 'svg',
       } as Record<string, string>
-    )[mime] || 'png'
+    )[mime.split(';', 1)[0].trim().toLowerCase()] || 'png'
   )
 }
 
@@ -406,6 +408,24 @@ export function extractImageResponse(
           mime = 'image/jpeg'
         } else if (prefix.startsWith('UklGR')) {
           mime = 'image/webp'
+        } else if (
+          prefix.startsWith('R0lGODlh') ||
+          prefix.startsWith('R0lGODdh')
+        ) {
+          mime = 'image/gif'
+        } else {
+          let text = ''
+          try {
+            // Inspect a bounded prefix without allocating another full image.
+            text = atob(item.b64_json.slice(0, 4096))
+          } catch {
+            // Retain the existing fallback; loading rejects malformed base64.
+          }
+          const root = text
+            .replace(/^\xef\xbb\xbf/, '')
+            .trimStart()
+            .replace(/^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*/, '')
+          if (/^<svg(?=[\s/>])/.test(root)) mime = 'image/svg+xml'
         }
         urls.push(`data:${mime};base64,${item.b64_json}`)
       }

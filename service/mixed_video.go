@@ -841,22 +841,25 @@ func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCan
 		*execution = *request.Execution
 	}
 	meta := candidate.Binding.Plugin.Meta
+	execution.VideoModelConfig = nil
 	if kitdto.ChannelConfiguredTaskVideoPlugin(meta.Key) {
 		config, err := model.ResolveTaskVideoModelConfig(candidate.Channel.GetSetting(), candidate.UpstreamModel)
 		if err != nil {
 			return err
 		}
-		data, err := common.Marshal(config)
-		if err != nil {
-			return err
+		// Legacy source declarations have no capability configuration to freeze.
+		// Keep their original plugin contract instead of persisting an empty one.
+		if config.BillingMode != "" {
+			data, err := common.Marshal(config)
+			if err != nil {
+				return err
+			}
+			var frozen kitdto.TaskVideoModelConfig
+			if err := common.Unmarshal(data, &frozen); err != nil {
+				return err
+			}
+			execution.VideoModelConfig = &frozen
 		}
-		var frozen kitdto.TaskVideoModelConfig
-		if err := common.Unmarshal(data, &frozen); err != nil {
-			return err
-		}
-		execution.VideoModelConfig = &frozen
-	} else {
-		execution.VideoModelConfig = nil
 	}
 	execution.TaskPlugin = &model.TaskPluginSnapshot{Key: meta.Key, Name: meta.Name, Version: meta.Version, Author: &model.TaskPluginAuthorSnapshot{Name: meta.Author.Name, URL: meta.Author.URL}, APIVersion: meta.APIVersion, Generation: jsplugin.DefaultRegistry.Generation().Number}
 	request.Execution = execution

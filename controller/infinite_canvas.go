@@ -240,6 +240,7 @@ func CanvasInputContent(c *gin.Context) {
 // Callers must establish ownership before passing an object to this function.
 func serveAuthorizedImageObject(c *gin.Context, object model.ImageStorageObject) {
 	canvasResponseHeaders(c)
+	imageOutputSecurityHeaders(c, object.ContentType)
 	ctx := c.Request.Context()
 	store, err := service.GetImageObjectStorage(ctx, object)
 	if err != nil {
@@ -307,6 +308,7 @@ func serveAuthorizedImageTaskResult(c *gin.Context, task model.AsyncImageTask, i
 			return
 		}
 		c.Header("Content-Type", image.ContentType)
+		imageOutputSecurityHeaders(c, image.ContentType)
 		c.Header("Content-Length", strconv.Itoa(len(image.Data)))
 		if c.Request.Method == http.MethodHead {
 			c.Status(200)

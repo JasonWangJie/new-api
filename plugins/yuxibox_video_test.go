@@ -44,7 +44,7 @@ func TestYuxiboxVideoModelsDefaultsAndBilling(t *testing.T) {
 	plugin := loadYuxiboxVideoPlugin(t, nil)
 	assert.Empty(t, plugin.Meta.ChannelTypes)
 	assert.Equal(t, "https://yuxibox.xyz", plugin.Meta.BaseURL)
-	assert.Equal(t, "1.0.0", plugin.Meta.Version)
+	assert.Equal(t, "1.0.2", plugin.Meta.Version)
 	models := []struct {
 		name, resolution, quantity string
 		seconds                    int
@@ -230,7 +230,7 @@ func TestYuxiboxVideoRejectsInvalidInputs(t *testing.T) {
 		name, modelName string
 		fields          map[string]any
 	}{
-		{name: "unknown model", modelName: "seedance-unlisted"},
+		{name: "custom model requires explicit dimensions", modelName: "seedance-unlisted"},
 		{name: "blank prompt", fields: map[string]any{"prompt": " "}},
 		{name: "long prompt", fields: map[string]any{"prompt": strings.Repeat("字", 16001)}},
 		{name: "zero duration", fields: map[string]any{"seconds": 0}},

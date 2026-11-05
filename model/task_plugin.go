@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -181,8 +182,33 @@ func GetTaskPluginSyncSnapshot() (TaskPluginSyncSnapshot, error) {
 		return TaskPluginSyncSnapshot{}, err
 	}
 	videoModels := make(map[string]map[string]dto.TaskVideoModelConfig)
-	for _, key := range []string{"sudashui", "huahuo-video", "wolong"} {
-		catalog, err := taskVideoModelCatalog(channels, key)
+	// Resolve desired source declarations before publishing them, so a cold
+	// node can discover saved channels using override-only presets atomically.
+	sources := make(map[string]jsplugin.Meta)
+	currentOverrides := jsplugin.DefaultRegistry.OverridePlugins()
+	for _, plugin := range enabledPlugins {
+		if !dto.PresetTaskVideoPlugin(plugin.Key) {
+			continue
+		}
+		current := currentOverrides[plugin.Key]
+		if current != nil && current.Engine.SourceFingerprint() == plugin.SourceHash {
+			sources[plugin.Key] = jsplugin.PresetTaskVideoMeta(current)
+			continue
+		}
+		compiled, compileErr := jsplugin.CompilePlugin(plugin.Source, jsplugin.Options{Key: plugin.Key, Version: plugin.Version})
+		if compileErr == nil {
+			sources[plugin.Key] = jsplugin.PresetTaskVideoMeta(compiled)
+		} else if current != nil {
+			// Match the sync worker's incumbent retention on compilation failure.
+			sources[plugin.Key] = jsplugin.PresetTaskVideoMeta(current)
+		}
+	}
+	for _, key := range dto.ChannelConfiguredTaskVideoPlugins() {
+		var desired []jsplugin.Meta
+		if source, exists := sources[key]; exists {
+			desired = append(desired, source)
+		}
+		catalog, err := taskVideoModelCatalog(channels, key, desired...)
 		if err != nil {
 			return TaskPluginSyncSnapshot{}, err
 		}

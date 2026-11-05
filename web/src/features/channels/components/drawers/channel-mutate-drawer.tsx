@@ -198,6 +198,10 @@ import {
   assessBaseUrlTrust,
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
+import {
+  hasPresetTaskVideoModels,
+  isChannelConfiguredVideoPlugin,
+} from '../../lib/task-video-models'
 import { upstreamAsyncFromSettingsJSON } from '../../lib/upstream-async'
 import type { Channel, UpstreamAsyncConfig } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
@@ -552,12 +556,11 @@ export function ChannelMutateDrawer({
   const isSudashui =
     currentType === CHANNEL_TYPE_TASK_PLUGIN &&
     currentTaskPluginKey === 'sudashui'
-  const isHuahuoVideo =
+  const isConfiguredVideo =
     currentType === CHANNEL_TYPE_TASK_PLUGIN &&
-    currentTaskPluginKey === 'huahuo-video'
-  const isWolong =
-    currentType === CHANNEL_TYPE_TASK_PLUGIN &&
-    currentTaskPluginKey === 'wolong'
+    isChannelConfiguredVideoPlugin(currentTaskPluginKey)
+  const hasVideoPresets =
+    isConfiguredVideo && hasPresetTaskVideoModels(currentTaskPluginKey)
   const canFetchModels = MODEL_FETCHABLE_TYPES.has(currentType) || isSudashui
   const currentModelSourceURL = formValues.task_plugin_model_source_url
   const currentKey = formValues.key
@@ -774,8 +777,8 @@ export function ChannelMutateDrawer({
         return
       }
       const shouldResetTaskVideoModels =
-        form.getValues('task_plugin_key') === 'wolong' ||
-        (target.kind === 'plugin' && target.key === 'wolong')
+        isChannelConfiguredVideoPlugin(form.getValues('task_plugin_key')) ||
+        (target.kind === 'plugin' && isChannelConfiguredVideoPlugin(target.key))
       if (target.kind === 'plugin') {
         if (!canBindTaskPlugin) return
         const plugin = taskPluginOptionsQuery.data?.find(
@@ -3299,10 +3302,12 @@ export function ChannelMutateDrawer({
               </div>
             )}
 
-            {(isSudashui || isHuahuoVideo || isWolong) && (
+            {isConfiguredVideo && (
               <TaskVideoModelEditor
-                manualOnly={isHuahuoVideo || isWolong}
-                defaultModels={isWolong ? boundTaskPlugin?.models : undefined}
+                manualOnly={!isSudashui}
+                defaultModels={
+                  hasVideoPresets ? boundTaskPlugin?.models : undefined
+                }
                 sourceURL={currentModelSourceURL || ''}
                 onSourceURLChange={(value) =>
                   form.setValue('task_plugin_model_source_url', value, {
@@ -3320,7 +3325,9 @@ export function ChannelMutateDrawer({
                 modelMapping={currentModelMapping}
                 details={discovery.modelDetails}
                 previewReady={discovery.status === 'success'}
-                disabled={!canEditSensitive || (isWolong && !boundTaskPlugin)}
+                disabled={
+                  !canEditSensitive || (hasVideoPresets && !boundTaskPlugin)
+                }
               />
             )}
 

@@ -72,7 +72,7 @@ export const meta = {
   key: "nldw",
   name: "NLDW Video",
   icon: "text:NL",
-  version: "1.0.0",
+  version: "1.0.2",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.nldw.online",
   website: "https://api.nldw.online/video-api-docs",
@@ -103,8 +103,28 @@ export const meta = {
 };
 
 function modelConfig(model) {
-  if (!Object.hasOwn(MODELS, model)) throw new Error("Unsupported NLDW video model");
-  return MODELS[model];
+  // oxlint-disable no-control-regex -- Match the host's model identity rules
+  if (typeof model !== "string" || !model || model !== model.trim() || /[\x00-\x1f\x7f-\x9f,*]/.test(model)) throw new Error("Invalid NLDW video model");
+  // oxlint-enable no-control-regex
+  let modelBytes = 0;
+  for (const character of model) {
+    const codePoint = character.codePointAt(0);
+    modelBytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (modelBytes > 255) throw new Error("NLDW video model must not exceed 255 UTF-8 bytes");
+  }
+  if (Object.hasOwn(MODELS, model)) return MODELS[model];
+  // Channel capabilities own unknown-model support. These are the host safety
+  // ceilings, not vendor promises; custom references use public URLs only.
+  return {
+    custom: true,
+    min: 1,
+    max: 3600,
+    resolutions: RESOLUTION_SCHEMA.enum,
+    images: 64,
+    videos: 64,
+    audios: 64,
+    total: 64,
+  };
 }
 
 function aliasedValue(request, names) {
@@ -126,6 +146,7 @@ function videoSeconds(value, min, max) {
 
 function referenceSource(value, kind, model, config) {
   if (typeof value !== "string" || !value) throw new Error("Media references must be public HTTPS URLs or base64 data URLs");
+  if (config.custom && value.startsWith("data:")) throw new Error("Channel-configured NLDW models require public HTTPS media URLs");
   if (value.startsWith("data:")) {
     const separator = value.indexOf(",");
     const header = value.slice(0, separator);
@@ -184,15 +205,29 @@ function normalizeRequest(request, model) {
     if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by NLDW video");
   }
   if (typeof request.prompt !== "string" || !request.prompt.trim()) throw new Error("prompt is required");
-  if (request.mode !== undefined && request.mode !== "omni_reference") throw new Error("NLDW video supports omni_reference mode only");
+  if (
+    request.mode !== undefined &&
+    request.mode !== "omni_reference" &&
+    !(config.custom && ["text_to_video", "reference_to_video", "image_to_video"].includes(request.mode))
+  )
+    throw new Error("Unsupported NLDW video mode");
   const rawSeconds = aliasedValue(request, ["seconds", "duration"]);
+  if (config.custom && rawSeconds === undefined) throw new Error("seconds is required for a channel-configured NLDW model");
   const seconds = videoSeconds(rawSeconds === undefined ? config.min : rawSeconds, config.min, config.max);
   const rawResolution = aliasedValue(request, ["resolution", "size"]);
+  if (config.custom && rawResolution === undefined) throw new Error("resolution is required for a channel-configured NLDW model");
   const resolution = rawResolution === undefined ? config.defaultResolution : rawResolution;
-  if (!config.resolutions.includes(resolution)) throw new Error("Unsupported NLDW video resolution");
+  if (config.custom ? typeof resolution !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(resolution) : !config.resolutions.includes(resolution))
+    throw new Error("Unsupported NLDW video resolution");
   const rawRatio = aliasedValue(request, ["aspect_ratio", "ratio"]);
+  if (config.custom && rawRatio === undefined) throw new Error("aspect_ratio is required for a channel-configured NLDW model");
   const ratio = rawRatio === undefined ? "16:9" : rawRatio;
-  if (!ASPECT_RATIOS.includes(ratio) && !(ratio === "adaptive" && !config.text)) throw new Error("Unsupported NLDW video aspect ratio");
+  if (
+    config.custom
+      ? typeof ratio !== "string" || (!/^[1-9][0-9]{0,2}:[1-9][0-9]{0,2}$/.test(ratio) && !["auto", "adaptive"].includes(ratio))
+      : !ASPECT_RATIOS.includes(ratio) && !(ratio === "adaptive" && !config.text)
+  )
+    throw new Error("Unsupported NLDW video aspect ratio");
   const references = [];
   if (request.references !== undefined) {
     if (!Array.isArray(request.references) || request.references.length > config.total) throw new Error("references exceeds the NLDW media limit");
@@ -231,9 +266,14 @@ function normalizeRequest(request, model) {
     throw new Error("References exceed the NLDW media limits");
   if (model === "sd2.5" && !counts.image && !counts.video) throw new Error("SD2.5 requires at least one image or video reference");
   if (model === "sd2.5de" && !counts.image && !counts.audio) throw new Error("SD2.5DE requires at least one image or audio reference");
+  const action =
+    config.custom && image !== undefined && references.length === 1 ? "image_to_video" : references.length ? "reference_to_video" : "text_to_video";
+  if (config.custom && request.mode !== undefined && request.mode !== "omni_reference" && request.mode !== action)
+    throw new Error("mode conflicts with the supplied media");
   const body = { model, prompt: request.prompt.trim(), seconds, resolution, aspect_ratio: ratio, mode: "omni_reference" };
-  if (references.length) body.references = references;
-  return { body, action: references.length ? "reference_to_video" : "text_to_video" };
+  if (action === "image_to_video") body.image = references[0].source;
+  else if (references.length) body.references = references;
+  return { body, action };
 }
 
 function taskIdentity(value) {
@@ -324,6 +364,10 @@ function hasVideoResult(body) {
 export function buildSubmitRequest(ctx) {
   const prepared = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   const body = { ...prepared.body };
+  if (body.image) {
+    body.references = [{ type: "image", source: body.image }];
+    delete body.image;
+  }
   if (body.references) body.references = body.references.map((reference) => ({ kind: reference.type, data: reference.source }));
   return {
     method: "POST",
@@ -336,6 +380,8 @@ export function buildSubmitRequest(ctx) {
 export function extractUsage(ctx) {
   const model = ctx.upstreamModel || ctx.model;
   const prepared = normalizeRequest(ctx.requestBody, model).body;
+  if (!Object.hasOwn(MODELS, model))
+    return ctx.usagePurpose === "billing_ratios" ? null : { seconds: prepared.seconds, requests: 1, resolution: prepared.resolution.toLowerCase() };
   // The host uses legacy ratios only when there is no usage expression.
   // Per-video prices must never be multiplied by their requested duration.
   if (ctx.usagePurpose === "billing_ratios") return model === "sd2.5pp" ? null : { seconds: prepared.seconds };
@@ -381,6 +427,8 @@ export function parseTaskResult(ctx, body) {
 export function extractUsageOnComplete(ctx, result, body) {
   if (!body || body.status !== "completed" || result.status !== "SUCCESS") return {};
   if (videoAPIError(body.error)) throw new Error("NLDW returned a completed task with an error");
+  // Unknown models retain the host-selected submission usage and billing mode.
+  if (!Object.hasOwn(MODELS, ctx.upstreamModel || ctx.model)) return {};
   const seconds = completionSeconds(ctx, body);
   if ((ctx.upstreamModel || ctx.model) === "sd2.5pp") return { requests: 1 };
   return seconds === undefined ? {} : { seconds };
@@ -404,6 +452,10 @@ export const protocols = {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("NLDW video requires JSON with public HTTPS URLs or base64 data URLs");
       if (ctx.operation && ctx.operation !== "create") throw new Error("NLDW video supports generation only");
+      if (!ctx.upstreamModel) {
+        if (!ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+        return { kind: "submit", model: ctx.model, requestBody: ctx.body.value };
+      }
       const prepared = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model);
       prepared.body.model = ctx.model;
       return { kind: "submit", model: ctx.model, action: prepared.action, requestBody: prepared.body };

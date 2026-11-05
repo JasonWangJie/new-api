@@ -594,7 +594,9 @@ func executeTaskSubmissionWith(
 				if request.InitialRetryState == nil {
 					request.InitialRetryState = &mediaretry.State{}
 				}
-				request.PendingDecision = &mediaretry.Decision{Action: mediaretry.ManualReview, BlockedReason: "mixed_video_unknown_not_replayable"}
+				if request.PendingDecision == nil || !request.PendingDecision.Matched {
+					request.PendingDecision = &mediaretry.Decision{Action: mediaretry.ManualReview, BlockedReason: "mixed_video_unknown_not_replayable"}
+				}
 				c.Set("async_media_policy_unknown_ended", true)
 				result = &relay.TaskSubmitResult{Platform: constant.TaskPlatform(c.GetString("platform")), Quota: relayInfo.Billing.GetPreConsumedQuota(), Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message}}
 				taskErr = nil

@@ -40,8 +40,11 @@ func TestTianyueVideoRequestBillingAndReferences(t *testing.T) {
 		{name: "per call native fields", upstream: "L-sd2-video", request: map[string]any{"duration": 1, "video_duration": 6}, wantDuration: 1, wantAction: "text_to_video", wantUsage: map[string]any{"requests": float64(1), "resolution": "720p"}},
 		{name: "per call public duration", upstream: "L-sd2-video", request: map[string]any{"duration": 6, "input_reference": "https://cdn.example/image.png"}, wantDuration: 1, wantAction: "image_to_video", wantUsage: map[string]any{"requests": float64(1), "resolution": "720p"}},
 		// The -se name is a protocol fixture, not a claim that this model exists.
-		{name: "mapped per second model", upstream: "protocol-fixture-se", request: map[string]any{"seconds": 6, "image_urls": []any{"https://cdn.example/1.png", "https://cdn.example/2.png"}, "audio_urls": []any{"https://cdn.example/reference.mp3"}, "video_urls": []any{"https://cdn.example/reference.mp4"}}, wantDuration: 6, wantAction: "reference_to_video", wantUsage: map[string]any{"seconds": float64(6), "resolution": "720p"}},
-		{name: "per second native duration equals output seconds", upstream: "protocol-fixture-se", request: map[string]any{"duration": 6, "video_duration": 6}, wantDuration: 6, wantAction: "text_to_video", wantUsage: map[string]any{"seconds": float64(6), "resolution": "720p"}},
+		{name: "mapped per second model", upstream: "protocol-fixture-se", request: map[string]any{"seconds": 6, "image_urls": []any{"https://cdn.example/1.png", "https://cdn.example/2.png"}, "audio_urls": []any{"https://cdn.example/reference.mp3"}, "video_urls": []any{"https://cdn.example/reference.mp4"}}, wantDuration: 6, wantAction: "reference_to_video", wantUsage: map[string]any{"seconds": float64(6), "requests": float64(1), "resolution": "720p"}},
+		{name: "per second native duration equals output seconds", upstream: "protocol-fixture-se", request: map[string]any{"duration": 6, "video_duration": 6}, wantDuration: 6, wantAction: "text_to_video", wantUsage: map[string]any{"seconds": float64(6), "requests": float64(1), "resolution": "720p"}},
+		{name: "custom single reference preserves reference mode", upstream: "future-video", request: map[string]any{"seconds": 6, "reference_images": "https://cdn.example/image.png"}, wantDuration: 1, wantAction: "reference_to_video", wantUsage: map[string]any{"seconds": float64(6), "requests": float64(1), "resolution": "720p"}},
+		{name: "custom image input uses image mode", upstream: "future-video", request: map[string]any{"seconds": 6, "input_reference": "https://cdn.example/image.png"}, wantDuration: 1, wantAction: "image_to_video", wantUsage: map[string]any{"seconds": float64(6), "requests": float64(1), "resolution": "720p"}},
+		{name: "custom explicit reference mode keeps single image", upstream: "future-video", request: map[string]any{"seconds": 6, "mode": "reference_to_video", "input_reference": "https://cdn.example/image.png"}, wantDuration: 1, wantAction: "reference_to_video", wantUsage: map[string]any{"seconds": float64(6), "requests": float64(1), "resolution": "720p"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := map[string]any{"model": "public-alias", "prompt": " retain reference identity ", "resolution": "720p", "aspect_ratio": "9:16"}
@@ -73,10 +76,13 @@ func TestTianyueVideoRequestBillingAndReferences(t *testing.T) {
 			if tc.wantAction == "image_to_video" {
 				assert.Equal(t, []any{"https://cdn.example/image.png"}, body["image_urls"])
 			}
-			if tc.wantAction == "reference_to_video" {
+			if tc.wantAction == "reference_to_video" && request["image_urls"] != nil {
 				assert.Equal(t, request["image_urls"], body["image_urls"])
 				assert.Equal(t, request["audio_urls"], body["audio_urls"])
 				assert.Equal(t, request["video_urls"], body["video_urls"])
+			}
+			if tc.upstream == "future-video" {
+				assert.Equal(t, []any{"https://cdn.example/image.png"}, body["image_urls"])
 			}
 			value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
 			require.NoError(t, err)
@@ -88,11 +94,7 @@ func TestTianyueVideoRequestBillingAndReferences(t *testing.T) {
 			ctx["usagePurpose"] = "billing_ratios"
 			value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
 			require.NoError(t, err)
-			if tc.wantDuration == 1 {
-				assert.Nil(t, value, "a per-call price must not be multiplied by video seconds")
-			} else {
-				assert.EqualValues(t, 6, value.(map[string]any)["seconds"])
-			}
+			assert.Nil(t, value, "local custom billing must not be inferred from the upstream protocol suffix")
 		})
 	}
 }
@@ -129,7 +131,7 @@ func TestTianyueVideoRejectsUnsafeInputsBeforeSubmission(t *testing.T) {
 				request[key] = value
 			}
 			_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-				"model": "L-sd2-video", "operation": "create", "body": map[string]any{"kind": "json", "value": request},
+				"model": "L-sd2-video", "upstreamModel": "L-sd2-video", "operation": "create", "body": map[string]any{"kind": "json", "value": request},
 			})
 			require.Error(t, err)
 		})
@@ -176,8 +178,8 @@ func TestTianyueVideoLifecycleUsesPublicResultAndBoundedUsage(t *testing.T) {
 	}
 	value, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", ctx, map[string]any{"status": "SUCCESS"}, map[string]any{"status": "completed", "seconds": "6"})
 	require.NoError(t, err)
-	assert.EqualValues(t, 6, value.(map[string]any)["seconds"])
-	_, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", ctx, map[string]any{"status": "SUCCESS"}, map[string]any{"status": "completed", "seconds": "18446744073686646784"})
+	assert.Empty(t, value, "custom local usage stays frozen regardless of the upstream -se protocol")
+	_, err = plugin.Engine.Call(t.Context(), "parseTaskResult", ctx, map[string]any{"status": "completed", "seconds": "18446744073686646784", "url": "https://cdn.example/result.mp4"})
 	require.Error(t, err)
 
 	adaptor := taskplugin.New(plugin)

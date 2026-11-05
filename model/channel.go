@@ -463,7 +463,8 @@ func BatchInsertChannels(channels []Channel) error {
 				break
 			}
 		}
-		for _, chunk := range lo.Chunk(channels, 50) {
+		for i := 0; i < len(channels); i += 50 {
+			chunk := channels[i:min(i+50, len(channels))]
 			if err := tx.Create(&chunk).Error; err != nil {
 				return err
 			}

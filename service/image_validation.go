@@ -271,7 +271,7 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 	return downloadImage(ctx, raw, cfg, false)
 }
 
-// DownloadImageOutput tolerates mislabeled raster formats in upstream results.
+// DownloadImageOutput tolerates mislabeled supported formats in upstream results.
 // References remain strict; outputs still require complete image validation.
 func DownloadImageOutput(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
 	return downloadImage(ctx, raw, cfg, true)
@@ -328,13 +328,41 @@ func validateImageOutputBytes(data []byte, declared string, maxBytes, maxPixels 
 	mediaType, _, err := mime.ParseMediaType(declared)
 	if err == nil {
 		switch strings.ToLower(mediaType) {
-		case "image/png", "image/jpeg", "image/webp":
+		case "image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml":
 			// Provider/CDN labels may disagree with the actual raster format.
 			// Decode and validate the bytes, then store only their detected MIME.
 			declared = ""
 		}
 	}
-	return ValidateImageBytes(data, declared, maxBytes, maxPixels)
+	return validateStoredImageBytes(data, declared, maxBytes, maxPixels)
+}
+
+// Stored outputs include animated GIF and passive SVG; reference inputs retain
+// their narrower raster contract in ValidateImageBytes.
+func validateStoredImageBytes(data []byte, declared string, maxBytes, maxPixels int64) (ImageBytes, error) {
+	if len(data) == 0 || maxBytes <= 0 || int64(len(data)) > maxBytes {
+		return ImageBytes{}, newImageValidationError("empty image or image byte limit exceeded")
+	}
+	var output ImageBytes
+	var err error
+	switch {
+	case bytes.HasPrefix(data, []byte("GIF87a")), bytes.HasPrefix(data, []byte("GIF89a")):
+		output, err = validateGIFOutput(data, maxPixels)
+	case bytes.HasPrefix(bytes.TrimSpace(bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})), []byte("<")):
+		output, err = validateSVGOutput(data, maxPixels)
+	default:
+		return ValidateImageBytes(data, declared, maxBytes, maxPixels)
+	}
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	if declared != "" {
+		actual, _, err := mime.ParseMediaType(declared)
+		if err != nil || !strings.EqualFold(actual, output.ContentType) {
+			return ImageBytes{}, newImageValidationError("declared image MIME does not match its bytes")
+		}
+	}
+	return output, nil
 }
 
 func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dto.UpstreamAsyncProfile, baseURL, proxy string, values UpstreamAsyncTemplateContext, cfg ImageRuntimeConfig) ([]ImageBytes, error) {

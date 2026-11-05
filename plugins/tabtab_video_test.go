@@ -159,7 +159,7 @@ func TestTabtabVideoValidationBeforeSubmission(t *testing.T) {
 			for key, value := range tc.fields {
 				request[key] = value
 			}
-			ctx := map[string]any{"model": model, "operation": "create", "body": map[string]any{"kind": "json", "value": request}}
+			ctx := map[string]any{"model": model, "upstreamModel": model, "operation": "create", "body": map[string]any{"kind": "json", "value": request}}
 			_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
 			require.Error(t, err)
 			_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": model, "requestBody": request})
@@ -373,7 +373,7 @@ func TestTabtabVideoPublishedModelBoundaries(t *testing.T) {
 			for _, resolution := range append(tc.resolutions, "8k") {
 				t.Run("resolution_"+resolution, func(t *testing.T) {
 					value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-						"model": tc.model, "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "draw", "resolution": resolution}},
+						"model": tc.model, "upstreamModel": tc.model, "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "draw", "resolution": resolution}},
 					})
 					if resolution == "8k" {
 						require.Error(t, err)
@@ -413,7 +413,7 @@ func TestTabtabVideoReferenceMergingAndHostProfiles(t *testing.T) {
 				}
 				request[media.field] = urls
 			}
-			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": tc.model, "body": map[string]any{"kind": "json", "value": request}})
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": tc.model, "upstreamModel": tc.model, "body": map[string]any{"kind": "json", "value": request}})
 			require.NoError(t, err)
 			intent := value.(map[string]any)
 			assert.Equal(t, "reference_to_video", intent["action"])
@@ -421,7 +421,7 @@ func TestTabtabVideoReferenceMergingAndHostProfiles(t *testing.T) {
 			require.True(t, found)
 			require.NoError(t, service.ValidateVideoProfileRequest(profile, "reference_to_video", intent["requestBody"], nil))
 			request["image_urls"] = []any{"https://cdn.example/over-limit.png"}
-			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": tc.model, "body": map[string]any{"kind": "json", "value": request}})
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": tc.model, "upstreamModel": tc.model, "body": map[string]any{"kind": "json", "value": request}})
 			require.Error(t, err, "different aliases must count toward one aggregate limit")
 		})
 	}
@@ -443,7 +443,7 @@ func TestTabtabVideoReferenceMergingAndHostProfiles(t *testing.T) {
 			for name, value := range tc.fields {
 				request[name] = value
 			}
-			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "seedance-2.0", "body": map[string]any{"kind": "json", "value": request}})
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "seedance-2.0", "upstreamModel": "seedance-2.0", "body": map[string]any{"kind": "json", "value": request}})
 			if tc.invalid {
 				require.Error(t, err)
 				return
@@ -523,7 +523,7 @@ func TestTabtabVideoHostRejectsAmbiguousReceiptsAndUnsafeURLs(t *testing.T) {
 		assert.True(t, content.Credentialless)
 		assert.Empty(t, content.Headers)
 	}
-	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "seedance-2.0", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "draw", "image": "http://0x7f.0.0.1/image.png"}}})
+	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "seedance-2.0", "upstreamModel": "seedance-2.0", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "draw", "image": "http://0x7f.0.0.1/image.png"}}})
 	require.Error(t, err, "alternate private IP spellings must not bypass reference validation")
 	data := []byte(`{"code":"OK","data":{"id":"known","status":"failed","error_code":"AUTH_ERROR","error_message":"API key=other-secret password=other-password https://user:pass@secret.example/path"}}`)
 	result, err := adaptor.ParseTaskResult(&model.Task{TaskID: "public-id", PrivateData: model.TaskPrivateData{UpstreamTaskID: "known"}}, &http.Response{StatusCode: http.StatusOK}, data)

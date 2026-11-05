@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -5730,11 +5732,9 @@ func TestAsyncImageOutputMIMECompatibility(t *testing.T) {
 		maxBytes, maxPixels       int64
 	}{
 		{name: "HTML MIME", declared: "text/html", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
-		{name: "SVG MIME", declared: "image/svg+xml", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
 		{name: "generic binary MIME", declared: "application/octet-stream", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
 		{name: "malformed MIME", declared: "image/jpeg; bad", data: pngImage.Data, wantError: "declared image MIME does not match its bytes"},
-		{name: "HTML body", declared: "image/jpeg", data: []byte("<!doctype html><html>upstream error</html>"), wantError: "invalid image header"},
-		{name: "SVG body", declared: "image/png", data: []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/>`), wantError: "invalid image header"},
+		{name: "HTML body", declared: "image/jpeg", data: []byte("<!doctype html><html>upstream error</html>")},
 		{name: "truncated PNG", declared: "image/jpeg", data: pngImage.Data[:len(pngImage.Data)-1], wantError: "invalid image container"},
 		{name: "corrupt PNG CRC", declared: "image/jpeg", data: badCRC, wantError: "image could not be fully decoded"},
 		{name: "excessive trailing data", declared: "image/jpeg", data: append(bytes.Clone(pngImage.Data), bytes.Repeat([]byte{0x5a}, maxNormalizedImageTrailingBytes+1)...), wantError: "invalid image container"},
@@ -5768,6 +5768,329 @@ func TestAsyncImageOutputMIMECompatibility(t *testing.T) {
 			if tc.wantError != "" {
 				assert.ErrorContains(t, err, tc.wantError)
 			}
+		})
+	}
+}
+
+func asyncImageGIFFixture(t *testing.T, frames int) []byte {
+	t.Helper()
+	animation := &gif.GIF{LoopCount: 0}
+	for i := range frames {
+		frame := image.NewPaletted(image.Rect(0, 0, 3, 2), color.Palette{color.Black, color.White})
+		frame.SetColorIndex(0, 0, uint8(i%2))
+		animation.Image = append(animation.Image, frame)
+		animation.Delay = append(animation.Delay, 5+i)
+		animation.Disposal = append(animation.Disposal, gif.DisposalBackground)
+	}
+	var encoded bytes.Buffer
+	require.NoError(t, gif.EncodeAll(&encoded, animation))
+	return encoded.Bytes()
+}
+
+func TestAsyncImageGIFAndSVGOutputs(t *testing.T) {
+	gifData := asyncImageGIFFixture(t, 2)
+	svgData := []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3 2"><defs><linearGradient id="g"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><path fill="url(#g)" d="M0 0H3V2H0Z"/></svg>`)
+	cfg := DefaultImageRuntimeConfig()
+	cfg.DownloadMaxPixels = 100
+	for _, tc := range []struct {
+		name, mime, extension string
+		data                  []byte
+	}{
+		{"GIF", "image/gif", ".gif", gifData},
+		{"SVG", "image/svg+xml", ".svg", svgData},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// OpenAI base64 envelopes and CDNs may incorrectly label results PNG.
+			for _, declared := range []string{tc.mime, "image/png", strings.ToUpper(tc.mime) + "; charset=utf-8"} {
+				output, err := DownloadImageOutput(t.Context(), "data:"+declared+";base64,"+base64.StdEncoding.EncodeToString(tc.data), cfg)
+				require.NoError(t, err)
+				assert.Equal(t, tc.mime, output.ContentType)
+				assert.Equal(t, 3, output.Width)
+				assert.Equal(t, 2, output.Height)
+				assert.Equal(t, tc.data, output.Data)
+				assert.Equal(t, tc.extension, filepath.Ext(ImageResultObjectKey(model.AsyncImageTask{}, 0, output.ContentType)))
+				rechecked, err := validateStoredImageBytes(output.Data, output.ContentType, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+				require.NoError(t, err)
+				assert.Equal(t, output, rechecked, "staging and archive validation must preserve bytes and checksum")
+				response := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {declared}}, Body: io.NopCloser(bytes.NewReader(tc.data)), ContentLength: int64(len(tc.data))}
+				downloaded, err := readUpstreamAsyncImageResponse(response, cfg)
+				require.NoError(t, err)
+				assert.Equal(t, output, downloaded)
+			}
+			_, err := DownloadImageReference(t.Context(), "data:"+tc.mime+";base64,"+base64.StdEncoding.EncodeToString(tc.data), cfg)
+			require.Error(t, err, "reference input format policy stays unchanged")
+			_, err = validateStoredImageBytes(tc.data, "image/jpeg", cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+			require.ErrorContains(t, err, "MIME")
+			_, err = validateImageOutputBytes(tc.data, tc.mime, int64(len(tc.data)-1), 100)
+			require.Error(t, err)
+		})
+	}
+	output, err := validateImageOutputBytes(append(bytes.Clone(gifData), []byte("tail")...), "image/gif", 1<<20, 100)
+	require.NoError(t, err)
+	assert.Equal(t, gifData, output.Data)
+	animation, err := gif.DecodeAll(bytes.NewReader(output.Data))
+	require.NoError(t, err)
+	require.Len(t, animation.Image, 2)
+	assert.Equal(t, []int{5, 6}, animation.Delay)
+	assert.Equal(t, []byte{gif.DisposalBackground, gif.DisposalBackground}, animation.Disposal)
+	assert.Equal(t, 0, animation.LoopCount)
+	assert.Equal(t, uint8(1), animation.Image[1].ColorIndexAt(0, 0))
+	corrupt := bytes.Clone(gifData)
+	// A valid descriptor with invalid LZW data must not be accepted by preflight.
+	frameStart := bytes.LastIndex(corrupt, []byte{0x2c, 0, 0, 0, 0, 3, 0, 2, 0})
+	require.GreaterOrEqual(t, frameStart, 0)
+	lzwOffset := frameStart + 10
+	if packed := corrupt[frameStart+9]; packed&0x80 != 0 {
+		lzwOffset += 3 * (1 << ((packed & 7) + 1))
+	}
+	corrupt[lzwOffset] = 0xff
+	for _, tc := range []struct {
+		name   string
+		data   []byte
+		pixels int64
+	}{
+		{"truncated second frame", gifData[:len(gifData)-5], 100},
+		{"invalid LZW", corrupt, 100},
+		{"aggregate animation pixels", gifData, 11},
+		{"canvas pixels", gifData, 5},
+		{"frame count", asyncImageGIFFixture(t, 513), 100000},
+		{"trailing payload", append(bytes.Clone(gifData), bytes.Repeat([]byte{'x'}, maxNormalizedImageTrailingBytes+1)...), 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateImageOutputBytes(tc.data, "image/gif", 1<<20, tc.pixels)
+			require.Error(t, err)
+			assert.True(t, IsImageValidationError(err))
+		})
+	}
+}
+
+func TestAsyncImageGIFAndSVGUploadAndArchive(t *testing.T) {
+	for _, tc := range []struct {
+		name, mime string
+		data       []byte
+	}{
+		{"GIF", "image/gif", asyncImageGIFFixture(t, 2)},
+		{"SVG", "image/svg+xml", []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><rect width="3" height="2" fill="red"/></svg>`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			require.NoError(t, model.MigrateImageModels(db))
+			_, err := SaveImageStorageProfile(t.Context(), model.ImageStorageProfile{Class: "durable", Backend: "local", Root: t.TempDir(), Active: true}, nil)
+			require.NoError(t, err)
+			output, err := validateImageOutputBytes(tc.data, tc.mime, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+			require.NoError(t, err)
+			task.Status, task.ImageCount = model.ImageTaskUploading, 1
+			require.NoError(t, db.Save(&task).Error)
+			require.NoError(t, db.Create(&model.AsyncImageStagingObject{TaskId: task.TaskId, ImageIndex: 0, Data: output.Data, ContentType: output.ContentType, Checksum: output.Checksum, Width: output.Width, Height: output.Height}).Error)
+			require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.Equal(t, model.ImageTaskBillingPending, task.Status)
+			assert.Equal(t, 1, task.ResultCount)
+			// The archive contract starts from a successfully settled task.
+			task.Status, task.BillingStatus = model.ImageTaskSucceeded, "succeeded"
+			require.NoError(t, db.Save(&task).Error)
+			item, reused, err := ArchiveAsyncImageResult(t.Context(), task.UserId, task.TaskId, 0, "result", cfg)
+			require.NoError(t, err)
+			assert.False(t, reused)
+			again, reused, err := ArchiveAsyncImageResult(t.Context(), task.UserId, task.TaskId, 0, "result", cfg)
+			require.NoError(t, err)
+			assert.True(t, reused)
+			assert.Equal(t, item.AssetId, again.AssetId)
+			var object model.ImageStorageObject
+			require.NoError(t, db.Where("object_id = ?", item.ObjectId).Take(&object).Error)
+			assert.Equal(t, tc.mime, object.ContentType)
+			assert.Equal(t, output.Checksum, object.Checksum)
+			assert.True(t, strings.HasSuffix(object.ObjectKey, "."+strings.ToLower(tc.name)))
+			store, err := GetImageObjectStorage(t.Context(), object)
+			require.NoError(t, err)
+			stored, err := store.Read(t.Context(), object.ObjectKey, cfg.LibraryImageBytes)
+			require.NoError(t, err)
+			assert.Equal(t, tc.data, stored)
+		})
+	}
+}
+
+func TestAsyncImageGIFFrameCompatibility(t *testing.T) {
+	t.Run("GIF87a static raster", func(t *testing.T) {
+		var encoded bytes.Buffer
+		palette := color.Palette{color.Black, color.White}
+		require.NoError(t, gif.Encode(&encoded, image.NewPaletted(image.Rect(0, 0, 3, 2), palette), nil))
+		data := bytes.Clone(encoded.Bytes())
+		copy(data[:6], "GIF87a")
+		output, err := validateImageOutputBytes(data, "IMAGE/GIF; charset=binary", 1<<20, 6)
+		require.NoError(t, err)
+		assert.Equal(t, data, output.Data)
+		assert.Equal(t, "image/gif", output.ContentType)
+		assert.Equal(t, 3, output.Width)
+		assert.Equal(t, 2, output.Height)
+	})
+	t.Run("transparent partial frame retains disposal and loop", func(t *testing.T) {
+		palette := color.Palette{color.RGBA{}, color.RGBA{R: 255, A: 255}}
+		first := image.NewPaletted(image.Rect(0, 0, 4, 3), palette)
+		first.SetColorIndex(0, 0, 1)
+		second := image.NewPaletted(image.Rect(1, 1, 3, 2), palette)
+		second.SetColorIndex(2, 1, 1)
+		var encoded bytes.Buffer
+		require.NoError(t, gif.EncodeAll(&encoded, &gif.GIF{
+			Image: []*image.Paletted{first, second}, Delay: []int{7, 12}, LoopCount: 3,
+			Disposal: []byte{gif.DisposalNone, gif.DisposalPrevious},
+			Config:   image.Config{ColorModel: palette, Width: 4, Height: 3},
+		}))
+		output, err := validateImageOutputBytes(encoded.Bytes(), "image/png", 1<<20, 24)
+		require.NoError(t, err)
+		assert.Equal(t, encoded.Bytes(), output.Data)
+		decoded, err := gif.DecodeAll(bytes.NewReader(output.Data))
+		require.NoError(t, err)
+		require.Len(t, decoded.Image, 2)
+		assert.Equal(t, image.Rect(1, 1, 3, 2), decoded.Image[1].Bounds())
+		_, _, _, alpha := decoded.Image[1].At(1, 1).RGBA()
+		assert.Zero(t, alpha)
+		assert.Equal(t, []int{7, 12}, decoded.Delay)
+		assert.Equal(t, []byte{gif.DisposalNone, gif.DisposalPrevious}, decoded.Disposal)
+		assert.Equal(t, 3, decoded.LoopCount)
+		corrupt := bytes.Clone(encoded.Bytes())
+		frame := bytes.LastIndex(corrupt, []byte{0x2c, 1, 0, 1, 0, 2, 0, 1, 0})
+		require.GreaterOrEqual(t, frame, 0)
+		corrupt[frame+1] = 3 // Second frame now extends beyond the canvas.
+		_, err = validateImageOutputBytes(corrupt, "image/gif", 1<<20, 24)
+		require.ErrorContains(t, err, "frame bounds")
+	})
+	t.Run("maximum frame count and exact aggregate budget", func(t *testing.T) {
+		data := asyncImageGIFFixture(t, 512)
+		output, err := validateImageOutputBytes(data, "image/gif", 1<<20, 512*6)
+		require.NoError(t, err)
+		assert.Equal(t, data, output.Data)
+		_, err = validateImageOutputBytes(data, "image/gif", 1<<20, 512*6-1)
+		require.ErrorContains(t, err, "pixel limit")
+	})
+}
+
+func TestAsyncImageSVGRejectsActiveAndMalformedContent(t *testing.T) {
+	for _, body := range []string{
+		`<script>alert(1)</script>`,
+		`<rect onload="alert(1)"/>`,
+		`<foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject>`,
+		`<use href="https://example.com/a.svg#x"/>`,
+		`<use href="data:image/svg+xml,x"/>`,
+		`<use href="javascript:alert(1)"/>`,
+		`<rect fill="url(https://example.com/a.svg#x)"/>`,
+		`<rect style="fill:u\72l(https://example.com/x)"/>`,
+		`<style>@import 'https://example.com/x';</style>`,
+		`<style>rect { fill: url(//example.com/x); }</style>`,
+		`<animate attributeName="href" values="javascript:alert(1)"/>`,
+		`<set attributeName="onload" to="alert(1)"/>`,
+		`<g xmlns="http://www.w3.org/1999/xhtml"><script/></g>`,
+		`<use xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://example.com/x"/>`,
+		`<g xml:base="https://example.com/"><use href="#x"/></g>`,
+		`<rect fill="url(&#104;ttps://example.com/x)"/>`,
+		`<rect style="fill:u/**/rl(https://example.com/x)"/>`,
+		`<use id="recursive" href="#recursive"/>`,
+		`<defs><g id="a"><use href="#b"/></g><g id="b"><use href="#a"/></g></defs>`,
+		`<use href="#missing"/>`,
+		strings.Repeat(`<g>`, 64) + strings.Repeat(`</g>`, 64),
+		`<g>`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			_, err := validateImageOutputBytes([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2">`+body+`</svg>`), "image/svg+xml", 1<<20, 100)
+			require.Error(t, err)
+			assert.True(t, IsImageValidationError(err))
+		})
+	}
+	for _, data := range []string{
+		`<!DOCTYPE svg [<!ENTITY x "text">]><svg xmlns="http://www.w3.org/2000/svg" width="3" height="2">&x;</svg>`,
+		`<?xml-stylesheet href="https://example.com/x"?><svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="NaN" height="2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="1e30" height="2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0 2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"/><svg/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="3" width="4" height="2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="3em" height="2em"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="0x1p0" height="2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="1_0"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 0x1p0 2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3 1_0"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0,,0,3,2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0,0,3,2,"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox=",0,0,3,2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0, ,0,3,2"/>`,
+		`<svg xmlns="http://www.w3.org/2000/svg"/>`,
+	} {
+		_, err := validateImageOutputBytes([]byte(data), "image/svg+xml", 1<<20, 100)
+		require.Error(t, err, data)
+	}
+	t.Run("repeated references cannot expand exponentially", func(t *testing.T) {
+		var document strings.Builder
+		document.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><defs><g id="s0"><rect width="1" height="1"/></g>`)
+		for i := range 16 {
+			fmt.Fprintf(&document, `<g id="s%d"><use href="#s%d"/><use href="#s%d"/></g>`, i+1, i, i)
+		}
+		document.WriteString(`</defs><use href="#s16"/></svg>`)
+		_, err := validateImageOutputBytes([]byte(document.String()), "image/svg+xml", 1<<20, 100)
+		require.Error(t, err)
+		assert.True(t, IsImageValidationError(err))
+	})
+}
+
+func TestAsyncImageSVGStaticOutputs(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		document      string
+		width, height int
+	}{
+		{
+			name:     "BOM and XML declaration",
+			document: "\xef\xbb\xbf" + `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><text x="1" y="1">房子 &amp; house</text></svg>`,
+			width:    3, height: 2,
+		},
+		{
+			name:     "stylesheet gradient and local reuse",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 3 2"><style><![CDATA[.paint { fill: url('#gradient'); stroke: rgb(0, 0, 0); } text { font-family: 'Noto Sans', sans-serif; font-size: 1px; }]]></style><defs><linearGradient id="gradient"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient><path id="shape" d="M0 0L3 2"/></defs><use xlink:href="#shape" class="paint"/><text x="1" y="1" style="fill: #f00; opacity: 0.8">SVG</text></svg>`,
+			width:    3, height: 2,
+		},
+		{
+			name:     "viewBox with responsive dimensions",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0,0,3,2"/>`,
+			width:    3, height: 2,
+		},
+		{
+			name:     "viewBox mixed separators and decimal exponents",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" viewBox=" 0 , 0 3e0, .2e1 "/>`,
+			width:    3, height: 2,
+		},
+		{
+			name:     "single explicit dimension preserves aspect ratio",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" width="6" viewBox="0 0 3 2"/>`,
+			width:    6, height: 4,
+		},
+		{
+			name:     "physical units round up to pixels",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="1pt"/>`,
+			width:    96, height: 2,
+		},
+		{
+			name:     "prefixed SVG namespace",
+			document: `<s:svg xmlns:s="http://www.w3.org/2000/svg" width="3.5px" height="2.1px"><s:rect width="3" height="2"/></s:svg>`,
+			width:    4, height: 3,
+		},
+		{
+			name:     "accessibility text is not CSS",
+			document: `<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2" role="img" aria-label="Logo (draft): A &lt; B" aria-labelledby="title" aria-describedby="description"><title id="title">Logo</title><desc id="description">Draft</desc><rect class="shape draft:version" width="3" height="2"/></svg>`,
+			width:    3, height: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(tc.document)
+			output, err := validateImageOutputBytes(data, "image/svg+xml", 1<<20, 1000)
+			require.NoError(t, err)
+			assert.Equal(t, "image/svg+xml", output.ContentType)
+			assert.Equal(t, tc.width, output.Width)
+			assert.Equal(t, tc.height, output.Height)
+			assert.Equal(t, data, output.Data, "stored SVG bytes remain stable for archival checksums")
+			again, err := validateStoredImageBytes(output.Data, output.ContentType, 1<<20, 1000)
+			require.NoError(t, err)
+			assert.Equal(t, output.Checksum, again.Checksum)
+			_, err = validateImageOutputBytes(data, "image/svg+xml", 1<<20, int64(tc.width*tc.height-1))
+			require.ErrorContains(t, err, "pixel limit")
 		})
 	}
 }

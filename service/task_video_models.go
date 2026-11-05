@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
@@ -24,12 +25,12 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 		intent map[string]any
 	}
 	decoded := make(map[string]decodedVideo)
-	for _, key := range []string{"sudashui", "huahuo-video", "wolong"} {
+	for _, key := range kitdto.ChannelConfiguredTaskVideoPlugins() {
 		plugin, found := jsplugin.DefaultRegistry.Get(key)
-		if !found {
+		if !found || !slices.ContainsFunc(plugin.Meta.Protocols, func(claim jsplugin.ProtocolClaim) bool { return claim.Name == "openai_video" }) {
 			continue
 		}
-		if key == "wolong" {
+		if kitdto.PresetTaskVideoPlugin(key) {
 			decoded[key] = decodedVideo{plugin: plugin}
 			continue
 		}
@@ -44,7 +45,7 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 		if !ok {
 			return false
 		}
-		if settings.TaskPluginKey == "wolong" {
+		if kitdto.PresetTaskVideoPlugin(settings.TaskPluginKey) {
 			candidateRequest := request
 			candidateRequest.UpstreamModel = upstream
 			result, err := body.plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, candidateRequest.JSValue())
@@ -57,6 +58,11 @@ func ConfiguredTaskVideoFilter(c *gin.Context) dto.ChannelFilter {
 		config, err := model.ResolveTaskVideoModelConfig(settings, upstream)
 		if err != nil {
 			return false
+		}
+		if config.PresetModel != "" && config.BillingMode == "" {
+			// Older source-declared models retain their decoder's original
+			// contract without inventing a video capability or billing unit.
+			return true
 		}
 		selected := jsplugin.WithTaskVideoModels(body.plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})
 		profile, exists := selected.Meta.VideoProfileForModel(upstream)

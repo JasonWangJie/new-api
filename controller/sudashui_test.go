@@ -51,6 +51,111 @@ func sudashuiFixture(t *testing.T) (*jsplugin.LoadedPlugin, dto.TaskVideoModelCo
 	return plugin, config
 }
 
+func TestLegacySourceVideoModelBindings(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.TaskPlugin{}, &model.Option{}))
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+	source, err := plugins.Source("drama")
+	require.NoError(t, err)
+	legacySource := strings.Replace(source, `videoProfiles: Object.keys(MODELS).map((model) => videoProfile(model, MODELS[model])),`, `videoProfiles: [],`, 1)
+	require.NotEqual(t, source, legacySource)
+	legacy, err := jsplugin.DefaultRegistry.Register(legacySource, jsplugin.Options{Key: "drama"})
+	require.NoError(t, err)
+	stored := model.TaskPlugin{Key: "drama", APIVersion: 1, Version: legacy.Meta.Version, Source: legacySource, SourceHash: legacy.Engine.SourceFingerprint(), Enabled: true}
+	require.NoError(t, model.SaveTaskPlugin(&stored))
+	const publicModel, upstream, customModel = "legacy-public", "seedance2.5-A", "future-custom"
+	mapping := `{"legacy-public":"seedance2.5-A"}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Key: "fixture", Name: "legacy source", Group: "default", Models: publicModel, Status: common.ChannelStatusEnabled, ModelMapping: &mapping}
+	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "drama"})
+	require.NoError(t, channel.ValidateSettings())
+	require.NoError(t, channel.Insert())
+	channel.Name = "updated legacy source"
+	require.NoError(t, channel.Update())
+	var persisted model.Channel
+	require.NoError(t, db.First(&persisted, channel.Id).Error)
+	_, marker, err := persisted.TaskVideoModelConfig(publicModel)
+	require.NoError(t, err)
+	assert.Equal(t, dto.TaskVideoModelConfig{PresetModel: upstream}, marker)
+	assert.Empty(t, persisted.GetSetting().TaskPluginModelConfigs)
+	_, err = model.ResolveTaskVideoModelConfig(persisted.GetSetting(), customModel)
+	require.ErrorContains(t, err, "requires a saved capability")
+	config := dto.TaskVideoModelConfig{Duration: dto.TaskVideoDuration{Values: []int{5}, Default: 5}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, References: dto.TaskVideoReferences{Images: common.GetPointer(0), Videos: common.GetPointer(0), Audios: common.GetPointer(0)}, BillingMode: "per_second"}
+	invalid := persisted.GetSetting()
+	invalid.TaskPluginModelConfigs = map[string]dto.TaskVideoModelConfig{upstream: config}
+	_, err = model.ResolveTaskVideoModelConfig(invalid, upstream)
+	require.ErrorContains(t, err, "source-declared legacy capabilities")
+	persisted.Models += "," + customModel
+	persisted.SetSetting(dto.ChannelSettings{TaskPluginKey: "drama", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{customModel: config}})
+	require.NoError(t, persisted.Update())
+
+	// Discover the saved override on a cold node before any source is active.
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	snapshot, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, marker, snapshot.VideoModels["drama"][publicModel])
+	assert.Empty(t, jsplugin.DefaultRegistry.OverridePlugins())
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels([]*jsplugin.LoadedPlugin{legacy}, snapshot.VideoModels))
+	active, found := jsplugin.DefaultRegistry.Get("drama")
+	require.True(t, found)
+	selected, err := service.ChannelTaskVideoPlugin(active, &persisted, publicModel)
+	require.NoError(t, err)
+	_, profiled := selected.Meta.VideoProfileForModel(publicModel)
+	assert.False(t, profiled, "source legacy declarations must not acquire invented capabilities")
+	expectedUsage, expectedExamples := legacy.Meta.UsageForModel(upstream)
+	actualUsage, actualExamples := selected.Meta.UsageForModel(publicModel)
+	assert.Equal(t, expectedUsage, actualUsage)
+	assert.Equal(t, expectedExamples, actualExamples)
+	assert.False(t, jsplugin.IsCustomTaskVideoModel(selected, publicModel))
+	assert.True(t, jsplugin.IsCustomTaskVideoModel(active, customModel))
+
+	for _, name := range []string{publicModel, customModel} {
+		body := map[string]any{"model": name, "prompt": "Animate the scene", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"}
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/videos", nil)
+		c.Set(jsplugin.ContextKeyProtocolRequest, jsplugin.ProtocolRequestContext{Model: name, Protocol: "openai_video", Operation: "create", RouteRequestContext: jsplugin.RouteRequestContext{Body: map[string]any{"kind": "json", "value": body}}})
+		matches, _ := model.ChannelSatisfiesFilters(&persisted, name, []gatewaydto.ChannelFilter{service.ConfiguredTaskVideoFilter(c)})
+		require.True(t, matches, name)
+		if name == customModel {
+			body["seconds"] = 6
+			matches, _ = model.ChannelSatisfiesFilters(&persisted, name, []gatewaydto.ChannelFilter{service.ConfiguredTaskVideoFilter(c)})
+			assert.False(t, matches, "dynamic models retain their saved capability limits")
+			continue
+		}
+		c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Plugin: selected, Generation: jsplugin.DefaultRegistry.Generation()})
+		c.Set("task_video_model_config", marker)
+		execution := service.TaskExecutionSnapshotFromContext(c)
+		require.NotNil(t, execution)
+		assert.Nil(t, execution.VideoModelConfig)
+		raw, err := common.Marshal(body)
+		require.NoError(t, err)
+		_, err = service.DecodeMixedVideoCandidate(t.Context(), persisted, name, "create", raw, service.VideoModelOverrides{}, user.Id, "application/json")
+		require.ErrorContains(t, err, "aspect ratio is fixed", "legacy compatibility must not expand mixed capabilities")
+		binding, found := jsplugin.DefaultRegistry.Generation().LookupEndpoint("POST", "/v1/videos", name)
+		require.True(t, found, "retain the source's existing video protocol")
+		// Re-freezing an already accepted legacy source binding must not
+		// manufacture an empty capability object in its execution snapshot.
+		candidate := service.MixedVideoCandidate{Channel: persisted, Binding: binding, UpstreamModel: upstream}
+		frozen := service.AsyncVideoRequest{Body: raw, ContentType: "application/json", Execution: execution}
+		require.NoError(t, service.RebindMixedVideoRequest(&frozen, candidate, common.GetTimestamp()+600))
+		assert.Nil(t, frozen.Execution.VideoModelConfig)
+		_, err = service.FrozenTaskVideoBinding(&frozen.Channel, publicModel)
+		require.NoError(t, err)
+	}
+
+	// A source without an OpenAI Video claim must not gain one through an alias.
+	nativeSource := strings.Replace(legacySource, `protocols: ["openai_video"],`, `protocols: [], routes: [{method:"GET",path:"/drama/v1/tasks/:task_id",type:"query",render:"legacyTask"}],`, 1)
+	nativeSource += "\nmeta.videoRetryInputs = [];\ndelete protocols.openai_video;\nexport const native = {legacyTask() {return {};}};"
+	require.NotEqual(t, legacySource, nativeSource)
+	native, err := jsplugin.CompilePlugin(nativeSource, jsplugin.Options{Key: "drama"})
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels([]*jsplugin.LoadedPlugin{native}, snapshot.VideoModels))
+	_, found = jsplugin.DefaultRegistry.Generation().LookupEndpoint("POST", "/v1/videos", publicModel)
+	assert.False(t, found)
+}
+
 func TestWolongDynamicVideoModelBindings(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
@@ -161,6 +266,114 @@ func TestWolongDynamicVideoModelBindings(t *testing.T) {
 	assert.Empty(t, jsplugin.DefaultRegistry.Generation().LookupEndpointCandidates("POST", "/v1/videos", publicModel))
 	_, err = service.FrozenTaskVideoBinding(&frozen.Channel, publicModel)
 	require.NoError(t, err)
+}
+
+func TestDramaSharedAliasRoutesWithPresetOptions(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	db := setupVideoRetryTestDatabase(t, user, token)
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.TaskPlugin{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+	previousRegistry := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+	source, err := plugins.Source("drama")
+	require.NoError(t, err)
+	factory, err := jsplugin.DefaultRegistry.RegisterFactory(source, jsplugin.Options{Key: "drama"})
+	require.NoError(t, err)
+	const publicModel = "shared-drama-preset"
+	for i, upstream := range []string{"seedance2.5-F", "seedance2.5-G"} {
+		mapping, err := common.Marshal(map[string]string{publicModel: upstream})
+		require.NoError(t, err)
+		channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: upstream, Key: "fixture-key", Status: common.ChannelStatusEnabled, Models: publicModel, Group: "default", ModelMapping: common.GetPointer(string(mapping)), Priority: common.GetPointer(int64(10 - i))}
+		channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "drama"})
+		require.NoError(t, channel.ValidateTaskVideoModelBindings())
+		require.NoError(t, db.Create(&channel).Error)
+		require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Group: "default", Model: publicModel, Enabled: true}).Error)
+	}
+	snapshot, err := model.GetTaskPluginSyncSnapshot()
+	require.NoError(t, err)
+	require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverridesWithVideoModels(nil, snapshot.VideoModels))
+	policy := model.ImageGroupPolicy{Group: "default", Platform: "drama", PolicyKey: service.ImageIdentityHash("default", "drama"), Enabled: true, AsyncEnabled: true, PoolMode: "model", Models: "[]"}
+	require.NoError(t, db.Create(&policy).Error)
+	requestTest := t
+	engine := gin.New()
+	engine.POST("/v1/videos/generations_async", func(c *gin.Context) {
+		c.Set("id", user.Id)
+		c.Set("token_id", token.Id)
+		common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+		common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+		common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
+		c.Next()
+	}, PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, func(c *gin.Context) {
+		t := requestTest
+		pin, found, _ := service.GetChannelConstraints(c).ResolvedPin()
+		require.True(t, found)
+		var channel model.Channel
+		require.NoError(t, db.First(&channel, pin.ChannelId).Error)
+		upstream, _, err := channel.TaskVideoModelConfig(publicModel)
+		require.NoError(t, err)
+		pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
+		profile, found := pinned.Plugin.Meta.VideoProfileForModel(upstream)
+		require.True(t, found)
+		expected, found := factory.Meta.VideoProfileForModel(upstream)
+		require.True(t, found)
+		assert.Equal(t, expected, profile, "routing must pin the complete selected provider profile")
+		require.Nil(t, middleware.SetupContextForSelectedChannel(c, &channel, publicModel))
+		pinned = c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
+		info := &relaycommon.RelayInfo{OriginModelName: publicModel, TaskRelayInfo: &relaycommon.TaskRelayInfo{PublicTaskID: "preset-option-request"}, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: upstream, ChannelBaseUrl: "https://upstream.example", ApiKey: "fixture-key"}}
+		adaptor := taskplugin.New(pinned.Plugin)
+		adaptor.Init(info)
+		require.Nil(t, adaptor.ValidateRequestAndSetAction(c, info))
+		usage, err := adaptor.ExtractUsageFactsValidated(c, info)
+		require.NoError(t, err)
+		assert.Contains(t, usage, "tokens", "known F/G billing facts must survive shared-alias discovery")
+		c.JSON(http.StatusOK, gin.H{"upstream": upstream, "body": c.MustGet("task_request"), "usage": usage})
+	})
+	for _, tc := range []struct {
+		name, upstream string
+		fields         map[string]any
+		override       bool
+	}{
+		{name: "shared option retains preferred F", upstream: "seedance2.5-F"},
+		{name: "G option selects capable lower priority channel", upstream: "seedance2.5-G", fields: map[string]any{"watermark": true}},
+		{name: "policy narrowing preserves shared option", upstream: "seedance2.5-F", override: true},
+		{name: "policy narrowing preserves G option", upstream: "seedance2.5-G", fields: map[string]any{"watermark": true}, override: true},
+		{name: "policy duration still enforced", fields: map[string]any{"seconds": 6}, override: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requestTest = t
+			capability := service.ImageModelCapability{Id: publicModel, MediaType: "video"}
+			if tc.override {
+				capability.VideoOverrides = service.VideoModelOverrides{Modes: []string{"text_to_video"}, Duration: &service.VideoDurationOverrides{Values: []int{5}, Default: common.GetPointer(5)}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}}
+			}
+			catalog, err := common.Marshal([]service.ImageModelCapability{capability})
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&policy).Update("models", string(catalog)).Error)
+			body := map[string]any{"provider": "drama", "model": publicModel, "prompt": "cinematic waves", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9", "generate_audio": true}
+			maps.Copy(body, tc.fields)
+			raw, err := common.Marshal(body)
+			require.NoError(t, err)
+			request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", bytes.NewReader(raw))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if tc.upstream == "" {
+				require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), "outside the enabled capability")
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			var result struct {
+				Upstream string         `json:"upstream"`
+				Body     map[string]any `json:"body"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, tc.upstream, result.Upstream)
+			assert.Equal(t, true, result.Body["generate_audio"])
+			if tc.fields["watermark"] == true {
+				assert.Equal(t, true, result.Body["watermark"])
+			}
+		})
+	}
 }
 
 func TestHuahuoDynamicVideoModelBindings(t *testing.T) {

@@ -201,13 +201,13 @@ func DecodeVideoExecution(ctx context.Context, request AsyncVideoRequest, channe
 }
 
 // ConditionalVideoRetryCandidates preserves rule order and intersects it with
-// the existing error policy. No policy can replay an unknown upstream result.
+// the existing error policy. Unknown results require an explicit matching rule.
 func ConditionalVideoRetryCandidates(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest, policy model.ImageGroupPolicy, catalog []ImageModelCapability) ([]model.Channel, bool, error) {
 	snapshot, decision := request.ConditionalRouting, request.PendingDecision
 	if snapshot == nil || decision == nil || request.RetryFact == nil {
 		return nil, false, errors.New("conditional retry context is unavailable")
 	}
-	if request.RetryFact.Unknown || request.RetryFact.HasOutput || request.RetryFact.Accepted && !request.RetryFact.Terminal {
+	if request.RetryFact.HasOutput || decision.BlockedReason != "" || !decision.Matched && (request.RetryFact.Unknown || request.RetryFact.Accepted && !request.RetryFact.Terminal) {
 		return nil, false, errors.New("unknown conditional video execution cannot be resubmitted")
 	}
 	other := decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel

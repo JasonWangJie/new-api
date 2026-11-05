@@ -44,6 +44,7 @@ const MODELS = {
 };
 const REQUEST_FIELDS = new Set([
   "model",
+  "mode",
   "prompt",
   "seconds",
   "duration",
@@ -93,7 +94,7 @@ export const meta = {
   key: "yuxibox",
   name: "Yuxibox Video",
   icon: "text:YX",
-  version: "1.0.0",
+  version: "1.0.2",
   author: { name: "new-api contributors" },
   baseUrl: "https://yuxibox.xyz",
   website: "https://yuxibox.xyz/docs",
@@ -200,6 +201,9 @@ function aliasedValue(request, names) {
 function videoSize(value, config) {
   if (value === undefined) return {};
   if (typeof value !== "string") throw new Error("size must be a resolution or pixel dimensions");
+  // Custom specifications are opaque upstream values; do not infer dimensions
+  // or remap their resolution using a known model's pixel table.
+  if (config.custom) return { resolution: value };
   const size = value.toLowerCase();
   if (RESOLUTION_SCHEMA.enum.includes(size)) return { resolution: size };
   if (config.count && !["1280x720", "720x1280", "720x720"].includes(size)) throw new Error("Unsupported Yuxibox count video size");
@@ -222,11 +226,27 @@ function videoSize(value, config) {
   return { resolution, ratio };
 }
 
+function modelConfig(model) {
+  // oxlint-disable no-control-regex -- Match the host's model identity rules
+  if (typeof model !== "string" || !model || model !== model.trim() || /[\x00-\x1f\x7f-\x9f,*]/.test(model)) throw new Error("Invalid Yuxibox video model");
+  // oxlint-enable no-control-regex
+  let modelBytes = 0;
+  for (const character of model) {
+    const codePoint = character.codePointAt(0);
+    modelBytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (modelBytes > 255) throw new Error("Yuxibox video model must not exceed 255 UTF-8 bytes");
+  }
+  if (Object.hasOwn(MODELS, model)) return MODELS[model];
+  // Saved channel capabilities provide model limits within this host envelope.
+  return { custom: true, min: 1, max: 3600, resolutions: RESOLUTION_SCHEMA.enum, images: 64, videos: 64, audios: 64, total: 64, frames: true };
+}
+
 function normalizeRequest(request, model) {
-  if (!Object.hasOwn(MODELS, model)) throw new Error("Unsupported Yuxibox video model");
-  const config = MODELS[model];
+  const config = modelConfig(model);
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("JSON object required");
   for (const name of Object.keys(request)) if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by Yuxibox video");
+  if (request.mode !== undefined && (!config.custom || !["text_to_video", "reference_to_video", "image_to_video", "first_last_frame"].includes(request.mode)))
+    throw new Error("Unsupported Yuxibox video mode");
   if (typeof request.prompt !== "string" || !request.prompt.trim()) throw new Error("prompt is required");
   if (Array.from(request.prompt).length > (config.h3 ? 20000 : 16000)) throw new Error("prompt exceeds the Yuxibox video length limit");
   let seconds;
@@ -239,15 +259,30 @@ function normalizeRequest(request, model) {
     if (seconds !== undefined && seconds !== value) throw new Error("seconds and duration must match");
     seconds = value;
   }
-  if (seconds === undefined) seconds = config.defaultSeconds;
+  if (seconds === undefined) {
+    if (config.custom) throw new Error("seconds is required for a channel-configured Yuxibox model");
+    seconds = config.defaultSeconds;
+  }
   const size = videoSize(request.size, config);
-  let resolution = request.resolution === undefined ? size.resolution : typeof request.resolution === "string" ? request.resolution.toLowerCase() : "";
+  let resolution =
+    request.resolution === undefined
+      ? size.resolution
+      : typeof request.resolution === "string"
+        ? config.custom
+          ? request.resolution
+          : request.resolution.toLowerCase()
+        : "";
   if (config.h3 && resolution === "720p") resolution = "768p";
   const sizeResolution = config.h3 && size.resolution === "720p" ? "768p" : size.resolution;
   if (request.resolution !== undefined && sizeResolution && resolution !== sizeResolution) throw new Error("resolution and size must match");
-  if (resolution === undefined) resolution = config.h3 ? "768p" : "720p";
-  if (!config.resolutions.includes(resolution)) throw new Error("Unsupported Yuxibox video resolution");
+  if (resolution === undefined) {
+    if (config.custom) throw new Error("resolution is required for a channel-configured Yuxibox model");
+    resolution = config.h3 ? "768p" : "720p";
+  }
+  if (config.custom ? typeof resolution !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(resolution) : !config.resolutions.includes(resolution))
+    throw new Error("Unsupported Yuxibox video resolution");
   const rawRatio = aliasedValue(request, ["aspect_ratio", "ratio", "aspectRatio"]);
+  if (config.custom && rawRatio === undefined && !size.ratio) throw new Error("aspect_ratio is required for a channel-configured Yuxibox model");
   const ratio = rawRatio === undefined ? size.ratio || (config.h3 ? "9:16" : "16:9") : rawRatio;
   if (size.ratio && ratio !== size.ratio) throw new Error("size and aspect_ratio must match");
   const ratios = config.h3
@@ -257,7 +292,12 @@ function normalizeRequest(request, model) {
     : config.seconds
       ? G_RATIOS.filter((value) => value !== "adaptive")
       : G_RATIOS;
-  if (!ratios.includes(ratio)) throw new Error("Unsupported Yuxibox video aspect ratio");
+  if (
+    config.custom
+      ? typeof ratio !== "string" || (!/^[1-9][0-9]{0,2}:[1-9][0-9]{0,2}$/.test(ratio) && !["auto", "adaptive"].includes(ratio))
+      : !ratios.includes(ratio)
+  )
+    throw new Error("Unsupported Yuxibox video aspect ratio");
   const body = { model, prompt: request.prompt.trim(), seconds, resolution, aspect_ratio: ratio };
   for (const [target, names, limit] of [
     ["reference_images", ["reference_images", "images", "image_urls"], config.images],
@@ -279,6 +319,7 @@ function normalizeRequest(request, model) {
   }
   const image = aliasedValue(request, ["image", "input_reference", "first_frame", "start_frame"]);
   const lastFrame = aliasedValue(request, ["last_frame", "end_frame"]);
+  let pinnedFirst = request.first_frame !== undefined || request.start_frame !== undefined;
   if (!config.frames && (request.first_frame !== undefined || request.start_frame !== undefined || lastFrame !== undefined))
     throw new Error("This Yuxibox model does not support first and last frames");
   if (image !== undefined) {
@@ -300,6 +341,7 @@ function normalizeRequest(request, model) {
       if (kind === "image" && ["first_frame", "last_frame"].includes(role)) {
         if (!config.frames) throw new Error("This Yuxibox model does not support first and last frames");
         const field = role === "first_frame" ? "image" : "last_frame";
+        if (role === "first_frame") pinnedFirst = true;
         if (body[field] !== undefined && body[field] !== source) throw new Error("Conflicting Yuxibox frame references");
         body[field] = source;
       } else {
@@ -310,6 +352,16 @@ function normalizeRequest(request, model) {
       }
     }
   }
+  if (
+    config.custom &&
+    body.image &&
+    !body.last_frame &&
+    !pinnedFirst &&
+    ((body.reference_images || []).length || (body.reference_videos || []).length || (body.reference_audios || []).length)
+  ) {
+    body.reference_images = [body.image, ...(body.reference_images || [])];
+    delete body.image;
+  }
   const imageCount = (body.reference_images || []).length,
     videoCount = (body.reference_videos || []).length,
     audioCount = (body.reference_audios || []).length;
@@ -317,7 +369,8 @@ function normalizeRequest(request, model) {
   if (imageCount > config.images || videoCount > config.videos || audioCount > config.audios || (config.total && total > config.total))
     throw new Error("References exceed the Yuxibox media limits");
   if (config.requiresImage && !imageCount) throw new Error("This Yuxibox H3 model requires at least one reference image");
-  if (Boolean(body.image) !== Boolean(body.last_frame)) throw new Error("Yuxibox first and last frames must be provided together");
+  if (Boolean(body.image) !== Boolean(body.last_frame) && !(config.custom && body.image && !pinnedFirst))
+    throw new Error("Yuxibox first and last frames must be provided together");
   if (body.image && total) throw new Error("First and last frames cannot be combined with ordinary references");
   if (config.h3) {
     if (["generate_audio", "enable_audio", "watermark", "prompt_extend"].some((name) => Object.hasOwn(request, name)))
@@ -341,7 +394,9 @@ function normalizeRequest(request, model) {
     }
   }
   for (const name of ["reference_images", "reference_videos", "reference_audios"]) if (body[name] && !body[name].length) delete body[name];
-  return { body, action: body.image ? "first_last_frame" : total ? "reference_to_video" : "text_to_video" };
+  const action = body.last_frame ? "first_last_frame" : body.image ? "image_to_video" : total ? "reference_to_video" : "text_to_video";
+  if (request.mode !== undefined && request.mode !== action) throw new Error("mode conflicts with the supplied media");
+  return { body, action };
 }
 
 function taskIdentity(value) {
@@ -368,8 +423,11 @@ export function buildSubmitRequest(ctx) {
   const prepared = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   const request = prepared.body;
   const body = { model: request.model, prompt: request.prompt, seconds: request.seconds, ratio: request.aspect_ratio };
-  if (!MODELS[request.model].count) body.resolution = request.resolution;
-  if (request.image) body.first_frame = request.image;
+  if (!modelConfig(request.model).count) body.resolution = request.resolution;
+  if (request.image) {
+    if (prepared.action === "image_to_video") body.reference_images = [request.image];
+    else body.first_frame = request.image;
+  }
   if (request.last_frame) body.last_frame = request.last_frame;
   for (const [source, target] of [
     ["reference_images", "reference_images"],
@@ -392,7 +450,8 @@ export function extractUsage(ctx) {
   if (ctx.usagePurpose === "billing_ratios") return null;
   const model = ctx.upstreamModel || ctx.model;
   const request = normalizeRequest(ctx.requestBody, model).body;
-  const config = MODELS[model];
+  const config = modelConfig(model);
+  if (config.custom) return { seconds: request.seconds, requests: 1, resolution: request.resolution.toLowerCase() };
   if (config.count) return { video_count: 1 };
   if (!config.h3) return config.seconds ? { seconds: request.seconds, resolution: request.resolution } : { video_count: 1, resolution: request.resolution };
   // These facts are frozen in the host's admission billing snapshot. Completion
@@ -475,6 +534,10 @@ export const protocols = {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("Yuxibox video requires JSON with public HTTPS media URLs");
       if (ctx.operation && ctx.operation !== "create") throw new Error("Yuxibox video supports generation only");
+      if (!ctx.upstreamModel) {
+        if (!ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+        return { kind: "submit", model: ctx.model, requestBody: ctx.body.value };
+      }
       const prepared = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model);
       prepared.body.model = ctx.model;
       return { kind: "submit", model: ctx.model, action: prepared.action, requestBody: prepared.body };

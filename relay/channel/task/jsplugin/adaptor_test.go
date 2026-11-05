@@ -1719,6 +1719,75 @@ export function parseBatchResult(){return [];}
 	assert.Equal(t, false, captured["hasRequestBody"])
 }
 
+func TestTaskAdaptorPreservesDeclaredLegacyVideoModels(t *testing.T) {
+	const source = `
+export const meta={apiVersion:1,key:"drama",name:"Legacy video",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",body:ctx.requestBody,action:"text_to_video"};}
+export function parseSubmitResponse(){return {taskId:"task"};}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+export function extractUsage(ctx){return {seconds:ctx.requestBody.seconds,requests:1,resolution:ctx.requestBody.resolution};}
+`
+	config := dto.TaskVideoModelConfig{
+		Duration: dto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"},
+		Modes: []string{"text_to_video"}, BillingMode: "per_request",
+		References: dto.TaskVideoReferences{Images: common.GetPointer(0), Videos: common.GetPointer(0), Audios: common.GetPointer(0)},
+	}
+	for _, tc := range []struct {
+		name, key, upstream, wantError string
+		seconds                        int
+		configured                     bool
+	}{
+		{name: "declared legacy model", key: "drama", upstream: "declared-model", seconds: 5},
+		{name: "unambiguous declared model case", key: "drama", upstream: "DECLARED-MODEL", seconds: 5},
+		{name: "legacy duration safety bound", key: "drama", upstream: "declared-model", seconds: relaycommon.MaxTaskDurationSeconds + 1, wantError: "plugin_usage_invalid"},
+		{name: "undeclared model requires configuration", key: "drama", upstream: "future-model", seconds: 5, wantError: "plugin_request_invalid"},
+		{name: "configured model", key: "drama", upstream: "future-model", seconds: 5, configured: true},
+		{name: "configured model respects duration", key: "drama", upstream: "future-model", seconds: 6, configured: true, wantError: "plugin_request_invalid"},
+		{name: "declared model with profile remains strict", key: "drama", upstream: "declared-model", seconds: 6, configured: true, wantError: "plugin_request_invalid"},
+		{name: "Wolong still requires profile", key: "wolong", upstream: "declared-model", seconds: 5, wantError: "plugin_request_invalid"},
+		{name: "configured-only provider still requires profile", key: "sudashui", upstream: "declared-model", seconds: 5, wantError: "plugin_request_invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin, err := pluginruntime.NewRegistry().Register(strings.Replace(source, `key:"drama"`, `key:"`+tc.key+`"`, 1), pluginruntime.Options{})
+			require.NoError(t, err)
+			if tc.configured {
+				plugin = pluginruntime.WithTaskVideoModels(plugin, map[string]dto.TaskVideoModelConfig{tc.upstream: config})
+				assert.Equal(t, tc.upstream == "declared-model", pluginruntime.HasPresetTaskVideoModel(plugin, tc.upstream), "channel-added models must not become source presets")
+			}
+			info := &relaycommon.RelayInfo{
+				OriginModelName: "public-alias", TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "text_to_video"},
+				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: tc.upstream, ChannelBaseUrl: "https://provider.example"},
+			}
+			adaptor := New(plugin)
+			adaptor.Init(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			c.Set("task_request", map[string]any{"prompt": "p", "seconds": tc.seconds, "resolution": "720p", "aspect_ratio": "16:9"})
+			taskErr := adaptor.ValidateRequestAndSetAction(c, info)
+			if tc.wantError != "" {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, tc.wantError, taskErr.Code)
+				return
+			}
+			require.Nil(t, taskErr)
+			assert.Equal(t, "text_to_video", info.Action)
+			facts, err := adaptor.ExtractUsageFactsValidated(c, info)
+			require.NoError(t, err)
+			wantFacts := map[string]any{"requests": float64(1), "resolution": "720p"}
+			wantRatios := map[string]float64{"requests": 1}
+			if !tc.configured {
+				wantFacts["seconds"] = float64(tc.seconds)
+				wantRatios["seconds"] = float64(tc.seconds)
+			}
+			assert.Equal(t, wantFacts, facts)
+			ratios, err := adaptor.EstimateBillingValidated(c, info)
+			require.NoError(t, err)
+			assert.Equal(t, wantRatios, ratios)
+		})
+	}
+}
+
 func TestTaskAdaptorUsageProfilesFollowExecutionModel(t *testing.T) {
 	const source = `
 export const meta = {

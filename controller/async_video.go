@@ -339,13 +339,13 @@ func RouteAsyncVideo(c *gin.Context) {
 		if policy.Id != 0 && (!policy.Enabled || !policy.AsyncEnabled || !selected) {
 			continue
 		}
-		profile, profileErr := service.EffectiveVideoProfile(binding, pinned.Model, capability.VideoOverrides)
-		if profileErr != nil {
-			capabilityErr = profileErr
-			continue
-		}
-		if provider != "wolong" {
-			if profileErr = service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
+		if !kitdto.PresetTaskVideoPlugin(provider) {
+			profile, profileErr := service.EffectiveVideoProfile(binding, pinned.Model, capability.VideoOverrides)
+			if profileErr != nil {
+				capabilityErr = profileErr
+				continue
+			}
+			if profileErr := service.ValidateVideoProfileRequest(profile, videoAction, videoRequest, videoFiles); profileErr != nil {
 				capabilityErr = profileErr
 				continue
 			}
@@ -390,10 +390,22 @@ func RouteAsyncVideo(c *gin.Context) {
 				if matches, _ := model.ChannelSatisfiesFilters(&channel, pinned.Model, append(slices.Clone(constraints.Filters), filter)); !matches {
 					continue
 				}
+				selectedBinding := binding
+				selectedPlugin, err := service.ChannelTaskVideoPlugin(binding.Plugin, &channel, pinned.Model)
+				if err != nil {
+					capabilityErr = err
+					continue
+				}
+				selectedBinding.Plugin = selectedPlugin
 				candidatePools := pools
-				if provider == "wolong" {
+				if kitdto.PresetTaskVideoPlugin(provider) {
 					// A public alias can resolve to different model semantics and
 					// defaults. Apply policy limits after resolving this channel.
+					profile, err := service.EffectiveVideoProfile(selectedBinding, pinned.Model, capability.VideoOverrides)
+					if err != nil {
+						capabilityErr = err
+						continue
+					}
 					upstream, _, err := channel.TaskVideoModelConfig(pinned.Model)
 					if err != nil {
 						capabilityErr = err
@@ -435,13 +447,6 @@ func RouteAsyncVideo(c *gin.Context) {
 					service.ApplyMediaChannelPoolWeight(&channel, candidatePools[index].Priority)
 					weight = channel.GetWeight()
 				}
-				selectedBinding := binding
-				selectedPlugin, err := service.ChannelTaskVideoPlugin(binding.Plugin, &channel, pinned.Model)
-				if err != nil {
-					capabilityErr = err
-					continue
-				}
-				selectedBinding.Plugin = selectedPlugin
 				choices = append(choices, choice{channel: channel, group: group, binding: selectedBinding, weight: weight})
 			}
 		}
@@ -1087,6 +1092,7 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		}
 		retry.event = event
 		if !mediaretry.IsResubmission(decision.Action) || decision.BlockedReason != "" {
+			request.PendingDecision = &decision
 			unknownStop := decision.Matched && decision.Action == mediaretry.Stop && decision.BlockedReason == "" && request.RetryFact.Unknown && job.DispatchedAt > 0 && !c.GetBool("async_media_submission_refundable")
 			if c.GetBool("async_media_execution") && info.Billing != nil && (unknownStop || request.HasRetainedSubmissionAttempts()) && info.Billing.GetPreConsumedQuota() > 0 {
 				// End locally while carrying every earlier uncertain dispatch into
@@ -1114,7 +1120,16 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 		if retry.dispatched && request.RetryFact.Unknown && !slices.ContainsFunc(request.InitialUnknownAttempts, func(attempt model.VideoTaskAttempt) bool {
 			return attempt.Generation == int64(state.TotalUsed) && attempt.ChannelID == request.RetryFact.ChannelID
 		}) {
-			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID, Decision: &decision, Generation: int64(state.TotalUsed), Status: model.TaskStatusUnknown, Reason: request.RetryFact.Message, StartedAt: job.DispatchedAt, FinishedAt: time.Now().Unix(), RefundOnFailure: c.GetBool("async_media_submission_refundable")})
+			attempt := model.VideoTaskAttempt{ChannelID: request.RetryFact.ChannelID}
+			if value, exists := c.Get("async_media_current_attempt"); exists {
+				if current, ok := value.(*model.VideoTaskAttempt); ok && current != nil {
+					attempt = *current
+				}
+			}
+			attempt.Decision, attempt.Generation, attempt.Status = &decision, int64(state.TotalUsed), model.TaskStatusUnknown
+			attempt.Reason, attempt.StartedAt, attempt.FinishedAt = request.RetryFact.Message, job.DispatchedAt, time.Now().Unix()
+			attempt.RefundOnFailure = c.GetBool("async_media_submission_refundable")
+			request.InitialUnknownAttempts = append(request.InitialUnknownAttempts, attempt)
 		}
 		request.PendingDecision = &decision
 		if decision.DelaySeconds > 0 {
@@ -1251,16 +1266,13 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 }
 
 func (retry *asyncVideoSubmissionRetry) decision(ctx context.Context) (mediaretry.Decision, error) {
-	if retry.request.MixedRouting != nil && retry.request.RetryFact != nil && (retry.request.RetryFact.Unknown || retry.request.RetryFact.HasOutput || retry.request.RetryFact.Accepted && !retry.request.RetryFact.Terminal) {
-		return mediaretry.Decision{Action: mediaretry.ManualReview, BlockedReason: "mixed_video_unknown_not_replayable"}, nil
-	}
 	policy, err := service.GetMediaRetryPolicy(ctx)
 	if err != nil {
 		return mediaretry.Decision{}, err
 	}
 	state := *retry.request.InitialRetryState
 	state.Now = time.Now().Unix()
-	return service.PlanInitialVideoFailure(policy, *retry.request.RetryFact, state)
+	return service.PlanInitialVideoFailure(policy, *retry.request.RetryFact, state, retry.request.MixedRouting != nil)
 }
 
 func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycommon.RelayInfo) error {

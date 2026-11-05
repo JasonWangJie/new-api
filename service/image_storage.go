@@ -495,6 +495,10 @@ func ImageResultObjectKey(task model.AsyncImageTask, index int, contentType stri
 		extension = ".jpg"
 	} else if contentType == "image/webp" {
 		extension = ".webp"
+	} else if contentType == "image/gif" {
+		extension = ".gif"
+	} else if contentType == "image/svg+xml" {
+		extension = ".svg"
 	}
 	date := time.Unix(task.CreatedAt, 0).UTC()
 	return fmt.Sprintf("results/%s/%s_%s%s", date.Format("2006/01/02"), date.Format("20060102150405"), ImageIdentityHash(task.TaskId, strconv.Itoa(index))[:32], extension)

@@ -607,6 +607,16 @@ func GetImageObjectContent(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "private, no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
+	imageOutputSecurityHeaders(c, object.ContentType)
 	c.Header("Content-Type", object.ContentType)
 	c.File(filename)
+}
+
+// Direct navigation must keep SVG in a passive, isolated document as well as
+// enforcing the output validator's restrictions before storage.
+func imageOutputSecurityHeaders(c *gin.Context, contentType string) {
+	if contentType == "image/svg+xml" {
+		c.Header("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		c.Header("X-Content-Type-Options", "nosniff")
+	}
 }

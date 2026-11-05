@@ -96,7 +96,16 @@ test('Sudashui channel form persists independent catalog and capability settings
   ).not.toHaveProperty('task_plugin_model_configs')
 })
 
-test.each(['huahuo-video', 'wolong'])(
+test.each([
+  'huahuo-video',
+  'wolong',
+  'drama',
+  'yali',
+  'tabtab',
+  'nldw',
+  'yuxibox',
+  'tianyue',
+])(
   '%s stores manually configured models and never saves a catalog URL',
   (pluginKey) => {
     const config = {
@@ -289,90 +298,99 @@ test('opening channel creation allows selecting a plugin with no registered mode
   expect(screen.getByLabelText('Name *')).toHaveValue('Huahuo Image')
 })
 
-test('Wolong adds a custom model while preserving preset choices and saves only manually initialized capabilities', async () => {
-  pluginOptions = [
-    ...plugins,
-    {
-      key: 'wolong',
-      name: 'Wolong Video',
-      baseUrl: 'https://wolongvideo.com',
-      models: ['haya-mo-seedance-25', 'czniu-seedance-20-stable'],
-    },
-  ]
-  const post = vi
-    .spyOn(api, 'post')
-    .mockResolvedValue({ data: { success: true } })
-  const user = userEvent.setup()
-  render(<ConfigurationHarness />)
-  await user.click(
-    await screen.findByRole('option', { name: 'Wolong Video Plugin wolong' })
-  )
-  fireEvent.change(screen.getByLabelText('API Key *'), {
-    target: { value: 'wl_test' },
-  })
-  const models = screen.getByRole('combobox', {
-    name: 'Select models or add custom ones',
-  })
-  await user.type(models, 'wolong-future,')
-  await user.keyboard('{Escape}')
-  expect(
-    screen.queryByRole('button', { name: 'Fetch from Upstream' })
-  ).not.toBeInTheDocument()
-  expect(screen.queryByLabelText('Model catalog URL')).not.toBeInTheDocument()
-  await user.click(
-    screen.getByRole('button', {
-      name: 'Initialize missing model capabilities',
+test.each(['wolong', 'drama', 'yali', 'tabtab', 'nldw', 'yuxibox', 'tianyue'])(
+  '%s adds a custom model while preserving preset choices and saves only manually initialized capabilities',
+  async (pluginKey) => {
+    pluginOptions = [
+      ...plugins,
+      {
+        key: pluginKey,
+        name: 'Wolong Video',
+        baseUrl: 'https://wolongvideo.com',
+        models: ['haya-mo-seedance-25', 'czniu-seedance-20-stable'],
+      },
+    ]
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    render(<ConfigurationHarness />)
+    await user.click(
+      await screen.findByRole('option', {
+        name: `Wolong Video Plugin ${pluginKey}`,
+      })
+    )
+    fireEvent.change(screen.getByLabelText('API Key *'), {
+      target: { value: 'wl_test' },
     })
-  )
-  expect(screen.getByDisplayValue('wolong-future')).toBeVisible()
-  expect(
-    screen.queryByDisplayValue('haya-mo-seedance-25')
-  ).not.toBeInTheDocument()
-  const config = {
-    ...taskVideoCatalogConfig(undefined, true),
-    duration: { values: [5] },
-    resolutions: ['720p'],
-    aspect_ratios: ['16:9'],
-    modes: ['text_to_video'],
-    references: {
-      images: 0,
-      videos: 0,
-      audios: 0,
-      image_upload: false,
-      image_data_uri: false,
-    },
-    billing_mode: 'per_request',
+    const models = screen.getByRole('combobox', {
+      name: 'Select models or add custom ones',
+    })
+    await user.type(models, 'wolong-future,')
+    await user.keyboard('{Escape}')
+    expect(
+      screen.queryByRole('button', { name: 'Fetch from Upstream' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Model catalog URL')).not.toBeInTheDocument()
+    await user.click(
+      screen.getByRole('button', {
+        name: 'Initialize missing model capabilities',
+      })
+    )
+    expect(screen.getByDisplayValue('wolong-future')).toBeVisible()
+    expect(
+      screen.queryByDisplayValue('haya-mo-seedance-25')
+    ).not.toBeInTheDocument()
+    const config = {
+      ...taskVideoCatalogConfig(undefined, true),
+      duration: { values: [5] },
+      resolutions: ['720p'],
+      aspect_ratios: ['16:9'],
+      modes: ['text_to_video'],
+      references: {
+        images: 0,
+        videos: 0,
+        audios: 0,
+        image_upload: false,
+        image_data_uri: false,
+      },
+      billing_mode: 'per_request',
+    }
+    fireEvent.change(
+      screen.getByDisplayValue(
+        JSON.stringify(taskVideoCatalogConfig(undefined, true))
+      ),
+      { target: { value: JSON.stringify(config) } }
+    )
+    await user.click(models)
+    await user.click(
+      screen.getByRole('option', { name: 'haya-mo-seedance-25' })
+    )
+    expect(
+      screen.getByRole('option', { name: 'haya-mo-seedance-25' })
+    ).toBeVisible()
+    await user.click(
+      screen.getByRole('option', { name: 'haya-mo-seedance-25' })
+    )
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+    await waitFor(() => expect(post).toHaveBeenCalledOnce())
+    const payload = post.mock.calls[0][1] as {
+      channel: { models: string; setting: string }
+    }
+    expect(payload.channel.models.split(',')).toEqual(
+      expect.arrayContaining([
+        'haya-mo-seedance-25',
+        'czniu-seedance-20-stable',
+        'wolong-future',
+      ])
+    )
+    expect(JSON.parse(payload.channel.setting)).toMatchObject({
+      task_plugin_key: pluginKey,
+      task_plugin_model_configs: { 'wolong-future': config },
+    })
   }
-  fireEvent.change(
-    screen.getByDisplayValue(
-      JSON.stringify(taskVideoCatalogConfig(undefined, true))
-    ),
-    { target: { value: JSON.stringify(config) } }
-  )
-  await user.click(models)
-  await user.click(screen.getByRole('option', { name: 'haya-mo-seedance-25' }))
-  expect(
-    screen.getByRole('option', { name: 'haya-mo-seedance-25' })
-  ).toBeVisible()
-  await user.click(screen.getByRole('option', { name: 'haya-mo-seedance-25' }))
-  await user.keyboard('{Escape}')
-  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
-  await waitFor(() => expect(post).toHaveBeenCalledOnce())
-  const payload = post.mock.calls[0][1] as {
-    channel: { models: string; setting: string }
-  }
-  expect(payload.channel.models.split(',')).toEqual(
-    expect.arrayContaining([
-      'haya-mo-seedance-25',
-      'czniu-seedance-20-stable',
-      'wolong-future',
-    ])
-  )
-  expect(JSON.parse(payload.channel.setting)).toMatchObject({
-    task_plugin_key: 'wolong',
-    task_plugin_model_configs: { 'wolong-future': config },
-  })
-})
+)
 
 test('switching away from Wolong clears its custom model capabilities from the next provider draft', async () => {
   pluginOptions = [

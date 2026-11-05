@@ -72,6 +72,7 @@ const MODELS = {
 };
 const REQUEST_FIELDS = new Set([
   "model",
+  "mode",
   "prompt",
   "seconds",
   "duration",
@@ -125,21 +126,21 @@ function videoProfile(model, config) {
 
 export const meta = {
   videoRetryInputs: [
-    {"path": "/image", "kind": "image"},
-    {"path": "/input_reference", "kind": "image"},
-    {"path": "/images/*", "kind": "image"},
-    {"path": "/reference_images/*", "kind": "image"},
-    {"path": "/image_urls/*", "kind": "image"},
-    {"path": "/start_frame", "kind": "image"},
-    {"path": "/end_frame", "kind": "image"},
-    {"path": "/last_frame", "kind": "image"},
-    {"path": "/reference_videos/*", "kind": "video"},
-    {"path": "/videos/*", "kind": "video"},
-    {"path": "/video_urls/*", "kind": "video"},
-    {"path": "/reference_audios/*", "kind": "audio"},
-    {"path": "/audios/*", "kind": "audio"},
-    {"path": "/audio_urls/*", "kind": "audio"},
-    {"path": "/references/*/source", "kind": "media"},
+    { path: "/image", kind: "image" },
+    { path: "/input_reference", kind: "image" },
+    { path: "/images/*", kind: "image" },
+    { path: "/reference_images/*", kind: "image" },
+    { path: "/image_urls/*", kind: "image" },
+    { path: "/start_frame", kind: "image" },
+    { path: "/end_frame", kind: "image" },
+    { path: "/last_frame", kind: "image" },
+    { path: "/reference_videos/*", kind: "video" },
+    { path: "/videos/*", kind: "video" },
+    { path: "/video_urls/*", kind: "video" },
+    { path: "/reference_audios/*", kind: "audio" },
+    { path: "/audios/*", kind: "audio" },
+    { path: "/audio_urls/*", kind: "audio" },
+    { path: "/references/*/source", kind: "media" },
   ],
   apiVersion: 1,
   key: "tabtab",
@@ -208,12 +209,24 @@ function publicMediaURL(value) {
 }
 
 function normalizeRequest(request, model) {
-  if (!Object.hasOwn(MODELS, model)) throw new Error("Unsupported TabTab video model");
-  const config = MODELS[model];
+  // oxlint-disable no-control-regex -- Match the host's model identity rules
+  if (typeof model !== "string" || !model || model !== model.trim() || /[\x00-\x1f\x7f-\x9f,*]/.test(model)) throw new Error("Invalid TabTab video model");
+  // oxlint-enable no-control-regex
+  let modelBytes = 0;
+  for (const character of model) {
+    const codePoint = character.codePointAt(0);
+    modelBytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (modelBytes > 255) throw new Error("TabTab video model must not exceed 255 UTF-8 bytes");
+  }
+  const builtIn = Object.hasOwn(MODELS, model);
+  // The host validates saved capabilities; these are only protocol safety bounds.
+  const config = builtIn ? MODELS[model] : { min: 1, max: 3600, images: 64, videos: 64, audios: 64, total: 64, frames: true, audioOnly: true };
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("JSON object required");
   for (const name of Object.keys(request)) {
     if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by TabTab video");
   }
+  if (request.mode !== undefined && !["text_to_video", "image_to_video", "reference_to_video", "first_last_frame"].includes(request.mode))
+    throw new Error("Unsupported TabTab video mode");
   if (!config.frames && (request.start_frame !== undefined || request.end_frame !== undefined || request.last_frame !== undefined))
     throw new Error("This TabTab model does not support first and last frames");
   if (typeof request.prompt !== "string" || !request.prompt.trim()) throw new Error("prompt is required");
@@ -227,7 +240,8 @@ function normalizeRequest(request, model) {
     throw new Error("seconds is outside this TabTab model's duration limits");
   const rawResolution = aliasedValue(request, ["resolution", "size"]);
   const resolution = rawResolution === undefined ? config.defaultResolution : typeof rawResolution === "string" ? rawResolution.toLowerCase() : "";
-  if (!config.resolutions.includes(resolution)) throw new Error("resolution is not supported by this TabTab model");
+  if (builtIn ? !config.resolutions.includes(resolution) : typeof resolution !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,31}$/.test(resolution))
+    throw new Error("resolution is not supported by this TabTab model");
   const images = [];
   const videos = [];
   const audios = [];
@@ -296,10 +310,13 @@ function normalizeRequest(request, model) {
   if (audios.length && !images.length && !videos.length && !config.audioOnly) throw new Error("Audio references require an image or video reference");
   if (image !== undefined) image = publicMediaURL(image);
   if (lastFrame !== undefined) lastFrame = publicMediaURL(lastFrame);
+  if (!builtIn && images.length + videos.length + audios.length + (image !== undefined ? 1 : 0) + (lastFrame !== undefined ? 1 : 0) > 64)
+    throw new Error("TabTab supports at most 64 media references");
   let ratio = aliasedValue(request, ["aspect_ratio", "ratio"]);
   const adaptive = model === "kling-4.0" || model === "wan3.0-video";
-  if (ratio === undefined) ratio = adaptive && (image !== undefined || images.length || videos.length || audios.length) ? "auto" : "16:9";
-  if (!config.ratios.includes(ratio)) throw new Error("aspect_ratio is not supported by this TabTab model");
+  if (ratio === undefined && builtIn) ratio = adaptive && (image !== undefined || images.length || videos.length || audios.length) ? "auto" : "16:9";
+  if (builtIn ? !config.ratios.includes(ratio) : typeof ratio !== "string" || !/^(?:[1-9][0-9]{0,2}:[1-9][0-9]{0,2}|auto|adaptive)$/.test(ratio))
+    throw new Error("aspect_ratio is not supported by this TabTab model");
   if (adaptive && image !== undefined && ratio !== "auto") throw new Error("This TabTab model's start_frame requires aspect_ratio=auto");
   const body = { model, prompt: request.prompt.trim(), seconds, resolution, aspect_ratio: ratio };
   if (image !== undefined) body.image = image;
@@ -311,6 +328,7 @@ function normalizeRequest(request, model) {
   if (lastFrame !== undefined) action = "first_last_frame";
   else if (image !== undefined && !images.length && !videos.length && !audios.length) action = "image_to_video";
   else if (image !== undefined || images.length || videos.length || audios.length) action = "reference_to_video";
+  if (request.mode !== undefined && request.mode !== action) throw new Error("mode conflicts with the supplied media");
   return { body, action };
 }
 
@@ -320,12 +338,12 @@ export function buildSubmitRequest(ctx) {
   const args = { prompt: request.prompt, duration: request.seconds, resolution: request.resolution, ratio: request.aspect_ratio };
   if (request.reference_images) args.images = request.reference_images;
   if (request.reference_videos) {
-    if (MODELS[model].singleVideo) args.video = request.reference_videos[0];
+    if (Object.hasOwn(MODELS, model) && MODELS[model].singleVideo) args.video = request.reference_videos[0];
     else args.videos = request.reference_videos;
   }
   if (request.reference_audios) args.audios = request.reference_audios;
   if (request.image) {
-    if (MODELS[model].frames) args.start_frame = request.image;
+    if (!Object.hasOwn(MODELS, model) || MODELS[model].frames) args.start_frame = request.image;
     else args.images = [request.image, ...(args.images || [])];
   }
   if (request.last_frame) args.end_frame = request.last_frame;
@@ -339,6 +357,10 @@ export function buildSubmitRequest(ctx) {
 
 export function extractUsage(ctx) {
   const body = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model).body;
+  if (!Object.hasOwn(MODELS, ctx.upstreamModel || ctx.model)) {
+    if (ctx.usagePurpose === "billing_ratios") return null;
+    return { seconds: body.seconds, requests: 1, resolution: body.resolution, reference_video: !!body.reference_videos };
+  }
   if (ctx.usagePurpose === "billing_ratios") return { seconds: body.seconds };
   return { seconds: body.seconds, resolution: body.resolution, reference_video: !!body.reference_videos };
 }
@@ -473,6 +495,10 @@ export const protocols = {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("TabTab video requires JSON with public media URLs");
       if (ctx.operation && ctx.operation !== "create") throw new Error("TabTab video supports generation only");
+      if (!ctx.upstreamModel) {
+        if (!ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+        return { kind: "submit", model: ctx.model, requestBody: ctx.body.value };
+      }
       const normalized = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model);
       normalized.body.model = ctx.model;
       return { kind: "submit", model: ctx.model, action: normalized.action, requestBody: normalized.body };

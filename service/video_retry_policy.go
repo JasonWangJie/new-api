@@ -61,11 +61,15 @@ func VideoJobRequiresReconciliation(job model.AsyncMediaJob) bool {
 
 // PlanInitialVideoFailure is shared by live submission and sample previews.
 // Only the captured legacy protocol evidence can grant its existing exception.
-func PlanInitialVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {
+func PlanInitialVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State, mixed ...bool) (mediaretry.Decision, error) {
 	decision, err := mediaretry.Evaluate(policy, fact, state)
 	decision = guardIdempotentVideoReplay(fact, decision)
 	if err != nil || decision.Matched {
 		return decision, err
+	}
+	if len(mixed) > 0 && mixed[0] && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) {
+		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "mixed_video_unknown_not_replayable"
+		return decision, nil
 	}
 	evidence := fact.VideoEvidence
 	if fact.MediaType != "video" || fact.Stage != "submit" || evidence == nil || !evidence.LegacySubmissionRejected || evidence.LegacySubmissionUsed || fact.HasOutput || fact.HasUpstreamTask {
@@ -85,6 +89,7 @@ func PlanInitialVideoFailure(policy mediaretry.Policy, fact mediaretry.Fact, sta
 // PreviewInitialVideoFailure retains the selected failure's evidence, while
 // incorporating a legacy replay already consumed by the current task.
 func PreviewInitialVideoFailure(ctx context.Context, taskID string, fact mediaretry.Fact, state mediaretry.State, policy mediaretry.Policy) (mediaretry.Decision, error) {
+	mixed := false
 	if fact.VideoEvidence != nil {
 		var job model.AsyncMediaJob
 		if err := model.DB.WithContext(ctx).Where("task_id = ?", taskID).Take(&job).Error; err != nil {
@@ -98,13 +103,14 @@ func PreviewInitialVideoFailure(ctx context.Context, taskID string, fact mediare
 		if err := common.Unmarshal(plain, &request); err != nil {
 			return mediaretry.Decision{}, err
 		}
+		mixed = request.MixedRouting != nil
 		if current := request.RetryFact; current != nil && current.VideoEvidence != nil && current.VideoEvidence.LegacySubmissionUsed {
 			evidence := *fact.VideoEvidence
 			evidence.LegacySubmissionUsed = true
 			fact.VideoEvidence = &evidence
 		}
 	}
-	return PlanInitialVideoFailure(policy, fact, state)
+	return PlanInitialVideoFailure(policy, fact, state, mixed)
 }
 
 // ResolveVideoRetryPolicy applies the token's current group restrictions to the
@@ -157,7 +163,7 @@ func VideoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 
 func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, request AsyncVideoRequest, upstreamModel string) ([]model.Channel, string, error) {
 	decision := request.PendingDecision
-	if decision == nil || request.RetryFact == nil || !mediaretry.IsResubmission(decision.Action) {
+	if decision == nil || request.RetryFact == nil || !mediaretry.IsResubmission(decision.Action) || decision.BlockedReason != "" {
 		return nil, "", errors.New("video recovery is missing an executable decision")
 	}
 	if job.Provider == constant.TaskPlatformHuahuoVideo || job.Provider == "wolong" || request.RetryFact.Provider == constant.TaskPlatformHuahuoVideo || request.RetryFact.Provider == "wolong" {
@@ -185,7 +191,7 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 	}
 	policy.Group = job.Group
 	if request.MixedRouting != nil {
-		if request.RetryFact.Unknown || request.RetryFact.HasOutput || !request.RetryFact.Terminal && request.RetryFact.Accepted {
+		if request.RetryFact.HasOutput || !decision.Matched && (request.RetryFact.Unknown || !request.RetryFact.Terminal && request.RetryFact.Accepted) {
 			return nil, "", errors.New("unknown mixed video execution cannot be resubmitted")
 		}
 		if request.ConditionalRouting != nil {
@@ -376,10 +382,6 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 		result.Reason = "initial_submission_session_not_replayable"
 		return result, nil
 	}
-	if task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) {
-		result.Reason = "upstream_result_unknown"
-		return result, nil
-	}
 	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
 		result.Reason = "historical_task_not_restarted"
 		return result, nil
@@ -494,10 +496,6 @@ func PreviewVideoRetryEligibility(ctx context.Context, taskID string, fact media
 // action. The captured protocol evidence remains unchanged in the retry record.
 func ApplyConfiguredVideoDecision(ctx context.Context, task model.Task, job model.AsyncMediaJob, fact mediaretry.Fact, decision *mediaretry.Decision, state mediaretry.State) (bool, error) {
 	*decision = guardIdempotentVideoReplay(fact, *decision)
-	if task.PrivateData.CurrentAttempt != nil && task.PrivateData.CurrentAttempt.MixedVideo && (fact.Unknown || fact.HasOutput || fact.Accepted && !fact.Terminal) && mediaretry.IsResubmission(decision.Action) {
-		decision.Action, decision.BlockedReason = mediaretry.ManualReview, "mixed_video_unknown_not_replayable"
-		return false, nil
-	}
 	if !decision.Matched || decision.BlockedReason != "" || fact.HasOutput || !fact.Unknown && !(fact.Accepted && !fact.Terminal) || !mediaretry.IsResubmission(decision.Action) && decision.Action != mediaretry.Stop {
 		return false, nil
 	}

@@ -51,7 +51,7 @@ func loadDramaVideoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 func decodeDramaVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, modelName, operation string, body map[string]any) (map[string]any, error) {
 	t.Helper()
 	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-		"model": modelName, "operation": operation, "body": map[string]any{"kind": "json", "value": body},
+		"model": modelName, "upstreamModel": modelName, "operation": operation, "body": map[string]any{"kind": "json", "value": body},
 	})
 	if err != nil {
 		return nil, err
@@ -61,6 +61,156 @@ func decodeDramaVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, modelN
 	var intent map[string]any
 	require.NoError(t, common.Unmarshal(encoded, &intent))
 	return intent, nil
+}
+
+func TestConfiguredDramaYaliTabtabVideoModels(t *testing.T) {
+	for _, key := range []string{"drama", "yali", "tabtab"} {
+		t.Run(key, func(t *testing.T) {
+			source, err := builtinplugins.Source(key)
+			require.NoError(t, err)
+			plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: key})
+			require.NoError(t, err)
+			for _, mode := range []string{"text_to_video", "image_to_video", "reference_to_video", "first_last_frame"} {
+				if key == "yali" && mode == "first_last_frame" {
+					continue
+				}
+				t.Run(mode, func(t *testing.T) {
+					request := map[string]any{"prompt": "cinematic sunrise", "mode": mode, "seconds": 20, "resolution": "8k", "aspect_ratio": "3:2"}
+					switch mode {
+					case "image_to_video":
+						request["image"] = "https://cdn.example/first.png"
+					case "reference_to_video":
+						request["reference_images"] = []any{"https://cdn.example/image.png"}
+						request["reference_audios"] = []any{"https://cdn.example/audio.mp3"}
+						if key != "yali" {
+							request["reference_videos"] = []any{"https://cdn.example/video.mp4"}
+						}
+					case "first_last_frame":
+						request["image"] = "https://cdn.example/first.png"
+						request["last_frame"] = "https://cdn.example/last.png"
+					}
+					ctx := map[string]any{"model": "public-alias", "operation": "create", "body": map[string]any{"kind": "json", "value": request}}
+					value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+					require.NoError(t, err)
+					preparsed := value.(map[string]any)
+					assert.Equal(t, request, preparsed["requestBody"], "public aliases must retain raw provider semantics until channel selection")
+					assert.NotContains(t, preparsed, "action")
+					ctx["upstreamModel"] = "vendor/新视频"
+					value, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+					require.NoError(t, err)
+					intent := value.(map[string]any)
+					assert.Equal(t, mode, intent["action"])
+					assert.Equal(t, "public-alias", intent["model"])
+					ctx["body"] = map[string]any{"kind": "json", "value": intent["requestBody"]}
+					repeated, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+					require.NoError(t, err)
+					assert.Equal(t, intent, repeated, "repeated decoding must preserve media roles and quantities")
+					ctx["requestBody"], ctx["baseUrl"], ctx["apiKey"] = intent["requestBody"], "https://channel.example", "test-key"
+					value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+					require.NoError(t, err)
+					descriptor := value.(map[string]any)
+					body := descriptor["body"].(map[string]any)
+					assert.Equal(t, "vendor/新视频", body["model"])
+					if key == "tabtab" {
+						assert.Equal(t, "https://channel.example/api/task/create", descriptor["url"])
+						args := body["args"].(map[string]any)
+						assert.EqualValues(t, 20, args["duration"])
+						assert.Equal(t, "8k", args["resolution"])
+						if mode == "reference_to_video" {
+							assert.Equal(t, []any{"https://cdn.example/video.mp4"}, args["videos"])
+							assert.NotContains(t, args, "video", "new models must not inherit Gemini's singular-video protocol")
+						}
+					} else {
+						assert.Equal(t, "https://channel.example/v1/videos", descriptor["url"])
+						assert.EqualValues(t, 20, body["seconds"])
+						assert.Equal(t, "8k", body["resolution"], "new Yali models must not inherit H3's 768P rewrite")
+						if key == "yali" && mode == "reference_to_video" {
+							assert.Equal(t, []any{"https://cdn.example/image.png"}, body["images"])
+							assert.Equal(t, map[string]any{"reference_audio": []any{"https://cdn.example/audio.mp3"}}, body["metadata"])
+						}
+					}
+					value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+					require.NoError(t, err)
+					facts := value.(map[string]any)
+					assert.EqualValues(t, 20, facts["seconds"])
+					assert.EqualValues(t, 1, facts["requests"])
+					assert.Equal(t, "8k", facts["resolution"])
+					assert.NotContains(t, facts, "tokens", "a new Drama model cannot imply F/G token billing")
+					if key == "drama" {
+						value, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", ctx, map[string]any{"status": "SUCCESS"}, map[string]any{"status": "completed", "seconds": 300, "usage": map[string]any{"total_tokens": 999999}})
+						require.NoError(t, err)
+						assert.Empty(t, value, "unknown models settle the facts frozen at submission")
+					}
+				})
+			}
+
+			knownModel := map[string]string{"drama": "seedance2.0-A", "yali": "minimax-h3-720p", "tabtab": "seedance-2.0"}[key]
+			raw := map[string]any{"prompt": "keep known defaults"}
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": knownModel, "body": map[string]any{"kind": "json", "value": raw}})
+			require.NoError(t, err)
+			assert.Equal(t, raw, value.(map[string]any)["requestBody"])
+			value, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "upstreamModel": knownModel, "body": map[string]any{"kind": "json", "value": raw}})
+			require.NoError(t, err)
+			assert.EqualValues(t, map[string]int{"drama": 4, "yali": 15, "tabtab": 5}[key], value.(map[string]any)["requestBody"].(map[string]any)["seconds"])
+			if key == "yali" {
+				request := map[string]any{"prompt": "single image", "seconds": 20, "resolution": "8k", "aspect_ratio": "3:2", "image": "https://cdn.example/image.png"}
+				ctx := map[string]any{"model": "alias", "upstreamModel": "new-yali", "body": map[string]any{"kind": "json", "value": request}}
+				value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+				require.NoError(t, err)
+				assert.Equal(t, "image_to_video", value.(map[string]any)["action"])
+				request["mode"] = "image_to_video"
+				_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+				require.NoError(t, err, "custom image mode uses Yali's existing image reference protocol")
+			}
+
+			for _, tc := range []struct {
+				name, missing, model string
+				fields               map[string]any
+			}{
+				{name: "missing duration", missing: "seconds"},
+				{name: "missing resolution", missing: "resolution"},
+				{name: "missing ratio", missing: "aspect_ratio"},
+				{name: "oversized duration", fields: map[string]any{"seconds": 3601}},
+				{name: "unsigned overflow", fields: map[string]any{"seconds": "18446744073709551615"}},
+				{name: "fractional duration", fields: map[string]any{"seconds": 1.5}},
+				{name: "boolean duration", fields: map[string]any{"seconds": true}},
+				{name: "conflicting duration", fields: map[string]any{"duration": 3}},
+				{name: "mode contradicts media", fields: map[string]any{"mode": "reference_to_video"}},
+				{name: "inline media", fields: map[string]any{"image": "data:image/png;base64,YQ=="}},
+				{name: "asset media", fields: map[string]any{"image": "asset://image-id"}},
+				{name: "invalid model punctuation", model: "vendor,new"},
+				{name: "invalid model control", model: "vendor\u0085new"},
+				{name: "model byte limit", model: strings.Repeat("界", 86)},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					request := map[string]any{"prompt": "sunrise", "seconds": 20, "resolution": "8k", "aspect_ratio": "3:2"}
+					delete(request, tc.missing)
+					for name, v := range tc.fields {
+						request[name] = v
+					}
+					upstream := tc.model
+					if upstream == "" {
+						upstream = "new-upstream"
+					}
+					_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "upstreamModel": upstream, "body": map[string]any{"kind": "json", "value": request}})
+					require.Error(t, err)
+					_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": "alias", "upstreamModel": upstream, "requestBody": request})
+					require.Error(t, err, "dispatch must enforce the same bounds independently")
+				})
+			}
+			images := make([]any, 64)
+			for i := range images {
+				images[i] = fmt.Sprintf("https://cdn.example/%d.png", i)
+			}
+			request := map[string]any{"prompt": "many references", "seconds": 3600, "resolution": "8k", "aspect_ratio": "3:2", "reference_images": images}
+			ctx := map[string]any{"model": "alias", "upstreamModel": strings.Repeat("界", 85), "body": map[string]any{"kind": "json", "value": request}}
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+			require.NoError(t, err, "protocol safety bounds must not reintroduce a known model's media limits")
+			request["reference_audios"] = []any{"https://cdn.example/audio.mp3"}
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+			require.Error(t, err, "the 64-reference limit is shared across media types")
+		})
+	}
 }
 
 func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {

@@ -1566,7 +1566,7 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	}
 	results := make([]model.AsyncImageResult, len(staging))
 	for i, saved := range staging {
-		image, err := ValidateImageBytes(saved.Data, saved.ContentType, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+		image, err := validateStoredImageBytes(saved.Data, saved.ContentType, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 		if err != nil {
 			return err
 		}

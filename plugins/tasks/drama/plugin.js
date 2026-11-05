@@ -1,8 +1,40 @@
 const RATIOS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"];
 const MODELS = {
-  "seedance2.0-A": { series: "A", min: 4, max: 15, resolutions: ["480p", "720p", "1080p", "4k"], defaultResolution: "480p", aspectRatios: [...RATIOS, "Auto"], images: 9, videos: 3, audios: 3, maxReferences: 12 },
-  "seedance2.5-A": { series: "A", min: 4, max: 30, resolutions: ["480p", "720p"], defaultResolution: "480p", images: 30, videos: 10, audios: 10, maxReferences: 50 },
-  "minimax-h3": { series: "H3", min: 4, max: 15, resolutions: ["480p", "720p", "1080p"], defaultResolution: "480p", aspectRatios: ["16:9", "9:16"], images: 9, videos: 3, audios: 3, maxReferences: 12 },
+  "seedance2.0-A": {
+    series: "A",
+    min: 4,
+    max: 15,
+    resolutions: ["480p", "720p", "1080p", "4k"],
+    defaultResolution: "480p",
+    aspectRatios: [...RATIOS, "Auto"],
+    images: 9,
+    videos: 3,
+    audios: 3,
+    maxReferences: 12,
+  },
+  "seedance2.5-A": {
+    series: "A",
+    min: 4,
+    max: 30,
+    resolutions: ["480p", "720p"],
+    defaultResolution: "480p",
+    images: 30,
+    videos: 10,
+    audios: 10,
+    maxReferences: 50,
+  },
+  "minimax-h3": {
+    series: "H3",
+    min: 4,
+    max: 15,
+    resolutions: ["480p", "720p", "1080p"],
+    defaultResolution: "480p",
+    aspectRatios: ["16:9", "9:16"],
+    images: 9,
+    videos: 3,
+    audios: 3,
+    maxReferences: 12,
+  },
   "seedance2.0-E-720p": { series: "legacy", min: 5, max: 15, resolutions: ["720p"], images: 9, videos: 3, audios: 3 },
   "seedance2.0-E-1080p": { series: "legacy", min: 5, max: 15, resolutions: ["1080p"], images: 9, videos: 3, audios: 3 },
   "seedance2.0-F-720p": { series: "legacy", min: 5, max: 15, resolutions: ["720p"], images: 9, videos: 0, audios: 3 },
@@ -45,13 +77,17 @@ function videoProfile(model, config) {
   const base = {
     duration: { min: config.min, max: config.max, step: 1, default: config.series === "G" ? 5 : config.min },
     resolutions: config.resolutions,
-    defaultResolution: config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]),
+    defaultResolution:
+      config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]),
     aspectRatios: config.aspectRatios || (config.series === "G" ? [...RATIOS, "adaptive"] : RATIOS),
     defaultAspectRatio: config.series === "G" ? "adaptive" : "16:9",
   };
   if (config.series === "F" || config.series === "H3") base.options = { generateAudio: true };
   if (config.series === "G") base.options = { generateAudio: true, watermark: true, returnLastFrame: true };
-  const modes = [{ ...base, name: "text_to_video" }, { ...base, name: "reference_to_video", inputs: referenceInputs }];
+  const modes = [
+    { ...base, name: "text_to_video" },
+    { ...base, name: "reference_to_video", inputs: referenceInputs },
+  ];
   if (model === "seedance2.0-A") {
     const frame = { name: "image", kind: "image", sources, maxItems: 1, required: true };
     modes.push({ ...base, name: "first_last_frame", aspectRatios: ["Auto"], defaultAspectRatio: "Auto", inputs: [frame, { ...frame, name: "last_frame" }] });
@@ -63,19 +99,28 @@ function videoProfile(model, config) {
     modes.push({ ...pinned, name: "first_last_frame", inputs: [frame, { ...frame, name: "last_frame" }] });
   }
   if (model === "seedance2.5-G") {
-    const operationInputs = [{ name: "video", kind: "video", sources, maxItems: 1, required: true }, ...referenceInputs.map((input) => input.name === "reference_videos" ? { ...input, maxItems: config.videos - 1 } : input)];
+    const operationInputs = [
+      { name: "video", kind: "video", sources, maxItems: 1, required: true },
+      ...referenceInputs.map((input) => (input.name === "reference_videos" ? { ...input, maxItems: config.videos - 1 } : input)),
+    ];
     const edit = { ...base, name: "edit_video", inputs: operationInputs, aspectRatios: ["adaptive"], defaultAspectRatio: "adaptive" };
     delete edit.duration;
     modes.push(edit);
-    modes.push({ ...base, name: "extend_video", inputs: operationInputs, aspectRatios: ["adaptive"], defaultAspectRatio: "adaptive", extensionDirections: ["backward"], defaultExtensionDirection: "backward" });
+    modes.push({
+      ...base,
+      name: "extend_video",
+      inputs: operationInputs,
+      aspectRatios: ["adaptive"],
+      defaultAspectRatio: "adaptive",
+      extensionDirections: ["backward"],
+      defaultExtensionDirection: "backward",
+    });
   }
   return { models: [model], modes };
 }
 
 export const meta = {
-  videoRetryInputs: [
-    {"path": "/references/*/source", "kind": "media"},
-  ],
+  videoRetryInputs: [{ path: "/references/*/source", kind: "media" }],
   apiVersion: 1,
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
@@ -97,7 +142,12 @@ export const meta = {
     let schema = { ...VIDEO_USAGE_SCHEMA, resolution };
     if (config.series === "E") {
       schema = {
-        requests: { type: "number", unit: "count", unitLabel: { en: "video", zh: "条" }, description: { en: "Video generation unit price", zh: "视频生成单价" } },
+        requests: {
+          type: "number",
+          unit: "count",
+          unitLabel: { en: "video", zh: "条" },
+          description: { en: "Video generation unit price", zh: "视频生成单价" },
+        },
         resolution,
         video_input: VIDEO_INPUT_SCHEMA,
       };
@@ -117,17 +167,65 @@ export const meta = {
 };
 
 const REQUEST_FIELDS = new Set([
-  "model", "prompt", "seconds", "duration", "resolution", "size", "aspect_ratio", "ratio", "aspectRatio", "references",
-  "image", "input_reference", "last_frame", "first_image", "last_image", "video", "reference_images", "reference_videos", "reference_audios",
-  "images", "image_urls", "referenceImages", "videos", "video_urls", "referenceVideos", "audios", "audio_urls", "referenceAudios",
-  "generate_audio", "watermark", "return_last_frame", "task_mode", "omni_reference_task_type", "extension_direction",
-  "priority", "output_format", "execution_expires_after", "service_tier", "safety_identifier", "callback_url", "metadata",
+  "model",
+  "mode",
+  "prompt",
+  "seconds",
+  "duration",
+  "resolution",
+  "size",
+  "aspect_ratio",
+  "ratio",
+  "aspectRatio",
+  "references",
+  "image",
+  "input_reference",
+  "last_frame",
+  "first_image",
+  "last_image",
+  "video",
+  "reference_images",
+  "reference_videos",
+  "reference_audios",
+  "images",
+  "image_urls",
+  "referenceImages",
+  "videos",
+  "video_urls",
+  "referenceVideos",
+  "audios",
+  "audio_urls",
+  "referenceAudios",
+  "generate_audio",
+  "watermark",
+  "return_last_frame",
+  "task_mode",
+  "omni_reference_task_type",
+  "extension_direction",
+  "priority",
+  "output_format",
+  "execution_expires_after",
+  "service_tier",
+  "safety_identifier",
+  "callback_url",
+  "metadata",
 ]);
 const G_FIELDS = ["priority", "output_format", "execution_expires_after", "service_tier", "safety_identifier", "callback_url"];
 
 function modelConfig(model) {
-  if (!Object.hasOwn(MODELS, model)) throw new Error("Unsupported Drama video model");
-  return MODELS[model];
+  // oxlint-disable no-control-regex -- Match the host's model identity rules
+  if (typeof model !== "string" || !model || model !== model.trim() || /[\x00-\x1f\x7f-\x9f,*]/.test(model)) throw new Error("Invalid Drama video model");
+  // oxlint-enable no-control-regex
+  let modelBytes = 0;
+  for (const character of model) {
+    const codePoint = character.codePointAt(0);
+    modelBytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (modelBytes > 255) throw new Error("Drama video model must not exceed 255 UTF-8 bytes");
+  }
+  if (Object.hasOwn(MODELS, model)) return MODELS[model];
+  // New models use the modern common endpoint. Saved channel capabilities
+  // determine allowed values; no model name implies an A/E/F/G series.
+  return { dynamic: true, min: 1, max: 3600, images: 64, videos: 64, audios: 64, maxReferences: 64 };
 }
 
 function aliasedValue(request, names) {
@@ -143,7 +241,8 @@ function aliasedValue(request, names) {
 function mediaSource(value, type, config) {
   if (value && typeof value === "object" && !Array.isArray(value)) value = value.url || value.source;
   // oxlint-disable no-control-regex -- Public media URLs must reject control characters
-  if (typeof value !== "string" || !value || value !== value.trim() || /[\s\\\x00-\x1f]/.test(value)) throw new Error("Media source must be a public HTTPS URL");
+  if (typeof value !== "string" || !value || value !== value.trim() || /[\s\\\x00-\x1f]/.test(value))
+    throw new Error("Media source must be a public HTTPS URL");
   // oxlint-enable no-control-regex
   if (/^https:\/\/[^/?#@]+(?:[/?#].*)?$/i.test(value)) return value;
   if (config.series === "G" && /^asset:\/\/[A-Za-z0-9_-]+$/.test(value)) return value;
@@ -155,11 +254,12 @@ function validateAReferencePrompt(prompt, references) {
   const counts = { image: 0, video: 0, audio: 0 };
   const mentioned = { image: new Set(), video: new Set(), audio: new Set() };
   for (const reference of references) counts[reference.type]++;
-  const types = { "图": "image", "图片": "image", "视频": "video", "音频": "audio" };
+  const types = { 图: "image", 图片: "image", 视频: "video", 音频: "audio" };
   for (const match of prompt.matchAll(/@(图片|图|视频|音频)([+-]?[0-9]+(?:\.[0-9]+)?)/g)) {
     const type = types[match[1]];
     const index = Number(match[2]);
-    if (!/^[1-9][0-9]*$/.test(match[2]) || !Number.isSafeInteger(index) || index > counts[type]) throw new Error("A series reference index must be a positive integer without leading zeros and within the supplied media count");
+    if (!/^[1-9][0-9]*$/.test(match[2]) || !Number.isSafeInteger(index) || index > counts[type])
+      throw new Error("A series reference index must be a positive integer without leading zeros and within the supplied media count");
     mentioned[type].add(index);
   }
   for (const type of ["image", "video", "audio"]) {
@@ -173,6 +273,8 @@ function normalizeRequest(request, model, operation) {
   for (const name of Object.keys(request)) {
     if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by this Drama model");
   }
+  if (request.mode !== undefined && !["text_to_video", "image_to_video", "reference_to_video", "first_last_frame"].includes(request.mode))
+    throw new Error("Unsupported Drama video mode");
   const req = Object.assign({}, request);
   if (req.first_image !== undefined || req.last_image !== undefined) {
     if (model !== "seedance2.0-A") throw new Error("first_image and last_image require seedance2.0-A");
@@ -195,9 +297,11 @@ function normalizeRequest(request, model, operation) {
   }
   if (typeof req.prompt !== "string" || !req.prompt.trim()) throw new Error("prompt is required");
   const prompt = req.prompt.trim();
-  if (Array.from(prompt).length > (config.series === "G" ? 20000 : config.series === "legacy" ? 4000 : 20000)) throw new Error("prompt exceeds this Drama model's length limit");
+  if (Array.from(prompt).length > (config.series === "G" ? 20000 : config.series === "legacy" ? 4000 : 20000))
+    throw new Error("prompt exceeds this Drama model's length limit");
   const requestedType = req.omni_reference_task_type;
-  if (requestedType !== undefined && (model !== "seedance2.5-G" || !["auto", "reference", "edit", "extend"].includes(requestedType))) throw new Error("omni_reference_task_type is not supported");
+  if (requestedType !== undefined && (model !== "seedance2.5-G" || !["auto", "reference", "edit", "extend"].includes(requestedType)))
+    throw new Error("omni_reference_task_type is not supported");
   let action = operation === "edit" || operation === "edit_video" ? "edit_video" : operation === "extend" || operation === "extend_video" ? "extend_video" : "";
   if (requestedType === "edit" || requestedType === "extend") {
     const nativeAction = requestedType + "_video";
@@ -212,32 +316,44 @@ function normalizeRequest(request, model, operation) {
   if (action === "edit_video") {
     if (rawSeconds !== undefined && rawSeconds !== -1 && rawSeconds !== "-1") throw new Error("Video editing uses automatic duration; omit seconds");
   } else {
-    if (rawSeconds === undefined && config.series === "G") throw new Error("seconds is required for this Drama model");
+    if (rawSeconds === undefined && (config.series === "G" || config.dynamic)) throw new Error("seconds is required for this Drama model");
     if (rawSeconds !== undefined && !["number", "string"].includes(typeof rawSeconds)) throw new Error("seconds must be an integer");
     seconds = rawSeconds === undefined ? config.min : Number(rawSeconds);
-    if (!Number.isInteger(seconds) || seconds < config.min || seconds > config.max) throw new Error("seconds must be between " + config.min + " and " + config.max);
+    if (!Number.isInteger(seconds) || seconds < config.min || seconds > config.max)
+      throw new Error("seconds must be between " + config.min + " and " + config.max);
   }
   const rawResolution = aliasedValue(req, ["resolution", "size"]);
-  const defaultResolution = config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]);
+  const defaultResolution = config.dynamic
+    ? undefined
+    : config.defaultResolution || (config.series === "E" ? config.resolutions[0] : config.resolutions.includes("720p") ? "720p" : config.resolutions[0]);
   const resolution = rawResolution === undefined ? defaultResolution : typeof rawResolution === "string" ? rawResolution.toLowerCase() : "";
-  if (!config.resolutions.includes(resolution)) throw new Error("resolution is not supported by this Drama model");
+  if (config.dynamic ? typeof resolution !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,31}$/.test(resolution) : !config.resolutions.includes(resolution))
+    throw new Error("resolution is not supported by this Drama model");
   const rawRatio = aliasedValue(req, ["aspect_ratio", "ratio", "aspectRatio"]);
-  let ratio = rawRatio === undefined ? config.series === "G" ? "adaptive" : "16:9" : rawRatio;
+  let ratio = rawRatio === undefined && !config.dynamic ? (config.series === "G" ? "adaptive" : "16:9") : rawRatio;
   if (model === "seedance2.0-A" && typeof ratio === "string" && ratio.toLowerCase() === "auto") ratio = "Auto";
   const ratios = config.aspectRatios || [...RATIOS, ...(config.series === "G" ? ["adaptive"] : [])];
-  if (!ratios.includes(ratio)) throw new Error("aspect_ratio is not supported by this Drama model");
+  if (config.dynamic ? typeof ratio !== "string" || !/^(?:[1-9][0-9]{0,2}:[1-9][0-9]{0,2}|auto|Auto|adaptive)$/.test(ratio) : !ratios.includes(ratio))
+    throw new Error("aspect_ratio is not supported by this Drama model");
 
   const references = [];
   if (req.references !== undefined) {
-    if (!Array.isArray(req.references) || req.references.length > (config.maxReferences || config.images + config.videos + config.audios)) throw new Error("references exceeds this Drama model's media limit");
+    if (!Array.isArray(req.references) || req.references.length > (config.maxReferences || config.images + config.videos + config.audios))
+      throw new Error("references exceeds this Drama model's media limit");
     for (const reference of req.references) {
-      if (!reference || typeof reference !== "object" || Array.isArray(reference) || !["image", "video", "audio"].includes(reference.type)) throw new Error("Invalid reference media type");
+      if (!reference || typeof reference !== "object" || Array.isArray(reference) || !["image", "video", "audio"].includes(reference.type))
+        throw new Error("Invalid reference media type");
       for (const name of Object.keys(reference)) {
         if (!["type", "role", "source"].includes(name)) throw new Error("Unsupported reference field: " + name);
       }
       let role = reference.role;
-      if (config.series === "G") {
-        if (!["reference_" + reference.type, ...(reference.type === "image" ? ["first_frame", "last_frame"] : [])].includes(role)) throw new Error("G series references require an explicit matching role");
+      if (config.dynamic) {
+        if (role === undefined) role = "reference";
+        if (!["reference", "reference_" + reference.type, ...(reference.type === "image" ? ["first_frame", "last_frame"] : [])].includes(role))
+          throw new Error("Invalid reference media role");
+      } else if (config.series === "G") {
+        if (!["reference_" + reference.type, ...(reference.type === "image" ? ["first_frame", "last_frame"] : [])].includes(role))
+          throw new Error("G series references require an explicit matching role");
       } else if (!(model === "seedance2.0-A" && reference.type === "image" && ["first_frame", "last_frame"].includes(role))) {
         if (config.series === "H3" && role === undefined) role = "reference";
         if (!["reference", "reference_" + reference.type].includes(role)) throw new Error("This Drama model only supports ordinary references");
@@ -254,14 +370,20 @@ function normalizeRequest(request, model, operation) {
     for (const name of entry[1]) {
       if (req[name] === undefined) continue;
       if (!Array.isArray(req[name]) || req[name].length > config.images + config.videos + config.audios) throw new Error(name + " must be a bounded array");
-      for (const value of req[name]) references.push({ type: entry[0], role: config.series === "G" ? "reference_" + entry[0] : "reference", source: mediaSource(value, entry[0], config) });
+      for (const value of req[name])
+        references.push({ type: entry[0], role: config.series === "G" ? "reference_" + entry[0] : "reference", source: mediaSource(value, entry[0], config) });
     }
   }
   if (req.image !== undefined && req.input_reference !== undefined) throw new Error("image and input_reference cannot both be provided");
   const first = req.image === undefined ? req.input_reference : req.image;
-  if (first !== undefined) references.push({ type: "image", role: config.series === "G" || model === "seedance2.0-A" ? "first_frame" : "reference", source: mediaSource(first, "image", config) });
+  if (first !== undefined)
+    references.push({
+      type: "image",
+      role: config.dynamic || config.series === "G" || model === "seedance2.0-A" ? "first_frame" : "reference",
+      source: mediaSource(first, "image", config),
+    });
   if (req.last_frame !== undefined) {
-    if (config.series !== "G" && model !== "seedance2.0-A") throw new Error("This Drama model does not support last_frame");
+    if (!config.dynamic && config.series !== "G" && model !== "seedance2.0-A") throw new Error("This Drama model does not support last_frame");
     references.push({ type: "image", role: "last_frame", source: mediaSource(req.last_frame, "image", config) });
   }
   if (req.video !== undefined) {
@@ -284,7 +406,14 @@ function normalizeRequest(request, model, operation) {
       lastFrame = reference.source;
     }
   }
-  if (counts.image > config.images || counts.video > config.videos || counts.audio > config.audios || ((config.series === "F" || config.series === "H3") && counts.video + counts.audio > 3) || (config.maxReferences && references.length > config.maxReferences)) throw new Error("Reference media exceeds this Drama model's limits");
+  if (
+    counts.image > config.images ||
+    counts.video > config.videos ||
+    counts.audio > config.audios ||
+    ((config.series === "F" || config.series === "H3") && counts.video + counts.audio > 3) ||
+    (config.maxReferences && references.length > config.maxReferences)
+  )
+    throw new Error("Reference media exceeds this Drama model's limits");
   if (lastFrame && !firstFrame) throw new Error("last_frame requires first_frame");
   if (firstFrame && references.length !== (lastFrame ? 2 : 1)) throw new Error("Pinned frames cannot be mixed with reference media");
   if (firstFrame && requestedType === "reference") throw new Error("omni_reference_task_type reference cannot use pinned frames");
@@ -294,11 +423,14 @@ function normalizeRequest(request, model, operation) {
     if (ratio !== "Auto") throw new Error("A 2.0 paired frames require aspect_ratio Auto");
   }
   if (config.series === "A" && !firstFrame) validateAReferencePrompt(prompt, references);
-  if (config.series === "G" && model !== "seedance2.5-G" && counts.audio && !counts.image && !counts.video) throw new Error("Audio references require an image or video reference");
+  if (config.series === "G" && model !== "seedance2.5-G" && counts.audio && !counts.image && !counts.video)
+    throw new Error("Audio references require an image or video reference");
   if (action && (!counts.video || firstFrame)) throw new Error("Video editing and extension require a reference video");
   if (model === "seedance2.5-G" && (action || firstFrame) && ratio !== "adaptive") throw new Error("This video mode requires aspect_ratio adaptive");
-  if (req.extension_direction !== undefined && (action !== "extend_video" || req.extension_direction !== "backward")) throw new Error("Only backward video extension is supported");
+  if (req.extension_direction !== undefined && (action !== "extend_video" || req.extension_direction !== "backward"))
+    throw new Error("Only backward video extension is supported");
   if (!action) action = lastFrame ? "first_last_frame" : firstFrame ? "image_to_video" : references.length ? "reference_to_video" : "text_to_video";
+  if (req.mode !== undefined && req.mode !== action) throw new Error("mode conflicts with the supplied media");
   const taskMode = model === "seedance2.0-A" && firstFrame ? "first_last_frame" : references.length ? "references" : "text";
   if (req.task_mode !== undefined && req.task_mode !== taskMode) throw new Error("task_mode conflicts with the supplied media");
 
@@ -311,7 +443,8 @@ function normalizeRequest(request, model, operation) {
   for (const name of ["generate_audio", "watermark", "return_last_frame"]) {
     if (req[name] === undefined) continue;
     if (typeof req[name] !== "boolean") throw new Error(name + " must be a boolean");
-    if (config.series !== "G" && !(["F", "H3"].includes(config.series) && name === "generate_audio")) throw new Error(name + " is not supported by this Drama model");
+    if (config.series !== "G" && !(["F", "H3"].includes(config.series) && name === "generate_audio"))
+      throw new Error(name + " is not supported by this Drama model");
     body[name] = req[name];
   }
   for (const name of G_FIELDS) {
@@ -319,11 +452,18 @@ function normalizeRequest(request, model, operation) {
     if (config.series !== "G") throw new Error(name + " is not supported by this Drama model");
     body[name] = req[name];
   }
-  if (body.priority !== undefined && (!Number.isInteger(body.priority) || body.priority < 0 || body.priority > 9)) throw new Error("priority must be between 0 and 9");
-  if (body.execution_expires_after !== undefined && (!Number.isInteger(body.execution_expires_after) || body.execution_expires_after < 3600 || body.execution_expires_after > 259200)) throw new Error("execution_expires_after must be between 3600 and 259200");
-  if (body.output_format !== undefined && (model !== "seedance2.5-G" || !["mp4", "mov"].includes(body.output_format))) throw new Error("output_format is not supported");
+  if (body.priority !== undefined && (!Number.isInteger(body.priority) || body.priority < 0 || body.priority > 9))
+    throw new Error("priority must be between 0 and 9");
+  if (
+    body.execution_expires_after !== undefined &&
+    (!Number.isInteger(body.execution_expires_after) || body.execution_expires_after < 3600 || body.execution_expires_after > 259200)
+  )
+    throw new Error("execution_expires_after must be between 3600 and 259200");
+  if (body.output_format !== undefined && (model !== "seedance2.5-G" || !["mp4", "mov"].includes(body.output_format)))
+    throw new Error("output_format is not supported");
   if (body.service_tier !== undefined && body.service_tier !== "default") throw new Error("service_tier must be default");
-  if (body.safety_identifier !== undefined && (typeof body.safety_identifier !== "string" || Array.from(body.safety_identifier).length > 256)) throw new Error("safety_identifier must be at most 256 characters");
+  if (body.safety_identifier !== undefined && (typeof body.safety_identifier !== "string" || Array.from(body.safety_identifier).length > 256))
+    throw new Error("safety_identifier must be at most 256 characters");
   if (body.callback_url !== undefined) body.callback_url = mediaSource(body.callback_url, "video", { series: "E" });
   return { body, action, references };
 }
@@ -332,14 +472,26 @@ export function buildSubmitRequest(ctx) {
   const model = ctx.upstreamModel || ctx.model;
   const prepared = normalizeRequest(ctx.requestBody, model, ctx.action);
   const config = modelConfig(model);
-  const body = { model, prompt: prepared.body.prompt, resolution: prepared.body.resolution, aspect_ratio: prepared.body.aspect_ratio, seconds: prepared.action === "edit_video" ? -1 : prepared.body.seconds };
+  const body = {
+    model,
+    prompt: prepared.body.prompt,
+    resolution: prepared.body.resolution,
+    aspect_ratio: prepared.body.aspect_ratio,
+    seconds: prepared.action === "edit_video" ? -1 : prepared.body.seconds,
+  };
   if (prepared.references.length) body.references = prepared.references;
   for (const name of ["generate_audio", "watermark", "return_last_frame", ...G_FIELDS]) {
     if (prepared.body[name] !== undefined) body[name] = prepared.body[name];
   }
   if (config.series === "legacy") body.task_mode = prepared.references.length ? "references" : "text";
   if (["edit_video", "extend_video"].includes(prepared.action)) body.omni_reference_task_type = prepared.action === "edit_video" ? "edit" : "extend";
-  return { method: "POST", url: ctx.baseUrl + (config.series === "legacy" ? "/v1/video/generations" : "/v1/videos"), headers: { "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey }, body, action: prepared.action };
+  return {
+    method: "POST",
+    url: ctx.baseUrl + (config.series === "legacy" ? "/v1/video/generations" : "/v1/videos"),
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey },
+    body,
+    action: prepared.action,
+  };
 }
 
 export function extractUsage(ctx) {
@@ -351,6 +503,7 @@ export function extractUsage(ctx) {
   const resolution = prepared.body.resolution;
   const videoInput = prepared.references.some((reference) => reference.type === "video");
   const videoInputFact = videoInput ? "video" : "none";
+  if (config.dynamic) return { seconds: prepared.body.seconds, requests: 1, resolution, video_input: videoInputFact };
   if (config.series === "E") return { requests: 1, resolution, video_input: videoInputFact };
   const seconds = prepared.action === "edit_video" ? config.max : prepared.body.seconds;
   const facts = { seconds, resolution, video_input: videoInputFact };
@@ -358,7 +511,7 @@ export function extractUsage(ctx) {
     // Ark-style pixel/time estimate for pre-consume only. The gateway's
     // actual total_tokens replaces it at completion, including reference videos.
     const pixels = { "480p": 854 * 480, "720p": 1280 * 720, "720px": 1280 * 720, "1080p": 1920 * 1080, "4k": 3840 * 2160 }[resolution];
-    facts.tokens = Math.ceil((seconds + (videoInput ? config.max : 0)) * pixels * 24 / 1024);
+    facts.tokens = Math.ceil(((seconds + (videoInput ? config.max : 0)) * pixels * 24) / 1024);
   }
   return facts;
 }
@@ -372,16 +525,21 @@ export function parseSubmitResponse(ctx, response) {
 
 export function buildQueryRequest(ctx) {
   const config = modelConfig(ctx.upstreamModel || ctx.model);
-  return { method: "GET", url: ctx.baseUrl + (config.series === "legacy" ? "/v1/video/generations/" : "/v1/videos/") + encodeURIComponent(ctx.taskId), headers: { Authorization: "Bearer " + ctx.apiKey } };
+  return {
+    method: "GET",
+    url: ctx.baseUrl + (config.series === "legacy" ? "/v1/video/generations/" : "/v1/videos/") + encodeURIComponent(ctx.taskId),
+    headers: { Authorization: "Bearer " + ctx.apiKey },
+  };
 }
 
 function completionUsage(ctx, body) {
   const config = modelConfig(ctx.upstreamModel || ctx.model);
   const facts = {};
-  if (config.series === "E") return facts;
+  if (config.series === "E" || config.dynamic) return facts;
   const metadata = body.metadata && typeof body.metadata === "object" ? body.metadata : {};
   const billing = metadata.billing && typeof metadata.billing === "object" ? metadata.billing : {};
-  const requiresTokens = config.series === "G" || (config.series === "F" && ((ctx.state || {}).video_input === "video" || billing.mode === "per_million_tokens"));
+  const requiresTokens =
+    config.series === "G" || (config.series === "F" && ((ctx.state || {}).video_input === "video" || billing.mode === "per_million_tokens"));
   if (requiresTokens && (billing.settle_state === "pending" || billing.settled === false)) return null;
   if (requiresTokens && billing.settle_state === "failed") throw new Error("Upstream video billing settlement failed");
   if (config.series === "F" || config.series === "G") {
@@ -389,20 +547,23 @@ function completionUsage(ctx, body) {
     for (const usage of sources) {
       if (usage === undefined || usage === null) continue;
       if (typeof usage !== "object" || Array.isArray(usage)) throw new Error("Invalid upstream video token usage");
-      const tokens = usage.total_tokens === undefined ? usage.completion_tokens === undefined ? usage.output_tokens : usage.completion_tokens : usage.total_tokens;
+      const tokens =
+        usage.total_tokens === undefined ? (usage.completion_tokens === undefined ? usage.output_tokens : usage.completion_tokens) : usage.total_tokens;
       if (tokens === undefined) continue;
-      if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0 || tokens > 2147483647) throw new Error("Invalid upstream video token usage");
+      if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0 || tokens > 2147483647)
+        throw new Error("Invalid upstream video token usage");
       facts.tokens = tokens;
       break;
     }
   }
   if (requiresTokens && facts.tokens === undefined) return null;
-  const duration = body.seconds === undefined ? body.duration === undefined ? billing.seconds : body.duration : body.seconds;
+  const duration = body.seconds === undefined ? (body.duration === undefined ? billing.seconds : body.duration) : body.seconds;
   // Extension output can include the original clip; keep the requested extension
   // seconds. An edit may echo -1 instead of reporting a measured output duration.
   const automaticEdit = ctx.action === "edit_video" && (duration === -1 || duration === "-1");
   if (duration !== undefined && ctx.action !== "extend_video" && !automaticEdit) {
-    if (!["number", "string"].includes(typeof duration) || !Number.isFinite(Number(duration)) || Number(duration) <= 0 || Number(duration) > 3600) throw new Error("Invalid upstream video duration");
+    if (!["number", "string"].includes(typeof duration) || !Number.isFinite(Number(duration)) || Number(duration) <= 0 || Number(duration) > 3600)
+      throw new Error("Invalid upstream video duration");
     facts.seconds = Number(duration);
   }
   return facts;
@@ -415,7 +576,8 @@ export function parseTaskResult(ctx, body) {
   if (!status) return { status: "UNKNOWN", reason: "Unrecognized upstream video status: " + String(body.status || "") };
   if (status === "SUCCESS" && completionUsage(ctx, body) === null) status = "IN_PROGRESS";
   const result = { status };
-  if (typeof body.progress === "number" && Number.isFinite(body.progress) && body.progress >= 0 && body.progress <= 100) result.progress = (status === "IN_PROGRESS" ? Math.min(99, body.progress) : body.progress) + "%";
+  if (typeof body.progress === "number" && Number.isFinite(body.progress) && body.progress >= 0 && body.progress <= 100)
+    result.progress = (status === "IN_PROGRESS" ? Math.min(99, body.progress) : body.progress) + "%";
   if (status === "FAILURE") {
     let reason = "";
     if (typeof body.error === "string") {
@@ -451,15 +613,24 @@ export function listArtifacts(task) {
 }
 
 export function buildContentRequest(ctx) {
-  if (ctx.artifactKey === "last_frame" && ctx.data && typeof ctx.data.last_frame_url === "string" && ctx.data.last_frame_url) return { method: ctx.clientRequest.method, url: ctx.data.last_frame_url, credentialless: true };
+  if (ctx.artifactKey === "last_frame" && ctx.data && typeof ctx.data.last_frame_url === "string" && ctx.data.last_frame_url)
+    return { method: ctx.clientRequest.method, url: ctx.data.last_frame_url, credentialless: true };
   if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
-  return { method: ctx.clientRequest.method, url: ctx.baseUrl + "/v1/videos/" + encodeURIComponent(ctx.upstreamTaskId) + "/content", headers: { Authorization: "Bearer " + ctx.apiKey } };
+  return {
+    method: ctx.clientRequest.method,
+    url: ctx.baseUrl + "/v1/videos/" + encodeURIComponent(ctx.upstreamTaskId) + "/content",
+    headers: { Authorization: "Bearer " + ctx.apiKey },
+  };
 }
 
 export const protocols = {
   openai_video: {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("Drama video requires JSON with public media URLs or asset references");
+      if (!ctx.upstreamModel) {
+        if (!ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+        return { kind: "submit", model: ctx.model, requestBody: ctx.body.value };
+      }
       const prepared = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model, ctx.operation);
       prepared.body.model = ctx.model;
       return { kind: "submit", model: ctx.model, action: prepared.action, requestBody: prepared.body };

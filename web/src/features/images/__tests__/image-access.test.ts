@@ -29,22 +29,25 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-test('authenticated images use the session client for bytes without an anonymous fetch', async () => {
-  const blob = new Blob(['image'], { type: 'image/png' })
-  vi.mocked(api.request).mockResolvedValue({ data: blob })
-  const anonymousFetch = vi.fn()
-  vi.stubGlobal('fetch', anonymousFetch)
-  const path = '/api/user/async-image-tasks/asyncimg_private/results/0/view'
-  await expect(imageBlob(path, undefined, true)).resolves.toBe(blob)
-  expect(api.request).toHaveBeenCalledWith(
-    expect.objectContaining({
-      url: path,
-      responseType: 'blob',
-      headers: { Accept: 'image/*' },
-    })
-  )
-  expect(anonymousFetch).not.toHaveBeenCalled()
-})
+test.each(['image/png', 'image/gif', 'image/svg+xml; charset=utf-8'])(
+  'authenticated %s images use the session client for bytes without an anonymous fetch',
+  async (type) => {
+    const blob = new Blob(['image'], { type })
+    vi.mocked(api.request).mockResolvedValue({ data: blob })
+    const anonymousFetch = vi.fn()
+    vi.stubGlobal('fetch', anonymousFetch)
+    const path = '/api/user/async-image-tasks/asyncimg_private/results/0/view'
+    await expect(imageBlob(path, undefined, true)).resolves.toBe(blob)
+    expect(api.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: path,
+        responseType: 'blob',
+        headers: { Accept: 'image/*' },
+      })
+    )
+    expect(anonymousFetch).not.toHaveBeenCalled()
+  }
+)
 
 test.each(['https://attacker.example/image.png', '/api/user/self'])(
   'authenticated image loading rejects an untrusted content endpoint: %s',
@@ -71,21 +74,41 @@ test('a protected link response resolves to session-authenticated bytes', async 
   )
 })
 
-test('ordinary signed images keep anonymous fetch behavior', async () => {
-  const blob = new Blob(['image'], { type: 'image/png' })
-  const anonymousFetch = vi.fn().mockResolvedValue({
-    ok: true,
-    blob: async () => blob,
-  })
-  vi.stubGlobal('fetch', anonymousFetch)
-  const url = 'https://storage.example/image.png?signature=ordinary'
-  await expect(imageBlob(url)).resolves.toBe(blob)
-  expect(api.request).not.toHaveBeenCalled()
-  expect(anonymousFetch).toHaveBeenCalledWith(
-    url,
-    expect.objectContaining({ credentials: 'omit', cache: 'no-store' })
-  )
-})
+test.each(['image/png', 'image/gif', 'image/svg+xml'])(
+  'ordinary signed %s images keep anonymous fetch behavior',
+  async (type) => {
+    const blob = new Blob(['image'], { type })
+    const anonymousFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => blob,
+    })
+    vi.stubGlobal('fetch', anonymousFetch)
+    const url = 'https://storage.example/image.png?signature=ordinary'
+    await expect(imageBlob(url)).resolves.toBe(blob)
+    expect(api.request).not.toHaveBeenCalled()
+    expect(anonymousFetch).toHaveBeenCalledWith(
+      url,
+      expect.objectContaining({ credentials: 'omit', cache: 'no-store' })
+    )
+  }
+)
+
+test.each([
+  { type: 'text/html', content: '<html>upstream error</html>' },
+  { type: 'image/svg+xml', content: '' },
+])(
+  'image results reject unsupported or empty responses: $type',
+  async ({ type, content }) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        blob: async () => new Blob([content], { type }),
+      })
+    )
+    await expect(imageBlob('https://storage.example/result')).rejects.toThrow()
+  }
+)
 
 test('protected video bytes use the session client and never resolve to an upstream link', async () => {
   const blob = new Blob(['video'], { type: 'video/mp4' })

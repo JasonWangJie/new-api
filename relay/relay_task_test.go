@@ -336,7 +336,7 @@ export function buildContentRequest(){return {url:"https://provider.example/vide
 
 func TestHuahuoVideoRequiresConfiguredSitePrice(t *testing.T) {
 	const modelName = "huahuo-pricing-fixture"
-	for _, provider := range []string{constant.TaskPlatformHuahuoVideo, "wolong"} {
+	for _, provider := range []string{constant.TaskPlatformHuahuoVideo, "wolong", "drama", "yali", "tabtab", "nldw", "yuxibox", "tianyue"} {
 		source, err := builtinplugins.Source(provider)
 		require.NoError(t, err)
 		registry := pluginruntime.NewRegistry()
@@ -1042,6 +1042,7 @@ export function parseTaskResult(){return {status:"IN_PROGRESS"};}
 			}))
 			defer upstream.Close()
 			c, info := newTaskSubmitContext(t, "declared-model", "")
+			info.OriginModelName = "declared-model"
 			pluginSource := source
 			if tc.otherProvider {
 				pluginSource = strings.Replace(source, `key:"drama"`, `key:"other"`, 1)

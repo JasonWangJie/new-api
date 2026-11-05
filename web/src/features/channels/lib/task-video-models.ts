@@ -18,6 +18,30 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { TaskVideoModelConfig, TaskVideoModelDetail } from '../types'
 
+const PRESET_VIDEO_PLUGINS = new Set([
+  'wolong',
+  'drama',
+  'yali',
+  'tabtab',
+  'nldw',
+  'yuxibox',
+  'tianyue',
+])
+
+export function hasPresetTaskVideoModels(key: string | undefined): boolean {
+  return key !== undefined && PRESET_VIDEO_PLUGINS.has(key)
+}
+
+export function isChannelConfiguredVideoPlugin(
+  key: string | undefined
+): boolean {
+  return (
+    key === 'sudashui' ||
+    key === 'huahuo-video' ||
+    hasPresetTaskVideoModels(key)
+  )
+}
+
 export function taskVideoCatalogConfig(
   detail?: TaskVideoModelDetail,
   manualOnly = false
@@ -26,7 +50,11 @@ export function taskVideoCatalogConfig(
     duration: detail?.duration ?? {},
     resolutions: detail?.resolutions ?? [],
     aspect_ratios: detail?.aspect_ratios ?? [],
-    modes: detail?.modes ?? [],
+    modes: detail?.modes ?? [
+      'text_to_video',
+      'reference_to_video',
+      'image_to_video',
+    ],
     references: detail?.references ?? {
       images: null,
       videos: null,

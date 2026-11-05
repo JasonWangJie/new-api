@@ -126,7 +126,7 @@ func ArchiveAsyncImageResult(ctx context.Context, userId int, taskId string, ind
 	if err != nil {
 		return model.ImageLibraryItem{}, false, err
 	}
-	image, err := ValidateImageBytes(data, object.ContentType, cfg.LibraryImageBytes, cfg.LibraryImagePixels)
+	image, err := validateStoredImageBytes(data, object.ContentType, cfg.LibraryImageBytes, cfg.LibraryImagePixels)
 	if err != nil {
 		return model.ImageLibraryItem{}, false, err
 	}

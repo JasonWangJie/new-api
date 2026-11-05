@@ -74,6 +74,37 @@ func TestWolongChannelVideoCapabilities(t *testing.T) {
 	}
 }
 
+func TestPresetCustomVideoCapabilities(t *testing.T) {
+	two, zero := 2, 0
+	for _, key := range []string{"drama", "yali", "tabtab", "nldw", "yuxibox", "tianyue"} {
+		t.Run(key, func(t *testing.T) {
+			base := TaskVideoModelConfig{Duration: TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video", "reference_to_video", "image_to_video"}, References: TaskVideoReferences{Images: &two, Videos: &zero, Audios: &zero}, BillingMode: "per_request"}
+			settings := ChannelSettings{TaskPluginKey: key, TaskPluginModelConfigs: map[string]TaskVideoModelConfig{"vendor/future": base}}
+			require.NoError(t, settings.ValidateTaskVideoModels(3600))
+			for _, mode := range []string{"image_to_video", "first_last_frame"} {
+				configured := base
+				configured.Modes = []string{mode}
+				err := configured.ValidateForPlugin(key, 3600)
+				allowed := mode == "image_to_video" || key == "drama" || key == "tabtab" || key == "yuxibox"
+				if allowed {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+			}
+			withoutImages := base
+			withoutImages.References.Images = &zero
+			withoutImages.Modes = []string{"image_to_video"}
+			require.ErrorContains(t, withoutImages.ValidateForPlugin(key, 3600), "image_to_video requires image support")
+			base.References.ImageDataURI = true
+			require.Error(t, base.ValidateForPlugin(key, 3600))
+			base.References.ImageDataURI = false
+			base.Resolutions, base.AspectRatios = []string{"1440p"}, []string{"3:2"}
+			require.NoError(t, base.ValidateForPlugin(key, 3600))
+		})
+	}
+}
+
 func TestChannelImageResolutionModelMapping(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

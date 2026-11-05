@@ -71,6 +71,129 @@ func TestWolongConfiguredModelsPreserveFactoryCapabilities(t *testing.T) {
 	assert.NotContains(t, plugin.Meta.Models, "future-wolong", "channel pinning must not mutate factory metadata")
 }
 
+func TestPresetVideoModelsKeepRichContracts(t *testing.T) {
+	for _, key := range kitdto.ChannelConfiguredTaskVideoPlugins() {
+		if !kitdto.PresetTaskVideoPlugin(key) {
+			continue
+		}
+		t.Run(key, func(t *testing.T) {
+			source, err := os.ReadFile(filepath.Join("..", "..", "plugins", "tasks", key, "plugin.js"))
+			require.NoError(t, err)
+			plugin, err := NewRegistry().RegisterFactory(string(source), Options{Key: key})
+			require.NoError(t, err)
+			defaults := map[string]kitdto.TaskVideoModelConfig{}
+			for _, name := range plugin.Meta.Models {
+				config, found := TaskVideoModelConfigFromMeta(plugin.Meta, name)
+				require.True(t, found)
+				require.NoError(t, config.ValidateForPlugin(key, 3600), name)
+				config.PresetModel = name
+				defaults[name] = config
+			}
+			preserved := WithTaskVideoModels(plugin, defaults)
+			assert.Equal(t, plugin.Meta.Models, preserved.Meta.Models)
+			assert.Equal(t, plugin.Meta.VideoProfiles, preserved.Meta.VideoProfiles, "configuration discovery cannot erase preset operations or options")
+			assert.Equal(t, plugin.Meta.UsageProfiles, preserved.Meta.UsageProfiles)
+			assert.Equal(t, plugin.Meta.UsageSchema, preserved.Meta.UsageSchema)
+			assert.Equal(t, plugin.Meta.UsageExamples, preserved.Meta.UsageExamples)
+			custom := kitdto.TaskVideoModelConfig{Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, References: kitdto.TaskVideoReferences{Images: common.GetPointer(0), Videos: common.GetPointer(0), Audios: common.GetPointer(0)}, BillingMode: "per_request"}
+			configured := WithTaskVideoModels(preserved, map[string]kitdto.TaskVideoModelConfig{"vendor/future": custom})
+			assert.True(t, IsCustomTaskVideoModel(configured, "vendor/future"))
+			assert.False(t, HasPresetTaskVideoModel(configured, "vendor/future"))
+			for _, name := range plugin.Meta.Models {
+				alias := "alias-" + name
+				selected := WithTaskVideoModels(configured, map[string]kitdto.TaskVideoModelConfig{alias: defaults[name]})
+				original, _ := plugin.Meta.VideoProfileForModel(name)
+				actual, found := selected.Meta.VideoProfileForModel(alias)
+				require.True(t, found)
+				original.Models = []string{alias}
+				assert.Equal(t, original, actual)
+				originalUsage, originalExamples := plugin.Meta.UsageForModel(name)
+				aliasUsage, aliasExamples := selected.Meta.UsageForModel(alias)
+				assert.Equal(t, originalUsage, aliasUsage)
+				assert.Equal(t, originalExamples, aliasExamples)
+				assert.True(t, HasPresetTaskVideoModel(selected, alias))
+				assert.False(t, IsCustomTaskVideoModel(selected, alias))
+			}
+			schema, _ := configured.Meta.UsageForModel("vendor/future")
+			count := "requests"
+			if key == "wolong" {
+				count = "video_count"
+			}
+			assert.Contains(t, schema, count)
+			assert.NotContains(t, schema, "seconds")
+			assert.NotContains(t, schema, "tokens")
+			assert.NotContains(t, schema, "billing_period")
+			if key == "drama" {
+				assert.Equal(t, plugin.Meta.UsageSchema["video_input"], schema["video_input"])
+			}
+			if key == "tabtab" {
+				assert.Equal(t, plugin.Meta.UsageSchema["reference_video"], schema["reference_video"])
+			}
+			custom.BillingMode = "per_second"
+			changed := WithTaskVideoModels(configured, map[string]kitdto.TaskVideoModelConfig{"vendor/future": custom})
+			assert.True(t, IsCustomTaskVideoModel(changed, "vendor/future"))
+			schema, _ = changed.Meta.UsageForModel("vendor/future")
+			assert.Contains(t, schema, "seconds")
+			assert.NotContains(t, schema, count)
+			assert.NotContains(t, plugin.Meta.Models, "vendor/future")
+		})
+	}
+}
+
+func TestLegacyVideoModelsPreserveSourceContracts(t *testing.T) {
+	const source = `
+export const meta={apiVersion:1,key:"drama",name:"Legacy video",version:"1.0.0",author:{name:"Test"},models:["Declared"],fetchMode:"per_task",usageSchema:{tokens:{type:"number",unit:"token"}},usageExamples:[{label:"source",facts:{tokens:42}}]};
+export function buildSubmitRequest(){return {url:"https://provider.example/submit"};}
+export function parseSubmitResponse(){return {taskId:"task"};}
+export function buildQueryRequest(){return {url:"https://provider.example/query"};}
+export function parseTaskResult(){return {status:"IN_PROGRESS"};}
+`
+	custom := kitdto.TaskVideoModelConfig{Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video"}, References: kitdto.TaskVideoReferences{Images: common.GetPointer(0), Videos: common.GetPointer(0), Audios: common.GetPointer(0)}, BillingMode: "per_request"}
+	for _, key := range []string{"drama", "yali", "tabtab", "nldw", "yuxibox", "tianyue"} {
+		t.Run(key, func(t *testing.T) {
+			plugin, err := NewRegistry().Register(strings.Replace(source, `key:"drama"`, `key:"`+key+`"`, 1), Options{})
+			require.NoError(t, err)
+			canonical, legacy := LegacyTaskVideoModel(plugin.Meta, "DECLARED")
+			require.True(t, legacy)
+			assert.Equal(t, "Declared", canonical)
+			preset := kitdto.TaskVideoModelConfig{PresetModel: canonical}
+			preserved := WithTaskVideoModels(plugin, map[string]kitdto.TaskVideoModelConfig{canonical: preset})
+			assert.Equal(t, plugin.Meta.Models, preserved.Meta.Models)
+			assert.Equal(t, plugin.Meta.UsageSchema, preserved.Meta.UsageSchema)
+			assert.Equal(t, plugin.Meta.UsageExamples, preserved.Meta.UsageExamples)
+			assert.Empty(t, preserved.Meta.VideoProfiles)
+			configured := WithTaskVideoModels(preserved, map[string]kitdto.TaskVideoModelConfig{"future": custom, "public-alias": preset})
+			assert.True(t, HasPresetTaskVideoModel(configured, "public-alias"))
+			assert.False(t, HasPresetTaskVideoModel(configured, "future"))
+			assert.Empty(t, configured.Meta.Protocols)
+			_, profiled := configured.Meta.VideoProfileForModel("public-alias")
+			assert.False(t, profiled, "a legacy alias cannot invent video capabilities")
+			schema, examples := configured.Meta.UsageForModel("public-alias")
+			assert.Equal(t, plugin.Meta.UsageSchema, schema)
+			assert.Equal(t, plugin.Meta.UsageExamples, examples)
+			assert.NotContains(t, plugin.Meta.Models, "future")
+			assert.NotContains(t, plugin.Meta.Models, "public-alias")
+			for _, merged := range []kitdto.TaskVideoModelConfig{MergeTaskVideoModel(preset, custom, 3600), MergeTaskVideoModel(custom, preset, 3600)} {
+				assert.Equal(t, "per_request", merged.BillingMode)
+				catalog := WithTaskVideoModels(configured, map[string]kitdto.TaskVideoModelConfig{"shared-alias": merged})
+				_, profiled = catalog.Meta.VideoProfileForModel("shared-alias")
+				assert.False(t, profiled, "mixed discovery cannot assign capabilities to a legacy source")
+				actual, _ := catalog.Meta.UsageForModel("shared-alias")
+				assert.Equal(t, schema, actual)
+				selected := WithTaskVideoModels(catalog, map[string]kitdto.TaskVideoModelConfig{"shared-alias": custom})
+				_, profiled = selected.Meta.VideoProfileForModel("shared-alias")
+				assert.True(t, profiled, "a selected configured channel restores its strict capabilities")
+				assert.True(t, IsCustomTaskVideoModel(selected, "shared-alias"))
+			}
+			assert.Empty(t, MergeTaskVideoModel(preset, preset, 3600).BillingMode)
+			ambiguous := plugin.Meta
+			ambiguous.Models = []string{"Declared", "declared"}
+			_, legacy = LegacyTaskVideoModel(ambiguous, "DECLARED")
+			assert.False(t, legacy)
+		})
+	}
+}
+
 func TestRegistryUnregisterFallsBackToFactory(t *testing.T) {
 	registry := NewRegistry()
 	require.NoError(t, registerTestPlugin(registry, "1.0.0-factory", true))

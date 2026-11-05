@@ -23,6 +23,7 @@ import { ASYNC_IMAGE_ENDPOINTS, asyncImageGuide } from '../guide-content'
 import {
   buildImageRequest,
   extractImageResponse,
+  imageFileExtension,
   imageRequestDimensions,
   terminalImageStatus,
 } from '../image-request'
@@ -551,4 +552,31 @@ describe('capability-driven image request contracts', () => {
     expect(terminalImageStatus('storage_failed', 0)).toBe(true)
     expect(terminalImageStatus('execution_unknown')).toBe(true)
   })
+
+  it.each([
+    { mime: 'image/gif', extension: 'gif', body: 'GIF89a' },
+    { mime: 'image/gif', extension: 'gif', body: 'GIF87a' },
+    {
+      mime: 'image/svg+xml',
+      extension: 'svg',
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>',
+    },
+    {
+      mime: 'image/svg+xml',
+      extension: 'svg',
+      body: '\xef\xbb\xbf<?xml version="1.0"?>\n<!-- generated vector -->\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 2"/>',
+    },
+  ])(
+    'preserves $mime base64 output bytes and download extension',
+    ({ mime, extension, body }) => {
+      const encoded = btoa(body)
+      expect(extractImageResponse({ data: [{ b64_json: encoded }] })).toEqual([
+        `data:${mime};base64,${encoded}`,
+      ])
+      expect(imageFileExtension(mime)).toBe(extension)
+      expect(imageFileExtension(`${mime.toUpperCase()}; charset=utf-8`)).toBe(
+        extension
+      )
+    }
+  )
 })

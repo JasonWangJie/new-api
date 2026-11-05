@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -59,7 +60,7 @@ func TestNLDWVideoRequiresDurableAdmissionBeforeBilling(t *testing.T) {
 		frozen := service.MediaBillingSnapshot{}
 		frozen.Price.Quota = 100
 		c.Set("async_media_billing", frozen)
-		info := &relaycommon.RelayInfo{OriginModelName: "sd2.5pp", TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+		info := &relaycommon.RelayInfo{OriginModelName: "sd2.5pp", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "sd2.5pp"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: "text_to_video"}}
 		result, taskErr := relay.RelayTaskSubmit(c, info)
 		require.Nil(t, taskErr)
 		require.NotNil(t, result)
@@ -78,6 +79,203 @@ func decodeNLDWVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, upstrea
 		return nil, err
 	}
 	return value.(map[string]any), nil
+}
+
+func TestLegacyVideoConfiguredModels(t *testing.T) {
+	for _, tc := range []struct {
+		key, known string
+		load       func(*testing.T) *jsplugin.LoadedPlugin
+	}{
+		{key: "nldw", known: "sd2.5pp", load: loadNLDWVideoPlugin},
+		{key: "yuxibox", known: "minimax-h3-15s", load: func(t *testing.T) *jsplugin.LoadedPlugin { return loadYuxiboxVideoPlugin(t, nil) }},
+		{key: "tianyue", known: "L-sd2-video", load: loadTianyueVideoPlugin},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			plugin := tc.load(t)
+			raw := map[string]any{"prompt": " animate ", "seconds": 6, "resolution": "720p"}
+			preliminary, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": tc.known, "operation": "create", "body": map[string]any{"kind": "json", "value": raw},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, raw, preliminary.(map[string]any)["requestBody"], "public names must not select upstream defaults or capability rules")
+			assert.NotContains(t, preliminary.(map[string]any), "action")
+
+			images, videos := make([]any, 32), make([]any, 32)
+			for i := range images {
+				images[i], videos[i] = "https://cdn.example/image.png", "https://cdn.example/video.mp4"
+			}
+			request := map[string]any{"prompt": "animate", "seconds": 3600, "resolution": "1080p", "aspect_ratio": "1:1", "reference_images": images, "reference_videos": videos}
+			upstream := "vendor/自定义视频"
+			value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": tc.known, "upstreamModel": upstream, "operation": "create", "body": map[string]any{"kind": "json", "value": request},
+			})
+			require.NoError(t, err)
+			intent := value.(map[string]any)
+			assert.Equal(t, tc.known, intent["model"])
+			assert.Equal(t, "reference_to_video", intent["action"])
+			ctx := map[string]any{"model": tc.known, "upstreamModel": upstream, "requestBody": intent["requestBody"], "baseUrl": "https://api.example", "apiKey": "test-key", "publicTaskId": "public-id"}
+			value, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.NoError(t, err)
+			descriptor := value.(map[string]any)
+			assert.Equal(t, "https://api.example/v1/videos", descriptor["url"])
+			assert.Equal(t, upstream, descriptor["body"].(map[string]any)["model"])
+			value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			facts := value.(map[string]any)
+			assert.Len(t, facts, 3)
+			assert.EqualValues(t, 3600, facts["seconds"])
+			assert.EqualValues(t, 1, facts["requests"])
+			assert.Equal(t, "1080p", facts["resolution"])
+			ctx["usagePurpose"] = "billing_ratios"
+			value, err = plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			assert.Nil(t, value, "the host chooses the administrator's billing mode")
+			value, err = plugin.Engine.Call(t.Context(), "extractUsageOnComplete", ctx, map[string]any{"status": "SUCCESS"}, map[string]any{"status": "completed", "seconds": 1})
+			require.NoError(t, err)
+			assert.Empty(t, value, "custom model settlement retains the frozen submission usage")
+			value, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+				"model": "public-alias", "upstreamModel": strings.Repeat("字", 85), "operation": "create",
+				"body": map[string]any{"kind": "json", "value": map[string]any{
+					"prompt": "animate", "seconds": 1, "resolution": "Future.8K", "aspect_ratio": "32:9", "reference_images": "https://cdn.example/image.png",
+				}},
+			})
+			require.NoError(t, err, "255 UTF-8 byte models and single-input workbench controls are accepted")
+			assert.Equal(t, "reference_to_video", value.(map[string]any)["action"])
+			customBody := value.(map[string]any)["requestBody"].(map[string]any)
+			assert.Equal(t, "Future.8K", customBody["resolution"], "unknown specifications must not inherit a preset's resolution conversion")
+			assert.Equal(t, "32:9", customBody["aspect_ratio"])
+			value, err = plugin.Engine.Call(t.Context(), "extractUsage", map[string]any{"model": "public-alias", "upstreamModel": upstream, "requestBody": customBody})
+			require.NoError(t, err)
+			assert.Equal(t, "future.8k", value.(map[string]any)["resolution"], "usage follows the host's canonical resolution enum")
+
+			for _, invalid := range []struct {
+				name, model, omit string
+				fields            map[string]any
+			}{
+				{name: "missing duration", omit: "seconds"},
+				{name: "missing resolution", omit: "resolution"},
+				{name: "missing ratio", omit: "aspect_ratio"},
+				{name: "zero duration", fields: map[string]any{"seconds": 0}},
+				{name: "host duration ceiling", fields: map[string]any{"seconds": 3601}},
+				{name: "unsafe resolution token", fields: map[string]any{"resolution": "8k/unsafe"}},
+				{name: "resolution token ceiling", fields: map[string]any{"resolution": strings.Repeat("a", 33)}},
+				{name: "invalid ratio", fields: map[string]any{"aspect_ratio": "0:9"}},
+				{name: "ratio bound", fields: map[string]any{"aspect_ratio": "1000:9"}},
+				{name: "combined media ceiling", fields: map[string]any{"reference_audios": []any{"https://cdn.example/audio.mp3"}}},
+				{name: "custom references require URLs", fields: map[string]any{"reference_images": []any{"data:image/png;base64,YQ=="}}},
+				{name: "untrimmed model", model: " future"},
+				{name: "wildcard model", model: "future*"},
+				{name: "comma model", model: "future,other"},
+				{name: "control model", model: "future\u0085"},
+				{name: "utf8 model ceiling", model: strings.Repeat("字", 86)},
+			} {
+				t.Run(invalid.name, func(t *testing.T) {
+					body := map[string]any{}
+					for name, value := range request {
+						body[name] = value
+					}
+					delete(body, invalid.omit)
+					for name, value := range invalid.fields {
+						body[name] = value
+					}
+					modelName := upstream
+					if invalid.model != "" {
+						modelName = invalid.model
+					}
+					_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
+						"model": tc.known, "upstreamModel": modelName, "body": map[string]any{"kind": "json", "value": body},
+					})
+					require.Error(t, err)
+					_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": tc.known, "upstreamModel": modelName, "requestBody": body, "publicTaskId": "public-id"})
+					require.Error(t, err, "the driver must independently enforce the same boundary")
+				})
+			}
+		})
+	}
+}
+
+func TestConfiguredVideoSingleImageReferenceProtocol(t *testing.T) {
+	const upstream = "vendor/future-image-video"
+	const imageURL = "https://cdn.example/image.png"
+	for _, key := range []string{"yali", "nldw", "yuxibox"} {
+		t.Run(key, func(t *testing.T) {
+			source, err := builtinplugins.Source(key)
+			require.NoError(t, err)
+			plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: key})
+			require.NoError(t, err)
+			images, videos, audios := 2, 0, 1
+			config := kitdto.TaskVideoModelConfig{Duration: kitdto.TaskVideoDuration{Values: []int{5}}, Resolutions: []string{"720p"}, AspectRatios: []string{"16:9"}, Modes: []string{"text_to_video", "reference_to_video", "image_to_video"}, References: kitdto.TaskVideoReferences{Images: &images, Videos: &videos, Audios: &audios}, BillingMode: "per_request"}
+			require.NoError(t, config.ValidateForPlugin(key, relaycommon.MaxTaskDurationSeconds))
+			plugin = jsplugin.WithTaskVideoModels(plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})
+			profile, found := plugin.Meta.VideoProfileForModel(upstream)
+			require.True(t, found)
+			for _, tc := range []struct {
+				name, action string
+				fields       map[string]any
+			}{
+				{name: "text", action: "text_to_video", fields: map[string]any{"mode": "text_to_video"}},
+				{name: "singular image", action: "image_to_video", fields: map[string]any{"image": imageURL}},
+				{name: "explicit image alias", action: "image_to_video", fields: map[string]any{"input_reference": imageURL, "mode": "image_to_video"}},
+				{name: "single reference remains reference", action: "reference_to_video", fields: map[string]any{"reference_images": []any{imageURL}}},
+				{name: "explicit reference", action: "reference_to_video", fields: map[string]any{"reference_images": []any{imageURL}, "mode": "reference_to_video"}},
+				{name: "image plus reference", action: "reference_to_video", fields: map[string]any{"image": imageURL, "reference_images": []any{"https://cdn.example/other.png"}}},
+				{name: "image plus audio", action: "reference_to_video", fields: map[string]any{"image": imageURL, "reference_audios": []any{"https://cdn.example/audio.mp3"}}},
+				{name: "image mode rejects missing image", fields: map[string]any{"mode": "image_to_video"}},
+				{name: "image mode rejects references", fields: map[string]any{"image": imageURL, "reference_images": []any{"https://cdn.example/other.png"}, "mode": "image_to_video"}},
+				{name: "image mode rejects audio", fields: map[string]any{"image": imageURL, "reference_audios": []any{"https://cdn.example/audio.mp3"}, "mode": "image_to_video"}},
+				{name: "image mode rejects a last frame", fields: map[string]any{"image": imageURL, "last_frame": "https://cdn.example/last.png", "mode": "image_to_video"}},
+				{name: "text mode rejects image", fields: map[string]any{"image": imageURL, "mode": "text_to_video"}},
+				{name: "reference mode requires references", fields: map[string]any{"mode": "reference_to_video"}},
+				{name: "reference collection cannot become image implicitly", fields: map[string]any{"reference_images": []any{imageURL}, "mode": "image_to_video"}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					request := map[string]any{"prompt": "animate the scene", "seconds": 5, "resolution": "720p", "aspect_ratio": "16:9"}
+					for name, value := range tc.fields {
+						request[name] = value
+					}
+					intent, err := decodeNLDWVideoRequest(t, plugin, upstream, request)
+					if tc.action == "" {
+						require.Error(t, err)
+						_, err = plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": "public-alias", "upstreamModel": upstream, "requestBody": request, "publicTaskId": "public-image-id"})
+						require.Error(t, err, "the outbound boundary must reject contradictory modes too")
+						return
+					}
+					require.NoError(t, err)
+					assert.Equal(t, tc.action, intent["action"])
+					body := intent["requestBody"].(map[string]any)
+					require.NoError(t, service.ValidateVideoProfileRequest(profile, tc.action, body, nil), "canonical input must match the channel's configured mode")
+					repeated, err := decodeNLDWVideoRequest(t, plugin, upstream, body)
+					require.NoError(t, err)
+					assert.Equal(t, intent, repeated, "candidate and final decoders must preserve image versus reference semantics")
+					if tc.action == "image_to_video" {
+						assert.Equal(t, imageURL, body["image"])
+						assert.NotContains(t, body, "references")
+						assert.NotContains(t, body, "reference_images")
+					} else {
+						assert.NotContains(t, body, "image")
+					}
+					value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{"model": "public-alias", "upstreamModel": upstream, "requestBody": body, "publicTaskId": "public-image-id", "baseUrl": "https://api.example", "apiKey": "fixture-key"})
+					require.NoError(t, err)
+					wire := value.(map[string]any)["body"].(map[string]any)
+					assert.Equal(t, upstream, wire["model"])
+					for _, field := range []string{"image", "input_reference", "first_frame", "start_frame", "last_frame"} {
+						assert.NotContains(t, wire, field, "single-image generation must use the existing ordinary-reference protocol")
+					}
+					if tc.action == "image_to_video" {
+						switch key {
+						case "yali":
+							assert.Equal(t, []any{imageURL}, wire["images"])
+						case "nldw":
+							assert.Equal(t, "omni_reference", wire["mode"])
+							assert.Equal(t, []any{map[string]any{"kind": "image", "data": imageURL}}, wire["references"])
+						case "yuxibox":
+							assert.Equal(t, []any{imageURL}, wire["reference_images"])
+						}
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestNLDWVideoModelsReferencesAndBilling(t *testing.T) {
@@ -261,7 +459,7 @@ func TestNLDWVideoRejectsInvalidRequestsBeforeBilling(t *testing.T) {
 		name, model string
 		fields      map[string]any
 	}{
-		{name: "unsupported model", model: "sd2.5-pro"},
+		{name: "custom model requires explicit ratio", model: "sd2.5-pro"},
 		{name: "empty prompt", fields: map[string]any{"prompt": " "}},
 		{name: "zero seconds", fields: map[string]any{"seconds": 0}},
 		{name: "negative seconds", fields: map[string]any{"seconds": -1}},

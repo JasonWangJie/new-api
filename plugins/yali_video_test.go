@@ -28,7 +28,7 @@ func loadYaliVideoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 func decodeYaliVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, request map[string]any) (map[string]any, error) {
 	t.Helper()
 	value, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
-		"model": "minimax-h3-720p", "operation": "create", "body": map[string]any{"kind": "json", "value": request},
+		"model": "minimax-h3-720p", "upstreamModel": "minimax-h3-720p", "operation": "create", "body": map[string]any{"kind": "json", "value": request},
 	})
 	if err != nil {
 		return nil, err
@@ -129,7 +129,7 @@ func TestYaliVideoMappedAliasesEndToEnd(t *testing.T) {
 	_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{
 		"model": "cinema-public", "upstreamModel": "unsupported-model", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "cat"}},
 	})
-	require.ErrorContains(t, err, "Unsupported Yali video model")
+	require.ErrorContains(t, err, "seconds must be between 1 and 3600")
 }
 
 func TestYaliVideoRequestValidation(t *testing.T) {

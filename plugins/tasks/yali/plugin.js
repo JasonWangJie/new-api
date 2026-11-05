@@ -3,13 +3,55 @@ const UPSTREAM_MODEL = "MiniMaxH3-720p-realistic";
 const MODELS = [PUBLIC_MODEL, UPSTREAM_MODEL];
 const ASPECT_RATIOS = ["16:9", "9:16"];
 const REQUEST_FIELDS = new Set([
-  "model", "prompt", "seconds", "duration", "resolution", "size", "aspect_ratio", "ratio", "aspectRatio", "metadata", "references",
-  "image", "input_reference", "reference_images", "images", "image_urls", "referenceImages", "reference_audios", "audios", "audio_urls", "referenceAudios",
+  "model",
+  "mode",
+  "prompt",
+  "seconds",
+  "duration",
+  "resolution",
+  "size",
+  "aspect_ratio",
+  "ratio",
+  "aspectRatio",
+  "metadata",
+  "references",
+  "image",
+  "input_reference",
+  "reference_images",
+  "images",
+  "image_urls",
+  "referenceImages",
+  "reference_audios",
+  "audios",
+  "audio_urls",
+  "referenceAudios",
 ]);
 const UNSUPPORTED_FIELDS = [
-  "video", "videos", "video_urls", "reference_video", "reference_videos", "referenceVideos", "content", "last_frame", "first_image", "last_image", "first_frame_image", "last_frame_image",
-  "generate_audio", "watermark", "return_last_frame", "face", "task_mode", "omni_reference_task_type", "extension_direction",
-  "priority", "output_format", "execution_expires_after", "service_tier", "safety_identifier", "callback_url",
+  "video",
+  "videos",
+  "video_urls",
+  "reference_video",
+  "reference_videos",
+  "referenceVideos",
+  "content",
+  "last_frame",
+  "first_image",
+  "last_image",
+  "first_frame_image",
+  "last_frame_image",
+  "generate_audio",
+  "watermark",
+  "return_last_frame",
+  "face",
+  "task_mode",
+  "omni_reference_task_type",
+  "extension_direction",
+  "priority",
+  "output_format",
+  "execution_expires_after",
+  "service_tier",
+  "safety_identifier",
+  "callback_url",
 ];
 const USAGE_SCHEMA = {
   requests: { type: "number", unit: "count", unitLabel: { en: "video", zh: "条" }, description: { en: "Video generation unit price", zh: "视频生成单价" } },
@@ -18,24 +60,24 @@ const USAGE_SCHEMA = {
 
 export const meta = {
   videoRetryInputs: [
-    {"path": "/image", "kind": "image"},
-    {"path": "/input_reference", "kind": "image"},
-    {"path": "/images/*", "kind": "image"},
-    {"path": "/reference_images/*", "kind": "image"},
-    {"path": "/image_urls/*", "kind": "image"},
-    {"path": "/referenceImages/*", "kind": "image"},
-    {"path": "/reference_audios/*", "kind": "audio"},
-    {"path": "/audios/*", "kind": "audio"},
-    {"path": "/audio_urls/*", "kind": "audio"},
-    {"path": "/referenceAudios/*", "kind": "audio"},
-    {"path": "/references/*/source", "kind": "media"},
-    {"path": "/metadata/reference_audio/*", "kind": "audio"},
+    { path: "/image", kind: "image" },
+    { path: "/input_reference", kind: "image" },
+    { path: "/images/*", kind: "image" },
+    { path: "/reference_images/*", kind: "image" },
+    { path: "/image_urls/*", kind: "image" },
+    { path: "/referenceImages/*", kind: "image" },
+    { path: "/reference_audios/*", kind: "audio" },
+    { path: "/audios/*", kind: "audio" },
+    { path: "/audio_urls/*", kind: "audio" },
+    { path: "/referenceAudios/*", kind: "audio" },
+    { path: "/references/*/source", kind: "media" },
+    { path: "/metadata/reference_audio/*", kind: "audio" },
   ],
   apiVersion: 1,
   key: "yali",
   name: "Yali Video",
   icon: "text:YL",
-  version: "1.0.5",
+  version: "1.0.6",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.yaliai.com",
   website: "https://api.yaliai.com/video-api.md",
@@ -58,10 +100,14 @@ export const meta = {
       models: [model],
       modes: [
         { ...settings, name: "text_to_video" },
-        { ...settings, name: "reference_to_video", inputs: [
-          { name: "reference_images", kind: "image", sources: ["url"], maxItems: 9 },
-          { name: "reference_audios", kind: "audio", sources: ["url"], maxItems: 3 },
-        ] },
+        {
+          ...settings,
+          name: "reference_to_video",
+          inputs: [
+            { name: "reference_images", kind: "image", sources: ["url"], maxItems: 9 },
+            { name: "reference_audios", kind: "audio", sources: ["url"], maxItems: 3 },
+          ],
+        },
       ],
     };
   }),
@@ -78,11 +124,26 @@ function mediaURL(value) {
   const hostMatch = /^([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::([0-9]{1,5}))?$/.exec(authority);
   if (!hostMatch || (hostMatch[2] && (Number(hostMatch[2]) < 1 || Number(hostMatch[2]) > 65535))) throw new Error("Media reference URL host is invalid");
   const host = hostMatch[1];
-  if (!host.includes(".") || host.endsWith(".local") || host.endsWith(".localhost") || host.split(".").some((label) => !label || label.startsWith("-") || label.endsWith("-"))) throw new Error("Media references must use public hosts");
+  if (
+    !host.includes(".") ||
+    host.endsWith(".local") ||
+    host.endsWith(".localhost") ||
+    host.split(".").some((label) => !label || label.startsWith("-") || label.endsWith("-"))
+  )
+    throw new Error("Media references must use public hosts");
   if (/^[0-9.]+$/.test(host)) {
     const octets = host.split(".").map(Number);
-    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part > 255) || host.split(".").some((part) => String(Number(part)) !== part)) throw new Error("Media reference IP address is invalid");
-    if ([0, 10, 127].includes(octets[0]) || octets[0] >= 224 || octets[0] === 169 && octets[1] === 254 || octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31 || octets[0] === 192 && octets[1] === 168 || octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) throw new Error("Media references must use public hosts");
+    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part > 255) || host.split(".").some((part) => String(Number(part)) !== part))
+      throw new Error("Media reference IP address is invalid");
+    if (
+      [0, 10, 127].includes(octets[0]) ||
+      octets[0] >= 224 ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168) ||
+      (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127)
+    )
+      throw new Error("Media references must use public hosts");
   }
   return value;
 }
@@ -102,16 +163,31 @@ function videoAPIError(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return "";
   if (typeof value.message === "string" && value.message.trim()) return value.message.trim();
   const code = value.code;
-  if (typeof code === "string" && code.trim() && code.trim() !== "0" || typeof code === "number" && Number.isFinite(code) && code !== 0) return "Yali video error: " + String(code);
+  if ((typeof code === "string" && code.trim() && code.trim() !== "0") || (typeof code === "number" && Number.isFinite(code) && code !== 0))
+    return "Yali video error: " + String(code);
   return "";
 }
 
 function normalizeRequest(request, model) {
-  if (!MODELS.includes(model)) throw new Error("Unsupported Yali video model");
+  // oxlint-disable no-control-regex -- Match the host's model identity rules
+  if (typeof model !== "string" || !model || model !== model.trim() || /[\x00-\x1f\x7f-\x9f,*]/.test(model)) throw new Error("Invalid Yali video model");
+  // oxlint-enable no-control-regex
+  let modelBytes = 0;
+  for (const character of model) {
+    const codePoint = character.codePointAt(0);
+    modelBytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (modelBytes > 255) throw new Error("Yali video model must not exceed 255 UTF-8 bytes");
+  }
+  const builtIn = MODELS.includes(model);
   if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("JSON object required");
   for (const name of Object.keys(request)) {
     if (!REQUEST_FIELDS.has(name)) throw new Error(name + " is not supported by this Yali model");
   }
+  if (
+    request.mode !== undefined &&
+    !(builtIn ? ["text_to_video", "reference_to_video"] : ["text_to_video", "reference_to_video", "image_to_video"]).includes(request.mode)
+  )
+    throw new Error("Unsupported Yali video mode");
   const metadata = request.metadata === undefined ? {} : request.metadata;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("metadata must be an object");
   for (const name of Object.keys(metadata)) {
@@ -120,22 +196,27 @@ function normalizeRequest(request, model) {
   if (typeof request.prompt !== "string" || !request.prompt.trim()) throw new Error("prompt is required");
   if (Array.from(request.prompt).length > 20000) throw new Error("prompt exceeds the video length limit");
   const rawSeconds = aliasedValue(request, ["seconds", "duration"]);
-  if (rawSeconds !== undefined && !["string", "number"].includes(typeof rawSeconds)) throw new Error("seconds must be 15");
-  const seconds = rawSeconds === undefined ? 15 : Number(rawSeconds);
-  if (!Number.isInteger(seconds) || seconds !== 15) throw new Error("seconds must be 15");
+  if (rawSeconds !== undefined && !["string", "number"].includes(typeof rawSeconds))
+    throw new Error(builtIn ? "seconds must be 15" : "seconds must be an integer");
+  const seconds = rawSeconds === undefined ? (builtIn ? 15 : undefined) : Number(rawSeconds);
+  if (!Number.isInteger(seconds) || (builtIn ? seconds !== 15 : seconds < 1 || seconds > 3600))
+    throw new Error(builtIn ? "seconds must be 15" : "seconds must be between 1 and 3600");
   const defaultResolution = "720p";
   const rawResolution = aliasedValue(request, ["resolution", "size"]);
-  const resolution = rawResolution === undefined ? defaultResolution : typeof rawResolution === "string" ? rawResolution.toLowerCase() : "";
-  if (resolution !== defaultResolution) throw new Error("resolution must be " + defaultResolution + " for this Yali model");
+  const resolution =
+    rawResolution === undefined ? (builtIn ? defaultResolution : undefined) : typeof rawResolution === "string" ? rawResolution.toLowerCase() : "";
+  if (builtIn ? resolution !== defaultResolution : typeof resolution !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,31}$/.test(resolution))
+    throw new Error(builtIn ? "resolution must be " + defaultResolution + " for this Yali model" : "A valid resolution is required");
   const rawRatio = aliasedValue(request, ["aspect_ratio", "ratio", "aspectRatio"]);
-  const ratio = rawRatio === undefined ? "16:9" : rawRatio;
-  if (!ASPECT_RATIOS.includes(ratio)) throw new Error("aspect_ratio must be 16:9 or 9:16");
+  const ratio = rawRatio === undefined && builtIn ? "16:9" : rawRatio;
+  if (builtIn ? !ASPECT_RATIOS.includes(ratio) : typeof ratio !== "string" || !/^(?:[1-9][0-9]{0,2}:[1-9][0-9]{0,2}|auto|adaptive)$/.test(ratio))
+    throw new Error(builtIn ? "aspect_ratio must be 16:9 or 9:16" : "A valid aspect_ratio is required");
 
   const images = [];
   const audios = [];
   for (const [names, destination, limit] of [
-    [["reference_images", "images", "image_urls", "referenceImages"], images, 9],
-    [["reference_audios", "audios", "audio_urls", "referenceAudios"], audios, 3],
+    [["reference_images", "images", "image_urls", "referenceImages"], images, builtIn ? 9 : 64],
+    [["reference_audios", "audios", "audio_urls", "referenceAudios"], audios, builtIn ? 3 : 64],
   ]) {
     for (const name of names) {
       if (request[name] === undefined) continue;
@@ -144,41 +225,60 @@ function normalizeRequest(request, model) {
     }
   }
   if (request.image !== undefined && request.input_reference !== undefined) throw new Error("image and input_reference cannot both be provided");
-  const image = request.input_reference === undefined ? request.image : request.input_reference;
-  if (image !== undefined) images.push(mediaURL(image));
+  let image = request.input_reference === undefined ? request.image : request.input_reference;
+  if (image !== undefined) image = mediaURL(image);
+  if (image !== undefined) images.push(image);
   if (metadata.reference_audio !== undefined) {
-    if (!Array.isArray(metadata.reference_audio) || metadata.reference_audio.length > 3) throw new Error("metadata.reference_audio exceeds the media limit");
+    if (!Array.isArray(metadata.reference_audio) || metadata.reference_audio.length > (builtIn ? 3 : 64))
+      throw new Error("metadata.reference_audio exceeds the media limit");
     if (audios.length) throw new Error("reference_audios and metadata.reference_audio cannot both be provided");
     for (const value of metadata.reference_audio) audios.push(mediaURL(value));
   }
   if (request.references !== undefined) {
-    if (!Array.isArray(request.references) || request.references.length > 12) throw new Error("references exceeds the media limit");
+    if (!Array.isArray(request.references) || request.references.length > (builtIn ? 12 : 64)) throw new Error("references exceeds the media limit");
     for (const reference of request.references) {
-      if (!reference || typeof reference !== "object" || Array.isArray(reference) || !["image", "audio"].includes(reference.type)) throw new Error("Only image and audio references are supported");
-      if (reference.role !== undefined && !["reference", "reference_" + reference.type].includes(reference.role)) throw new Error("Only ordinary media references are supported");
+      if (!reference || typeof reference !== "object" || Array.isArray(reference) || !["image", "audio"].includes(reference.type))
+        throw new Error("Only image and audio references are supported");
+      if (reference.role !== undefined && !["reference", "reference_" + reference.type].includes(reference.role))
+        throw new Error("Only ordinary media references are supported");
       for (const name of Object.keys(reference)) {
         if (!["type", "role", "source"].includes(name)) throw new Error("Unsupported reference field: " + name);
       }
       (reference.type === "image" ? images : audios).push(mediaURL(reference.source));
     }
   }
-  if (images.length > 9 || audios.length > 3) throw new Error("Yali supports at most 9 image and 3 audio references");
+  const action =
+    !builtIn && image !== undefined && images.length === 1 && !audios.length
+      ? "image_to_video"
+      : images.length || audios.length
+        ? "reference_to_video"
+        : "text_to_video";
+  if (builtIn ? images.length > 9 || audios.length > 3 : images.length + audios.length > 64)
+    throw new Error(builtIn ? "Yali supports at most 9 image and 3 audio references" : "Yali supports at most 64 media references");
+  if (request.mode !== undefined && request.mode !== action) throw new Error("mode conflicts with the supplied media");
   const body = { model, prompt: request.prompt.trim(), seconds, resolution, aspect_ratio: ratio };
-  if (images.length) body.reference_images = images;
+  if (action === "image_to_video") body.image = image;
+  else if (images.length) body.reference_images = images;
   if (audios.length) body.reference_audios = audios;
-  return { body, action: images.length || audios.length ? "reference_to_video" : "text_to_video" };
+  return { body, action };
 }
 
 export function buildSubmitRequest(ctx) {
   const normalized = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
   let model = ctx.upstreamModel || ctx.model;
   if (model === PUBLIC_MODEL) model = UPSTREAM_MODEL;
-  if (model !== UPSTREAM_MODEL) throw new Error("Unsupported Yali upstream model");
   const request = normalized.body;
   // This provider calls its medium resolution 768P. The observed output is
   // 1312x736, so the public capability and frozen billing fact remain 720p.
-  const body = { model, prompt: request.prompt, seconds: request.seconds, resolution: "768P", aspect_ratio: request.aspect_ratio };
+  const body = {
+    model,
+    prompt: request.prompt,
+    seconds: request.seconds,
+    resolution: model === UPSTREAM_MODEL ? "768P" : request.resolution,
+    aspect_ratio: request.aspect_ratio,
+  };
   if (request.reference_images) body.images = request.reference_images;
+  if (request.image) body.images = [request.image];
   if (request.reference_audios) body.metadata = { reference_audio: request.reference_audios };
   return { url: ctx.baseUrl + "/v1/videos", method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + ctx.apiKey }, body };
 }
@@ -196,7 +296,9 @@ export function parseSubmitResponse(_ctx, response) {
 export function extractUsage(ctx) {
   if (ctx.usagePurpose === "billing_ratios") return null;
   const normalized = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model);
-  return { requests: 1, resolution: normalized.body.resolution };
+  const facts = { requests: 1, resolution: normalized.body.resolution };
+  if (!MODELS.includes(ctx.upstreamModel || ctx.model)) facts.seconds = normalized.body.seconds;
+  return facts;
 }
 
 export function buildQueryRequest(ctx) {
@@ -221,7 +323,11 @@ export function listArtifacts(task) {
 
 export function buildContentRequest(ctx) {
   if (ctx.artifactKey !== "video") throw new Error("artifact_not_found");
-  return { url: ctx.baseUrl + "/v1/videos/" + encodeURIComponent(ctx.upstreamTaskId) + "/content", method: ctx.clientRequest.method, headers: { Authorization: "Bearer " + ctx.apiKey } };
+  return {
+    url: ctx.baseUrl + "/v1/videos/" + encodeURIComponent(ctx.upstreamTaskId) + "/content",
+    method: ctx.clientRequest.method,
+    headers: { Authorization: "Bearer " + ctx.apiKey },
+  };
 }
 
 export const protocols = {
@@ -229,7 +335,12 @@ export const protocols = {
     decodeRequest(ctx) {
       if (!ctx.body || ctx.body.kind !== "json") throw new Error("Yali video requires JSON with public media URLs");
       if (ctx.operation && ctx.operation !== "create") throw new Error("Yali video supports generation only");
+      if (!ctx.upstreamModel) {
+        if (!ctx.body.value || typeof ctx.body.value !== "object" || Array.isArray(ctx.body.value)) throw new Error("JSON object required");
+        return { kind: "submit", model: ctx.model, requestBody: ctx.body.value };
+      }
       const normalized = normalizeRequest(ctx.body.value, ctx.upstreamModel || ctx.model);
+      normalized.body.model = ctx.model;
       return { kind: "submit", model: ctx.model, action: normalized.action, requestBody: normalized.body };
     },
     render(_ctx, task) {

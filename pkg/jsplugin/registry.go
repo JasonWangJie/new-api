@@ -291,8 +291,10 @@ type UsageFieldSchema struct {
 }
 
 type LoadedPlugin struct {
-	Meta   Meta
-	Engine *Engine
+	Meta               Meta
+	Engine             *Engine
+	presetVideoMeta    *Meta
+	presetVideoAliases map[string]bool
 }
 
 // RegistrySnapshot is a read-only copy of the metadata currently stored in

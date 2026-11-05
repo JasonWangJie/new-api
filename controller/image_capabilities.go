@@ -512,7 +512,8 @@ func videoProfileMaxDuration(profile pluginruntime.VideoProfile) int {
 }
 
 func videoPricingStatus(provider, modelName, mappedModel string, plugin *pluginruntime.LoadedPlugin, channel *model.Channel) string {
-	configuredPricing := provider == constant.TaskPlatformHuahuoVideo || provider == "wolong"
+	configuredPricing := provider == constant.TaskPlatformHuahuoVideo || provider == "wolong" ||
+		dto.PresetTaskVideoPlugin(provider) && pluginruntime.IsCustomTaskVideoModel(plugin, mappedModel)
 	requiresSeconds := false
 	if configuredPricing {
 		upstream, config, err := channel.TaskVideoModelConfig(modelName)

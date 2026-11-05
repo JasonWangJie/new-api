@@ -120,9 +120,6 @@ func ScheduleAsyncVideoReferenceRecovery(ctx context.Context, task Task, job Asy
 		}
 		now := time.Now().Unix()
 		configuredUnknown := policyRecovery && plans[0].Decision.BlockedReason == "" && mediaretry.IsResubmission(plans[0].Decision.Action) && !plans[0].Fact.HasOutput && (plans[0].Fact.Unknown || plans[0].Fact.Accepted && !plans[0].Fact.Terminal)
-		if configuredUnknown && current.PrivateData.CurrentAttempt != nil && current.PrivateData.CurrentAttempt.MixedVideo {
-			return ErrTaskAttemptConflict
-		}
 		rejected := policyRecovery && plans[0].RejectedSubmission && currentJob.ReferenceRecoveryStage == "dispatched" && currentJob.DispatchedAt > 0 && current.Status == TaskStatusQueued && current.PrivateData.UpstreamTaskID == ""
 		// Inline reference preparation runs in the submit phase, before the
 		// same dispatch barrier. Only an unsent operation may advance this way.

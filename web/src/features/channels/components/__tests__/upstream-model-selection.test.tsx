@@ -43,6 +43,7 @@ test('manual capability initialization preserves configured models and leaves ma
   const manual = {
     ...taskVideoCatalogConfig(undefined, true),
     duration: { values: [5] },
+    modes: ['first_last_frame'],
     billing_mode: 'per_request',
   }
   const onChange = vi.fn()
@@ -73,6 +74,9 @@ test('manual capability initialization preserves configured models and leaves ma
     existing: manual,
     'seedance-future': taskVideoCatalogConfig(undefined, true),
   })
+  expect(
+    JSON.parse(onChange.mock.lastCall?.[0] as string)['seedance-future'].modes
+  ).toEqual(['text_to_video', 'reference_to_video', 'image_to_video'])
 })
 
 test('catalog capability previews preserve manual edits and import only missing selections', async () => {
@@ -80,6 +84,7 @@ test('catalog capability previews preserve manual edits and import only missing 
     ...taskVideoCatalogConfig(),
     duration: { values: [5, 10] },
     resolutions: ['720p'],
+    modes: ['text_to_video'],
     billing_mode: 'per_request',
   }
   const manual = {

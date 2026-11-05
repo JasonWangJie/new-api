@@ -1235,7 +1235,14 @@ func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string,
 		}
 		for _, item := range response.Data {
 			if item.B64 != "" {
-				references = append(references, "data:"+http.DetectContentType(decodeAsyncImagePrefix(item.B64))+";base64,"+item.B64)
+				prefix := bytes.TrimSpace(bytes.TrimPrefix(decodeAsyncImagePrefix(item.B64), []byte{0xef, 0xbb, 0xbf}))
+				contentType := http.DetectContentType(prefix)
+				if bytes.HasPrefix(prefix, []byte("<")) {
+					// HTTP sniffing classifies SVG as text/XML. The output validator
+					// below still requires a complete, safe SVG document.
+					contentType = "image/svg+xml"
+				}
+				references = append(references, "data:"+contentType+";base64,"+item.B64)
 			} else if item.URL != "" {
 				references = append(references, item.URL)
 			} else {

@@ -346,7 +346,8 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 		exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, info.UpstreamModelName)
 		useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
-		configuredVideoPricing := platform == constant.TaskPlatformHuahuoVideo || platform == "wolong"
+		configuredVideoPricing := platform == constant.TaskPlatformHuahuoVideo || platform == "wolong" ||
+			kitdto.PresetTaskVideoPlugin(string(platform)) && jsplugin.IsCustomTaskVideoModel(pinnedPlugin.Plugin, info.UpstreamModelName)
 		if configuredVideoPricing && pinnedPlugin.Plugin != nil {
 			schema, _ := pinnedPlugin.Plugin.Meta.UsageForModel(info.UpstreamModelName)
 			if _, perSecond := schema["seconds"]; perSecond && (!exists || !billingexpr.UsedUsageKeys(exprStr)["seconds"]) {

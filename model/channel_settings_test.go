@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -55,6 +56,7 @@ func TestWolongModelDefaultsAndConfiguredCatalog(t *testing.T) {
 	_, _, err = channel.TaskVideoModelConfig("future-model")
 	require.ErrorContains(t, err, "requires a saved capability")
 	custom := defaults
+	custom.PresetModel = ""
 	custom.BillingMode = "per_second"
 	channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong", TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-model": custom, channel.Models: custom}})
 	_, _, err = channel.TaskVideoModelConfig(channel.Models)
@@ -73,6 +75,174 @@ func TestWolongModelDefaultsAndConfiguredCatalog(t *testing.T) {
 	_, config, err := channel.TaskVideoModelConfig("haya-mo-seedance-25")
 	require.NoError(t, err)
 	assert.Equal(t, defaults, config)
+}
+
+func TestPresetVideoConfigRestoresFrozenContracts(t *testing.T) {
+	previous := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previous })
+	for _, key := range dto.ChannelConfiguredTaskVideoPlugins() {
+		if !dto.PresetTaskVideoPlugin(key) {
+			continue
+		}
+		t.Run(key, func(t *testing.T) {
+			source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", key, "plugin.js"))
+			require.NoError(t, err)
+			plugin, err := jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: key})
+			require.NoError(t, err)
+			for _, name := range plugin.Meta.Models {
+				settings := dto.ChannelSettings{TaskPluginKey: key}
+				defaults, err := ResolveTaskVideoModelConfig(settings, name)
+				require.NoError(t, err, name)
+				encoded, err := common.Marshal(defaults)
+				require.NoError(t, err)
+				var frozen dto.TaskVideoModelConfig
+				require.NoError(t, common.Unmarshal(encoded, &frozen))
+				assert.Empty(t, frozen.PresetModel)
+				settings.TaskPluginModelConfigs = map[string]dto.TaskVideoModelConfig{name: frozen}
+				require.NoError(t, settings.ValidateTaskVideoModels(3600))
+				restored, err := ResolveTaskVideoModelConfig(settings, name)
+				require.NoError(t, err)
+				assert.Equal(t, defaults, restored)
+				assert.False(t, IsConfiguredTaskVideoModel(settings, name))
+				selected := jsplugin.WithTaskVideoModels(plugin, map[string]dto.TaskVideoModelConfig{"public-alias": restored})
+				expected, _ := plugin.Meta.VideoProfileForModel(name)
+				actual, found := selected.Meta.VideoProfileForModel("public-alias")
+				require.True(t, found)
+				expected.Models = []string{"public-alias"}
+				assert.Equal(t, expected, actual)
+				if key != "wolong" {
+					frozen.Duration = dto.TaskVideoDuration{Values: []int{3600}}
+					settings.TaskPluginModelConfigs[name] = frozen
+					_, err = ResolveTaskVideoModelConfig(settings, name)
+					require.ErrorContains(t, err, "built-in capabilities")
+				}
+			}
+			var members []Channel
+			unit := ""
+			for _, name := range plugin.Meta.Models {
+				defaults, err := ResolveTaskVideoModelConfig(dto.ChannelSettings{TaskPluginKey: key}, name)
+				require.NoError(t, err)
+				if unit != "" && unit != defaults.BillingMode {
+					continue
+				}
+				unit = defaults.BillingMode
+				mapping, err := common.Marshal(map[string]string{"shared-public": name})
+				require.NoError(t, err)
+				channel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: "shared-public", ModelMapping: common.GetPointer(string(mapping))}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: key})
+				members = append(members, channel)
+				if len(members) == 2 {
+					break
+				}
+			}
+			if len(members) == 2 {
+				catalog, err := taskVideoModelCatalog(members, key)
+				require.NoError(t, err)
+				assert.Empty(t, catalog["shared-public"].PresetModel, "different source presets cannot claim one shared provenance")
+				discovery := jsplugin.WithTaskVideoModels(plugin, catalog)
+				for _, member := range members {
+					upstream, config, err := member.TaskVideoModelConfig("shared-public")
+					require.NoError(t, err)
+					selected := jsplugin.WithTaskVideoModels(discovery, map[string]dto.TaskVideoModelConfig{"shared-public": config, upstream: config})
+					expected, _ := plugin.Meta.VideoProfileForModel(upstream)
+					actual, found := selected.Meta.VideoProfileForModel("shared-public")
+					require.True(t, found)
+					expected.Models = []string{"shared-public"}
+					assert.Equal(t, expected, actual)
+					assert.False(t, jsplugin.IsCustomTaskVideoModel(selected, "shared-public"))
+				}
+			}
+			if key == "drama" {
+				members = nil
+				for _, name := range []string{"seedance2.0-F", "seedance2.5-G"} {
+					mapping, err := common.Marshal(map[string]string{"shared-rich": name})
+					require.NoError(t, err)
+					channel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: "shared-rich", ModelMapping: common.GetPointer(string(mapping))}
+					channel.SetSetting(dto.ChannelSettings{TaskPluginKey: key})
+					members = append(members, channel)
+				}
+				catalog, err := taskVideoModelCatalog(members, key)
+				require.NoError(t, err)
+				assert.ElementsMatch(t, []string{"seedance2.0-F", "seedance2.5-G"}, catalog["shared-rich"].PresetModels)
+				discovery := jsplugin.WithTaskVideoModels(plugin, catalog)
+				require.NoError(t, jsplugin.ValidateV1Meta(discovery.Meta))
+				profile, found := discovery.Meta.VideoProfileForModel("shared-rich")
+				require.True(t, found)
+				modes := map[string]jsplugin.VideoModeProfile{}
+				for _, mode := range profile.Modes {
+					modes[mode.Name] = mode
+				}
+				assert.Contains(t, modes, "edit_video")
+				assert.Contains(t, modes, "extend_video")
+				assert.True(t, modes["reference_to_video"].Options.GenerateAudio)
+				assert.True(t, modes["reference_to_video"].Options.ReturnLastFrame)
+				assert.Contains(t, modes["reference_to_video"].Inputs[0].Sources, "asset")
+				schema, _ := discovery.Meta.UsageForModel("shared-rich")
+				assert.Contains(t, schema, "tokens")
+				assert.Contains(t, schema, "video_input")
+				assert.False(t, jsplugin.IsCustomTaskVideoModel(discovery, "shared-rich"))
+				for _, member := range members {
+					upstream, config, err := member.TaskVideoModelConfig("shared-rich")
+					require.NoError(t, err)
+					selected := jsplugin.WithTaskVideoModels(discovery, map[string]dto.TaskVideoModelConfig{"shared-rich": config})
+					expected, _ := plugin.Meta.VideoProfileForModel(upstream)
+					actual, _ := selected.Meta.VideoProfileForModel("shared-rich")
+					expected.Models = []string{"shared-rich"}
+					assert.Equal(t, expected, actual)
+				}
+				custom := dto.TaskVideoModelConfig{
+					Duration:    dto.TaskVideoDuration{Values: []int{30}, Default: 30},
+					Resolutions: []string{"future4k"}, AspectRatios: []string{"32:9"}, Modes: []string{"text_to_video"},
+					References: dto.TaskVideoReferences{Images: common.GetPointer(0), Videos: common.GetPointer(0), Audios: common.GetPointer(0)}, BillingMode: "per_second",
+				}
+				mapping, err := common.Marshal(map[string]string{"shared-rich": "future-model"})
+				require.NoError(t, err)
+				customChannel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: "shared-rich", ModelMapping: common.GetPointer(string(mapping))}
+				customChannel.SetSetting(dto.ChannelSettings{TaskPluginKey: key, TaskPluginModelConfigs: map[string]dto.TaskVideoModelConfig{"future-model": custom}})
+				members = append(members, customChannel)
+				for _, order := range [][]Channel{members, {members[2], members[0], members[1]}} {
+					catalog, err = taskVideoModelCatalog(order, key)
+					require.NoError(t, err)
+					assert.True(t, catalog["shared-rich"].CustomModelUnion)
+					discovery = jsplugin.WithTaskVideoModels(plugin, catalog)
+					require.NoError(t, jsplugin.ValidateV1Meta(discovery.Meta))
+					profile, found = discovery.Meta.VideoProfileForModel("shared-rich")
+					require.True(t, found)
+					clear(modes)
+					for _, mode := range profile.Modes {
+						modes[mode.Name] = mode
+					}
+					assert.Contains(t, modes, "edit_video")
+					assert.Contains(t, modes, "extend_video")
+					assert.True(t, modes["reference_to_video"].Options.GenerateAudio)
+					assert.True(t, modes["reference_to_video"].Options.ReturnLastFrame)
+					assert.Contains(t, modes["reference_to_video"].Inputs[0].Sources, "asset")
+					assert.Contains(t, modes["text_to_video"].Resolutions, "future4k")
+					assert.Contains(t, modes["text_to_video"].Duration.Values, 30)
+					schema, _ = discovery.Meta.UsageForModel("shared-rich")
+					assert.Contains(t, schema, "tokens")
+					assert.Contains(t, schema["resolution"].Enum, "future4k")
+					upstream, preset, err := members[0].TaskVideoModelConfig("shared-rich")
+					require.NoError(t, err)
+					selectedPreset := jsplugin.WithTaskVideoModels(discovery, map[string]dto.TaskVideoModelConfig{"shared-rich": preset})
+					expected, _ := plugin.Meta.VideoProfileForModel(upstream)
+					actual, _ := selectedPreset.Meta.VideoProfileForModel("shared-rich")
+					expected.Models = []string{"shared-rich"}
+					assert.Equal(t, expected, actual)
+					selected := jsplugin.WithTaskVideoModels(discovery, map[string]dto.TaskVideoModelConfig{"shared-rich": custom})
+					profile, found = selected.Meta.VideoProfileForModel("shared-rich")
+					require.True(t, found)
+					require.Len(t, profile.Modes, 1)
+					assert.Equal(t, "text_to_video", profile.Modes[0].Name)
+					assert.Equal(t, []string{"future4k"}, profile.Modes[0].Resolutions)
+					schema, _ = selected.Meta.UsageForModel("shared-rich")
+					assert.NotContains(t, schema, "tokens")
+					assert.True(t, jsplugin.IsCustomTaskVideoModel(selected, "shared-rich"))
+				}
+			}
+		})
+	}
 }
 
 func TestTaskVideoModelBindingWrites(t *testing.T) {
@@ -112,6 +282,107 @@ func TestTaskVideoModelBindingWrites(t *testing.T) {
 			}
 			require.NoError(t, db.Raw(query).Scan(&version).Error)
 			t.Logf("%s version: %s", dialect, version)
+			t.Run("batch insert associates generated channel IDs with abilities", func(t *testing.T) {
+				channels := make([]Channel, 51)
+				for i := range channels {
+					channels[i] = Channel{
+						Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
+						Name: fmt.Sprintf("batch-channel-%d", i), Key: "test-key",
+						Models: fmt.Sprintf("batch-model-%d", i), Group: "batch-a,batch-b",
+					}
+				}
+				require.NoError(t, BatchInsertChannels(channels))
+				var saved []Channel
+				require.NoError(t, db.Where("name LIKE ?", "batch-channel-%").Find(&saved).Error)
+				require.Len(t, saved, len(channels))
+				ids := make([]int, 0, len(saved))
+				for _, channel := range saved {
+					require.NotZero(t, channel.Id)
+					ids = append(ids, channel.Id)
+					var abilities []Ability
+					require.NoError(t, db.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+					require.Len(t, abilities, 2)
+					for _, ability := range abilities {
+						assert.Equal(t, channel.Models, ability.Model)
+						assert.Contains(t, []string{"batch-a", "batch-b"}, ability.Group)
+						assert.True(t, ability.Enabled)
+					}
+					assert.NotEqual(t, abilities[0].Group, abilities[1].Group)
+				}
+				var orphanCount int64
+				require.NoError(t, db.Model(&Ability{}).Where("channel_id = ? AND model LIKE ?", 0, "batch-model-%").Count(&orphanCount).Error)
+				assert.Zero(t, orphanCount)
+				require.NoError(t, db.Where("channel_id IN ?", ids).Delete(&Ability{}).Error)
+				require.NoError(t, db.Where("id IN ?", ids).Delete(&Channel{}).Error)
+			})
+			t.Run("disabled preset catalog", func(t *testing.T) {
+				previousRegistry := jsplugin.DefaultRegistry
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				t.Cleanup(func() { jsplugin.DefaultRegistry = previousRegistry })
+				source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "wolong", "plugin.js"))
+				require.NoError(t, err)
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: "wolong"})
+				require.NoError(t, err)
+				channel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Key: "preset-test", Name: "disabled-preset-test", Group: "default", Models: "haya-mo-seedance-25"}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: "wolong"})
+				require.NoError(t, channel.Insert())
+				t.Cleanup(func() { require.NoError(t, channel.Delete()) })
+				jsplugin.DefaultRegistry.SetDisabledFactoryKeys([]string{"wolong"})
+				for _, overridden := range []bool{false, true} {
+					if overridden {
+						override := strings.ReplaceAll(string(source), `defaultAspectRatio: "16:9"`, `defaultAspectRatio: "9:16"`)
+						_, err = jsplugin.DefaultRegistry.Register(override, jsplugin.Options{Key: "wolong"})
+						require.NoError(t, err)
+						jsplugin.DefaultRegistry.SetEnabled(false)
+					}
+					_, active := jsplugin.DefaultRegistry.Get("wolong")
+					require.False(t, active)
+					require.NoError(t, channel.ValidateTaskVideoModelBindings())
+					channel.Name += "-updated"
+					require.NoError(t, channel.Update())
+					snapshot, err := GetTaskPluginSyncSnapshot()
+					require.NoError(t, err)
+					config, found := snapshot.VideoModels["wolong"][channel.Models]
+					require.True(t, found)
+					expected := "16:9"
+					if overridden {
+						expected = "9:16"
+					}
+					assert.Equal(t, expected, config.AspectRatios[0])
+					assert.Equal(t, channel.Models, config.PresetModel)
+					_, active = jsplugin.DefaultRegistry.Get("wolong")
+					assert.False(t, active, "catalog reads must not reenable execution")
+				}
+
+				// A newly started node has not registered the saved override yet.
+				jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+				_, err = jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: "wolong"})
+				require.NoError(t, err)
+				jsplugin.DefaultRegistry.SetDisabledFactoryKeys([]string{"wolong"})
+				overrideSource := strings.ReplaceAll(string(source), "haya-mo-seedance-25", "future-override-only")
+				compiled, err := jsplugin.CompilePlugin(overrideSource, jsplugin.Options{Key: "wolong"})
+				require.NoError(t, err)
+				stored := TaskPlugin{Key: "wolong", APIVersion: 1, Version: compiled.Meta.Version, Source: overrideSource, SourceHash: compiled.Engine.SourceFingerprint(), Enabled: true, Active: true}
+				require.NoError(t, db.Create(&stored).Error)
+				t.Cleanup(func() { require.NoError(t, db.Delete(&stored).Error) })
+				channel.Models = "future-override-only"
+				require.NoError(t, db.Model(&channel).Update("models", channel.Models).Error)
+				snapshot, err := GetTaskPluginSyncSnapshot()
+				require.NoError(t, err)
+				assert.Equal(t, channel.Models, snapshot.VideoModels["wolong"][channel.Models].PresetModel)
+				assert.Empty(t, jsplugin.DefaultRegistry.OverridePlugins(), "snapshot must not publish the desired override")
+				_, active := jsplugin.DefaultRegistry.Get("wolong")
+				assert.False(t, active)
+
+				// An invalid replacement retains the registered incumbent contract.
+				_, err = jsplugin.DefaultRegistry.Register(overrideSource, jsplugin.Options{Key: "wolong"})
+				require.NoError(t, err)
+				jsplugin.DefaultRegistry.SetEnabled(false)
+				require.NoError(t, db.Model(&stored).Updates(map[string]any{"source": "invalid javascript", "source_hash": "invalid"}).Error)
+				snapshot, err = GetTaskPluginSyncSnapshot()
+				require.NoError(t, err)
+				assert.Equal(t, channel.Models, snapshot.VideoModels["wolong"][channel.Models].PresetModel)
+			})
 
 			for _, writes := range [][2]string{{"batch", "batch"}, {"insert", "update"}, {"insert", "tag"}, {"update", "tag"}, {"batch", "upstream sync"}} {
 				t.Run(writes[0]+" against "+writes[1], func(t *testing.T) {

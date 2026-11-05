@@ -97,6 +97,7 @@ func ImagePlazaContent(c *gin.Context) {
 		}
 		c.Header("Cache-Control", "public, max-age=3600")
 		c.Header("Content-Type", object.ContentType)
+		imageOutputSecurityHeaders(c, object.ContentType)
 		c.File(file)
 		return
 	}

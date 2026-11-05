@@ -714,7 +714,15 @@ func TestLegacyDramaMixedVideoReferenceSlots(t *testing.T) {
 				if rebound {
 					// A channel change rebuilds slots from the original public body.
 					request.Body = []byte(`{"references":[]}`)
-					require.NoError(t, RebindMixedVideoRequest(&request, MixedVideoCandidate{Binding: jsplugin.ProtocolBinding{Plugin: plugin}}, now+5*86400))
+					upstream := "seedance2.5-A"
+					var original map[string]any
+					require.NoError(t, common.Unmarshal([]byte(tc.body), &original))
+					if name, ok := original["model"].(string); ok {
+						upstream = name
+					}
+					channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Models: upstream}
+					channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+					require.NoError(t, RebindMixedVideoRequest(&request, MixedVideoCandidate{Channel: channel, UpstreamModel: upstream, Binding: jsplugin.ProtocolBinding{Plugin: plugin}}, now+5*86400))
 				}
 				require.Len(t, request.ReferenceInputs, len(tc.paths))
 				assert.Equal(t, tc.unsupported, request.ReferenceLocalizationUnsupported)

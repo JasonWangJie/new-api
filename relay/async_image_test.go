@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -53,6 +55,13 @@ func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
 	var bitmap bytes.Buffer
 	require.NoError(t, png.Encode(&bitmap, image.NewRGBA(image.Rect(0, 0, 2, 3))))
 	encoded := base64.StdEncoding.EncodeToString(bitmap.Bytes())
+	var animation bytes.Buffer
+	palette := color.Palette{color.Black, color.White}
+	require.NoError(t, gif.EncodeAll(&animation, &gif.GIF{
+		Image: []*image.Paletted{image.NewPaletted(image.Rect(0, 0, 2, 3), palette), image.NewPaletted(image.Rect(0, 0, 2, 3), palette)},
+		Delay: []int{3, 5},
+	}))
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="2" height="3"><path d="M0 0L2 3"/></svg>`)
 	imageURI := "data:image/png;base64," + encoded
 	inline := `{"inlineData":{"mimeType":"image/png","data":"` + encoded + `"}}`
 	file := `{"fileData":{"mimeType":"image/png","fileUri":"` + imageURI + `"}}`
@@ -62,6 +71,8 @@ func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
 		name, platform, body, wantError string
 		wantCount                       int
 		maxBytes, maxPixels             int64
+		wantData                        []byte
+		wantMIME                        string
 	}{
 		{name: "native inline remains supported", body: `{"candidates":[{"content":{"parts":[` + inline + `]}}]}`, wantCount: 1},
 		{name: "fileData plus Markdown counts once", body: native, wantCount: 1},
@@ -71,6 +82,9 @@ func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
 		{name: "null error still allows a successful wrapper", body: `{"error":null,"data":[{"url":"` + imageURI + `"}]}`, wantCount: 1},
 		{name: "existing OpenAI URL", platform: "openai", body: openai, wantCount: 1},
 		{name: "existing OpenAI base64 takes precedence", platform: "openai", body: `{"data":[{"url":"https://127.0.0.1/ignored.png","b64_json":"` + encoded + `"}]}`, wantCount: 1},
+		{name: "OpenAI base64 preserves animated GIF", platform: "openai", body: `{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(animation.Bytes()) + `"}]}`, wantCount: 1, wantData: animation.Bytes(), wantMIME: "image/gif"},
+		{name: "OpenAI base64 detects SVG instead of text", platform: "openai", body: `{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString(svg) + `"}]}`, wantCount: 1, wantData: svg, wantMIME: "image/svg+xml"},
+		{name: "OpenAI base64 rejects HTML disguised as SVG", platform: "openai", body: `{"data":[{"b64_json":"` + base64.StdEncoding.EncodeToString([]byte(`<html><script>alert(1)</script></html>`)) + `"}]}`, wantError: "SVG"},
 		{name: "native takes precedence over duplicate wrapper", body: strings.TrimSuffix(native, "}") + `,"data":[{"url":"https://127.0.0.1/ignored.png"}]}`, wantCount: 1},
 		{name: "inline takes precedence within one part", body: `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"` + encoded + `"},"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/ignored.png"}}]}}]}`, wantCount: 1},
 		{name: "thought images are not final images", body: `{"candidates":[{"content":{"parts":[{"thought":true,"inlineData":{"mimeType":"image/png","data":"` + encoded + `"}},{"thought":true,"fileData":{"mimeType":"image/png","fileUri":"https://127.0.0.1/ignored.png"}},` + file + `]}}]}`, wantCount: 1},
@@ -114,8 +128,13 @@ func TestExtractAsyncImageOutputCompatibility(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Len(t, images, tc.wantCount)
+			wantData, wantMIME := tc.wantData, tc.wantMIME
+			if wantData == nil {
+				wantData, wantMIME = bitmap.Bytes(), "image/png"
+			}
 			for _, actual := range images {
-				assert.Equal(t, bitmap.Bytes(), actual.Data)
+				assert.Equal(t, wantData, actual.Data)
+				assert.Equal(t, wantMIME, actual.ContentType)
 				assert.Equal(t, 2, actual.Width)
 				assert.Equal(t, 3, actual.Height)
 			}

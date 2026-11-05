@@ -166,7 +166,13 @@ export async function imageBlob(
     blob = await response.blob()
   }
   if (
-    !['image/png', 'image/jpeg', 'image/webp'].includes(blob.type) ||
+    ![
+      'image/png',
+      'image/jpeg',
+      'image/webp',
+      'image/gif',
+      'image/svg+xml',
+    ].includes(blob.type.split(';', 1)[0].trim().toLowerCase()) ||
     !blob.size
   ) {
     throw new Error(t('Unsupported image format'))

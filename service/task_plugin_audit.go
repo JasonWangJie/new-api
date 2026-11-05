@@ -34,7 +34,7 @@ func TaskExecutionSnapshotFromContext(ctx *gin.Context) *model.TaskExecutionSnap
 				if value, exists := ctx.Get("task_video_model_config"); exists {
 					data, _ := common.Marshal(value)
 					var frozen kitdto.TaskVideoModelConfig
-					if common.Unmarshal(data, &frozen) == nil {
+					if common.Unmarshal(data, &frozen) == nil && frozen.BillingMode != "" {
 						snapshot.VideoModelConfig = &frozen
 					}
 				}
