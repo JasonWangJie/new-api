@@ -78,9 +78,12 @@ export type TaskPluginOption = {
 export async function getTaskPluginOptions(): Promise<TaskPluginOption[]> {
   const response = await api.get<{
     success: boolean
-    data: TaskPluginOption[]
+    data: Array<Omit<TaskPluginOption, 'models'> & { models: string[] | null }>
   }>('/api/task_plugin_options')
-  return requireServerSuccess(response.data).data
+  return requireServerSuccess(response.data).data.map((option) => ({
+    ...option,
+    models: option.models ?? [],
+  }))
 }
 
 export type CodexUsageResponse = {

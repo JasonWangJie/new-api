@@ -127,7 +127,11 @@ test('Huahuo video stores manually configured models and never saves a catalog U
 })
 let client: QueryClient
 let editingChannel: Channel
-let pluginOptions: TaskPluginOption[]
+let pluginOptions: Array<
+  Omit<TaskPluginOption, 'models'> & {
+    models: string[] | null
+  }
+>
 const plugins: TaskPluginOption[] = [
   {
     key: 'video-a',
@@ -256,6 +260,21 @@ afterEach(() => {
   client.clear()
   useAuthStore.setState({ auth: originalAuth })
   vi.restoreAllMocks()
+})
+
+test('opening channel creation allows selecting a plugin with no registered models', async () => {
+  pluginOptions = [{ key: 'huahuo-image', name: 'Huahuo Image', models: null }]
+  const user = userEvent.setup()
+  render(<ConfigurationHarness initialOpen={false} />)
+
+  await user.click(screen.getByRole('button', { name: 'Open channel' }))
+  await user.click(
+    await screen.findByRole('option', {
+      name: 'Huahuo Image Plugin huahuo-image',
+    })
+  )
+
+  expect(screen.getByLabelText('Name *')).toHaveValue('Huahuo Image')
 })
 
 test('changing built-in providers updates server-provided URL placeholders without replacing the draft address', async () => {
