@@ -103,6 +103,22 @@ func QueryAsyncMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, view)
 }
 
+func videoReconciliationFailureReason(job model.AsyncMediaJob, task model.Task) string {
+	var captured, reconciliation string
+	if fact := task.PrivateData.MediaRetryFact; fact != nil {
+		captured = fact.Message
+	}
+	if state := task.PrivateData.VideoReconciliation; state != nil {
+		reconciliation = state.Reason
+	}
+	for _, reason := range []string{captured, reconciliation, job.ErrorMessage} {
+		if detail := service.VideoTaskFailureNotice(reason).Detail; strings.TrimSpace(detail) != "" {
+			return service.VideoTaskFailureReason(reason)
+		}
+	}
+	return ""
+}
+
 func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (gin.H, []gin.H, error) {
 	managed, ownerErr := service.CanvasTaskOwnerManaged(c.Request.Context(), job.TokenId, job.UserId)
 	if ownerErr != nil && !errors.Is(ownerErr, service.ErrCanvasAuthorization) && !errors.Is(ownerErr, model.ErrCanvasBillingOwner) {
@@ -267,17 +283,19 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 		if job.Provider == "drama" && slices.Contains([]model.TaskStatus{model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued}, task.Status) {
 			view["status"], view["stage"] = "queued", "queued"
 		}
-		view["can_terminate"] = false
+		view["can_terminate"] = admin && ownerErr == nil && job.CanTerminateVideoReconciliation(task, now)
+		view["termination_requires_reconciliation"] = true
 		if reconciliation := task.PrivateData.VideoReconciliation; reconciliation != nil {
-			view["video_reconciliation"] = reconciliation
+			reason := videoReconciliationFailureReason(job, task)
+			publicReconciliation := *reconciliation
+			publicReconciliation.Reason = service.VideoTaskFailureNotice(reason).Detail
+			view["video_reconciliation"] = &publicReconciliation
 			if hideExecution {
-				publicReconciliation := *reconciliation
 				publicReconciliation.Reason = ""
-				view["video_reconciliation"] = &publicReconciliation
 			}
 			view["can_resume"] = admin && reconciliation.ManualRequired && ownerErr == nil
 			view["next_attempt_at"] = reconciliation.NextPollAt
-			view["error_message"] = ""
+			view["error_message"] = reason
 		}
 	}
 	succeeded := job.Status == "succeeded" && (err != nil || task.Status != model.TaskStatusFailure) || job.Status == "expired" && err == nil && task.Status == model.TaskStatusSuccess
@@ -305,7 +323,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && (errors.Is(err, gorm.ErrRecordNotFound) || job.ReferenceRecoveryStage == "unknown") {
 		view["error_code"], view["error_retryable"] = "execution_unknown", false
 	}
-	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" {
+	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" || view["video_reconciliation"] != nil {
 		reason, _ := view["error_message"].(string)
 		if job.Status == "execution_unknown" && strings.TrimSpace(reason) == "" {
 			reason = "execution_unknown"
@@ -349,10 +367,6 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	if job.StorageStatus != "succeeded" || job.ExpiresAt <= time.Now().Unix() {
 		return view, results, nil
 	}
-	cfg, err := service.GetMediaRuntimeConfig(c.Request.Context())
-	if err != nil {
-		return nil, nil, err
-	}
 	var objects []model.MediaArtifactObject
 	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND status = ? AND expires_at > ?", job.TaskId, job.UserId, "active", time.Now().Unix()).Order("artifact_key").Find(&objects).Error; err != nil {
 		return nil, nil, err
@@ -365,12 +379,12 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 				link = service.CanvasContentPath("media", job.TaskId, object.ArtifactKey)
 			}
 		} else {
-			link, err = service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+			link, err = service.MediaResultFileURL(c.Request.Context(), object, AsyncImageGatewayBase())
 			if err != nil {
 				return nil, nil, err
 			}
 		}
-		item := gin.H{"id": object.ID, "image_index": i, "key": object.ArtifactKey, "url": link, "view_url": link, "content_type": object.MimeType, "width": 0, "height": 0, "byte_size": object.ByteSize, "checksum": object.Checksum, "expires_at": min(object.ExpiresAt, time.Now().Unix()+int64(cfg.SignedURLExpiry))}
+		item := gin.H{"id": object.ID, "image_index": i, "key": object.ArtifactKey, "url": link, "view_url": link, "content_type": object.MimeType, "width": 0, "height": 0, "byte_size": object.ByteSize, "checksum": object.Checksum, "expires_at": min(object.ExpiresAt, job.ExpiresAt)}
 		if managed {
 			item["authenticated"] = true
 		}
@@ -783,7 +797,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 		if job.HasPendingSubmissionReconciliation() {
 			query = query.Where("id = ? AND status = ? AND dispatched_at = ? AND billing_status = ? AND lease_expires_at <= ?", job.ID, job.Status, job.DispatchedAt, job.BillingStatus, time.Now().Unix())
 		} else if action == "terminate" {
-			query = query.Where("expires_at > ? OR status = ? OR created_at <= ? OR (status = ? AND (expires_at <= ? OR (reference_retry_count = ? AND reference_recovery_stage = ?)))", time.Now().Unix(), "expired", time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds, "execution_unknown", time.Now().Unix(), 1, "unknown")
+			query = query.Where("expires_at > ? OR status IN ? OR created_at <= ? OR (status = ? AND (expires_at <= ? OR (reference_retry_count = ? AND reference_recovery_stage = ?)))", time.Now().Unix(), []string{"expired", "reconciling"}, time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds, "execution_unknown", time.Now().Unix(), 1, "unknown")
 		} else {
 			query = query.Where("expires_at > ? OR (status = ? AND reference_retry_count = ? AND reference_recovery_stage = ?)", time.Now().Unix(), "execution_unknown", 1, "unknown")
 		}
@@ -846,7 +860,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			imageManagementData(c, gin.H{"task_id": job.TaskId})
 			return
 		}
-		if admin && !job.HasPendingSubmissionReconciliation() && (job.Status == "expired" || job.CreatedAt > 0 && job.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds) {
+		if admin && job.Status != "reconciling" && !job.HasPendingSubmissionReconciliation() && (job.Status == "expired" || job.CreatedAt > 0 && job.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds) {
 			if err := service.TerminateExpiredAsyncMediaJob(c.Request.Context(), job); err != nil {
 				status := http.StatusServiceUnavailable
 				if errors.Is(err, model.ErrImageConflict) || errors.Is(err, model.ErrTaskAttemptConflict) {
@@ -858,7 +872,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			imageManagementData(c, gin.H{"task_id": job.TaskId})
 			return
 		}
-		if job.Status == "execution_unknown" {
+		if job.Status == "execution_unknown" || job.Status == "reconciling" {
 			if !admin {
 				imageManagementError(c, http.StatusForbidden, errors.New("Permission denied"))
 				return
@@ -883,6 +897,11 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 				return
 			}
 			if taskErr == nil {
+				if job.Status == "reconciling" && task.PrivateData.VideoReconciliation != nil {
+					if detail := service.VideoTaskFailureNotice(videoReconciliationFailureReason(job, task)).Detail; detail != "" {
+						updates["error_message"] = service.VideoTaskFailureReason("Terminated by administrator after upstream verification\n" + detail)
+					}
+				}
 				job.ErrorMessage = updates["error_message"].(string)
 				if err := service.ReconcileTerminatedAsyncMediaReservation(c.Request.Context(), job); err != nil {
 					imageManagementError(c, http.StatusConflict, errors.New("Media task reservation requires reconciliation"))

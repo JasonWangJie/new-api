@@ -544,6 +544,28 @@ test.each([
   }
 )
 
+test.each([
+  { message: '', expected: 'Failed to load image' },
+  { message: 'Image link expired', expected: 'Image link expired' },
+])(
+  'an image download failure displays "$expected"',
+  async ({ message, expected }) => {
+    const user = userEvent.setup()
+    const url = '/api/image-objects/imo_example/content?signature=example'
+    vi.mocked(imageBlob).mockRejectedValueOnce(new Error(message))
+    render(
+      <>
+        <Toaster />
+        <ImageResults images={[{ id: 'image', url }]} />
+      </>
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Download image' }))
+
+    expect(await screen.findByText(expected)).toBeVisible()
+  }
+)
+
 test('replacing a protected image releases the previous preview URL', async () => {
   const first = new Blob(['first'], { type: 'image/png' })
   const second = new Blob(['second'], { type: 'image/png' })
@@ -1365,6 +1387,7 @@ test.each([false, true])(
       media_type: 'video' as const,
       status: 'processing',
       billing_status: 'reserved',
+      error_message: 'Reference media download timed out',
       video_reconciliation: {
         started_at: 1789600100,
         deadline_at: 1789601000,
@@ -1384,6 +1407,7 @@ test.each([false, true])(
     expect(notice).toHaveTextContent(
       'Reserved quota is retained and no new generation will be submitted.'
     )
+    expect(notice).toHaveTextContent('Reference media download timed out')
     expect(notice).toHaveTextContent(formatTimestampToDate(1789600100))
     expect(notice).toHaveTextContent(formatTimestampToDate(1789601000))
     expect(within(notice).queryByText('Total retries')).not.toBeInTheDocument()
@@ -1398,6 +1422,129 @@ test.each([false, true])(
     }
   }
 )
+
+test.each([
+  { source: 'list', manual: false, mobile: false },
+  { source: 'details', manual: true, mobile: false },
+  { source: 'list', manual: true, mobile: true },
+])(
+  'administrator can end a waiting video and refund only after confirmation from $source (manual=$manual, mobile=$mobile)',
+  async ({ source, manual, mobile }) => {
+    if (mobile) setMobileViewport()
+    const checking: ImageTask = {
+      ...task,
+      media_type: 'video',
+      status: 'processing',
+      billing_status: 'reserved',
+      can_resume: manual,
+      termination_requires_reconciliation: true,
+      error_message: 'Reference media download timed out',
+      video_reconciliation: {
+        started_at: 1789600100,
+        deadline_at: 1789601000,
+        next_poll_at: manual ? 0 : 1789600200,
+        manual_required: manual,
+        reason: 'Reference media download timed out',
+        revision: 1,
+      },
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [checking],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: checking,
+      results: [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    let scope: ReturnType<typeof within> = screen
+    if (source === 'details') {
+      await user.click(screen.getByRole('button', { name: task.id }))
+      scope = within(
+        await screen.findByRole('dialog', { name: 'Media task details' })
+      )
+    }
+    expect(
+      scope.getByText(manual ? '· Awaiting administrator review' : '· Waiting')
+    ).toBeVisible()
+    expect(scope.getByText('Reference media download timed out')).toBeVisible()
+    await user.click(scope.getByRole('button', { name: 'End task and refund' }))
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'End task and refund',
+    })
+    expect(confirmation).toHaveTextContent(
+      'Verify the upstream task before continuing.'
+    )
+    expect(imageRequest).not.toHaveBeenCalled()
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'End task and refund' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        `/api/admin/media-tasks/${task.id}/terminate`,
+        'POST',
+        { confirm_upstream_checked: true }
+      )
+    )
+  }
+)
+
+test('ordinary users see the waiting video failure reason without administrator refund actions', async () => {
+  const checking: ImageTask = {
+    ...task,
+    media_type: 'video',
+    status: 'processing',
+    billing_status: 'reserved',
+    can_resume: true,
+    error_message: 'Reference media download timed out',
+    error_detail: '',
+    video_reconciliation: {
+      started_at: 1789600100,
+      deadline_at: 1789601000,
+      next_poll_at: 0,
+      manual_required: true,
+      reason: '',
+      revision: 1,
+    },
+  }
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [checking],
+    total: 1,
+    pages: 1,
+    stats: {},
+  })
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    task: checking,
+    results: [],
+  })
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter />)
+  await screen.findByRole('button', { name: task.id })
+  expect(screen.getByText('Reference media download timed out')).toBeVisible()
+  expect(
+    screen.queryByRole('button', {
+      name: /End task and refund|Terminate|Check existing video task/,
+    })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: task.id }))
+  const details = await screen.findByRole('dialog', {
+    name: 'Media task details',
+  })
+  expect(
+    within(details).getByText('Reference media download timed out')
+  ).toBeVisible()
+  expect(
+    within(details).queryByRole('button', {
+      name: /End task and refund|Terminate|Check existing video task/,
+    })
+  ).not.toBeInTheDocument()
+})
 
 test.each([
   {
@@ -3968,6 +4115,46 @@ test('video task details play local results and refresh an expired link', async 
     expect(vi.mocked(getImageTask).mock.calls.length).toBeGreaterThan(calls)
   )
   expect(document.body).not.toHaveTextContent('secret-fingerprint-canary')
+})
+
+test('refreshing a failed video retries the same file URL without an automatic reload loop', async () => {
+  const user = userEvent.setup()
+  const link = '/v1/media/files/vid_0123456789abcdef0123456789abcdef.mp4'
+  vi.mocked(getImageTask).mockResolvedValue({
+    ...detail,
+    task: {
+      ...task,
+      media_type: 'video',
+      status: 'succeeded',
+      storage_status: 'succeeded',
+    },
+    results: [{ ...detail.results[0], url: link, view_url: link }],
+  })
+  mount(
+    <ImageTaskDetails
+      id={task.id}
+      admin={false}
+      userId={101}
+      onClose={vi.fn()}
+      canManage={false}
+      onManage={vi.fn()}
+    />
+  )
+
+  await screen.findByText('Generated videos')
+  const failedVideo = document.querySelector('video')
+  assert(failedVideo)
+  expect(failedVideo).toHaveAttribute('src', link)
+  const calls = vi.mocked(getImageTask).mock.calls.length
+  fireEvent.error(failedVideo)
+  await waitFor(() =>
+    expect(vi.mocked(getImageTask).mock.calls.length).toBeGreaterThan(calls)
+  )
+  expect(document.querySelector('video')).toBe(failedVideo)
+
+  await user.click(screen.getByRole('button', { name: 'Refresh link' }))
+  expect(failedVideo).not.toBeInTheDocument()
+  expect(document.querySelector('video')).toHaveAttribute('src', link)
 })
 
 test.each([false, true])(

@@ -165,6 +165,27 @@ func (store *ImageStorage) LocalPath(key string, createParent bool) (string, err
 
 func (store *ImageStorage) Key(key string) string { return path.Join(store.Profile.Prefix, key) }
 
+// OpenS3Object opens a private S3 object with the configured storage credentials.
+// A negative length means storage did not return Content-Length. The caller
+// closes the body and applies its own read limit.
+func (store *ImageStorage) OpenS3Object(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	if store.Client == nil {
+		return nil, 0, errors.New("S3 image storage is unavailable")
+	}
+	output, err := store.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(store.Profile.Bucket), Key: aws.String(store.Key(key))})
+	if err != nil {
+		var apiError smithy.APIError
+		if errors.As(err, &apiError) && (apiError.ErrorCode() == "NoSuchKey" || apiError.ErrorCode() == "NotFound") {
+			return nil, 0, ErrImageObjectMissing
+		}
+		return nil, 0, err
+	}
+	if output.ContentLength == nil {
+		return output.Body, -1, nil
+	}
+	return output.Body, *output.ContentLength, nil
+}
+
 func (store *ImageStorage) Read(ctx context.Context, key string, maxBytes int64) ([]byte, error) {
 	if maxBytes <= 0 {
 		return nil, errors.New("invalid image read limit")
@@ -187,15 +208,11 @@ func (store *ImageStorage) Read(ctx context.Context, key string, maxBytes int64)
 		}
 		reader = file
 	} else {
-		output, err := store.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(store.Profile.Bucket), Key: aws.String(store.Key(key))})
+		body, _, err := store.OpenS3Object(ctx, key)
 		if err != nil {
-			var apiError smithy.APIError
-			if errors.As(err, &apiError) && (apiError.ErrorCode() == "NoSuchKey" || apiError.ErrorCode() == "NotFound") {
-				return nil, ErrImageObjectMissing
-			}
 			return nil, err
 		}
-		reader = output.Body
+		reader = body
 	}
 	defer reader.Close()
 	data, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))

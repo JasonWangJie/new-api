@@ -62,6 +62,7 @@ import {
   imageTaskResultExpired,
   imageTaskUpstreamProgress,
   imageTaskRequiresTerminationConfirmation,
+  imageTaskTerminationLabel,
 } from '../lib/task-presentation'
 import { CreateRetryRuleFromError } from '../retry-policy/create-from-error'
 import { ACTION_LABELS } from '../retry-policy/policy'
@@ -378,7 +379,8 @@ export function ImageTaskDetails(props: {
   const canTerminate = Boolean(
     data &&
     imageTaskCanTerminate(data, now) &&
-    (props.canManage || (!props.admin && data.media_type === 'video'))
+    (props.canManage ||
+      (!props.admin && data.media_type === 'video' && !videoReconciliation))
   )
   return (
     <Dialog
@@ -423,7 +425,7 @@ export function ImageTaskDetails(props: {
                 <ImageRequestTypeBadge requestType={data.request_type} />
               </div>
               {(canResume || canTerminate) && (
-                <div className='flex gap-2'>
+                <div className='flex flex-wrap gap-2'>
                   {canResume && (
                     <Button
                       size='sm'
@@ -454,6 +456,10 @@ export function ImageTaskDetails(props: {
                           props.onManage('terminate', true, true)
                           return
                         }
+                        if (videoReconciliation) {
+                          props.onManage('terminate', true, undefined, true)
+                          return
+                        }
                         props.onManage(
                           'terminate',
                           imageTaskRequiresTerminationConfirmation(data)
@@ -461,11 +467,7 @@ export function ImageTaskDetails(props: {
                       }}
                     >
                       <Ban className='size-3.5' aria-hidden />
-                      {t(
-                        data.status === 'expired'
-                          ? 'Mark as failed'
-                          : 'Terminate'
-                      )}
+                      {t(imageTaskTerminationLabel(data))}
                     </Button>
                   )}
                 </div>

@@ -16,7 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useQuery } from '@tanstack/react-query'
+import {
+  replaceEqualDeep,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { isAxiosError } from 'axios'
 import {
   Film,
@@ -78,7 +82,6 @@ type SubmissionSnapshot = {
   body: string
   key: string
   tokenId: number
-  version: string
 }
 
 export function ImageWorkbench() {
@@ -117,6 +120,7 @@ export function ImageWorkbench() {
 
 function WorkbenchSession({ userId }: { userId: number }) {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const [tokenId, setTokenId] = useState('')
   const [modelId, setModelId] = useState('')
   const [prompt, setPrompt] = useState(() => {
@@ -158,8 +162,9 @@ function WorkbenchSession({ userId }: { userId: number }) {
     queryKey: ['image-keys', userId],
     queryFn: () => getApiKeys({ p: 1, size: 100 }),
   })
+  const capabilitiesKey = ['image-capabilities', userId, tokenId]
   const capabilities = useQuery({
-    queryKey: ['image-capabilities', userId, tokenId],
+    queryKey: capabilitiesKey,
     queryFn: ({ signal }) => getImageCapabilities(Number(tokenId), signal),
     enabled: !!tokenId,
     staleTime: 0,
@@ -307,16 +312,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
       )
       if (!currentOwner()) return
       if (!retry) {
-        if (
-          fresh.capability_version !== capabilities.data?.capability_version
-        ) {
-          await capabilities.refetch()
-          throw new Error(
-            t(
-              'Image capabilities changed. Review your selection and submit again.'
-            )
-          )
-        }
+        queryClient.setQueryData(capabilitiesKey, fresh)
         const currentModel = fresh.models.find(
           (candidate) =>
             `${candidate.platform}:${candidate.id}` === modelId &&
@@ -324,6 +320,14 @@ function WorkbenchSession({ userId }: { userId: number }) {
         )
         if (!currentModel) {
           throw new Error(t('No executable image model is available'))
+        }
+        // The catalog version also includes other image models and video.
+        if (replaceEqualDeep(model, currentModel) !== model) {
+          throw new Error(
+            t(
+              'Image capabilities changed. Review your selection and submit again.'
+            )
+          )
         }
         const request = buildImageRequest({
           model: currentModel,
@@ -361,7 +365,6 @@ function WorkbenchSession({ userId }: { userId: number }) {
                 )
               : crypto.randomUUID(),
           tokenId: selectedId,
-          version: fresh.capability_version,
         }
         snapshot.current = currentModel.mode === 'async' ? accepted : null
         setResults([])

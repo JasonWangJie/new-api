@@ -267,6 +267,8 @@ type ImageStorageObject struct {
 	DeleteLeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`
 	CreatedAt            int64  `json:"created_at" gorm:"type:bigint"`
 	ExpiresAt            int64  `json:"expires_at" gorm:"type:bigint;index"`
+
+	ResultFileId *string `json:"-" gorm:"size:64;uniqueIndex:idx_image_storage_objects_result_file_id"`
 }
 
 type ImageUploadIntent struct {

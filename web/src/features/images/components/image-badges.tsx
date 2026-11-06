@@ -33,7 +33,7 @@ import {
 export function ImageStatusBadge(props: {
   status: string
   errorCode?: string | number | boolean | null
-  pendingAction?: 'retry' | 'wait'
+  pendingAction?: 'retry' | 'wait' | 'review'
   resultExpired?: boolean
   className?: string
 }) {
@@ -42,11 +42,16 @@ export function ImageStatusBadge(props: {
   let pendingLabel = ''
   if (props.pendingAction === 'retry') pendingLabel = 'Retry scheduled'
   if (props.pendingAction === 'wait') pendingLabel = 'Waiting'
+  if (props.pendingAction === 'review') {
+    pendingLabel = 'Awaiting administrator review'
+  }
   const statusBadge = (
     <Badge
       variant={imageStatusBadgeVariant(visualStatus, props.errorCode)}
       className={cn(
         imageStatusBadgeClass(visualStatus, props.errorCode),
+        props.pendingAction === 'review' &&
+          'h-auto max-w-full flex-wrap justify-start whitespace-normal',
         props.className
       )}
     >

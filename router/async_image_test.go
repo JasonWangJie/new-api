@@ -742,18 +742,29 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	assert.NotContains(t, query.Body.String(), profile.Root)
 	resultURL, err := url.Parse(success.Data[0]["url"])
 	require.NoError(t, err)
-	imageResponse := request(http.MethodGet, resultURL.RequestURI(), "", "", token.Key)
+	assert.Empty(t, resultURL.RawQuery)
+	assert.Regexp(t, `^/v1/media/files/img_[0-9a-f]{32}\.png$`, resultURL.Path)
+	imageResponse := request(http.MethodGet, resultURL.RequestURI(), "", "", "")
 	require.Equal(t, http.StatusOK, imageResponse.Code)
 	assert.Equal(t, valid.Data, imageResponse.Body.Bytes())
 	assert.Equal(t, "image/png", imageResponse.Header().Get("Content-Type"))
 	assert.Equal(t, "nosniff", imageResponse.Header().Get("X-Content-Type-Options"))
-	assert.Equal(t, "private, no-store", imageResponse.Header().Get("Cache-Control"))
-	tamperedURL := *resultURL
+	assert.Contains(t, imageResponse.Header().Get("Cache-Control"), "no-store")
+	// Previously issued signed URLs retain their signature and expiry checks.
+	var storedResult model.AsyncImageResult
+	var storedObject model.ImageStorageObject
+	require.NoError(t, model.DB.Where("task_id = ? AND image_index = ?", payload.TaskId, 0).Take(&storedResult).Error)
+	require.NoError(t, model.DB.Where("object_id = ?", storedResult.ObjectId).Take(&storedObject).Error)
+	legacyLink, err := service.ImageObjectURL(context.Background(), storedObject, "", 3600)
+	require.NoError(t, err)
+	legacyURL, err := url.Parse(legacyLink)
+	require.NoError(t, err)
+	tamperedURL := *legacyURL
 	tamperedQuery := tamperedURL.Query()
 	tamperedQuery.Set("signature", "invalid-signature")
 	tamperedURL.RawQuery = tamperedQuery.Encode()
 	assert.Equal(t, http.StatusNotFound, request(http.MethodGet, tamperedURL.RequestURI(), "", "", token.Key).Code)
-	expiredURL := *resultURL
+	expiredURL := *legacyURL
 	expiredQuery := expiredURL.Query()
 	expiredTime := strconv.FormatInt(time.Now().Unix()-1, 10)
 	objectID := strings.TrimSuffix(strings.TrimPrefix(expiredURL.Path, "/api/image-objects/"), "/content")

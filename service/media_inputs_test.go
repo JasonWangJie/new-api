@@ -740,43 +740,61 @@ func TestLegacyDramaMixedVideoReferenceSlots(t *testing.T) {
 
 func TestLegacyDramaMixedVideoReferenceAliases(t *testing.T) {
 	plugin := legacyDramaRetryPluginFixture(t, "", "")
-	for _, tc := range []struct {
-		name, model, media, videoInput, decodeError string
-		paths                                       []string
-	}{
-		{"mixed image arrays", "minimax-h3", `"images":["https://source.example/one.png"],"image_urls":[{"url":"HTTPS://source.example/two.png","source":"https://ignored.example/fallback.png"}],"referenceImages":[{"source":"https://source.example/three.png"}]`, "none", "", []string{"/images/0", "/image_urls/0/url", "/referenceImages/0/source"}},
-		{"ordered wrapped sources", "minimax-h3", `"references":[{"type":"image","role":"reference","source":{"url":"https://source.example/one.png"}},{"type":"image","role":"reference","source":{"url":"","source":"HTTPS://source.example/two.png"}}]`, "none", "", []string{"/references/0/source/url", "/references/1/source/source"}},
-		{"frames", "seedance2.0-A", `"aspect_ratio":"Auto","first_image":{"url":"https://source.example/first.png"},"last_image":"https://source.example/last.png"`, "none", "", []string{"/first_image/url", "/last_image"}},
-		{"video and audio aliases", "seedance2.5-G", `"referenceVideos":["https://source.example/video.mp4"],"audio_urls":["https://source.example/voice.wav"]`, "video", "", []string{"/referenceVideos/0", "/audio_urls/0"}},
-		{"duplicate alias URL", "minimax-h3", `"reference_images":["https://source.example/duplicate.png"],"referenceImages":["https://source.example/duplicate.png"]`, "", "Duplicate reference media source", nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			channel := model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Models: tc.model}
-			channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
-			binding, _, err := MixedVideoChannelBinding(channel, tc.model, "create")
-			require.NoError(t, err)
-			profile, err := EffectiveMixedVideoProfile(binding, tc.model, VideoModelOverrides{})
-			require.NoError(t, err)
-			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","seconds":5,"resolution":"720p",%s}`, tc.model, tc.media))
-			normalized, contentType, body, err := NormalizeMixedVideoDefaults(raw, "application/json", "create", []jsplugin.VideoProfile{profile})
-			require.NoError(t, err)
-			_, err = DecodeMixedVideoCandidate(t.Context(), channel, tc.model, "create", normalized, VideoModelOverrides{}, 0)
-			if tc.decodeError != "" {
-				require.ErrorContains(t, err, tc.decodeError)
-				return
-			}
-			require.NoError(t, err)
-			facts, err := MixedVideoPublicFacts(body, "create", nil, profile)
-			require.NoError(t, err)
-			assert.Equal(t, tc.videoInput, facts["video_input"])
+	source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", "drama", "plugin.js"))
+	require.NoError(t, err)
+	builtin, err := jsplugin.DefaultRegistry.Register(string(source), jsplugin.Options{})
+	require.NoError(t, err)
+	for _, candidate := range []*jsplugin.LoadedPlugin{plugin, builtin} {
+		variant := "legacy"
+		if candidate == builtin {
+			variant = "builtin"
+		}
+		t.Run(variant, func(t *testing.T) {
+			plugin := candidate
+			require.NoError(t, jsplugin.DefaultRegistry.ReplaceOverrides([]*jsplugin.LoadedPlugin{plugin}))
+			for _, tc := range []struct {
+				name, model, media, videoInput, decodeError string
+				paths                                       []string
+			}{
+				{"mixed image arrays", "minimax-h3", `"images":["https://source.example/one.png"],"image_urls":[{"url":"HTTPS://source.example/two.png","source":"https://ignored.example/fallback.png"}],"referenceImages":[{"source":"https://source.example/three.png"}]`, "none", "", []string{"/images/0", "/image_urls/0/url", "/referenceImages/0/source"}},
+				{"ordered wrapped sources", "minimax-h3", `"references":[{"type":"image","role":"reference","source":{"url":"https://source.example/one.png"}},{"type":"image","role":"reference","source":{"url":"","source":"HTTPS://source.example/two.png"}}]`, "none", "", []string{"/references/0/source/url", "/references/1/source/source"}},
+				{"frames", "seedance2.0-A", `"aspect_ratio":"Auto","first_image":{"url":"https://source.example/first.png"},"last_image":"https://source.example/last.png"`, "none", "", []string{"/first_image/url", "/last_image"}},
+				{"video and audio aliases", "seedance2.5-G", `"referenceVideos":["https://source.example/video.mp4"],"audio_urls":["https://source.example/voice.wav"]`, "video", "", []string{"/referenceVideos/0", "/audio_urls/0"}},
+				{"duplicate alias URL", "minimax-h3", `"reference_images":["https://source.example/duplicate.png"],"referenceImages":["https://source.example/duplicate.png"]`, "", "Duplicate reference media source", nil},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					channel := model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Models: tc.model}
+					channel.SetSetting(relaydto.ChannelSettings{TaskPluginKey: plugin.Meta.Key})
+					binding, _, err := MixedVideoChannelBinding(channel, tc.model, "create")
+					require.NoError(t, err)
+					profile, err := EffectiveMixedVideoProfile(binding, tc.model, VideoModelOverrides{})
+					require.NoError(t, err)
+					raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"animate","seconds":5,"resolution":"720p",%s}`, tc.model, tc.media))
+					normalized, contentType, body, err := NormalizeMixedVideoDefaults(raw, "application/json", "create", []jsplugin.VideoProfile{profile})
+					require.NoError(t, err)
+					_, err = DecodeMixedVideoCandidate(t.Context(), channel, tc.model, "create", normalized, VideoModelOverrides{}, 0)
+					if tc.decodeError != "" {
+						require.ErrorContains(t, err, tc.decodeError)
+						return
+					}
+					require.NoError(t, err)
+					facts, err := MixedVideoPublicFacts(body, "create", nil, profile)
+					require.NoError(t, err)
+					assert.Equal(t, tc.videoInput, facts["video_input"])
 
-			request := AsyncVideoRequest{Body: normalized, ContentType: contentType, MixedRouting: &MixedVideoRouting{Model: tc.model}, Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key}}}
-			require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, time.Now().Unix()+86400))
-			assert.Equal(t, normalized, request.Body)
-			require.Len(t, request.ReferenceInputs, len(tc.paths))
-			for index, input := range request.ReferenceInputs {
-				assert.Equal(t, tc.paths[index], input.Path)
-				assert.Contains(t, input.Source, "://source.example/")
+					request := AsyncVideoRequest{Body: normalized, ContentType: contentType, MixedRouting: &MixedVideoRouting{Model: tc.model}, Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key}}}
+					require.NoError(t, FreezeAsyncVideoReferenceRecovery(&request, nil, time.Now().Unix()+86400))
+					assert.Equal(t, normalized, request.Body)
+					frozenInputs := append([]AsyncVideoReferenceInput(nil), request.ReferenceInputs...)
+					request.Body = []byte(`{"references":[]}`)
+					require.NoError(t, RebindMixedVideoRequest(&request, MixedVideoCandidate{Channel: channel, UpstreamModel: tc.model, Binding: binding}, time.Now().Unix()+86400))
+					assert.Equal(t, frozenInputs, request.ReferenceInputs, "channel rebinding preserves original request slots")
+					require.Len(t, request.ReferenceInputs, len(tc.paths))
+					for index, input := range request.ReferenceInputs {
+						assert.Equal(t, tc.paths[index], input.Path)
+						assert.Contains(t, input.Source, "://source.example/")
+					}
+				})
 			}
 		})
 	}

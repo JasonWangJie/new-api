@@ -99,10 +99,16 @@ export function imageTaskRequiresTerminationConfirmation(
   task: ImageTask
 ): boolean {
   return (
+    !!imageTaskVideoReconciliation(task) ||
     !!task.termination_requires_quota_reconciliation ||
     (task.termination_requires_reconciliation ??
       task.status === 'execution_unknown')
   )
+}
+
+export function imageTaskTerminationLabel(task: ImageTask): string {
+  if (imageTaskVideoReconciliation(task)) return 'End task and refund'
+  return task.status === 'expired' ? 'Mark as failed' : 'Terminate'
 }
 
 export function imageTaskProgress(task: ImageTask): number | null {
@@ -132,7 +138,7 @@ export function imageTaskIssue(task: ImageTask): {
   summaryParams?: Record<string, string | number>
   suggestion: string
   stage: string
-  pendingAction?: 'retry' | 'wait'
+  pendingAction?: 'retry' | 'wait' | 'review'
   nextAttemptAt: number
   reconciliation?: ImageTask['video_reconciliation']
 } | null {
@@ -147,7 +153,7 @@ export function imageTaskIssue(task: ImageTask): {
         ? 'An administrator must check the existing upstream video task. Reserved quota is retained and no new generation will be submitted.'
         : 'The existing upstream video task is being checked. Reserved quota is retained and no new generation will be submitted.',
       stage: 'poll',
-      pendingAction: 'wait',
+      pendingAction: reconciliation.manual_required ? 'review' : 'wait',
       nextAttemptAt: reconciliation.manual_required
         ? 0
         : reconciliation.next_poll_at,

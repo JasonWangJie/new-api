@@ -20,6 +20,7 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/mediaretry"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
@@ -1605,6 +1606,117 @@ func TestAsyncVideoReconciliationResumeAndSettlement(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAsyncVideoOperatorReconciliationIgnoresResubmissionRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, response                              string
+		transient, batch, conflict, output, success bool
+	}{
+		{name: "original failure", response: `{"id":"native-reconciliation","status":"failed"}`},
+		{name: "batch original failure", response: `{"id":"native-reconciliation","status":"failed"}`, batch: true},
+		{name: "batch failure without data", response: `null`, batch: true},
+		{name: "batch failure with array data", response: `[{"id":"diagnostic-id","error":"reference download failed"}]`, batch: true},
+		{name: "batch failure with scalar data", response: `"reference download failed"`, batch: true},
+		{name: "query error then failure", response: `{"id":"native-reconciliation","status":"failed"}`, transient: true},
+		{name: "original success", response: `{"id":"native-reconciliation","status":"succeeded"}`, success: true},
+		{name: "identity conflict", response: `{"id":"another-operation","status":"failed"}`, conflict: true},
+		{name: "batch identity conflict", response: `{"id":"another-operation","status":"failed"}`, batch: true, conflict: true},
+		{name: "output conflict", response: `{"id":"native-reconciliation","status":"failed","video_url":"https://cdn.example/result.mp4"}`, conflict: true, output: true},
+		{name: "batch output conflict", response: `{"id":"native-reconciliation","status":"failed","video_url":"https://cdn.example/result.mp4"}`, batch: true, conflict: true, output: true},
+		{name: "batch array output conflict", response: `[{"video_url":"https://cdn.example/result.mp4"}]`, batch: true, conflict: true, output: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task, channel := setupVideoReconciliationTask(t)
+			asyncImageKeyFixture(t)
+			mediaConfig := DefaultMediaRuntimeConfig()
+			mediaConfig.LocalPath = t.TempDir()
+			require.NoError(t, SaveMediaRuntimeConfig(t.Context(), mediaConfig))
+			require.NoError(t, model.DB.AutoMigrate(&model.MediaRetryPolicyVersion{}))
+			t.Cleanup(func() {
+				assert.NoError(t, model.DB.Where(map[string]any{"key": model.MediaRetryPolicyOptionKey}).Delete(&model.Option{}).Error)
+				assert.NoError(t, model.DB.Where("1 = 1").Delete(&model.MediaRetryPolicyVersion{}).Error)
+			})
+			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "reference", Name: "Local recovery", Enabled: true, Match: mediaretry.Match{ContainsAny: []string{"resolve reference", "poll failed"}}, Steps: []mediaretry.Step{{ID: "local", Action: mediaretry.LocalSameChannel, MaxAttempts: 1}}}}}
+			_, err := model.SaveMediaRetryPolicy(t.Context(), policy, 0, task.UserId, nil)
+			require.NoError(t, err)
+			const reason = "resolve reference[0] failed with i/o timeout"
+			now := time.Now().Unix()
+			task.Platform = "drama"
+			task.PrivateData.CurrentAttempt = &model.VideoTaskAttempt{MixedVideo: true, PluginKey: "drama", ChannelID: task.ChannelId}
+			task.PrivateData.MediaRetryFact = &mediaretry.Fact{Stage: "terminal", ErrorCode: "upstream_failed", Message: reason, HTTPStatus: 200, Terminal: true, Accepted: true, HasUpstreamTask: true}
+			task.PrivateData.VideoReconciliation = &model.VideoTaskReconciliation{StartedAt: now, DeadlineAt: now, Reason: reason, ManualRequired: true, Revision: 1}
+			require.NoError(t, task.Update())
+			channelData, err := common.Marshal(channel)
+			require.NoError(t, err)
+			channelCipher, err := EncryptImagePayload(channelData, "media-channel:"+task.TaskID)
+			require.NoError(t, err)
+			job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: task.TaskID, UserId: task.UserId, TokenId: task.PrivateData.TokenId, ChannelId: task.ChannelId, Provider: "drama", Model: "test-model", Status: "reconciling", BillingStatus: "reserved", Quota: task.Quota, CreatedAt: now, ExpiresAt: now + 3600, ChannelCipher: channelCipher}
+			require.NoError(t, model.DB.Create(&job).Error)
+			task, won, err := model.ResumeAsyncVideoReconciliation(t.Context(), task.TaskID, task.UserId, 60)
+			require.NoError(t, err)
+			require.True(t, won)
+			require.True(t, task.PrivateData.VideoReconciliation.ObserveOnly)
+			adaptor := &scriptedBatchPollingAdaptor{scriptedPollingAdaptor: scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{TaskID: task.GetUpstreamTaskID(), Status: model.TaskStatusFailure, Reason: reason}, body: []byte(tc.response)}}
+			if tc.success {
+				adaptor.parse.Status, adaptor.parse.Url = model.TaskStatusSuccess, "https://cdn.example/result.mp4"
+			}
+			adaptor.results = map[string]*BatchTaskResult{task.GetUpstreamTaskID(): {TaskInfo: *adaptor.parse}}
+			require.NoError(t, common.Unmarshal([]byte(tc.response), &adaptor.results[task.GetUpstreamTaskID()].Data))
+			poll := func() error {
+				if tc.batch {
+					return updateBatchTaskGroup(t.Context(), adaptor, channel, channel.Key, []*model.Task{task})
+				}
+				return updateVideoSingleTask(t.Context(), adaptor, channel, task.TaskID, map[string]*model.Task{task.TaskID: task})
+			}
+			if tc.transient {
+				adaptor.fetchErr = io.ErrUnexpectedEOF
+				require.NoError(t, poll())
+				require.NoError(t, model.DB.First(task, task.ID).Error)
+				require.Equal(t, 1, adaptor.fetchCalls)
+				require.NotNil(t, task.PrivateData.VideoReconciliation)
+				assert.False(t, task.PrivateData.VideoReconciliation.ManualRequired)
+				assert.Equal(t, reason, task.PrivateData.VideoReconciliation.Reason)
+				assert.Equal(t, "terminal", task.PrivateData.MediaRetryFact.Stage)
+				require.NoError(t, poll())
+				assert.Equal(t, 1, adaptor.fetchCalls, "query errors retain the polling interval")
+				task.PrivateData.VideoReconciliation.NextPollAt = 0
+				require.NoError(t, model.DB.Model(task).Update("private_data", task.PrivateData).Error)
+				adaptor.fetchErr = nil
+			}
+			require.NoError(t, poll())
+			require.NoError(t, model.DB.First(task, task.ID).Error)
+			assert.EqualValues(t, 0, task.AttemptGeneration, "operator reconciliation never resubmits")
+			assert.Equal(t, "native-reconciliation", task.PrivateData.UpstreamTaskID)
+			if tc.conflict {
+				assert.EqualValues(t, model.TaskStatusInProgress, task.Status)
+				assert.Equal(t, 4000, task.Quota)
+				require.NotNil(t, task.PrivateData.MediaRetryFact)
+				assert.True(t, task.PrivateData.MediaRetryFact.Unknown)
+				assert.Equal(t, tc.output, task.PrivateData.MediaRetryFact.HasOutput)
+				require.NotNil(t, task.PrivateData.MediaRetryDecision)
+				require.NotNil(t, task.PrivateData.VideoReconciliation)
+				assert.Equal(t, mediaretry.PollSameJob, task.PrivateData.MediaRetryDecision.Action)
+				assert.False(t, task.PrivateData.VideoReconciliation.ManualRequired)
+				assert.Zero(t, countLogs(t))
+				return
+			}
+			if tc.success {
+				assert.EqualValues(t, model.TaskStatusSuccess, task.Status)
+				assert.Equal(t, 4000, task.Quota)
+				assert.Equal(t, 10000, getUserQuota(t, task.UserId))
+				assert.Zero(t, countLogs(t))
+				return
+			}
+			assert.EqualValues(t, model.TaskStatusFailure, task.Status)
+			assert.Zero(t, task.Quota)
+			assert.Equal(t, 14000, getUserQuota(t, task.UserId))
+			assert.Equal(t, 11000, getTokenRemainQuota(t, task.PrivateData.TokenId))
+			assert.EqualValues(t, 1, countLogs(t))
+			require.NoError(t, poll())
+			assert.EqualValues(t, 1, countLogs(t), "terminal queries never repeat the refund")
+		})
 	}
 }
 

@@ -156,6 +156,8 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 	f.router.GET("/v1/images/tasks_async/:task_id", middleware.TokenAuth(), QueryAsyncImage)
 	f.router.GET("/v1/media/tasks_async/:task_id", middleware.TokenAuth(), QueryAsyncMedia)
 	f.router.GET("/v1/media/objects/:object_id", MediaObjectContent)
+	f.router.GET("/v1/media/files/:filename", StoredResultFileContent)
+	f.router.HEAD("/v1/media/files/:filename", StoredResultFileContent)
 	f.router.GET("/api/log/token", middleware.TokenAuthReadOnly(), func(c *gin.Context) { c.Status(200) })
 	f.router.GET("/v1/images/tasks_async/stats", middleware.AsyncTaskStatsAuth(), func(c *gin.Context) { c.Status(200) })
 	return f
@@ -698,7 +700,8 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 	ordinary := model.Token{UserId: f.user.Id, Key: "ordinary" + common.GetUUID(), Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true, Group: "default"}
 	require.NoError(t, f.db.Create(&ordinary).Error)
 	ordinaryObject := object
-	ordinaryObject.Id, ordinaryObject.ObjectId, ordinaryObject.IdentityHash, ordinaryObject.ObjectKey = 0, "ordinary-result", "ordinary-result-identity", "ordinary.svg"
+	ordinaryObject.Id, ordinaryObject.ObjectId, ordinaryObject.IdentityHash, ordinaryObject.ObjectKey = 0, "imo_"+common.GetUUID(), "ordinary-result-identity", "ordinary.svg"
+	ordinaryObject.Class = "temporary"
 	require.NoError(t, os.WriteFile(filepath.Join(profile.Root, ordinaryObject.ObjectKey), content, 0600))
 	require.NoError(t, f.db.Create(&ordinaryObject).Error)
 	ordinaryTask := task
@@ -709,7 +712,9 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 	require.Equal(t, 200, response.Code, response.Body.String())
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &manifest))
 	require.Len(t, manifest.Data, 1)
-	assert.Contains(t, manifest.Data[0].URL, "/api/image-objects/ordinary-result/content?")
+	assert.Regexp(t, `/v1/media/files/img_[0-9a-f]{32}\.svg$`, manifest.Data[0].URL)
+	assert.NotContains(t, manifest.Data[0].URL, "?")
+	assert.NotContains(t, manifest.Data[0].URL, ordinaryObject.ObjectId)
 	response = f.request("GET", manifest.Data[0].URL, "", "", "", "")
 	require.Equal(t, 200, response.Code, response.Body.String())
 	assert.Equal(t, content, response.Body.Bytes())

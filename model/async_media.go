@@ -70,6 +70,8 @@ type MediaArtifactObject struct {
 	CreatedAt    int64  `json:"created_at"`
 	ExpiresAt    int64  `json:"expires_at" gorm:"index"`
 	Status       string `json:"-" gorm:"size:16"`
+
+	ResultFileId *string `json:"-" gorm:"size:64;uniqueIndex:idx_media_artifact_objects_result_file_id"`
 }
 
 // GetDueAsyncMediaJobs rotates pending work by its next eligible attempt. A

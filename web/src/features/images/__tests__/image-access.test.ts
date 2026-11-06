@@ -93,6 +93,37 @@ test.each(['image/png', 'image/gif', 'image/svg+xml'])(
   }
 )
 
+const signedImagePath =
+  '/api/image-objects/imo_example/content?expires=123&signature=ordinary'
+const resultFilePath =
+  '/v1/media/files/img_12345678901234567890123456789012.svg'
+
+test.each([
+  ['relative signed object', signedImagePath, false, 'image/gif'],
+  ['absolute signed object', signedImagePath, true, 'image/gif'],
+  ['relative result file', resultFilePath, false, 'image/svg+xml'],
+  ['absolute result file', resultFilePath, true, 'image/svg+xml'],
+] as const)(
+  'loads a %s as bytes without session credentials',
+  async (_, path, absolute, type) => {
+    const url = absolute ? `${window.location.origin}${path}` : path
+    const blob = new Blob(['image'], { type })
+    vi.mocked(api.request).mockResolvedValue({ data: blob })
+    const anonymousFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => blob,
+    })
+    vi.stubGlobal('fetch', anonymousFetch)
+
+    await expect(imageBlob(url)).resolves.toBe(blob)
+    expect(api.request).not.toHaveBeenCalled()
+    expect(anonymousFetch).toHaveBeenCalledWith(
+      url,
+      expect.objectContaining({ credentials: 'omit', cache: 'no-store' })
+    )
+  }
+)
+
 test.each([
   { type: 'text/html', content: '<html>upstream error</html>' },
   { type: 'image/svg+xml', content: '' },

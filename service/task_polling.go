@@ -570,6 +570,38 @@ func updateBatchTaskGroup(ctx context.Context, adaptor BatchTaskPollingAdaptor, 
 			}
 			continue
 		}
+		if reconciliation := task.PrivateData.VideoReconciliation; task.PrivateData.AsyncMedia && reconciliation != nil && reconciliation.ObserveOnly && parsedStatus == model.TaskStatusFailure {
+			// Validate the individual receipt, not the whole batch envelope,
+			// before an operator's resumed query can refund its reservation.
+			itemBody, marshalErr := common.Marshal(responseItem.Data)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if common.GetJsonType(itemBody) != "object" {
+				// Batch data is optional and may be any JSON value. Use the
+				// normalized receipt while retaining custom data for output and
+				// status checks; object data keeps its original identity checks.
+				evidence := map[string]any{
+					"status": responseItem.TaskInfo.Status, "reason": responseItem.TaskInfo.Reason,
+					"url": responseItem.TaskInfo.Url, "remote_url": responseItem.TaskInfo.RemoteUrl,
+					"data": responseItem.Data,
+				}
+				if responseItem.TaskInfo.TaskID != "" {
+					evidence["task_id"] = responseItem.TaskInfo.TaskID
+				}
+				itemBody, marshalErr = common.Marshal(evidence)
+				if marshalErr != nil {
+					return marshalErr
+				}
+			}
+			held, recoveryErr := TryAsyncVideoReferenceRecovery(ctx, *task, &responseItem.TaskInfo, resp.StatusCode, itemBody)
+			if recoveryErr != nil {
+				return recoveryErr
+			}
+			if held {
+				continue
+			}
+		}
 		if isNonTerminalPollStatus(parsedStatus) {
 			task.PrivateData.PollFailures = 0
 			if err := advanceVideoReconciliationPoll(ctx, task); err != nil {
@@ -1288,7 +1320,9 @@ func reconcileAsyncVideoTask(ctx context.Context, task *model.Task, before model
 		state.StartedAt, state.DeadlineAt = now, now+int64(cfg.ReconciliationTimeout)*60
 	}
 	state.Revision++
-	state.Reason = pollFailureReason(class, statusCode, "")
+	if !state.ObserveOnly || state.Reason == "" {
+		state.Reason = pollFailureReason(class, statusCode, "")
+	}
 	if now >= state.DeadlineAt {
 		state.ManualRequired, state.NextPollAt = true, 0
 	} else if class == "task_timeout" {

@@ -752,6 +752,11 @@ func VideoPostprocessDecision(ctx context.Context, job model.AsyncMediaJob, task
 }
 
 func videoPollingDecision(ctx context.Context, task *model.Task, reason string, statusCode int, begin bool, recorded ...*mediaretry.Fact) (mediaretry.Decision, error) {
+	if state := task.PrivateData.VideoReconciliation; state != nil && state.ObserveOnly {
+		// An operator resumed observation of this receipt. A matching recovery
+		// rule must not pause it again, overwrite its evidence, or regenerate.
+		return mediaretry.Decision{Action: mediaretry.PollSameJob}, nil
+	}
 	var job model.AsyncMediaJob
 	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", task.TaskID, task.UserId).Take(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {

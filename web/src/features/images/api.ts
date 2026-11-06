@@ -133,17 +133,24 @@ export async function imageRelayRequest(
   return data
 }
 
+const imageLinkViewPaths = [
+  /^\/api\/(?:user|admin)\/async-image-tasks\/[^/]+\/results\/[^/]+\/view$/,
+  /^\/api\/(?:user|admin)\/image-library\/[^/]+\/view$/,
+  /^\/api\/admin\/image-plaza\/publications\/[^/]+\/view$/,
+]
+
 export async function imageBlob(
   url: string,
   signal?: AbortSignal,
   authenticated = false
 ): Promise<Blob> {
   let target = url
+  const resolved = new URL(url, window.location.origin)
   if (
     !authenticated &&
-    (url.startsWith('/') || url.startsWith(`${window.location.origin}/`))
+    resolved.origin === window.location.origin &&
+    imageLinkViewPaths.some((path) => path.test(resolved.pathname))
   ) {
-    const resolved = new URL(url, window.location.origin)
     const link = await imageRequest<{ url: string; authenticated?: boolean }>(
       `${resolved.pathname}${resolved.search}`,
       'GET',

@@ -329,11 +329,6 @@ func QueryAsyncImage(c *gin.Context) {
 			c.JSON(http.StatusOK, response)
 			return
 		}
-		cfg, err := service.GetImageRuntimeConfig(ctx)
-		if err != nil {
-			AsyncImagePublicError(c, 503, "storage_unavailable", "Image links are unavailable")
-			return
-		}
 		var results []model.AsyncImageResult
 		if err := model.DB.WithContext(ctx).Where("task_id = ?", task.TaskId).Order("image_index").Find(&results).Error; err != nil {
 			AsyncImagePublicError(c, 503, "storage_unavailable", "Image results are unavailable")
@@ -346,13 +341,13 @@ func QueryAsyncImage(c *gin.Context) {
 		data := make([]gin.H, 0, len(results))
 		for _, result := range results {
 			var object model.ImageStorageObject
-			if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ?", result.ObjectId, "active").Take(&object).Error; err != nil {
+			if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ? AND (expires_at = 0 OR expires_at > ?)", result.ObjectId, "active", time.Now().Unix()).Take(&object).Error; err != nil {
 				AsyncImagePublicError(c, 503, "storage_unavailable", "Image object is unavailable")
 				return
 			}
-			link, err := service.ImageObjectURL(ctx, object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+			link, err := service.ImageResultFileURL(ctx, object, AsyncImageGatewayBase())
 			if err != nil {
-				AsyncImagePublicError(c, 503, "storage_unavailable", "Image signing is unavailable")
+				AsyncImagePublicError(c, 503, "storage_unavailable", "Image file is unavailable")
 				return
 			}
 			data = append(data, gin.H{"url": link})

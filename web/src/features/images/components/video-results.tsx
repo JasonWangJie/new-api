@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
@@ -71,41 +71,50 @@ function AuthenticatedVideoResult(props: VideoResultProps) {
 function VideoResult(props: VideoResultProps) {
   const { t } = useTranslation()
   const result = props.result
+  const mediaUrl = result.url || result.view_url
+  const failedUrl = useRef<string | null>(null)
+  const [mediaRevision, setMediaRevision] = useState(0)
+  const refresh = () => {
+    if (result.source === 'upstream') {
+      props.onRefreshUpstream?.()
+      return
+    }
+    // A refetched task can retain the same file URL after a transfer failure.
+    if (failedUrl.current === mediaUrl) {
+      failedUrl.current = null
+      setMediaRevision((revision) => revision + 1)
+    }
+    props.onRefresh()
+  }
   return (
     <div className='space-y-3'>
       <ArtifactMedia
+        key={mediaRevision}
         artifact={{
           key: String(result.id),
           type: 'video',
-          content_url: result.url || result.view_url,
+          content_url: mediaUrl,
         }}
-        mediaUrl={result.url || result.view_url}
-        onError={props.onRefresh}
+        mediaUrl={mediaUrl}
+        onError={() => {
+          failedUrl.current = mediaUrl
+          props.onRefresh()
+        }}
       />
       <div className='flex flex-wrap items-center gap-2'>
         <Button
           variant='outline'
           size='sm'
           nativeButton={false}
-          render={<a href={result.url || result.view_url} download />}
+          render={<a href={mediaUrl} download />}
         >
           {t('Download')}
         </Button>
         {!result.authenticated && (
-          <CopyButton value={result.url || result.view_url}>
-            {t('Copy link')}
-          </CopyButton>
+          <CopyButton value={mediaUrl}>{t('Copy link')}</CopyButton>
         )}
         {(result.source !== 'upstream' || props.onRefreshUpstream) && (
-          <Button
-            variant='ghost'
-            size='sm'
-            onClick={
-              result.source === 'upstream'
-                ? props.onRefreshUpstream
-                : props.onRefresh
-            }
-          >
+          <Button variant='ghost' size='sm' onClick={refresh}>
             {t('Refresh link')}
           </Button>
         )}

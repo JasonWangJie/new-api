@@ -556,18 +556,24 @@ func verifiedLocalMediaReference(ctx context.Context, job model.AsyncMediaJob, i
 		}
 	}
 	base, err := mediaInputPublicBase()
+	gateway := strings.TrimSuffix(strings.TrimRight(system_setting.ServerAddress, "/"), "/v1")
+	for _, address := range []string{gateway, base} {
+		origin, parseErr := url.Parse(address)
+		if parseErr != nil || !mediaReferenceSameOrigin(parsed, origin) {
+			continue
+		}
+		if filename, found := strings.CutPrefix(parsed.Path, strings.TrimRight(origin.Path, "/")+storedResultFilePath); found {
+			if parsed.RawQuery != "" || parsed.ForceQuery {
+				return true, ErrMediaInputUnavailable
+			}
+			return true, verifyStoredResultFileReference(ctx, job, input.Kind, filename, requiredExpiry)
+		}
+	}
 	if err != nil {
 		return false, err
 	}
 	origin, _ := url.Parse(base)
-	port, originPort := parsed.Port(), origin.Port()
-	if port == "" {
-		port = "443"
-	}
-	if originPort == "" {
-		originPort = "443"
-	}
-	if !strings.EqualFold(parsed.Scheme, origin.Scheme) || !strings.EqualFold(parsed.Hostname(), origin.Hostname()) || port != originPort {
+	if !mediaReferenceSameOrigin(parsed, origin) {
 		return false, nil
 	}
 	artifactPrefix := strings.TrimRight(origin.Path, "/") + "/v1/media/objects/"
@@ -591,6 +597,43 @@ func verifiedLocalMediaReference(ctx context.Context, job model.AsyncMediaJob, i
 		return true, ErrMediaInputUnavailable
 	}
 	return true, nil
+}
+
+func mediaReferenceSameOrigin(parsed, origin *url.URL) bool {
+	if origin == nil || !strings.EqualFold(parsed.Scheme, origin.Scheme) || !strings.EqualFold(parsed.Hostname(), origin.Hostname()) {
+		return false
+	}
+	defaultPort := "443"
+	if parsed.Scheme == "http" {
+		defaultPort = "80"
+	}
+	port, originPort := parsed.Port(), origin.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	if originPort == "" {
+		originPort = defaultPort
+	}
+	return port == originPort
+}
+
+func verifyStoredResultFileReference(ctx context.Context, job model.AsyncMediaJob, kind, filename string, requiredExpiry int64) error {
+	now := time.Now().Unix()
+	switch kind {
+	case "image":
+		object, source, err := ReadImageResultFile(ctx, filename, now)
+		if err == nil && source.UserId == job.UserId && source.TokenId == job.TokenId &&
+			(source.ExpiresAt == 0 || source.ExpiresAt >= requiredExpiry) && (object.ExpiresAt == 0 || object.ExpiresAt >= requiredExpiry) &&
+			slices.Contains([]string{"image/png", "image/jpeg", "image/webp"}, object.ContentType) {
+			return nil
+		}
+	case "video":
+		object, source, err := ReadMediaResultFile(ctx, filename, now)
+		if err == nil && source.UserId == job.UserId && source.TokenId == job.TokenId && source.ExpiresAt >= requiredExpiry && object.ExpiresAt >= requiredExpiry {
+			return nil
+		}
+	}
+	return ErrMediaInputUnavailable
 }
 
 func CleanupMediaInputs(ctx context.Context, now int64) error {

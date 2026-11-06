@@ -73,6 +73,7 @@ import { ImageReliabilityPanel } from './components/image-reliability-panel'
 import { ImageSelect } from './components/image-select'
 import { ImageTaskDetails } from './components/image-task-details'
 import { ImageTaskMobileCard } from './components/image-task-mobile-card'
+import { ImageTaskNotice } from './components/image-task-notice'
 import { ImageTaskRefreshActions } from './components/image-task-refresh-actions'
 import { useMediaRetentionClock } from './hooks/use-media-retention-clock'
 import { imageLabel } from './lib/image-labels'
@@ -89,6 +90,7 @@ import {
   imageTaskCanTerminate,
   imageTaskResultExpired,
   imageTaskRequiresTerminationConfirmation,
+  imageTaskTerminationLabel,
 } from './lib/task-presentation'
 import type { ImageTask } from './types'
 
@@ -365,6 +367,13 @@ function TaskCenterSession({
                   {t('Upstream progress')} {upstreamProgress}%
                 </p>
               )}
+              {issue?.reconciliation && (
+                <ImageTaskNotice
+                  task={row.original}
+                  compact
+                  className='max-w-72'
+                />
+              )}
             </div>
           )
         },
@@ -484,25 +493,28 @@ function TaskCenterSession({
                   : t('Resume')}
               </Button>
             )}
-            {(canManage || (!admin && row.original.media_type === 'video')) &&
+            {(canManage ||
+              (!admin &&
+                row.original.media_type === 'video' &&
+                !imageTaskVideoReconciliation(row.original))) &&
               imageTaskCanTerminate(row.original, now) && (
                 <Button
-                  size={row.original.status === 'expired' ? 'xs' : 'icon-sm'}
+                  size={
+                    row.original.status === 'expired' ||
+                    imageTaskVideoReconciliation(row.original)
+                      ? 'xs'
+                      : 'icon-sm'
+                  }
                   variant='ghost'
-                  aria-label={t(
-                    row.original.status === 'expired'
-                      ? 'Mark as failed'
-                      : 'Terminate'
-                  )}
-                  title={t(
-                    row.original.status === 'expired'
-                      ? 'Mark as failed'
-                      : 'Terminate'
-                  )}
+                  aria-label={t(imageTaskTerminationLabel(row.original))}
+                  title={t(imageTaskTerminationLabel(row.original))}
                   onClick={() =>
                     setOperation({
                       ids: [row.original.id],
                       action: 'terminate',
+                      checkExistingVideo: Boolean(
+                        imageTaskVideoReconciliation(row.original)
+                      ),
                       confirmUpstreamChecked:
                         imageTaskRequiresTerminationConfirmation(row.original),
                       confirmQuotaReconciled:
@@ -512,7 +524,9 @@ function TaskCenterSession({
                   }
                 >
                   <Ban className='size-3.5' aria-hidden />
-                  {row.original.status === 'expired' && t('Mark as failed')}
+                  {(row.original.status === 'expired' ||
+                    imageTaskVideoReconciliation(row.original)) &&
+                    t(imageTaskTerminationLabel(row.original))}
                 </Button>
               )}
           </div>
@@ -657,6 +671,9 @@ function TaskCenterSession({
     confirmationDescription = `${t('Ask an administrator to reconcile the quota reservation before trying again.')} ${confirmationDescription}`
   }
   let confirmationTitle = t('Terminate media tasks')
+  if (operation?.action === 'terminate' && operation.checkExistingVideo) {
+    confirmationTitle = t('End task and refund')
+  }
   if (operation?.action === 'resume') {
     confirmationTitle = operation.checkExistingVideo
       ? t('Check existing video task')
@@ -1178,6 +1195,11 @@ function TaskCenterSession({
             }}
             title={confirmationTitle}
             desc={confirmationDescription}
+            confirmText={
+              operation?.action === 'terminate' && operation.checkExistingVideo
+                ? t('End task and refund')
+                : undefined
+            }
             destructive={operation?.action !== 'resume'}
             isLoading={busy}
             handleConfirm={() => void confirm()}

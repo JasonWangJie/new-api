@@ -36,6 +36,10 @@ func SetUpLogger(server *gin.Engine) {
 		}
 		// Stats never accept query credentials; avoid recording rejected keys.
 		requestPath, _, _ := strings.Cut(path, "?")
+		if strings.HasPrefix(requestPath, "/v1/media/files/") {
+			// Complete public result filenames grant access until retention expiry.
+			path = "/v1/media/files/[redacted]"
+		}
 		if requestPath == "/v1/models" || strings.HasPrefix(requestPath, "/v1beta/models") || strings.HasPrefix(requestPath, "/v1beta/openai/models") {
 			// These compatibility routes accept ?key= credentials, including
 			// rejected managed keys. Never copy their query into access logs.

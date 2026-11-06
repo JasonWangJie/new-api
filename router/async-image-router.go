@@ -127,6 +127,8 @@ func SetAsyncImagePublicRouter(router *gin.Engine) {
 	api.GET("/media/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncMedia)
 	api.GET("/media/objects/:object_id", controller.MediaObjectContent)
 	api.HEAD("/media/objects/:object_id", controller.MediaObjectContent)
+	api.GET("/media/files/:filename", controller.StoredResultFileContent)
+	api.HEAD("/media/files/:filename", controller.StoredResultFileContent)
 	api.POST("/uploads/images_sc", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.UploadAsyncImageInput)
 	api.GET("/images/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
 	api.GET("/tasks_sc/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)

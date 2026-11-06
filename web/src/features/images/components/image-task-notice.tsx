@@ -29,6 +29,7 @@ import type { ImageTask } from '../types'
 export function ImageTaskNotice(props: {
   task: ImageTask
   diagnostics?: boolean
+  compact?: boolean
   className?: string
 }) {
   const { t } = useTranslation()
@@ -39,7 +40,8 @@ export function ImageTaskNotice(props: {
       props.task.error_summary_key ||
       props.task.error_suggestion_key) &&
     typeof props.task.error_detail === 'string'
-      ? props.task.error_detail
+      ? props.task.error_detail ||
+        (issue.reconciliation ? props.task.error_message : '')
       : props.task.error_message
   const retryCount =
     props.task.retry_decision?.total_used ?? props.task.retry_count
@@ -59,7 +61,7 @@ export function ImageTaskNotice(props: {
         {t(imageLabel(issue.summary), issue.summaryParams || {})}
       </AlertTitle>
       <AlertDescription className='space-y-2 text-xs leading-5'>
-        {diagnostic && !issue.reconciliation && (
+        {diagnostic && (
           <div className='space-y-1'>
             {props.diagnostics && (
               <div className='font-medium'>{t('Failure reason')}</div>
@@ -74,59 +76,61 @@ export function ImageTaskNotice(props: {
             </div>
           </div>
         )}
-        {issue.suggestion && <div>{t(issue.suggestion)}</div>}
-        <dl className='flex flex-wrap gap-x-3 gap-y-1 text-[11px] [&>div]:flex [&>div]:gap-1'>
-          {issue.stage && (
-            <div>
-              <dt>{t('Task stage')}:</dt>
-              <dd>{t(imageLabel(issue.stage))}</dd>
-            </div>
-          )}
-          <div>
-            <dt>{t('Billing status')}:</dt>
-            <dd>{t(imageLabel(props.task.billing_status))}</dd>
-          </div>
-          {issue.reconciliation && (
-            <>
-              {issue.reconciliation.started_at > 0 && (
-                <div>
-                  <dt>{t('Status checking started')}:</dt>
-                  <dd>
-                    {formatTimestampToDate(issue.reconciliation.started_at)}
-                  </dd>
-                </div>
-              )}
-              {issue.reconciliation.deadline_at > 0 && (
-                <div>
-                  <dt>{t('Automatic checking until')}:</dt>
-                  <dd>
-                    {formatTimestampToDate(issue.reconciliation.deadline_at)}
-                  </dd>
-                </div>
-              )}
-              {issue.nextAttemptAt > 0 && (
-                <div>
-                  <dt>{t('Next status check')}</dt>
-                  <dd>{formatTimestampToDate(issue.nextAttemptAt)}</dd>
-                </div>
-              )}
-            </>
-          )}
-          {issue.pendingAction && !issue.reconciliation && (
-            <>
+        {!props.compact && issue.suggestion && <div>{t(issue.suggestion)}</div>}
+        {!props.compact && (
+          <dl className='flex flex-wrap gap-x-3 gap-y-1 text-[11px] [&>div]:flex [&>div]:gap-1'>
+            {issue.stage && (
               <div>
-                <dt>{t('Total retries')}</dt>
-                <dd>{retryCount}</dd>
+                <dt>{t('Task stage')}:</dt>
+                <dd>{t(imageLabel(issue.stage))}</dd>
               </div>
-              {issue.nextAttemptAt > 0 && (
+            )}
+            <div>
+              <dt>{t('Billing status')}:</dt>
+              <dd>{t(imageLabel(props.task.billing_status))}</dd>
+            </div>
+            {issue.reconciliation && (
+              <>
+                {issue.reconciliation.started_at > 0 && (
+                  <div>
+                    <dt>{t('Status checking started')}:</dt>
+                    <dd>
+                      {formatTimestampToDate(issue.reconciliation.started_at)}
+                    </dd>
+                  </div>
+                )}
+                {issue.reconciliation.deadline_at > 0 && (
+                  <div>
+                    <dt>{t('Automatic checking until')}:</dt>
+                    <dd>
+                      {formatTimestampToDate(issue.reconciliation.deadline_at)}
+                    </dd>
+                  </div>
+                )}
+                {issue.nextAttemptAt > 0 && (
+                  <div>
+                    <dt>{t('Next status check')}</dt>
+                    <dd>{formatTimestampToDate(issue.nextAttemptAt)}</dd>
+                  </div>
+                )}
+              </>
+            )}
+            {issue.pendingAction && !issue.reconciliation && (
+              <>
                 <div>
-                  <dt>{t('Next retry')}</dt>
-                  <dd>{formatTimestampToDate(issue.nextAttemptAt)}</dd>
+                  <dt>{t('Total retries')}</dt>
+                  <dd>{retryCount}</dd>
                 </div>
-              )}
-            </>
-          )}
-        </dl>
+                {issue.nextAttemptAt > 0 && (
+                  <div>
+                    <dt>{t('Next retry')}</dt>
+                    <dd>{formatTimestampToDate(issue.nextAttemptAt)}</dd>
+                  </div>
+                )}
+              </>
+            )}
+          </dl>
+        )}
       </AlertDescription>
     </Alert>
   )

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -236,9 +237,13 @@ func CanvasInputContent(c *gin.Context) {
 	serveAuthorizedImageObject(c, object)
 }
 
-// serveAuthorizedImageObject is shared by Canvas and dashboard content routes.
-// Callers must establish ownership before passing an object to this function.
 func serveAuthorizedImageObject(c *gin.Context, object model.ImageStorageObject) {
+	serveImageObject(c, object, false)
+}
+
+// serveImageObject serves validated content without a storage redirect.
+// Callers must establish ownership or public result eligibility first.
+func serveImageObject(c *gin.Context, object model.ImageStorageObject, streamS3 bool) {
 	canvasResponseHeaders(c)
 	imageOutputSecurityHeaders(c, object.ContentType)
 	ctx := c.Request.Context()
@@ -258,7 +263,7 @@ func serveAuthorizedImageObject(c *gin.Context, object model.ImageStorageObject)
 		return
 	}
 	cfg, err := service.GetImageRuntimeConfig(ctx)
-	if err != nil {
+	if err != nil || streamS3 && object.ByteSize <= 0 {
 		c.Status(503)
 		return
 	}
@@ -272,12 +277,26 @@ func serveAuthorizedImageObject(c *gin.Context, object model.ImageStorageObject)
 		c.Status(200)
 		return
 	}
-	data, err := store.Read(ctx, object.ObjectKey, cfg.DownloadMaxBytes)
+	if !streamS3 {
+		data, err := store.Read(ctx, object.ObjectKey, cfg.DownloadMaxBytes)
+		if err != nil {
+			c.Status(503)
+			return
+		}
+		c.Data(200, object.ContentType, data)
+		return
+	}
+	body, length, err := store.OpenS3Object(ctx, object.ObjectKey)
 	if err != nil {
 		c.Status(503)
 		return
 	}
-	c.Data(200, object.ContentType, data)
+	defer body.Close()
+	if length >= 0 && length != object.ByteSize {
+		c.Status(503)
+		return
+	}
+	c.DataFromReader(200, object.ByteSize, object.ContentType, io.LimitReader(body, object.ByteSize), nil)
 }
 
 // serveAuthorizedImageTaskResult never returns a storage or provider capability.

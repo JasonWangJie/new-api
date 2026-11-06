@@ -242,6 +242,111 @@ test('ignores an empty reference field when generating from text alone', async (
   ).toEqual([{ type: 'text', text: 'Keep the subject consistent' }])
 })
 
+test('submits again after a completed task when only another model capability changed', async () => {
+  const otherModel = {
+    ...referenceImageModel,
+    id: 'other-image',
+    label: 'Other Image',
+  }
+  const user = await prepareImageSubmission(referenceImageModel, [otherModel])
+  imageApiMocks.getImageTask.mockResolvedValue({
+    task: { status: 'succeeded', progress: 100, cost: 0 },
+    results: [],
+    events: [],
+  })
+  imageApiMocks.imageRelayRequest
+    .mockResolvedValueOnce({ task_id: 'first_image' })
+    .mockResolvedValueOnce({ task_id: 'second_image' })
+
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  expect(await screen.findByText('first_image')).toBeVisible()
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Generate image' })).toBeEnabled()
+  )
+
+  imageApiMocks.getImageCapabilities.mockResolvedValue({
+    api_key_id: 7,
+    capability_version: 'other-model-changed',
+    gateway_base_url: '',
+    models: [
+      { ...otherModel, available: false },
+      {
+        ...referenceImageModel,
+        capability: { max_reference_images: 4, max_output_images: 1 },
+      },
+    ],
+    platforms: [],
+  })
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  expect(await screen.findByText('second_image')).toBeVisible()
+  expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledTimes(2)
+  expect(imageApiMocks.imageRelayRequest.mock.calls[1][3]).not.toBe(
+    imageApiMocks.imageRelayRequest.mock.calls[0][3]
+  )
+})
+
+test('requires confirmation when the selected model capability changes', async () => {
+  const user = await prepareImageSubmission()
+  imageApiMocks.getImageCapabilities.mockResolvedValue({
+    api_key_id: 7,
+    capability_version: 'test',
+    gateway_base_url: '',
+    models: [
+      {
+        ...referenceImageModel,
+        capability: {
+          ...referenceImageModel.capability,
+          max_reference_images: 2,
+        },
+      },
+    ],
+    platforms: [],
+  })
+
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Image capabilities changed. Review your selection and submit again.'
+  )
+  expect(imageApiMocks.imageRelayRequest).not.toHaveBeenCalled()
+
+  await user.click(screen.getByRole('button', { name: 'Generate image' }))
+  expect(await screen.findByText('image_queued')).toBeVisible()
+  expect(imageApiMocks.imageRelayRequest).toHaveBeenCalledOnce()
+})
+
+test.each([
+  {
+    state: 'unavailable',
+    models: [{ ...referenceImageModel, available: false }],
+  },
+  { state: 'missing', models: [] },
+])(
+  'blocks submission when the refreshed model is $state',
+  async ({ models }) => {
+    const user = await prepareImageSubmission()
+    imageApiMocks.getImageCapabilities.mockResolvedValue({
+      api_key_id: 7,
+      capability_version: 'test',
+      gateway_base_url: '',
+      models,
+      platforms: [],
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Generate image' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'No executable image model is available'
+    )
+    expect(
+      screen.getByRole('button', { name: 'Generate image' })
+    ).toBeDisabled()
+    expect(keyApiMocks.fetchTokenKey).not.toHaveBeenCalled()
+    expect(imageApiMocks.imageRelayRequest).not.toHaveBeenCalled()
+  }
+)
+
 test('mixed image selection shows shared limits and submits references without fixing a provider', async () => {
   const user = await prepareImageSubmission({
     ...referenceImageModel,

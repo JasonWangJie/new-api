@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2740,6 +2741,174 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						var savedNative model.Task
 						require.NoError(t, db.Where("id = ?", native.ID).Take(&savedNative).Error)
 						assert.Equal(t, nativeStatus, savedNative.Status, "ending local processing must preserve a completed upstream outcome")
+					})
+				}
+			})
+			t.Run("waiting video reconciliation can end with one refund", func(t *testing.T) {
+				previousRedis, previousBatch, previousLog := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
+				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
+				t.Cleanup(func() {
+					common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousRedis, previousBatch, previousLog
+				})
+				for _, tc := range []struct {
+					name                                   string
+					manual, owner, missingConfirmation     bool
+					concurrent                             bool
+					capturedDiagnostic, storedDiagnostic   bool
+					output, leased, expired, refundFailure bool
+					want                                   int
+				}{
+					{name: "manual wait", manual: true, want: http.StatusOK},
+					{name: "automatic reconciliation", want: http.StatusOK},
+					{name: "concurrent administrator requests", concurrent: true, want: http.StatusOK},
+					{name: "expired reconciliation", manual: true, expired: true, want: http.StatusOK},
+					{name: "captured error with generic reason", manual: true, capturedDiagnostic: true, want: http.StatusOK},
+					{name: "stored error with empty reason", manual: true, storedDiagnostic: true, want: http.StatusOK},
+					{name: "missing confirmation", missingConfirmation: true, want: http.StatusConflict},
+					{name: "owner cannot refund", owner: true, want: http.StatusForbidden},
+					{name: "known output is protected", output: true, want: http.StatusConflict},
+					{name: "active worker is protected", leased: true, want: http.StatusConflict},
+					{name: "interrupted refund is recoverable", refundFailure: true, want: http.StatusConflict},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						require.NoError(t, db.Model(&model.User{}).Where("id = ?", 101).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
+						require.NoError(t, db.Model(&model.Token{}).Where("id = ?", 201).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
+						require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 301).Update("used_quota", 100).Error)
+						id := "waiting-refund-" + strings.ReplaceAll(tc.name, " ", "-")
+						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, ChannelId: 301, Provider: "drama", Model: "seedance2.0-A", Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", Quota: 100, CreatedAt: now, ExpiresAt: now + 3600, DispatchedAt: now - 30}
+						native := model.Task{TaskID: id, UserId: 101, ChannelId: 301, Platform: "drama", Status: model.TaskStatusInProgress, Quota: 100, SubmitTime: now - 30, PrivateData: model.TaskPrivateData{TokenId: 201, AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, BillingSource: "wallet", UpstreamTaskID: "original-" + id,
+							VideoReconciliation: &model.VideoTaskReconciliation{StartedAt: now - 20, DeadlineAt: now + 3600, ManualRequired: tc.manual, Reason: `resolve reference[0]: Get "https://private.example/source?token=secret-canary": i/o timeout`, Revision: 1},
+							MediaRetryFact:      &mediaretry.Fact{Stage: "poll", Unknown: true, HasOutput: tc.output},
+						}}
+						if tc.capturedDiagnostic {
+							native.PrivateData.MediaRetryFact.Message = native.PrivateData.VideoReconciliation.Reason
+							native.PrivateData.VideoReconciliation.Reason = "Upstream failure conflicts with output, status, or task identity; reconcile the original operation"
+						}
+						if tc.storedDiagnostic {
+							job.ErrorMessage = native.PrivateData.VideoReconciliation.Reason
+							native.PrivateData.VideoReconciliation.Reason = ""
+						}
+						if tc.expired {
+							job.ExpiresAt = now - 1
+						}
+						if tc.leased {
+							job.LeaseToken, job.LeaseExpiresAt = "live-worker", now+3600
+						}
+						if tc.refundFailure {
+							require.NoError(t, db.Model(&model.Token{}).Where("id = ?", 201).Update("used_quota", 0).Error)
+						}
+						require.NoError(t, db.Create(&job).Error)
+						require.NoError(t, db.Create(&native).Error)
+						body := `{"confirm_upstream_checked":true}`
+						if tc.missingConfirmation {
+							body = `{}`
+						}
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: id}}
+						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(body))
+						view, _, err := videoJobView(c, job, !tc.owner, true)
+						require.NoError(t, err)
+						assert.Equal(t, !tc.owner && !tc.output && !tc.leased, view["can_terminate"])
+						assert.Equal(t, true, view["termination_requires_reconciliation"])
+						assert.Contains(t, view["error_message"], "i/o timeout")
+						assert.NotContains(t, view["error_message"], "secret-canary")
+						assert.NotEmpty(t, view["error_summary"])
+						ownerView, _, err := videoJobView(c, job, false, true)
+						require.NoError(t, err)
+						assert.Equal(t, view["error_message"], ownerView["error_message"])
+						assert.Equal(t, view["error_detail"], ownerView["error_detail"])
+						reconciliation := ownerView["video_reconciliation"].(*model.VideoTaskReconciliation)
+						assert.Contains(t, reconciliation.Reason, "i/o timeout")
+						assert.NotContains(t, reconciliation.Reason, "secret-canary")
+						if tc.concurrent {
+							start := make(chan struct{})
+							responses := make(chan int, 2)
+							var workers sync.WaitGroup
+							for range 2 {
+								workers.Go(func() {
+									response := httptest.NewRecorder()
+									requestContext, _ := gin.CreateTestContext(response)
+									requestContext.Set("id", 101)
+									requestContext.Params = gin.Params{{Key: "task_id", Value: id}}
+									requestContext.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(body))
+									<-start
+									ManageMediaTask(requestContext, true, "terminate")
+									responses <- response.Code
+								})
+							}
+							close(start)
+							workers.Wait()
+							assert.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, []int{<-responses, <-responses})
+						} else {
+							ManageMediaTask(c, !tc.owner, "terminate")
+							assert.Equal(t, tc.want, recorder.Code, recorder.Body.String())
+						}
+						if tc.refundFailure {
+							var held model.AsyncMediaJob
+							require.NoError(t, db.First(&held, job.ID).Error)
+							assert.Equal(t, "age_limit_refund", held.ReferenceRecoveryStage)
+							var user model.User
+							require.NoError(t, db.First(&user, 101).Error)
+							assert.Equal(t, 900, user.Quota, "partial refund must roll back the wallet")
+							require.NoError(t, db.Model(&model.Token{}).Where("id = ?", 201).Update("used_quota", 100).Error)
+							require.NoError(t, db.Model(&held).Updates(map[string]any{"next_attempt_at": 0, "lease_expires_at": 0}).Error)
+							require.NoError(t, service.FailOverdueAsyncMediaJobs(t.Context(), 100))
+						}
+						var saved model.Task
+						var savedJob model.AsyncMediaJob
+						require.NoError(t, db.First(&saved, native.ID).Error)
+						require.NoError(t, db.First(&savedJob, job.ID).Error)
+						var refunds []model.Log
+						require.NoError(t, logDB.Where("type = ?", model.LogTypeRefund).Find(&refunds).Error)
+						var matching []model.Log
+						for _, log := range refunds {
+							var other map[string]any
+							require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+							if other["task_id"] == id {
+								matching = append(matching, log)
+							}
+						}
+						if tc.want != http.StatusOK && !tc.refundFailure {
+							assert.Equal(t, native.Status, saved.Status)
+							assert.Equal(t, job.Status, savedJob.Status)
+							assert.Equal(t, 100, saved.Quota)
+							assert.Empty(t, matching)
+							return
+						}
+						assert.EqualValues(t, model.TaskStatusFailure, saved.Status)
+						assert.Contains(t, saved.FailReason, "i/o timeout")
+						assert.NotContains(t, saved.FailReason, "secret-canary")
+						assert.Zero(t, saved.Quota)
+						assert.Equal(t, "failed", savedJob.Status)
+						assert.Equal(t, "refunded", savedJob.BillingStatus)
+						assert.Zero(t, savedJob.Quota)
+						require.Len(t, matching, 1)
+						assert.Equal(t, 100, matching[0].Quota)
+						var user model.User
+						var token model.Token
+						var channel model.Channel
+						require.NoError(t, db.First(&user, 101).Error)
+						require.NoError(t, db.First(&token, 201).Error)
+						require.NoError(t, db.First(&channel, 301).Error)
+						assert.Equal(t, 1000, user.Quota)
+						assert.Zero(t, user.UsedQuota)
+						assert.Equal(t, 1, user.RequestCount)
+						assert.Equal(t, 1000, token.RemainQuota)
+						assert.Zero(t, token.UsedQuota)
+						assert.Zero(t, channel.UsedQuota)
+						assert.Greater(t, saved.AttemptGeneration, native.AttemptGeneration)
+						native.Status = model.TaskStatusSuccess
+						won, _, err := model.SettleTaskBilling(t.Context(), &native, model.TaskStatusInProgress, 100, nil, "")
+						require.NoError(t, err)
+						assert.False(t, won, "a stale poll cannot settle after the refund fence")
+						assert.ErrorIs(t, service.ReconcileTerminatedAsyncMediaReservation(t.Context(), savedJob), model.ErrImageConflict)
+						view, _, err = videoJobView(c, savedJob, true, true)
+						require.NoError(t, err)
+						assert.Equal(t, "failed", view["status"])
+						assert.Equal(t, "refunded", view["billing_status"])
+						assert.Equal(t, false, view["can_terminate"])
 					})
 				}
 			})

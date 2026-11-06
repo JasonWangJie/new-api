@@ -178,6 +178,7 @@ type VideoTaskReconciliation struct {
 	DeadlineAt     int64  `json:"deadline_at"`
 	NextPollAt     int64  `json:"next_poll_at"`
 	ManualRequired bool   `json:"manual_required"`
+	ObserveOnly    bool   `json:"observe_only,omitempty"`
 	Reason         string `json:"reason"`
 	Revision       int64  `json:"revision"`
 }
@@ -705,7 +706,7 @@ func ResumeAsyncVideoReconciliation(ctx context.Context, taskID string, userID i
 			return nil
 		}
 		now := time.Now().Unix()
-		task.PrivateData.VideoReconciliation = &VideoTaskReconciliation{StartedAt: now, DeadlineAt: now + windowSeconds, Revision: state.Revision + 1, Reason: state.Reason}
+		task.PrivateData.VideoReconciliation = &VideoTaskReconciliation{StartedAt: now, DeadlineAt: now + windowSeconds, Revision: state.Revision + 1, Reason: state.Reason, ObserveOnly: true}
 		task.PrivateData.PollFailures = 0
 		result := tx.Model(&task).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, task.Status, task.AttemptGeneration).Update("private_data", task.PrivateData)
 		won = result.RowsAffected > 0

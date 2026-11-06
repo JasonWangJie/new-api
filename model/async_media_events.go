@@ -195,6 +195,24 @@ func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, au
 	return job, err
 }
 
+// CanTerminateVideoReconciliation checks whether an administrator can release
+// a retained video reservation after explicitly checking the upstream task.
+// ReconcileAgedAsyncMediaReservation repeats this check under row locks.
+func (job AsyncMediaJob) CanTerminateVideoReconciliation(task Task, now int64) bool {
+	if job.Status != "reconciling" || task.Status == TaskStatusSuccess || task.Status == TaskStatusFailure ||
+		task.PrivateData.VideoReconciliation == nil || task.PrivateData.UpstreamTaskID == "" || job.LeaseExpiresAt > now {
+		return false
+	}
+	if job.BillingStatus != "reserved" && job.BillingStatus != "unknown" ||
+		job.TaskId != task.TaskID || job.UserId != task.UserId || job.ChannelId != task.ChannelId || job.TokenId != task.PrivateData.TokenId ||
+		job.AttemptGeneration != task.AttemptGeneration || job.Quota != task.Quota || !task.VideoRecoveryQuotaValid() ||
+		!task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded {
+		return false
+	}
+	return task.PrivateData.ResultURL == "" && (task.PrivateData.MediaRetryFact == nil || !task.PrivateData.MediaRetryFact.HasOutput) &&
+		job.OutputObjectKey == "" && job.ArtifactKeys == "" && !slices.Contains([]string{"ready", "saving", "succeeded", "upstream"}, job.StorageStatus)
+}
+
 // ReconcileAgedAsyncMediaReservation authorizes one refund only after the
 // administrator explicitly verifies the unknown upstream operation. Initial
 // and replacement submissions share the same durable accounting boundary.
@@ -210,21 +228,26 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 		}
 		policyStopped := current.ReferenceRecoveryStage == "policy_stopped_unknown"
 		unknownExecution := current.Status == "execution_unknown" && (current.ReferenceRecoveryStage == "unknown" || current.ReferenceRecoveryStage == "manual")
-		if unknownExecution {
+		waitingReconciliation := current.Status == "reconciling"
+		if waitingReconciliation {
+			if !current.CanTerminateVideoReconciliation(task, time.Now().Unix()) {
+				return ErrImageConflict
+			}
+		} else if unknownExecution {
 			if task.Status != TaskStatusUnknown || current.LeaseExpiresAt > time.Now().Unix() {
 				return ErrImageConflict
 			}
 		} else if current.Status != "failed" || current.ReferenceRecoveryStage != "age_limit_unknown" && !policyStopped || !policyStopped && current.ReferenceRetryCount != 1 || task.Status != TaskStatusFailure || !policyStopped && task.PrivateData.UpstreamTaskID != "" {
 			return ErrImageConflict
 		}
-		if current.BillingStatus != "unknown" && !(unknownExecution && current.BillingStatus == "reserved") ||
+		if current.BillingStatus != "unknown" && !((unknownExecution || waitingReconciliation) && current.BillingStatus == "reserved") ||
 			current.AttemptGeneration != job.AttemptGeneration || current.AttemptGeneration != task.AttemptGeneration || current.TaskId != job.TaskId || current.UserId != job.UserId || current.UserId != task.UserId || current.ChannelId != task.ChannelId || current.TokenId != task.PrivateData.TokenId ||
 			!task.VideoRecoveryQuotaValid() || task.Quota != current.Quota || !task.PrivateData.AsyncMedia || !task.PrivateData.DurableBilling || !task.PrivateData.SubmitAccountingRecorded ||
 			task.PrivateData.ResultURL != "" || task.PrivateData.MediaRetryFact != nil && task.PrivateData.MediaRetryFact.HasOutput || current.OutputObjectKey != "" || current.ArtifactKeys != "" {
 			return ErrImageConflict
 		}
 		generation := task.AttemptGeneration
-		if unknownExecution {
+		if unknownExecution || waitingReconciliation {
 			if generation == math.MaxInt64 {
 				return ErrTaskAttemptConflict
 			}
@@ -234,7 +257,7 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 			return err
 		}
 		changes := map[string]any{"status": "failed", "attempt_generation": generation, "billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0}
-		if unknownExecution {
+		if unknownExecution || waitingReconciliation {
 			changes["error_message"] = job.ErrorMessage
 		}
 		if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID).Updates(changes).Error; err != nil {

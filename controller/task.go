@@ -130,11 +130,6 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 		}
 		items := make([]taskArtifactResponse, 0)
 		if mediaJob.StorageStatus == "succeeded" {
-			cfg, err := service.GetMediaRuntimeConfig(c.Request.Context())
-			if err != nil {
-				writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
-				return
-			}
 			var objects []model.MediaArtifactObject
 			if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ? AND user_id = ? AND status = ? AND expires_at > ?", task.TaskID, task.UserId, "active", common.GetTimestamp()).Order("artifact_key").Find(&objects).Error; err != nil {
 				writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
@@ -148,7 +143,7 @@ func writeTaskArtifacts(c *gin.Context, task *model.Task, dashboard bool) {
 						link = mediaTaskResultPath(task.TaskID, object.ArtifactKey, c.GetInt("role") >= common.RoleAdminUser)
 					}
 				} else {
-					link, err = service.MediaObjectURL(object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
+					link, err = service.MediaResultFileURL(c.Request.Context(), object, AsyncImageGatewayBase())
 					if err != nil {
 						writeTaskArtifactError(c, 503, "artifact_internal_error", "Media links are unavailable")
 						return

@@ -19,11 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 import { Download, Expand, ImageIcon } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { toast } from 'sonner'
 
 import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
+import { handleServerError } from '@/lib/handle-server-error'
 
 import { imageBlob } from '../api'
 import { imageFileExtension } from '../lib/image-request'
@@ -82,9 +82,7 @@ export function ImageResults({
       anchor.click()
       setTimeout(() => URL.revokeObjectURL(url), 0)
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Failed to load image')
-      )
+      handleServerError(error, t('Failed to load image'))
     }
   }
   if (!images.length) {

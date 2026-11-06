@@ -170,9 +170,9 @@ func FreezeAsyncVideoReferenceRecovery(request *AsyncVideoRequest, canonical any
 }
 
 // videoRetryInputSelectors gives admission and replay the same plugin capabilities.
-func videoRetryInputSelectors(plugin *jsplugin.LoadedPlugin) (selectors []jsplugin.VideoRetryInput, legacyDrama bool) {
+func videoRetryInputSelectors(plugin *jsplugin.LoadedPlugin) (selectors []jsplugin.VideoRetryInput, drama bool) {
 	if len(plugin.Meta.VideoRetryInputs) > 0 || plugin.Meta.Key != "drama" {
-		return plugin.Meta.VideoRetryInputs, false
+		return plugin.Meta.VideoRetryInputs, plugin.Meta.Key == "drama"
 	}
 	// Older site overrides predate videoRetryInputs. Keep explicit declarations
 	// authoritative and other plugins opt-in.
@@ -216,7 +216,7 @@ func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 	if err := common.Unmarshal(request.Body, &body); err != nil {
 		return err
 	}
-	selectors, legacyDrama := videoRetryInputSelectors(plugin)
+	selectors, drama := videoRetryInputSelectors(plugin)
 	seen := make(map[string]bool)
 	counts := make(map[string]int)
 	for _, selector := range selectors {
@@ -241,7 +241,7 @@ func freezeVideoRetryInputs(request *AsyncVideoRequest, expiresAt int64) error {
 		}
 		for _, slot := range slots {
 			source, ok := slot.Value.(string)
-			if object, wrapped := slot.Value.(map[string]any); legacyDrama && wrapped {
+			if object, wrapped := slot.Value.(map[string]any); drama && wrapped {
 				field := "url"
 				source, ok = object[field].(string)
 				if source == "" {
@@ -397,21 +397,24 @@ func tryConfiguredVideoRecovery(ctx context.Context, task model.Task, result *re
 	}
 	fact = NormalizeMediaRetryFact(fact)
 	state := videoRetryState(task, job)
-	policy, err := GetMediaRetryPolicy(ctx)
-	if err != nil {
-		return true, false, err
-	}
-	cfg, err := GetImageRuntimeConfig(ctx)
-	if err != nil {
-		return true, false, err
-	}
-	state.TotalLimit = min(state.TotalLimit, cfg.TotalRetries)
-	decision, err := PlanTerminalVideoFailure(policy, fact, state)
-	if err != nil {
-		return true, false, err
-	}
-	if applied, err := ApplyConfiguredVideoDecision(ctx, task, job, fact, &decision, state); err != nil || applied {
-		return true, true, err
+	decision := mediaretry.Decision{Action: mediaretry.PollSameJob}
+	if reconciliation := task.PrivateData.VideoReconciliation; reconciliation == nil || !reconciliation.ObserveOnly {
+		policy, err := GetMediaRetryPolicy(ctx)
+		if err != nil {
+			return true, false, err
+		}
+		cfg, err := GetImageRuntimeConfig(ctx)
+		if err != nil {
+			return true, false, err
+		}
+		state.TotalLimit = min(state.TotalLimit, cfg.TotalRetries)
+		decision, err = PlanTerminalVideoFailure(policy, fact, state)
+		if err != nil {
+			return true, false, err
+		}
+		if applied, err := ApplyConfiguredVideoDecision(ctx, task, job, fact, &decision, state); err != nil || applied {
+			return true, true, err
+		}
 	}
 	if fact.Unknown {
 		// A failure envelope containing output, an accepted status, or another
