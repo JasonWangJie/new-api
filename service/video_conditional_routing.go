@@ -470,9 +470,5 @@ func PublicVideoRoutingFailureNotice(raw string) VideoFailureNotice {
 }
 
 func PublicVideoRoutingFailureReason(raw string) string {
-	notice := PublicVideoRoutingFailureNotice(raw)
-	if notice.Summary == "" {
-		return ""
-	}
-	return notice.Summary + "\n处理建议：" + notice.Suggestion
+	return PublicVideoRoutingFailureNotice(raw).Message()
 }

@@ -2083,6 +2083,115 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 	}
 }
 
+func TestOpenAIAsyncImageAnimationParameters(t *testing.T) {
+	for _, tc := range []struct {
+		name, model, path, fields, expected string
+		multipart                           bool
+	}{
+		{"default PNG", "gpt-image-2.6-flare", "generations_async", `{}`, `{"output_format":"png"}`, false},
+		{"GIF defaults", "gpt-image-2.6-sunburst", "generations_async", `{"output_format":"gif"}`, `{"output_format":"gif","frame_count":9,"frame_duration_ms":200}`, false},
+		{"GIF minimum", "gpt-image-2.6-flare", "edits_async", `{"output_format":"gif","frame_count":2,"frame_duration_ms":20}`, `{"output_format":"gif","frame_count":2,"frame_duration_ms":20}`, true},
+		{"GIF maximum", "gpt-image-2.6-sunburst", "generations_oa", `{"output_format":"gif","frame_count":16,"frame_duration_ms":2000}`, `{"output_format":"gif","frame_count":16,"frame_duration_ms":2000}`, true},
+		{"GIF independent count default", "gpt-image-2.6-flare", "generations_oa", `{"output_format":"gif","frame_duration_ms":50}`, `{"output_format":"gif","frame_count":9,"frame_duration_ms":50}`, false},
+		{"GIF independent duration default", "gpt-image-2.6-sunburst", "generations_oa", `{"output_format":"gif","frame_count":15}`, `{"output_format":"gif","frame_count":15,"frame_duration_ms":200}`, true},
+		{"SVG", "gpt-image-2.6-flare", "edits_async", `{"output_format":"svg"}`, `{"output_format":"svg"}`, false},
+		{"WebP", "gpt-image-2.6-sunburst", "generations_async", `{"output_format":"webp"}`, `{"output_format":"webp"}`, false},
+		{"JPEG", "gpt-image-2.6-flare", "generations_async", `{"output_format":"jpeg"}`, `{"output_format":"jpeg"}`, false},
+		{"other models keep provider extensions", "gpt-image-2", "generations_async", `{"frame_count":30,"output_format":"provider-native"}`, `{"frame_count":30,"output_format":"provider-native"}`, false},
+		{"other models keep omitted fields", "gpt-image-2", "generations_async", `{}`, `{}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fields map[string]common.RawMessage
+			require.NoError(t, common.UnmarshalJsonStr(tc.fields, &fields))
+			fields["model"], _ = common.Marshal(tc.model)
+			fields["prompt"] = common.RawMessage(`"draw"`)
+			if strings.HasPrefix(tc.path, "edits") {
+				fields["image_urls"] = common.RawMessage(`["https://example.com/reference.png"]`)
+			}
+			raw, err := common.Marshal(fields)
+			require.NoError(t, err)
+			contentType := "application/json"
+			if tc.multipart {
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				for key, raw := range fields {
+					var value string
+					if common.Unmarshal(raw, &value) != nil {
+						value = string(raw)
+					}
+					require.NoError(t, writer.WriteField(key, value))
+				}
+				require.NoError(t, writer.Close())
+				raw, contentType = body.Bytes(), writer.FormDataContentType()
+			}
+			request, err := service.ParseAsyncImageRequest(raw, contentType, "/v1/images/"+tc.path, service.DefaultImageRuntimeConfig())
+			require.NoError(t, err)
+			actual := make(map[string]common.RawMessage)
+			for _, key := range []string{"output_format", "frame_count", "frame_duration_ms"} {
+				if value, present := request.Native[key]; present {
+					actual[key] = value
+				}
+			}
+			encoded, err := common.Marshal(actual)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.expected, string(encoded))
+			if tc.model != "gpt-image-2" {
+				require.NoError(t, validateMixedImageChannelRequest(model.Channel{Type: constant.ChannelTypeOpenAI}, request))
+				mapping, err := common.Marshal(map[string]string{tc.model: tc.model + "-upstream"})
+				require.NoError(t, err)
+				require.NoError(t, validateMixedImageChannelRequest(model.Channel{Type: constant.ChannelTypeOpenAI, ModelMapping: common.GetPointer(string(mapping))}, request), "upstream aliases must preserve the public image parameter contract")
+				mapping, err = common.Marshal(map[string]string{"public-image": tc.model})
+				require.NoError(t, err)
+				request.Model = "public-image"
+				require.NoError(t, validateMixedImageChannelRequest(model.Channel{Type: constant.ChannelTypeOpenAI, ModelMapping: common.GetPointer(string(mapping))}, request), "public aliases must retain the upstream model capability")
+			}
+		})
+	}
+	for _, tc := range []struct{ name, fields, errorField string }{
+		{"unknown format", `"output_format":"bmp"`, "output_format"},
+		{"empty format", `"output_format":""`, "output_format"},
+		{"null format", `"output_format":null`, "output_format"},
+		{"wrong format type", `"output_format":3`, "output_format"},
+		{"count requires GIF", `"frame_count":9`, "frame_count"},
+		{"duration requires GIF", `"output_format":"svg","frame_duration_ms":200`, "frame_duration_ms"},
+		{"count zero", `"output_format":"gif","frame_count":0`, "frame_count"},
+		{"count below minimum", `"output_format":"gif","frame_count":1`, "frame_count"},
+		{"count above maximum", `"output_format":"gif","frame_count":17`, "frame_count"},
+		{"negative count", `"output_format":"gif","frame_count":-1`, "frame_count"},
+		{"fraction count", `"output_format":"gif","frame_count":9.5`, "frame_count"},
+		{"string count", `"output_format":"gif","frame_count":"9"`, "frame_count"},
+		{"null count", `"output_format":"gif","frame_count":null`, "frame_count"},
+		{"boolean count", `"output_format":"gif","frame_count":true`, "frame_count"},
+		{"overflow count", `"output_format":"gif","frame_count":18446744073709551615`, "frame_count"},
+		{"duration below minimum", `"output_format":"gif","frame_duration_ms":19`, "frame_duration_ms"},
+		{"duration above maximum", `"output_format":"gif","frame_duration_ms":2001`, "frame_duration_ms"},
+		{"fraction duration", `"output_format":"gif","frame_duration_ms":200.5`, "frame_duration_ms"},
+		{"null duration", `"output_format":"gif","frame_duration_ms":null`, "frame_duration_ms"},
+		{"string duration", `"output_format":"gif","frame_duration_ms":"200"`, "frame_duration_ms"},
+		{"overflow duration", `"output_format":"gif","frame_duration_ms":18446744073709551615`, "frame_duration_ms"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"model":"gpt-image-2.6-flare","prompt":"draw",` + tc.fields + `}`)
+			_, err := service.ParseAsyncImageRequest(raw, "application/json", "/v1/images/generations_async", service.DefaultImageRuntimeConfig())
+			require.ErrorContains(t, err, tc.errorField)
+			var fields map[string]common.RawMessage
+			require.NoError(t, common.Unmarshal(raw, &fields))
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			for key, value := range fields {
+				text := string(value)
+				if key == "model" || key == "prompt" || key == "output_format" {
+					_ = common.Unmarshal(value, &text)
+				}
+				require.NoError(t, writer.WriteField(key, text))
+			}
+			require.NoError(t, writer.Close())
+			_, err = service.ParseAsyncImageRequest(body.Bytes(), writer.FormDataContentType(), "/v1/images/generations_oa", service.DefaultImageRuntimeConfig())
+			require.ErrorContains(t, err, tc.errorField)
+		})
+	}
+}
+
 func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 	previousDB, previousCount, previousRedis := model.DB, constant.CountToken, common.RedisEnabled
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "openai-outbound.db")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -2108,6 +2217,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 	require.NoError(t, jpeg.Encode(&jpegImage, image.NewRGBA(image.Rect(0, 0, 2, 3)), nil))
 	for _, tc := range []struct {
 		name, path, referenceField string
+		imageModel                 string
+		imageFields                map[string]any
+		expectedImageFields        map[string]string
 		providerStatus, requestID  string
 		secrets                    []string
 		channelReferenceLimit      int64
@@ -2134,6 +2246,12 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		templateBody               map[string]any
 		expectedTemplate           string
 	}{
+		{name: "gif_json_defaults", path: "/v1/images/generations_async", referenceField: "images", imageModel: "gpt-image-2.6-flare", imageFields: map[string]any{"output_format": "gif"}, expectedImageFields: map[string]string{"output_format": `"gif"`, "frame_count": "9", "frame_duration_ms": "200"}},
+		{name: "gif_json_explicit", path: "/v1/images/edits_async", referenceField: "images", imageModel: "gpt-image-2.6-sunburst", imageFields: map[string]any{"output_format": "gif", "frame_count": 15, "frame_duration_ms": 2000}, expectedImageFields: map[string]string{"output_format": `"gif"`, "frame_count": "15", "frame_duration_ms": "2000"}},
+		{name: "gif_legacy_multipart", path: "/v1/images/edits_oa", fileFormat: "png", imageModel: "gpt-image-2.6-flare", imageFields: map[string]any{"output_format": "gif", "frame_count": 2, "frame_duration_ms": 20}, expectedImageFields: map[string]string{"output_format": `"gif"`, "frame_count": "2", "frame_duration_ms": "20"}},
+		{name: "gif_multipart_passthrough", path: "/v1/images/edits_async", fileFormat: "png", passThrough: true, imageModel: "gpt-image-2.6-sunburst", imageFields: map[string]any{"output_format": "gif"}, expectedImageFields: map[string]string{"output_format": `"gif"`, "frame_count": "9", "frame_duration_ms": "200"}},
+		{name: "svg_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", passThrough: true, imageModel: "gpt-image-2.6-flare", imageFields: map[string]any{"output_format": "svg"}, expectedImageFields: map[string]string{"output_format": `"svg"`}},
+		{name: "png_legacy_default", path: "/v1/images/generations_oa", referenceField: "images", imageModel: "gpt-image-2.6-sunburst", expectedImageFields: map[string]string{"output_format": `"png"`}},
 		{name: "volcengine_edits_json", path: "/v1/images/edits_async", referenceField: "image", volcengine: true},
 		{name: "volcengine_edits_json_passthrough", path: "/v1/images/edits_async", referenceField: "image", volcengine: true, passThrough: true},
 		{name: "volcengine_edits_uploaded_reference", path: "/v1/images/edits_async", fileFormat: "png", volcengine: true},
@@ -2298,6 +2416,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				"mask":      map[string]string{"image_url": maskURL},
 				"watermark": false, "seed": 0, "custom_toggle": false,
 				"vendor_options": map[string]any{"strength": 0, "enabled": false},
+			}
+			if tc.imageModel != "" {
+				body["model"] = tc.imageModel
+				maps.Copy(body, tc.imageFields)
 			}
 			if tc.resolution == "2K" {
 				body["size"] = "2048x2048"
@@ -2495,6 +2617,13 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				if tc.resolutionMapping {
 					expectedModel = "gpt-image-2"
 				}
+				if tc.imageModel != "" {
+					expectedModel = tc.imageModel
+					for _, key := range []string{"output_format", "frame_count", "frame_duration_ms"} {
+						value := tc.expectedImageFields[key]
+						assert.Equal(t, strings.Trim(value, `"`), replayed.PostForm.Get(key))
+					}
+				}
 				assert.Equal(t, expectedModel, replayed.PostForm.Get("model"))
 				assert.Equal(t, "draw a river", replayed.PostForm.Get("prompt"))
 				for field, value := range map[string]string{"n": "1", "size": "1024x1024", "response_format": "b64_json", "watermark": "false", "seed": "0", "custom_toggle": "false"} {
@@ -2534,6 +2663,16 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				expectedModel = `"gpt-image-2"`
 				if tc.resolution == "2K" {
 					expectedModel = `"gpt-image-2-2k"`
+				}
+			}
+			if tc.imageModel != "" {
+				expectedModel = `"` + tc.imageModel + `"`
+				for _, key := range []string{"output_format", "frame_count", "frame_duration_ms"} {
+					if value, present := tc.expectedImageFields[key]; present {
+						assert.JSONEq(t, value, string(outbound[key]))
+					} else {
+						assert.NotContains(t, outbound, key)
+					}
 				}
 			}
 			assert.JSONEq(t, expectedModel, string(outbound["model"]))

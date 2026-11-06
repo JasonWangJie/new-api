@@ -165,6 +165,8 @@ Inside `relaykit/`, use `kitutil.*` from `relaykit/relayconvert/kitutil/json.go`
 
 **Documentation files:**
 
+- 对外异步图片与视频调用文档按业务场景统一组织示例，不传递 `provider`，不按供应商或渠道重复展开同类请求；由服务按 `model`、权限及可用能力选路。模型专属参数须就近标明适用范围，不能将某个模型的素材格式、时长或能力推广为所有模型通用。
+- **异步生图 API 文档同步（强制）：** 凡修改对外异步生图接口相关行为（包括请求参数、默认值、校验范围、支持模型或格式、响应、查询、错误与兼容入口），MUST 在同一变更中同步更新根目录 `异步生图API接口文档-用户版.md`、`异步生图API接口文档.md`，以及页面 `/async-image-api-docs`（正文源 `web/src/features/docs/data/async-image-api.zh.md`）和 `/guide/async-image-api`（`web/src/features/images/guide.tsx` 及其文案、示例和翻译）。各版本须保持接口契约一致，面向用户的页面继续保留各自的信息披露边界；不得只改代码或只更新其中一份文档。完成前逐项核对参数类型、默认值、边界、示例和错误说明，同时遵守下方 `readmenew.md`、Wiki 及月度台账更新要求。
 - Do NOT add new files under `docs/` or any of its subdirectories unless the user explicitly requests it.
 - Do NOT create or generate documentation files in this repository's plugin directories under `plugins/`, including `plugins/tasks/<plugin>/` and their subdirectories. This includes README files, changelogs, usage guides, and other documentation files, regardless of format.
 - Supplemental project documentation is maintained in the root `readmenew.md` and the root `wiki/` directory. Every feature addition, feature removal, or user-visible behavior change MUST update `readmenew.md`, the applicable page under `wiki/`, and the current monthly code-change ledger under `wiki/` in the same change. Each changelog entry must include the commit date, commit hash, affected scope, and a concise description of the final behavior.

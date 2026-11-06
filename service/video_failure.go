@@ -30,6 +30,19 @@ type VideoFailureNotice struct {
 	Detail     string
 }
 
+// Message renders an already classified notice without parsing its display text
+// as another provider error. Classify untrusted diagnostics before calling it.
+func (notice VideoFailureNotice) Message() string {
+	if notice.Summary == "" {
+		return ""
+	}
+	reason := notice.Summary + "\n处理建议：" + notice.Suggestion
+	if notice.Detail != "" {
+		reason += "\n原始错误：" + notice.Detail
+	}
+	return reason
+}
+
 // VideoTaskFailureNotice keeps a bounded, sanitized diagnostic alongside a
 // plain-language explanation. Unknown errors do not imply a content category,
 // a retry policy or a successful refund.
@@ -300,10 +313,5 @@ func videoFailureErrorCodes(value any, depth int) []string {
 // VideoTaskFailureReason provides the same explanation to API error.message,
 // plugin fail_reason, and task-history callers.
 func VideoTaskFailureReason(raw string) string {
-	notice := VideoTaskFailureNotice(raw)
-	reason := notice.Summary + "\n处理建议：" + notice.Suggestion
-	if notice.Detail != "" {
-		reason += "\n原始错误：" + notice.Detail
-	}
-	return reason
+	return VideoTaskFailureNotice(raw).Message()
 }

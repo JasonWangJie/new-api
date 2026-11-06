@@ -31,7 +31,6 @@ vi.mock('@/hooks/use-status', () => ({
     status: { server_address: 'https://gateway.example/v1/' },
   }),
 }))
-
 vi.mock('@/lib/copy-to-clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
 }))
@@ -41,193 +40,133 @@ afterEach(async () => {
   i18next.removeResourceBundle('zhTW', 'translation')
 })
 
-test('xAI examples explain native image geometry and duration-based async billing', () => {
+test('one example per image or video scenario uses a model placeholder and copies only its request', async () => {
   render(<AsyncImageGuide />)
-  const image = screen.queryByRole('group', {
-    name: 'xAI: generate a 2K image',
-  })
-  expect(image).not.toBeNull()
-  expect(image).toHaveTextContent('"provider": "xai"')
-  expect(image).toHaveTextContent('"resolution": "2K"')
-  expect(image).toHaveTextContent('/v1/images/generations_async')
-  const edit = screen.getByRole('group', {
-    name: 'xAI: edit an image from a URL',
-  })
-  expect(edit).toHaveTextContent('/v1/images/edits_async')
-  expect(edit).toHaveTextContent('"image"')
-  const video = screen.getByRole('group', {
-    name: 'xAI: generate a video from text',
-  })
-  expect(video).toHaveTextContent('"duration": 5')
-  expect(video).toHaveTextContent('/v1/videos/generations_async')
-  expect(
-    screen.getByText(/Video billing uses valid video.duration/)
-  ).toBeVisible()
-  const references = screen.getByRole('group', {
-    name: 'xAI 1.5: combine references and pinned frames',
-  })
-  expect(references).toHaveTextContent('"keyframes"')
-  expect(references).toHaveTextContent('"timestamp_s": 2')
-  expect(screen.getByText(/Generation defaults to 5 seconds/)).toBeVisible()
-  expect(
-    screen.getByText(/grok-imagine-image-quality and its grok-imagine alias/)
-  ).toBeVisible()
-})
-
-test('xAI edit and extension examples inherit source geometry and distinguish extension billing', () => {
-  render(<AsyncImageGuide />)
-  const edit = screen.getByRole('group', {
-    name: 'xAI: edit a video as a durable task',
-  })
-  const extension = screen.getByRole('group', {
-    name: 'xAI: extend a video as a durable task',
-  })
-  expect(edit).toHaveTextContent('8.7')
-  expect(extension).toHaveTextContent('/v1/videos/extensions_async')
-  expect(extension).toHaveTextContent('additional seconds')
-  for (const example of [edit, extension]) {
+  const scenarios = [
+    [
+      'Generate an image from text',
+      'YOUR_IMAGE_MODEL',
+      '/v1/images/generations_async',
+    ],
+    [
+      'Edit a reference image',
+      'YOUR_IMAGE_EDIT_MODEL',
+      '/v1/images/edits_async',
+    ],
+    [
+      'Generate a video from text',
+      'YOUR_VIDEO_MODEL',
+      '/v1/videos/generations_async',
+    ],
+    [
+      'Generate a video with reference media',
+      'YOUR_VIDEO_REFERENCE_MODEL',
+      '/v1/videos/generations_async',
+    ],
+    [
+      'Generate a video between first and last frames',
+      'YOUR_VIDEO_KEYFRAME_MODEL',
+      '/v1/videos/generations_async',
+    ],
+    [
+      'Edit an existing video',
+      'YOUR_VIDEO_EDIT_MODEL',
+      '/v1/videos/edits_async',
+    ],
+    [
+      'Extend an existing video',
+      'YOUR_VIDEO_EXTEND_MODEL',
+      '/v1/videos/extensions_async',
+    ],
+  ]
+  for (const [title, model, endpoint] of scenarios) {
+    const example = screen.getByRole('group', { name: title })
     const command = example.querySelector('pre code')?.textContent ?? ''
     const body = JSON.parse(command.match(/--data '([\s\S]*)'$/)?.[1] ?? '{}')
-    expect(body).toMatchObject({
-      provider: 'xai',
-      model: 'grok-imagine-video',
-      video: { url: 'https://cdn.example/source.mp4' },
-    })
-    expect(body).not.toHaveProperty('resolution')
-    expect(body).not.toHaveProperty('aspect_ratio')
-    expect(body).not.toHaveProperty('seconds')
-    if (example === edit) expect(body).not.toHaveProperty('duration')
-    else expect(body.duration).toBe(2)
+    expect(command).toContain(`https://gateway.example${endpoint}`)
+    expect(command).not.toContain('/v1/v1/')
+    expect(body.model).toBe(model)
+    expect(body).not.toHaveProperty('provider')
+    expect(
+      within(example).getByRole('button', { name: `Copy ${title}` })
+    ).toBeEnabled()
   }
-})
-
-test.each(['E', 'F', 'G'])(
-  'Drama %s provides text, image, video, audio and combined reference examples',
-  (series) => {
-    render(<AsyncImageGuide />)
-    for (const scenario of [
-      'generate a video from text',
-      'use reference image URLs',
-      'use a reference video URL',
-      'use a reference audio URL',
-      'combine image, video and audio references',
-    ]) {
-      const title = `Drama ${series}: ${scenario}`
-      const example = screen.getByRole('group', { name: title })
-      expect(example).toHaveTextContent(`seedance2.5-${series}`)
-      expect(
-        within(example).getByRole('button', { name: `Copy ${title}` })
-      ).toBeEnabled()
-      const code = example.querySelector('pre code')?.textContent ?? ''
-      const body = JSON.parse(code.match(/--data '([\s\S]*)'$/)?.[1] ?? '{}')
-      expect(body).toMatchObject({
-        provider: 'drama',
-        model: `seedance2.5-${series}`,
-        resolution: '720p',
-      })
-      if (scenario === 'combine image, video and audio references') {
-        expect(
-          body.references.map((reference: { role: string }) => reference.role)
-        ).toEqual(
-          series === 'G'
-            ? ['reference_image', 'reference_video', 'reference_audio']
-            : ['reference', 'reference', 'reference']
-        )
-      }
-    }
-  }
-)
-
-test('video examples explain file uploads and URL references and copy only the selected command', async () => {
-  render(<AsyncImageGuide />)
-  const upload = screen.getByRole('group', {
-    name: 'Sora: upload a local reference image',
-  })
-  expect(
-    within(upload).getByRole('heading', {
-      level: 3,
-      name: 'Sora: upload a local reference image',
-    })
-  ).toBeVisible()
-  expect(
-    within(upload).getByText(/input_reference=@reference.png/)
-  ).toBeVisible()
-  expect(
-    screen.getByRole('group', { name: 'xAI: generate from one image URL' })
-  ).toHaveTextContent('output inherits the source image aspect ratio')
-  expect(
-    screen.getByRole('group', { name: 'Drama F: use reference image URLs' })
-  ).toHaveTextContent('reference_images')
-  expect(
-    screen.getByRole('group', { name: 'Drama G: use a first-frame image URL' })
-  ).toHaveTextContent('adaptive')
-
-  const user = userEvent.setup()
-  await user.click(
-    within(upload).getByRole('button', {
-      name: 'Copy Sora: upload a local reference image',
-    })
-  )
-  expect(copyToClipboard).toHaveBeenCalledOnce()
-  expect(copyToClipboard).toHaveBeenCalledWith(
-    expect.stringContaining(
-      "-F 'input_reference=@reference.png;type=image/png'"
+  const requests = screen
+    .getAllByRole('group')
+    .filter((group) =>
+      group.querySelector('pre code')?.textContent?.includes('--data ')
     )
-  )
-  expect(vi.mocked(copyToClipboard).mock.calls[0][0]).not.toContain(
-    'Sora: upload a local reference image'
-  )
-})
-
-test('Drama A and H3 explain their separate reference rules and copy the paired-frame command', async () => {
-  render(<AsyncImageGuide />)
-  const numbered = screen.getByRole('group', {
-    name: 'Drama A: reference images, video and audio by number',
-  })
-  expect(numbered).toHaveTextContent(
-    'Every ordinary reference must be mentioned'
-  )
-  expect(numbered).toHaveTextContent('@图1')
-  const h3 = screen.getByRole('group', {
-    name: 'Drama minimax-h3: use a reference image without audio',
-  })
-  expect(h3).toHaveTextContent('numbered prompt references are optional')
-  expect(h3).toHaveTextContent('generate_audio=false')
-  const paired = screen.getByRole('group', {
-    name: 'Drama A 2.0: provide paired first and last frames',
-  })
-  expect(paired).toHaveTextContent('aspect_ratio=Auto')
-  const user = userEvent.setup()
-  await user.click(
-    within(paired).getByRole('button', {
-      name: 'Copy Drama A 2.0: provide paired first and last frames',
-    })
-  )
+  expect(requests).toHaveLength(7)
+  const edit = screen.getByRole('group', { name: 'Edit a reference image' })
+  expect(edit).toHaveTextContent('"image": "https://cdn.example/source.png"')
+  await userEvent
+    .setup()
+    .click(
+      within(edit).getByRole('button', { name: 'Copy Edit a reference image' })
+    )
   expect(copyToClipboard).toHaveBeenCalledWith(
-    expect.stringContaining('"aspect_ratio": "Auto"')
-  )
-  expect(vi.mocked(copyToClipboard).mock.calls[0][0]).not.toContain(
-    'This mode requires'
+    edit.querySelector('pre code')?.textContent
   )
 })
 
-test('Traditional Chinese shows translated video explanations while retaining the video section link', async () => {
+test('output options state model scope and frame bounds without adding format-specific request cards', () => {
+  render(<AsyncImageGuide />)
+  expect(
+    screen.getByText(/GIF, SVG and frame controls are limited/)
+  ).toHaveTextContent('gpt-image-2.6-flare and gpt-image-2.6-sunburst')
+  expect(screen.getByRole('row', { name: /frame_count/ })).toHaveTextContent(
+    '2-16 frames, default 9'
+  )
+  expect(
+    screen.getByRole('row', { name: /frame_duration_ms/ })
+  ).toHaveTextContent('20-2000 milliseconds per frame, default 200')
+  expect(
+    screen.getByText(/Frame controls require output_format=gif/)
+  ).toHaveTextContent('HTTP 400')
+  expect(
+    screen.getByText(/Frame values are requested settings/)
+  ).toHaveTextContent('can differ upstream')
+  expect(
+    screen.getByText(/Poll query_url with the submitting API key/)
+  ).toHaveTextContent('stage=completed and status=succeeded')
+  expect(
+    screen.getByText(/Statistics cover the authenticated user/)
+  ).toHaveTextContent('across all API keys and workbench tasks')
+  expect(
+    screen.getByRole('group', { name: 'Completed image response' })
+  ).toHaveTextContent('/v1/media/files/')
+  expect(
+    screen.queryByRole('group', { name: /OpenAI|xAI|Drama|Sora|Doubao/ })
+  ).not.toBeInTheDocument()
+})
+
+test('Traditional Chinese translates scenarios, output options and polling while retaining section links', async () => {
   i18next.addResourceBundle('zhTW', 'translation', zhTW.translation)
   await i18next.changeLanguage('zhTW')
   render(<AsyncImageGuide />)
-
-  const referenceExample = screen.getByRole('group', {
-    name: 'Drama F：使用一般參考圖 URL',
-  })
-  expect(referenceExample).toHaveTextContent('不固定為首幀')
-  expect(referenceExample).toHaveTextContent('reference_images')
+  expect(
+    screen.getByRole('group', {
+      name: zhTW.translation['Generate an image from text'],
+    })
+  ).toHaveTextContent('YOUR_IMAGE_MODEL')
+  expect(
+    screen.getByRole('link', { name: zhTW.translation['Image output options'] })
+  ).toHaveAttribute('href', '#image-guide-gif-svg')
   expect(
     screen.getByRole('link', {
-      name: '非同步影片：生成、編輯、延長與本機儲存',
+      name: zhTW.translation['Video generation scenarios'],
     })
   ).toHaveAttribute('href', '#image-guide-video')
   expect(
-    screen.getByRole('group', { name: 'xAI：以持久化任務延長影片' })
-  ).toHaveTextContent('新增 2–10 秒')
-  expect(screen.getByText(/本站生成預設 5 秒/)).toBeVisible()
+    screen.getByText(
+      zhTW.translation['GIF only: optional integer, 2-16 frames, default 9.']
+    )
+  ).toBeVisible()
+  expect(
+    screen.getByText(
+      zhTW.translation[
+        'Poll query_url with the submitting API key. Stages are queued, generating, saving, completed and failed. Download data[].url after stage=completed and status=succeeded, provided result_expired is not true and data is available.'
+      ]
+    )
+  ).toBeVisible()
 })

@@ -82,12 +82,22 @@ func PublicTaskFailureReason(task *model.Task) string {
 	if !video {
 		return task.FailReason
 	}
-	if task.Platform != "drama" || !isMissingVideoFailureReason(task.FailReason) {
-		return VideoTaskFailureReason(task.FailReason)
+	return VideoTaskFailureReason(VideoTaskFailureDiagnostic(task))
+}
+
+// VideoTaskFailureDiagnostic recovers the complete diagnostic before display
+// classification and truncation. It is not safe to return directly to clients;
+// callers must apply the notice classifier appropriate for their audience.
+func VideoTaskFailureDiagnostic(task *model.Task) string {
+	if task == nil {
+		return ""
+	}
+	if task.Status != model.TaskStatusFailure || task.Platform != "drama" || !isMissingVideoFailureReason(task.FailReason) {
+		return task.FailReason
 	}
 	var snapshot map[string]any
 	if common.Unmarshal(task.Data, &snapshot) != nil || snapshot["status"] != "failed" {
-		return VideoTaskFailureReason(task.FailReason)
+		return task.FailReason
 	}
 	var candidates []string
 	switch failure := snapshot["error"].(type) {
@@ -108,9 +118,9 @@ func PublicTaskFailureReason(task *model.Task) string {
 		if isMissingVideoFailureReason(candidate) {
 			continue
 		}
-		return VideoTaskFailureReason(candidate)
+		return candidate
 	}
-	return VideoTaskFailureReason(task.FailReason)
+	return task.FailReason
 }
 
 // BuildTaskPluginView converts a persisted task into the deliberately narrow

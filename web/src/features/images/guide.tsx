@@ -23,15 +23,10 @@ import { StaticDataTable } from '@/components/data-table'
 import { SectionPageLayout } from '@/components/layout'
 import { useStatus } from '@/hooks/use-status'
 
-import {
-  ASYNC_IMAGE_ENDPOINTS,
-  asyncImageGuide,
-  IMAGE_ERROR_CODES,
-} from './lib/guide-content'
-import { OPENAI_SIZES } from './lib/image-request'
+import { ASYNC_IMAGE_ENDPOINTS, asyncImageGuide } from './lib/guide-content'
 
 export function AsyncImageGuide() {
-  const { t, i18n } = useTranslation()
+  const { t } = useTranslation()
   const { status } = useStatus()
   const base = (
     typeof status?.server_address === 'string'
@@ -40,8 +35,7 @@ export function AsyncImageGuide() {
   )
     .replace(/\/+$/, '')
     .replace(/\/v1$/, '')
-  const chinese = i18n.language.startsWith('zh')
-  const sections = asyncImageGuide(chinese, base, t)
+  const sections = asyncImageGuide(base, t)
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>
@@ -126,6 +120,24 @@ export function AsyncImageGuide() {
                     {paragraph}
                   </p>
                 ))}
+                {section.parameters && (
+                  <StaticDataTable
+                    data={section.parameters}
+                    getRowKey={(row) => row[0]}
+                    columns={[
+                      {
+                        id: 'parameter',
+                        header: t('Parameter'),
+                        cell: (row) => <code>{row[0]}</code>,
+                      },
+                      {
+                        id: 'description',
+                        header: t('Description'),
+                        cell: (row) => row[1],
+                      },
+                    ]}
+                  />
+                )}
                 {section.examples.map((example) => (
                   <div
                     key={example.code}
@@ -161,40 +173,6 @@ export function AsyncImageGuide() {
                     </pre>
                   </div>
                 ))}
-                {section.id === 'dimensions' && (
-                  <StaticDataTable
-                    data={Object.entries(OPENAI_SIZES)}
-                    getRowKey={(row) => row[0]}
-                    columns={[
-                      {
-                        id: 'ratio',
-                        header: t('Aspect Ratio'),
-                        cell: (row) => row[0],
-                      },
-                      ...['1K', '2K', '4K'].map((tier, index) => ({
-                        id: tier,
-                        header: tier,
-                        cell: (row: [string, string[]]) => (
-                          <code className='text-xs'>{row[1][index]}</code>
-                        ),
-                      })),
-                    ]}
-                  />
-                )}
-                {section.id === 'errors' && (
-                  <StaticDataTable
-                    data={[...IMAGE_ERROR_CODES]}
-                    getRowKey={(row) => row[0]}
-                    columns={[
-                      { id: 'code', header: t('Code'), cell: (row) => row[0] },
-                      {
-                        id: 'meaning',
-                        header: t('Description'),
-                        cell: (row) => (chinese ? row[2] : row[1]),
-                      },
-                    ]}
-                  />
-                )}
               </section>
             ))}
           </article>

@@ -113,7 +113,7 @@ func videoReconciliationFailureReason(job model.AsyncMediaJob, task model.Task) 
 	}
 	for _, reason := range []string{captured, reconciliation, job.ErrorMessage} {
 		if detail := service.VideoTaskFailureNotice(reason).Detail; strings.TrimSpace(detail) != "" {
-			return service.VideoTaskFailureReason(reason)
+			return reason
 		}
 	}
 	return ""
@@ -236,7 +236,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 			view["stage"], view["status"], view["progress"] = "saving", "upstream_succeeded", 70
 		}
 		if task.Status == model.TaskStatusFailure {
-			view["status"], view["stage"], view["error_message"] = "failed", "failed", service.PublicTaskFailureReason(&task)
+			view["status"], view["stage"], view["error_message"] = "failed", "failed", service.VideoTaskFailureDiagnostic(&task)
 			if job.BillingStatus != "failed" {
 				view["billing_status"] = "failed"
 				if task.Quota == 0 {
@@ -323,22 +323,21 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	if (job.Status == "execution_unknown" || job.BillingStatus == "unknown") && (errors.Is(err, gorm.ErrRecordNotFound) || job.ReferenceRecoveryStage == "unknown") {
 		view["error_code"], view["error_retryable"] = "execution_unknown", false
 	}
-	if status, _ := view["status"].(string); slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" || view["video_reconciliation"] != nil {
-		reason, _ := view["error_message"].(string)
-		if job.Status == "execution_unknown" && strings.TrimSpace(reason) == "" {
-			reason = "execution_unknown"
-		}
-		if reason != "" || status == "failed" {
-			notice := service.VideoTaskFailureNotice(reason)
-			view["error_summary"], view["error_suggestion"] = notice.Summary, notice.Suggestion
-			view["error_detail"] = notice.Detail
-			view["error_message"] = service.VideoTaskFailureReason(reason)
-		}
+	status, _ = view["status"].(string)
+	failureNotice := slices.Contains([]string{"failed", "execution_unknown", "storage_failed", "billing_failed", "expired"}, status) || job.BillingStatus == "failed" || view["video_reconciliation"] != nil
+	reason, _ := view["error_message"].(string)
+	if failureNotice && job.Status == "execution_unknown" && strings.TrimSpace(reason) == "" {
+		reason = "execution_unknown"
 	}
-	if reason, _ := view["error_message"].(string); hideExecution && reason != "" {
-		notice := service.PublicVideoRoutingFailureNotice(reason)
-		view["error_summary"], view["error_suggestion"], view["error_detail"] = notice.Summary, notice.Suggestion, ""
-		view["error_message"] = service.PublicVideoRoutingFailureReason(reason)
+	if reason != "" && (failureNotice || hideExecution) || failureNotice && status == "failed" {
+		var notice service.VideoFailureNotice
+		if hideExecution && (strings.TrimSpace(reason) != "" || !failureNotice) {
+			notice = service.PublicVideoRoutingFailureNotice(reason)
+		} else {
+			notice = service.VideoTaskFailureNotice(reason)
+		}
+		view["error_summary"], view["error_suggestion"], view["error_detail"] = notice.Summary, notice.Suggestion, notice.Detail
+		view["error_message"] = notice.Message()
 	}
 	if view["billing_status"] == "refunded" && err == nil && task.PrivateData.TokenId == job.TokenId &&
 		task.PrivateData.RefundedQuota != nil && *task.PrivateData.RefundedQuota >= 0 {

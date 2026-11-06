@@ -269,147 +269,70 @@ describe('capability-driven image request contracts', () => {
       )
     ).toBeUndefined()
   })
-  it('documents every asynchronous media path with valid standalone examples', () => {
-    for (const chinese of [true, false]) {
-      const examples = asyncImageGuide(
-        chinese,
-        'https://gateway.example'
-      ).flatMap((section) => section.examples.map((example) => example.code))
-      for (const example of examples) {
-        if (example.startsWith('{')) {
-          expect(() => JSON.parse(example)).not.toThrow()
-        }
-        expect(example).not.toMatch(/\n\+\s+-H/)
-        const body = /--data '([\s\S]+)'$/.exec(example)?.[1]
-        if (body) expect(() => JSON.parse(body)).not.toThrow()
+  it('documents each asynchronous media path with valid provider-free requests', () => {
+    const examples = asyncImageGuide('https://gateway.example').flatMap(
+      (section) => section.examples.map((example) => example.code)
+    )
+    const bodies: Record<string, unknown>[] = []
+    for (const example of examples) {
+      if (example.startsWith('{')) {
+        expect(() => JSON.parse(example)).not.toThrow()
       }
-      for (const [, path] of ASYNC_IMAGE_ENDPOINTS) {
-        const examplePath = path
-          .replace('{task_id}', 'YOUR_TASK_ID')
-          .replace('{object_id}', 'YOUR_OBJECT_ID')
-        expect(examples.join('\n')).toContain(examplePath)
+      const body = /--data '([\s\S]+)'$/.exec(example)?.[1]
+      if (body) {
+        const request = JSON.parse(body) as Record<string, unknown>
+        expect(request).not.toHaveProperty('provider')
+        expect(request.model).toMatch(/^YOUR_.*MODEL$/)
+        bodies.push(request)
       }
-      const video = examples
-        .filter((example) => example.startsWith('{'))
-        .map((example) => JSON.parse(example))
-        .find((example) => example.media_type === 'video')
-      expect(video).toMatchObject({
-        protocol: 'openai_video',
-        storage_status: 'succeeded',
-        data: [{ content_type: 'video/mp4', url: expect.any(String) }],
-      })
-      const failed = examples
-        .filter((example) => example.startsWith('{'))
-        .map((example) => JSON.parse(example))
-        .find((example) => example.status === 'failed')
-      expect(failed).toMatchObject({
-        error_code: 601,
-        fail_reason: expect.any(String),
-      })
-      expect(failed).not.toHaveProperty('error')
     }
+    expect(bodies).toHaveLength(7)
+    for (const [, path] of ASYNC_IMAGE_ENDPOINTS) {
+      expect(examples.join('\n')).toContain(
+        path.replace('{task_id}', 'YOUR_TASK_ID')
+      )
+    }
+    const image = examples
+      .filter((example) => example.startsWith('{'))
+      .map((example) => JSON.parse(example))
+      .find((example) => example.media_type === 'image')
+    expect(image).toMatchObject({
+      status: 'succeeded',
+      storage_status: 'succeeded',
+      data: [{ url: expect.stringContaining('/v1/media/files/') }],
+    })
   })
-  it('explains every video example and keeps reference images distinct from pinned first frames', () => {
-    const video = asyncImageGuide(true, 'https://gateway.example').find(
+  it('keeps reference-media generation distinct from paired-frame generation', () => {
+    const video = asyncImageGuide('https://gateway.example').find(
       (section) => section.id === 'video'
     )
     expect(video).toBeDefined()
     const examples = video?.examples ?? []
+    expect(examples).toHaveLength(3)
     for (const example of examples) {
       expect(example.title).toBeTruthy()
       expect(example.description).toBeTruthy()
     }
-    const bodies = examples.flatMap((example) => {
+    const bodies = examples.map((example) => {
       const body = /--data '([\s\S]+)'$/.exec(example.code)?.[1]
-      return body ? [JSON.parse(body) as Record<string, unknown>] : []
+      expect(body).toBeDefined()
+      return JSON.parse(body ?? '') as Record<string, unknown>
     })
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'xai',
-        image: { url: 'https://cdn.example/reference.png' },
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.0-A',
-        seconds: 4,
-        resolution: '480p',
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.5-A',
-        prompt: expect.stringContaining('@图1'),
-        reference_images: ['https://cdn.example/character.png'],
-        reference_videos: ['https://cdn.example/motion.mp4'],
-        reference_audios: ['https://cdn.example/voice.mp3'],
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.0-A',
-        image: 'https://cdn.example/first.png',
-        last_frame: 'https://cdn.example/last.png',
-        aspect_ratio: 'Auto',
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'minimax-h3',
-        generate_audio: false,
-        reference_images: ['https://cdn.example/character.png'],
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.5-F',
-        reference_images: ['https://cdn.example/character.png'],
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.5-E',
-        reference_videos: ['https://cdn.example/motion.mp4'],
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.5-E',
-        references: [
-          {
-            type: 'image',
-            role: 'reference',
-            source: 'https://cdn.example/character.png',
-          },
-          {
-            type: 'video',
-            role: 'reference',
-            source: 'https://cdn.example/motion.mp4',
-          },
-          {
-            type: 'audio',
-            role: 'reference',
-            source: 'https://cdn.example/voice.mp3',
-          },
-        ],
-      })
-    )
-    expect(bodies).toContainEqual(
-      expect.objectContaining({
-        provider: 'drama',
-        model: 'seedance2.5-G',
-        image: 'https://cdn.example/first.png',
-        last_frame: 'https://cdn.example/last.png',
-        aspect_ratio: 'adaptive',
-      })
-    )
+    const references = bodies.find((body) => 'reference_images' in body)
+    expect(references).toMatchObject({
+      reference_images: ['https://cdn.example/character.png'],
+      reference_videos: ['https://cdn.example/motion.mp4'],
+      reference_audios: ['https://cdn.example/voice.mp3'],
+    })
+    expect(references).not.toHaveProperty('image')
+    expect(references).not.toHaveProperty('last_frame')
+    expect(references).not.toHaveProperty('video_input')
+    const frames = bodies.find((body) => 'last_frame' in body)
+    expect(frames).toMatchObject({
+      image: 'https://cdn.example/first.png',
+      last_frame: 'https://cdn.example/last.png',
+    })
+    expect(frames).not.toHaveProperty('reference_images')
   })
   it('sends explicit async aliases and native realtime dimensions without switching mode', () => {
     const async = buildImageRequest(options)

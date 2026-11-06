@@ -459,6 +459,7 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 	}
 	// Model mappings determine the upstream protocol, while the original name
 	// continues to identify permissions and billing.
+	requestedModel := modelName
 	if ch.Type == constant.ChannelTypeTabTab {
 		var err error
 		modelName, err = service.ResolveImageChannelUpstreamModel(ch, modelName)
@@ -488,6 +489,10 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 		}
 	}
 	capability := provider.ImageCapability(modelName)
+	animationModels := []string{"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
+	if capability.OpenAICompatibleRequest && (slices.Contains(animationModels, requestedModel) || slices.Contains(animationModels, modelName)) {
+		capability.Parameters = append(slices.Clone(capability.Parameters), "output_format", "frame_count", "frame_duration_ms")
+	}
 	if ch.Type == constant.ChannelTypeTabTab {
 		capability = service.TabtabImageCapability(modelName)
 	}

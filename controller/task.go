@@ -61,9 +61,11 @@ func GetTask(c *gin.Context) {
 	if createdAt == 0 {
 		createdAt = task.SubmitTime
 	}
-	failReason := service.PublicTaskFailureReason(task)
+	var failReason string
 	if task.PrivateData.VideoRouting != nil {
-		failReason = service.PublicVideoRoutingFailureReason(failReason)
+		failReason = service.PublicVideoRoutingFailureReason(service.VideoTaskFailureDiagnostic(task))
+	} else {
+		failReason = service.PublicTaskFailureReason(task)
 	}
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""

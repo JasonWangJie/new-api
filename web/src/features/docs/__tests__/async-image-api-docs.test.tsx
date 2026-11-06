@@ -255,8 +255,8 @@ describe('public async image API documentation', () => {
       within(article).getByRole('heading', { name: '9. 旧版兼容入口' })
     ).toHaveAttribute('id', '9-旧版兼容入口')
     expect(
-      within(article).getByRole('heading', { name: '6.3 结果链接' })
-    ).toHaveAttribute('id', '63-结果链接')
+      within(article).getByRole('heading', { name: '6.3 结果链接与文件读取' })
+    ).toHaveAttribute('id', '63-结果链接与文件读取')
     const chapter = within(article).getByRole('link', { name: '第 9 节' })
     expect(decodeURIComponent(chapter.getAttribute('href') ?? '')).toBe(
       '#9-旧版兼容入口'

@@ -395,7 +395,7 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 					continue
 				}
 			}
-			if name == "n" || name == "stream" || name == "watermark" || name == "output_compression" || name == "partial_images" {
+			if name == "n" || name == "stream" || name == "watermark" || name == "output_compression" || name == "partial_images" || name == "frame_count" || name == "frame_duration_ms" {
 				fields[name] = common.RawMessage(data)
 			} else {
 				encoded, err := common.Marshal(value)
@@ -442,6 +442,38 @@ func ParseAsyncImageRequest(raw []byte, contentType, path string, cfg ImageRunti
 	}
 	if err := ValidateImageModelName(request.Model); err != nil {
 		return request, err
+	}
+	if request.Platform == "openai" && slices.Contains([]string{"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}, request.Model) {
+		var format string
+		if raw, present := fields["output_format"]; present {
+			if common.Unmarshal(raw, &format) != nil || !slices.Contains([]string{"png", "webp", "jpeg", "gif", "svg"}, format) {
+				return request, errors.New("output_format must be one of png, webp, jpeg, gif, svg")
+			}
+		} else {
+			format = "png"
+			fields["output_format"] = common.RawMessage(`"png"`)
+		}
+		for _, parameter := range []struct {
+			name             string
+			minimum, maximum int
+			defaultValue     string
+		}{
+			{"frame_count", 2, 16, "9"},
+			{"frame_duration_ms", 20, 2000, "200"},
+		} {
+			raw, present := fields[parameter.name]
+			if present {
+				if format != "gif" {
+					return request, fmt.Errorf("%s requires output_format=gif", parameter.name)
+				}
+				var value int
+				if common.Unmarshal(raw, &value) != nil || value < parameter.minimum || value > parameter.maximum {
+					return request, fmt.Errorf("%s must be an integer between %d and %d", parameter.name, parameter.minimum, parameter.maximum)
+				}
+			} else if format == "gif" {
+				fields[parameter.name] = common.RawMessage(parameter.defaultValue)
+			}
+		}
 	}
 	if request.Platform == "gemini" && request.Dialect == "bb" {
 		var body struct {
