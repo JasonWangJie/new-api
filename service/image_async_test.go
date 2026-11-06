@@ -5965,6 +5965,70 @@ func TestAsyncImageGIFFrameCompatibility(t *testing.T) {
 	})
 }
 
+func TestAsyncImageSVGEmbeddedJPEG(t *testing.T) {
+	var encoded bytes.Buffer
+	require.NoError(t, jpeg.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 3, 2)), nil))
+	jpegData := encoded.Bytes()
+	// JPEG APP15 segments model a large valid data URI without a binary fixture.
+	segment := append([]byte{0xff, 0xef, 0xff, 0xff}, make([]byte, 65533)...)
+	largeJPEG := append(bytes.Clone(jpegData[:2]), bytes.Repeat(segment, 13)...)
+	largeJPEG = append(largeJPEG, jpegData[2:]...)
+	const svgStart = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="3" height="2">`
+	const jpegURI = "data:image/jpeg;base64,"
+	href := jpegURI + base64.StdEncoding.EncodeToString(jpegData)
+	largeHref := jpegURI + base64.StdEncoding.EncodeToString(largeJPEG)
+	require.Greater(t, len(largeHref), 1<<20)
+	const imageStart = `<image width="3" height="2" `
+	const imageEnd = `"/>`
+	imageElement := imageStart + `href="` + href + imageEnd
+
+	for _, tc := range []struct {
+		name, elements string
+		pixels         int64
+	}{
+		{"href", imageElement, 12},
+		{"large xlink href", imageStart + `xlink:href="` + largeHref + imageEnd, 12},
+		{"multiple images at budget", imageElement + imageElement, 18},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			document := []byte(svgStart + tc.elements + "</svg>")
+			cfg := DefaultImageRuntimeConfig()
+			cfg.DownloadMaxPixels = tc.pixels
+			output, err := DownloadImageOutput(t.Context(), "data:image/svg+xml;base64,"+base64.StdEncoding.EncodeToString(document), cfg)
+			require.NoError(t, err)
+			assert.Equal(t, "image/svg+xml", output.ContentType)
+			assert.Equal(t, 3, output.Width)
+			assert.Equal(t, 2, output.Height)
+			assert.Equal(t, document, output.Data)
+			stored, err := validateStoredImageBytes(output.Data, output.ContentType, int64(len(document)), tc.pixels)
+			require.NoError(t, err)
+			assert.Equal(t, output, stored)
+		})
+	}
+
+	for _, tc := range []struct {
+		name, elements string
+		pixels         int64
+	}{
+		{"external resource", imageStart + `href="https://example.com/image.jpg` + imageEnd, 100},
+		{"nested SVG", imageStart + `href="data:image/svg+xml;base64,PHN2Zy8+` + imageEnd, 100},
+		{"non-JPEG bytes", imageStart + `href="` + jpegURI + base64.StdEncoding.EncodeToString(asyncImageBytesFixture(t).Data) + imageEnd, 100},
+		{"invalid base64", imageStart + `href="` + jpegURI + "invalid!" + imageEnd, 100},
+		{"truncated JPEG", imageStart + `href="` + jpegURI + base64.StdEncoding.EncodeToString(jpegData[:len(jpegData)-2]) + imageEnd, 100},
+		{"JPEG trailing data", imageStart + `href="` + jpegURI + base64.StdEncoding.EncodeToString(append(bytes.Clone(jpegData), 'x')) + imageEnd, 100},
+		{"ambiguous href", imageStart + `href="` + href + `" xlink:href="` + href + imageEnd, 100},
+		{"event handler", imageStart + `onload="alert(1)" href="` + href + imageEnd, 100},
+		{"cumulative pixels", imageElement + imageElement, 17},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			document := []byte(svgStart + tc.elements + "</svg>")
+			_, err := validateImageOutputBytes(document, "image/svg+xml", int64(len(document)), tc.pixels)
+			require.Error(t, err)
+			assert.True(t, IsImageValidationError(err))
+		})
+	}
+}
+
 func TestAsyncImageSVGRejectsActiveAndMalformedContent(t *testing.T) {
 	for _, body := range []string{
 		`<script>alert(1)</script>`,

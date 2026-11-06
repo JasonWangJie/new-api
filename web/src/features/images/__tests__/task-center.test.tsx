@@ -2386,7 +2386,7 @@ test.each([
   { admin: false, mobile: true },
   { admin: true, mobile: true },
 ])(
-  'refunded costs remain visible with a red strikethrough in the list and details (admin=$admin, mobile=$mobile)',
+  'refunded costs show a red strikethrough and settled video costs show green (admin=$admin, mobile=$mobile)',
   async ({ admin, mobile }) => {
     if (mobile) setMobileViewport()
     const refunded = {
@@ -2396,7 +2396,7 @@ test.each([
       cost: 0,
       refunded_cost: 0.12,
     }
-    const items = [
+    const items: ImageTask[] = [
       refunded,
       { ...refunded, id: 'asyncimg_refunded_zero', refunded_cost: 0 },
       {
@@ -2412,7 +2412,8 @@ test.each([
       },
       {
         ...task,
-        id: 'asyncimg_settled',
+        id: 'asyncvideo_settled',
+        media_type: 'video',
         status: 'succeeded',
         billing_status: 'settled',
         cost: 0.34,
@@ -2434,14 +2435,15 @@ test.each([
     for (const [id, amount] of [
       [refunded.id, '$0.12'],
       ['asyncimg_refunded_zero', '$0'],
-      ['asyncimg_settled', '$0.34'],
+      ['asyncvideo_settled', '$0.34'],
     ]) {
       const container = mobile
         ? screen.getByRole('article', { name: id })
         : screen.getByRole('row', { name: new RegExp(id) })
       const cost = within(container).getByText(amount)
       expect(cost).toBeVisible()
-      if (id === 'asyncimg_settled') {
+      if (id === 'asyncvideo_settled') {
+        expect(cost).toHaveClass('text-emerald-700', 'dark:text-emerald-400')
         expect(cost).not.toHaveClass('text-destructive', 'line-through')
       } else {
         expect(cost).toHaveClass('text-destructive', 'line-through')

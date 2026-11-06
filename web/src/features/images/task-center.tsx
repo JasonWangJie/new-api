@@ -432,7 +432,7 @@ function TaskCenterSession({
             <span
               className={cn(
                 'text-muted-foreground font-mono text-xs',
-                ['succeeded', 'not_billable'].includes(
+                ['succeeded', 'not_billable', 'settled'].includes(
                   row.original.billing_status
                 ) && 'text-emerald-700 dark:text-emerald-400',
                 row.original.billing_status === 'refunded' &&

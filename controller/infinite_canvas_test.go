@@ -606,6 +606,7 @@ func TestCanvasImageContentAuthorizationAndOrdinaryKeyCompatibility(t *testing.T
 		assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
 		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "sandbox;")
 		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'none'")
+		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "img-src data:;")
 		if method == http.MethodGet {
 			assert.Equal(t, content, response.Body.Bytes())
 		} else {

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"io"
@@ -15,9 +16,9 @@ import (
 
 const svgNamespace = "http://www.w3.org/2000/svg"
 
-// SVG outputs are passive documents. This intentionally excludes scripting,
-// animation, embedded documents/images, network resources and arbitrary CSS.
-var svgOutputElements = strings.Fields(`svg g defs symbol use title desc path rect circle ellipse line polyline polygon
+// SVG outputs allow inline JPEGs and exclude scripting, animation,
+// embedded documents, network resources and arbitrary CSS.
+var svgOutputElements = strings.Fields(`svg g defs symbol use image title desc path rect circle ellipse line polyline polygon
 	text tspan textPath linearGradient radialGradient stop pattern clipPath mask marker
 	filter feBlend feColorMatrix feComponentTransfer feComposite feConvolveMatrix feDiffuseLighting
 	feDisplacementMap feDistantLight feDropShadow feFlood feFuncA feFuncB feFuncG feFuncR feGaussianBlur
@@ -66,7 +67,8 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 	var nodes []svgOutputNode
 	var stack []int
 	ids := make(map[string]int)
-	var rootAttrs []xml.Attr
+	var width, height int
+	remainingPixels := maxPixels
 	rootClosed, declarationSeen := false, false
 	styleNode := -1
 	var styleText strings.Builder
@@ -93,13 +95,10 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 			if len(nodes) >= 10000 || len(stack) >= 64 || len(token.Attr) > 64 {
 				return ImageBytes{}, newImageValidationError("SVG structure limit exceeded")
 			}
-			if len(nodes) == 0 {
-				if token.Name.Local != "svg" {
-					return ImageBytes{}, newImageValidationError("invalid SVG root")
-				}
-				rootAttrs = token.Attr
-			}
 			index := len(nodes)
+			if index == 0 && token.Name.Local != "svg" {
+				return ImageBytes{}, newImageValidationError("invalid SVG root")
+			}
 			nodes = append(nodes, svgOutputNode{})
 			if len(stack) > 0 {
 				parent := stack[len(stack)-1]
@@ -107,8 +106,12 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 			}
 			stack = append(stack, index)
 			seenAttrs := make(map[xml.Name]bool, len(token.Attr))
+			imageHrefSeen := false
 			for _, attr := range token.Attr {
-				if seenAttrs[attr.Name] || len(attr.Value) > 1<<20 {
+				isHref := attr.Name.Local == "href" && (attr.Name.Space == "" || attr.Name.Space == "http://www.w3.org/1999/xlink")
+				isImageHref := isHref && token.Name.Local == "image"
+				// Inline JPEGs are bounded by the whole SVG byte limit.
+				if seenAttrs[attr.Name] || (len(attr.Value) > 1<<20 && !isImageHref) {
 					return ImageBytes{}, newImageValidationError("invalid or oversized SVG attribute")
 				}
 				seenAttrs[attr.Name] = true
@@ -121,7 +124,19 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 				if attr.Name.Space == "http://www.w3.org/XML/1998/namespace" && (attr.Name.Local == "space" || attr.Name.Local == "lang") {
 					continue
 				}
-				if attr.Name.Local == "href" && (attr.Name.Space == "" || attr.Name.Space == "http://www.w3.org/1999/xlink") {
+				if isImageHref {
+					if imageHrefSeen {
+						return ImageBytes{}, newImageValidationError("SVG image has multiple href attributes")
+					}
+					pixels, err := validateSVGEmbeddedJPEG(attr.Value, remainingPixels)
+					if err != nil {
+						return ImageBytes{}, err
+					}
+					remainingPixels -= pixels
+					imageHrefSeen = true
+					continue
+				}
+				if isHref {
 					if !slices.Contains([]string{"use", "textPath", "linearGradient", "radialGradient", "pattern"}, token.Name.Local) || !strings.HasPrefix(attr.Value, "#") || !svgFragmentID.MatchString(attr.Value[1:]) {
 						return ImageBytes{}, newImageValidationError("SVG references must be local fragments")
 					}
@@ -159,6 +174,25 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 					return ImageBytes{}, err
 				}
 				nodes[index].refs = append(nodes[index].refs, refs...)
+			}
+			if index == 0 {
+				canvasWidth, canvasHeight, err := svgOutputDimensions(token.Attr)
+				if err != nil {
+					return ImageBytes{}, err
+				}
+				canvasWidth, canvasHeight = math.Ceil(canvasWidth), math.Ceil(canvasHeight)
+				if canvasWidth > math.MaxInt32 || canvasHeight > math.MaxInt32 {
+					return ImageBytes{}, newImageValidationError("image pixel limit exceeded")
+				}
+				width, height = int(canvasWidth), int(canvasHeight)
+				canvasPixels := int64(width) * int64(height)
+				if canvasPixels > remainingPixels {
+					return ImageBytes{}, newImageValidationError("image pixel limit exceeded")
+				}
+				remainingPixels -= canvasPixels
+			}
+			if token.Name.Local == "image" && !imageHrefSeen {
+				return ImageBytes{}, newImageValidationError("SVG image requires an embedded JPEG")
 			}
 			if token.Name.Local == "style" {
 				styleNode = index
@@ -202,14 +236,6 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 	if len(nodes) == 0 || !rootClosed || len(stack) != 0 {
 		return ImageBytes{}, newImageValidationError("incomplete SVG document")
 	}
-	width, height, err := svgOutputDimensions(rootAttrs)
-	if err != nil {
-		return ImageBytes{}, err
-	}
-	width, height = math.Ceil(width), math.Ceil(height)
-	if maxPixels <= 0 || width > math.MaxInt32 || height > math.MaxInt32 || height > float64(maxPixels) || width > float64(maxPixels)/height {
-		return ImageBytes{}, newImageValidationError("image pixel limit exceeded")
-	}
 	for i := range nodes {
 		for _, ref := range nodes[i].refs {
 			target, exists := ids[ref]
@@ -223,7 +249,28 @@ func validateSVGOutput(data []byte, maxPixels int64) (ImageBytes, error) {
 		return ImageBytes{}, err
 	}
 	sum := sha256.Sum256(data)
-	return ImageBytes{Data: data, ContentType: "image/svg+xml", Checksum: hex.EncodeToString(sum[:]), Width: int(width), Height: int(height)}, nil
+	return ImageBytes{Data: data, ContentType: "image/svg+xml", Checksum: hex.EncodeToString(sum[:]), Width: width, Height: height}, nil
+}
+
+func validateSVGEmbeddedJPEG(href string, maxPixels int64) (int64, error) {
+	encoded, ok := strings.CutPrefix(href, "data:image/jpeg;base64,")
+	if !ok {
+		return 0, newImageValidationError("SVG image requires an embedded Base64 JPEG")
+	}
+	data, err := base64.StdEncoding.Strict().DecodeString(encoded)
+	if err != nil {
+		return 0, newImageValidationError("invalid SVG JPEG base64")
+	}
+	raster, err := ValidateImageBytes(data, "image/jpeg", int64(len(data)), maxPixels)
+	if err != nil {
+		return 0, err
+	}
+	// The original SVG retains the URI, including any suffix the raster
+	// validator would normally trim from a standalone JPEG.
+	if len(raster.Data) != len(data) {
+		return 0, newImageValidationError("embedded SVG JPEG has trailing data")
+	}
+	return int64(raster.Width) * int64(raster.Height), nil
 }
 
 func validateSVGStyleDeclarations(style string) ([]string, error) {

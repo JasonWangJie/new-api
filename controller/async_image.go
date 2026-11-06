@@ -616,7 +616,7 @@ func GetImageObjectContent(c *gin.Context) {
 // enforcing the output validator's restrictions before storage.
 func imageOutputSecurityHeaders(c *gin.Context, contentType string) {
 	if contentType == "image/svg+xml" {
-		c.Header("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		c.Header("Content-Security-Policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		c.Header("X-Content-Type-Options", "nosniff")
 	}
 }
