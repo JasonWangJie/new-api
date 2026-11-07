@@ -121,7 +121,7 @@ type AsyncImageTask struct {
 	UpstreamTaskId        string `json:"-" gorm:"size:191"`
 	SelectedChannelCipher []byte `json:"-"`
 	Id                    int    `json:"-"`
-	TaskId                string `json:"task_id" gorm:"size:64;uniqueIndex"`
+	TaskId                string `json:"task_id" gorm:"size:64;uniqueIndex;index:idx_image_created_task,priority:2"`
 	UserId                int    `json:"user_id" gorm:"index:idx_image_user_created,priority:1"`
 	TokenId               int    `json:"api_key_id" gorm:"index"`
 	Group                 string `json:"group" gorm:"size:255"`
@@ -165,7 +165,7 @@ type AsyncImageTask struct {
 	LeaseExpiresAt        int64  `json:"-" gorm:"type:bigint"`
 	DispatchedAt          int64  `json:"-" gorm:"type:bigint"`
 	NextAttemptAt         int64  `json:"next_attempt_at" gorm:"type:bigint;index:idx_image_status_due,priority:2"`
-	CreatedAt             int64  `json:"created_at" gorm:"type:bigint;index:idx_image_user_created,priority:2"`
+	CreatedAt             int64  `json:"created_at" gorm:"type:bigint;index:idx_image_user_created,priority:2;index:idx_image_created_task,priority:1"`
 	UpdatedAt             int64  `json:"updated_at" gorm:"type:bigint"`
 	StartedAt             int64  `json:"started_at" gorm:"type:bigint"`
 	UpstreamSucceededAt   int64  `json:"upstream_succeeded_at" gorm:"type:bigint"`

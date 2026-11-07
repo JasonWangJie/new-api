@@ -123,11 +123,6 @@ func ListImageTasks(c *gin.Context, admin bool) {
 		imageManagementError(c, 400, errors.New("Task page size must be between 1 and 100"))
 		return
 	}
-	var total int64
-	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
-		imageManagementError(c, 503, err)
-		return
-	}
 	var stats struct {
 		Total           int64    `json:"total"`
 		Queued          int64    `json:"queued"`
@@ -154,6 +149,7 @@ AVG(CASE WHEN status = 'succeeded' AND finished_at >= created_at THEN (finished_
 		return
 	}
 	stats.SucceededCost = float64(stats.SucceededQuota) / common.QuotaPerUnit
+	total := stats.Total
 	allowed := map[string]string{"created_at": "created_at", "submitted_at": "created_at", "finished_at": "finished_at", "updated_at": "updated_at", "status": "status", "quota": "quota", "image_count": "image_count", "duration_ms": "(CASE WHEN finished_at > 0 THEN finished_at-created_at ELSE 0 END)"}
 	column, ok := allowed[c.DefaultQuery("sort_by", "created_at")]
 	if !ok {

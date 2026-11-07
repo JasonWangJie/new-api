@@ -1114,11 +1114,6 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 	videoProjection := "task_id, created_at, (?) AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, (?) AS billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
 	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, videoStatus, videoBillingStatus))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
-	var total int64
-	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
-		imageManagementError(c, 503, err)
-		return
-	}
 	sortBy := c.DefaultQuery("sort_by", "created_at")
 	if !slices.Contains([]string{"created_at", "finished_at", "updated_at", "status", "quota", "image_count"}, sortBy) {
 		imageManagementError(c, 400, errors.New("Invalid media task sorting"))
@@ -1208,5 +1203,6 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		return
 	}
 	stats.SucceededCost = float64(stats.SucceededQuota) / common.QuotaPerUnit
+	total := stats.Total
 	imageManagementData(c, gin.H{"items": ordered, "total": total, "pages": (total + int64(size) - 1) / int64(size), "stats": stats, "page": page, "page_size": size})
 }

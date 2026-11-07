@@ -101,17 +101,30 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+				require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+				assert.True(t, db.Migrator().HasIndex(&model.AsyncImageTask{}, "idx_image_created_task"))
 			}
 			// Rebuild the released table shape, then exercise the same startup
 			// migration against both existing data and its unique task identifier.
+			require.NoError(t, db.Migrator().DropIndex(&model.AsyncImageTask{}, "idx_image_created_task"))
+			legacyImage := model.AsyncImageTask{TaskId: "legacy-image-list-upgrade", UserId: 90101, TokenId: 90201, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Quota: 120, ImageCount: 2, ResultCount: 2, PromptSummary: "historical image prompt", RequestCipher: []byte("historical encrypted request"), Attempts: `[{"channel_id":301}]`, CreatedAt: 1700000000, FinishedAt: 1700000020}
+			require.NoError(t, db.Create(&legacyImage).Error)
 			require.NoError(t, db.Migrator().DropColumn(&model.AsyncMediaJob{}, "RefundLogPayload"))
 			legacy := model.AsyncMediaJob{TaskId: "legacy-video-refund-upgrade", IdentityHash: "legacy-video-refund-identity", UserId: 90101, TokenId: 90201, Provider: "drama", Model: "legacy-video-model", Group: "refund-upgrade", Status: "execution_unknown", StorageStatus: "pending", BillingStatus: "unknown", Quota: 120, ErrorMessage: "historical video submission diagnostic", CreatedAt: 1700000000, ExpiresAt: 1800000000}
 			require.NoError(t, db.Omit("RefundLogPayload").Create(&legacy).Error)
 			for range 2 {
 				require.NoError(t, db.AutoMigrate(entities...))
 				require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AsyncImageLogReceipt{}))
+				assert.True(t, db.Migrator().HasIndex(&model.AsyncImageTask{}, "idx_image_created_task"))
+				assert.True(t, db.Migrator().HasIndex(&model.AsyncImageTask{}, "idx_image_user_created"))
 			}
+			var upgradedImage model.AsyncImageTask
+			require.NoError(t, db.Take(&upgradedImage, legacyImage.Id).Error)
+			assert.Equal(t, legacyImage, upgradedImage, "adding the list index must preserve historical task content and accounting")
+			duplicateImage := legacyImage
+			duplicateImage.Id = 0
+			require.Error(t, db.Create(&duplicateImage).Error, "adding the list index must preserve task_id uniqueness")
+			require.NoError(t, db.Delete(&legacyImage).Error)
 			var upgraded model.AsyncMediaJob
 			require.NoError(t, db.Take(&upgraded, legacy.ID).Error)
 			assert.Equal(t, legacy, upgraded, "adding the refund log outbox must preserve historical task and accounting data")
@@ -715,6 +728,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							{name: "administrator all matches", admin: true, imageQuota: 1000000, videoQuota: 875000},
 							{name: "owner only", imageQuota: 500000, videoQuota: 875000},
 							{name: "last page keeps full summary", admin: true, params: url.Values{"page": {"2"}}, imageQuota: 1000000, videoQuota: 875000},
+							{name: "out of range page keeps full summary", admin: true, params: url.Values{"page": {"99"}}, imageQuota: 1000000, videoQuota: 875000},
 							{name: "success filter", admin: true, params: url.Values{"status": {"succeeded"}}, imageQuota: 1000000, videoQuota: 875000},
 							{name: "failed excludes previously charged and refunded", admin: true, params: url.Values{"status": {"failed"}}},
 							{name: "billing filter", admin: true, params: url.Values{"billing_status": {"succeeded"}}, imageQuota: 1000000},
@@ -725,6 +739,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							{name: "API key filter", admin: true, params: url.Values{"api_key_id": {"202"}}, imageQuota: 500000},
 							{name: "date excludes all", admin: true, params: url.Values{"start_date": {"2099-01-01"}, "end_date": {"2099-01-01"}}},
 							{name: "no matches", admin: true, params: url.Values{"q": {"missing-cost-task"}}},
+							{name: "empty scope on later page", admin: true, params: url.Values{"q": {"missing-cost-task"}, "page": {"99"}}},
 						} {
 							t.Run(tc.name, func(t *testing.T) {
 								params := tc.params
@@ -748,13 +763,29 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								var response struct {
 									Data struct {
 										Items []gin.H
+										Total int
+										Pages int
 										Stats struct {
+											Total         int
 											SucceededCost *float64 `json:"succeeded_cost"`
 										}
 									}
 								}
 								require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 								require.NotNil(t, response.Data.Stats.SucceededCost)
+								assert.Equal(t, response.Data.Stats.Total, response.Data.Total)
+								assert.Equal(t, response.Data.Total, response.Data.Pages, "a one-item page keeps the filtered scope's page count")
+								if params.Get("page") == "99" {
+									assert.Empty(t, response.Data.Items)
+									wantTotal := 8
+									if handler.name == "media" {
+										wantTotal += 5
+									}
+									if params.Get("q") != "" {
+										wantTotal = 0
+									}
+									assert.Equal(t, wantTotal, response.Data.Total)
+								}
 								quota := tc.imageQuota
 								if handler.name == "media" {
 									quota += tc.videoQuota
