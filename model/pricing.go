@@ -143,6 +143,43 @@ func getPricingEndpointTypesForAbility(ability AbilityWithChannel, advancedCusto
 	return common.GetEndpointTypesByChannelType(ability.ChannelType, ability.Model)
 }
 
+func getPricingTaskPluginEndpointTypes(channel *Channel, modelName string, generation *jsplugin.RoutingGeneration) []constant.EndpointType {
+	if channel == nil {
+		return nil
+	}
+	mapping := make(map[string]string)
+	if raw := channel.GetModelMapping(); strings.TrimSpace(raw) != "" {
+		if err := common.UnmarshalJsonStr(raw, &mapping); err != nil {
+			common.SysLog(fmt.Sprintf("load task plugin pricing model mapping error: channel_id=%d, error=%v", channel.Id, err))
+			return nil
+		}
+	}
+	upstream, cyclic := followChannelModelMapping(mapping, modelName)
+	if cyclic {
+		return nil
+	}
+	if canonical, ok := generation.CanonicalModel(upstream); ok {
+		upstream = canonical
+	}
+	key := channel.GetSetting().TaskPluginKey
+	var endpoints []constant.EndpointType
+	for _, protocol := range []struct {
+		path     string
+		endpoint constant.EndpointType
+	}{
+		{"/v1/videos", constant.EndpointTypeOpenAIVideo},
+		{"/v1/responses", constant.EndpointTypeOpenAIResponse},
+	} {
+		for _, binding := range generation.LookupEndpointCandidates("POST", protocol.path, upstream) {
+			if binding.Plugin.Meta.Key == key {
+				endpoints = append(endpoints, protocol.endpoint)
+				break
+			}
+		}
+	}
+	return endpoints
+}
+
 // loadPricingAdvancedCustomConfigs runs inside updatePricing while
 // updatePricingLock is held, and nests channelSyncLock.RLock. This defines the
 // global lock order updatePricingLock -> channelSyncLock: any code path holding
@@ -255,11 +292,31 @@ func updatePricing() {
 	//这里使用切片而不是Set，因为一个模型可能支持多个端点类型，并且第一个端点是优先使用端点
 	modelSupportEndpointsStr := make(map[string][]string)
 	advancedCustomConfigs := loadPricingAdvancedCustomConfigs(enableAbilities)
+	pluginGeneration := jsplugin.DefaultRegistry.Generation()
+	taskPluginChannels := make(map[int]*Channel)
+	for _, ability := range enableAbilities {
+		if ability.ChannelType != constant.ChannelTypeTaskPlugin {
+			continue
+		}
+		if _, loaded := taskPluginChannels[ability.ChannelId]; loaded {
+			continue
+		}
+		channel, err := CacheGetChannel(ability.ChannelId)
+		if err != nil {
+			common.SysLog(fmt.Sprintf("load task plugin pricing channel error: channel_id=%d, error=%v", ability.ChannelId, err))
+		}
+		taskPluginChannels[ability.ChannelId] = channel
+	}
 
 	// 先根据已有能力填充原生端点
 	for _, ability := range enableAbilities {
 		endpoints := modelSupportEndpointsStr[ability.Model]
-		channelTypes := getPricingEndpointTypesForAbility(ability, advancedCustomConfigs)
+		var channelTypes []constant.EndpointType
+		if ability.ChannelType == constant.ChannelTypeTaskPlugin {
+			channelTypes = getPricingTaskPluginEndpointTypes(taskPluginChannels[ability.ChannelId], ability.Model, pluginGeneration)
+		} else {
+			channelTypes = getPricingEndpointTypesForAbility(ability, advancedCustomConfigs)
+		}
 		for _, channelType := range channelTypes {
 			if !common.StringsContains(endpoints, string(channelType)) {
 				endpoints = append(endpoints, string(channelType))
@@ -338,7 +395,6 @@ func updatePricing() {
 	}
 
 	pricingMap = make([]Pricing, 0)
-	pluginGeneration := jsplugin.DefaultRegistry.Generation()
 	for model, groups := range modelGroupsMap {
 		pricing := Pricing{
 			ModelName:              model,

@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -188,6 +189,74 @@ func TestPricingNativeChannelEndpointTypesUnchanged(t *testing.T) {
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAI}, byModel["gpt-4o"])
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}, byModel["gemini-2.5-flash"])
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}, byModel["claude-3-5-sonnet"])
+}
+
+func TestPricingTaskPluginUsesBoundProtocolsAndPreservesSharedChannels(t *testing.T) {
+	for _, memoryCache := range []bool{true, false} {
+		t.Run(fmt.Sprintf("memory_cache_%t", memoryCache), func(t *testing.T) {
+			resetPricingEndpointTestTables(t)
+			common.MemoryCacheEnabled = memoryCache
+			for _, plugin := range []struct{ key, protocols string }{
+				{"pricing-protocol-video", `[{name:"openai_video",models:["opaque-video"]},{name:"openai_responses",models:["response-only"],supports:["sync"]}]`},
+				{"pricing-protocol-response", `[{name:"openai_responses",models:["opaque-video"],supports:["sync"]},{name:"openai_video",models:["native-only"]}]`},
+			} {
+				source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: "Pricing Protocol Probe", version: "1.0.0", author: {name: "Test"},
+  models: ["opaque-video", "response-only", "native-only"], fetchMode: "per_task", protocols: %s
+};
+export const protocols = {
+  openai_video: {decodeRequest() { return {}; }, render() { return {}; }},
+  openai_responses: {decodeRequest() { return {}; }, renderFinal() { return {}; }}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+export function listArtifacts() { return []; }
+export function buildContentRequest() { return {}; }
+`, plugin.key, plugin.protocols)
+				_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(plugin.key) })
+			}
+			for _, channel := range []Channel{
+				{
+					Id: 501, Type: constant.ChannelTypeTaskPlugin,
+					Models:       "minimax-public,shared-catalog,shared-providers,response-only,native-only,unbound-model",
+					Setting:      common.GetPointer(`{"task_plugin_key":"pricing-protocol-video"}`),
+					ModelMapping: common.GetPointer(`{"minimax-public":"alias-tail","alias-tail":"opaque-video","shared-catalog":"opaque-video","shared-providers":"opaque-video"}`),
+				},
+				{
+					Id: 502, Type: constant.ChannelTypeTaskPlugin, Models: "response-alias,shared-providers",
+					Setting:      common.GetPointer(`{"task_plugin_key":"pricing-protocol-response"}`),
+					ModelMapping: common.GetPointer(`{"response-alias":"opaque-video","shared-providers":"opaque-video"}`),
+				},
+				{Id: 503, Type: constant.ChannelTypeOpenAI, Models: "shared-catalog"},
+				{
+					Id: 504, Type: constant.ChannelTypeTaskPlugin, Models: "missing-plugin",
+					Setting: common.GetPointer(`{"task_plugin_key":"pricing-protocol-missing"}`),
+				},
+			} {
+				channel.Status = common.ChannelStatusEnabled
+				channel.Name = fmt.Sprintf("channel-%d", channel.Id)
+				require.NoError(t, DB.Create(&channel).Error)
+				for _, modelName := range channel.GetModels() {
+					insertPricingEndpointAbility(t, channel.Id, modelName)
+				}
+			}
+
+			byModel := pricingEndpointTypesByModel(t)
+			assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAIVideo}, byModel["minimax-public"])
+			assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAIResponse}, byModel["response-only"])
+			assert.Equal(t, []constant.EndpointType{constant.EndpointTypeOpenAIResponse}, byModel["response-alias"])
+			assert.ElementsMatch(t, []constant.EndpointType{constant.EndpointTypeOpenAIVideo, constant.EndpointTypeOpenAI}, byModel["shared-catalog"])
+			assert.ElementsMatch(t, []constant.EndpointType{constant.EndpointTypeOpenAIVideo, constant.EndpointTypeOpenAIResponse}, byModel["shared-providers"])
+			assert.Empty(t, byModel["native-only"])
+			assert.Empty(t, byModel["unbound-model"])
+			assert.Empty(t, byModel["missing-plugin"])
+		})
+	}
 }
 
 func TestInitChannelCacheInvalidatesPricingCache(t *testing.T) {
