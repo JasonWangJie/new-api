@@ -44,6 +44,68 @@ import type { PricingValues } from '../pricing'
 
 const clients: QueryClient[] = []
 
+it('keeps mixed video prices and expanded provider prices in a shrinkable scroll region', async () => {
+  useAuthStore
+    .getState()
+    .auth.setUser({ id: 1, username: 'administrator', role: 100 })
+  const configured = {
+    'billing_setting.mixed_video_billing_expr':
+      'tier("seconds", u("seconds") * 0.6)',
+  }
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        entries: [
+          {
+            model_name: 'seedance2.5-A',
+            version: 'v1',
+            configured,
+            effective: {},
+            mixed_video: {
+              eligible: true,
+              valid: true,
+              source: 'override',
+              expression:
+                configured['billing_setting.mixed_video_billing_expr'],
+              usage_schema: { seconds: { type: 'number', unit: 'second' } },
+            },
+          },
+        ],
+      },
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <div className='flex h-96 flex-col overflow-hidden'>
+        <ModelPricingPanel modelName='seedance2.5-A' />
+      </div>
+    </QueryClientProvider>
+  )
+  const mixed = await screen.findByRole('region', {
+    name: 'Mixed video public price',
+  })
+  const scrollRegion = mixed.closest('[class~="overflow-y-auto"]')
+  expect(scrollRegion).toHaveClass('min-h-0', 'flex-1', 'overscroll-contain')
+  expect(scrollRegion).toContainElement(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: 'Advanced model and provider pricing' })
+  )
+  expect(scrollRegion).toContainElement(
+    await screen.findByRole('region', { name: 'Edit model pricing' })
+  )
+  expect(scrollRegion).toContainElement(
+    screen.getByRole('button', { name: 'Save model prices' })
+  )
+})
+
 it('refreshes an already mounted public price after saving mixed-price inheritance', async () => {
   useAuthStore
     .getState()
@@ -116,8 +178,8 @@ it('refreshes an already mounted public price after saving mixed-price inheritan
     }
   })
   vi.spyOn(api, 'patch').mockImplementation(async (_url, body) => {
-    configured = (body as { changes: { pricing: PricingValues }[] })
-      .changes[0].pricing
+    configured = (body as { changes: { pricing: PricingValues }[] }).changes[0]
+      .pricing
     return { data: { success: true } }
   })
   function PublicPrice() {
@@ -147,7 +209,9 @@ it('refreshes an already mounted public price after saving mixed-price inheritan
   await waitFor(() => expect(publicPrice).toHaveTextContent('7/unit'))
   const user = userEvent.setup()
   await user.click(screen.getByRole('button', { name: 'Use model pricing' }))
-  await user.click(screen.getByRole('button', { name: 'Save mixed video price' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Save mixed video price' })
+  )
   await waitFor(() => expect(publicPrice).toHaveTextContent('3/unit'))
   expect(publicPrice).not.toHaveTextContent('7/unit')
 })

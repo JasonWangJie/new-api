@@ -41,6 +41,7 @@ import {
   type ModelPricingEditorPanelHandle,
 } from '@/features/system-settings/models/model-pricing-sheet'
 import { handleServerError } from '@/lib/handle-server-error'
+import { cn } from '@/lib/utils'
 import { usePricingPreferencesStore } from '@/stores/pricing-preferences-store'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
@@ -302,7 +303,12 @@ export function ModelPricingPanel(props: {
     />
   )
   return (
-    <div className='flex min-h-0 min-w-0 flex-1 flex-col gap-3'>
+    <div
+      className={cn(
+        'flex min-h-0 min-w-0 flex-1 flex-col gap-3',
+        showMixed && 'overflow-y-auto overscroll-contain'
+      )}
+    >
       {(save.isError || mixedDirty || baseDirty) && (
         <div className='space-y-2'>
           {save.isError && (
