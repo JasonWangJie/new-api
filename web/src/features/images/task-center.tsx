@@ -95,6 +95,7 @@ import {
 import type { ImageTask } from './types'
 
 const TASK_REFRESH_INTERVAL_SECONDS = 10
+const TASK_TERMINATION_CONCURRENCY = 3
 const TASK_STATES = [
   'queued',
   'invoking',
@@ -169,6 +170,7 @@ function TaskCenterSession({
     checkExistingVideo?: boolean
   } | null>(null)
   const [busy, setBusy] = useState(false)
+  const [completedTasks, setCompletedTasks] = useState(0)
   const params = new URLSearchParams({
     ...Object.fromEntries(
       Object.entries(filters).filter(([, value]) => !!value)
@@ -181,7 +183,8 @@ function TaskCenterSession({
   const tasks = useQuery({
     queryKey: ['image-task-center', userId, admin, params.toString()],
     queryFn: ({ signal }) => getImageTasks(admin, params, signal),
-    refetchInterval: autoRefresh ? TASK_REFRESH_INTERVAL_SECONDS * 1000 : false,
+    refetchInterval:
+      autoRefresh && !busy ? TASK_REFRESH_INTERVAL_SECONDS * 1000 : false,
   })
   const now = useMediaRetentionClock(tasks.data?.items)
   const platforms = useQuery({
@@ -573,7 +576,8 @@ function TaskCenterSession({
     ...values.map((value) => ({ value, label: t(imageLabel(value)) })),
   ]
   const confirm = async () => {
-    if (!operation) return
+    if (!operation || busy) return
+    setCompletedTasks(0)
     setBusy(true)
     const body: Record<string, boolean> = {}
     if (operation.confirmUpstreamChecked) body.confirm_upstream_checked = true
@@ -582,22 +586,44 @@ function TaskCenterSession({
     }
     try {
       if (operation.action === 'batch-terminate') {
-        const failures: { id: string; reason: string }[] = []
-        for (const id of operation.ids) {
-          try {
-            await imageRequest(
-              `${mediaTasksPath(true)}/${id}/terminate`,
-              'POST',
-              Object.keys(body).length ? body : undefined
-            )
-          } catch (error) {
-            failures.push({
-              id,
-              reason:
-                error instanceof Error ? error.message : t('Operation failed'),
-            })
-          }
-        }
+        const failureReasons: (string | undefined)[] = []
+        let nextIndex = 0
+        let completed = 0
+        await Promise.all(
+          Array.from(
+            {
+              length: Math.min(
+                TASK_TERMINATION_CONCURRENCY,
+                operation.ids.length
+              ),
+            },
+            async () => {
+              while (nextIndex < operation.ids.length) {
+                const index = nextIndex++
+                const id = operation.ids[index]
+                try {
+                  await imageRequest(
+                    `${mediaTasksPath(true)}/${id}/terminate`,
+                    'POST',
+                    Object.keys(body).length ? body : undefined
+                  )
+                } catch (error) {
+                  failureReasons[index] =
+                    error instanceof Error
+                      ? error.message
+                      : t('Operation failed')
+                } finally {
+                  completed += 1
+                  setCompletedTasks(completed)
+                }
+              }
+            }
+          )
+        )
+        const failures = operation.ids.flatMap((id, index) => {
+          const reason = failureReasons[index]
+          return reason === undefined ? [] : [{ id, reason }]
+        })
         const succeeded = operation.ids.length - failures.length
         if (failures.length) {
           toast.error(
@@ -635,12 +661,14 @@ function TaskCenterSession({
           body
         )
       }
-      await queryClient.invalidateQueries({
-        queryKey: ['image-task-center', userId, admin],
-      })
-      await queryClient.invalidateQueries({
-        queryKey: ['image-task-details', userId, admin],
-      })
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['image-task-center', userId, admin],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['image-task-details', userId, admin],
+        }),
+      ])
       setSelection({})
       setOperation(null)
     } catch (error) {
@@ -1027,7 +1055,7 @@ function TaskCenterSession({
             <ImageReliabilityPanel
               userId={userId}
               filters={filters}
-              autoRefresh={autoRefresh}
+              autoRefresh={autoRefresh && !busy}
             />
           )}
           {isMobile ? (
@@ -1203,7 +1231,19 @@ function TaskCenterSession({
             destructive={operation?.action !== 'resume'}
             isLoading={busy}
             handleConfirm={() => void confirm()}
-          />
+          >
+            {busy && operation?.action === 'batch-terminate' && (
+              <p
+                role='status'
+                className='text-muted-foreground text-sm tabular-nums'
+              >
+                {t('{{completed}}/{{total}} completed', {
+                  completed: completedTasks,
+                  total: operation.ids.length,
+                })}
+              </p>
+            )}
+          </ConfirmDialog>
         </div>
       </SectionPageLayout.Content>
     </SectionPageLayout>

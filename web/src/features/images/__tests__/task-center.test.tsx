@@ -3839,6 +3839,175 @@ test.each([
   }
 )
 
+test('batch termination of twelve fixed tasks refills three request slots, reports progress and retains failures in task order', async () => {
+  const user = userEvent.setup()
+  const items = Array.from({ length: 12 }, (_, index) => ({
+    ...task,
+    id: `asyncimg_batch_${index}`,
+    task_id: `asyncimg_batch_${index}`,
+  }))
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items,
+    total: items.length,
+    pages: 1,
+    stats: {},
+  })
+  const requests: {
+    resolve: (value: unknown) => void
+    reject: (error: Error) => void
+  }[] = []
+  vi.mocked(imageRequest).mockImplementation(
+    () => new Promise((resolve, reject) => requests.push({ resolve, reject }))
+  )
+  mount(
+    <>
+      <ImageTaskCenter admin />
+      <Toaster />
+    </>
+  )
+  await user.click(
+    await screen.findByRole('button', { name: 'Terminate current page (12)' })
+  )
+  const confirmation = await screen.findByRole('alertdialog', {
+    name: 'Terminate media tasks',
+  })
+  const confirm = within(confirmation).getByRole('button', { name: 'Continue' })
+  await user.click(confirm)
+  await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(3))
+  expect(within(confirmation).getByRole('status')).toHaveTextContent(
+    '0/12 completed'
+  )
+  expect(confirm).toBeDisabled()
+  expect(
+    within(confirmation).getByRole('button', { name: 'Cancel' })
+  ).toBeDisabled()
+  await user.click(confirm)
+  expect(imageRequest).toHaveBeenCalledTimes(3)
+
+  const client = clients.at(-1)
+  assert(client)
+  act(() => {
+    client.setQueriesData(
+      { queryKey: ['image-task-center'] },
+      { items: [task], total: 1, pages: 1, stats: {} }
+    )
+  })
+  await act(async () => requests[2].reject(new Error('Third task failed')))
+  await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(4))
+  expect(within(confirmation).getByRole('status')).toHaveTextContent(
+    '1/12 completed'
+  )
+  await act(async () => requests[0].reject(new Error('First task failed')))
+  await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(5))
+  for (let index = 3; index < items.length; index += 1) {
+    await act(async () => requests[index].resolve({}))
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledTimes(Math.min(12, index + 3))
+    )
+  }
+  expect(within(confirmation).getByRole('status')).toHaveTextContent(
+    '11/12 completed'
+  )
+  expect(confirm).toBeDisabled()
+  expect(getImageTasks).toHaveBeenCalledTimes(1)
+  expect(vi.mocked(imageRequest).mock.calls).toEqual(
+    items.map((item) => [
+      `/api/admin/media-tasks/${item.id}/terminate`,
+      'POST',
+      undefined,
+    ])
+  )
+  await act(async () => requests[1].resolve({}))
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(
+    await screen.findByText('Task termination: 10 succeeded, 2 failed')
+  ).toBeVisible()
+  const failures = screen
+    .getByText('asyncimg_batch_0: First task failed')
+    .closest('ul')
+  assert(failures)
+  expect(
+    within(failures)
+      .getAllByRole('listitem')
+      .map((item) => item.textContent)
+  ).toEqual([
+    'asyncimg_batch_0: First task failed',
+    'asyncimg_batch_2: Third task failed',
+  ])
+  expect(imageRequest).toHaveBeenCalledTimes(12)
+
+  await user.click(
+    screen.getByRole('button', { name: 'Terminate current page (12)' })
+  )
+  const nextConfirmation = await screen.findByRole('alertdialog')
+  await user.click(
+    within(nextConfirmation).getByRole('button', { name: 'Continue' })
+  )
+  await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(15))
+  expect(within(nextConfirmation).getByRole('status')).toHaveTextContent(
+    '0/12 completed'
+  )
+  await act(async () => {
+    for (const request of requests.slice(12)) {
+      request.resolve({})
+    }
+  })
+  for (let index = 15; index < 24; index += 3) {
+    await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(index + 3))
+    await act(async () => {
+      for (const request of requests.slice(index, index + 3)) {
+        request.resolve({})
+      }
+    })
+  }
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+})
+
+test('batch termination pauses automatic list polling until completion and then resumes it', async () => {
+  let finish!: (value: unknown) => void
+  vi.mocked(imageRequest).mockReturnValueOnce(
+    new Promise((resolve) => {
+      finish = resolve
+    })
+  )
+  mount(<ImageTaskCenter admin />)
+  await screen.findByRole('button', { name: task.id })
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  try {
+    fireEvent.click(screen.getByRole('button', { name: 'Auto refresh' }))
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Terminate current page (1)' })
+    )
+    const confirmation = await screen.findByRole('alertdialog')
+    fireEvent.click(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    )
+    await waitFor(() => expect(imageRequest).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(11_000)
+    })
+    expect(getImageTasks).toHaveBeenCalledTimes(1)
+    expect(
+      within(confirmation).getByRole('button', { name: 'Continue' })
+    ).toBeDisabled()
+    await act(async () => finish({}))
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    )
+    expect(getImageTasks).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    await waitFor(() => expect(getImageTasks).toHaveBeenCalledTimes(3))
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
 test.each([
   { failure: false, dismiss: false },
   { failure: true, dismiss: false },
