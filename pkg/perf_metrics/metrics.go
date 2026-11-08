@@ -18,7 +18,7 @@ var hotBuckets sync.Map
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
-const seriesSchema = "dbcd0a3c01b55203"
+const seriesSchema = "task-delivery-v1-20261108"
 
 func Init() {
 	go flushLoop()
@@ -85,6 +85,7 @@ func Query(params QueryParams) (QueryResult, error) {
 	}
 	endTs := time.Now().Unix()
 	startTs := endTs - int64(params.Hours)*3600
+	allowedGroups := allowedGroupSet(params.Groups)
 
 	merged := map[bucketKey]counters{}
 	rows, err := model.GetPerfMetrics(params.Model, params.Group, startTs, endTs)
@@ -92,6 +93,11 @@ func Query(params QueryParams) (QueryResult, error) {
 		return QueryResult{}, err
 	}
 	for _, row := range rows {
+		if allowedGroups != nil {
+			if _, ok := allowedGroups[row.Group]; !ok {
+				continue
+			}
+		}
 		mergeCounters(merged, bucketKey{
 			model:    row.ModelName,
 			group:    row.Group,
@@ -104,7 +110,16 @@ func Query(params QueryParams) (QueryResult, error) {
 			ttftCount:      row.TtftCount,
 			outputTokens:   row.OutputTokens,
 			generationMs:   row.GenerationMs,
+			latencyCount:   row.RequestCount,
+			workloads:      relayWorkload,
 		})
+	}
+	taskRows, err := model.GetTaskPerfMetricBuckets(params.Model, params.Group, startTs, endTs, params.Groups)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	for _, row := range taskRows {
+		mergeCounters(merged, bucketKey{model: row.ModelName, group: row.Group, bucketTs: row.BucketTs}, taskCounters(row))
 	}
 
 	hotBuckets.Range(func(key, value any) bool {
@@ -115,11 +130,18 @@ func Query(params QueryParams) (QueryResult, error) {
 		if params.Group != "" && k.group != params.Group {
 			return true
 		}
+		if allowedGroups != nil {
+			if _, ok := allowedGroups[k.group]; !ok {
+				return true
+			}
+		}
 		mergeCounters(merged, k, value.(*atomicBucket).snapshot())
 		return true
 	})
 
-	return buildQueryResult(params.Model, merged), nil
+	result := buildQueryResult(params.Model, merged)
+	result.WindowHours, result.UpdatedAt = params.Hours, endTs
+	return result, nil
 }
 
 func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
@@ -147,7 +169,20 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 			totalLatencyMs: row.TotalLatencyMs,
 			outputTokens:   row.OutputTokens,
 			generationMs:   row.GenerationMs,
+			ttftSumMs:      row.TtftSumMs,
+			ttftCount:      row.TtftCount,
+			latencyCount:   row.RequestCount,
+			workloads:      relayWorkload,
 		}
+		mergeModelTotals(totals, row.ModelName, value)
+		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
+	}
+	taskRows, err := model.GetTaskPerfMetricBuckets("", "", startTs, endTs, groups)
+	if err != nil {
+		return SummaryAllResult{}, err
+	}
+	for _, row := range taskRows {
+		value := taskCounters(row)
 		mergeModelTotals(totals, row.ModelName, value)
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
@@ -176,26 +211,33 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		if total.requestCount == 0 {
 			continue
 		}
-		avgLatency := total.totalLatencyMs / total.requestCount
-		successRate := float64(total.successCount) / float64(total.requestCount) * 100
-		avgTps := 0.0
-		if total.generationMs > 0 {
-			avgTps = float64(total.outputTokens) / (float64(total.generationMs) / 1000.0)
-		}
+		stats := total.stats()
+		stats.SuccessRate = math.Round(stats.SuccessRate*100) / 100
+		stats.AvgTps = math.Round(stats.AvgTps*100) / 100
 		models = append(models, ModelSummary{
 			ModelName:           name,
-			AvgLatencyMs:        avgLatency,
-			SuccessRate:         math.Round(successRate*100) / 100,
-			AvgTps:              math.Round(avgTps*100) / 100,
+			MetricStats:         stats,
 			RecentSuccessSeries: recentSuccessSeries(modelBuckets[name]),
-			RequestCount:        total.requestCount,
 		})
 	}
 	sort.Slice(models, func(i, j int) bool {
 		return models[i].RequestCount > models[j].RequestCount
 	})
 
-	return SummaryAllResult{Models: models}, nil
+	return SummaryAllResult{Models: models, WindowHours: hours, UpdatedAt: endTs}, nil
+}
+
+func taskCounters(row model.TaskPerfMetricBucket) counters {
+	workloads := imageWorkload
+	if row.Kind == "video" {
+		workloads = videoWorkload
+	}
+	return counters{
+		requestCount: row.RequestCount, successCount: row.SuccessCount,
+		unknownCount: row.UnknownCount, latencyCount: row.LatencyCount,
+		totalLatencyMs: row.TotalLatencyMs, outputCount: row.OutputCount,
+		workloads: workloads,
+	}
 }
 
 func mergeModelTotals(totals map[string]counters, modelName string, value counters) {
@@ -203,13 +245,7 @@ func mergeModelTotals(totals map[string]counters, modelName string, value counte
 		return
 	}
 	current := totals[modelName]
-	current.requestCount += value.requestCount
-	current.successCount += value.successCount
-	current.totalLatencyMs += value.totalLatencyMs
-	current.ttftSumMs += value.ttftSumMs
-	current.ttftCount += value.ttftCount
-	current.outputTokens += value.outputTokens
-	current.generationMs += value.generationMs
+	current.add(value)
 	totals[modelName] = current
 }
 
@@ -221,13 +257,7 @@ func mergeModelBucket(modelBuckets map[string]map[int64]counters, modelName stri
 		modelBuckets[modelName] = map[int64]counters{}
 	}
 	current := modelBuckets[modelName][bucketTs]
-	current.requestCount += value.requestCount
-	current.successCount += value.successCount
-	current.totalLatencyMs += value.totalLatencyMs
-	current.ttftSumMs += value.ttftSumMs
-	current.ttftCount += value.ttftCount
-	current.outputTokens += value.outputTokens
-	current.generationMs += value.generationMs
+	current.add(value)
 	modelBuckets[modelName][bucketTs] = current
 }
 
@@ -290,13 +320,7 @@ func mergeCounters(merged map[bucketKey]counters, key bucketKey, value counters)
 		return
 	}
 	current := merged[key]
-	current.requestCount += value.requestCount
-	current.successCount += value.successCount
-	current.totalLatencyMs += value.totalLatencyMs
-	current.ttftSumMs += value.ttftSumMs
-	current.ttftCount += value.ttftCount
-	current.outputTokens += value.outputTokens
-	current.generationMs += value.generationMs
+	current.add(value)
 	merged[key] = current
 }
 
@@ -319,6 +343,7 @@ func buildQueryResult(modelName string, merged map[bucketKey]counters) QueryResu
 	sort.Strings(groups)
 
 	results := make([]GroupResult, 0, len(groups))
+	modelTotal := counters{}
 	for _, group := range groups {
 		buckets := groupBuckets[group]
 		timestamps := make([]int64, 0, len(buckets))
@@ -333,23 +358,15 @@ func buildQueryResult(modelName string, merged map[bucketKey]counters) QueryResu
 		series := make([]BucketPoint, 0, len(timestamps))
 		for _, ts := range timestamps {
 			value := buckets[ts]
-			total.requestCount += value.requestCount
-			total.successCount += value.successCount
-			total.totalLatencyMs += value.totalLatencyMs
-			total.ttftSumMs += value.ttftSumMs
-			total.ttftCount += value.ttftCount
-			total.outputTokens += value.outputTokens
-			total.generationMs += value.generationMs
+			total.add(value)
 			series = append(series, bucketPoint(ts, value))
 		}
+		modelTotal.add(total)
 
 		results = append(results, GroupResult{
-			Group:        group,
-			AvgTtftMs:    avg(total.ttftSumMs, total.ttftCount),
-			AvgLatencyMs: avg(total.totalLatencyMs, total.requestCount),
-			SuccessRate:  successRate(total),
-			AvgTps:       avgTps(total),
-			Series:       series,
+			Group:       group,
+			MetricStats: total.stats(),
+			Series:      series,
 		})
 	}
 
@@ -357,16 +374,14 @@ func buildQueryResult(modelName string, merged map[bucketKey]counters) QueryResu
 		ModelName:    modelName,
 		SeriesSchema: seriesSchema,
 		Groups:       results,
+		Summary:      modelTotal.stats(),
 	}
 }
 
 func bucketPoint(ts int64, value counters) BucketPoint {
 	return BucketPoint{
-		Ts:           ts,
-		AvgTtftMs:    avg(value.ttftSumMs, value.ttftCount),
-		AvgLatencyMs: avg(value.totalLatencyMs, value.requestCount),
-		SuccessRate:  successRate(value),
-		AvgTps:       avgTps(value),
+		Ts:          ts,
+		MetricStats: value.stats(),
 	}
 }
 

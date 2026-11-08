@@ -60,7 +60,7 @@ func setupGenericTaskTest(t *testing.T) *model.Task {
 		require.NoError(t, database.Raw(query).Scan(&databaseName).Error)
 		require.True(t, strings.HasPrefix(databaseName, "new_api_controller_test"), "media tests require an isolated new_api_controller_test database")
 	}
-	rows := []any{&model.Task{}, &model.Channel{}, &model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.MediaRetryEvent{}, &model.MediaInputObject{}}
+	rows := []any{&model.Task{}, &model.Channel{}, &model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Option{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.MediaRetryEvent{}, &model.MediaInputObject{}}
 	for range 2 {
 		require.NoError(t, database.AutoMigrate(rows...))
 	}
@@ -133,7 +133,7 @@ func TestAsyncVideoReconciliationManagementRetainsReservation(t *testing.T) {
 	require.NoError(t, model.DB.Save(task).Error)
 	job := model.AsyncMediaJob{TaskId: task.TaskID, IdentityHash: "reconciliation-management", UserId: task.UserId, TokenId: 2, ChannelId: task.ChannelId, Provider: "drama", Status: "reconciling", StorageStatus: "pending", BillingStatus: "reserved", ExpiresAt: now - 1, CreatedAt: now - 7200}
 	require.NoError(t, model.DB.Create(&job).Error)
-	require.NoError(t, model.DB.AutoMigrate(&model.AsyncImageTask{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncImageTask{}))
 	require.NoError(t, model.DB.Where("1 = 1").Delete(&model.AsyncImageTask{}).Error)
 	for _, filter := range []string{"status=invoking", "stage=generating"} {
 		recorder := httptest.NewRecorder()
@@ -921,7 +921,7 @@ func TestPersistAsyncVideoRefreshesDynamicResultURL(t *testing.T) {
 	require.NoError(t, err)
 	connection.SetMaxOpenConns(1)
 	allowPrivateTaskMediaTest(t)
-	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:"+base64.StdEncoding.EncodeToString([]byte(strings.Repeat("a", 32))))
 	cfg := service.DefaultMediaRuntimeConfig()
@@ -1140,7 +1140,7 @@ func TestDynamicUpstreamVideoUsesPublicURLAfterStorageRetries(t *testing.T) {
 	connection, err := model.DB.DB()
 	require.NoError(t, err)
 	connection.SetMaxOpenConns(1)
-	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 	cfg := service.DefaultMediaRuntimeConfig()
 	cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
 	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
@@ -1266,7 +1266,7 @@ func TestAsyncVideoFallbackRejectsInvalidContentAndRefreshKeepsOwnership(t *test
 	connection, err := model.DB.DB()
 	require.NoError(t, err)
 	connection.SetMaxOpenConns(1)
-	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.Token{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}))
 	cfg := service.DefaultMediaRuntimeConfig()
 	cfg.VideoAsyncEnabled, cfg.LocalPath, cfg.MaxFileBytes = true, t.TempDir(), 4096
 	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))

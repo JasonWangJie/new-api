@@ -16,13 +16,54 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { TFunction } from 'i18next'
+
+import type { PerformanceMetricsData, PerformanceStats } from '../types'
+
+export function isTaskPerformance(stats?: PerformanceStats): boolean {
+  return stats?.workload != null && stats.workload !== 'relay'
+}
+
+export function formatPerformanceOutput(
+  stats: PerformanceStats | undefined,
+  t: TFunction
+): string {
+  if (!isTaskPerformance(stats)) return formatThroughput(stats?.avg_tps ?? 0)
+  const count =
+    stats?.workload === 'mixed' ? stats.success_count : stats?.output_count
+  if (count == null || !Number.isFinite(count) || count < 0) return '—'
+  if (stats?.workload === 'image') {
+    return count === 1
+      ? t('{{count}} image', { count })
+      : t('{{count}} images', { count })
+  }
+  if (stats?.workload === 'video') {
+    return count === 1
+      ? t('{{count}} video', { count })
+      : t('{{count}} videos', { count })
+  }
+  if (count === 1) return t('{{count}} successful request', { count })
+  return t('{{count}} successful requests', { count })
+}
+
+export function getPerformanceSummary(
+  data?: PerformanceMetricsData['data']
+): PerformanceStats | undefined {
+  if (data?.summary) return data.summary
+  // A single group is already the model total. Older multi-group responses
+  // lack the counters needed to combine rates, latency, and TPS correctly.
+  if (data?.groups.length === 1) return data.groups[0]
+  return undefined
+}
+
 export function formatThroughput(tps: number): string {
   if (!Number.isFinite(tps) || tps <= 0) return '—'
   if (tps >= 1_000) return `${(tps / 1_000).toFixed(1)}K t/s`
   return `${tps.toFixed(tps < 10 ? 2 : 1)} t/s`
 }
 
-export function formatLatency(ms: number): string {
+export function formatLatency(ms: number, latencyCount?: number): string {
+  if (ms === 0 && latencyCount != null && latencyCount > 0) return '<1s'
   if (!Number.isFinite(ms) || ms <= 0) return '—'
   if (ms >= 1_000) return `${(ms / 1_000).toFixed(2)}s`
   return `${Math.round(ms)}ms`

@@ -19,32 +19,47 @@ type Sample struct {
 }
 
 type QueryParams struct {
-	Model string
-	Group string
-	Hours int
+	Model  string
+	Group  string
+	Hours  int
+	Groups []string
+}
+
+// MetricStats describes the observations in a window, not model capacity.
+// Unknown outcomes count as undelivered and remain separately visible.
+type MetricStats struct {
+	AvgTtftMs      int64   `json:"avg_ttft_ms"`
+	AvgLatencyMs   int64   `json:"avg_latency_ms"`
+	SuccessRate    float64 `json:"success_rate"`
+	AvgTps         float64 `json:"avg_tps"`
+	RequestCount   int64   `json:"request_count"`
+	SuccessCount   int64   `json:"success_count"`
+	FailureCount   int64   `json:"failure_count"`
+	UnknownCount   int64   `json:"unknown_count"`
+	LatencyCount   int64   `json:"latency_count"`
+	TotalLatencyMs int64   `json:"total_latency_ms"`
+	OutputCount    int64   `json:"output_count"`
+	Workload       string  `json:"workload"`
 }
 
 type BucketPoint struct {
-	Ts           int64   `json:"ts"`
-	AvgTtftMs    int64   `json:"avg_ttft_ms"`
-	AvgLatencyMs int64   `json:"avg_latency_ms"`
-	SuccessRate  float64 `json:"success_rate"`
-	AvgTps       float64 `json:"avg_tps"`
+	Ts int64 `json:"ts"`
+	MetricStats
 }
 
 type GroupResult struct {
-	Group        string        `json:"group"`
-	AvgTtftMs    int64         `json:"avg_ttft_ms"`
-	AvgLatencyMs int64         `json:"avg_latency_ms"`
-	SuccessRate  float64       `json:"success_rate"`
-	AvgTps       float64       `json:"avg_tps"`
-	Series       []BucketPoint `json:"series"`
+	Group string `json:"group"`
+	MetricStats
+	Series []BucketPoint `json:"series"`
 }
 
 type QueryResult struct {
 	ModelName    string        `json:"model_name"`
 	SeriesSchema string        `json:"series_schema"`
 	Groups       []GroupResult `json:"groups"`
+	Summary      MetricStats   `json:"summary"`
+	WindowHours  int           `json:"window_hours"`
+	UpdatedAt    int64         `json:"updated_at"`
 }
 
 type SuccessRatePoint struct {
@@ -53,16 +68,15 @@ type SuccessRatePoint struct {
 }
 
 type ModelSummary struct {
-	ModelName           string             `json:"model_name"`
-	AvgLatencyMs        int64              `json:"avg_latency_ms"`
-	SuccessRate         float64            `json:"success_rate"`
-	AvgTps              float64            `json:"avg_tps"`
+	ModelName string `json:"model_name"`
+	MetricStats
 	RecentSuccessSeries []SuccessRatePoint `json:"recent_success_series,omitempty"`
-	RequestCount        int64              `json:"-"`
 }
 
 type SummaryAllResult struct {
-	Models []ModelSummary `json:"models"`
+	Models      []ModelSummary `json:"models"`
+	WindowHours int            `json:"window_hours"`
+	UpdatedAt   int64          `json:"updated_at"`
 }
 
 type bucketKey struct {
@@ -79,6 +93,52 @@ type counters struct {
 	ttftCount      int64
 	outputTokens   int64
 	generationMs   int64
+	unknownCount   int64
+	latencyCount   int64
+	outputCount    int64
+	workloads      uint8
+}
+
+const (
+	relayWorkload uint8 = 1 << iota
+	imageWorkload
+	videoWorkload
+)
+
+func (c *counters) add(value counters) {
+	c.requestCount += value.requestCount
+	c.successCount += value.successCount
+	c.unknownCount += value.unknownCount
+	c.totalLatencyMs += value.totalLatencyMs
+	c.latencyCount += value.latencyCount
+	c.ttftSumMs += value.ttftSumMs
+	c.ttftCount += value.ttftCount
+	c.outputTokens += value.outputTokens
+	c.generationMs += value.generationMs
+	c.outputCount += value.outputCount
+	c.workloads |= value.workloads
+}
+
+func (c counters) stats() MetricStats {
+	workload := "mixed"
+	switch c.workloads {
+	case 0, relayWorkload:
+		workload = "relay"
+	case imageWorkload:
+		workload = "image"
+	case videoWorkload:
+		workload = "video"
+	}
+	return MetricStats{
+		AvgTtftMs:    avg(c.ttftSumMs, c.ttftCount),
+		AvgLatencyMs: avg(c.totalLatencyMs, c.latencyCount),
+		SuccessRate:  successRate(c), AvgTps: avgTps(c),
+		RequestCount: c.requestCount, SuccessCount: c.successCount,
+		FailureCount: c.requestCount - c.successCount - c.unknownCount,
+		UnknownCount: c.unknownCount, LatencyCount: c.latencyCount,
+		TotalLatencyMs: c.totalLatencyMs, OutputCount: c.outputCount,
+		Workload: workload,
+	}
 }
 
 type atomicBucket struct {
@@ -110,7 +170,7 @@ func (b *atomicBucket) add(sample Sample) {
 }
 
 func (b *atomicBucket) snapshot() counters {
-	return counters{
+	value := counters{
 		requestCount:   b.requestCount.Load(),
 		successCount:   b.successCount.Load(),
 		totalLatencyMs: b.totalLatencyMs.Load(),
@@ -119,6 +179,9 @@ func (b *atomicBucket) snapshot() counters {
 		outputTokens:   b.outputTokens.Load(),
 		generationMs:   b.generationMs.Load(),
 	}
+	value.latencyCount = value.requestCount
+	value.workloads = relayWorkload
+	return value
 }
 
 func (b *atomicBucket) drain() counters {

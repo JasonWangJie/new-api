@@ -473,9 +473,10 @@ func HoldAsyncVideoRecovery(ctx context.Context, job AsyncMediaJob, task Task, r
 		if err := tx.Model(&current).Updates(map[string]any{"status": TaskStatusUnknown, "fail_reason": reason}).Error; err != nil {
 			return err
 		}
+		before := queued
 		if err := tx.Model(&queued).Updates(map[string]any{"status": "execution_unknown", "reference_recovery_stage": "manual", "next_attempt_at": 0, "error_message": reason}).Error; err != nil {
 			return err
 		}
-		return nil
+		return recordAsyncMediaTransitionTx(tx, before, queued, nil, "")
 	})
 }

@@ -85,7 +85,7 @@ func asyncImageWorkerFixture(t *testing.T) (*gorm.DB, model.AsyncImageTask, Asyn
 		require.NoError(t, client.FlushDB(t.Context()).Err())
 	}
 	common.RDB, common.RedisEnabled = client, true
-	entities := []any{&model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.Token{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}}
+	entities := []any{&model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.Token{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}}
 	t.Cleanup(func() {
 		model.DB, common.RDB, common.RedisEnabled = previousDB, previousRedis, previousEnabled
 		common.SetMainDatabaseType(previousType)
@@ -2120,8 +2120,8 @@ func TestAsyncImageKnownUpstreamPollReleasesLeaseAndStaysProcessing(t *testing.T
 			_ = sqlDB.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 	var databaseVersion string
 	require.NoError(t, db.Raw(databaseVersionQuery).Scan(&databaseVersion).Error)
 	t.Logf("Database version: %s", databaseVersion)
@@ -5090,7 +5090,7 @@ func TestGeminiAsyncImageReferenceFailureSchedulesSingleLocalFallback(t *testing
 					_ = connection.Close()
 				}
 			})
-			require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageStagingObject{}, &model.AsyncImageBill{}))
+			require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageStagingObject{}, &model.AsyncImageBill{}))
 
 			now := time.Now().Unix()
 			attempts, err := common.Marshal([]ImageChannelAttempt{{
@@ -5204,7 +5204,7 @@ func TestFailAsyncImageInvocationPersistsSanitizedProviderDiagnostics(t *testing
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 
 	now := time.Now().Unix()
 	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1, Dispatched: true}})
@@ -5264,7 +5264,7 @@ func TestInvalidImageReferenceFailureIsIndexedAndNotRetried(t *testing.T) {
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.AsyncImageBill{}))
 
 	now := time.Now().Unix()
 	attempts, err := common.Marshal([]ImageChannelAttempt{{ChannelId: 17, StartedAt: now - 1}})

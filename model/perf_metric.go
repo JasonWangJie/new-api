@@ -1,6 +1,7 @@
 package model
 
 import (
+	"github.com/QuantumNous/new-api/common"
 	"time"
 
 	"gorm.io/gorm"
@@ -50,10 +51,11 @@ func UpsertPerfMetric(metric *PerfMetric) error {
 
 func GetPerfMetrics(modelName string, group string, startTs int64, endTs int64) ([]PerfMetric, error) {
 	var metrics []PerfMetric
+	modelCol, groupCol := perfIdentityColumns()
 	query := DB.Model(&PerfMetric{}).
-		Where("model_name = ? AND bucket_ts >= ? AND bucket_ts <= ?", modelName, startTs, endTs)
+		Where(modelCol+" = ? AND bucket_ts >= ? AND bucket_ts <= ?", modelName, startTs, endTs)
 	if group != "" {
-		query = query.Where(commonGroupCol+" = ?", group)
+		query = query.Where(groupCol+" = ?", group)
 	}
 	err := query.Order("bucket_ts ASC").Find(&metrics).Error
 	return metrics, err
@@ -76,21 +78,24 @@ type PerfMetricSummaryBucket struct {
 	TotalLatencyMs int64  `json:"total_latency_ms"`
 	OutputTokens   int64  `json:"output_tokens"`
 	GenerationMs   int64  `json:"generation_ms"`
+	TtftSumMs      int64  `json:"-"`
+	TtftCount      int64  `json:"-"`
 }
 
 func GetPerfMetricsSummaryAll(startTs int64, endTs int64, groups []string) ([]PerfMetricSummary, error) {
 	var summaries []PerfMetricSummary
+	modelCol, groupCol := perfIdentityColumns()
 	query := DB.Model(&PerfMetric{}).
-		Select("model_name, SUM(request_count) as request_count, SUM(success_count) as success_count, SUM(total_latency_ms) as total_latency_ms, SUM(output_tokens) as output_tokens, SUM(generation_ms) as generation_ms").
+		Select(modelCol+" AS model_name, SUM(request_count) as request_count, SUM(success_count) as success_count, SUM(total_latency_ms) as total_latency_ms, SUM(output_tokens) as output_tokens, SUM(generation_ms) as generation_ms").
 		Where("bucket_ts >= ? AND bucket_ts <= ?", startTs, endTs)
 	if groups != nil {
 		if len(groups) == 0 {
 			return summaries, nil
 		}
-		query = query.Where(commonGroupCol+" IN ?", groups)
+		query = query.Where(groupCol+" IN ?", groups)
 	}
 	err := query.
-		Group("model_name").
+		Group(modelCol).
 		Having("SUM(request_count) > 0").
 		Find(&summaries).Error
 	return summaries, err
@@ -98,28 +103,41 @@ func GetPerfMetricsSummaryAll(startTs int64, endTs int64, groups []string) ([]Pe
 
 func GetPerfMetricsSummaryBucketsAll(startTs int64, endTs int64, groups []string) ([]PerfMetricSummaryBucket, error) {
 	var summaries []PerfMetricSummaryBucket
+	modelCol, groupCol := perfIdentityColumns()
 	query := DB.Model(&PerfMetric{}).
-		Select("model_name, bucket_ts, SUM(request_count) as request_count, SUM(success_count) as success_count, SUM(total_latency_ms) as total_latency_ms, SUM(output_tokens) as output_tokens, SUM(generation_ms) as generation_ms").
+		Select(modelCol+" AS model_name, bucket_ts, SUM(request_count) as request_count, SUM(success_count) as success_count, SUM(total_latency_ms) as total_latency_ms, SUM(output_tokens) as output_tokens, SUM(generation_ms) as generation_ms, SUM(ttft_sum_ms) as ttft_sum_ms, SUM(ttft_count) as ttft_count").
 		Where("bucket_ts >= ? AND bucket_ts <= ?", startTs, endTs)
 	if groups != nil {
 		if len(groups) == 0 {
 			return summaries, nil
 		}
-		query = query.Where(commonGroupCol+" IN ?", groups)
+		query = query.Where(groupCol+" IN ?", groups)
 	}
 	err := query.
-		Group("model_name, bucket_ts").
+		Group(modelCol + ", bucket_ts").
 		Having("SUM(request_count) > 0").
 		Order("bucket_ts ASC").
 		Find(&summaries).Error
 	return summaries, err
 }
 
+// Public model and group identities are case-sensitive even when a MySQL
+// database uses its usual case-insensitive text collation.
+func perfIdentityColumns() (string, string) {
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		return "BINARY model_name", "BINARY " + commonGroupCol
+	}
+	return "model_name", commonGroupCol
+}
+
 func DeletePerfMetricsBefore(cutoffTs int64) error {
 	if cutoffTs <= 0 {
 		return nil
 	}
-	return DB.Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error
+	if err := DB.Where("bucket_ts < ?", cutoffTs).Delete(&PerfMetric{}).Error; err != nil {
+		return err
+	}
+	return DB.Where("completed_at < ?", cutoffTs).Delete(&TaskPerfSample{}).Error
 }
 
 func PerfMetricStartTime(hours int) int64 {

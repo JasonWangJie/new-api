@@ -247,7 +247,7 @@ func setupTaskPollingDatabase(t *testing.T) {
 		assert.NoError(t, connection.Close())
 	})
 	for range 2 {
-		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.Channel{}, &model.User{}, &model.Log{}))
+		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.Channel{}, &model.User{}, &model.Log{}))
 	}
 }
 
@@ -1150,7 +1150,7 @@ func TestAsyncVideoPollTimeoutIncludesResponseBodyAndPreservesDownloadBudget(t *
 				// Driver watchers must share the bubble with request contexts;
 				// opening a MySQL connection outside it crosses synctest channels.
 				setupTaskPollingDatabase(t)
-				entities := []any{&model.Option{}, &model.AsyncMediaJob{}}
+				entities := []any{&model.Option{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}}
 				require.NoError(t, model.DB.AutoMigrate(entities...))
 				t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(entities...)) })
 				cfg := DefaultMediaRuntimeConfig()
@@ -1202,7 +1202,7 @@ func TestAsyncVideoPollTimeoutIncludesResponseBodyAndPreservesDownloadBudget(t *
 }
 
 func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
-	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.Option{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 	testCases := []struct {
 		name          string
 		statusCode    int

@@ -266,7 +266,10 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 		if err := tx.Where("id = ?", current.ID).Take(&job).Error; err != nil {
 			return err
 		}
-		return recordAsyncMediaEventTx(tx, job, "reconciliation", "", nil, "")
+		if err := recordAsyncMediaEventTx(tx, job, "reconciliation", "", nil, ""); err != nil {
+			return err
+		}
+		return recordAsyncMediaTransitionTx(tx, current, job, nil, "")
 	})
 	return job, err
 }
@@ -290,6 +293,11 @@ func recordAsyncMediaEventTx(tx *gorm.DB, job AsyncMediaJob, eventType, discrimi
 }
 
 func recordAsyncMediaTransitionTx(tx *gorm.DB, before, after AsyncMediaJob, keyIndex *int, referenceMode string) error {
+	if before.Status != after.Status || before.BillingStatus != after.BillingStatus || before.ReferenceRecoveryStage != after.ReferenceRecoveryStage {
+		if err := recordVideoTaskPerfSampleTx(tx, before, after); err != nil {
+			return err
+		}
+	}
 	if before.Status != after.Status {
 		eventType := after.Status
 		switch after.Status {

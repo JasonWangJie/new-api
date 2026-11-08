@@ -28,7 +28,6 @@ import {
   Layers,
   Maximize2,
   Sparkles,
-  Timer,
 } from 'lucide-react'
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -36,8 +35,11 @@ import { useTranslation } from 'react-i18next'
 import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
 import { sideDrawerContentClassName } from '@/components/drawer-layout'
+import { EmptyState } from '@/components/empty-state'
+import { ErrorState } from '@/components/error-state'
 import { GroupBadge } from '@/components/group-badge'
 import { PublicLayout } from '@/components/layout'
+import { LoadingState } from '@/components/loading-state'
 import { Button } from '@/components/ui/button'
 import {
   Sheet,
@@ -49,12 +51,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getPerfMetrics } from '@/features/performance-metrics/api'
-import {
-  formatLatency,
-  formatThroughput,
-  formatUptimePct,
-  getSuccessRateTextClass,
-} from '@/features/performance-metrics/lib/format'
+import { getPerformanceSummary } from '@/features/performance-metrics/lib/format'
 import { PluginIcon } from '@/features/task-plugins/components/plugin-icon'
 import { getLobeIcon } from '@/lib/lobe-icon'
 import { requireServerSuccess } from '@/lib/server-error-message'
@@ -83,6 +80,10 @@ import {
   getConfiguredGroupRatio,
   isTokenBasedModel,
 } from '../lib/model-helpers'
+import {
+  getModelPerformanceStats,
+  isMediaModel,
+} from '../lib/model-performance'
 import { withPluginPricing, withPublicPricing } from '../lib/plugin-pricing'
 import { formatFixedPrice, formatGroupPrice } from '../lib/price'
 import {
@@ -108,6 +109,7 @@ import { DynamicPricingBreakdown } from './dynamic-pricing-breakdown'
 import { ModelBillingModeBadge } from './model-billing-mode-badge'
 import { ModelDetailsApi } from './model-details-api'
 import { ModelDetailsPerformance } from './model-details-performance'
+import { ModelPerformanceSummary } from './model-performance-summary'
 
 // ----------------------------------------------------------------------------
 // Local UI helpers
@@ -241,34 +243,6 @@ function normalizeCatalogItems(items?: readonly string[]): string[] {
   return items.filter((item) => item.trim().length > 0)
 }
 
-function OverviewMetric(props: {
-  icon: React.ComponentType<{ className?: string }>
-  label: string
-  value: React.ReactNode
-  valueClassName?: string
-}) {
-  const Icon = props.icon
-
-  return (
-    <div className='flex min-w-0 items-center gap-2 px-3 py-2'>
-      <Icon className='text-muted-foreground/70 size-3.5 shrink-0' />
-      <div className='min-w-0 flex-1'>
-        <div className='text-muted-foreground truncate text-[10px] font-medium tracking-wider uppercase'>
-          {props.label}
-        </div>
-        <div
-          className={cn(
-            'text-foreground truncate font-mono text-sm font-semibold tabular-nums',
-            props.valueClassName
-          )}
-        >
-          {props.value}
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function OverviewSummaryGrid(props: { model: PricingModel }) {
   const { t } = useTranslation()
   const metricsQuery = useQuery({
@@ -277,52 +251,36 @@ function OverviewSummaryGrid(props: { model: PricingModel }) {
       requireServerSuccess(await getPerfMetrics(props.model.model_name, 24)),
     staleTime: 60 * 1000,
   })
-
-  const groups = metricsQuery.data?.data.groups ?? []
-  const successRates = groups
-    .map((group) => group.success_rate)
-    .filter((rate) => Number.isFinite(rate))
-  const successRate =
-    successRates.length > 0
-      ? successRates.reduce((sum, rate) => sum + rate, 0) / successRates.length
-      : Number.NaN
-  const tpsValues = groups
-    .map((group) => group.avg_tps)
-    .filter((value) => value > 0)
-  const avgTps =
-    tpsValues.length > 0
-      ? tpsValues.reduce((sum, value) => sum + value, 0) / tpsValues.length
-      : 0
-  const latencyValues = groups
-    .map((group) => group.avg_latency_ms)
-    .filter((value) => value > 0)
-  const avgLatency =
-    latencyValues.length > 0
-      ? Math.round(
-          latencyValues.reduce((sum, value) => sum + value, 0) /
-            latencyValues.length
-        )
-      : 0
-
+  if (metricsQuery.isError) {
+    return (
+      <ErrorState
+        title={t('Performance metrics unavailable')}
+        onRetry={() => void metricsQuery.refetch()}
+        className='min-h-0 rounded-lg border p-4'
+      />
+    )
+  }
+  if (metricsQuery.isLoading) return <LoadingState className='min-h-0 p-4' />
+  if (!metricsQuery.data?.data.groups.length) {
+    return (
+      <EmptyState
+        title={t('Performance data is not yet available for this model.')}
+        className='min-h-0 p-4'
+        bordered
+      />
+    )
+  }
   return (
-    <div className='bg-muted/20 grid overflow-hidden rounded-lg border sm:grid-cols-3 sm:divide-x'>
-      <OverviewMetric
-        icon={Timer}
-        label='TPS'
-        value={formatThroughput(avgTps)}
-      />
-      <OverviewMetric
-        icon={Timer}
-        label={t('Average latency')}
-        value={formatLatency(avgLatency)}
-      />
-      <OverviewMetric
-        icon={HeartPulse}
-        label={t('Success rate')}
-        value={formatUptimePct(successRate)}
-        valueClassName={getSuccessRateTextClass(successRate)}
-      />
-    </div>
+    <ModelPerformanceSummary
+      compact
+      mediaModel={isMediaModel(props.model)}
+      stats={getModelPerformanceStats(
+        props.model,
+        getPerformanceSummary(metricsQuery.data?.data)
+      )}
+      windowHours={metricsQuery.data?.data.window_hours}
+      updatedAt={metricsQuery.data?.data.updated_at}
+    />
   )
 }
 

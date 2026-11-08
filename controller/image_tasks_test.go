@@ -84,7 +84,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetMainDatabaseType(common.DatabaseType(engine))
 			common.SetLogDatabaseType(common.DatabaseType(logEngine))
-			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncImageUsageProjection{}, &model.QuotaData{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
+			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncImageUsageProjection{}, &model.QuotaData{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB, model.LOG_DB = previousDB, previousLogDB
 				common.SetMainDatabaseType(previousType)
@@ -101,7 +101,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+				require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 				assert.True(t, db.Migrator().HasIndex(&model.AsyncImageTask{}, "idx_image_created_task"))
 			}
 			// Rebuild the released table shape, then exercise the same startup
@@ -3444,7 +3444,7 @@ func TestConfiguredInitialVideoRecoveryAccounting(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
 			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}))
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaInputObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaInputObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
 			if tc.revokeAuto {
 				require.NoError(t, db.Model(token).Updates(map[string]any{"group": "auto", "auto_groups": `["default"]`}).Error)
 				groups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
@@ -3659,7 +3659,7 @@ func TestAsyncVideoReferenceRetryAdmissionAndAccounting(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"group": "vip", "quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"group": "default", "status": common.TokenStatusExhausted, "remain_quota": 0, "used_quota": 100}).Error)
 			require.NoError(t, db.Take(user, user.Id).Error)
@@ -3807,7 +3807,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"remain_quota": 0, "used_quota": 100}).Error)
 			channel := model.Channel{Key: "original-upstream-key", UsedQuota: 100}

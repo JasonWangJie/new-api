@@ -384,6 +384,9 @@ func CompleteAsyncImageTask(ctx context.Context, task AsyncImageTask, autoArchiv
 		if updated.RowsAffected != 1 {
 			return ErrImageConflict
 		}
+		if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ?", task.TaskId).Delete(&AsyncImageStagingObject{}).Error; err != nil {
 			return err
 		}
@@ -728,6 +731,9 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 				}
 				if changed.RowsAffected != 1 {
 					return ErrImageConflict
+				}
+				if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {
+					return err
 				}
 				eventKey := common.GetUUID()
 				if task.UpstreamTaskId == "" || updates["status"] != task.Status {

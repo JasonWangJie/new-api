@@ -492,7 +492,7 @@ type ImageModerationEvent struct {
 }
 
 func MigrateImageModels(db *gorm.DB) error {
-	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}); err != nil {
+	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}); err != nil {
 		return err
 	}
 	return db.AutoMigrate(&ImageGroupPolicy{}, &TokenImagePlatformMapping{}, &ImageChannelPool{}, &AsyncImageTask{}, &AsyncImageIdempotency{}, &AsyncImageEvent{}, &ImageOutbox{}, &AsyncImageStagingObject{}, &ImageStorageProfile{}, &ImageStorageObject{}, &ImageUploadIntent{}, &AsyncImageResult{}, &AsyncImageBill{}, &AsyncImageUsageProjection{}, &ImageInputAdmission{}, &ImageUploadAdmissionTicket{}, &ImageInputObject{}, &ImageInputAlias{}, &ImageInputTaskReference{}, &ImageLibraryItem{}, &ImagePublication{}, &ImageSubmissionRequest{}, &ImageReport{}, &ImageCleanupJob{}, &ImageModerationEvent{})
@@ -541,6 +541,11 @@ func transitionImageTaskTx(tx *gorm.DB, task AsyncImageTask, updates map[string]
 	status := task.Status
 	if value, ok := updates["status"].(string); ok {
 		status = value
+	}
+	if _, changesReconciliation := updates["reconciliation_status"]; status != task.Status || changesReconciliation {
+		if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {
+			return err
+		}
 	}
 	eventKey := common.GetUUID()
 	// Polling an accepted upstream job can run many times without changing its

@@ -42,6 +42,7 @@ func TestMain(m *testing.M) {
 
 	if err := db.AutoMigrate(
 		&Task{},
+		&TaskPerfSample{},
 		&AsyncMediaJob{},
 		&AsyncMediaEvent{},
 		&User{},
@@ -100,6 +101,7 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM subscription_plans")
 		DB.Exec("DELETE FROM user_subscriptions")
 		DB.Exec("DELETE FROM perf_metrics")
+		DB.Exec("DELETE FROM task_perf_samples")
 		DB.Exec("DELETE FROM system_instances")
 		DB.Exec("DELETE FROM system_task_locks")
 		DB.Exec("DELETE FROM system_tasks")
@@ -362,7 +364,7 @@ func TestUpdateWithStatus_PersistsPluginStateAndPollFailures(t *testing.T) {
 func asyncVideoRecoveryFixture(t *testing.T) (*gorm.DB, Task, AsyncMediaJob) {
 	t.Helper()
 	db, image, _ := imageDatabaseFixture(t)
-	require.NoError(t, db.AutoMigrate(&Task{}, &AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaRetryEvent{}, &MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&Task{}, &TaskPerfSample{}, &AsyncMediaJob{}, &AsyncMediaEvent{}, &MediaRetryEvent{}, &MediaInputObject{}))
 	require.NoError(t, db.Model(&User{}).Where("id = ?", image.UserId).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 	require.NoError(t, db.Model(&Token{}).Where("id = ?", image.TokenId).Updates(map[string]any{"remain_quota": 900, "used_quota": 100}).Error)
 	require.NoError(t, db.Model(&Channel{}).Where("id = ?", image.ChannelId).Update("used_quota", 100).Error)

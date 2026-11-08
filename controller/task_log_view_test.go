@@ -113,7 +113,7 @@ func TestVideoRoutingTaskDetailsKeepExecutionPrivate(t *testing.T) {
 func TestVideoRoutingPublicTaskViewsOmitPrivateDiagnostics(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Channel{}, &model.CanvasGrant{}))
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Channel{}, &model.CanvasGrant{}))
 	previousRegistry := pluginruntime.DefaultRegistry
 	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
 	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })

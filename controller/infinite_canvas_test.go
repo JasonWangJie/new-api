@@ -87,7 +87,7 @@ func newCanvasFixture(t *testing.T) *canvasFixture {
 	sqlDB, err := f.db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageStorageProfile{}, &model.AsyncImageEvent{}, &model.Option{}))
+	require.NoError(t, f.db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.CanvasGrant{}, &model.AuditLog{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.ImageInputObject{}, &model.MediaArtifactObject{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageStorageProfile{}, &model.AsyncImageEvent{}, &model.Option{}))
 	f.redis = miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: f.redis.Addr()})
 	model.DB, model.LOG_DB, common.RedisEnabled, common.RDB, common.SessionSecret = f.db, f.db, true, client, "canvas-fixture-signing-secret"
@@ -883,7 +883,7 @@ func TestCanvasColdCacheRechecksBeforePublishingBalance(t *testing.T) {
 
 func runCanvasFundingOwnership(t *testing.T, db *gorm.DB, user model.User, token model.Token, grant model.CanvasGrant) {
 	t.Helper()
-	require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}, &model.Task{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageResult{}, &model.Channel{}))
+	require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageResult{}, &model.Channel{}))
 	require.NoError(t, db.Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"canvas_subject": grant.Subject, "quota": 1000, "used_quota": 100}).Error)
 	require.NoError(t, model.AdjustCanvasWallet(user.Id, grant.Subject, -100, true))
 	require.NoError(t, model.AdjustCanvasWallet(user.Id, grant.Subject, 40, false))

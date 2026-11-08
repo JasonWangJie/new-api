@@ -53,9 +53,10 @@ func GetPerfMetrics(c *gin.Context) {
 	}
 
 	result, err := perfmetrics.Query(perfmetrics.QueryParams{
-		Model: modelName,
-		Group: c.Query("group"),
-		Hours: hours,
+		Model:  modelName,
+		Group:  c.Query("group"),
+		Hours:  hours,
+		Groups: append(lo.Keys(ratio_setting.GetGroupRatioCopy()), "auto"),
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{

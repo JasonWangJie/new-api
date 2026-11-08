@@ -616,7 +616,7 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 	})
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tabtab:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tabtab")
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	user := model.User{Username: "tabtab-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "tabtab-test-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
@@ -848,7 +848,7 @@ func TestMixedImageBillingExecutionAndRecovery(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-billing:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-billing")
 	prices := ratio_setting.GetModelPriceCopy()
@@ -1362,7 +1362,7 @@ func TestMixedGeminiImageRoutingAndExecution(t *testing.T) {
 	require.NoError(t, err)
 	model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = db, false, false, 500000
 	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
-	entities := []any{&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}}
+	entities := []any{&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.Option{}}
 	t.Cleanup(func() {
 		assert.NoError(t, db.Migrator().DropTable(entities...))
 		model.DB, constant.CountToken, common.RedisEnabled, common.QuotaPerUnit = previousDB, previousCount, previousRedis, previousUnit
@@ -1903,7 +1903,7 @@ func TestAsyncImageCompletionRecoveryPreservesAcceptedOutputAndPrice(t *testing.
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "completion-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "completion-test")
 	user := model.User{Username: "completion-recovery-user", Status: common.UserStatusDisabled}
@@ -2203,7 +2203,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	user := model.User{Username: "openai-outbound-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "openai-outbound-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
@@ -2864,7 +2864,7 @@ func TestTianyueAsyncImageOutbound(t *testing.T) {
 	})
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tianyue:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tianyue")
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	user := model.User{Username: "tianyue-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "tianyue-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
@@ -3262,7 +3262,7 @@ func TestGeminiAsyncImageCustomSubmitAndResume(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, sqlDB.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
 	user := model.User{Username: "gemini-submit-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{Id: 17, UserId: user.Id, Key: "gemini-submit-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
@@ -3508,8 +3508,8 @@ func TestRecordAsyncImageUpstreamJobAfterDispatch(t *testing.T) {
 			_ = connection.Close()
 		}
 	})
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
-	require.NoError(t, db.AutoMigrate(&model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "checkpoint-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "checkpoint-test")
 
@@ -3712,7 +3712,7 @@ func TestTianyueSynchronousImageCompletionRecovery(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tianyue-sync:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tianyue-sync")
 	user := model.User{Username: "tianyue-sync-user", Status: common.UserStatusEnabled, Quota: 1000000}

@@ -305,7 +305,7 @@ func TestMediaRetryPolicyLargeDocuments(t *testing.T) {
 				require.NoError(t, db.Create(&MediaRetryEvent{TaskID: "legacy-small-state", EventKey: "legacy-small-event", StateJSON: `{"total_used":3}`}).Error)
 			}
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &AsyncImageTask{}))
+				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}, &AsyncImageTask{}))
 				require.NoError(t, InitializeMediaRetryPolicy(db))
 			}
 			if legacyText {
@@ -354,7 +354,7 @@ func TestMediaRetryPolicyLargeDocuments(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, saved.Rules, restored.Rules)
 			for range 2 {
-				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &AsyncImageTask{}))
+				require.NoError(t, db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}, &AsyncImageTask{}))
 				require.NoError(t, InitializeMediaRetryPolicy(db))
 				version, err := GetMediaRetryPolicyVersion(t.Context(), original)
 				require.NoError(t, err)
@@ -457,7 +457,7 @@ func imageDatabaseFixture(t *testing.T) (*gorm.DB, AsyncImageTask, AsyncImageBil
 		initCol()
 		common.RedisEnabled, common.DataExportEnabled, common.LogConsumeEnabled = previousRedis, previousExport, previousLogs
 	})
-	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}, &AsyncMediaJob{}, &AsyncMediaEvent{}))
+	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}, &TaskPerfSample{}, &AsyncMediaJob{}, &AsyncMediaEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&Log{}))
 	require.NoError(t, MigrateImageLogs(logDB))
 	user := User{Username: "image-test", Quota: 1000, Status: common.UserStatusEnabled}
@@ -495,7 +495,7 @@ func TestAsyncMediaAdmissionBudgets(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			db, task, _ := imageDatabaseFixture(t)
 			require.NoError(t, db.Model(&task).Update("status", ImageTaskSucceeded).Error)
-			require.NoError(t, db.AutoMigrate(&AsyncMediaJob{}))
+			require.NoError(t, db.AutoMigrate(&TaskPerfSample{}, &AsyncMediaJob{}))
 			if db.Dialector.Name() == "sqlite" {
 				conn, err := db.DB()
 				require.NoError(t, err)
@@ -1525,15 +1525,15 @@ func TestAsyncImageRetryAuditMigration(t *testing.T) {
 			if upgrade {
 				// The audit base has exactly these task fields except the two new
 				// columns. Removing them reproduces that schema with existing data.
-				require.NoError(t, db.AutoMigrate(&AsyncImageTask{}))
+				require.NoError(t, db.AutoMigrate(&TaskPerfSample{}, &AsyncImageTask{}))
 				require.NoError(t, db.Create(&legacy).Error)
 				require.NoError(t, db.Migrator().DropIndex(&AsyncImageTask{}, "idx_image_request_retention"))
 				require.NoError(t, db.Migrator().DropColumn(&AsyncImageTask{}, "request_retain_until"))
 				require.NoError(t, db.Migrator().DropColumn(&AsyncImageTask{}, "retry_decision"))
 			}
-			require.NoError(t, db.AutoMigrate(&AsyncImageTask{}))
+			require.NoError(t, db.AutoMigrate(&TaskPerfSample{}, &AsyncImageTask{}))
 			trace := &imageReservationMigrationTrace{Interface: logger.Default.LogMode(logger.Silent)}
-			require.NoError(t, db.Session(&gorm.Session{Logger: trace}).AutoMigrate(&AsyncImageTask{}))
+			require.NoError(t, db.Session(&gorm.Session{Logger: trace}).AutoMigrate(&TaskPerfSample{}, &AsyncImageTask{}))
 			assert.Empty(t, trace.changes, "second startup must be idempotent")
 			if upgrade {
 				var saved AsyncImageTask

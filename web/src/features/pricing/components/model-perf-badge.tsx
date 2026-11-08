@@ -19,23 +19,29 @@ For commercial licensing, please contact support@quantumnous.com
 import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { LoadingState } from '@/components/loading-state'
 import {
   formatLatency,
-  formatThroughput,
+  formatPerformanceOutput,
   getSuccessRateDotClass,
+  isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
-import type { SuccessRatePoint } from '@/features/performance-metrics/types'
+import type {
+  PerformanceStats,
+  SuccessRatePoint,
+} from '@/features/performance-metrics/types'
 import { cn } from '@/lib/utils'
 
-export type ModelPerfBadgeData = {
-  avg_latency_ms: number
-  success_rate: number
-  avg_tps: number
+import { PerformanceSampleContext } from './model-performance-summary'
+
+export type ModelPerfBadgeData = PerformanceStats & {
   recent_success_series?: SuccessRatePoint[]
 }
 
 export interface ModelPerfBadgeProps extends React.HTMLAttributes<HTMLDivElement> {
   perf: ModelPerfBadgeData | undefined
+  mediaModel?: boolean
+  status?: 'loading' | 'error' | 'ready'
 }
 
 const STATUS_SLOTS = Array.from({ length: 24 }, (_, slot) => slot)
@@ -44,13 +50,19 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
   props: ModelPerfBadgeProps
 ) {
   const { t } = useTranslation()
-  const latencyText = formatLatency(props.perf?.avg_latency_ms ?? 0)
-  const throughputText = formatThroughput(props.perf?.avg_tps ?? 0).replace(
-    ' t/s',
-    't/s'
-  )
+  const hasSamples = props.perf != null && props.perf.request_count !== 0
+  const media = isTaskPerformance(props.perf) || props.mediaModel
+  const deliveredMedia =
+    props.perf?.workload === 'image' || props.perf?.workload === 'video'
+  const latencyText = hasSamples
+    ? formatLatency(props.perf?.avg_latency_ms ?? 0, props.perf?.latency_count)
+    : '—'
+  const throughputText = (
+    hasSamples ? formatPerformanceOutput(props.perf, t) : '—'
+  ).replace(' t/s', 't/s')
   const successRate = props.perf?.success_rate
   const hasSuccessRate =
+    hasSamples &&
     successRate != null &&
     Number.isFinite(successRate) &&
     successRate >= 0 &&
@@ -69,73 +81,100 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
     })
   }, [props.perf?.recent_success_series])
 
+  let sampleContext: React.ReactNode = null
+  if (props.status === 'loading') {
+    sampleContext = <LoadingState inline size='sm' message={t('Loading...')} />
+  } else if (props.status === 'error') {
+    sampleContext = (
+      <span className='text-muted-foreground text-[11px]'>
+        {t('Performance metrics unavailable')}
+      </span>
+    )
+  } else if (hasSamples) {
+    sampleContext = <PerformanceSampleContext stats={props.perf} />
+  } else if (props.status === 'ready') {
+    sampleContext = (
+      <span className='text-muted-foreground text-[11px]'>
+        {t('No samples in the last 24 hours')}
+      </span>
+    )
+  }
+
   return (
     <div
       aria-label={t('Performance metrics for the last 24 hours')}
-      className={cn(
-        'flex w-full min-w-0 items-center justify-between gap-3',
-        props.className
-      )}
+      className={cn('flex w-full min-w-0 flex-col gap-2', props.className)}
     >
-      <dl className='flex min-w-0 items-start gap-5 text-xs tabular-nums'>
-        <div className='w-24 shrink-0'>
-          <dt
-            title={t('Request success rate sampled over the last 24 hours')}
-            className='text-muted-foreground flex items-center justify-between gap-1 text-[11px] leading-4'
+      <div className='flex w-full min-w-0 flex-wrap items-center justify-between gap-3'>
+        <dl className='flex min-w-0 flex-1 basis-60 flex-wrap items-start gap-x-3 gap-y-2 text-xs tabular-nums'>
+          <div className='w-24 shrink-0'>
+            <dt
+              title={t('Request success rate sampled over the last 24 hours')}
+              className='text-muted-foreground flex items-center justify-between gap-1 text-[11px] leading-4'
+            >
+              <span>{t('Status')}</span>
+              <span className='font-mono'>
+                {hasSuccessRate ? `${successRate.toFixed(1)}%` : '—%'}
+              </span>
+            </dt>
+            <dd
+              role='img'
+              aria-label={t(
+                'Recent success-rate samples; gray bars indicate missing data.'
+              )}
+              title={t(
+                'Recent success-rate samples; gray bars indicate missing data.'
+              )}
+              className='mt-1 flex h-3 w-24 items-center gap-px'
+            >
+              {STATUS_SLOTS.map((slot) => {
+                const rate = statusRates[slot]
+                return (
+                  <span
+                    key={slot}
+                    aria-hidden
+                    className={cn(
+                      'h-full w-[3px] shrink-0 rounded-xs',
+                      rate != null &&
+                        Number.isFinite(rate) &&
+                        rate >= 0 &&
+                        rate <= 100
+                        ? getSuccessRateDotClass(rate)
+                        : 'bg-muted-foreground/15'
+                    )}
+                  />
+                )
+              })}
+            </dd>
+          </div>
+          <div
+            title={
+              deliveredMedia ? t('Average delivery time') : t('Average latency')
+            }
+            className='shrink-0'
           >
-            <span>{t('Status')}</span>
-            <span className='font-mono'>
-              {hasSuccessRate ? `${successRate.toFixed(1)}%` : '—%'}
-            </span>
-          </dt>
-          <dd
-            role='img'
-            aria-label={t(
-              'Recent success-rate samples; gray bars indicate missing data.'
-            )}
-            title={t(
-              'Recent success-rate samples; gray bars indicate missing data.'
-            )}
-            className='mt-1 flex h-3 w-24 items-center gap-px'
+            <dt className='text-muted-foreground text-[11px] leading-4'>
+              {deliveredMedia ? t('Delivery time') : t('Latency short')}
+            </dt>
+            <dd className='mt-1 font-mono whitespace-nowrap'>
+              {latencyText === '—' ? '—s' : latencyText}
+            </dd>
+          </div>
+          <div
+            title={media ? t('Completed (24h)') : t('Throughput')}
+            className='max-w-full shrink-0'
           >
-            {STATUS_SLOTS.map((slot) => {
-              const rate = statusRates[slot]
-              return (
-                <span
-                  key={slot}
-                  aria-hidden
-                  className={cn(
-                    'h-full w-[3px] shrink-0 rounded-xs',
-                    rate != null &&
-                      Number.isFinite(rate) &&
-                      rate >= 0 &&
-                      rate <= 100
-                      ? getSuccessRateDotClass(rate)
-                      : 'bg-muted-foreground/15'
-                  )}
-                />
-              )
-            })}
-          </dd>
-        </div>
-        <div title={t('Average latency')} className='shrink-0'>
-          <dt className='text-muted-foreground text-[11px] leading-4'>
-            {t('Latency short')}
-          </dt>
-          <dd className='mt-1 font-mono whitespace-nowrap'>
-            {latencyText === '—' ? '—s' : latencyText}
-          </dd>
-        </div>
-        <div title={t('Throughput')} className='shrink-0'>
-          <dt className='text-muted-foreground text-[11px] leading-4'>
-            {t('Throughput short')}
-          </dt>
-          <dd className='mt-1 font-mono whitespace-nowrap'>
-            {throughputText === '—' ? '—t/s' : throughputText}
-          </dd>
-        </div>
-      </dl>
-      {props.children}
+            <dt className='text-muted-foreground text-[11px] leading-4'>
+              {media ? t('Completed (24h)') : t('Throughput short')}
+            </dt>
+            <dd className='mt-1 font-mono whitespace-nowrap'>
+              {throughputText === '—' && !media ? '—t/s' : throughputText}
+            </dd>
+          </div>
+        </dl>
+        {props.children}
+      </div>
+      {sampleContext}
     </div>
   )
 })

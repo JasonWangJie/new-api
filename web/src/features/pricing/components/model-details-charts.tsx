@@ -21,7 +21,10 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { useThemeCustomization } from '@/context/theme-customization-provider'
-import { getSuccessRateColor } from '@/features/performance-metrics/lib/format'
+import {
+  formatLatency,
+  getSuccessRateColor,
+} from '@/features/performance-metrics/lib/format'
 import { useThemeRadiusPx } from '@/lib/theme-radius'
 import { useChartTheme } from '@/lib/use-chart-theme'
 import { cn } from '@/lib/utils'
@@ -94,7 +97,8 @@ function stripUptimePointSuffix(value: string): string {
 // ---------------------------------------------------------------------------
 
 export function LatencyTrendChart(props: {
-  series: LatencyTimePoint[]
+  series: (LatencyTimePoint & { latency_count?: number })[]
+  metricLabel?: string
   className?: string
 }) {
   const { t } = useTranslation()
@@ -107,6 +111,7 @@ export function LatencyTrendChart(props: {
       time: formatHourLabel(point.timestamp),
       group: point.group,
       ttft: point.ttft_ms,
+      latency_count: point.latency_count,
     }))
     return {
       type: 'line' as const,
@@ -128,8 +133,9 @@ export function LatencyTrendChart(props: {
           title: { value: (d: { time: string }) => d.time },
           content: [
             {
-              key: t('Average TTFT'),
-              value: (d: { ttft: number }) => `${Math.round(d.ttft)} ms`,
+              key: props.metricLabel ?? t('Average TTFT'),
+              value: (d: { ttft: number; latency_count?: number }) =>
+                formatLatency(d.ttft, d.latency_count),
             },
           ],
         },
@@ -155,7 +161,7 @@ export function LatencyTrendChart(props: {
         },
       ],
     }
-  }, [gridColor, props.series, t, textColor])
+  }, [gridColor, props.metricLabel, props.series, t, textColor])
 
   if (props.series.length === 0) {
     return (

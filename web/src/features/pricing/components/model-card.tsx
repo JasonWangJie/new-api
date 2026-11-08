@@ -38,6 +38,10 @@ import {
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
 import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getModelPerformanceStats,
+  isMediaModel,
+} from '../lib/model-performance'
 import { withPublicPricing } from '../lib/plugin-pricing'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import { taskPriceLabel, taskUsageUnitLabel } from '../lib/task-price-display'
@@ -54,6 +58,7 @@ export interface ModelCardProps {
   showRechargePrice?: boolean
   selectedGroup?: string
   perf?: ModelPerfBadgeData
+  perfStatus?: 'loading' | 'error' | 'ready'
 }
 
 export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
@@ -403,7 +408,9 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
       </CardContent>
       <CardFooter className='mt-auto border-0 bg-transparent pt-0'>
         <ModelPerfBadge
-          perf={props.perf}
+          perf={getModelPerformanceStats(props.model, props.perf)}
+          status={props.perfStatus}
+          mediaModel={isMediaModel(props.model)}
           className='border-border/60 border-t pt-2'
         >
           <Button variant='ghost' size='sm' onClick={props.onClick}>

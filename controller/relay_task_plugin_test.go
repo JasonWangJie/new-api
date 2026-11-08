@@ -89,7 +89,7 @@ func TestMixedVideoAdmissionAndCrossPluginRecovery(t *testing.T) {
 	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTaskTimeout })
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "mixed-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "mixed-test")
 	previousRegistry := pluginruntime.DefaultRegistry
@@ -508,7 +508,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "conditional-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "conditional-test")
 			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
@@ -876,7 +876,7 @@ func TestMixedVideoPricingAPIThroughSubmissionAndSettlement(t *testing.T) {
 		dialect = "sqlite"
 	}
 	db := modelManagementDB(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
 	token.RemainQuota = 1000
 	require.NoError(t, db.Create(user).Error)
 	require.NoError(t, db.Create(token).Error)
@@ -1586,7 +1586,7 @@ func TestAsyncVideoSubmissionRetryKeepsOneBillingLifecycle(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			events := []string{}
 			database := setupTaskSubmissionDatabase(t, true, &events)
-			require.NoError(t, database.AutoMigrate(&model.AsyncMediaJob{}))
+			require.NoError(t, database.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncMediaJob{}))
 			billing := &taskSubmissionTestBilling{events: &events}
 			c := taskSubmissionTestContext()
 			c.Set("async_media_execution", true)
@@ -1660,7 +1660,7 @@ func TestTypedInitialVideoFailureUsesOneBillingLifecycle(t *testing.T) {
 			t.Cleanup(func() { common.LogConsumeEnabled = oldLogs })
 			events := []string{}
 			db := setupTaskSubmissionDatabase(t, true, &events)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Token{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}, &model.Token{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.ImageChannelPool{}, &model.TokenImagePlatformMapping{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "typed-retry:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "typed-retry")
 			previousRegistry := pluginruntime.DefaultRegistry
@@ -1791,7 +1791,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 	t.Run("pre-consumption validation and existing holds", func(t *testing.T) {
 		user, token := setupResponsesWSRequestTest(t)
 		db := setupVideoRetryTestDatabase(t, user, token)
-		require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}))
+		require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncMediaJob{}))
 		for _, tc := range []struct {
 			name, validation, billingStatus      string
 			priorUnknown, dispatched, staleLease bool
@@ -1848,7 +1848,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 	t.Run("reclaimed submission preserves billing outcomes", func(t *testing.T) {
 		user, token := setupResponsesWSRequestTest(t)
 		db := setupVideoRetryTestDatabase(t, user, token)
-		require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}))
+		require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}))
 		t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "reclaimed-video:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
 		t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "reclaimed-video")
 		previousSubmit := service.SubmitAsyncVideoFunc
@@ -1908,7 +1908,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			t.Run(fmt.Sprintf("stale lease %t", staleLease), func(t *testing.T) {
 				user, token := setupResponsesWSRequestTest(t)
 				db := setupVideoRetryTestDatabase(t, user, token)
-				require.NoError(t, db.AutoMigrate(&model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}, &model.Log{}))
+				require.NoError(t, db.AutoMigrate(&model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.Task{}, &model.AsyncMediaEvent{}, &model.Log{}))
 				require.NoError(t, db.Model(token).Update("remain_quota", 40).Error)
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "reserve-failure:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "reserve-failure")
@@ -2007,7 +2007,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 			// The shared cross-database fixture inserts this unused seed with an
 			// explicit ID. Remove it so PostgreSQL can generate the first test token.
 			require.NoError(t, db.Unscoped().Delete(baseToken).Error)
-			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
+			require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
 			require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.SubscriptionPreConsumeRecord{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "nldw-submit:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "nldw-submit")
@@ -2477,7 +2477,7 @@ func TestYuxiboxPollingHonorsPluginContractDatabase(t *testing.T) {
 	baseUser, baseToken := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, baseUser, baseToken)
 	require.NoError(t, db.Unscoped().Delete(baseToken).Error)
-	require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
+	require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.Option{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaArtifactObject{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "yuxibox-poll:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "yuxibox-poll")
 	previousRegistry := pluginruntime.DefaultRegistry
@@ -2589,7 +2589,7 @@ func TestHuahuoVideoDurableLifecycle(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "huahuo-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "huahuo-test")
 			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
@@ -2833,7 +2833,7 @@ func TestWolongVideoDurableLifecycle(t *testing.T) {
 			}
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "wolong-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "wolong-test")
 			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
@@ -3088,7 +3088,7 @@ func TestPresetVideoCustomModelDurableLifecycle(t *testing.T) {
 			t.Run(provider+"/"+unit, func(t *testing.T) {
 				user, token := setupResponsesWSRequestTest(t)
 				db := setupVideoRetryTestDatabase(t, user, token)
-				require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+				require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
 				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "custom-video:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
 				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "custom-video")
 				previousRegistry, previousSubmit, previousAdaptor := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc, service.GetTaskAdaptorFunc
@@ -3456,7 +3456,7 @@ func TestMixedVideoConfirmedFailureRecovery(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
+			require.NoError(t, db.AutoMigrate(&model.Option{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "third:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "third")
 			policy := mediaretry.Policy{Rules: []mediaretry.Rule{{ID: "terminal", Name: "Confirmed failure retry", Enabled: true, Scope: mediaretry.Scope{MediaTypes: []string{"video"}}, Match: mediaretry.Match{ContainsAny: []string{"confirmed provider failure"}}, Steps: []mediaretry.Step{{ID: "other", Action: mediaretry.OtherChannel, MaxAttempts: 1}}}}}
@@ -3702,7 +3702,7 @@ func TestMixedVideoSoraPublicDimensions(t *testing.T) {
 func TestSoraVideoPolicyAspectRatioAdmission(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.AsyncMediaJob{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}))
 	previousRegistry := pluginruntime.DefaultRegistry
 	pluginruntime.DefaultRegistry = pluginruntime.NewRegistry()
 	t.Cleanup(func() { pluginruntime.DefaultRegistry = previousRegistry })

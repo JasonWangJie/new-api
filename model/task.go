@@ -684,7 +684,11 @@ func (t *Task) UpdatePollingState(ctx context.Context, before TaskPollingSnapsho
 		if result.Error != nil || !won || privateData.VideoReconciliation == nil {
 			return result.Error
 		}
-		return tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", t.TaskID, t.UserId, t.AttemptGeneration, []string{"queued", "submitting", "submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "next_attempt_at": 0}).Error
+		projection := tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", t.TaskID, t.UserId, t.AttemptGeneration, []string{"queued", "submitting", "submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "next_attempt_at": 0})
+		if projection.Error != nil || projection.RowsAffected == 0 {
+			return projection.Error
+		}
+		return tx.Where("kind = ? AND task_id = ? AND outcome <> ?", "video", t.TaskID, "success").Delete(&TaskPerfSample{}).Error
 	})
 	return won, err
 }
@@ -713,7 +717,11 @@ func ResumeAsyncVideoReconciliation(ctx context.Context, taskID string, userID i
 		if result.Error != nil || !won {
 			return result.Error
 		}
-		return tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", task.TaskID, task.UserId, task.AttemptGeneration, []string{"submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "storage_status": "pending", "next_attempt_at": 0}).Error
+		projection := tx.Model(&AsyncMediaJob{}).Where("task_id = ? AND user_id = ? AND attempt_generation = ? AND status IN ?", task.TaskID, task.UserId, task.AttemptGeneration, []string{"submitted", "reconciling", "expired"}).Updates(map[string]any{"status": "reconciling", "storage_status": "pending", "next_attempt_at": 0})
+		if projection.Error != nil || projection.RowsAffected == 0 {
+			return projection.Error
+		}
+		return tx.Where("kind = ? AND task_id = ? AND outcome <> ?", "video", task.TaskID, "success").Delete(&TaskPerfSample{}).Error
 	})
 	return &task, won, err
 }

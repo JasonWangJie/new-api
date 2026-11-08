@@ -16,20 +16,29 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export type PerformanceSeriesPoint = {
-  ts: number
-  avg_ttft_ms: number
+export type PerformanceStats = {
+  avg_ttft_ms?: number
   avg_latency_ms: number
   success_rate: number
   avg_tps: number
+  request_count?: number
+  success_count?: number
+  failure_count?: number
+  unknown_count?: number
+  latency_count?: number
+  total_latency_ms?: number
+  output_count?: number
+  workload?: 'relay' | 'image' | 'video' | 'mixed'
 }
 
-export type PerformanceGroup = {
+export type PerformanceSeriesPoint = PerformanceStats & {
+  ts: number
+  avg_ttft_ms: number
+}
+
+export type PerformanceGroup = PerformanceStats & {
   group: string
   avg_ttft_ms: number
-  avg_latency_ms: number
-  success_rate: number
-  avg_tps: number
   series: PerformanceSeriesPoint[]
 }
 
@@ -39,19 +48,18 @@ export type PerformanceMetricsData = {
   data: {
     model_name: string
     series_schema?: string
+    summary?: PerformanceStats
+    window_hours?: number
+    updated_at?: number
     groups: PerformanceGroup[]
   }
 }
 
 export type SuccessRatePoint = { ts: number; success_rate: number }
 
-export type PerfModelSummary = {
+export type PerfModelSummary = PerformanceStats & {
   model_name: string
-  avg_latency_ms: number
-  success_rate: number
-  avg_tps: number
   recent_success_series?: SuccessRatePoint[]
-  request_count?: number
 }
 
 export type PerfSummaryAllData = {
@@ -59,5 +67,7 @@ export type PerfSummaryAllData = {
   message?: string
   data: {
     models: PerfModelSummary[]
+    window_hours?: number
+    updated_at?: number
   }
 }

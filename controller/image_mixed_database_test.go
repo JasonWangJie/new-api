@@ -63,7 +63,7 @@ func TestAsyncImageAdmissionPreservesMixedRouting(t *testing.T) {
 	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "admission:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "admission")
-	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}, &model.ImageInputAlias{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}, &model.ImageInputAlias{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}))
 	require.NoError(t, model.InitializeMediaRetryPolicy(db))
 	cfg := service.DefaultImageRuntimeConfig()
 	cfg.AsyncEnabled = true

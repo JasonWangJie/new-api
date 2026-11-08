@@ -831,7 +831,7 @@ func TestSudashuiCatalogReadsAndTagWrites(t *testing.T) {
 func TestSudashuiAsyncAdmissionFreezesSelectedChannel(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	db := setupVideoRetryTestDatabase(t, user, token)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.Option{}, &model.Log{}, &model.UserSubscription{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.MediaInputObject{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.Option{}, &model.Log{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.MediaInputObject{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
 	_, config := sudashuiFixture(t)
 	redisServer := miniredis.RunT(t)
 	previousRDB, previousRedis, previousSecret, previousPlugins := common.RDB, common.RedisEnabled, common.CryptoSecret, constant.TaskPluginEnabled
@@ -1204,7 +1204,7 @@ func TestSudashuiRoutedSubmitPollAndFrozenBilling(t *testing.T) {
 		t.Run(tc.unit+"/failure="+strconv.FormatBool(tc.fail), func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.Log{}, &model.UserSubscription{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPlugin{}, &model.Log{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}))
 			user.Quota, token.RemainQuota = 1_000_000, 1_000_000
 			require.NoError(t, model.DB.Model(user).Update("quota", user.Quota).Error)
 			require.NoError(t, model.DB.Model(token).Update("remain_quota", token.RemainQuota).Error)

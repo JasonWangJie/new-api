@@ -440,7 +440,7 @@ describe('model cards', () => {
     expect(screen.getByText(expression)).toBeVisible()
   })
 
-  it('keeps browsing and neutral health placeholders available after the metrics request fails', async () => {
+  it('keeps browsing available and identifies a failed metrics request', async () => {
     const request = vi
       .spyOn(api, 'get')
       .mockRejectedValue(new Error('metrics unavailable'))
@@ -461,11 +461,182 @@ describe('model cards', () => {
     expect(
       within(
         screen.getByLabelText('Performance metrics for the last 24 hours')
+      ).getByText('Performance metrics unavailable')
+    ).toBeVisible()
+    expect(
+      screen.queryByText('No samples in the last 24 hours')
+    ).not.toBeInTheDocument()
+    expect(
+      within(
+        screen.getByLabelText('Performance metrics for the last 24 hours')
       ).getAllByText(/^—/)
     ).toHaveLength(3)
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: 'Details' }))
     expect(onModelClick).toHaveBeenCalledWith('example-model')
+  })
+
+  it('shows metrics loading until a successful response confirms that a model has no samples', async () => {
+    let resolveRequest: (value: unknown) => void = () => undefined
+    vi.spyOn(api, 'get').mockReturnValue(
+      new Promise((resolve) => {
+        resolveRequest = resolve
+      })
+    )
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ModelCardGrid models={[pricingModel()]} onModelClick={vi.fn()} />
+      </QueryClientProvider>
+    )
+    const metrics = screen.getByLabelText(
+      'Performance metrics for the last 24 hours'
+    )
+    expect(within(metrics).getByText('Loading...')).toBeVisible()
+    expect(
+      screen.queryByText('No samples in the last 24 hours')
+    ).not.toBeInTheDocument()
+    await act(async () =>
+      resolveRequest({ data: { success: true, data: { models: [] } } })
+    )
+    expect(
+      await within(metrics).findByText('No samples in the last 24 hours')
+    ).toBeVisible()
+  })
+
+  it.each([
+    { workload: 'image' as const, output_count: 6, expected: '6 images' },
+    { workload: 'video' as const, output_count: 3, expected: '3 videos' },
+    { workload: 'video' as const, output_count: 1, expected: '1 video' },
+    {
+      workload: 'mixed' as const,
+      output_count: 6,
+      expected: '3 successful requests',
+    },
+  ])(
+    'shows $workload completion counts and sample context instead of token throughput',
+    (entry) => {
+      render(
+        <ModelCard
+          model={pricingModel()}
+          onClick={vi.fn()}
+          perf={{
+            avg_latency_ms: 120000,
+            avg_tps: 42,
+            success_rate: 60,
+            workload: entry.workload,
+            output_count: entry.output_count,
+            request_count: 5,
+            success_count: 3,
+            unknown_count: 1,
+          }}
+        />
+      )
+      const metrics = screen.getByLabelText(
+        'Performance metrics for the last 24 hours'
+      )
+      expect(within(metrics).getByText(entry.expected)).toBeVisible()
+      expect(within(metrics).getByText(entry.expected)).toHaveClass(
+        'whitespace-nowrap'
+      )
+      expect(
+        within(metrics).getByText(entry.expected).closest('dl')
+      ).toHaveClass('flex-wrap', 'basis-60')
+      expect(within(metrics).getByText('5 samples')).toBeVisible()
+      expect(within(metrics).getByText('1 unknown result')).toBeVisible()
+      expect(within(metrics).queryByText(/t\/s/)).not.toBeInTheDocument()
+    }
+  )
+
+  it('shows successful request counts for legacy media metrics without inventing image quantities or TPS', () => {
+    render(
+      <ModelCard
+        model={pricingModel({ supported_endpoint_types: ['image-generation'] })}
+        onClick={vi.fn()}
+        perf={{
+          workload: 'relay',
+          avg_latency_ms: 1200,
+          avg_tps: 42,
+          success_rate: 75,
+          request_count: 4,
+          success_count: 3,
+          output_count: 0,
+        }}
+      />
+    )
+    const metrics = screen.getByLabelText(
+      'Performance metrics for the last 24 hours'
+    )
+    expect(within(metrics).getByText('3 successful requests')).toBeVisible()
+    expect(within(metrics).queryByText(/images|t\/s/)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { state: 'no observations', perf: undefined, expected: '—' },
+    {
+      state: 'legacy relay observations',
+      perf: {
+        workload: 'relay' as const,
+        avg_latency_ms: 1200,
+        avg_tps: 42,
+        success_rate: 75,
+        request_count: 4,
+        success_count: 3,
+        output_count: 0,
+      },
+      expected: '3 successful requests',
+    },
+  ])(
+    'shows completion metrics for mixed video pricing with generic endpoints and $state',
+    (entry) => {
+      render(
+        <ModelCard
+          model={pricingModel({
+            supported_endpoint_types: ['openai'],
+            mixed_video_pricing: {
+              source: 'model',
+              groups: ['default'],
+              billing_usage_schema: {
+                requests: { type: 'number', unit: 'count' },
+              },
+            },
+          })}
+          onClick={vi.fn()}
+          perf={entry.perf}
+          perfStatus='ready'
+        />
+      )
+      const metrics = screen.getByLabelText(
+        'Performance metrics for the last 24 hours'
+      )
+      expect(within(metrics).getByText('Completed (24h)')).toBeVisible()
+      expect(within(metrics).getByText(entry.expected)).toBeVisible()
+      expect(within(metrics).queryByText(/TPS|t\/s/)).not.toBeInTheDocument()
+    }
+  )
+
+  it('shows a subsecond delivery when a completed media sample has a valid zero coarse duration', () => {
+    render(
+      <ModelCard
+        model={pricingModel()}
+        onClick={vi.fn()}
+        perf={{
+          workload: 'image',
+          avg_latency_ms: 0,
+          latency_count: 1,
+          avg_tps: 0,
+          success_rate: 100,
+          request_count: 1,
+          success_count: 1,
+          output_count: 1,
+        }}
+      />
+    )
+    expect(screen.getByText('<1s')).toBeVisible()
+    expect(screen.getByText('1 image')).toBeVisible()
+    expect(screen.getByText('1 sample')).toBeVisible()
+    expect(screen.getByTitle('Fewer than 20 samples')).toHaveTextContent(
+      'Limited samples'
+    )
   })
 
   it('paginates the model cards and disables navigation at both boundaries', async () => {
