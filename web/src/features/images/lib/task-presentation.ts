@@ -18,7 +18,10 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { TFunction } from 'i18next'
 
+import { formatUseTime } from '@/lib/format'
+
 import type { ImageTask, ImageTaskList } from '../types'
+import { terminalImageStatus } from './image-request'
 
 const FINAL_ISSUE_STATUSES = new Set([
   'failed',
@@ -231,12 +234,19 @@ export function imageTaskIssue(task: ImageTask): {
   }
 }
 
-export function imageTaskElapsedSeconds(
+export function formatImageTaskElapsedTime(
   task: ImageTask,
   now = Date.now() / 1000
-): number | null {
-  if (!task.created_at) return null
-  return Math.max(0, (task.finished_at || now) - task.created_at)
+): string {
+  if (!task.created_at) return '—'
+  const finishedAt = task.finished_at > 0 ? task.finished_at : undefined
+  if (
+    finishedAt === undefined &&
+    terminalImageStatus(task.status, task.next_attempt_at)
+  ) {
+    return '—'
+  }
+  return formatUseTime(Math.max(0, (finishedAt ?? now) - task.created_at))
 }
 
 export function imageTaskCost(task: ImageTask): number | null {

@@ -78,8 +78,8 @@ import { ImageTaskRefreshActions } from './components/image-task-refresh-actions
 import { useMediaRetentionClock } from './hooks/use-media-retention-clock'
 import { imageLabel } from './lib/image-labels'
 import {
+  formatImageTaskElapsedTime,
   imageTaskCost,
-  imageTaskElapsedSeconds,
   imageTaskListSpecifications,
   imageTaskSuccessRate,
   imageTaskIssue,
@@ -292,11 +292,7 @@ function TaskCenterSession({
             ))}
             <div className='flex gap-1.5 font-medium'>
               <dt>{t('Time spent')}</dt>
-              <dd>
-                {row.original.created_at
-                  ? formatUseTime(imageTaskElapsedSeconds(row.original) || 0)
-                  : '—'}
-              </dd>
+              <dd>{formatImageTaskElapsedTime(row.original)}</dd>
             </div>
           </dl>
         ),

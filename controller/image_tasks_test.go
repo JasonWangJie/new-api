@@ -164,6 +164,75 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "presentation-profile", Provider: "local", Class: "temporary", Root: "private-storage-canary"}).Error)
 			require.NoError(t, db.Create(&model.ImageStorageObject{ObjectId: "presentation-output", ProfileId: "presentation-profile", ObjectKey: "private-object-canary", Width: 2048, Height: 1186, Status: "active"}).Error)
 			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: 0, ObjectId: "presentation-output"}).Error)
+			t.Run("failed video duration uses its current attempt event", func(t *testing.T) {
+				jobs := []model.AsyncMediaJob{
+					{TaskId: "task_duration_failed", Status: "failed", BillingStatus: "refunded"},
+					{TaskId: "task_duration_without_event", Status: "failed", BillingStatus: "refunded"},
+					{TaskId: "task_duration_with_receipt", Status: "failed", BillingStatus: "refunded"},
+					{TaskId: "task_duration_retrying", Status: "submitting", BillingStatus: "reserved"},
+				}
+				for i := range jobs {
+					jobs[i].IdentityHash, jobs[i].Group = jobs[i].TaskId, "video-duration"
+					jobs[i].UserId, jobs[i].TokenId, jobs[i].Provider = 101, 201, "drama"
+					jobs[i].CreatedAt, jobs[i].ExpiresAt, jobs[i].AttemptGeneration = now-30, now+3600, 1
+				}
+				require.NoError(t, db.Create(&jobs).Error)
+				receipt := model.Task{TaskID: jobs[2].TaskId, UserId: 101, Status: model.TaskStatusFailure, FinishTime: now - 25}
+				require.NoError(t, db.Create(&receipt).Error)
+				events := []model.AsyncMediaEvent{
+					{TaskId: jobs[0].TaskId, EventKey: "duration-failed", EventType: "failed", Status: "failed", AttemptGeneration: 1, CreatedAt: now - 28},
+					{TaskId: jobs[0].TaskId, EventKey: "duration-refunded", EventType: "billing_refunded", Status: "failed", AttemptGeneration: 1, CreatedAt: now - 20},
+					{TaskId: jobs[1].TaskId, EventKey: "duration-stale-failure", EventType: "failed", Status: "failed", AttemptGeneration: 0, CreatedAt: now - 26},
+					{TaskId: jobs[2].TaskId, EventKey: "duration-receipt-failure", EventType: "failed", Status: "failed", AttemptGeneration: 1, CreatedAt: now - 23},
+					{TaskId: jobs[3].TaskId, EventKey: "duration-retrying-failure", EventType: "failed", Status: "failed", AttemptGeneration: 1, CreatedAt: now - 27},
+				}
+				require.NoError(t, db.Create(&events).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&events).Error)
+					assert.NoError(t, db.Delete(&receipt).Error)
+					assert.NoError(t, db.Delete(&jobs).Error)
+				})
+				date := time.Unix(jobs[0].CreatedAt, 0).UTC().Format(time.DateOnly)
+				for _, admin := range []bool{false, true} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Request = httptest.NewRequest(http.MethodGet, "/?group=video-duration&sort_by=finished_at&sort_order=desc&start_date="+date+"&end_date="+date, nil)
+					ListMediaTasks(c, admin)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var list struct {
+						Data struct {
+							Items []gin.H
+							Stats struct {
+								AverageDurationMS float64 `json:"average_duration_ms"`
+							}
+						}
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &list))
+					require.Len(t, list.Data.Items, len(jobs))
+					assert.Equal(t, jobs[2].TaskId, list.Data.Items[0]["task_id"])
+					assert.Equal(t, jobs[0].TaskId, list.Data.Items[1]["task_id"])
+					assert.Equal(t, float64(now-28), list.Data.Items[1]["finished_at"])
+					assert.Equal(t, float64(2000), list.Data.Items[1]["duration_ms"])
+					for _, item := range list.Data.Items[2:] {
+						assert.Zero(t, item["finished_at"])
+						assert.Nil(t, item["duration_ms"])
+					}
+					assert.Equal(t, float64(3500), list.Data.Stats.AverageDurationMS)
+
+					recorder = httptest.NewRecorder()
+					c, _ = gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Params = gin.Params{{Key: "task_id", Value: jobs[0].TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+					GetMediaTask(c, admin)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var detail struct{ Data struct{ Task gin.H } }
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &detail))
+					assert.Equal(t, float64(now-28), detail.Data.Task["finished_at"])
+					assert.Equal(t, float64(2000), detail.Data.Task["duration_ms"])
+				}
+			})
 			t.Run("refunded task costs", func(t *testing.T) {
 				images := []model.AsyncImageTask{
 					{TaskId: "asyncimg_refund_cost_confirmed", BillingStatus: "refunded"},

@@ -55,6 +55,7 @@ import { ImageResults } from '../components/image-results'
 import { ImageTaskDetails } from '../components/image-task-details'
 import { ImageTaskNotice } from '../components/image-task-notice'
 import {
+  formatImageTaskElapsedTime,
   imageTaskCanResume,
   imageTaskIssue,
   imageTaskProgress,
@@ -344,6 +345,64 @@ afterEach(() => {
   clients.length = 0
   useAuthStore.getState().auth.reset()
 })
+
+test.each([
+  { mobile: false, finishedAt: 0, expected: '—' },
+  { mobile: true, finishedAt: 0, expected: '—' },
+  { mobile: false, finishedAt: task.created_at, expected: '0.0s' },
+  { mobile: true, finishedAt: task.created_at, expected: '0.0s' },
+])(
+  'shows $expected for a refunded video with finished_at=$finishedAt (mobile=$mobile)',
+  async ({ mobile, finishedAt, expected }) => {
+    if (mobile) setMobileViewport()
+    const failedTask: ImageTask = {
+      ...task,
+      media_type: 'video',
+      status: 'failed',
+      billing_status: 'refunded',
+      finished_at: finishedAt,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [failedTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: failedTask,
+      results: [],
+    })
+
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    const listTask = mobile
+      ? screen.getByRole('article', { name: task.id })
+      : screen.getByRole('row', { name: new RegExp(task.id) })
+    expect(
+      within(listTask).getByText('Time spent').nextElementSibling
+    ).toHaveTextContent(expected)
+
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog')
+    expect(
+      (await within(dialog).findByText('Time spent')).nextElementSibling
+    ).toHaveTextContent(expected)
+  }
+)
+
+test.each(['storage_failed', 'billing_failed'])(
+  'counts elapsed time for %s while an automatic retry is scheduled',
+  (status) => {
+    expect(
+      formatImageTaskElapsedTime(
+        { ...task, status, next_attempt_at: task.created_at + 30 },
+        task.created_at + 20
+      )
+    ).toBe('20.0s')
+  }
+)
 
 test.each([
   { mediaType: 'image', mobile: false },

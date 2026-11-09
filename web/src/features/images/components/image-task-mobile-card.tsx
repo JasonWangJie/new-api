@@ -23,11 +23,11 @@ import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Progress } from '@/components/ui/progress'
-import { formatTimestampToDate, formatUseTime } from '@/lib/format'
+import { formatTimestampToDate } from '@/lib/format'
 
 import { imageLabel } from '../lib/image-labels'
 import {
-  imageTaskElapsedSeconds,
+  formatImageTaskElapsedTime,
   imageTaskListSpecifications,
   imageTaskIssue,
   imageTaskProgress,
@@ -185,11 +185,7 @@ export function ImageTaskMobileCard(props: {
         </div>
         <div>
           <dt>{t('Time spent')}</dt>
-          <dd className='tabular-nums'>
-            {task.created_at
-              ? formatUseTime(imageTaskElapsedSeconds(task) || 0)
-              : '—'}
-          </dd>
+          <dd className='tabular-nums'>{formatImageTaskElapsedTime(task)}</dd>
         </div>
         {props.admin && (
           <>

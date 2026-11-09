@@ -534,17 +534,43 @@ func UpdateMediaConfiguration(c *gin.Context) {
 	imageManagementData(c, cfg)
 }
 
+type videoTaskViewJob struct {
+	model.AsyncMediaJob
+	FailedAt int64
+}
+
+func videoTaskFailureTime() clause.Expr {
+	eventTime := model.DB.Model(&model.AsyncMediaEvent{}).Select("MAX(created_at)").
+		Where("task_id = async_media_jobs.task_id AND attempt_generation = async_media_jobs.attempt_generation").
+		Where("event_type = ? AND status = ? AND created_at >= async_media_jobs.created_at", "failed", "failed")
+	return gorm.Expr("CASE WHEN async_media_jobs.status = 'failed' AND async_media_jobs.created_at > 0 THEN COALESCE((?), 0) ELSE 0 END", eventTime)
+}
+
+func videoTaskViewJobs(ctx context.Context) *gorm.DB {
+	return model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
+		Select("async_media_jobs.*, (?) AS failed_at", videoTaskFailureTime())
+}
+
+func (job videoTaskViewJob) view(c *gin.Context, admin, detail bool) (gin.H, []gin.H, error) {
+	view, results, err := videoJobView(c, job.AsyncMediaJob, admin, detail)
+	if err == nil && view["finished_at"] == int64(0) && job.FailedAt > 0 {
+		view["finished_at"] = job.FailedAt
+		view["duration_ms"] = (job.FailedAt - job.CreatedAt) * 1000
+	}
+	return view, results, err
+}
+
 func GetMediaTask(c *gin.Context, admin bool) {
 	if strings.HasPrefix(c.Param("task_id"), "asyncimg_") {
 		GetImageTask(c, admin)
 		return
 	}
 	c.Header("Cache-Control", "private, no-store")
-	query := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id"))
+	query := videoTaskViewJobs(c.Request.Context()).Where("task_id = ?", c.Param("task_id"))
 	if !admin {
 		query = query.Where("user_id = ?", c.GetInt("id"))
 	}
-	var job model.AsyncMediaJob
+	var job videoTaskViewJob
 	if err := query.Take(&job).Error; err != nil {
 		imageManagementError(c, 404, errors.New("Media task was not found"))
 		return
@@ -557,14 +583,14 @@ func GetMediaTask(c *gin.Context, admin bool) {
 		imageManagementError(c, status, errors.New("Media task is unavailable"))
 		return
 	}
-	view, results, err := videoJobView(c, job, admin, true)
+	view, results, err := job.view(c, admin, true)
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
 	}
 	// Complete request parameters and caller-owned signed reference URLs remain
 	// owner/admin detail data. Management lists project specifications only.
-	if details := videoJobRequestDetails(job); details != nil {
+	if details := videoJobRequestDetails(job.AsyncMediaJob); details != nil {
 		if details.RequestedSeconds != nil {
 			view["requested_seconds"] = *details.RequestedSeconds
 		}
@@ -579,12 +605,12 @@ func GetMediaTask(c *gin.Context, admin bool) {
 			view["prompt_summary"] = service.SanitizeAsyncImageText(prompt, 512)
 		}
 	}
-	events, err := videoTaskAudit(c, job, view, admin)
+	events, err := videoTaskAudit(c, job.AsyncMediaJob, view, admin)
 	if err != nil {
 		imageManagementError(c, http.StatusServiceUnavailable, err)
 		return
 	}
-	attachVideoRefundCosts(c.Request.Context(), []model.AsyncMediaJob{job}, map[string]gin.H{job.TaskId: view})
+	attachVideoRefundCosts(c.Request.Context(), []model.AsyncMediaJob{job.AsyncMediaJob}, map[string]gin.H{job.TaskId: view})
 	imageManagementData(c, gin.H{"task": view, "results": results, "events": events})
 }
 
@@ -1111,8 +1137,8 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		images = images.Where("status IN ?", selected)
 		videos = videos.Where("(?) IN ?", videoStatus, selected)
 	}
-	videoProjection := "task_id, created_at, (?) AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, (?) AS billing_status, 0 AS image_count, COALESCE((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1),0) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
-	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, videoStatus, videoBillingStatus))
+	videoProjection := "task_id, created_at, (?) AS status, COALESCE((SELECT quota FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), quota) AS quota, (?) AS billing_status, 0 AS image_count, COALESCE(NULLIF((SELECT finish_time FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), 0), (?)) AS finished_at, CASE WHEN provider = 'drama' THEN COALESCE((SELECT updated_at FROM tasks WHERE tasks.task_id = async_media_jobs.task_id AND tasks.user_id = async_media_jobs.user_id LIMIT 1), created_at) ELSE created_at END AS updated_at, 'video' AS media_type"
+	union := model.DB.Raw("? UNION ALL ?", images.Select("task_id, created_at, status, quota, billing_status, image_count, finished_at, updated_at, 'image' AS media_type"), videos.Select(videoProjection, videoStatus, videoBillingStatus, videoTaskFailureTime()))
 	query := model.DB.WithContext(c.Request.Context()).Table("(?) AS media_tasks", union)
 	sortBy := c.DefaultQuery("sort_by", "created_at")
 	if !slices.Contains([]string{"created_at", "finished_at", "updated_at", "status", "quota", "image_count"}, sortBy) {
@@ -1158,20 +1184,21 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 		item["stage"] = mediaStage(item["status"].(string))
 		byID[item["task_id"].(string)] = item
 	}
-	var jobs []model.AsyncMediaJob
+	var videoJobs []videoTaskViewJob
 	if len(videoIDs) > 0 {
-		if err := model.DB.WithContext(c.Request.Context()).Where("task_id IN ?", videoIDs).Find(&jobs).Error; err != nil {
+		if err := videoTaskViewJobs(c.Request.Context()).Where("task_id IN ?", videoIDs).Find(&videoJobs).Error; err != nil {
 			imageManagementError(c, 503, err)
 			return
 		}
 	}
-	for _, job := range jobs {
-		view, _, err := videoJobView(c, job, admin, false)
+	jobs := make([]model.AsyncMediaJob, 0, len(videoJobs))
+	for _, job := range videoJobs {
+		view, _, err := job.view(c, admin, false)
 		if err != nil {
 			imageManagementError(c, 503, err)
 			return
 		}
-		if details := videoJobRequestDetails(job); details != nil {
+		if details := videoJobRequestDetails(job.AsyncMediaJob); details != nil {
 			if details.RequestedSeconds != nil {
 				view["requested_seconds"] = *details.RequestedSeconds
 			}
@@ -1180,6 +1207,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			}
 		}
 		byID[job.TaskId] = view
+		jobs = append(jobs, job.AsyncMediaJob)
 	}
 	attachVideoRefundCosts(c.Request.Context(), jobs, byID)
 	ordered := make([]gin.H, 0, len(rows))

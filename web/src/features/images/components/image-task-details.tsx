@@ -34,7 +34,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
-import { formatTimestampToDate, formatUseTime } from '@/lib/format'
+import { formatTimestampToDate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 import {
@@ -52,8 +52,8 @@ import {
 import { terminalImageStatus } from '../lib/image-request'
 import { imageDetailHeaderClass } from '../lib/image-visuals'
 import {
+  formatImageTaskElapsedTime,
   imageTaskCost,
-  imageTaskElapsedSeconds,
   imageTaskSpecifications,
   imageTaskIssue,
   imageTaskCanResume,
@@ -694,9 +694,7 @@ export function ImageTaskDetails(props: {
                 },
                 {
                   label: t('Time spent'),
-                  value: data.created_at
-                    ? formatUseTime(imageTaskElapsedSeconds(data) || 0)
-                    : '—',
+                  value: formatImageTaskElapsedTime(data),
                 },
                 {
                   label: t('Actual cost'),
