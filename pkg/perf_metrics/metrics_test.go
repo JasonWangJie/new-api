@@ -270,3 +270,114 @@ func TestModelPerformanceTaskDelivery(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), result.Summary.RequestCount, "retention preserves samples inside the boundary")
 }
+
+func TestModelPerformanceVideoErrorExclusions(t *testing.T) {
+	db := performanceDatabase(t)
+	entities := []any{&model.TaskPerfSample{}, &model.PerfMetric{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Option{}}
+	require.NoError(t, db.Migrator().DropTable(entities...))
+	require.NoError(t, db.AutoMigrate(entities...))
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	previousEnabled := perf_metrics_setting.GetSetting().Enabled
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": strconv.FormatBool(previousEnabled)}))
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": "true"}))
+
+	now := time.Now().Unix()
+	bucket := now - now%3600
+	for _, fixture := range []struct {
+		id, model, group, status, reason string
+	}{
+		{"delivered", "mixed-video", "default", "succeeded", "Code_100%"},
+		{"matched", "mixed-video", "default", "failed", "资源错误 Code_100% provider-only-detail"},
+		{"different-case", "mixed-video", "vip", "failed", "code_100%"},
+		{"wildcards-are-literal", "mixed-video", "vip", "failed", "CodeX100Z"},
+		{"unknown", "mixed-video", "default", "execution_unknown", "Code_100%"},
+		{"expired", "mixed-video", "default", "expired", "Code_100%"},
+		{"pending", "mixed-video", "default", "submitted", "Code_100%"},
+		{"all-excluded", "failed-video", "default", "failed", "Code_100%"},
+		{"Other-Task", "old-video", "default", "failed", "Code_100%"},
+	} {
+		job := model.AsyncMediaJob{TaskId: fixture.id, IdentityHash: fixture.id, Model: fixture.model, Group: fixture.group, Status: "submitted", CreatedAt: now - 300}
+		require.NoError(t, db.Create(&job).Error)
+		require.NoError(t, model.ChangeAsyncMediaJob(db.Model(&model.AsyncMediaJob{}).Where("id = ?", job.ID), map[string]any{"status": fixture.status, "error_message": fixture.reason}, ""))
+	}
+	// A missing terminal job (or one with a different task ID) never excludes a
+	// historical observation. Identical image task IDs are a separate workload.
+	require.NoError(t, db.Model(&model.TaskPerfSample{}).Where("task_id = ?", "Other-Task").Update("task_id", "other-task").Error)
+	require.NoError(t, db.Create(&model.TaskPerfSample{TaskId: "matched", Kind: "image", ModelName: "mixed-video", Group: "default", Outcome: "failure", CompletedAt: now, BucketTs: bucket}).Error)
+	require.NoError(t, db.Create(&model.PerfMetric{ModelName: "mixed-video", Group: "default", BucketTs: bucket, RequestCount: 1, SuccessCount: 1, TotalLatencyMs: 1000}).Error)
+	params := QueryParams{Model: "mixed-video", Groups: []string{"default", "vip"}}
+	raw, err := Query(params)
+	require.NoError(t, err)
+	require.Equal(t, int64(8), raw.Summary.RequestCount)
+	assert.Nil(t, raw.Summary.VideoFilteredSuccessRate)
+
+	key := perf_metrics_setting.VideoErrorExclusionsOptionKey
+	rules := "  Code_100% \r\n资源错误\nCode_100%\n"
+	require.NoError(t, model.UpdateOption(key, rules))
+	require.Error(t, model.UpdateOption(key, strings.Repeat("x", 257)))
+	require.Error(t, model.UpdateOption(key, "Code\x00error"))
+	var saved model.Option
+	require.NoError(t, db.Take(&saved).Error)
+	assert.Equal(t, rules, saved.Value, "invalid rules must not replace the persisted setting")
+	result, err := Query(params)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Code_100%", "资源错误"}, result.VideoErrorExclusions)
+	filtered := result.Summary.VideoFilteredSuccessRate
+	require.NotNil(t, filtered)
+	assert.Equal(t, int64(2), filtered.ExcludedCount, "overlapping literal rules and the expired job each count once")
+	assert.Equal(t, int64(4), filtered.SampleCount, "unknown remains in the denominator, image and relay are outside this metric")
+	require.NotNil(t, filtered.Rate)
+	assert.Equal(t, float64(25), *filtered.Rate)
+	result.Summary.VideoFilteredSuccessRate = nil
+	assert.Equal(t, raw.Summary, result.Summary, "raw metrics and average latency retain their original scope")
+
+	params.Group = "default"
+	defaultGroup, err := Query(params)
+	require.NoError(t, err)
+	require.Len(t, defaultGroup.Groups, 1)
+	require.NotNil(t, defaultGroup.Summary.VideoFilteredSuccessRate)
+	require.NotNil(t, defaultGroup.Summary.VideoFilteredSuccessRate.Rate)
+	assert.Equal(t, float64(50), *defaultGroup.Summary.VideoFilteredSuccessRate.Rate)
+	assert.Equal(t, defaultGroup.Summary.VideoFilteredSuccessRate, defaultGroup.Groups[0].VideoFilteredSuccessRate)
+
+	summary, err := QuerySummaryAll(24, params.Groups)
+	require.NoError(t, err)
+	assert.Equal(t, result.VideoErrorExclusions, summary.VideoErrorExclusions)
+	models := make(map[string]ModelSummary, len(summary.Models))
+	for _, entry := range summary.Models {
+		models[entry.ModelName] = entry
+	}
+	assert.Equal(t, filtered, models["mixed-video"].VideoFilteredSuccessRate)
+	allExcluded := models["failed-video"].VideoFilteredSuccessRate
+	require.NotNil(t, allExcluded)
+	assert.Equal(t, int64(1), allExcluded.ExcludedCount)
+	assert.Zero(t, allExcluded.SampleCount)
+	assert.Nil(t, allExcluded.Rate)
+	old := models["old-video"].VideoFilteredSuccessRate
+	require.NotNil(t, old)
+	assert.Zero(t, old.ExcludedCount, "matching only a case-insensitive task ID cannot exclude the observation")
+	encoded, err := common.Marshal(summary)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "provider-only-detail")
+	assert.Contains(t, string(encoded), `"rate":null`)
+
+	require.NoError(t, model.UpdateOption(key, "CodeX100Z"))
+	params.Group = ""
+	updated, err := Query(params)
+	require.NoError(t, err)
+	require.NotNil(t, updated.Summary.VideoFilteredSuccessRate)
+	assert.Equal(t, int64(1), updated.Summary.VideoFilteredSuccessRate.ExcludedCount, "rule edits apply to existing observations")
+	require.NoError(t, model.UpdateOption(key, ""))
+	cleared, err := Query(params)
+	require.NoError(t, err)
+	assert.Empty(t, cleared.VideoErrorExclusions)
+	assert.Equal(t, raw.Summary, cleared.Summary)
+}

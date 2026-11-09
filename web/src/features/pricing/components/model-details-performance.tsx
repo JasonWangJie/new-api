@@ -217,6 +217,16 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
       cell: (perf) => <PerformanceSampleContext stats={perf} />,
     },
   ]
+  if (groups.some((group) => group.video_filtered_success_rate)) {
+    columns.splice(3, 0, {
+      id: 'filtered-video-success',
+      header: t('Filtered success rate'),
+      className: tableStyles.compactHeaderCellRight,
+      cellClassName: tableStyles.compactNumericCell,
+      cell: (perf) =>
+        formatUptimePct(perf.video_filtered_success_rate?.rate ?? Number.NaN),
+    })
+  }
   if (!media) {
     columns.splice(
       1,
@@ -245,6 +255,7 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
         mediaModel={isMediaModel(props.model)}
         windowHours={metricsQuery.data?.data.window_hours}
         updatedAt={metricsQuery.data?.data.updated_at}
+        videoErrorExclusions={metricsQuery.data?.data.video_error_exclusions}
       />
       <section>
         <SectionHeader icon={HeartPulse} title={t('Per-group performance')} />

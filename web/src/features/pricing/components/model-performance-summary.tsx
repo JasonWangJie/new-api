@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 import { HeartPulse, Timer } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { LearnMore } from '@/components/learn-more'
+import { PopoverTitle } from '@/components/ui/popover'
 import {
   formatLatency,
   formatThroughput,
@@ -26,9 +28,56 @@ import {
   getSuccessRateTextClass,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
-import type { PerformanceStats } from '@/features/performance-metrics/types'
+import type {
+  FilteredVideoSuccessRate,
+  PerformanceStats,
+} from '@/features/performance-metrics/types'
 import { toIntlLocale } from '@/i18n/languages'
 import { cn } from '@/lib/utils'
+
+export function FilteredVideoSuccessRateHelp(props: {
+  stats: FilteredVideoSuccessRate
+  exclusions?: readonly string[]
+}) {
+  const { t } = useTranslation()
+  if (!props.exclusions?.length) return null
+
+  return (
+    <LearnMore
+      triggerProps={{
+        'aria-label': t('Show excluded video errors'),
+        className: 'shrink-0 rounded-full',
+      }}
+      contentProps={{
+        className:
+          'max-h-[min(24rem,60dvh)] w-80 max-w-[calc(100vw-1.5rem)] overflow-y-auto overscroll-contain p-3',
+      }}
+    >
+      <PopoverTitle className='text-foreground'>
+        {t('Filtered success rate')}
+      </PopoverTitle>
+      <p className='text-xs'>
+        {t(
+          'Successful video tasks divided by terminal video tasks after excluding matching failures. Unknown outcomes are included.'
+        )}
+      </p>
+      <dl className='grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 text-xs tabular-nums'>
+        <dt>{t('Samples')}</dt>
+        <dd>{props.stats.sample_count}</dd>
+        <dt>{t('Excluded failures')}</dt>
+        <dd>{props.stats.excluded_count}</dd>
+      </dl>
+      <p className='text-foreground text-xs font-medium'>
+        {t('Error phrases excluded from this rate')}
+      </p>
+      <ul className='list-disc space-y-1 ps-4 text-xs [overflow-wrap:anywhere]'>
+        {props.exclusions.map((phrase) => (
+          <li key={phrase}>{phrase}</li>
+        ))}
+      </ul>
+    </LearnMore>
+  )
+}
 
 export function PerformanceSampleContext(props: {
   stats?: PerformanceStats
@@ -83,15 +132,23 @@ export function ModelPerformanceSummary(props: {
   windowHours?: number
   updatedAt?: number
   mediaModel?: boolean
+  videoErrorExclusions?: readonly string[]
 }) {
   const { t } = useTranslation()
   const stats = props.stats
   const hasSamples = stats != null && stats.request_count !== 0
-  const media = isTaskPerformance(stats) || props.mediaModel
+  const filtered = stats?.video_filtered_success_rate
+  const media = isTaskPerformance(stats) || props.mediaModel || filtered != null
   const deliveredMedia =
     stats?.workload === 'image' || stats?.workload === 'video'
   const successRate = hasSamples ? stats.success_rate : Number.NaN
-  const metrics = [
+  const metrics: {
+    icon: typeof Timer
+    label: string
+    value: string
+    valueClassName?: string
+    help?: React.ReactNode
+  }[] = [
     {
       icon: Timer,
       label: deliveredMedia ? t('Average delivery time') : t('Average latency'),
@@ -106,6 +163,21 @@ export function ModelPerformanceSummary(props: {
       valueClassName: getSuccessRateTextClass(successRate),
     },
   ]
+  if (filtered) {
+    const rate = filtered.rate ?? Number.NaN
+    metrics.push({
+      icon: HeartPulse,
+      label: t('Filtered success rate'),
+      value: formatUptimePct(rate),
+      valueClassName: getSuccessRateTextClass(rate),
+      help: (
+        <FilteredVideoSuccessRateHelp
+          stats={filtered}
+          exclusions={props.videoErrorExclusions}
+        />
+      ),
+    })
+  }
   if (!media) {
     metrics.unshift({
       icon: Timer,
@@ -118,7 +190,7 @@ export function ModelPerformanceSummary(props: {
       <dl
         className={cn(
           'grid overflow-hidden rounded-lg',
-          media ? 'sm:grid-cols-2' : 'sm:grid-cols-3',
+          media && !filtered ? 'sm:grid-cols-2' : 'sm:grid-cols-3',
           props.compact ? 'bg-muted/20 border sm:divide-x' : 'gap-2'
         )}
       >
@@ -132,7 +204,10 @@ export function ModelPerformanceSummary(props: {
           >
             <dt className='text-muted-foreground flex items-center gap-1.5 text-[10px] font-medium tracking-wider uppercase'>
               <metric.icon aria-hidden className='size-3 shrink-0' />
-              {metric.label}
+              <span className='min-w-0 [overflow-wrap:anywhere]'>
+                {metric.label}
+              </span>
+              {metric.help}
             </dt>
             <dd
               className={cn(

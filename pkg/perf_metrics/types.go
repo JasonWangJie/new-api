@@ -40,6 +40,16 @@ type MetricStats struct {
 	TotalLatencyMs int64   `json:"total_latency_ms"`
 	OutputCount    int64   `json:"output_count"`
 	Workload       string  `json:"workload"`
+
+	VideoFilteredSuccessRate *VideoFilteredSuccessRate `json:"video_filtered_success_rate,omitempty"`
+}
+
+// VideoFilteredSuccessRate counts async video terminal outcomes only. The rate
+// is null when all such samples were excluded.
+type VideoFilteredSuccessRate struct {
+	Rate          *float64 `json:"rate"`
+	ExcludedCount int64    `json:"excluded_count"`
+	SampleCount   int64    `json:"sample_count"`
 }
 
 type BucketPoint struct {
@@ -60,6 +70,8 @@ type QueryResult struct {
 	Summary      MetricStats   `json:"summary"`
 	WindowHours  int           `json:"window_hours"`
 	UpdatedAt    int64         `json:"updated_at"`
+
+	VideoErrorExclusions []string `json:"video_error_exclusions,omitempty"`
 }
 
 type SuccessRatePoint struct {
@@ -77,6 +89,8 @@ type SummaryAllResult struct {
 	Models      []ModelSummary `json:"models"`
 	WindowHours int            `json:"window_hours"`
 	UpdatedAt   int64          `json:"updated_at"`
+
+	VideoErrorExclusions []string `json:"video_error_exclusions,omitempty"`
 }
 
 type bucketKey struct {
@@ -97,6 +111,10 @@ type counters struct {
 	latencyCount   int64
 	outputCount    int64
 	workloads      uint8
+
+	videoRequestCount  int64
+	videoSuccessCount  int64
+	videoExcludedCount int64
 }
 
 const (
@@ -117,6 +135,9 @@ func (c *counters) add(value counters) {
 	c.generationMs += value.generationMs
 	c.outputCount += value.outputCount
 	c.workloads |= value.workloads
+	c.videoRequestCount += value.videoRequestCount
+	c.videoSuccessCount += value.videoSuccessCount
+	c.videoExcludedCount += value.videoExcludedCount
 }
 
 func (c counters) stats() MetricStats {
@@ -129,7 +150,7 @@ func (c counters) stats() MetricStats {
 	case videoWorkload:
 		workload = "video"
 	}
-	return MetricStats{
+	stats := MetricStats{
 		AvgTtftMs:    avg(c.ttftSumMs, c.ttftCount),
 		AvgLatencyMs: avg(c.totalLatencyMs, c.latencyCount),
 		SuccessRate:  successRate(c), AvgTps: avgTps(c),
@@ -139,6 +160,18 @@ func (c counters) stats() MetricStats {
 		TotalLatencyMs: c.totalLatencyMs, OutputCount: c.outputCount,
 		Workload: workload,
 	}
+	if c.videoRequestCount > 0 {
+		filtered := &VideoFilteredSuccessRate{
+			ExcludedCount: c.videoExcludedCount,
+			SampleCount:   c.videoRequestCount - c.videoExcludedCount,
+		}
+		if filtered.SampleCount > 0 {
+			rate := float64(c.videoSuccessCount) / float64(filtered.SampleCount) * 100
+			filtered.Rate = &rate
+		}
+		stats.VideoFilteredSuccessRate = filtered
+	}
+	return stats
 }
 
 type atomicBucket struct {

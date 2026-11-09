@@ -80,11 +80,22 @@ it.each(['overview', 'performance'])(
       success: true,
       data: {
         model_name: model.model_name,
-        groups,
+        groups: [
+          {
+            ...groups[0],
+            video_filtered_success_rate: {
+              rate: 100,
+              excluded_count: 0,
+              sample_count: 1,
+            },
+          },
+          groups[1],
+        ],
+        video_error_exclusions: ['Reference file unavailable'],
         window_hours: 24,
         updated_at: 1794096000,
         summary: {
-          workload: 'image',
+          workload: 'video',
           request_count: 100,
           success_count: 1,
           unknown_count: 2,
@@ -93,6 +104,11 @@ it.each(['overview', 'performance'])(
           avg_latency_ms: 120000,
           avg_tps: 0,
           success_rate: 1,
+          video_filtered_success_rate: {
+            rate: 1.02,
+            excluded_count: 2,
+            sample_count: 98,
+          },
         },
       },
     })
@@ -116,6 +132,12 @@ it.each(['overview', 'performance'])(
     )
     const summary = screen.getByLabelText('Model performance summary')
     expect(within(summary).getByText('1.00%')).toBeVisible()
+    expect(within(summary).getByText('1.02%')).toBeVisible()
+    expect(
+      within(summary).getByRole('button', {
+        name: 'Show excluded video errors',
+      })
+    ).toBeVisible()
     expect(within(summary).queryByText('3 images')).not.toBeInTheDocument()
     expect(within(summary).getByText('100 samples')).toBeVisible()
     expect(within(summary).getByText('2 unknown')).toBeVisible()
@@ -127,6 +149,30 @@ it.each(['overview', 'performance'])(
     ).not.toBeInTheDocument()
   }
 )
+
+it('shows an unavailable filtered rate when all video observations are excluded', () => {
+  render(
+    <ModelPerformanceSummary
+      videoErrorExclusions={['Reference file unavailable']}
+      stats={{
+        workload: 'video',
+        request_count: 3,
+        avg_latency_ms: 0,
+        avg_tps: 0,
+        success_rate: 0,
+        video_filtered_success_rate: {
+          rate: null,
+          excluded_count: 3,
+          sample_count: 0,
+        },
+      }}
+    />
+  )
+  const summary = screen.getByLabelText('Model performance summary')
+  expect(within(summary).getByText('0.00%')).toBeVisible()
+  expect(within(summary).getByText('Filtered success rate')).toBeVisible()
+  expect(within(summary).getAllByText('—')).toHaveLength(2)
+})
 
 it('keeps media labels without inventing overall metrics when an older response has multiple groups without a model summary', () => {
   client.setQueryData(['perf-metrics', model.model_name], {
