@@ -323,6 +323,17 @@ func executeAsyncImage(ctx context.Context, task model.AsyncImageTask, request s
 		referenceCfg.DownloadMaxBytes = min(referenceCfg.DownloadMaxBytes, *channelLimit)
 	}
 	if request.Platform == "openai" {
+		if channel.Type == constant.ChannelTypeOpenAI {
+			baseURL, err := url.Parse(channel.GetBaseURL())
+			if err == nil && strings.EqualFold(baseURL.Hostname(), "api.openai.com") {
+				// OpenAI Images takes the normalized size. Keep the gateway
+				// dimensions on the task for billing, templates, and retries.
+				request.Native = maps.Clone(request.Native)
+				delete(request.Native, "aspect_ratio")
+				delete(request.Native, "ratio")
+				delete(request.Native, "resolution")
+			}
+		}
 		var images []map[string]string
 		mode := service.ImageChannelReferenceTransport(*channel, request.Platform, task.ReferenceRetryCount, cfg)
 		referenceIndex := 0

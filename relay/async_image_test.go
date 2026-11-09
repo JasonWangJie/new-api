@@ -14,6 +14,7 @@ import (
 	"io"
 	"maps"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2234,6 +2235,9 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		statusMapping              string
 		fileFormat                 string
 		passThrough                bool
+		geometry                   bool
+		official                   bool
+		defaultBaseURL             bool
 		volcengine                 bool
 		xai                        bool
 		newapi                     bool
@@ -2252,6 +2256,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 		{name: "gif_multipart_passthrough", path: "/v1/images/edits_async", fileFormat: "png", passThrough: true, imageModel: "gpt-image-2.6-sunburst", imageFields: map[string]any{"output_format": "gif"}, expectedImageFields: map[string]string{"output_format": `"gif"`, "frame_count": "9", "frame_duration_ms": "200"}},
 		{name: "svg_json_passthrough", path: "/v1/images/edits_async", referenceField: "images", passThrough: true, imageModel: "gpt-image-2.6-flare", imageFields: map[string]any{"output_format": "svg"}, expectedImageFields: map[string]string{"output_format": `"svg"`}},
 		{name: "png_legacy_default", path: "/v1/images/generations_oa", referenceField: "images", imageModel: "gpt-image-2.6-sunburst", expectedImageFields: map[string]string{"output_format": `"png"`}},
+		{name: "official_json_edit_geometry", path: "/v1/images/generations_async", referenceField: "images", geometry: true, official: true},
+		{name: "official_multipart_edit_geometry", path: "/v1/images/edits_async", fileFormat: "png", geometry: true, official: true, defaultBaseURL: true},
+		{name: "compatible_json_edit_geometry", path: "/v1/images/generations_async", referenceField: "images", geometry: true},
+		{name: "compatible_multipart_edit_geometry", path: "/v1/images/edits_async", fileFormat: "png", geometry: true},
 		{name: "volcengine_edits_json", path: "/v1/images/edits_async", referenceField: "image", volcengine: true},
 		{name: "volcengine_edits_json_passthrough", path: "/v1/images/edits_async", referenceField: "image", volcengine: true, passThrough: true},
 		{name: "volcengine_edits_uploaded_reference", path: "/v1/images/edits_async", fileFormat: "png", volcengine: true},
@@ -2354,7 +2362,7 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			if tc.unreadableResponse {
 				responseBody = []byte(`{"data":[`)
 			}
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, readErr := io.ReadAll(r.Body)
 				if !assert.NoError(t, readErr) {
 					w.WriteHeader(http.StatusBadRequest)
@@ -2367,14 +2375,41 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				w.WriteHeader(responseStatus)
 				_, _ = w.Write(responseBody)
 			}))
+			if tc.official {
+				upstream.StartTLS()
+				address := upstream.Listener.Addr().(*net.TCPAddr)
+				transport := upstream.Client().Transport.(*http.Transport).Clone()
+				transport.Proxy = nil
+				transport.TLSClientConfig.ServerName = address.IP.String()
+				transport.DialContext = func(ctx context.Context, network, target string) (net.Conn, error) {
+					assert.Equal(t, "api.openai.com:443", target)
+					return new(net.Dialer).DialContext(ctx, network, address.String())
+				}
+				client := service.GetHttpClient()
+				originalTransport := client.Transport
+				client.Transport = transport
+				t.Cleanup(func() {
+					client.Transport = originalTransport
+					transport.CloseIdleConnections()
+				})
+			} else {
+				upstream.Start()
+			}
 			defer upstream.Close()
+			baseURL := upstream.URL
+			if tc.official {
+				baseURL = "https://api.openai.com"
+				if tc.defaultBaseURL {
+					baseURL = ""
+				}
+			}
 			mapping := `{"image-alias":"gpt-image-2"}`
 			parameters := `{"quality":"low","vendor_override":true}`
 			if tc.parameterOverride != "" {
 				parameters = tc.parameterOverride
 			}
 			headers := `{"X-Image-Probe":"synthetic"}`
-			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &upstream.URL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
+			channel := &model.Channel{Id: 1, Key: "synthetic-upstream-key", BaseURL: &baseURL, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping, ParamOverride: &parameters, HeaderOverride: &headers}
 			if tc.newapi {
 				channel.Type = constant.ChannelTypeNewAPI
 			}
@@ -2423,6 +2458,13 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			if tc.resolution == "2K" {
 				body["size"] = "2048x2048"
+			}
+			geometry := map[string]string{"resolution": "2K", "aspect_ratio": "16:9", "ratio": "16:9"}
+			if tc.geometry {
+				delete(body, "size")
+				for field, value := range geometry {
+					body[field] = value
+				}
 			}
 			if tc.xai {
 				delete(body, "mask")
@@ -2482,6 +2524,10 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 			}
 			request, err := service.ParseAsyncImageRequest(raw, contentType, tc.path, cfg)
 			require.NoError(t, err)
+			if tc.geometry {
+				require.Equal(t, "2048x1152", request.Size)
+				body["size"] = "2048x1152"
+			}
 			request.Billing = &service.MediaBillingSnapshot{Price: types.PriceData{UsePrice: true, ModelPrice: 0.01, QuotaToPreConsume: 5000, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
 			persisted, err := common.Marshal(request)
 			require.NoError(t, err)
@@ -2626,8 +2672,17 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				}
 				assert.Equal(t, expectedModel, replayed.PostForm.Get("model"))
 				assert.Equal(t, "draw a river", replayed.PostForm.Get("prompt"))
-				for field, value := range map[string]string{"n": "1", "size": "1024x1024", "response_format": "b64_json", "watermark": "false", "seed": "0", "custom_toggle": "false"} {
+				for field, value := range map[string]string{"n": "1", "size": body["size"].(string), "response_format": "b64_json", "watermark": "false", "seed": "0", "custom_toggle": "false"} {
 					assert.Equal(t, value, replayed.PostForm.Get(field), "multipart field %s must survive persistence and relay conversion", field)
+				}
+				if tc.geometry {
+					for field, value := range geometry {
+						if tc.official {
+							assert.NotContains(t, replayed.PostForm, field)
+						} else {
+							assert.Equal(t, value, replayed.PostForm.Get(field))
+						}
+					}
 				}
 				assert.JSONEq(t, `{"strength":0,"enabled":false}`, replayed.PostForm.Get("vendor_options"))
 				for _, file := range []struct {
@@ -2681,6 +2736,15 @@ func TestOpenAIAsyncImageOutboundParameters(t *testing.T) {
 				encoded, err := common.Marshal(body[key])
 				require.NoError(t, err)
 				assert.JSONEq(t, string(encoded), string(outbound[key]), "field %s must survive persistence and relay conversion", key)
+			}
+			if tc.geometry {
+				for field, value := range geometry {
+					if tc.official {
+						assert.NotContains(t, outbound, field)
+					} else {
+						assert.JSONEq(t, strconv.Quote(value), string(outbound[field]))
+					}
+				}
 			}
 			var images []struct {
 				URL string `json:"image_url"`

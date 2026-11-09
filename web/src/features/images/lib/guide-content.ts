@@ -91,6 +91,9 @@ export function asyncImageGuide(
         t(
           'For JSON, image is a reference URL or Data URI; image_urls is an array. For local files, use multipart image=@reference.png and let curl set the boundary. Reference count, masks and geometry must be supported by the selected model.'
         ),
+        t(
+          'For the official OpenAI Images API, the gateway converts the requested dimensions to size. Supported pixel dimensions depend on the selected model.'
+        ),
       ],
       parameters: [
         [

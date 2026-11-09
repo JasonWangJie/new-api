@@ -3002,6 +3002,7 @@
     "For security, existing access tokens cannot be displayed. Regenerate only when you need a new token.": "基於安全考量，現有存取令牌無法再次顯示。僅在需要新令牌時重新生成。",
     "For seedance2.5-F, reference_images is an array of public HTTPS URL strings. Images guide the content but are not pinned first frames. New E models use this ordinary-reference form too; seedance2.0-F requires 720px instead of 720p.": "seedance2.5-F 的 reference_images 是公開 HTTPS URL 字串陣列。圖片用於內容參考，不固定為首幀。新 E 也使用此一般參考寫法；seedance2.0-F 的解析度必須是 720px，不能填 720p。",
     "For the new asynchronous routes, keep task_id and query_url, query with the same API token, and read data[].url after completion. Output format does not change the task receipt or query flow.": "新非同步入口需儲存 task_id 和 query_url，使用同一 API Token 查詢，完成後讀取 data[].url。輸出格式不改變受理回應或查詢流程。",
+    "For the official OpenAI Images API, the gateway converts the requested dimensions to size. Supported pixel dimensions depend on the selected model.": "使用 OpenAI 官方圖像 API 時，閘道會將要求的尺寸轉換為 size。可用的像素尺寸取決於所選模型。",
     "For this channel, map the model name in client requests to the model name sent upstream.": "將用戶端請求中的模型名稱替換為此渠道對應的上游模型名稱。",
     "For this website, you can enter: {{domain}}": "目前網站通常填寫：{{domain}}",
     "For this xAI form, image contains JSON object text. There is no @ before the URL and no file is uploaded. Do not replace a Sora file part with this field or use it with a JSON-only model.": "此 xAI 寫法中，image 欄位內容是 JSON 物件文字。URL 前不加 @，也不會上傳檔案。不能用它替換 Sora 檔案 part，或套用到僅接受 JSON 的型號。",
