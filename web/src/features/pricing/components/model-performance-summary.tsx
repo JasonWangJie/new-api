@@ -21,7 +21,7 @@ import { useTranslation } from 'react-i18next'
 
 import {
   formatLatency,
-  formatPerformanceOutput,
+  formatThroughput,
   formatUptimePct,
   getSuccessRateTextClass,
   isTaskPerformance,
@@ -94,11 +94,6 @@ export function ModelPerformanceSummary(props: {
   const metrics = [
     {
       icon: Timer,
-      label: media ? t('Completed (24h)') : 'TPS',
-      value: hasSamples ? formatPerformanceOutput(stats, t) : '—',
-    },
-    {
-      icon: Timer,
       label: deliveredMedia ? t('Average delivery time') : t('Average latency'),
       value: hasSamples
         ? formatLatency(stats.avg_latency_ms, stats.latency_count)
@@ -111,11 +106,19 @@ export function ModelPerformanceSummary(props: {
       valueClassName: getSuccessRateTextClass(successRate),
     },
   ]
+  if (!media) {
+    metrics.unshift({
+      icon: Timer,
+      label: 'TPS',
+      value: hasSamples ? formatThroughput(stats.avg_tps) : '—',
+    })
+  }
   return (
     <div aria-label={t('Model performance summary')} className='space-y-2'>
       <dl
         className={cn(
-          'grid overflow-hidden rounded-lg sm:grid-cols-3',
+          'grid overflow-hidden rounded-lg',
+          media ? 'sm:grid-cols-2' : 'sm:grid-cols-3',
           props.compact ? 'bg-muted/20 border sm:divide-x' : 'gap-2'
         )}
       >

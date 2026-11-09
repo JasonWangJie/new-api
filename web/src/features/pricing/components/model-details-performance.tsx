@@ -33,7 +33,7 @@ import { LoadingState } from '@/components/loading-state'
 import { getPerfMetrics } from '@/features/performance-metrics/api'
 import {
   formatLatency,
-  formatPerformanceOutput,
+  formatThroughput,
   formatUptimePct,
   getPerformanceSummary,
   isTaskPerformance,
@@ -182,17 +182,6 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
       cell: (perf) => <GroupBadge group={perf.group} size='sm' />,
     },
     {
-      id: 'output',
-      header: media ? t('Completed (24h)') : 'TPS',
-      className: tableStyles.compactHeaderCellRight,
-      cellClassName: tableStyles.compactNumericCell,
-      cell: (perf) =>
-        formatPerformanceOutput(
-          mixed ? { ...perf, workload: 'mixed' } : perf,
-          t
-        ),
-    },
-    {
       id: 'latency',
       header: latencyLabel,
       className: tableStyles.compactHeaderCellRight,
@@ -229,13 +218,24 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
     },
   ]
   if (!media) {
-    columns.splice(2, 0, {
-      id: 'ttft',
-      header: t('Average TTFT'),
-      className: tableStyles.compactHeaderCellRight,
-      cellClassName: tableStyles.compactNumericCell,
-      cell: (perf) => formatLatency(perf.avg_ttft_ms),
-    })
+    columns.splice(
+      1,
+      0,
+      {
+        id: 'output',
+        header: 'TPS',
+        className: tableStyles.compactHeaderCellRight,
+        cellClassName: tableStyles.compactNumericCell,
+        cell: (perf) => formatThroughput(perf.avg_tps),
+      },
+      {
+        id: 'ttft',
+        header: t('Average TTFT'),
+        className: tableStyles.compactHeaderCellRight,
+        cellClassName: tableStyles.compactNumericCell,
+        cell: (perf) => formatLatency(perf.avg_ttft_ms),
+      }
+    )
   }
 
   return (

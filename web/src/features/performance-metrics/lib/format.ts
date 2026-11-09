@@ -16,34 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { TFunction } from 'i18next'
-
 import type { PerformanceMetricsData, PerformanceStats } from '../types'
 
 export function isTaskPerformance(stats?: PerformanceStats): boolean {
   return stats?.workload != null && stats.workload !== 'relay'
-}
-
-export function formatPerformanceOutput(
-  stats: PerformanceStats | undefined,
-  t: TFunction
-): string {
-  if (!isTaskPerformance(stats)) return formatThroughput(stats?.avg_tps ?? 0)
-  const count =
-    stats?.workload === 'mixed' ? stats.success_count : stats?.output_count
-  if (count == null || !Number.isFinite(count) || count < 0) return '—'
-  if (stats?.workload === 'image') {
-    return count === 1
-      ? t('{{count}} image', { count })
-      : t('{{count}} images', { count })
-  }
-  if (stats?.workload === 'video') {
-    return count === 1
-      ? t('{{count}} video', { count })
-      : t('{{count}} videos', { count })
-  }
-  if (count === 1) return t('{{count}} successful request', { count })
-  return t('{{count}} successful requests', { count })
 }
 
 export function getPerformanceSummary(

@@ -16,6 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
@@ -24,6 +31,8 @@ import {
   PricingToolbar,
   type PricingToolbarProps,
 } from '../components/pricing-toolbar'
+import { useFilters } from '../hooks/use-filters'
+import type { PricingModel } from '../types'
 
 function toolbarProps(): PricingToolbarProps {
   return {
@@ -56,6 +65,94 @@ function toolbarProps(): PricingToolbarProps {
     activeFilterCount: 0,
     onClearFilters: vi.fn(),
   }
+}
+
+const modelOrderFixtures = [
+  { model_name: 'gpt-5', supported_endpoint_types: ['openai'] },
+  {
+    model_name: 'sora-2',
+    vendor_name: 'OpenAI',
+    supported_endpoint_types: ['openai-video', 'openai'],
+  },
+  {
+    model_name: 'seedream-5-pro',
+    supported_endpoint_types: ['image-generation'],
+  },
+  {
+    model_name: 'gemini-nano-banana-2.1',
+    supported_endpoint_types: ['openai'],
+  },
+  { model_name: 'gpt-image-2', supported_endpoint_types: ['image-generation'] },
+  { model_name: 'claude-sonnet', supported_endpoint_types: ['openai'] },
+  {
+    model_name: 'gemini-3-pro-image-preview',
+    supported_endpoint_types: ['gemini'],
+  },
+  {
+    model_name: 'codex-auto-review',
+    supported_endpoint_types: ['openai-response'],
+  },
+  { model_name: 'dall-e-3', supported_endpoint_types: ['image-generation'] },
+  {
+    model_name: 'doubao-seedream-4-5',
+    supported_endpoint_types: ['image-generation'],
+  },
+  {
+    model_name: 'o3',
+    vendor_name: 'OpenAI',
+    supported_endpoint_types: ['openai'],
+  },
+].map(
+  (model, index): PricingModel => ({
+    id: index + 1,
+    quota_type: 1,
+    model_price: index + 1,
+    model_ratio: 0,
+    completion_ratio: 0,
+    enable_groups: ['default'],
+    ...model,
+  })
+)
+
+function ModelSortFixture() {
+  const { filteredModels, sortBy, setSortBy } = useFilters(modelOrderFixtures)
+
+  return (
+    <>
+      <PricingToolbar
+        {...toolbarProps()}
+        sortBy={sortBy}
+        onSortChange={setSortBy}
+      />
+      <ol aria-label='Models'>
+        {filteredModels.map((model) => (
+          <li key={model.id}>{model.model_name}</li>
+        ))}
+      </ol>
+    </>
+  )
+}
+
+async function renderModelSorting(initialUrl = '/pricing/') {
+  vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
+  const root = createRootRoute()
+  const pricing = createRoute({ getParentRoute: () => root, path: 'pricing' })
+  const index = createRoute({
+    getParentRoute: () => pricing,
+    path: '/',
+    component: ModelSortFixture,
+  })
+  const router = createRouter({
+    routeTree: root.addChildren([pricing.addChildren([index])]),
+    history: createMemoryHistory({ initialEntries: [initialUrl] }),
+  })
+  await router.load()
+  render(<RouterProvider router={router} />)
+  const list = await screen.findByRole('list', { name: 'Models' })
+  return () =>
+    within(list)
+      .getAllByRole('listitem')
+      .map((row) => row.textContent)
 }
 
 describe('pricing controls', () => {
@@ -106,15 +203,37 @@ describe('pricing controls', () => {
     )
   })
 
-  it('selects price sorting from the shared dropdown', async () => {
-    const props = toolbarProps()
+  it('defaults to the recommended model order and orders each family by name', async () => {
+    const modelNames = await renderModelSorting()
+    expect(modelNames()).toEqual([
+      'gemini-3-pro-image-preview',
+      'gemini-nano-banana-2.1',
+      'dall-e-3',
+      'gpt-image-2',
+      'doubao-seedream-4-5',
+      'seedream-5-pro',
+      'claude-sonnet',
+      'sora-2',
+      'codex-auto-review',
+      'gpt-5',
+      'o3',
+    ])
+  })
+
+  it('honors an explicit name sort and switches to price sorting from the dropdown', async () => {
+    const modelNames = await renderModelSorting('/pricing/?sort=name')
+    expect(modelNames()[0]).toBe('claude-sonnet')
     const user = userEvent.setup()
-    render(<PricingToolbar {...props} />)
     await user.click(screen.getByRole('button', { name: 'Name' }))
     await user.click(
       screen.getByRole('menuitem', { name: 'Price: Low to High' })
     )
-    expect(props.onSortChange).toHaveBeenCalledWith('price-low')
+    expect(modelNames()).toEqual(
+      modelOrderFixtures.map((model) => model.model_name)
+    )
+    await user.click(screen.getByRole('button', { name: 'Price: Low to High' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Name' }))
+    expect(modelNames()[0]).toBe('claude-sonnet')
   })
 
   it('opens mobile filters from the left, selects a group, and restores focus on close', async () => {

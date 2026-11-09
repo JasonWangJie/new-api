@@ -22,7 +22,7 @@ import { useTranslation } from 'react-i18next'
 import { LoadingState } from '@/components/loading-state'
 import {
   formatLatency,
-  formatPerformanceOutput,
+  formatThroughput,
   getSuccessRateDotClass,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
@@ -58,7 +58,7 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
     ? formatLatency(props.perf?.avg_latency_ms ?? 0, props.perf?.latency_count)
     : '—'
   const throughputText = (
-    hasSamples ? formatPerformanceOutput(props.perf, t) : '—'
+    hasSamples ? formatThroughput(props.perf?.avg_tps ?? 0) : '—'
   ).replace(' t/s', 't/s')
   const successRate = props.perf?.success_rate
   const hasSuccessRate =
@@ -160,17 +160,16 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
               {latencyText === '—' ? '—s' : latencyText}
             </dd>
           </div>
-          <div
-            title={media ? t('Completed (24h)') : t('Throughput')}
-            className='max-w-full shrink-0'
-          >
-            <dt className='text-muted-foreground text-[11px] leading-4'>
-              {media ? t('Completed (24h)') : t('Throughput short')}
-            </dt>
-            <dd className='mt-1 font-mono whitespace-nowrap'>
-              {throughputText === '—' && !media ? '—t/s' : throughputText}
-            </dd>
-          </div>
+          {!media && (
+            <div title={t('Throughput')} className='max-w-full shrink-0'>
+              <dt className='text-muted-foreground text-[11px] leading-4'>
+                {t('Throughput short')}
+              </dt>
+              <dd className='mt-1 font-mono whitespace-nowrap'>
+                {throughputText === '—' ? '—t/s' : throughputText}
+              </dd>
+            </div>
+          )}
         </dl>
         {props.children}
       </div>

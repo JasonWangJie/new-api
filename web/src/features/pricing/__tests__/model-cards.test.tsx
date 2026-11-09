@@ -506,14 +506,13 @@ describe('model cards', () => {
   it.each([
     { workload: 'image' as const, output_count: 6, expected: '6 images' },
     { workload: 'video' as const, output_count: 3, expected: '3 videos' },
-    { workload: 'video' as const, output_count: 1, expected: '1 video' },
     {
       workload: 'mixed' as const,
       output_count: 6,
       expected: '3 successful requests',
     },
   ])(
-    'shows $workload completion counts and sample context instead of token throughput',
+    'keeps $workload latency and sample context without a completion or throughput metric',
     (entry) => {
       render(
         <ModelCard
@@ -534,20 +533,21 @@ describe('model cards', () => {
       const metrics = screen.getByLabelText(
         'Performance metrics for the last 24 hours'
       )
-      expect(within(metrics).getByText(entry.expected)).toBeVisible()
-      expect(within(metrics).getByText(entry.expected)).toHaveClass(
-        'whitespace-nowrap'
-      )
       expect(
-        within(metrics).getByText(entry.expected).closest('dl')
-      ).toHaveClass('flex-wrap', 'basis-60')
+        within(metrics).queryByText('Completed (24h)')
+      ).not.toBeInTheDocument()
+      expect(
+        within(metrics).queryByText(entry.expected)
+      ).not.toBeInTheDocument()
+      expect(within(metrics).getByText('120.00s')).toBeVisible()
+      expect(within(metrics).getByText('60.0%')).toBeVisible()
       expect(within(metrics).getByText('5 samples')).toBeVisible()
       expect(within(metrics).getByText('1 unknown result')).toBeVisible()
       expect(within(metrics).queryByText(/t\/s/)).not.toBeInTheDocument()
     }
   )
 
-  it('shows successful request counts for legacy media metrics without inventing image quantities or TPS', () => {
+  it('shows latency without a completion metric or TPS for legacy media', () => {
     render(
       <ModelCard
         model={pricingModel({ supported_endpoint_types: ['image-generation'] })}
@@ -566,12 +566,16 @@ describe('model cards', () => {
     const metrics = screen.getByLabelText(
       'Performance metrics for the last 24 hours'
     )
-    expect(within(metrics).getByText('3 successful requests')).toBeVisible()
-    expect(within(metrics).queryByText(/images|t\/s/)).not.toBeInTheDocument()
+    expect(within(metrics).getByText('1.20s')).toBeVisible()
+    expect(
+      within(metrics).queryByText(
+        /Completed \(24h\)|successful requests|images|t\/s/
+      )
+    ).not.toBeInTheDocument()
   })
 
   it.each([
-    { state: 'no observations', perf: undefined, expected: '—' },
+    { state: 'no observations', perf: undefined },
     {
       state: 'legacy relay observations',
       perf: {
@@ -583,10 +587,9 @@ describe('model cards', () => {
         success_count: 3,
         output_count: 0,
       },
-      expected: '3 successful requests',
     },
   ])(
-    'shows completion metrics for mixed video pricing with generic endpoints and $state',
+    'hides completion and TPS for mixed video pricing with generic endpoints and $state',
     (entry) => {
       render(
         <ModelCard
@@ -608,9 +611,11 @@ describe('model cards', () => {
       const metrics = screen.getByLabelText(
         'Performance metrics for the last 24 hours'
       )
-      expect(within(metrics).getByText('Completed (24h)')).toBeVisible()
-      expect(within(metrics).getByText(entry.expected)).toBeVisible()
-      expect(within(metrics).queryByText(/TPS|t\/s/)).not.toBeInTheDocument()
+      expect(
+        within(metrics).queryByText(
+          /Completed \(24h\)|successful requests|TPS|t\/s/
+        )
+      ).not.toBeInTheDocument()
     }
   )
 
@@ -632,7 +637,6 @@ describe('model cards', () => {
       />
     )
     expect(screen.getByText('<1s')).toBeVisible()
-    expect(screen.getByText('1 image')).toBeVisible()
     expect(screen.getByText('1 sample')).toBeVisible()
     expect(screen.getByTitle('Fewer than 20 samples')).toHaveTextContent(
       'Limited samples'

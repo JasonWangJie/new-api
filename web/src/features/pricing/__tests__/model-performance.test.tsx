@@ -116,11 +116,15 @@ it.each(['overview', 'performance'])(
     )
     const summary = screen.getByLabelText('Model performance summary')
     expect(within(summary).getByText('1.00%')).toBeVisible()
-    expect(within(summary).getByText('3 images')).toBeVisible()
+    expect(within(summary).queryByText('3 images')).not.toBeInTheDocument()
     expect(within(summary).getByText('100 samples')).toBeVisible()
     expect(within(summary).getByText('2 unknown')).toBeVisible()
     expect(within(summary).getByText('Average delivery time')).toBeVisible()
+    expect(within(summary).getByText('120.00s')).toBeVisible()
     expect(within(summary).queryByText('TPS')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('columnheader', { name: 'Completed (24h)' })
+    ).not.toBeInTheDocument()
   }
 )
 
@@ -138,8 +142,8 @@ it('keeps media labels without inventing overall metrics when an older response 
   )
   const summary = screen.getByLabelText('Model performance summary')
   expect(within(summary).queryByText('50.00%')).not.toBeInTheDocument()
-  expect(within(summary).getAllByText('—')).toHaveLength(3)
-  expect(within(summary).getByText('Completed (24h)')).toBeVisible()
+  expect(within(summary).getAllByText('—')).toHaveLength(2)
+  expect(within(summary).queryByText('Completed (24h)')).not.toBeInTheDocument()
   expect(within(summary).queryByText('TPS')).not.toBeInTheDocument()
 })
 
@@ -190,8 +194,8 @@ it('keeps media metric labels and neutral values when the model has zero samples
     />
   )
   const summary = screen.getByLabelText('Model performance summary')
-  expect(within(summary).getByText('Completed (24h)')).toBeVisible()
-  expect(within(summary).getAllByText('—')).toHaveLength(3)
+  expect(within(summary).queryByText('Completed (24h)')).not.toBeInTheDocument()
+  expect(within(summary).getAllByText('—')).toHaveLength(2)
   expect(within(summary).getByText('0 samples')).toBeVisible()
   expect(within(summary).queryByText('TPS')).not.toBeInTheDocument()
 })

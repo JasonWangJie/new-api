@@ -25,6 +25,7 @@ import {
 } from '../constants'
 import type { PricingModel } from '../types'
 import { hasTaskUsageSchema } from './dynamic-price'
+import { isMediaModel } from './model-performance'
 
 // ----------------------------------------------------------------------------
 // Filter Utilities
@@ -112,6 +113,40 @@ function getModelPrice(model: PricingModel): number {
   return model.quota_type === 0 ? model.model_ratio : model.model_price || 0
 }
 
+function getRecommendedModelRank(model: PricingModel): number {
+  const name = model.model_name.toLowerCase()
+  const endpoints = model.supported_endpoint_types
+  const isImage =
+    endpoints?.includes(ENDPOINT_TYPES.IMAGE_GENERATION) ||
+    model.output_modalities?.includes('image')
+  const isOpenAI = model.vendor_name?.toLowerCase() === 'openai'
+
+  // Gemini image models can use Gemini or chat endpoints, including Nano Banana aliases.
+  if (
+    /^nano-banana(?:-|$)/.test(name) ||
+    (name.startsWith('gemini-') &&
+      (isImage || /-(?:image|nano-banana)(?:-|$)/.test(name)))
+  ) {
+    return 0
+  }
+  if (/^(?:gpt-image|chatgpt-image|dall-e)(?:-|$)/.test(name)) return 1
+  if (/^(?:doubao-)?seedream(?:-|$)/.test(name)) return 2
+  if (isOpenAI && isImage) return 1
+
+  if (
+    (isOpenAI || /^(?:gpt-|chatgpt-|codex(?:-|$)|o[134](?:-|$))/.test(name)) &&
+    endpoints?.some(
+      (endpoint) =>
+        endpoint === ENDPOINT_TYPES.OPENAI ||
+        endpoint === ENDPOINT_TYPES.OPENAI_RESPONSE
+    ) &&
+    !isMediaModel(model)
+  ) {
+    return 4
+  }
+  return 3
+}
+
 /**
  * Sort models by specified option
  */
@@ -122,6 +157,13 @@ export function sortModels(
   const sorted = [...models]
 
   switch (sortBy) {
+    case SORT_OPTIONS.RECOMMENDED:
+      sorted.sort(
+        (a, b) =>
+          getRecommendedModelRank(a) - getRecommendedModelRank(b) ||
+          a.model_name.localeCompare(b.model_name)
+      )
+      break
     case SORT_OPTIONS.NAME:
       sorted.sort((a, b) =>
         (a.model_name || '').localeCompare(b.model_name || '')
@@ -190,7 +232,7 @@ export function extractAllTags(models: PricingModel[]): string[] {
     }
   })
 
-  return Array.from(tagSet).sort((a, b) => a.localeCompare(b))
+  return [...tagSet].sort((a, b) => a.localeCompare(b))
 }
 
 /**
