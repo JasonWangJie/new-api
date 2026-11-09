@@ -280,6 +280,7 @@ function OverviewSummaryGrid(props: { model: PricingModel }) {
       )}
       windowHours={metricsQuery.data?.data.window_hours}
       updatedAt={metricsQuery.data?.data.updated_at}
+      videoErrorExclusions={metricsQuery.data?.data.video_error_exclusions}
     />
   )
 }

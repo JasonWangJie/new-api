@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 
@@ -194,6 +195,12 @@ func UpdateOption(c *gin.Context) {
 	if model.IsModelPricingOption(option.Key) {
 		mixedVideoConfigurationMu.Lock()
 		defer mixedVideoConfigurationMu.Unlock()
+	}
+	if option.Key == perf_metrics_setting.VideoErrorExclusionsOptionKey {
+		if _, ok := option.Value.(string); !ok {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
 	}
 	switch option.Value.(type) {
 	case bool:

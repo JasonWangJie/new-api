@@ -61,6 +61,11 @@ export function useUpdateOption() {
         // Always refresh system-options
         queryClient.invalidateQueries({ queryKey: ['system-options'] })
 
+        if (variables.key === 'perf_metrics_setting.video_error_exclusions') {
+          queryClient.invalidateQueries({ queryKey: ['perf-metrics'] })
+          queryClient.invalidateQueries({ queryKey: ['perf-metrics-summary'] })
+        }
+
         // If updating frontend-display-related config, also refresh status
         if (STATUS_RELATED_KEYS.has(variables.key)) {
           queryClient.invalidateQueries({ queryKey: ['status'] })

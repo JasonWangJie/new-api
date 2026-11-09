@@ -42,6 +42,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 
 import {
   SettingsForm,
@@ -60,6 +61,39 @@ const numericString = z.string().refine((value) => {
   return !Number.isNaN(Number(trimmed)) && Number(trimmed) >= 0
 }, 'Enter a non-negative number or leave empty')
 
+function videoErrorKeywords(value: string): string[] {
+  const keywords = value
+    .split('\n')
+    // Match the server's Unicode whitespace trimming.
+    .map((line) => line.replaceAll(/^\p{White_Space}+|\p{White_Space}+$/gu, ''))
+    .filter(Boolean)
+  return [...new Set(keywords)]
+}
+
+const videoErrorExclusions = z.string().transform((value, ctx) => {
+  const keywords = videoErrorKeywords(value)
+  if (
+    new TextEncoder().encode(value).length > 16_384 ||
+    keywords.length > 40 ||
+    keywords.some((keyword) => [...keyword].length > 256)
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      message:
+        'Use up to 40 keywords of 256 characters each, with at most 16 KB in total.',
+    })
+    return z.NEVER
+  }
+  if (keywords.some((keyword) => /\p{Cc}/u.test(keyword))) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Keywords cannot contain control characters.',
+    })
+    return z.NEVER
+  }
+  return keywords.join('\n')
+})
+
 const monitoringSchema = z.object({
   QuotaRemindThreshold: numericString,
   perf_metrics_setting: z.object({
@@ -67,6 +101,7 @@ const monitoringSchema = z.object({
     flush_interval: z.coerce.number().min(1),
     bucket_time: z.enum(['minute', '5min', 'hour']),
     retention_days: z.coerce.number().min(0),
+    video_error_exclusions: videoErrorExclusions,
   }),
 })
 
@@ -79,6 +114,7 @@ type FlatMonitoringDefaults = {
   'perf_metrics_setting.flush_interval': number
   'perf_metrics_setting.bucket_time': 'minute' | '5min' | 'hour'
   'perf_metrics_setting.retention_days': number
+  'perf_metrics_setting.video_error_exclusions': string
 }
 
 type MonitoringSettingsSectionProps = {
@@ -94,6 +130,8 @@ const buildFormDefaults = (
     flush_interval: defaults['perf_metrics_setting.flush_interval'],
     bucket_time: defaults['perf_metrics_setting.bucket_time'],
     retention_days: defaults['perf_metrics_setting.retention_days'],
+    video_error_exclusions:
+      defaults['perf_metrics_setting.video_error_exclusions'] ?? '',
   },
 })
 
@@ -108,6 +146,9 @@ const normalizeDefaults = (
     defaults['perf_metrics_setting.bucket_time'],
   'perf_metrics_setting.retention_days':
     defaults['perf_metrics_setting.retention_days'],
+  'perf_metrics_setting.video_error_exclusions': videoErrorKeywords(
+    defaults['perf_metrics_setting.video_error_exclusions'] ?? ''
+  ).join('\n'),
 })
 
 const normalizeFormValues = (
@@ -120,6 +161,8 @@ const normalizeFormValues = (
   'perf_metrics_setting.bucket_time': values.perf_metrics_setting.bucket_time,
   'perf_metrics_setting.retention_days':
     values.perf_metrics_setting.retention_days,
+  'perf_metrics_setting.video_error_exclusions':
+    values.perf_metrics_setting.video_error_exclusions,
 })
 
 export function MonitoringSettingsSection({
@@ -313,6 +356,31 @@ export function MonitoringSettingsSection({
               )}
             />
           </div>
+          <FormField
+            control={form.control}
+            name='perf_metrics_setting.video_error_exclusions'
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('Async video error exclusions')}</FormLabel>
+                <FormControl>
+                  <Textarea
+                    rows={5}
+                    placeholder={t('Enter one keyword per line')}
+                    {...field}
+                  />
+                </FormControl>
+                <FormDescription>
+                  {t(
+                    'Final video failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
+                  )}{' '}
+                  {t(
+                    'Keywords appear in the public rule list. Use generic phrases and omit private details.'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
         </SettingsForm>
       </Form>
     </SettingsSection>

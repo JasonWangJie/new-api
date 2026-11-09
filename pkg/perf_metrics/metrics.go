@@ -86,6 +86,7 @@ func Query(params QueryParams) (QueryResult, error) {
 	endTs := time.Now().Unix()
 	startTs := endTs - int64(params.Hours)*3600
 	allowedGroups := allowedGroupSet(params.Groups)
+	exclusions := perf_metrics_setting.GetVideoErrorExclusions()
 
 	merged := map[bucketKey]counters{}
 	rows, err := model.GetPerfMetrics(params.Model, params.Group, startTs, endTs)
@@ -114,12 +115,12 @@ func Query(params QueryParams) (QueryResult, error) {
 			workloads:      relayWorkload,
 		})
 	}
-	taskRows, err := model.GetTaskPerfMetricBuckets(params.Model, params.Group, startTs, endTs, params.Groups)
+	taskRows, err := model.GetTaskPerfMetricBuckets(params.Model, params.Group, startTs, endTs, params.Groups, exclusions)
 	if err != nil {
 		return QueryResult{}, err
 	}
 	for _, row := range taskRows {
-		mergeCounters(merged, bucketKey{model: row.ModelName, group: row.Group, bucketTs: row.BucketTs}, taskCounters(row))
+		mergeCounters(merged, bucketKey{model: row.ModelName, group: row.Group, bucketTs: row.BucketTs}, taskCounters(row, len(exclusions) > 0))
 	}
 
 	hotBuckets.Range(func(key, value any) bool {
@@ -141,6 +142,7 @@ func Query(params QueryParams) (QueryResult, error) {
 
 	result := buildQueryResult(params.Model, merged)
 	result.WindowHours, result.UpdatedAt = params.Hours, endTs
+	result.VideoErrorExclusions = exclusions
 	return result, nil
 }
 
@@ -154,6 +156,7 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 	endTs := time.Now().Unix()
 	startTs := endTs - int64(hours)*3600
 	allowedGroups := allowedGroupSet(groups)
+	exclusions := perf_metrics_setting.GetVideoErrorExclusions()
 
 	rows, err := model.GetPerfMetricsSummaryBucketsAll(startTs, endTs, groups)
 	if err != nil {
@@ -177,12 +180,12 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		mergeModelTotals(totals, row.ModelName, value)
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
-	taskRows, err := model.GetTaskPerfMetricBuckets("", "", startTs, endTs, groups)
+	taskRows, err := model.GetTaskPerfMetricBuckets("", "", startTs, endTs, groups, exclusions)
 	if err != nil {
 		return SummaryAllResult{}, err
 	}
 	for _, row := range taskRows {
-		value := taskCounters(row)
+		value := taskCounters(row, len(exclusions) > 0)
 		mergeModelTotals(totals, row.ModelName, value)
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
@@ -224,20 +227,26 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		return models[i].RequestCount > models[j].RequestCount
 	})
 
-	return SummaryAllResult{Models: models, WindowHours: hours, UpdatedAt: endTs}, nil
+	return SummaryAllResult{Models: models, WindowHours: hours, UpdatedAt: endTs, VideoErrorExclusions: exclusions}, nil
 }
 
-func taskCounters(row model.TaskPerfMetricBucket) counters {
+func taskCounters(row model.TaskPerfMetricBucket, filterVideo bool) counters {
 	workloads := imageWorkload
 	if row.Kind == "video" {
 		workloads = videoWorkload
 	}
-	return counters{
+	value := counters{
 		requestCount: row.RequestCount, successCount: row.SuccessCount,
 		unknownCount: row.UnknownCount, latencyCount: row.LatencyCount,
 		totalLatencyMs: row.TotalLatencyMs, outputCount: row.OutputCount,
 		workloads: workloads,
 	}
+	if filterVideo && row.Kind == "video" {
+		value.videoRequestCount = row.RequestCount
+		value.videoSuccessCount = row.SuccessCount
+		value.videoExcludedCount = row.ExcludedCount
+	}
+	return value
 }
 
 func mergeModelTotals(totals map[string]counters, modelName string, value counters) {

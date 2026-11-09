@@ -23,7 +23,9 @@ import { LoadingState } from '@/components/loading-state'
 import {
   formatLatency,
   formatThroughput,
+  formatUptimePct,
   getSuccessRateDotClass,
+  getSuccessRateTextClass,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
 import type {
@@ -32,7 +34,10 @@ import type {
 } from '@/features/performance-metrics/types'
 import { cn } from '@/lib/utils'
 
-import { PerformanceSampleContext } from './model-performance-summary'
+import {
+  FilteredVideoSuccessRateHelp,
+  PerformanceSampleContext,
+} from './model-performance-summary'
 
 export type ModelPerfBadgeData = PerformanceStats & {
   recent_success_series?: SuccessRatePoint[]
@@ -42,6 +47,7 @@ export interface ModelPerfBadgeProps extends React.HTMLAttributes<HTMLDivElement
   perf: ModelPerfBadgeData | undefined
   mediaModel?: boolean
   status?: 'loading' | 'error' | 'ready'
+  videoErrorExclusions?: readonly string[]
 }
 
 const STATUS_SLOTS = Array.from({ length: 24 }, (_, slot) => slot)
@@ -51,7 +57,10 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
 ) {
   const { t } = useTranslation()
   const hasSamples = props.perf != null && props.perf.request_count !== 0
-  const media = isTaskPerformance(props.perf) || props.mediaModel
+  const filtered = props.perf?.video_filtered_success_rate
+  const filteredRate = filtered?.rate ?? Number.NaN
+  const media =
+    isTaskPerformance(props.perf) || props.mediaModel || filtered != null
   const deliveredMedia =
     props.perf?.workload === 'image' || props.perf?.workload === 'video'
   const latencyText = hasSamples
@@ -147,6 +156,27 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
               })}
             </dd>
           </div>
+          {filtered && (
+            <div className='max-w-full min-w-0'>
+              <dt className='text-muted-foreground flex items-center gap-1 text-[11px] leading-4'>
+                <span className='min-w-0 [overflow-wrap:anywhere]'>
+                  {t('Filtered success rate')}
+                </span>
+                <FilteredVideoSuccessRateHelp
+                  stats={filtered}
+                  exclusions={props.videoErrorExclusions}
+                />
+              </dt>
+              <dd
+                className={cn(
+                  'mt-1 font-mono whitespace-nowrap',
+                  getSuccessRateTextClass(filteredRate)
+                )}
+              >
+                {formatUptimePct(filteredRate)}
+              </dd>
+            </div>
+          )}
           <div
             title={
               deliveredMedia ? t('Average delivery time') : t('Average latency')

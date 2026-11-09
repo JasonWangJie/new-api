@@ -88,6 +88,60 @@ afterEach(() => {
 })
 
 describe('model cards', () => {
+  it('opens the configured video exclusions beside the raw and filtered card rates', async () => {
+    queryClient.setQueryData(['perf-metrics-summary', 24], {
+      success: true,
+      data: {
+        video_error_exclusions: [
+          'Reference file unavailable',
+          'Invalid aspect ratio',
+        ],
+        models: [
+          {
+            model_name: 'example-model',
+            workload: 'video',
+            request_count: 4,
+            avg_latency_ms: 15000,
+            avg_tps: 0,
+            success_rate: 25,
+            video_filtered_success_rate: {
+              rate: 50,
+              excluded_count: 2,
+              sample_count: 2,
+            },
+          },
+        ],
+      },
+    })
+    const onModelClick = vi.fn()
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ModelCardGrid models={[pricingModel()]} onModelClick={onModelClick} />
+      </QueryClientProvider>
+    )
+
+    expect(screen.getByText('25.0%')).toBeVisible()
+    expect(screen.getByText('50.00%')).toBeVisible()
+    const info = screen.getByRole('button', {
+      name: 'Show excluded video errors',
+    })
+    expect(info).toHaveAttribute('aria-expanded', 'false')
+
+    const user = userEvent.setup()
+    info.focus()
+    await user.keyboard('{Enter}')
+
+    const popup = await screen.findByRole('dialog', {
+      name: 'Filtered success rate',
+    })
+    expect(info).toHaveAttribute('aria-expanded', 'true')
+    expect(within(popup).getByText('Reference file unavailable')).toBeVisible()
+    expect(within(popup).getByText('Invalid aspect ratio')).toBeVisible()
+    expect(onModelClick).not.toHaveBeenCalled()
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(info).toHaveAttribute('aria-expanded', 'false'))
+  })
+
   it('shows separate generic and image cache prices including a free image cache', () => {
     render(
       <CachedPriceCell

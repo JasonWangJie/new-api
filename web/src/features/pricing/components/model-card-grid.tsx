@@ -102,6 +102,7 @@ export function ModelCardGrid(props: ModelCardGridProps) {
             selectedGroup={props.selectedGroup}
             perf={perfMap.get(model.model_name || '')}
             perfStatus={perfStatus}
+            videoErrorExclusions={perfQuery.data?.data.video_error_exclusions}
             onClick={() => props.onModelClick(model.model_name || '')}
           />
         ))}
