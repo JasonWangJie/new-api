@@ -527,7 +527,8 @@ func AcceptAsyncVideo(c *gin.Context) {
 		}
 	}
 	var channel model.Channel
-	if kitdto.ChannelConfiguredTaskVideoPlugin(c.GetString("task_plugin_key")) {
+	mapping := service.PinnedMixedVideoResolutionMapping(c)
+	if kitdto.ChannelConfiguredTaskVideoPlugin(c.GetString("task_plugin_key")) || mapping != nil {
 		value, _ := c.Get("task_video_channel_snapshot")
 		data, _ := value.([]byte)
 		if common.Unmarshal(data, &channel) != nil || channel.Id != job.ChannelId {
@@ -583,6 +584,7 @@ func AcceptAsyncVideo(c *gin.Context) {
 	if value, exists := c.Get("async_media_mixed_routing"); exists {
 		request.MixedRouting, _ = value.(*service.MixedVideoRouting)
 		request.InitialExecution = execution
+		request.ResolutionMapping = mapping
 	}
 	if value, exists := c.Get(service.VideoRoutingContextKey); exists {
 		request.ConditionalRouting, _ = value.(*service.VideoRoutingSnapshot)
@@ -734,7 +736,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 				return
 			}
 		}
-		if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
+		if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) || request.ResolutionMapping != nil {
 			// Model selection and capabilities were frozen at admission. Keep
 			// checking live group access without consulting the edited model list.
 			if !slices.Contains(strings.Split(liveChannel.Group, ","), job.Group) {
@@ -780,10 +782,16 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 		}
 		profile, profileErr := service.EffectiveVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
 		if request.MixedRouting != nil {
-			profile, profileErr = service.EffectiveMixedVideoProfile(endpoint.Candidates[bindingIndex], job.Model, capability.VideoOverrides)
-		}
-		if request.ConditionalRouting.ActiveTarget() != nil {
-			profile, profileErr = service.EffectiveMixedVideoProfile(endpoint.Candidates[bindingIndex], request.ExecutionModel(job.Model), service.VideoModelOverrides{})
+			overrides := capability.VideoOverrides
+			if request.ConditionalRouting.ActiveTarget() != nil {
+				overrides = service.VideoModelOverrides{}
+			}
+			tier := ""
+			if request.ResolutionMapping != nil {
+				tier = request.ResolutionMapping.Resolution
+			}
+			profile, profileErr = service.EffectiveMixedVideoExecutionProfile(endpoint.Candidates[bindingIndex], request.ExecutionModel(job.Model), endpoint.MappedModel, tier, overrides)
+			videoRequest = service.MixedVideoValidationDimensions(videoRequest, job.Provider, endpoint.MappedModel)
 		}
 		if profileErr != nil {
 			executionErr = errors.New("video provider capability changed")
@@ -1156,7 +1164,6 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 			if err != nil {
 				return nil, service.TaskErrorWrapperLocal(err, "media_retry_channel_unavailable", http.StatusServiceUnavailable)
 			}
-			request.Channel = *candidate
 			if request.MixedRouting != nil {
 				var token model.Token
 				if err := model.DB.WithContext(c.Request.Context()).First(&token, job.TokenId).Error; err != nil {
@@ -1196,6 +1203,8 @@ func (retry *asyncVideoSubmissionRetry) submit(c *gin.Context, info *relaycommon
 				constraints.Pins = slices.DeleteFunc(constraints.Pins, func(pin gatewaydto.ChannelPin) bool { return pin.Source == "media_policy" })
 				constraints.AddPin(gatewaydto.ChannelPin{ChannelId: candidate.Id, Source: "media_policy", Rank: 20, RetryMode: gatewaydto.PinRetrySingleAttempt})
 				service.AppendTaskPluginIdentityFilter(c, job.Provider)
+			} else {
+				request.Channel = *candidate
 			}
 			*retry.liveChannel = model.Channel{}
 			if err := model.DB.WithContext(c.Request.Context()).Where("id = ?", candidate.Id).Take(retry.liveChannel).Error; err != nil {

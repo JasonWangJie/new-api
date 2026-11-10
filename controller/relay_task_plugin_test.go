@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -869,6 +870,185 @@ func (b *taskSubmissionTestBilling) Reserve(int) error {
 	return b.reserveErr
 }
 
+func TestMixedVideoResolutionMappingDispatch(t *testing.T) {
+	user, token := setupResponsesWSRequestTest(t)
+	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
+	db := modelManagementDB(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+	token.RemainQuota = 1000
+	require.NoError(t, db.Create(user).Error)
+	require.NoError(t, db.Create(token).Error)
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "video-map:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "video-map")
+	previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
+	previousSecret, previousTimeout, previousUnit := common.CryptoSecret, constant.TaskTimeoutMinutes, common.QuotaPerUnit
+	previousRedis, previousRedisEnabled := common.RDB, common.RedisEnabled
+	previousBatch := common.BatchUpdateEnabled
+	pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = pluginruntime.NewRegistry(), ExecuteAsyncVideo
+	common.CryptoSecret, constant.TaskTimeoutMinutes, common.QuotaPerUnit = "video-map-fixture-secret", 10, 500000
+	common.BatchUpdateEnabled = false
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	common.RDB, common.RedisEnabled = client, true
+	t.Cleanup(func() {
+		pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc = previousRegistry, previousSubmit
+		common.CryptoSecret, constant.TaskTimeoutMinutes, common.QuotaPerUnit = previousSecret, previousTimeout, previousUnit
+		common.RDB, common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousRedisEnabled, previousBatch
+		assert.NoError(t, client.Close())
+	})
+	cfg := service.DefaultMediaRuntimeConfig()
+	cfg.VideoAsyncEnabled, cfg.LocalPath = true, t.TempDir()
+	require.NoError(t, service.SaveMediaRuntimeConfig(t.Context(), cfg))
+	source, err := builtinplugins.Source("yali")
+	require.NoError(t, err)
+	_, err = pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: "yali"})
+	require.NoError(t, err)
+	requests := make(chan map[string]any, 8)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := common.DecodeJson(r.Body, &body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"mapped-video","status":"queued"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	const publicModel = "minimax-h3-sec"
+	setting := `{"task_plugin_key":"yali","task_plugin_model_configs":{
+		"MiniMaxH3-480p-sec":{"duration":{"min":4,"max":15,"step":1,"default":5},"modes":["text_to_video"],"resolutions":["480p"],"aspect_ratios":["16:9"],"references":{"images":0,"videos":0,"audios":0},"billing_mode":"per_second"},
+		"MiniMaxH3-2k-pro-sec":{"duration":{"min":4,"max":15,"step":1,"default":5},"modes":["text_to_video"],"resolutions":["768p","2k"],"aspect_ratios":["16:9"],"references":{"images":0,"videos":0,"audios":0},"billing_mode":"per_second"}
+	},"video_resolution_model_mapping":{"minimax-h3-sec":{"480p":"MiniMaxH3-480p-sec","720p":"MiniMaxH3-2k-pro-sec","2k":"MiniMaxH3-2k-pro-sec"}}}`
+	channel := model.Channel{Type: constant.ChannelTypeTaskPlugin, Name: "Yali resolution fixture", Status: common.ChannelStatusEnabled, Group: "default", Models: publicModel, Key: "fixture-key", Setting: &setting, BaseURL: &upstream.URL}
+	require.NoError(t, channel.Insert())
+	policy := model.ImageGroupPolicy{Group: "default", Platform: "mixed", PolicyKey: service.ImageIdentityHash("default", "mixed"), Enabled: true, AsyncEnabled: true, PoolMode: "model_resolution", Models: `[{"id":"minimax-h3-sec","media_type":"video"}]`}
+	require.NoError(t, db.Create(&policy).Error)
+	for _, tier := range []string{"1K", "2K"} {
+		require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.MediaPoolBindingKey(policy, publicModel, tier, "video"), Group: "default", Platform: "mixed", Mode: policy.PoolMode, Model: publicModel, Resolution: tier, ChannelId: channel.Id, Priority: 1}).Error)
+	}
+	const price = `u("resolution") == "480p" ? tier("480p", u("seconds") * 0.00001) : (u("resolution") == "720p" ? tier("720p", u("seconds") * 0.00002) : tier("2k", u("seconds") * 0.00003))`
+	prices := config.GlobalConfig.Get("billing_setting").(*billing_setting.BillingSetting)
+	previousPrices := prices.MixedVideoBillingExpr
+	prices.MixedVideoBillingExpr = map[string]string{publicModel: price}
+	t.Cleanup(func() { prices.MixedVideoBillingExpr = previousPrices })
+	engine := gin.New()
+	engine.POST("/v1/videos/generations_async", middleware.TokenAuth(), PrepareAsyncVideo, PinAsyncVideoEndpoint(), FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), RouteAsyncVideo, middleware.Distribute(), AcceptAsyncVideo)
+	accept := func(t *testing.T, resolution string, status int) model.AsyncMediaJob {
+		t.Helper()
+		body := gin.H{"model": publicModel, "prompt": "test motion", "seconds": 5, "aspect_ratio": "16:9"}
+		if resolution != "" {
+			body["resolution"] = resolution
+		}
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", bytes.NewReader(encoded))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		res := httptest.NewRecorder()
+		engine.ServeHTTP(res, req)
+		require.Equal(t, status, res.Code, res.Body.String())
+		if status != http.StatusAccepted {
+			return model.AsyncMediaJob{}
+		}
+		var accepted struct {
+			TaskID string `json:"task_id"`
+		}
+		require.NoError(t, common.Unmarshal(res.Body.Bytes(), &accepted))
+		var job model.AsyncMediaJob
+		require.NoError(t, db.Where("task_id = ?", accepted.TaskID).Take(&job).Error)
+		assert.Equal(t, channel.Id, job.ChannelId)
+		return job
+	}
+	accept(t, "", http.StatusBadRequest)
+	accept(t, "1080p", http.StatusBadRequest)
+	for _, tc := range []struct {
+		name, resolution, upstreamModel, upstreamResolution string
+		quota                                               int
+	}{
+		{"480p", "480p", "MiniMaxH3-480p-sec", "480p", 25},
+		{"720p", "720p", "MiniMaxH3-2k-pro-sec", "768P", 50},
+		{"2k", "2k", "MiniMaxH3-2k-pro-sec", "2k", 75},
+		{"conditional", "480p", "MiniMaxH3-2k-pro-sec", "768P", 25},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "conditional" {
+				rules := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{
+					ID: "mapped-tier", Name: "Mapped tier", Enabled: true,
+					Match:       model.VideoRoutingMatch{Models: []string{publicModel}, Resolutions: []string{"480p"}},
+					Targets:     []model.VideoRoutingTarget{{ChannelID: channel.Id, Model: publicModel, Resolution: "720p"}},
+					OnExhausted: "fail",
+				}}}
+				require.NoError(t, service.ValidateVideoRoutingConfig(t.Context(), rules))
+				_, err := model.SaveVideoRoutingConfig(t.Context(), rules, 0)
+				require.NoError(t, err)
+			}
+			preview, err := service.PreviewMediaRouting(t.Context(), service.MediaRoutingPreviewRequest{
+				Platform: "mixed", Group: "default", MediaType: "video", Model: publicModel, Resolution: tc.resolution,
+				Operation: "text_to_video", Seconds: common.GetPointer(5),
+			})
+			require.NoError(t, err)
+			require.Len(t, preview.Eligible, 1, "%+v", preview)
+			assert.Equal(t, tc.upstreamModel, preview.Eligible[0].UpstreamModel)
+			job := accept(t, tc.resolution, http.StatusAccepted)
+			require.Empty(t, requests)
+			require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", `{"task_plugin_key":"yali"}`).Error)
+			t.Cleanup(func() {
+				assert.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("setting", setting).Error)
+			})
+			if tc.name == "480p" {
+				plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
+				require.NoError(t, err)
+				var retry service.AsyncVideoRequest
+				require.NoError(t, common.Unmarshal(plain, &retry))
+				retry.PendingDecision = &mediaretry.Decision{Action: mediaretry.SameChannel, Matched: true}
+				retry.RetryFact = &mediaretry.Fact{ChannelID: channel.Id, Provider: "yali", Terminal: true}
+				same, err := service.PickVideoRetryChannel(t.Context(), job, retry, tc.upstreamModel)
+				require.NoError(t, err)
+				candidate, err := service.RebindConditionalVideoRequest(t.Context(), job, &retry, *same, service.VideoModelOverrides{})
+				require.NoError(t, err)
+				assert.Equal(t, tc.upstreamModel, candidate.UpstreamModel)
+				other := channel
+				other.Id, other.Name, other.Key = 0, "alternate resolution fixture", "fixture-key-2"
+				otherSetting := strings.ReplaceAll(setting, tc.upstreamModel, "alternate-480p")
+				other.Setting = &otherSetting
+				require.NoError(t, other.Insert())
+				pool := model.ImageChannelPool{BindingKey: service.MediaPoolBindingKey(policy, publicModel, "1K", "video"), Group: "default", Platform: "mixed", Mode: policy.PoolMode, Model: publicModel, Resolution: "1K", ChannelId: other.Id, Priority: 1}
+				require.NoError(t, db.Create(&pool).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&pool).Error)
+					assert.NoError(t, db.Where("channel_id = ?", other.Id).Delete(&model.Ability{}).Error)
+					assert.NoError(t, db.Delete(&other).Error)
+				})
+				retry.PendingDecision.Action = mediaretry.OtherChannel
+				next, err := service.PickVideoRetryChannel(t.Context(), job, retry, tc.upstreamModel)
+				require.NoError(t, err)
+				candidate, err = service.RebindConditionalVideoRequest(t.Context(), job, &retry, *next, service.VideoModelOverrides{})
+				require.NoError(t, err)
+				require.NoError(t, service.RebindMixedVideoRequest(&retry, candidate, job.ExpiresAt))
+				assert.Equal(t, other.Id, retry.ResolutionMapping.ChannelID)
+				assert.Equal(t, "alternate-480p", retry.ResolutionMapping.UpstreamModel)
+				assert.Equal(t, tc.quota, retry.Billing.Price.Quota)
+				assert.Equal(t, tc.resolution, retry.Billing.Tiered.UsageFacts["resolution"])
+			}
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &job, "video-map-worker", 120)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, cfg))
+			require.Len(t, requests, 1)
+			body := <-requests
+			assert.Equal(t, tc.upstreamModel, body["model"])
+			assert.Equal(t, tc.upstreamResolution, body["resolution"])
+			var task model.Task
+			require.NoError(t, db.Where("task_id = ?", job.TaskId).Take(&task).Error)
+			assert.Equal(t, tc.upstreamModel, task.Properties.UpstreamModelName)
+			assert.Equal(t, tc.quota, task.Quota)
+			require.NotNil(t, task.PrivateData.BillingContext)
+			assert.Equal(t, tc.resolution, task.PrivateData.BillingContext.TieredSnapshot.UsageFacts["resolution"])
+		})
+	}
+}
+
 func TestMixedVideoPricingAPIThroughSubmissionAndSettlement(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	dialect := os.Getenv("RETRY_POLICY_TEST_DIALECT")
@@ -1039,12 +1219,12 @@ func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
 	const publicModel = "public-drama-video"
 	setting := `{"task_plugin_key":"drama"}`
 	for _, tc := range []struct {
-		name, model, operation, fields, resolution, ratio, wantError string
+		name, model, operation, fields, resolution, wireResolution, ratio, wantError string
 	}{
 		{name: "F default retains wire resolution", model: "seedance2.0-F", fields: `"seconds":4`, resolution: "720px", ratio: "16:9"},
 		{name: "F explicit wire resolution", model: "seedance2.0-F", fields: `"seconds":4,"resolution":"720px"`, resolution: "720px", ratio: "16:9"},
-		{name: "H3 camel case portrait", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","aspectRatio":"9:16"`, resolution: "720p", ratio: "9:16"},
-		{name: "H3 short portrait alias", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","ratio":"9:16"`, resolution: "720p", ratio: "9:16"},
+		{name: "H3 camel case portrait", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","aspectRatio":"9:16"`, resolution: "720p", wireResolution: "768p", ratio: "9:16"},
+		{name: "H3 short portrait alias", model: "minimax-h3", fields: `"seconds":4,"resolution":"720p","ratio":"9:16"`, resolution: "720p", wireResolution: "768p", ratio: "9:16"},
 		{name: "matching aliases", model: "minimax-h3", fields: `"seconds":4,"aspectRatio":"9:16","aspect_ratio":"9:16","ratio":"9:16"`, resolution: "480p", ratio: "9:16"},
 		{name: "conflicting aliases", model: "minimax-h3", fields: `"seconds":4,"aspectRatio":"9:16","aspect_ratio":"16:9"`, wantError: "conflicting mixed video aspect ratios"},
 		{name: "F wire resolution is not global", model: "minimax-h3", fields: `"seconds":4,"resolution":"720px"`, wantError: "resolution is invalid"},
@@ -1085,7 +1265,7 @@ func TestMixedVideoBuiltinPublicNormalization(t *testing.T) {
 			require.True(t, ok)
 			wire, ok := request["body"].(map[string]any)
 			require.True(t, ok)
-			assert.Equal(t, tc.resolution, wire["resolution"])
+			assert.Equal(t, cmp.Or(tc.wireResolution, tc.resolution), wire["resolution"])
 			assert.Equal(t, tc.ratio, wire["aspect_ratio"])
 			if tc.resolution == "720px" {
 				_, err := service.MixedVideoPublicFacts(body, operation, nil)

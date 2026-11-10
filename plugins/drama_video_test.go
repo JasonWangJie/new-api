@@ -63,6 +63,94 @@ func decodeDramaVideoRequest(t *testing.T, plugin *jsplugin.LoadedPlugin, modelN
 	return intent, nil
 }
 
+func TestMiniMaxH3UpstreamResolutionAndBilling(t *testing.T) {
+	for _, tc := range []struct {
+		plugin, upstream, requested, wireField, wireResolution, usageResolution string
+		multipart                                                               bool
+	}{
+		{plugin: "yali", upstream: "MiniMaxH3-720p-realistic", requested: "720p", wireField: "resolution", wireResolution: "768P", usageResolution: "720p"},
+		{plugin: "yali", upstream: "MiniMaxH3-2k-pro-sec", requested: "720p", wireField: "resolution", wireResolution: "768P", usageResolution: "720p"},
+		{plugin: "yali", upstream: "MiniMaxH3-2k-pro-sec", requested: "2k", wireField: "resolution", wireResolution: "2k", usageResolution: "2k"},
+		{plugin: "yali", upstream: "MiniMaxH3-480p-sec", requested: "480p", wireField: "resolution", wireResolution: "480p", usageResolution: "480p"},
+		{plugin: "yali", upstream: "custom-minimax-h3-video", requested: "720p", wireField: "resolution", wireResolution: "720p", usageResolution: "720p"},
+		{plugin: "drama", upstream: "minimax-h3", requested: "720p", wireField: "resolution", wireResolution: "768p", usageResolution: "720p"},
+		{plugin: "drama", upstream: "minimax-h3", requested: "480p", wireField: "resolution", wireResolution: "480p", usageResolution: "480p"},
+		{plugin: "drama", upstream: "minimax-h3-2k", requested: "2k", wireField: "resolution", wireResolution: "2k", usageResolution: "2k"},
+		{plugin: "drama", upstream: "seedance2.5-A", requested: "720p", wireField: "resolution", wireResolution: "720p", usageResolution: "720p"},
+		{plugin: "yuxibox", upstream: "minimax-h3-quality", requested: "720p", wireField: "resolution", wireResolution: "768p", usageResolution: "768p"},
+		{plugin: "yuxibox", upstream: "minimax-h3-fast", requested: "720p", wireField: "resolution", wireResolution: "768p", usageResolution: "768p"},
+		{plugin: "yuxibox", upstream: "minimax-h3-15s", requested: "480p", wireField: "resolution", wireResolution: "480p", usageResolution: "480p"},
+		{plugin: "wolong", upstream: "czniu-minimax-h3-15s", requested: "720p", wireField: "quality", wireResolution: "768p", usageResolution: "720p"},
+		{plugin: "wolong", upstream: "czniu-minimax-h3-30s", requested: "720p", wireField: "quality", wireResolution: "768p", usageResolution: "720p"},
+		{plugin: "wolong", upstream: "vendor/seedance", requested: "720p", wireField: "quality", wireResolution: "720p", usageResolution: "720p"},
+		{plugin: "huahuo-video", upstream: "inmind/video/minimax-h3-2", requested: "720p", wireField: "resolution", wireResolution: "768p", usageResolution: "720p"},
+		{plugin: "huahuo-video", upstream: "inmind/video/minimax-h3-2", requested: "720p", wireField: "resolution", wireResolution: "768p", usageResolution: "720p", multipart: true},
+		{plugin: "hailuo", upstream: "MiniMax-H3", requested: "720p", wireField: "resolution", wireResolution: "768P", usageResolution: "768P"},
+		{plugin: "hailuo", upstream: "MiniMax-H3", requested: "2k", wireField: "resolution", wireResolution: "2K", usageResolution: "2K"},
+	} {
+		name := tc.plugin + "/" + tc.upstream + "/" + tc.requested
+		if tc.multipart {
+			name += "/multipart"
+		}
+		t.Run(name, func(t *testing.T) {
+			source, err := builtinplugins.Source(tc.plugin)
+			require.NoError(t, err)
+			plugin, err := jsplugin.NewRegistry().RegisterFactory(source, jsplugin.Options{Key: tc.plugin})
+			require.NoError(t, err)
+
+			const publicModel = "public-video"
+			request := map[string]any{"model": publicModel, "prompt": "a blue glass cube", "seconds": 15, "resolution": tc.requested, "aspect_ratio": "16:9"}
+			if tc.plugin == "yuxibox" {
+				request["reference_images"] = []any{"https://cdn.example/cube.png"}
+			}
+			body := map[string]any{"kind": "json", "value": request}
+			if tc.multipart {
+				fields := make(map[string][]string, len(request))
+				for field, value := range request {
+					fields[field] = []string{fmt.Sprint(value)}
+				}
+				body = map[string]any{"kind": "multipart", "fields": fields, "files": []any{
+					map[string]any{"field": "input_reference", "ref": "request_file:input_reference", "mimeType": "image/png", "size": 100},
+				}}
+			}
+			ctx := map[string]any{
+				"model": publicModel, "upstreamModel": tc.upstream, "operation": "create", "body": body,
+				"publicTaskId": "video_public", "baseUrl": "https://upstream.example", "apiKey": "test-key",
+			}
+			decoded, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, ctx)
+			require.NoError(t, err)
+			intent := decoded.(map[string]any)
+			assert.Equal(t, publicModel, intent["model"])
+			ctx["requestBody"], ctx["action"] = intent["requestBody"], intent["action"]
+
+			value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", ctx)
+			require.NoError(t, err)
+			descriptor := value.(map[string]any)
+			if tc.multipart {
+				assert.Equal(t, "multipart", descriptor["bodyType"])
+				fields := make(map[string]any)
+				for _, value := range descriptor["parts"].([]any) {
+					part := value.(map[string]any)
+					fields[part["name"].(string)] = part["value"]
+					if part["name"] == "input_reference" {
+						assert.Equal(t, "request_file:input_reference", part["fileRef"])
+					}
+				}
+				assert.Contains(t, fields, "input_reference")
+				assert.Equal(t, tc.upstream, fields["model"])
+				assert.Equal(t, tc.wireResolution, fields[tc.wireField])
+			} else {
+				wire := descriptor["body"].(map[string]any)
+				assert.Equal(t, tc.upstream, wire["model"])
+				assert.Equal(t, tc.wireResolution, wire[tc.wireField])
+			}
+			usage, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tc.usageResolution, usage.(map[string]any)["resolution"])
+		})
+	}
+}
+
 func TestConfiguredDramaYaliTabtabVideoModels(t *testing.T) {
 	for _, key := range []string{"drama", "yali", "tabtab"} {
 		t.Run(key, func(t *testing.T) {

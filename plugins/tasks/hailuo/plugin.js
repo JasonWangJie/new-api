@@ -20,7 +20,7 @@ export const meta = {
     en: "MiniMax Hailuo video generation (text-to-video, image-to-video, and MiniMax-H3 multimodal reference)",
     zh: "MiniMax 海螺视频生成（文生视频、图生视频、MiniMax-H3 多模态参考生视频）",
   },
-  version: "1.1.4",
+  version: "1.1.5",
   author: { name: "QuantumNous" },
   channelTypes: [35],
   models: [
@@ -165,7 +165,7 @@ function h3Resolution(req) {
   if (!raw) return "768P";
   const value = raw.toUpperCase();
   if (value.includes("2K")) return "2K";
-  if (value.includes("768")) return "768P";
+  if (value === "720P" || value.includes("768")) return "768P";
   throw new Error(H3_MODEL + " resolution must be 768P or 2K");
 }
 

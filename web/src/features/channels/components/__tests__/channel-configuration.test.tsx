@@ -1739,6 +1739,83 @@ test('adds a resolution mapping from declared models and requires at least one t
   ).toEqual({ 'custom-model': { '2K': 'custom-2K' } })
 })
 
+test('edits independent video resolution tiers and preserves the ordinary model mapping', async () => {
+  pluginOptions = [
+    ...plugins,
+    {
+      key: 'yali',
+      name: 'Yali Video',
+      models: ['MiniMaxH3-720p-realistic'],
+    },
+  ]
+  const mapping = {
+    'minimax-h3-sec': {
+      '480p': 'MiniMaxH3-480p-sec',
+      '720p': 'MiniMaxH3-2k-pro-sec',
+      '2k': 'MiniMaxH3-2k-pro-sec',
+    },
+  }
+  editingChannel = {
+    ...editingChannel,
+    type: 61,
+    models: 'minimax-h3-sec',
+    model_mapping: '{"minimax-h3-sec":"MiniMaxH3-720p-realistic"}',
+    setting: JSON.stringify({
+      task_plugin_key: 'yali',
+      video_resolution_model_mapping: mapping,
+    }),
+  }
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  const initializeCapabilities = await screen.findByRole('button', {
+    name: 'Initialize missing model capabilities',
+  })
+  await waitFor(() => expect(initializeCapabilities).toBeEnabled())
+  await user.click(initializeCapabilities)
+  expect(screen.getByDisplayValue('MiniMaxH3-480p-sec')).toBeVisible()
+  expect(screen.getByDisplayValue('MiniMaxH3-2k-pro-sec')).toBeVisible()
+  expect(
+    screen.queryByDisplayValue('MiniMaxH3-720p-realistic')
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  const video = within(
+    screen.getByRole('group', { name: 'Async video resolution model mapping' })
+  )
+  expect(
+    video.getByRole('combobox', { name: 'Resolution mapping source 1' })
+  ).toHaveValue('minimax-h3-sec')
+  expect(
+    video.getByRole('textbox', { name: 'Upstream model 720p row 1' })
+  ).toHaveValue('MiniMaxH3-2k-pro-sec')
+  await user.clear(
+    video.getByRole('textbox', { name: 'Upstream model 2k row 1' })
+  )
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() => expect(put).toHaveBeenCalledOnce())
+  const payload = put.mock.calls[0][1] as {
+    setting: string
+    model_mapping: string
+  }
+  expect(JSON.parse(payload.setting).video_resolution_model_mapping).toEqual({
+    'minimax-h3-sec': {
+      '480p': 'MiniMaxH3-480p-sec',
+      '720p': 'MiniMaxH3-2k-pro-sec',
+    },
+  })
+  expect(payload.model_mapping).toBe(editingChannel.model_mapping)
+  expect(
+    JSON.parse(
+      transformFormDataToCreatePayload(
+        transformChannelToFormDefaults(editingChannel)
+      ).channel.setting || '{}'
+    ).video_resolution_model_mapping
+  ).toEqual(mapping)
+})
+
 test('retains an unavailable resolution mapping until it is explicitly deleted', async () => {
   editingChannel = {
     ...editingChannel,

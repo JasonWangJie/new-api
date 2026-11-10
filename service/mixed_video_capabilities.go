@@ -118,67 +118,69 @@ func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.Im
 			continue
 		}
 		for _, operation := range []string{"create", "edit", "extend"} {
-			binding, _, err := MixedVideoChannelBinding(channel, publicModel, operation)
-			if err != nil {
-				continue
-			}
-			profile, err := EffectiveMixedVideoProfile(binding, publicModel, overrides)
-			if err != nil {
-				continue
-			}
-			if requirePool {
-				modes := make([]jsplugin.VideoModeProfile, 0, len(profile.Modes))
-				for _, mode := range profile.Modes {
-					portable := true
-					inputs := make([]jsplugin.VideoInputProfile, 0, len(mode.Inputs))
-					for _, input := range mode.Inputs {
-						input.Sources = slices.DeleteFunc(input.Sources, func(source string) bool {
-							return source == "asset" || source == "file_id" || source == "voice_id"
-						})
-						if len(input.Sources) == 0 {
-							portable = portable && !input.Required
+			for _, tier := range MixedVideoResolutionChoices(channel, publicModel, operation) {
+				binding, upstream, err := MixedVideoChannelBinding(channel, publicModel, operation, tier)
+				if err != nil {
+					continue
+				}
+				profile, err := EffectiveMixedVideoExecutionProfile(binding, publicModel, upstream, tier, overrides)
+				if err != nil {
+					continue
+				}
+				if requirePool {
+					modes := make([]jsplugin.VideoModeProfile, 0, len(profile.Modes))
+					for _, mode := range profile.Modes {
+						portable := true
+						inputs := make([]jsplugin.VideoInputProfile, 0, len(mode.Inputs))
+						for _, input := range mode.Inputs {
+							input.Sources = slices.DeleteFunc(input.Sources, func(source string) bool {
+								return source == "asset" || source == "file_id" || source == "voice_id"
+							})
+							if len(input.Sources) == 0 {
+								portable = portable && !input.Required
+								continue
+							}
+							inputs = append(inputs, input)
+						}
+						if !portable {
 							continue
 						}
-						inputs = append(inputs, input)
-					}
-					if !portable {
-						continue
-					}
-					mode.Inputs = inputs
-					resolutions := mode.Resolutions
-					if len(resolutions) == 0 {
-						resolutions = []string{""}
-					}
-					allowed := make([]string, 0, len(resolutions))
-					for _, resolution := range resolutions {
-						key := MediaPoolBindingKey(policy, publicModel, VideoPoolResolution(resolution), "video")
-						if slices.ContainsFunc(pools, func(pool model.ImageChannelPool) bool { return pool.BindingKey == key && pool.ChannelId == channel.Id }) {
-							allowed = append(allowed, resolution)
+						mode.Inputs = inputs
+						resolutions := mode.Resolutions
+						if len(resolutions) == 0 {
+							resolutions = []string{""}
 						}
-					}
-					if len(allowed) == 0 {
-						continue
-					}
-					if len(mode.Resolutions) > 0 {
-						mode.Resolutions = allowed
-						if !slices.Contains(allowed, mode.DefaultResolution) {
-							mode.DefaultResolution = allowed[0]
+						allowed := make([]string, 0, len(resolutions))
+						for _, resolution := range resolutions {
+							key := MediaPoolBindingKey(policy, publicModel, VideoPoolResolution(resolution), "video")
+							if slices.ContainsFunc(pools, func(pool model.ImageChannelPool) bool { return pool.BindingKey == key && pool.ChannelId == channel.Id }) {
+								allowed = append(allowed, resolution)
+							}
 						}
+						if len(allowed) == 0 {
+							continue
+						}
+						if len(mode.Resolutions) > 0 {
+							mode.Resolutions = allowed
+							if !slices.Contains(allowed, mode.DefaultResolution) {
+								mode.DefaultResolution = allowed[0]
+							}
+						}
+						modes = append(modes, mode)
 					}
-					modes = append(modes, mode)
+					profile.Modes = modes
 				}
-				profile.Modes = modes
-			}
-			if len(profile.Modes) == 0 {
-				continue
-			}
-			encoded, err := common.Marshal(profile)
-			if err != nil {
-				return nil, err
-			}
-			if !seen[string(encoded)] {
-				seen[string(encoded)] = true
-				profiles = append(profiles, profile)
+				if len(profile.Modes) == 0 {
+					continue
+				}
+				encoded, err := common.Marshal(profile)
+				if err != nil {
+					return nil, err
+				}
+				if !seen[string(encoded)] {
+					seen[string(encoded)] = true
+					profiles = append(profiles, profile)
+				}
 			}
 		}
 	}

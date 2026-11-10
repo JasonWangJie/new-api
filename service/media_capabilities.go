@@ -167,8 +167,10 @@ func mediaChannelSupportsVideoPlatform(channel *model.Channel, modelName, platfo
 	}
 	if platform == "mixed" {
 		for _, operation := range []string{"create", "edit", "extend"} {
-			if _, _, err := MixedVideoChannelBinding(*channel, modelName, operation); err == nil {
-				return true
+			for _, tier := range MixedVideoResolutionChoices(*channel, modelName, operation) {
+				if _, _, err := MixedVideoChannelBinding(*channel, modelName, operation, tier); err == nil {
+					return true
+				}
 			}
 		}
 		return false

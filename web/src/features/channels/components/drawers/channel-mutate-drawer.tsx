@@ -216,8 +216,8 @@ import {
 import { ParamOverrideEditorDialog } from '../dialogs/param-override-editor-dialog'
 import { StatusCodeRiskDialog } from '../dialogs/status-code-risk-dialog'
 import { UpstreamAsyncEditorDialog } from '../dialogs/upstream-async-editor-dialog'
-import { ImageResolutionModelMapping } from '../image-resolution-model-mapping'
 import { ModelMappingEditor } from '../model-mapping-editor'
+import { ResolutionModelMapping } from '../resolution-model-mapping'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { TaskVideoModelEditor } from '../task-video-model-editor'
 import { UpstreamModelSelection } from '../upstream-model-selection'
@@ -292,6 +292,7 @@ const SENSITIVE_FORM_FIELDS = [
   'image_reference_timeout_retry_same_channel',
   'tianyue_media_compatibility',
   'image_resolution_model_mapping',
+  'video_resolution_model_mapping',
   'image_max_reference_bytes',
   'image_attempt_timeout_seconds',
   'image_concurrency_limit',
@@ -831,6 +832,7 @@ export function ChannelMutateDrawer({
       if (shouldResetTaskVideoModels) {
         form.setValue('task_plugin_model_configs', '{}', { shouldDirty: true })
       }
+      form.setValue('video_resolution_model_mapping', [], { shouldDirty: true })
       setProviderTarget(target)
       if (
         !(target.kind === 'builtin' && target.type === 48) &&
@@ -1985,11 +1987,20 @@ export function ChannelMutateDrawer({
           )}
         />
 
-        <ImageResolutionModelMapping
+        <ResolutionModelMapping
+          media='image'
           form={form}
           models={currentModelsArray}
           disabled={sensitiveLocked || isSubmitting}
         />
+        {currentType === CHANNEL_TYPE_TASK_PLUGIN && (
+          <ResolutionModelMapping
+            media='video'
+            form={form}
+            models={currentModelsArray}
+            disabled={sensitiveLocked || isSubmitting}
+          />
+        )}
         {currentType === CHANNEL_TYPE_NEW_API && (
           <FormField
             control={form.control}
@@ -3323,6 +3334,9 @@ export function ChannelMutateDrawer({
                 }
                 models={currentModelsArray}
                 modelMapping={currentModelMapping}
+                videoResolutionMappings={
+                  formValues.video_resolution_model_mapping
+                }
                 details={discovery.modelDetails}
                 previewReady={discovery.status === 'success'}
                 disabled={

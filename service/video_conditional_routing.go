@@ -150,7 +150,7 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 
 // DecodeFrozenVideoRoutingTarget checks the live authority against the frozen
 // target identity. Parameter rewriting always starts from the source request.
-func DecodeFrozenVideoRoutingTarget(ctx context.Context, snapshot *VideoRoutingSnapshot, index int, group, operation string, userID int) (MixedVideoCandidate, []byte, string, error) {
+func DecodeFrozenVideoRoutingTarget(ctx context.Context, snapshot *VideoRoutingSnapshot, index int, group, operation string, userID int, frozenChannel ...*model.Channel) (MixedVideoCandidate, []byte, string, error) {
 	if snapshot == nil || index < 0 || index >= len(snapshot.Targets) {
 		return MixedVideoCandidate{}, nil, "", errors.New("conditional video target snapshot is unavailable")
 	}
@@ -158,7 +158,7 @@ func DecodeFrozenVideoRoutingTarget(ctx context.Context, snapshot *VideoRoutingS
 	if target.Reason != "" || target.UpstreamModel == "" {
 		return MixedVideoCandidate{}, nil, "", errors.New("conditional video target was unavailable at admission")
 	}
-	candidate, body, ct, err := DecodeVideoRoutingTarget(ctx, target.Target, group, operation, snapshot.SourceBody, snapshot.SourceContentType, userID)
+	candidate, body, ct, err := DecodeVideoRoutingTarget(ctx, target.Target, group, operation, snapshot.SourceBody, snapshot.SourceContentType, userID, frozenChannel...)
 	if err != nil {
 		return candidate, nil, "", err
 	}
@@ -182,7 +182,7 @@ func DecodeVideoExecution(ctx context.Context, request AsyncVideoRequest, channe
 	if target == nil {
 		return DecodeMixedVideoCandidate(ctx, channel, publicModel, request.Operation, request.Body, overrides, userID, request.ContentType)
 	}
-	candidate, _, _, err := DecodeFrozenVideoRoutingTarget(ctx, request.ConditionalRouting, request.ConditionalRouting.TargetIndex, group, request.Operation, userID)
+	candidate, _, _, err := DecodeFrozenVideoRoutingTarget(ctx, request.ConditionalRouting, request.ConditionalRouting.TargetIndex, group, request.Operation, userID, request.frozenVideoMappingChannel())
 	if err != nil {
 		return candidate, err
 	}
@@ -193,8 +193,8 @@ func DecodeVideoExecution(ctx context.Context, request AsyncVideoRequest, channe
 	if err != nil {
 		return candidate, err
 	}
-	candidate, err = DecodeMixedVideoCandidate(ctx, channel, target.Target.Model, request.Operation, body, VideoModelOverrides{}, userID, ct)
-	if err == nil && (candidate.UpstreamModel != target.UpstreamModel || candidate.Binding.Plugin.Engine.SourceFingerprint() != target.PluginHash) {
+	candidate, err = request.decodeMixedVideoRetryCandidate(ctx, channel, target.Target.Model, body, ct, VideoModelOverrides{}, userID)
+	if err == nil && (candidate.UpstreamModel != target.UpstreamModel || candidate.Binding.Plugin.Engine.SourceFingerprint() != target.PluginHash || !request.ValidateMixedVideoMapping(candidate)) {
 		err = errors.New("conditional video execution identity changed")
 	}
 	return candidate, err
@@ -223,7 +223,7 @@ func ConditionalVideoRetryCandidates(ctx context.Context, job model.AsyncMediaJo
 			}
 		}
 		for index := max(0, start); index < end; index++ {
-			candidate, _, _, err := DecodeFrozenVideoRoutingTarget(ctx, snapshot, index, job.Group, request.Operation, job.UserId)
+			candidate, _, _, err := DecodeFrozenVideoRoutingTarget(ctx, snapshot, index, job.Group, request.Operation, job.UserId, request.frozenVideoMappingChannel())
 			if err != nil || !videoRoutingRetryAllowed(candidate.Channel, request, candidate) {
 				continue
 			}
@@ -245,7 +245,7 @@ func ConditionalVideoRetryCandidates(ctx context.Context, job model.AsyncMediaJo
 		if ok, _ := model.ChannelSatisfiesFilters(&channel, job.Model, snapshot.ChannelFilters()); !ok {
 			continue
 		}
-		candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, snapshot.SourceBody, capability.VideoOverrides, job.UserId, snapshot.SourceContentType)
+		candidate, err := request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, snapshot.SourceBody, snapshot.SourceContentType, capability.VideoOverrides, job.UserId)
 		if err == nil && videoRoutingRetryAllowed(channel, request, candidate) {
 			channels = append(channels, channel)
 		}
@@ -274,7 +274,7 @@ func videoRoutingRetryAllowed(channel model.Channel, request AsyncVideoRequest, 
 func RebindConditionalVideoRequest(ctx context.Context, job model.AsyncMediaJob, request *AsyncVideoRequest, channel model.Channel, overrides VideoModelOverrides) (MixedVideoCandidate, error) {
 	snapshot := request.ConditionalRouting
 	if snapshot == nil {
-		return DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, overrides, job.UserId, request.ContentType)
+		return request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, request.Body, request.ContentType, overrides, job.UserId)
 	}
 	if !snapshot.Fallback {
 		start, end := snapshot.TargetIndex, snapshot.TargetIndex+1
@@ -291,21 +291,27 @@ func RebindConditionalVideoRequest(ctx context.Context, job model.AsyncMediaJob,
 			if snapshot.Targets[index].Target.ChannelID != channel.Id {
 				continue
 			}
-			candidate, body, ct, err := DecodeFrozenVideoRoutingTarget(ctx, snapshot, index, job.Group, request.Operation, job.UserId)
+			candidate, body, ct, err := DecodeFrozenVideoRoutingTarget(ctx, snapshot, index, job.Group, request.Operation, job.UserId, request.frozenVideoMappingChannel())
 			if err != nil {
 				continue
+			}
+			keyIndex := slices.Index(candidate.Channel.GetKeys(), channel.Key)
+			if !sameVideoMappingOrigin(candidate.Channel, channel) || keyIndex < 0 ||
+				candidate.Channel.ChannelInfo.MultiKeyStatusList[keyIndex] != 0 && candidate.Channel.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusEnabled {
+				return candidate, errors.New("conditional video retry account or origin changed")
 			}
 			if err := applyVideoRoutingBody(request, body, ct, snapshot.Targets[index].Target.Resolution); err != nil {
 				return candidate, err
 			}
 			snapshot.TargetIndex = index
+			candidate.Channel.Key, candidate.Channel.Keys, candidate.Channel.ChannelInfo = channel.Key, channel.Keys, channel.ChannelInfo
 			return candidate, nil
 		}
 		if snapshot.Rule.OnExhausted != "original" {
 			return MixedVideoCandidate{}, errors.New("conditional video routing forbids original-route fallback")
 		}
 	}
-	candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, snapshot.SourceBody, overrides, job.UserId, snapshot.SourceContentType)
+	candidate, err := request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, snapshot.SourceBody, snapshot.SourceContentType, overrides, job.UserId)
 	if err != nil {
 		return candidate, fmt.Errorf("original video route: %w", err)
 	}

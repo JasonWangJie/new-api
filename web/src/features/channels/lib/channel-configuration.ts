@@ -61,6 +61,7 @@ const CONFIGURATION_BLOCKS = {
       'image_reference_timeout_retry_same_channel',
       'tianyue_media_compatibility',
       'image_resolution_model_mapping',
+      'video_resolution_model_mapping',
       'image_max_reference_bytes',
       'image_attempt_timeout_seconds',
       'image_concurrency_limit',
@@ -164,6 +165,7 @@ export function getChannelConfigurationState(
       values.video_reference_transport_mode === 'inline' ||
       values.image_reference_timeout_retry_same_channel ||
       values.image_resolution_model_mapping?.length ||
+      values.video_resolution_model_mapping?.length ||
       values.image_max_reference_bytes ||
       values.image_attempt_timeout_seconds ||
       values.image_concurrency_limit ||

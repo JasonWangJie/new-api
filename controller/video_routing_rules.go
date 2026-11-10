@@ -81,17 +81,22 @@ func GetVideoRoutingOptions(c *gin.Context) {
 		}
 		option := channelOption{ID: channel.Id, Name: channel.Name, Models: []modelOption{}}
 		for _, alias := range channel.GetModels() {
-			binding, upstream, err := service.MixedVideoChannelBinding(channel, alias, "create")
-			if err != nil {
-				continue
+			targets := make([]string, 0, 1)
+			for _, tier := range service.MixedVideoResolutionChoices(channel, alias, "create") {
+				binding, upstream, err := service.MixedVideoChannelBinding(channel, alias, "create", tier)
+				if err != nil {
+					continue
+				}
+				profile, err := service.EffectiveMixedVideoExecutionProfile(binding, alias, upstream, tier, service.VideoModelOverrides{})
+				if err == nil && slices.ContainsFunc(profile.Modes, func(mode jsplugin.VideoModeProfile) bool {
+					return mode.Name != "edit_video" && mode.Name != "extend_video"
+				}) && !slices.Contains(targets, upstream) {
+					targets = append(targets, upstream)
+				}
 			}
-			profile, err := service.EffectiveMixedVideoProfile(binding, alias, service.VideoModelOverrides{})
-			if err != nil || !slices.ContainsFunc(profile.Modes, func(mode jsplugin.VideoModeProfile) bool {
-				return mode.Name != "edit_video" && mode.Name != "extend_video"
-			}) {
-				continue
+			if len(targets) > 0 {
+				option.Models = append(option.Models, modelOption{Model: alias, UpstreamModel: strings.Join(targets, " / ")})
 			}
-			option.Models = append(option.Models, modelOption{Model: alias, UpstreamModel: upstream})
 		}
 		if len(option.Models) > 0 {
 			options = append(options, option)

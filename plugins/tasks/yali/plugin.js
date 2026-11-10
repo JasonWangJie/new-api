@@ -1,6 +1,7 @@
 const PUBLIC_MODEL = "minimax-h3-720p";
 const UPSTREAM_MODEL = "MiniMaxH3-720p-realistic";
 const MODELS = [PUBLIC_MODEL, UPSTREAM_MODEL];
+const H3_UPSTREAM_MODELS = [UPSTREAM_MODEL, "MiniMaxH3-480p", "MiniMaxH3-480p-sec", "MiniMaxH3-2k-pro-sec"];
 const ASPECT_RATIOS = ["16:9", "9:16"];
 const REQUEST_FIELDS = new Set([
   "model",
@@ -77,7 +78,7 @@ export const meta = {
   key: "yali",
   name: "Yali Video",
   icon: "text:YL",
-  version: "1.0.6",
+  version: "1.0.7",
   author: { name: "new-api contributors" },
   baseUrl: "https://api.yaliai.com",
   website: "https://api.yaliai.com/video-api.md",
@@ -268,13 +269,12 @@ export function buildSubmitRequest(ctx) {
   let model = ctx.upstreamModel || ctx.model;
   if (model === PUBLIC_MODEL) model = UPSTREAM_MODEL;
   const request = normalized.body;
-  // This provider calls its medium resolution 768P. The observed output is
-  // 1312x736, so the public capability and frozen billing fact remain 720p.
+  // Yali H3 uses 768P on the wire for the public 720p tier.
   const body = {
     model,
     prompt: request.prompt,
     seconds: request.seconds,
-    resolution: model === UPSTREAM_MODEL ? "768P" : request.resolution,
+    resolution: request.resolution === "720p" && H3_UPSTREAM_MODELS.includes(model) ? "768P" : request.resolution,
     aspect_ratio: request.aspect_ratio,
   };
   if (request.reference_images) body.images = request.reference_images;

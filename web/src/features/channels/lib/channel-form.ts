@@ -31,7 +31,7 @@ import {
   MODEL_FETCHABLE_TYPES,
   OPENAI_FIELD_PASSTHROUGH_TYPES,
 } from '../constants'
-import type { Channel } from '../types'
+import type { Channel, ChannelSettings } from '../types'
 import {
   CHANNEL_TYPE_ADVANCED_CUSTOM,
   advancedCustomConfigUsesRelativeUpstreamPath,
@@ -40,6 +40,7 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
+import { parseModelsString } from './model-mapping-validation'
 import { isChannelConfiguredVideoPlugin } from './task-video-models'
 
 // ============================================================================
@@ -70,6 +71,65 @@ function imageChannelLimitSchema(maximum: number) {
     .optional()
 }
 
+export const IMAGE_MODEL_RESOLUTION_FIELDS = [
+  { label: '1K', field: 'resolution_1k' },
+  { label: '2K', field: 'resolution_2k' },
+  { label: '4K', field: 'resolution_4k' },
+] as const
+
+export const VIDEO_MODEL_RESOLUTION_FIELDS = [
+  { label: '480p', field: 'resolution_480p' },
+  { label: '720p', field: 'resolution_720p' },
+  { label: '1080p', field: 'resolution_1080p' },
+  { label: '2k', field: 'resolution_2k' },
+  { label: '4k', field: 'resolution_4k' },
+] as const
+
+function validateResolutionMappings<Field extends string>(
+  rows: (Record<Field, string> & { model: string })[],
+  ctx: z.RefinementCtx,
+  resolutions: readonly { field: Field }[]
+) {
+  const sources = new Set<string>()
+  for (const [index, row] of rows.entries()) {
+    for (const field of [
+      'model',
+      ...resolutions.map(({ field }) => field),
+    ] as const) {
+      const value = row[field].trim()
+      if (field !== 'model' && !value) continue
+      if (
+        !value ||
+        new TextEncoder().encode(value).length > 255 ||
+        /[\p{Cc}*]/u.test(value)
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [index, field],
+          message:
+            'Model names must be 1–255 UTF-8 bytes without control characters or wildcards',
+        })
+      }
+    }
+    const source = row.model.trim()
+    if (sources.has(source)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [index, 'model'],
+        message: 'Duplicate source model mappings are not allowed',
+      })
+    }
+    sources.add(source)
+    if (!resolutions.some(({ field }) => row[field].trim())) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [index, resolutions[0].field],
+        message: 'Configure at least one resolution or delete this mapping',
+      })
+    }
+  }
+}
+
 const imageResolutionMappingSchema = z
   .array(
     z.object({
@@ -79,52 +139,24 @@ const imageResolutionMappingSchema = z
       resolution_4k: z.string(),
     })
   )
-  .superRefine((rows, ctx) => {
-    const sources = new Set<string>()
-    for (const [index, row] of rows.entries()) {
-      for (const field of [
-        'model',
-        'resolution_1k',
-        'resolution_2k',
-        'resolution_4k',
-      ] as const) {
-        const value = row[field].trim()
-        if (field !== 'model' && !value) continue
-        if (
-          !value ||
-          new TextEncoder().encode(value).length > 255 ||
-          /[\p{Cc}*]/u.test(value)
-        ) {
-          ctx.addIssue({
-            code: 'custom',
-            path: [index, field],
-            message:
-              'Model names must be 1–255 UTF-8 bytes without control characters or wildcards',
-          })
-        }
-      }
-      const source = row.model.trim()
-      if (sources.has(source)) {
-        ctx.addIssue({
-          code: 'custom',
-          path: [index, 'model'],
-          message: 'Duplicate source model mappings are not allowed',
-        })
-      }
-      sources.add(source)
-      if (
-        !row.resolution_1k.trim() &&
-        !row.resolution_2k.trim() &&
-        !row.resolution_4k.trim()
-      ) {
-        ctx.addIssue({
-          code: 'custom',
-          path: [index, 'resolution_1k'],
-          message: 'Configure at least one resolution or delete this mapping',
-        })
-      }
-    }
-  })
+  .superRefine((rows, ctx) =>
+    validateResolutionMappings(rows, ctx, IMAGE_MODEL_RESOLUTION_FIELDS)
+  )
+
+const videoResolutionMappingSchema = z
+  .array(
+    z.object({
+      model: z.string(),
+      resolution_480p: z.string(),
+      resolution_720p: z.string(),
+      resolution_1080p: z.string(),
+      resolution_2k: z.string(),
+      resolution_4k: z.string(),
+    })
+  )
+  .superRefine((rows, ctx) =>
+    validateResolutionMappings(rows, ctx, VIDEO_MODEL_RESOLUTION_FIELDS)
+  )
 
 function isOptionalProxyURL(value: string | undefined): boolean {
   const trimmedValue = value?.trim() || ''
@@ -386,6 +418,7 @@ export const channelFormSchema = z
     tianyue_media_compatibility: z.boolean().optional(),
     image_reference_timeout_retry_same_channel: z.boolean().optional(),
     image_resolution_model_mapping: imageResolutionMappingSchema.optional(),
+    video_resolution_model_mapping: videoResolutionMappingSchema.optional(),
     image_max_reference_bytes: imageChannelLimitSchema(
       IMAGE_CHANNEL_EXECUTION_LIMITS.image_max_reference_bytes
     ),
@@ -420,6 +453,24 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (
+      data.type === CHANNEL_TYPE_TASK_PLUGIN &&
+      data.video_resolution_model_mapping?.length
+    ) {
+      const models = new Set(parseModelsString(data.models))
+      for (const [
+        index,
+        row,
+      ] of data.video_resolution_model_mapping.entries()) {
+        if (row.model.trim() && !models.has(row.model.trim())) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['video_resolution_model_mapping', index, 'model'],
+            message: 'Select a model enabled on this channel',
+          })
+        }
+      }
+    }
     if (
       data.video_reference_transport_mode === 'inline' &&
       data.type !== 48 &&
@@ -606,6 +657,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   tianyue_media_compatibility: false,
   image_reference_timeout_retry_same_channel: false,
   image_resolution_model_mapping: [],
+  video_resolution_model_mapping: [],
   image_max_reference_bytes: undefined,
   image_attempt_timeout_seconds: undefined,
   image_concurrency_limit: undefined,
@@ -665,6 +717,9 @@ export function transformChannelToFormDefaults(
     image_reference_timeout_retry_same_channel: false,
     image_resolution_model_mapping: [] as NonNullable<
       ChannelFormValues['image_resolution_model_mapping']
+    >,
+    video_resolution_model_mapping: [] as NonNullable<
+      ChannelFormValues['video_resolution_model_mapping']
     >,
     image_max_reference_bytes:
       CHANNEL_FORM_DEFAULT_VALUES.image_max_reference_bytes,
@@ -727,6 +782,18 @@ export function transformChannelToFormDefaults(
           resolution_1k: resolutions['1K'] || '',
           resolution_2k: resolutions['2K'] || '',
           resolution_4k: resolutions['4K'] || '',
+        })),
+        video_resolution_model_mapping: Object.entries(
+          (parsed.video_resolution_model_mapping || {}) as NonNullable<
+            ChannelSettings['video_resolution_model_mapping']
+          >
+        ).map(([model, resolutions]) => ({
+          model,
+          resolution_480p: resolutions['480p'] || '',
+          resolution_720p: resolutions['720p'] || '',
+          resolution_1080p: resolutions['1080p'] || '',
+          resolution_2k: resolutions['2k'] || '',
+          resolution_4k: resolutions['4k'] || '',
         })),
         pass_through_body_enabled: parsed.pass_through_body_enabled || false,
         image_max_reference_bytes:
@@ -925,11 +992,26 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
       formData.image_resolution_model_mapping.map((row) => [
         row.model.trim(),
         Object.fromEntries(
-          [
-            ['1K', row.resolution_1k.trim()],
-            ['2K', row.resolution_2k.trim()],
-            ['4K', row.resolution_4k.trim()],
-          ].filter(([, target]) => target)
+          IMAGE_MODEL_RESOLUTION_FIELDS.map(({ label, field }) => [
+            label,
+            row[field].trim(),
+          ]).filter(([, target]) => target)
+        ),
+      ])
+    )
+  }
+  if (
+    formData.type === CHANNEL_TYPE_TASK_PLUGIN &&
+    formData.video_resolution_model_mapping?.length
+  ) {
+    settingObj.video_resolution_model_mapping = Object.fromEntries(
+      formData.video_resolution_model_mapping.map((row) => [
+        row.model.trim(),
+        Object.fromEntries(
+          VIDEO_MODEL_RESOLUTION_FIELDS.map(({ label, field }) => [
+            label,
+            row[field].trim(),
+          ]).filter(([, target]) => target)
         ),
       ])
     )

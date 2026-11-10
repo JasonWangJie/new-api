@@ -28,7 +28,7 @@ export const meta = {
   key: "huahuo-video",
   name: "HUAHUO Video",
   icon: "text:HH",
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "new-api contributors" },
   baseUrl: "https://huahuo.ccwu.cc",
   website: "https://huahuo.ccwu.cc/video",
@@ -241,12 +241,13 @@ function decode(body) {
 
 export function buildSubmitRequest(ctx) {
   const request = ctx.requestBody;
+  const model = ctx.upstreamModel || ctx.model;
   const body = {
-    model: ctx.upstreamModel || ctx.model,
+    model,
     prompt: request.prompt,
     seconds: String(request.seconds),
     size: request.aspect_ratio,
-    resolution: request.resolution,
+    resolution: model === "inmind/video/minimax-h3-2" && request.resolution === "720p" ? "768p" : request.resolution,
   };
   const descriptor = { method: "POST", url: videoURL(ctx), headers: { Authorization: "Bearer " + ctx.apiKey, "Idempotency-Key": taskId(ctx.publicTaskId) } };
   if (ctx.action === "first_last_frame") {

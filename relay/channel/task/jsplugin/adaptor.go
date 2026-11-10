@@ -129,6 +129,8 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	request, hasRequest := c.Get("task_request")
+	h3PublicResolution := c.GetBool("async_media_mixed_video") &&
+		model.IsMiniMaxH3VideoModel(a.plugin.Meta.Key, cmp.Or(info.UpstreamModelName, info.OriginModelName))
 	if kitdto.ChannelConfiguredTaskVideoPlugin(a.plugin.Meta.Key) && hasRequest {
 		modelName := cmp.Or(info.UpstreamModelName, info.OriginModelName)
 		profile, exists := a.plugin.Meta.VideoProfileForModel(modelName)
@@ -136,20 +138,32 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 			return service.TaskErrorWrapperLocal(fmt.Errorf("missing saved video model configuration"), "plugin_request_invalid", http.StatusBadRequest)
 		}
 		if exists {
+			validationRequest := request
+			if h3PublicResolution {
+				var err error
+				binding := pluginruntime.ProtocolBinding{Plugin: a.plugin, Model: modelName}
+				profile, err = service.EffectiveMixedVideoProfile(binding, modelName, service.VideoModelOverrides{})
+				if err != nil {
+					return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+				}
+				if body, ok := request.(map[string]any); ok {
+					validationRequest = service.MixedVideoValidationDimensions(body, a.plugin.Meta.Key, modelName)
+				}
+			}
 			var files []map[string]any
 			if value, exists := c.Get(pluginruntime.ContextKeyProtocolRequest); exists {
 				if protocol, valid := value.(pluginruntime.ProtocolRequestContext); valid {
 					files = protocol.Files
 				}
 			}
-			if err := service.ValidateVideoProfileRequest(profile, info.Action, request, files); err != nil {
+			if err := service.ValidateVideoProfileRequest(profile, info.Action, validationRequest, files); err != nil {
 				return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
 			}
 		}
 	}
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
 	if hasRequest && !hasUsageProfiles {
-		if err := a.validateResolvedUsageRequest(request, ""); err != nil {
+		if err := a.validateResolvedUsageRequest(request, "", h3PublicResolution); err != nil {
 			return service.TaskErrorWrapperLocal(err, "plugin_usage_invalid", http.StatusBadRequest)
 		}
 	}
@@ -160,7 +174,7 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	// that final model before any quota calculation or upstream submission.
 	if hasRequest && hasUsageProfiles {
 		usageModel := cmp.Or(info.UpstreamModelName, info.OriginModelName)
-		if err := a.validateResolvedUsageRequest(request, usageModel); err != nil {
+		if err := a.validateResolvedUsageRequest(request, usageModel, h3PublicResolution); err != nil {
 			return service.TaskErrorWrapperLocal(err, "plugin_usage_invalid", http.StatusBadRequest)
 		}
 	}
@@ -1503,6 +1517,9 @@ func (a *TaskAdaptor) buildSubmit(c *gin.Context, info *relaycommon.RelayInfo) (
 		info.OriginModelName = descriptor.Model
 	}
 	if descriptor.RewriteModel != "" {
+		if mapping := service.PinnedMixedVideoResolutionMapping(c); mapping != nil && descriptor.RewriteModel != mapping.UpstreamModel {
+			return nil, errors.New("plugin changed the mapped video model")
+		}
 		info.UpstreamModelName = descriptor.RewriteModel
 	}
 	a.submit = &descriptor
@@ -1677,8 +1694,16 @@ func (a *TaskAdaptor) usageRatios(ctx context.Context, modelName, hook string, a
 	return ratios, nil
 }
 
-func (a *TaskAdaptor) validateResolvedUsageRequest(request any, modelName string) error {
+func (a *TaskAdaptor) validateResolvedUsageRequest(request any, modelName string, h3PublicResolution bool) error {
 	schema, _ := a.plugin.Meta.UsageForModel(modelName)
+	if resolution := schema["resolution"]; h3PublicResolution &&
+		!slices.Contains(resolution.Enum, "720p") && slices.ContainsFunc(resolution.Enum, func(value string) bool {
+		return strings.EqualFold(value, "768p")
+	}) {
+		schema = maps.Clone(schema)
+		resolution.Enum = append(slices.Clone(resolution.Enum), "720p")
+		schema["resolution"] = resolution
+	}
 	return a.validateResolvedUsageValue(jsonValue(request), schema)
 }
 

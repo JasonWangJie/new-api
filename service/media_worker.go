@@ -30,8 +30,9 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
-	ConditionalRouting               *VideoRoutingSnapshot `json:"conditional_routing,omitempty"`
-	MixedRouting                     *MixedVideoRouting    `json:"mixed_routing,omitempty"`
+	ConditionalRouting               *VideoRoutingSnapshot        `json:"conditional_routing,omitempty"`
+	MixedRouting                     *MixedVideoRouting           `json:"mixed_routing,omitempty"`
+	ResolutionMapping                *MixedVideoResolutionMapping `json:"video_resolution_mapping,omitempty"`
 	Body                             []byte
 	ContentType                      string
 	ClientIP                         string

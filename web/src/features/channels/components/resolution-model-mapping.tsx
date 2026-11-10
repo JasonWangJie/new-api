@@ -30,48 +30,73 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 
-import type { ChannelFormValues } from '../lib/channel-form'
+import {
+  IMAGE_MODEL_RESOLUTION_FIELDS,
+  VIDEO_MODEL_RESOLUTION_FIELDS,
+  type ChannelFormValues,
+} from '../lib/channel-form'
 
-const resolutions = [
-  { label: '1K', field: 'resolution_1k' },
-  { label: '2K', field: 'resolution_2k' },
-  { label: '4K', field: 'resolution_4k' },
-] as const
+const imageColumns = IMAGE_MODEL_RESOLUTION_FIELDS.map(({ label, field }) => ({
+  label,
+  fieldName: (index: number) =>
+    `image_resolution_model_mapping.${index}.${field}` as const,
+}))
 
-export function ImageResolutionModelMapping(props: {
+const videoColumns = VIDEO_MODEL_RESOLUTION_FIELDS.map(({ label, field }) => ({
+  label,
+  fieldName: (index: number) =>
+    `video_resolution_model_mapping.${index}.${field}` as const,
+}))
+
+export function ResolutionModelMapping(props: {
   form: UseFormReturn<ChannelFormValues>
   models: string[]
+  media: 'image' | 'video'
   disabled: boolean
 }) {
   const { t } = useTranslation()
+  const isVideo = props.media === 'video'
+  const name = isVideo
+    ? 'video_resolution_model_mapping'
+    : 'image_resolution_model_mapping'
+  const resolutions = isVideo ? videoColumns : imageColumns
+  const title = isVideo
+    ? t('Async video resolution model mapping')
+    : t('Async image resolution model mapping')
   const mappings = useFieldArray({
     control: props.form.control,
-    name: 'image_resolution_model_mapping',
+    name,
   })
   const rows =
     useWatch({
       control: props.form.control,
-      name: 'image_resolution_model_mapping',
+      name,
     }) || []
   const availableModels = props.models.filter(
     (model) => !rows.some((row) => row.model.trim() === model)
   )
 
   return (
-    <div className='space-y-3 sm:col-span-2'>
-      <p className='text-sm font-medium'>
-        {t('Async image resolution model mapping')}
-      </p>
+    <div
+      role='group'
+      aria-label={title}
+      className='min-w-0 space-y-3 sm:col-span-2'
+    >
+      <p className='text-sm font-medium'>{title}</p>
       <p className='text-muted-foreground text-sm'>
-        {t(
-          'Only asynchronous images use these upstream models. Blank resolutions are unsupported. Delete a row to restore ordinary model mapping.'
-        )}
+        {isVideo
+          ? t(
+              'Mixed async video requires an explicit resolution for mapped models. Blank resolutions are unsupported. Delete a row to restore ordinary model mapping.'
+            )
+          : t(
+              'Only asynchronous images use these upstream models. Blank resolutions are unsupported. Delete a row to restore ordinary model mapping.'
+            )}
       </p>
       {mappings.fields.length > 0 && (
         <StaticDataTable
           data={mappings.fields}
           getRowKey={(row) => row.id}
-          tableClassName='min-w-[640px]'
+          tableClassName={isVideo ? 'min-w-[960px]' : 'min-w-[640px]'}
           columns={[
             {
               id: 'model',
@@ -80,7 +105,7 @@ export function ImageResolutionModelMapping(props: {
               cell: (_, index) => (
                 <FormField
                   control={props.form.control}
-                  name={`image_resolution_model_mapping.${index}.model`}
+                  name={`${name}.${index}.model`}
                   render={({ field }) => {
                     const options = [
                       ...new Set([...availableModels, field.value || '']),
@@ -123,7 +148,7 @@ export function ImageResolutionModelMapping(props: {
               cell: (_: unknown, index: number) => (
                 <FormField
                   control={props.form.control}
-                  name={`image_resolution_model_mapping.${index}.${resolution.field}`}
+                  name={resolution.fieldName(index)}
                   render={({ field }) => (
                     <FormItem>
                       <FormControl>
@@ -172,14 +197,26 @@ export function ImageResolutionModelMapping(props: {
         variant='outline'
         size='sm'
         disabled={props.disabled || availableModels.length === 0}
-        onClick={() =>
-          mappings.append({
-            model: availableModels.length === 1 ? availableModels[0] : '',
-            resolution_1k: '',
-            resolution_2k: '',
-            resolution_4k: '',
-          })
-        }
+        onClick={() => {
+          const model = availableModels.length === 1 ? availableModels[0] : ''
+          mappings.append(
+            isVideo
+              ? {
+                  model,
+                  resolution_480p: '',
+                  resolution_720p: '',
+                  resolution_1080p: '',
+                  resolution_2k: '',
+                  resolution_4k: '',
+                }
+              : {
+                  model,
+                  resolution_1k: '',
+                  resolution_2k: '',
+                  resolution_4k: '',
+                }
+          )
+        }}
       >
         {t('Add resolution mapping')}
       </Button>

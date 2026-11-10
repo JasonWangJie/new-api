@@ -49,7 +49,7 @@ export const meta = {
   key: "wolong",
   name: "Wolong Video",
   icon: "text:卧龙",
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "new-api contributors" },
   baseUrl: "https://wolongvideo.com",
   website: "https://wolongvideo.com/docs.html",
@@ -344,7 +344,9 @@ export function buildSubmitRequest(ctx) {
   const request = normalizeRequest(ctx.requestBody, ctx.upstreamModel || ctx.model).body;
   if (typeof ctx.publicTaskId !== "string" || !/^[A-Za-z0-9._:-]{8,128}$/.test(ctx.publicTaskId))
     throw new Error("Wolong requires a valid public task id for idempotency");
-  const body = { model: request.model, prompt: request.prompt, duration: request.seconds, quality: request.resolution, ratio: request.aspect_ratio };
+  const h3 = request.model === "czniu-minimax-h3-15s" || request.model === "czniu-minimax-h3-30s";
+  const quality = h3 && request.resolution === "720p" ? "768p" : request.resolution;
+  const body = { model: request.model, prompt: request.prompt, duration: request.seconds, quality, ratio: request.aspect_ratio };
   for (const [source, target] of [
     ["reference_images", "image_urls"],
     ["reference_videos", "video_urls"],

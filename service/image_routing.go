@@ -359,6 +359,10 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			operation = "extend"
 		}
 		if operation == "create" {
+			requiresResolution, resolutionErr := MixedVideoRequiresExplicitResolution(ctx, policy, routingGroups, input.Model, parameters)
+			if resolutionErr != nil {
+				return preview, resolutionErr
+			}
 			config, configErr := model.GetVideoRoutingConfig(ctx)
 			if input.VideoRoutingConfig != nil {
 				config, configErr = *input.VideoRoutingConfig, nil
@@ -367,7 +371,11 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				return preview, configErr
 			}
 			input.VideoRoutingConfig = &config
-			_, _, videoParameters, err = NormalizeVideoRoutingAdmissionDefaults(config, input.Model, routingGroups, raw, "application/json", operation, profilesByGroup, input.VideoInput)
+			if requiresResolution {
+				err = errors.New("an explicit video resolution is required for model mapping")
+			} else {
+				_, _, videoParameters, err = NormalizeVideoRoutingAdmissionDefaults(config, input.Model, routingGroups, raw, "application/json", operation, profilesByGroup, input.VideoInput)
+			}
 		} else {
 			_, _, videoParameters, err = NormalizeMixedVideoDefaults(raw, "application/json", operation, profiles)
 		}
@@ -493,6 +501,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					candidate.Reasons = append(candidate.Reasons, "platform_mismatch")
 				}
 				videoBindings := mediaVideoCandidates(input.Model)
+				mappingTier := ""
 				if input.Platform == "mixed" {
 					operation := "create"
 					if input.Operation == "edit_video" {
@@ -500,10 +509,14 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					} else if input.Operation == "extend_video" {
 						operation = "extend"
 					}
-					binding, _, err := MixedVideoChannelBinding(channel, input.Model, operation)
+					if choices := MixedVideoResolutionChoices(channel, input.Model, operation); len(choices) > 0 && choices[0] != "" {
+						mappingTier = NormalizeVideoResolution(input.Resolution)
+					}
+					binding, upstream, err := MixedVideoChannelBinding(channel, input.Model, operation, mappingTier)
 					videoBindings = nil
 					if err == nil {
 						videoBindings = []jsplugin.ProtocolBinding{binding}
+						candidate.UpstreamModel = upstream
 					} else {
 						candidate.Reasons = append(candidate.Reasons, "operation_not_supported")
 					}
@@ -519,7 +532,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 					}
 					profile, err := EffectiveVideoProfile(binding, input.Model, overrides)
 					if input.Platform == "mixed" {
-						profile, err = EffectiveMixedVideoProfile(binding, input.Model, overrides)
+						profile, err = EffectiveMixedVideoExecutionProfile(binding, input.Model, candidate.UpstreamModel, mappingTier, overrides)
 					}
 					if err != nil {
 						candidate.Reasons = append(candidate.Reasons, "video_parameters_not_supported")
@@ -568,10 +581,12 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			if candidate.AvailableAccounts == 0 {
 				candidate.Reasons = append(candidate.Reasons, "no_enabled_account")
 			}
-			var mappingErr error
-			candidate.UpstreamModel, mappingErr = ResolveImageChannelUpstreamModel(channel, input.Model)
-			if mappingErr != nil {
-				candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
+			if candidate.UpstreamModel == "" && (input.MediaType != "video" || input.Platform != "mixed") {
+				var mappingErr error
+				candidate.UpstreamModel, mappingErr = ResolveImageChannelUpstreamModel(channel, input.Model)
+				if mappingErr != nil {
+					candidate.Reasons = append(candidate.Reasons, "invalid_model_mapping")
+				}
 			}
 			if len(candidate.Reasons) > 0 {
 				preview.Excluded = append(preview.Excluded, candidate)

@@ -37,10 +37,11 @@ type MixedVideoRouting struct {
 }
 
 type MixedVideoCandidate struct {
-	Channel       model.Channel
-	Binding       jsplugin.ProtocolBinding
-	UpstreamModel string
-	Intent        map[string]any
+	Channel           model.Channel
+	Binding           jsplugin.ProtocolBinding
+	UpstreamModel     string
+	Intent            map[string]any
+	ResolutionMapping *MixedVideoResolutionMapping
 }
 
 func MixedVideoPolicyCapability(catalog []ImageModelCapability, publicModel string) (ImageModelCapability, bool) {
@@ -55,8 +56,21 @@ func MixedVideoPolicyCapability(catalog []ImageModelCapability, publicModel stri
 
 // MixedVideoChannelBinding resolves aliases inside one explicit pool member;
 // global aliases deliberately remain unambiguous for all other relay paths.
-func MixedVideoChannelBinding(channel model.Channel, publicModel, operation string) (jsplugin.ProtocolBinding, string, error) {
-	upstream, err := ResolveImageChannelUpstreamModel(channel, publicModel)
+func MixedVideoChannelBinding(channel model.Channel, publicModel, operation string, resolution ...string) (jsplugin.ProtocolBinding, string, error) {
+	tier := ""
+	if len(resolution) > 0 {
+		tier = resolution[0]
+	}
+	settings := channel.GetSetting()
+	mapped := (operation == "" || operation == "create") && len(settings.VideoResolutionModelMapping[publicModel]) > 0
+	var upstream string
+	var config kitdto.TaskVideoModelConfig
+	var err error
+	if mapped {
+		upstream, config, err = channel.TaskVideoResolutionModelConfig(publicModel, tier)
+	} else {
+		upstream, err = ResolveImageChannelUpstreamModel(channel, publicModel)
+	}
 	if err != nil {
 		return jsplugin.ProtocolBinding{}, "", err
 	}
@@ -73,6 +87,25 @@ func MixedVideoChannelBinding(channel model.Channel, publicModel, operation stri
 	generation := jsplugin.DefaultRegistry.Generation()
 	if generation == nil {
 		return jsplugin.ProtocolBinding{}, "", errors.New("video plugins are unavailable")
+	}
+	if mapped {
+		plugin, found := generation.Get(settings.TaskPluginKey)
+		if !found {
+			return jsplugin.ProtocolBinding{}, "", errors.New("mapped video plugin is unavailable")
+		}
+		if kitdto.ChannelConfiguredTaskVideoPlugin(plugin.Meta.Key) {
+			plugin = jsplugin.WithTaskVideoModels(plugin, map[string]kitdto.TaskVideoModelConfig{upstream: config})
+			generation, err = generation.RebuildWithPlugins([]*jsplugin.LoadedPlugin{plugin})
+			if err != nil {
+				return jsplugin.ProtocolBinding{}, "", err
+			}
+		}
+		for _, binding := range generation.LookupEndpointCandidates(http.MethodPost, path, upstream) {
+			if binding.Plugin == plugin && binding.Protocol == "openai_video" {
+				return binding, upstream, nil
+			}
+		}
+		return jsplugin.ProtocolBinding{}, "", fmt.Errorf("channel %d has no video protocol for mapped model %q", channel.Id, upstream)
 	}
 	if channel.Type == constant.ChannelTypeTaskPlugin && kitdto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) && (operation == "" || operation == "create") {
 		binding, err := FrozenTaskVideoBinding(&channel, publicModel)
@@ -98,6 +131,12 @@ func MixedVideoChannelBinding(channel model.Channel, publicModel, operation stri
 // EffectiveMixedVideoProfile intersects a member with the public allowlist.
 // Unlike provider overrides, a mixed allowlist may include other members' modes.
 func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel string, overrides VideoModelOverrides) (jsplugin.VideoProfile, error) {
+	return EffectiveMixedVideoExecutionProfile(binding, publicModel, binding.Model, "", overrides)
+}
+
+// EffectiveMixedVideoExecutionProfile limits the public view of a mapped
+// target to the one tier it serves, without altering its native profile.
+func EffectiveMixedVideoExecutionProfile(binding jsplugin.ProtocolBinding, publicModel, upstream, tier string, overrides VideoModelOverrides) (jsplugin.VideoProfile, error) {
 	profile, err := EffectiveVideoProfile(binding, publicModel, VideoModelOverrides{})
 	if err != nil {
 		return profile, err
@@ -106,6 +145,32 @@ func EffectiveMixedVideoProfile(binding jsplugin.ProtocolBinding, publicModel st
 	for _, mode := range profile.Modes {
 		if overrides.Modes != nil && !slices.Contains(overrides.Modes, mode.Name) {
 			continue
+		}
+		if model.IsMiniMaxH3VideoModel(binding.Plugin.Meta.Key, upstream) {
+			resolutions := make([]string, 0, len(mode.Resolutions))
+			for _, resolution := range mode.Resolutions {
+				publicResolution := publicH3VideoResolution(resolution)
+				if !slices.Contains(resolutions, publicResolution) {
+					resolutions = append(resolutions, publicResolution)
+				}
+			}
+			mode.Resolutions = resolutions
+			mode.DefaultResolution = publicH3VideoResolution(mode.DefaultResolution)
+			if duration, exists := mode.DurationsByResolution["768p"]; exists {
+				mode.DurationsByResolution = maps.Clone(mode.DurationsByResolution)
+				if _, has720p := mode.DurationsByResolution["720p"]; !has720p {
+					mode.DurationsByResolution["720p"] = duration
+				}
+				delete(mode.DurationsByResolution, "768p")
+			}
+		}
+		if tier != "" {
+			if mode.Name == "edit_video" || mode.Name == "extend_video" || !slices.ContainsFunc(mode.Resolutions, func(resolution string) bool {
+				return strings.EqualFold(resolution, tier)
+			}) {
+				continue
+			}
+			mode.Resolutions, mode.DefaultResolution = []string{tier}, tier
 		}
 		if binding.Plugin.Meta.Key == constant.TaskPlatformHuahuoVideo && len(mode.Resolutions) > 0 {
 			// The mixed retail price only accepts canonical resolution facts.
@@ -484,10 +549,6 @@ func mixedVideoAspectRatio(body, metadata map[string]any, profiles ...jsplugin.V
 // Returned objects belong to this call and are never reused by another plugin.
 func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publicModel, operation string, raw []byte, overrides VideoModelOverrides, userID int, contentTypes ...string) (MixedVideoCandidate, error) {
 	var candidate MixedVideoCandidate
-	binding, upstream, err := MixedVideoChannelBinding(channel, publicModel, operation)
-	if err != nil {
-		return candidate, err
-	}
 	contentType := "application/json"
 	if len(contentTypes) > 0 {
 		contentType = contentTypes[0]
@@ -499,7 +560,19 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 	if body["model"] != publicModel {
 		return candidate, errors.New("mixed video public model changed")
 	}
-	profile, err := EffectiveMixedVideoProfile(binding, publicModel, overrides)
+	tier := ""
+	mapped := (operation == "" || operation == "create") && len(channel.GetSetting().VideoResolutionModelMapping[publicModel]) > 0
+	if mapped {
+		tier = mixedVideoMappingTier(body)
+		if tier == "" {
+			return candidate, errors.New("an explicit video resolution is required for model mapping")
+		}
+	}
+	binding, upstream, err := MixedVideoChannelBinding(channel, publicModel, operation, tier)
+	if err != nil {
+		return candidate, err
+	}
+	profile, err := EffectiveMixedVideoExecutionProfile(binding, publicModel, upstream, tier, overrides)
 	if err != nil {
 		return candidate, err
 	}
@@ -533,10 +606,14 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 		return candidate, fmt.Errorf("video mode %q is not enabled", action)
 	}
 	decoded, _ := intent["requestBody"].(map[string]any)
+	decoded = MixedVideoValidationDimensions(decoded, binding.Plugin.Meta.Key, upstream)
 	if err := ValidateVideoProfileRequest(profile, action, mixedVideoValidationBody(profile.Modes[modeIndex], body, decoded, view.Files), view.Files); err != nil {
 		return candidate, err
 	}
 	if normalized, present := intent["requestBody"]; present {
+		if decoded != nil {
+			normalized = decoded
+		}
 		if err := ValidateVideoProfileRequest(profile, action, normalized, view.Files); err != nil {
 			return candidate, err
 		}
@@ -585,7 +662,11 @@ func DecodeMixedVideoCandidate(ctx context.Context, channel model.Channel, publi
 			}
 		}
 	}
-	return MixedVideoCandidate{Channel: channel, Binding: binding, UpstreamModel: upstream, Intent: intent}, nil
+	candidate = MixedVideoCandidate{Channel: channel, Binding: binding, UpstreamModel: upstream, Intent: intent}
+	if mapped {
+		candidate.ResolutionMapping = newMixedVideoResolutionMapping(channel, tier, upstream)
+	}
+	return candidate, nil
 }
 
 // MixedVideoRequestContext parses the existing public JSON/multipart formats
@@ -835,6 +916,7 @@ func MixedVideoAttempt(candidate MixedVideoCandidate, generation int64) *model.V
 // original request, public routing identity or frozen retail reservation.
 func RebindMixedVideoRequest(request *AsyncVideoRequest, candidate MixedVideoCandidate, expiresAt int64) error {
 	request.Channel = candidate.Channel
+	request.ResolutionMapping = candidate.ResolutionMapping
 	request.PluginHash = candidate.Binding.Plugin.Engine.SourceFingerprint()
 	execution := &model.TaskExecutionSnapshot{}
 	if request.Execution != nil {

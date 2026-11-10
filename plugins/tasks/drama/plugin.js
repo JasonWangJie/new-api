@@ -145,7 +145,7 @@ export const meta = {
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.8",
+  version: "1.1.9",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
@@ -492,10 +492,12 @@ export function buildSubmitRequest(ctx) {
   const model = ctx.upstreamModel || ctx.model;
   const prepared = normalizeRequest(ctx.requestBody, model, ctx.action);
   const config = modelConfig(model);
+  const resolution = prepared.body.resolution;
+  const h3 = config.series === "H3" || model === "minimax-h3-2k";
   const body = {
     model,
     prompt: prepared.body.prompt,
-    resolution: prepared.body.resolution,
+    resolution: h3 && resolution === "720p" ? "768p" : resolution,
     aspect_ratio: prepared.body.aspect_ratio,
     seconds: prepared.action === "edit_video" ? -1 : prepared.body.seconds,
   };

@@ -191,12 +191,16 @@ func PreviewConditionalVideoRouting(ctx context.Context, input MediaRoutingPrevi
 			if len(ImageChannelAccounts(channel, ImageAccountRouting{})) == 0 {
 				entry.Reasons = append(entry.Reasons, "no_available_accounts")
 			}
-			binding, upstream, bindErr := MixedVideoChannelBinding(channel, target.Model, "create")
+			tier := ""
+			if choices := MixedVideoResolutionChoices(channel, target.Model, "create"); len(choices) > 0 && choices[0] != "" {
+				tier = entry.Resolution
+			}
+			binding, upstream, bindErr := MixedVideoChannelBinding(channel, target.Model, "create", tier)
 			entry.UpstreamModel = upstream
 			if bindErr != nil {
 				entry.Reasons = append(entry.Reasons, SanitizeAsyncImageDiagnostic(bindErr.Error(), 512))
 			} else {
-				profile, validationErr := EffectiveMixedVideoProfile(binding, target.Model, VideoModelOverrides{})
+				profile, validationErr := EffectiveMixedVideoExecutionProfile(binding, target.Model, upstream, tier, VideoModelOverrides{})
 				if validationErr == nil {
 					profile, validationErr = videoRoutingPreviewProfileForInputs(profile, mode, input.VideoInput)
 				}

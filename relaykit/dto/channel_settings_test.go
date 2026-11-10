@@ -153,6 +153,37 @@ func TestChannelImageResolutionModelMapping(t *testing.T) {
 	}
 }
 
+func TestChannelVideoResolutionModelMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name, mapping string
+		invalid       bool
+	}{
+		{name: "exact video specifications", mapping: `{"h3":{"480p":"h3-small","720p":"h3-main","2k":"h3-main"}}`},
+		{name: "duplicate model", mapping: `{"h3":{"720p":"one"},"h3":{"2k":"two"}}`, invalid: true},
+		{name: "duplicate specification", mapping: `{"h3":{"720p":"one","720p":"two"}}`, invalid: true},
+		{name: "native specification", mapping: `{"h3":{"768p":"target"}}`, invalid: true},
+		{name: "noncanonical specification", mapping: `{"h3":{"2K":"target"}}`, invalid: true},
+		{name: "empty model specifications", mapping: `{"h3":{}}`, invalid: true},
+		{name: "invalid target", mapping: `{"h3":{"720p":"target,other"}}`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var settings ChannelSettings
+			err := kitutil.Unmarshal([]byte(`{"task_plugin_key":"yali","video_resolution_model_mapping":`+tc.mapping+`}`), &settings)
+			if err == nil {
+				err = settings.ValidateTaskVideoModels(3600)
+			}
+			if tc.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			encoded, err := kitutil.Marshal(settings)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.mapping, gjson.GetBytes(encoded, "video_resolution_model_mapping").Raw)
+		})
+	}
+}
+
 func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

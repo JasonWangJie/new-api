@@ -134,15 +134,23 @@ func ValidateVideoRoutingConfig(ctx context.Context, config model.VideoRoutingCo
 			if !groupAllowed {
 				return fmt.Errorf("Rule %q target channel %d has no matching enabled group", rule.ID, target.ChannelID)
 			}
-			binding, _, err := MixedVideoChannelBinding(channel, target.Model, "create")
-			if err != nil {
-				return fmt.Errorf("Rule %q target channel %d: %w", rule.ID, target.ChannelID, err)
+			compatible := false
+			tiers := MixedVideoResolutionChoices(channel, target.Model, "create")
+			for _, tier := range tiers {
+				binding, upstream, err := MixedVideoChannelBinding(channel, target.Model, "create", tier)
+				if err != nil {
+					if len(tiers) == 1 && tier == "" {
+						return fmt.Errorf("Rule %q target channel %d: %w", rule.ID, target.ChannelID, err)
+					}
+					continue
+				}
+				profile, err := EffectiveMixedVideoExecutionProfile(binding, target.Model, upstream, tier, VideoModelOverrides{})
+				if err == nil && videoRoutingTargetCanMatch(rule.Match, target, profile, minimum, maximum) {
+					compatible = true
+					break
+				}
 			}
-			profile, err := EffectiveMixedVideoProfile(binding, target.Model, VideoModelOverrides{})
-			if err != nil {
-				return fmt.Errorf("Rule %q target channel %d: %w", rule.ID, target.ChannelID, err)
-			}
-			if !videoRoutingTargetCanMatch(rule.Match, target, profile, minimum, maximum) {
+			if !compatible {
 				return fmt.Errorf("Rule %q target channel %d has no compatible mode, resolution and duration", rule.ID, target.ChannelID)
 			}
 		}

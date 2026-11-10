@@ -211,6 +211,9 @@ func (d TaskVideoDuration) validate(maxSeconds int) error {
 }
 
 func (s *ChannelSettings) ValidateTaskVideoModels(maxSeconds int) error {
+	if err := s.VideoResolutionModelMapping.Validate(); err != nil {
+		return err
+	}
 	if s.TaskPluginModelSourceURL == "" && len(s.TaskPluginModelConfigs) == 0 {
 		return nil
 	}

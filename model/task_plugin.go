@@ -215,17 +215,18 @@ func GetTaskPluginSyncSnapshot() (TaskPluginSyncSnapshot, error) {
 		videoModels[key] = catalog
 	}
 	type videoBinding struct {
-		ID      int
-		Status  int
-		Plugin  string
-		Models  string
-		Mapping string
-		Configs map[string]dto.TaskVideoModelConfig
+		ID                int
+		Status            int
+		Plugin            string
+		Models            string
+		Mapping           string
+		Configs           map[string]dto.TaskVideoModelConfig
+		ResolutionMapping dto.VideoResolutionModelMapping `json:"ResolutionMapping,omitempty"`
 	}
 	bindings := []videoBinding{}
 	for _, channel := range channels {
 		if settings := channel.GetSetting(); dto.ChannelConfiguredTaskVideoPlugin(settings.TaskPluginKey) {
-			bindings = append(bindings, videoBinding{channel.Id, channel.Status, settings.TaskPluginKey, channel.Models, channel.GetModelMapping(), settings.TaskPluginModelConfigs})
+			bindings = append(bindings, videoBinding{channel.Id, channel.Status, settings.TaskPluginKey, channel.Models, channel.GetModelMapping(), settings.TaskPluginModelConfigs, settings.VideoResolutionModelMapping})
 		}
 	}
 	payload, err := common.Marshal(struct {

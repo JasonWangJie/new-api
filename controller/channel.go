@@ -1113,7 +1113,8 @@ func UpdateChannel(c *gin.Context) {
 	validation := channel.Channel
 	updatesPlugin := originChannel.Type == constant.ChannelTypeTaskPlugin &&
 		(channel.Type == 0 || channel.Type == constant.ChannelTypeTaskPlugin)
-	convertsToConfiguredVideo := channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(validation.GetSetting().TaskPluginKey)
+	validationSettings := validation.GetSetting()
+	convertsToConfiguredVideo := channel.Type == constant.ChannelTypeTaskPlugin && (dto.ChannelConfiguredTaskVideoPlugin(validationSettings.TaskPluginKey) || len(validationSettings.VideoResolutionModelMapping) > 0)
 	if updatesPlugin || convertsToConfiguredVideo {
 		// Match GORM struct Updates: zero strings and nil pointers retain the
 		// persisted value. Validate the resulting binding, not the partial body.
@@ -1130,7 +1131,8 @@ func UpdateChannel(c *gin.Context) {
 		if validation.BaseURL == nil && updatesPlugin {
 			validation.BaseURL = originChannel.BaseURL
 		}
-		if channel.Type == 0 && !dto.ChannelConfiguredTaskVideoPlugin(validation.GetSetting().TaskPluginKey) {
+		validationSettings = validation.GetSetting()
+		if channel.Type == 0 && !dto.ChannelConfiguredTaskVideoPlugin(validationSettings.TaskPluginKey) && len(validationSettings.VideoResolutionModelMapping) == 0 {
 			// Preserve legacy partial updates for other plugins, including edits
 			// while their runtime is unavailable.
 			validation.Type = 0

@@ -12,7 +12,7 @@ import (
 // DecodeVideoRoutingTarget validates an explicitly configured execution target.
 // Its model is a configured channel alias, independently of the public model's
 // ordinary pool; authorization of that public model remains with admission.
-func DecodeVideoRoutingTarget(ctx context.Context, target model.VideoRoutingTarget, group, operation string, sourceRaw []byte, sourceContentType string, userID int) (MixedVideoCandidate, []byte, string, error) {
+func DecodeVideoRoutingTarget(ctx context.Context, target model.VideoRoutingTarget, group, operation string, sourceRaw []byte, sourceContentType string, userID int, frozenChannel ...*model.Channel) (MixedVideoCandidate, []byte, string, error) {
 	var empty MixedVideoCandidate
 	var channel model.Channel
 	if target.ChannelID <= 0 || target.Model == "" || group == "" {
@@ -30,6 +30,14 @@ func DecodeVideoRoutingTarget(ctx context.Context, target model.VideoRoutingTarg
 	}
 	if len(ImageChannelAccounts(channel, ImageAccountRouting{})) == 0 {
 		return empty, nil, "", errors.New("video routing target has no available account")
+	}
+	if len(frozenChannel) > 0 && frozenChannel[0] != nil && frozenChannel[0].Id == channel.Id {
+		frozen := *frozenChannel[0]
+		if !sameVideoMappingOrigin(channel, frozen) {
+			return empty, nil, "", errors.New("conditional video target origin changed")
+		}
+		frozen.Key, frozen.Keys, frozen.ChannelInfo = channel.Key, channel.Keys, channel.ChannelInfo
+		channel = frozen
 	}
 	raw, contentType, err := RewriteVideoRoutingRequest(sourceRaw, sourceContentType, operation, target.Model, target.Resolution)
 	if err != nil {

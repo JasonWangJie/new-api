@@ -101,6 +101,10 @@ export interface ChannelSettings {
     string,
     Partial<Record<'1K' | '2K' | '4K', string>>
   >
+  video_resolution_model_mapping?: Record<
+    string,
+    Partial<Record<'480p' | '720p' | '1080p' | '2k' | '4k', string>>
+  >
   proxy?: string
   pass_through_body_enabled?: boolean
   responses_websocket_enabled?: boolean

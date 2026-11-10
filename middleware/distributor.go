@@ -45,7 +45,9 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		constraints.AddFilter(service.ConfiguredTaskVideoFilter(c))
+		if service.PinnedMixedVideoResolutionMapping(c) == nil {
+			constraints.AddFilter(service.ConfiguredTaskVideoFilter(c))
+		}
 		if pin, found, overridden := constraints.ResolvedPin(); found {
 			for _, lost := range overridden {
 				logger.LogWarn(c, fmt.Sprintf(
@@ -645,7 +647,15 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
-	if candidate, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
+	mapping := service.PinnedMixedVideoResolutionMapping(c)
+	if mapping != nil {
+		executionModel := service.VideoRoutingExecutionModel(c, modelName)
+		upstream, config, err := channel.TaskVideoResolutionModelConfig(executionModel, mapping.Resolution)
+		if err != nil || !mapping.MatchesChannel(*channel) || upstream != mapping.UpstreamModel {
+			return types.NewError(errors.New("selected channel does not match the video resolution mapping"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		}
+		c.Set("task_video_model_config", config)
+	} else if candidate, matched := pinnedEndpointCandidateForChannel(c, channel, expectedPlugin); matched {
 		executionModel := service.VideoRoutingExecutionModel(c, modelName)
 		selected, err := service.ChannelTaskVideoPlugin(candidate.Plugin, channel, executionModel)
 		if err != nil {
@@ -720,7 +730,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	// c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
 	common.SetContextKey(c, constant.ContextKeyChannelKey, key)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, channel.GetBaseURL())
-	if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
+	if channel.Type == constant.ChannelTypeTaskPlugin && (dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) || mapping != nil) {
 		// Admission must freeze the same channel that supplied the model profile,
 		// mapping and price, even if an administrator saves it before admission.
 		frozen := *channel

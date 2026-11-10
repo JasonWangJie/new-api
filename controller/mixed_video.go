@@ -87,6 +87,17 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		var routingConfig model.VideoRoutingConfig
 		if operation == "" || operation == "create" {
+			requiresResolution, err := service.MixedVideoRequiresExplicitResolution(c.Request.Context(), policy, groups, publicModel, body)
+			if err != nil {
+				AsyncImagePublicError(c, 503, "routing_unavailable", "Video routing configuration is unavailable")
+				c.Abort()
+				return
+			}
+			if requiresResolution {
+				AsyncImagePublicError(c, 400, "invalid_request", "An explicit video resolution is required for model mapping")
+				c.Abort()
+				return
+			}
 			config, configErr := model.GetVideoRoutingConfig(c.Request.Context())
 			if configErr != nil {
 				AsyncImagePublicError(c, 503, "routing_unavailable", "Video routing rules are unavailable")
@@ -199,6 +210,7 @@ func pinMixedVideoCandidate(c *gin.Context, candidate service.MixedVideoCandidat
 	c.Set("async_media_mixed_video", true)
 	c.Set("mixed_video_billing", true)
 	c.Set("async_media_current_attempt", service.MixedVideoAttempt(candidate, generation))
+	c.Set(service.MixedVideoResolutionMappingContextKey, candidate.ResolutionMapping)
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, route.Group)
 	common.SetContextKey(c, constant.ContextKeyAutoGroup, route.Group)
 }
@@ -248,7 +260,7 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 	}
 	capability, _ := service.MixedVideoPolicyCapability(catalog, job.Model)
 	var selected *model.Channel
-	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) || request.ResolutionMapping != nil {
 		// The live model list may have changed after acceptance. Pool membership,
 		// channel status, group access and account access remain live controls.
 		var pool model.ImageChannelPool
@@ -283,11 +295,14 @@ func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request servic
 		return
 	}
 	decodeChannel := *selected
-	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
+	if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) || request.ResolutionMapping != nil {
 		decodeChannel = request.Channel
 	}
 	candidate, err := service.DecodeMixedVideoCandidate(c.Request.Context(), decodeChannel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
-	if err == nil {
+	if err == nil && !request.ValidateMixedVideoMapping(candidate) {
+		err = errors.New("mixed video resolution mapping changed before dispatch")
+	}
+	if err == nil && request.ResolutionMapping == nil {
 		frozenModel, mappingErr := service.ResolveImageChannelUpstreamModel(request.Channel, job.Model)
 		if mappingErr != nil || candidate.UpstreamModel != frozenModel {
 			err = errors.New("mixed video model mapping changed before dispatch")

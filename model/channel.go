@@ -456,7 +456,7 @@ func BatchInsertChannels(channels []Channel) error {
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		for _, channel := range channels {
-			if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
+			if channel.Type == constant.ChannelTypeTaskPlugin && channel.hasTaskVideoModelBindings() {
 				if err := lockTaskVideoModelBindings(tx); err != nil {
 					return err
 				}
@@ -550,7 +550,7 @@ func (channel *Channel) GetStatusCodeMapping() string {
 
 func (channel *Channel) Insert() error {
 	return DB.Transaction(func(tx *gorm.DB) error {
-		if channel.Type == constant.ChannelTypeTaskPlugin && dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey) {
+		if channel.Type == constant.ChannelTypeTaskPlugin && channel.hasTaskVideoModelBindings() {
 			if err := lockTaskVideoModelBindings(tx); err != nil {
 				return err
 			}
@@ -571,7 +571,7 @@ func (channel *Channel) Update() error {
 		// Omitted type/settings are merged by GORM. They cannot establish that
 		// this is an ordinary channel before the binding lock has been acquired.
 		editsBindings := channel.Type == constant.ChannelTypeTaskPlugin || channel.Type == 0 && (channel.Setting != nil || channel.Models != "" || channel.ModelMapping != nil)
-		if editsBindings && (channel.Setting == nil || dto.ChannelConfiguredTaskVideoPlugin(channel.GetSetting().TaskPluginKey)) {
+		if editsBindings && (channel.Setting == nil || channel.hasTaskVideoModelBindings()) {
 			if err := lockTaskVideoModelBindings(tx); err != nil {
 				return err
 			}
@@ -1092,6 +1092,9 @@ func (channel *Channel) ValidateSettings() error {
 		return err
 	}
 	if err := channelParams.ValidateTaskVideoModels(relaycommon.MaxTaskDurationSeconds); err != nil {
+		return err
+	}
+	if err := channel.validateTaskVideoResolutionSources(channelParams.VideoResolutionModelMapping); err != nil {
 		return err
 	}
 	if err := channelParams.ValidateImageGeneration(); err != nil {

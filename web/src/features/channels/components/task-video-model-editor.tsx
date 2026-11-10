@@ -24,6 +24,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 
 import {
+  VIDEO_MODEL_RESOLUTION_FIELDS,
+  type ChannelFormValues,
+} from '../lib/channel-form'
+import {
   importMissingTaskVideoModels,
   taskVideoCatalogConfig,
 } from '../lib/task-video-models'
@@ -38,6 +42,7 @@ interface TaskVideoModelEditorProps {
   onChange: (value: string) => void
   models: string[]
   modelMapping?: string
+  videoResolutionMappings?: ChannelFormValues['video_resolution_model_mapping']
   details?: Record<string, TaskVideoModelDetail>
   previewReady: boolean
   disabled?: boolean
@@ -63,15 +68,25 @@ export function TaskVideoModelEditor(props: TaskVideoModelEditorProps) {
   } catch {
     /* Mapping validation belongs to the channel form. */
   }
+  const resolutionTargets = new Map(
+    props.videoResolutionMappings?.map((row) => [
+      row.model.trim(),
+      VIDEO_MODEL_RESOLUTION_FIELDS.map(({ field }) =>
+        row[field].trim()
+      ).filter(Boolean),
+    ])
+  )
   const upstreamModels = [
     ...new Set(
-      props.models.map((model) => {
+      props.models.flatMap((model) => {
+        const targets = resolutionTargets.get(model) || []
+        if (targets.length && !mapping[model]) return targets
         const seen = new Set<string>()
         while (mapping[model] && !seen.has(model)) {
           seen.add(model)
           model = mapping[model]
         }
-        return model
+        return [...targets, model]
       })
     ),
   ]

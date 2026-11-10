@@ -90,6 +90,20 @@ func TestPresetVideoConfigRestoresFrozenContracts(t *testing.T) {
 			require.NoError(t, err)
 			plugin, err := jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: key})
 			require.NoError(t, err)
+			if key == "yuxibox" {
+				const name = "minimax-h3-quality"
+				channel := Channel{Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled, Models: name}
+				channel.SetSetting(dto.ChannelSettings{TaskPluginKey: key, VideoResolutionModelMapping: dto.VideoResolutionModelMapping{name: {"720p": name}}})
+				catalog, err := taskVideoModelCatalog([]Channel{channel}, key)
+				require.NoError(t, err)
+				discovery := jsplugin.WithTaskVideoModels(plugin, catalog)
+				expected, _ := plugin.Meta.VideoProfileForModel(name)
+				profile, found := discovery.Meta.VideoProfileForModel(name)
+				require.True(t, found)
+				assert.Equal(t, expected, profile)
+				usage, _ := discovery.Meta.UsageForModel(name)
+				assert.Contains(t, usage, "billing_period")
+			}
 			for _, name := range plugin.Meta.Models {
 				settings := dto.ChannelSettings{TaskPluginKey: key}
 				defaults, err := ResolveTaskVideoModelConfig(settings, name)
@@ -282,6 +296,54 @@ func TestTaskVideoModelBindingWrites(t *testing.T) {
 			}
 			require.NoError(t, db.Raw(query).Scan(&version).Error)
 			t.Logf("%s version: %s", dialect, version)
+			t.Run("video resolution mapping saves and validates final models", func(t *testing.T) {
+				const public, h3 = "mapped-video", "inmind/video/minimax-h3-2"
+				channel := taskVideoBindingTestChannel(public, "per_second")
+				channel.ModelMapping = nil
+				settings := channel.GetSetting()
+				small, large := settings.TaskPluginModelConfigs["vendor-model"], settings.TaskPluginModelConfigs["vendor-model"]
+				small.Resolutions = []string{"480p"}
+				large.Resolutions = []string{"768p", "2k"}
+				settings.TaskPluginModelConfigs = map[string]dto.TaskVideoModelConfig{"small": small, h3: large}
+				settings.VideoResolutionModelMapping = dto.VideoResolutionModelMapping{public: {"480p": "small", "720p": h3, "2k": h3}}
+				channel.SetSetting(settings)
+				require.NoError(t, channel.Insert())
+				t.Cleanup(func() { require.NoError(t, channel.Delete()) })
+				var loaded Channel
+				require.NoError(t, db.First(&loaded, channel.Id).Error)
+				assert.JSONEq(t, *channel.Setting, *loaded.Setting)
+				catalog, err := taskVideoModelCatalog([]Channel{loaded}, "huahuo-video")
+				require.NoError(t, err)
+				assert.ElementsMatch(t, []string{"480p", "720p", "2k"}, catalog[public].Resolutions)
+				assert.Equal(t, []string{"480p"}, catalog["small"].Resolutions)
+				assert.Equal(t, []string{"768p", "2k"}, catalog[h3].Resolutions)
+				upstream, config, err := loaded.TaskVideoResolutionModelConfig(public, "720p")
+				require.NoError(t, err)
+				assert.Equal(t, h3, upstream)
+				assert.Equal(t, large, config)
+				_, _, err = loaded.TaskVideoResolutionModelConfig(public, "1080p")
+				require.ErrorContains(t, err, "1080p")
+				patch := Channel{Id: loaded.Id}
+				settings.VideoResolutionModelMapping[public]["480p"] = h3
+				patch.SetSetting(settings)
+				require.ErrorContains(t, patch.Update(), "480p")
+				settings.VideoResolutionModelMapping[public]["480p"] = "small"
+				small.BillingMode = "per_request"
+				settings.TaskPluginModelConfigs["small"] = small
+				patch.SetSetting(settings)
+				require.ErrorContains(t, patch.Update(), "incompatible billing units")
+				require.ErrorContains(t, (&Channel{Id: loaded.Id, Models: "different-model"}).Update(), public)
+				require.NoError(t, db.First(&loaded, channel.Id).Error)
+				assert.JSONEq(t, *channel.Setting, *loaded.Setting)
+				ordinary := `{"mapped-video":"inmind/video/minimax-h3-2"}`
+				require.NoError(t, (&Channel{Id: loaded.Id, ModelMapping: &ordinary}).Update())
+				require.NoError(t, db.First(&loaded, channel.Id).Error)
+				catalog, err = taskVideoModelCatalog([]Channel{loaded}, "huahuo-video")
+				require.NoError(t, err)
+				assert.Equal(t, []string{"768p", "2k"}, catalog[public].Resolutions)
+				badOrdinary := `{"mapped-video":"missing-ordinary-model"}`
+				require.ErrorContains(t, (&Channel{Id: loaded.Id, ModelMapping: &badOrdinary}).Update(), "missing-ordinary-model")
+			})
 			t.Run("batch insert associates generated channel IDs with abilities", func(t *testing.T) {
 				channels := make([]Channel, 51)
 				for i := range channels {

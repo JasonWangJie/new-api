@@ -26,7 +26,7 @@ func RefreshConditionalVideoAdmission(ctx context.Context, job *model.AsyncMedia
 	if err != nil {
 		return err
 	}
-	current, _, _, currentErr := DecodeFrozenVideoRoutingTarget(ctx, snapshot, snapshot.TargetIndex, job.Group, request.Operation, job.UserId)
+	current, _, _, currentErr := DecodeFrozenVideoRoutingTarget(ctx, snapshot, snapshot.TargetIndex, job.Group, request.Operation, job.UserId, request.frozenVideoMappingChannel())
 	if currentErr == nil {
 		keyIndex := slices.Index(current.Channel.GetKeys(), request.Channel.Key)
 		if keyIndex >= 0 && (current.Channel.ChannelInfo.MultiKeyStatusList[keyIndex] == 0 || current.Channel.ChannelInfo.MultiKeyStatusList[keyIndex] == common.ChannelStatusEnabled) {

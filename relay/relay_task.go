@@ -280,6 +280,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 				return nil, service.TaskErrorWrapperLocal(errors.New("conditional video public model changed"), "model_mapping_failed", http.StatusBadRequest)
 			}
 			info.UpstreamModelName, info.IsModelMapped = target.UpstreamModel, target.UpstreamModel != info.OriginModelName
+		} else if mapping := service.PinnedMixedVideoResolutionMapping(c); mapping != nil {
+			if mapping.ChannelID != info.ChannelId {
+				return nil, service.TaskErrorWrapperLocal(errors.New("video resolution mapping channel changed"), "model_mapping_failed", http.StatusBadRequest)
+			}
+			info.UpstreamModelName, info.IsModelMapped = mapping.UpstreamModel, mapping.UpstreamModel != info.OriginModelName
 		} else if err := helper.ModelMappedHelper(c, info, nil); err != nil {
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}

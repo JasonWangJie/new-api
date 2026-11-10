@@ -215,7 +215,7 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 			if len(ImageChannelAccounts(channel, ImageAccountRouting{})) == 0 {
 				return true
 			}
-			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, request.Body, capability.VideoOverrides, job.UserId, request.ContentType)
+			candidate, err := request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, request.Body, request.ContentType, capability.VideoOverrides, job.UserId)
 			if err != nil {
 				return true
 			}
@@ -606,8 +606,10 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 	if upstream == "" {
 		upstream = job.Model
 	}
-	selected.PrivateData.UpstreamAsync, _ = candidate.GetOtherSettings().UpstreamAsync.Match("video", upstream, UpstreamAsyncOperation(selected.Action))
-	request.Channel = *candidate
+	if request.MixedRouting == nil {
+		request.Channel = *candidate
+	}
+	selected.PrivateData.UpstreamAsync, _ = request.Channel.GetOtherSettings().UpstreamAsync.Match("video", upstream, UpstreamAsyncOperation(selected.Action))
 	selected.PrivateData.VideoRouting = request.ConditionalRouting.Audit(upstream)
 	encoded, err := common.Marshal(request)
 	if err != nil {
@@ -617,7 +619,7 @@ func SelectVideoRecoveryChannel(ctx context.Context, job *model.AsyncMediaJob, t
 	if err != nil {
 		return err
 	}
-	channelData, err := common.Marshal(candidate)
+	channelData, err := common.Marshal(request.Channel)
 	if err != nil {
 		return err
 	}

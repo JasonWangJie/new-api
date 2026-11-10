@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"unicode"
@@ -31,6 +32,9 @@ type ChannelSettings struct {
 	// ImageResolutionModelMapping selects final upstream names for asynchronous
 	// images only. A configured model cannot use a tier absent from its map.
 	ImageResolutionModelMapping ImageResolutionModelMapping `json:"image_resolution_model_mapping,omitempty"`
+	// VideoResolutionModelMapping selects the final upstream model for a public
+	// model and exact mixed asynchronous video resolution.
+	VideoResolutionModelMapping VideoResolutionModelMapping `json:"video_resolution_model_mapping,omitempty"`
 	Proxy                       string                      `json:"proxy"`
 	PassThroughBodyEnabled      bool                        `json:"pass_through_body_enabled,omitempty"`
 	ResponsesWebSocketEnabled   bool                        `json:"responses_websocket_enabled,omitempty"`
@@ -45,20 +49,37 @@ type ChannelSettings struct {
 }
 
 type ImageResolutionModelMapping map[string]map[string]string
+type VideoResolutionModelMapping map[string]map[string]string
 
 // UnmarshalJSON rejects ambiguous duplicate rules instead of accepting the
 // last JSON object member silently. Decoding still uses the module's codec.
 func (mapping *ImageResolutionModelMapping) UnmarshalJSON(data []byte) error {
+	decoded, err := decodeResolutionModelMapping(data, "image")
+	if err == nil {
+		*mapping = decoded
+	}
+	return err
+}
+
+func (mapping *VideoResolutionModelMapping) UnmarshalJSON(data []byte) error {
+	decoded, err := decodeResolutionModelMapping(data, "video")
+	if err == nil {
+		*mapping = decoded
+	}
+	return err
+}
+
+func decodeResolutionModelMapping(data []byte, media string) (map[string]map[string]string, error) {
 	var decoded map[string]map[string]string
 	if err := kitutil.Unmarshal(data, &decoded); err != nil {
-		return err
+		return nil, err
 	}
 	seen := make(map[string]bool, len(decoded))
 	var duplicateErr error
 	gjson.ParseBytes(data).ForEach(func(source, targets gjson.Result) bool {
 		modelName := source.String()
 		if seen[modelName] {
-			duplicateErr = fmt.Errorf("duplicate image resolution mapping model: %s", modelName)
+			duplicateErr = fmt.Errorf("duplicate %s resolution mapping model: %s", media, modelName)
 			return false
 		}
 		seen[modelName] = true
@@ -66,7 +87,7 @@ func (mapping *ImageResolutionModelMapping) UnmarshalJSON(data []byte) error {
 		targets.ForEach(func(tier, _ gjson.Result) bool {
 			resolution := tier.String()
 			if resolutions[resolution] {
-				duplicateErr = fmt.Errorf("duplicate image resolution mapping tier for %s: %s", modelName, resolution)
+				duplicateErr = fmt.Errorf("duplicate %s resolution mapping tier for %s: %s", media, modelName, resolution)
 				return false
 			}
 			resolutions[resolution] = true
@@ -75,10 +96,38 @@ func (mapping *ImageResolutionModelMapping) UnmarshalJSON(data []byte) error {
 		return duplicateErr == nil
 	})
 	if duplicateErr != nil {
-		return duplicateErr
+		return nil, duplicateErr
 	}
-	*mapping = decoded
+	return decoded, nil
+}
+
+func (mapping VideoResolutionModelMapping) Validate() error {
+	if len(mapping) > 1000 {
+		return fmt.Errorf("too many video resolution mapping models")
+	}
+	for source, targets := range mapping {
+		if len(targets) == 0 {
+			return fmt.Errorf("video resolution mapping requires at least one tier for %s", source)
+		}
+		names := []string{source}
+		for resolution, target := range targets {
+			if !slices.Contains(VideoResolutionMappingTiers(), resolution) {
+				return fmt.Errorf("invalid video resolution mapping tier: %s", resolution)
+			}
+			names = append(names, target)
+		}
+		for _, name := range names {
+			if name == "" || name != strings.TrimSpace(name) || len(name) > 255 || !utf8.ValidString(name) || strings.ContainsAny(name, ",*") || strings.ContainsFunc(name, unicode.IsControl) {
+				return fmt.Errorf("invalid model name in video resolution mapping")
+			}
+		}
+	}
 	return nil
+}
+
+// VideoResolutionMappingTiers returns the public tiers in ascending order.
+func VideoResolutionMappingTiers() []string {
+	return []string{"480p", "720p", "1080p", "2k", "4k"}
 }
 
 // ValidateImageGeneration validates save-time image generation channel settings.
