@@ -36,6 +36,7 @@ func InitOptionMap() {
 	common.OptionMapRWMutex.Lock()
 	common.OptionMap = make(map[string]string)
 	common.OptionMap[perf_metrics_setting.VideoErrorExclusionsOptionKey] = ""
+	common.OptionMap[perf_metrics_setting.ImageErrorExclusionsOptionKey] = ""
 
 	// 添加原有的系统配置
 	common.OptionMap["FileUploadPermission"] = strconv.Itoa(common.FileUploadPermission)
@@ -224,8 +225,12 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
-	if key == perf_metrics_setting.VideoErrorExclusionsOptionKey {
+	switch key {
+	case perf_metrics_setting.VideoErrorExclusionsOptionKey:
 		_, err := perf_metrics_setting.ParseVideoErrorExclusions(value)
+		return err
+	case perf_metrics_setting.ImageErrorExclusionsOptionKey:
+		_, err := perf_metrics_setting.ParseImageErrorExclusions(value)
 		return err
 	}
 	if strings.HasPrefix(key, "infinite_canvas.") {
@@ -298,6 +303,25 @@ func UpdateOptionsBulk(values map[string]string) error {
 			}
 			if versionedCount > 0 {
 				return errors.New("Media runtime configuration must be updated through its versioned settings endpoint")
+			}
+			switch k {
+			case perf_metrics_setting.ImageErrorExclusionsOptionKey, perf_metrics_setting.VideoErrorExclusionsOptionKey:
+				if option.Key != k {
+					return errors.New("Performance error exclusion options require their exact keys")
+				}
+			default:
+				// Reject aliases under the database's collation, including a
+				// new alias that FirstOrCreate just inserted in this transaction.
+				var exclusionAliasCount int64
+				if err := tx.Model(&Option{}).Where(map[string]any{"key": []string{
+					perf_metrics_setting.ImageErrorExclusionsOptionKey,
+					perf_metrics_setting.VideoErrorExclusionsOptionKey,
+				}}).Where(&Option{Key: option.Key}).Count(&exclusionAliasCount).Error; err != nil {
+					return err
+				}
+				if exclusionAliasCount > 0 {
+					return errors.New("Performance error exclusion options require their exact keys")
+				}
 			}
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {

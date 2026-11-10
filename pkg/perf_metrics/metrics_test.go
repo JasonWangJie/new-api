@@ -381,3 +381,136 @@ func TestModelPerformanceVideoErrorExclusions(t *testing.T) {
 	assert.Empty(t, cleared.VideoErrorExclusions)
 	assert.Equal(t, raw.Summary, cleared.Summary)
 }
+
+func TestModelPerformanceImageErrorExclusions(t *testing.T) {
+	db := performanceDatabase(t)
+	entities := []any{&model.TaskPerfSample{}, &model.PerfMetric{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Option{}}
+	require.NoError(t, db.Migrator().DropTable(entities...))
+	require.NoError(t, db.AutoMigrate(entities...))
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	previousEnabled := perf_metrics_setting.GetSetting().Enabled
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": strconv.FormatBool(previousEnabled)}))
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"perf_metrics_setting.enabled": "true"}))
+
+	now := time.Now().Unix()
+	bucket := now - now%3600
+	for _, fixture := range []struct {
+		id, model, group, status, reason, reconciliation string
+	}{
+		{"delivered", "mixed-media", "default", model.ImageTaskSucceeded, "Image_100%", ""},
+		{"image-matched", "mixed-media", "default", model.ImageTaskFailed, "资源错误 Image_100% internal-image-detail", ""},
+		{"image-expired", "mixed-media", "default", model.ImageTaskExpired, "资源错误", ""},
+		{"unknown", "mixed-media", "default", model.ImageTaskFailed, "Image_100%", model.ImagePolicyUnconfirmed},
+		{"different-case", "mixed-media", "vip", model.ImageTaskFailed, "image_100%", ""},
+		{"wildcards-are-literal", "mixed-media", "vip", model.ImageTaskFailed, "ImageX100Z", ""},
+		{"ImageCaseID", "mixed-media", "default", model.ImageTaskFailed, "Image_100%", ""},
+		{"pending", "mixed-media", "default", model.ImageTaskInvoking, "Image_100%", ""},
+		{"video-matched", "mixed-media", "default", model.ImageTaskFailed, "VideoOnly", ""},
+		{"all-image-excluded", "failed-image", "default", model.ImageTaskFailed, "Image_100%", ""},
+	} {
+		task := model.AsyncImageTask{TaskId: fixture.id, Model: fixture.model, Group: fixture.group, Status: model.ImageTaskInvoking, CreatedAt: now - 120, Version: 1}
+		require.NoError(t, db.Create(&task).Error)
+		require.NoError(t, model.TransitionImageTask(t.Context(), task, map[string]any{"status": fixture.status, "error_message": fixture.reason, "reconciliation_status": fixture.reconciliation, "finished_at": now}, fixture.status, "", ""))
+	}
+	for _, fixture := range []struct{ id, status, reason string }{
+		{"delivered", "succeeded", "VideoOnly"},
+		{"video-matched", "failed", "VideoOnly"},
+		{"image-matched", "failed", "Image_100%"},
+	} {
+		job := model.AsyncMediaJob{TaskId: fixture.id, IdentityHash: fixture.id, Model: "mixed-media", Group: "default", Status: "submitted", CreatedAt: now - 120}
+		require.NoError(t, db.Create(&job).Error)
+		require.NoError(t, model.ChangeAsyncMediaJob(db.Model(&model.AsyncMediaJob{}).Where("id = ?", job.ID), map[string]any{"status": fixture.status, "error_message": fixture.reason}, ""))
+	}
+	// Historical samples can outlive their original terminal task state.
+	require.NoError(t, db.Model(&model.TaskPerfSample{}).Where("kind = ? AND task_id = ?", "image", "ImageCaseID").Update("task_id", "imagecaseid").Error)
+	require.NoError(t, db.Create(&model.TaskPerfSample{TaskId: "pending", Kind: "image", ModelName: "mixed-media", Group: "default", Outcome: "failure", CompletedAt: now, BucketTs: bucket}).Error)
+	require.NoError(t, db.Create(&model.PerfMetric{ModelName: "mixed-media", Group: "default", BucketTs: bucket, RequestCount: 1, SuccessCount: 1, TotalLatencyMs: 1000}).Error)
+
+	params := QueryParams{Model: "mixed-media", Groups: []string{"default", "vip"}}
+	raw, err := Query(params)
+	require.NoError(t, err)
+	require.Equal(t, int64(13), raw.Summary.RequestCount)
+	assert.Equal(t, int64(1), raw.Summary.UnknownCount)
+	assert.Equal(t, "mixed", raw.Summary.Workload)
+	assert.Nil(t, raw.Summary.ImageFilteredSuccessRate)
+	imageKey := perf_metrics_setting.ImageErrorExclusionsOptionKey
+	rules := "  Image_100% \r\n资源错误\nImage_100%\n"
+	require.NoError(t, model.UpdateOptionsBulk(map[string]string{imageKey: rules, perf_metrics_setting.VideoErrorExclusionsOptionKey: "VideoOnly"}))
+	require.Error(t, model.UpdateOption(imageKey, strings.Repeat("x", 257)))
+	for _, alias := range []string{
+		strings.ToUpper(imageKey),
+		strings.Replace(imageKey, "image", "imáge", 1),
+	} {
+		var matchingKeys int64
+		require.NoError(t, db.Model(&model.Option{}).Where(&model.Option{Key: alias}).Count(&matchingKeys).Error)
+		if matchingKeys > 0 {
+			require.Error(t, model.UpdateOption(alias, strings.Repeat("x", 257)), "option aliases cannot bypass validation")
+			require.NoError(t, db.Delete(&model.Option{Key: imageKey}).Error)
+			require.Error(t, model.UpdateOption(alias, rules), "aliases cannot reserve the option key before its first save")
+			require.NoError(t, model.UpdateOption(imageKey, rules))
+		}
+	}
+	var saved model.Option
+	require.NoError(t, db.Where(&model.Option{Key: imageKey}).Take(&saved).Error)
+	assert.Equal(t, rules, saved.Value, "invalid image rules must not replace the saved setting")
+	result, err := Query(params)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Image_100%", "资源错误"}, result.ImageErrorExclusions)
+	image := result.Summary.ImageFilteredSuccessRate
+	require.NotNil(t, image)
+	assert.Equal(t, int64(2), image.ExcludedCount)
+	assert.Equal(t, int64(7), image.SampleCount)
+	require.NotNil(t, image.Rate)
+	assert.InDelta(t, 100.0/7, *image.Rate, 0.00001)
+	video := result.Summary.VideoFilteredSuccessRate
+	require.NotNil(t, video)
+	assert.Equal(t, int64(1), video.ExcludedCount)
+	assert.Equal(t, int64(2), video.SampleCount)
+	require.NotNil(t, video.Rate)
+	assert.Equal(t, float64(50), *video.Rate)
+	unfiltered := result.Summary
+	unfiltered.ImageFilteredSuccessRate, unfiltered.VideoFilteredSuccessRate = nil, nil
+	assert.Equal(t, raw.Summary, unfiltered)
+	require.Len(t, result.Groups, 2)
+	defaultGroup := result.Groups[0]
+	require.Equal(t, "default", defaultGroup.Group)
+	require.NotNil(t, defaultGroup.ImageFilteredSuccessRate)
+	require.NotNil(t, defaultGroup.ImageFilteredSuccessRate.Rate)
+	assert.Equal(t, float64(20), *defaultGroup.ImageFilteredSuccessRate.Rate)
+	assert.Equal(t, video, defaultGroup.VideoFilteredSuccessRate)
+	assert.Nil(t, result.Groups[1].VideoFilteredSuccessRate)
+
+	summary, err := QuerySummaryAll(24, params.Groups)
+	require.NoError(t, err)
+	assert.Equal(t, result.ImageErrorExclusions, summary.ImageErrorExclusions)
+	require.Len(t, summary.Models, 2)
+	assert.Equal(t, image, summary.Models[0].ImageFilteredSuccessRate)
+	assert.Equal(t, video, summary.Models[0].VideoFilteredSuccessRate)
+	assert.Equal(t, &FilteredSuccessRate{ExcludedCount: 1}, summary.Models[1].ImageFilteredSuccessRate)
+	assert.Nil(t, summary.Models[1].VideoFilteredSuccessRate)
+	encoded, err := common.Marshal(summary)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"image_error_exclusions":["Image_100%","资源错误"]`)
+	assert.Contains(t, string(encoded), `"image_filtered_success_rate":{"rate":null,"excluded_count":1,"sample_count":0}`)
+	assert.NotContains(t, string(encoded), "internal-image-detail")
+
+	require.NoError(t, model.UpdateOption(imageKey, "ImageX100Z"))
+	updated, err := Query(params)
+	require.NoError(t, err)
+	require.NotNil(t, updated.Summary.ImageFilteredSuccessRate)
+	assert.Equal(t, int64(1), updated.Summary.ImageFilteredSuccessRate.ExcludedCount, "updated rules apply to existing samples")
+	require.NoError(t, model.UpdateOption(imageKey, ""))
+	cleared, err := Query(params)
+	require.NoError(t, err)
+	assert.Empty(t, cleared.ImageErrorExclusions)
+	assert.Nil(t, cleared.Summary.ImageFilteredSuccessRate)
+	assert.Equal(t, video, cleared.Summary.VideoFilteredSuccessRate)
+}

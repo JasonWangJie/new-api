@@ -196,7 +196,8 @@ func UpdateOption(c *gin.Context) {
 		mixedVideoConfigurationMu.Lock()
 		defer mixedVideoConfigurationMu.Unlock()
 	}
-	if option.Key == perf_metrics_setting.VideoErrorExclusionsOptionKey {
+	switch option.Key {
+	case perf_metrics_setting.VideoErrorExclusionsOptionKey, perf_metrics_setting.ImageErrorExclusionsOptionKey:
 		if _, ok := option.Value.(string); !ok {
 			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 			return

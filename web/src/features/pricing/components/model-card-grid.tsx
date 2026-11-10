@@ -30,7 +30,7 @@ import { DEFAULT_PRICING_PAGE_SIZE, DEFAULT_TOKEN_UNIT } from '../constants'
 import type { PricingModel, TokenUnit } from '../types'
 import { ModelCard } from './model-card'
 import type { ModelPerfBadgeData } from './model-perf-badge'
-import { PerformanceSampleContext } from './model-performance-summary'
+import { PerformanceTimeContext } from './model-performance-summary'
 
 export interface ModelCardGridProps {
   models: PricingModel[]
@@ -86,7 +86,7 @@ export function ModelCardGrid(props: ModelCardGridProps) {
           className='min-h-0 border p-3'
         />
       )}
-      <PerformanceSampleContext
+      <PerformanceTimeContext
         windowHours={perfQuery.data?.data.window_hours ?? 24}
         updatedAt={perfQuery.data?.data.updated_at}
       />
@@ -102,6 +102,7 @@ export function ModelCardGrid(props: ModelCardGridProps) {
             selectedGroup={props.selectedGroup}
             perf={perfMap.get(model.model_name || '')}
             perfStatus={perfStatus}
+            imageErrorExclusions={perfQuery.data?.data.image_error_exclusions}
             videoErrorExclusions={perfQuery.data?.data.video_error_exclusions}
             onClick={() => props.onModelClick(model.model_name || '')}
           />

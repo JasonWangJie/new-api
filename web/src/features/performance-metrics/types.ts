@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export type FilteredVideoSuccessRate = {
+export type FilteredSuccessRate = {
   rate: number | null
   excluded_count: number
   sample_count: number
@@ -35,7 +35,8 @@ export type PerformanceStats = {
   total_latency_ms?: number
   output_count?: number
   workload?: 'relay' | 'image' | 'video' | 'mixed'
-  video_filtered_success_rate?: FilteredVideoSuccessRate
+  image_filtered_success_rate?: FilteredSuccessRate
+  video_filtered_success_rate?: FilteredSuccessRate
 }
 
 export type PerformanceSeriesPoint = PerformanceStats & {
@@ -58,6 +59,7 @@ export type PerformanceMetricsData = {
     summary?: PerformanceStats
     window_hours?: number
     updated_at?: number
+    image_error_exclusions?: string[]
     video_error_exclusions?: string[]
     groups: PerformanceGroup[]
   }
@@ -77,6 +79,7 @@ export type PerfSummaryAllData = {
     models: PerfModelSummary[]
     window_hours?: number
     updated_at?: number
+    image_error_exclusions?: string[]
     video_error_exclusions?: string[]
   }
 }

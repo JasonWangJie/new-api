@@ -35,9 +35,10 @@ import type {
 import { cn } from '@/lib/utils'
 
 import {
-  FilteredVideoSuccessRateHelp,
-  PerformanceSampleContext,
-} from './model-performance-summary'
+  filteredMediaRateLabel,
+  getFilteredMediaKinds,
+} from '../lib/model-performance'
+import { FilteredMediaSuccessRateHelp } from './model-performance-summary'
 
 export type ModelPerfBadgeData = PerformanceStats & {
   recent_success_series?: SuccessRatePoint[]
@@ -47,6 +48,7 @@ export interface ModelPerfBadgeProps extends React.HTMLAttributes<HTMLDivElement
   perf: ModelPerfBadgeData | undefined
   mediaModel?: boolean
   status?: 'loading' | 'error' | 'ready'
+  imageErrorExclusions?: readonly string[]
   videoErrorExclusions?: readonly string[]
 }
 
@@ -57,10 +59,11 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
 ) {
   const { t } = useTranslation()
   const hasSamples = props.perf != null && props.perf.request_count !== 0
-  const filtered = props.perf?.video_filtered_success_rate
-  const filteredRate = filtered?.rate ?? Number.NaN
+  const filteredKinds = getFilteredMediaKinds([props.perf])
   const media =
-    isTaskPerformance(props.perf) || props.mediaModel || filtered != null
+    isTaskPerformance(props.perf) ||
+    props.mediaModel ||
+    filteredKinds.length > 0
   const deliveredMedia =
     props.perf?.workload === 'image' || props.perf?.workload === 'video'
   const latencyText = hasSamples
@@ -90,21 +93,13 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
     })
   }, [props.perf?.recent_success_series])
 
-  let sampleContext: React.ReactNode = null
+  let statusMessage: React.ReactNode = null
   if (props.status === 'loading') {
-    sampleContext = <LoadingState inline size='sm' message={t('Loading...')} />
+    statusMessage = <LoadingState inline size='sm' message={t('Loading...')} />
   } else if (props.status === 'error') {
-    sampleContext = (
+    statusMessage = (
       <span className='text-muted-foreground text-[11px]'>
         {t('Performance metrics unavailable')}
-      </span>
-    )
-  } else if (hasSamples) {
-    sampleContext = <PerformanceSampleContext stats={props.perf} />
-  } else if (props.status === 'ready') {
-    sampleContext = (
-      <span className='text-muted-foreground text-[11px]'>
-        {t('No samples in the last 24 hours')}
       </span>
     )
   }
@@ -156,27 +151,41 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
               })}
             </dd>
           </div>
-          {filtered && (
-            <div className='max-w-full min-w-0'>
-              <dt className='text-muted-foreground flex items-center gap-1 text-[11px] leading-4'>
-                <span className='min-w-0 [overflow-wrap:anywhere]'>
-                  {t('Filtered success rate')}
-                </span>
-                <FilteredVideoSuccessRateHelp
-                  stats={filtered}
-                  exclusions={props.videoErrorExclusions}
-                />
-              </dt>
-              <dd
-                className={cn(
-                  'mt-1 font-mono whitespace-nowrap',
-                  getSuccessRateTextClass(filteredRate)
-                )}
-              >
-                {formatUptimePct(filteredRate)}
-              </dd>
-            </div>
-          )}
+          {filteredKinds.map((kind) => {
+            const rate =
+              props.perf?.[`${kind}_filtered_success_rate`]?.rate ?? Number.NaN
+            const label = filteredMediaRateLabel(
+              t,
+              kind,
+              filteredKinds.length > 1
+            )
+            return (
+              <div key={kind} className='max-w-full min-w-0'>
+                <dt className='text-muted-foreground flex items-center gap-1 text-[11px] leading-4'>
+                  <span className='min-w-0 [overflow-wrap:anywhere]'>
+                    {label}
+                  </span>
+                  <FilteredMediaSuccessRateHelp
+                    kind={kind}
+                    label={label}
+                    exclusions={
+                      kind === 'image'
+                        ? props.imageErrorExclusions
+                        : props.videoErrorExclusions
+                    }
+                  />
+                </dt>
+                <dd
+                  className={cn(
+                    'mt-1 font-mono whitespace-nowrap',
+                    getSuccessRateTextClass(rate)
+                  )}
+                >
+                  {formatUptimePct(rate)}
+                </dd>
+              </div>
+            )
+          })}
           <div
             title={
               deliveredMedia ? t('Average delivery time') : t('Average latency')
@@ -203,7 +212,7 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
         </dl>
         {props.children}
       </div>
-      {sampleContext}
+      {statusMessage}
     </div>
   )
 })

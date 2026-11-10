@@ -43,16 +43,15 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type { UptimeDayPoint } from '../lib/mock-stats'
 import {
+  filteredMediaRateLabel,
+  getFilteredMediaKinds,
   getModelPerformanceStats,
   isMediaModel,
 } from '../lib/model-performance'
 import type { PricingModel } from '../types'
 import { LatencyTrendChart, UptimeTrendChart } from './model-details-charts'
 import { UptimeSparkline } from './model-details-uptime-sparkline'
-import {
-  ModelPerformanceSummary,
-  PerformanceSampleContext,
-} from './model-performance-summary'
+import { ModelPerformanceSummary } from './model-performance-summary'
 
 function toLatencySeries(
   groups: PerformanceGroup[],
@@ -209,22 +208,18 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
         </div>
       ),
     },
-    {
-      id: 'samples',
-      header: t('Samples'),
-      className: tableStyles.compactHeaderCell,
-      cellClassName: tableStyles.compactCell,
-      cell: (perf) => <PerformanceSampleContext stats={perf} />,
-    },
   ]
-  if (groups.some((group) => group.video_filtered_success_rate)) {
-    columns.splice(3, 0, {
-      id: 'filtered-video-success',
-      header: t('Filtered success rate'),
+  const filteredKinds = getFilteredMediaKinds(groups)
+  for (const kind of filteredKinds) {
+    columns.push({
+      id: `filtered-${kind}-success`,
+      header: filteredMediaRateLabel(t, kind, filteredKinds.length > 1),
       className: tableStyles.compactHeaderCellRight,
       cellClassName: tableStyles.compactNumericCell,
       cell: (perf) =>
-        formatUptimePct(perf.video_filtered_success_rate?.rate ?? Number.NaN),
+        formatUptimePct(
+          perf[`${kind}_filtered_success_rate`]?.rate ?? Number.NaN
+        ),
     })
   }
   if (!media) {
@@ -255,6 +250,7 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
         mediaModel={isMediaModel(props.model)}
         windowHours={metricsQuery.data?.data.window_hours}
         updatedAt={metricsQuery.data?.data.updated_at}
+        imageErrorExclusions={metricsQuery.data?.data.image_error_exclusions}
         videoErrorExclusions={metricsQuery.data?.data.video_error_exclusions}
       />
       <section>

@@ -75,7 +75,7 @@ const groups = [
 
 it.each(['overview', 'performance'])(
   'uses the server model summary in the %s view instead of averaging group rates',
-  (view) => {
+  async (view) => {
     client.setQueryData(['perf-metrics', model.model_name], {
       success: true,
       data: {
@@ -134,13 +134,24 @@ it.each(['overview', 'performance'])(
     expect(within(summary).getByText('1.00%')).toBeVisible()
     expect(within(summary).getByText('1.02%')).toBeVisible()
     expect(
+      screen.queryByRole('columnheader', { name: 'Samples' })
+    ).not.toBeInTheDocument()
+    await userEvent.setup().click(
       within(summary).getByRole('button', {
         name: 'Show excluded video errors',
       })
-    ).toBeVisible()
+    )
+    const popup = await screen.findByRole('dialog', {
+      name: 'Filtered success rate',
+    })
+    expect(within(popup).getByText('Reference file unavailable')).toBeVisible()
+    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
+    expect(
+      within(popup).queryByText('Excluded failures')
+    ).not.toBeInTheDocument()
     expect(within(summary).queryByText('3 images')).not.toBeInTheDocument()
-    expect(within(summary).getByText('100 samples')).toBeVisible()
-    expect(within(summary).getByText('2 unknown')).toBeVisible()
+    expect(within(summary).queryByText('100 samples')).not.toBeInTheDocument()
+    expect(within(summary).queryByText('2 unknown')).not.toBeInTheDocument()
     expect(within(summary).getByText('Average delivery time')).toBeVisible()
     expect(within(summary).getByText('120.00s')).toBeVisible()
     expect(within(summary).queryByText('TPS')).not.toBeInTheDocument()
@@ -149,6 +160,51 @@ it.each(['overview', 'performance'])(
     ).not.toBeInTheDocument()
   }
 )
+
+it('shows separate filtered columns for mixed models and a placeholder when all image observations are excluded', () => {
+  const summary = {
+    workload: 'mixed',
+    request_count: 3,
+    avg_latency_ms: 1000,
+    avg_tps: 0,
+    success_rate: 33.33,
+    image_filtered_success_rate: {
+      rate: null,
+      excluded_count: 1,
+      sample_count: 0,
+    },
+    video_filtered_success_rate: {
+      rate: 100,
+      excluded_count: 1,
+      sample_count: 1,
+    },
+  }
+  client.setQueryData(['perf-metrics', model.model_name], {
+    success: true,
+    data: {
+      model_name: model.model_name,
+      image_error_exclusions: ['Image source unavailable'],
+      video_error_exclusions: ['Video source unavailable'],
+      summary,
+      groups: [{ ...groups[0], ...summary }],
+    },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsPerformance model={model} />
+    </QueryClientProvider>
+  )
+  const table = within(screen.getByRole('table'))
+  expect(
+    table.getByRole('columnheader', { name: 'Image filtered success rate' })
+  ).toBeVisible()
+  expect(
+    table.getByRole('columnheader', { name: 'Video filtered success rate' })
+  ).toBeVisible()
+  expect(table.getByRole('cell', { name: '—' })).toBeVisible()
+  expect(table.getByRole('cell', { name: '100.00%' })).toBeVisible()
+  expect(table.queryByRole('columnheader', { name: 'Samples' })).toBeNull()
+})
 
 it('shows an unavailable filtered rate when all video observations are excluded', () => {
   render(
@@ -221,6 +277,7 @@ it('keeps a valid subsecond media observation in the latency trend', () => {
     </QueryClientProvider>
   )
   expect(screen.getAllByText('<1s')).toHaveLength(2)
+  expect(screen.queryAllByText('Limited samples')).toHaveLength(0)
   expect(
     screen.queryByText('No latency data available')
   ).not.toBeInTheDocument()
@@ -242,7 +299,7 @@ it('keeps media metric labels and neutral values when the model has zero samples
   const summary = screen.getByLabelText('Model performance summary')
   expect(within(summary).queryByText('Completed (24h)')).not.toBeInTheDocument()
   expect(within(summary).getAllByText('—')).toHaveLength(2)
-  expect(within(summary).getByText('0 samples')).toBeVisible()
+  expect(within(summary).queryByText('0 samples')).not.toBeInTheDocument()
   expect(within(summary).queryByText('TPS')).not.toBeInTheDocument()
 })
 

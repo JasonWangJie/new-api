@@ -10,13 +10,24 @@ import (
 	"github.com/QuantumNous/new-api/setting/config"
 )
 
-const VideoErrorExclusionsOptionKey = "perf_metrics_setting.video_error_exclusions"
+const (
+	VideoErrorExclusionsOptionKey = "perf_metrics_setting.video_error_exclusions"
+	ImageErrorExclusionsOptionKey = "perf_metrics_setting.image_error_exclusions"
+)
 
-// ParseVideoErrorExclusions treats each trimmed line as a literal substring.
-// The same rules are returned publicly so viewers can inspect the calculation.
 func ParseVideoErrorExclusions(value string) ([]string, error) {
+	return parseTaskErrorExclusions(value, "Video")
+}
+
+func ParseImageErrorExclusions(value string) ([]string, error) {
+	return parseTaskErrorExclusions(value, "Image")
+}
+
+// Each trimmed line is a literal substring. The same rules are returned
+// publicly so viewers can inspect the calculation.
+func parseTaskErrorExclusions(value, kind string) ([]string, error) {
 	if len(value) > 16384 || !utf8.ValidString(value) {
-		return nil, errors.New("Video error exclusions must be valid UTF-8 and at most 16384 bytes")
+		return nil, errors.New(kind + " error exclusions must be valid UTF-8 and at most 16384 bytes")
 	}
 	var rules []string
 	seen := make(map[string]struct{})
@@ -26,13 +37,13 @@ func ParseVideoErrorExclusions(value string) ([]string, error) {
 			continue
 		}
 		if utf8.RuneCountInString(rule) > 256 || strings.ContainsFunc(rule, unicode.IsControl) {
-			return nil, errors.New("Each video error exclusion must be at most 256 characters with no control characters")
+			return nil, errors.New("Each " + strings.ToLower(kind) + " error exclusion must be at most 256 characters with no control characters")
 		}
 		if _, ok := seen[rule]; ok {
 			continue
 		}
 		if len(rules) == 40 {
-			return nil, errors.New("Use at most 40 distinct video error exclusions")
+			return nil, errors.New("Use at most 40 distinct " + strings.ToLower(kind) + " error exclusions")
 		}
 		seen[rule] = struct{}{}
 		rules = append(rules, rule)
@@ -41,10 +52,18 @@ func ParseVideoErrorExclusions(value string) ([]string, error) {
 }
 
 func GetVideoErrorExclusions() []string {
+	return getTaskErrorExclusions(VideoErrorExclusionsOptionKey, "Video")
+}
+
+func GetImageErrorExclusions() []string {
+	return getTaskErrorExclusions(ImageErrorExclusionsOptionKey, "Image")
+}
+
+func getTaskErrorExclusions(key, kind string) []string {
 	common.OptionMapRWMutex.RLock()
-	value := common.OptionMap[VideoErrorExclusionsOptionKey]
+	value := common.OptionMap[key]
 	common.OptionMapRWMutex.RUnlock()
-	rules, _ := ParseVideoErrorExclusions(value)
+	rules, _ := parseTaskErrorExclusions(value, kind)
 	return rules
 }
 

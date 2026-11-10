@@ -59,6 +59,7 @@ export interface ModelCardProps {
   selectedGroup?: string
   perf?: ModelPerfBadgeData
   perfStatus?: 'loading' | 'error' | 'ready'
+  imageErrorExclusions?: readonly string[]
   videoErrorExclusions?: readonly string[]
 }
 
@@ -412,6 +413,7 @@ export const ModelCard = memo(function ModelCard(props: ModelCardProps) {
           perf={getModelPerformanceStats(props.model, props.perf)}
           status={props.perfStatus}
           mediaModel={isMediaModel(props.model)}
+          imageErrorExclusions={props.imageErrorExclusions}
           videoErrorExclusions={props.videoErrorExclusions}
           className='border-border/60 border-t pt-2'
         >

@@ -47,7 +47,7 @@ type TaskPerfMetricBucket struct {
 // GetTaskPerfMetricBuckets aggregates in the database; public requests never
 // load individual task observations. CompletedAt bounds the window exactly,
 // while BucketTs keeps hourly series independent of SQL-dialect date functions.
-func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, groups, videoErrorExclusions []string) ([]TaskPerfMetricBucket, error) {
+func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, groups, videoErrorExclusions, imageErrorExclusions []string) ([]TaskPerfMetricBucket, error) {
 	rows := make([]TaskPerfMetricBucket, 0)
 	if groups != nil && len(groups) == 0 {
 		return rows, nil
@@ -59,9 +59,19 @@ func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, gro
 		"SUM(CASE WHEN outcome = 'unknown' THEN 1 ELSE 0 END) AS unknown_count, " +
 		"SUM(latency_count) AS latency_count, SUM(latency_ms) AS total_latency_ms, SUM(output_count) AS output_count"
 	var args []any
-	if len(videoErrorExclusions) > 0 {
+	var filteredWorkloads []string
+	for _, filter := range []struct {
+		kind, table string
+		rules       []string
+	}{
+		{"video", "async_media_jobs", videoErrorExclusions},
+		{"image", "async_image_tasks", imageErrorExclusions},
+	} {
+		if len(filter.rules) == 0 {
+			continue
+		}
 		// Match against the current terminal job's reason inside the database.
-		// EXISTS counts a failed sample only once, even with overlapping rules.
+		// Qualifying EXISTS by workload keeps identical task IDs independent.
 		identity := "job.task_id = task_perf_samples.task_id"
 		match := "instr(job.error_message, ?) > 0"
 		switch {
@@ -69,18 +79,22 @@ func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, gro
 			// The first comparison can use the unique index. The binary comparison
 			// prevents case-insensitive collations from matching another task ID.
 			identity += " AND CAST(job.task_id AS BINARY) = CAST(task_perf_samples.task_id AS BINARY)"
-			match = "LOCATE(CAST(? AS BINARY), CAST(job.error_message AS BINARY)) > 0"
+			match = "LOCATE(CAST(CONVERT(? USING utf8mb4) AS BINARY), CAST(CONVERT(job.error_message USING utf8mb4) AS BINARY)) > 0"
 		case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
 			match = "strpos(job.error_message, ?) > 0"
 		}
-		matches := make([]string, len(videoErrorExclusions))
-		args = make([]any, len(videoErrorExclusions))
-		for i, exclusion := range videoErrorExclusions {
-			matches[i], args[i] = match, exclusion
+		matches := make([]string, len(filter.rules))
+		for i, exclusion := range filter.rules {
+			matches[i] = match
+			args = append(args, exclusion)
 		}
-		columns += ", SUM(CASE WHEN kind = 'video' AND outcome = 'failure' AND EXISTS (" +
-			"SELECT 1 FROM async_media_jobs job WHERE " + identity + " AND job.status IN ('failed', 'expired') AND (" +
-			strings.Join(matches, " OR ") + ")) THEN 1 ELSE 0 END) AS excluded_count"
+		filteredWorkloads = append(filteredWorkloads, "(kind = '"+filter.kind+"' AND EXISTS ("+
+			"SELECT 1 FROM "+filter.table+" job WHERE "+identity+" AND job.status IN ('failed', 'expired') AND ("+
+			strings.Join(matches, " OR ")+")))")
+	}
+	if len(filteredWorkloads) > 0 {
+		columns += ", SUM(CASE WHEN outcome = 'failure' AND (" +
+			strings.Join(filteredWorkloads, " OR ") + ") THEN 1 ELSE 0 END) AS excluded_count"
 	}
 	query := DB.Model(&TaskPerfSample{}).Select(columns, args...).
 		Where("completed_at >= ? AND completed_at <= ?", startTs, endTs)

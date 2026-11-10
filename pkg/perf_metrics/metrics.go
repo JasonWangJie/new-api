@@ -86,7 +86,8 @@ func Query(params QueryParams) (QueryResult, error) {
 	endTs := time.Now().Unix()
 	startTs := endTs - int64(params.Hours)*3600
 	allowedGroups := allowedGroupSet(params.Groups)
-	exclusions := perf_metrics_setting.GetVideoErrorExclusions()
+	videoExclusions := perf_metrics_setting.GetVideoErrorExclusions()
+	imageExclusions := perf_metrics_setting.GetImageErrorExclusions()
 
 	merged := map[bucketKey]counters{}
 	rows, err := model.GetPerfMetrics(params.Model, params.Group, startTs, endTs)
@@ -115,12 +116,12 @@ func Query(params QueryParams) (QueryResult, error) {
 			workloads:      relayWorkload,
 		})
 	}
-	taskRows, err := model.GetTaskPerfMetricBuckets(params.Model, params.Group, startTs, endTs, params.Groups, exclusions)
+	taskRows, err := model.GetTaskPerfMetricBuckets(params.Model, params.Group, startTs, endTs, params.Groups, videoExclusions, imageExclusions)
 	if err != nil {
 		return QueryResult{}, err
 	}
 	for _, row := range taskRows {
-		mergeCounters(merged, bucketKey{model: row.ModelName, group: row.Group, bucketTs: row.BucketTs}, taskCounters(row, len(exclusions) > 0))
+		mergeCounters(merged, bucketKey{model: row.ModelName, group: row.Group, bucketTs: row.BucketTs}, taskCounters(row, len(videoExclusions) > 0, len(imageExclusions) > 0))
 	}
 
 	hotBuckets.Range(func(key, value any) bool {
@@ -142,7 +143,8 @@ func Query(params QueryParams) (QueryResult, error) {
 
 	result := buildQueryResult(params.Model, merged)
 	result.WindowHours, result.UpdatedAt = params.Hours, endTs
-	result.VideoErrorExclusions = exclusions
+	result.VideoErrorExclusions = videoExclusions
+	result.ImageErrorExclusions = imageExclusions
 	return result, nil
 }
 
@@ -156,7 +158,8 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 	endTs := time.Now().Unix()
 	startTs := endTs - int64(hours)*3600
 	allowedGroups := allowedGroupSet(groups)
-	exclusions := perf_metrics_setting.GetVideoErrorExclusions()
+	videoExclusions := perf_metrics_setting.GetVideoErrorExclusions()
+	imageExclusions := perf_metrics_setting.GetImageErrorExclusions()
 
 	rows, err := model.GetPerfMetricsSummaryBucketsAll(startTs, endTs, groups)
 	if err != nil {
@@ -180,12 +183,12 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		mergeModelTotals(totals, row.ModelName, value)
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
-	taskRows, err := model.GetTaskPerfMetricBuckets("", "", startTs, endTs, groups, exclusions)
+	taskRows, err := model.GetTaskPerfMetricBuckets("", "", startTs, endTs, groups, videoExclusions, imageExclusions)
 	if err != nil {
 		return SummaryAllResult{}, err
 	}
 	for _, row := range taskRows {
-		value := taskCounters(row, len(exclusions) > 0)
+		value := taskCounters(row, len(videoExclusions) > 0, len(imageExclusions) > 0)
 		mergeModelTotals(totals, row.ModelName, value)
 		mergeModelBucket(modelBuckets, row.ModelName, row.BucketTs, value)
 	}
@@ -227,10 +230,14 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		return models[i].RequestCount > models[j].RequestCount
 	})
 
-	return SummaryAllResult{Models: models, WindowHours: hours, UpdatedAt: endTs, VideoErrorExclusions: exclusions}, nil
+	return SummaryAllResult{
+		Models: models, WindowHours: hours, UpdatedAt: endTs,
+		VideoErrorExclusions: videoExclusions,
+		ImageErrorExclusions: imageExclusions,
+	}, nil
 }
 
-func taskCounters(row model.TaskPerfMetricBucket, filterVideo bool) counters {
+func taskCounters(row model.TaskPerfMetricBucket, filterVideo, filterImage bool) counters {
 	workloads := imageWorkload
 	if row.Kind == "video" {
 		workloads = videoWorkload
@@ -241,10 +248,12 @@ func taskCounters(row model.TaskPerfMetricBucket, filterVideo bool) counters {
 		totalLatencyMs: row.TotalLatencyMs, outputCount: row.OutputCount,
 		workloads: workloads,
 	}
+	filtered := taskFilterCounters{requestCount: row.RequestCount, successCount: row.SuccessCount, excludedCount: row.ExcludedCount}
 	if filterVideo && row.Kind == "video" {
-		value.videoRequestCount = row.RequestCount
-		value.videoSuccessCount = row.SuccessCount
-		value.videoExcludedCount = row.ExcludedCount
+		value.videoFiltered = filtered
+	}
+	if filterImage && row.Kind == "image" {
+		value.imageFiltered = filtered
 	}
 	return value
 }

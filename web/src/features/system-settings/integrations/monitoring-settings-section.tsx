@@ -61,7 +61,7 @@ const numericString = z.string().refine((value) => {
   return !Number.isNaN(Number(trimmed)) && Number(trimmed) >= 0
 }, 'Enter a non-negative number or leave empty')
 
-function videoErrorKeywords(value: string): string[] {
+function errorExclusionKeywords(value: string): string[] {
   const keywords = value
     .split('\n')
     // Match the server's Unicode whitespace trimming.
@@ -70,8 +70,8 @@ function videoErrorKeywords(value: string): string[] {
   return [...new Set(keywords)]
 }
 
-const videoErrorExclusions = z.string().transform((value, ctx) => {
-  const keywords = videoErrorKeywords(value)
+const errorExclusions = z.string().transform((value, ctx) => {
+  const keywords = errorExclusionKeywords(value)
   if (
     new TextEncoder().encode(value).length > 16_384 ||
     keywords.length > 40 ||
@@ -101,7 +101,8 @@ const monitoringSchema = z.object({
     flush_interval: z.coerce.number().min(1),
     bucket_time: z.enum(['minute', '5min', 'hour']),
     retention_days: z.coerce.number().min(0),
-    video_error_exclusions: videoErrorExclusions,
+    image_error_exclusions: errorExclusions,
+    video_error_exclusions: errorExclusions,
   }),
 })
 
@@ -114,6 +115,7 @@ type FlatMonitoringDefaults = {
   'perf_metrics_setting.flush_interval': number
   'perf_metrics_setting.bucket_time': 'minute' | '5min' | 'hour'
   'perf_metrics_setting.retention_days': number
+  'perf_metrics_setting.image_error_exclusions': string
   'perf_metrics_setting.video_error_exclusions': string
 }
 
@@ -130,6 +132,8 @@ const buildFormDefaults = (
     flush_interval: defaults['perf_metrics_setting.flush_interval'],
     bucket_time: defaults['perf_metrics_setting.bucket_time'],
     retention_days: defaults['perf_metrics_setting.retention_days'],
+    image_error_exclusions:
+      defaults['perf_metrics_setting.image_error_exclusions'] ?? '',
     video_error_exclusions:
       defaults['perf_metrics_setting.video_error_exclusions'] ?? '',
   },
@@ -146,7 +150,10 @@ const normalizeDefaults = (
     defaults['perf_metrics_setting.bucket_time'],
   'perf_metrics_setting.retention_days':
     defaults['perf_metrics_setting.retention_days'],
-  'perf_metrics_setting.video_error_exclusions': videoErrorKeywords(
+  'perf_metrics_setting.image_error_exclusions': errorExclusionKeywords(
+    defaults['perf_metrics_setting.image_error_exclusions'] ?? ''
+  ).join('\n'),
+  'perf_metrics_setting.video_error_exclusions': errorExclusionKeywords(
     defaults['perf_metrics_setting.video_error_exclusions'] ?? ''
   ).join('\n'),
 })
@@ -161,6 +168,8 @@ const normalizeFormValues = (
   'perf_metrics_setting.bucket_time': values.perf_metrics_setting.bucket_time,
   'perf_metrics_setting.retention_days':
     values.perf_metrics_setting.retention_days,
+  'perf_metrics_setting.image_error_exclusions':
+    values.perf_metrics_setting.image_error_exclusions,
   'perf_metrics_setting.video_error_exclusions':
     values.perf_metrics_setting.video_error_exclusions,
 })
@@ -198,6 +207,22 @@ export function MonitoringSettingsSection({
   }, [defaultValues])
 
   const perfMetricsEnabled = form.watch('perf_metrics_setting.enabled')
+  const errorExclusionFields = [
+    {
+      name: 'perf_metrics_setting.image_error_exclusions',
+      label: t('Async image error exclusions'),
+      description: t(
+        'Final image failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
+      ),
+    },
+    {
+      name: 'perf_metrics_setting.video_error_exclusions',
+      label: t('Async video error exclusions'),
+      description: t(
+        'Final video failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
+      ),
+    },
+  ] as const
 
   const onSubmit = async (values: MonitoringFormValues) => {
     const normalized = normalizeFormValues(values)
@@ -356,31 +381,32 @@ export function MonitoringSettingsSection({
               )}
             />
           </div>
-          <FormField
-            control={form.control}
-            name='perf_metrics_setting.video_error_exclusions'
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('Async video error exclusions')}</FormLabel>
-                <FormControl>
-                  <Textarea
-                    rows={5}
-                    placeholder={t('Enter one keyword per line')}
-                    {...field}
-                  />
-                </FormControl>
-                <FormDescription>
-                  {t(
-                    'Final video failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
-                  )}{' '}
-                  {t(
-                    'Keywords appear in the public rule list. Use generic phrases and omit private details.'
-                  )}
-                </FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+          {errorExclusionFields.map(({ name, label, description }) => (
+            <FormField
+              key={name}
+              control={form.control}
+              name={name}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{label}</FormLabel>
+                  <FormControl>
+                    <Textarea
+                      rows={5}
+                      placeholder={t('Enter one keyword per line')}
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    {description}{' '}
+                    {t(
+                      'Keywords appear in the public rule list. Use generic phrases and omit private details.'
+                    )}
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          ))}
         </SettingsForm>
       </Form>
     </SettingsSection>

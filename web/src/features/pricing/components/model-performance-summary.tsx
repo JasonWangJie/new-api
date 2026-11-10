@@ -28,15 +28,19 @@ import {
   getSuccessRateTextClass,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
-import type {
-  FilteredVideoSuccessRate,
-  PerformanceStats,
-} from '@/features/performance-metrics/types'
+import type { PerformanceStats } from '@/features/performance-metrics/types'
 import { toIntlLocale } from '@/i18n/languages'
 import { cn } from '@/lib/utils'
 
-export function FilteredVideoSuccessRateHelp(props: {
-  stats: FilteredVideoSuccessRate
+import {
+  filteredMediaRateLabel,
+  getFilteredMediaKinds,
+  type FilteredMediaKind,
+} from '../lib/model-performance'
+
+export function FilteredMediaSuccessRateHelp(props: {
+  kind: FilteredMediaKind
+  label: string
   exclusions?: readonly string[]
 }) {
   const { t } = useTranslation()
@@ -45,7 +49,10 @@ export function FilteredVideoSuccessRateHelp(props: {
   return (
     <LearnMore
       triggerProps={{
-        'aria-label': t('Show excluded video errors'),
+        'aria-label':
+          props.kind === 'image'
+            ? t('Show excluded image errors')
+            : t('Show excluded video errors'),
         className: 'shrink-0 rounded-full',
       }}
       contentProps={{
@@ -53,20 +60,16 @@ export function FilteredVideoSuccessRateHelp(props: {
           'max-h-[min(24rem,60dvh)] w-80 max-w-[calc(100vw-1.5rem)] overflow-y-auto overscroll-contain p-3',
       }}
     >
-      <PopoverTitle className='text-foreground'>
-        {t('Filtered success rate')}
-      </PopoverTitle>
+      <PopoverTitle className='text-foreground'>{props.label}</PopoverTitle>
       <p className='text-xs'>
-        {t(
-          'Successful video tasks divided by terminal video tasks after excluding matching failures. Unknown outcomes are included.'
-        )}
+        {props.kind === 'image'
+          ? t(
+              'Successful image tasks divided by terminal image tasks after excluding matching failures. Unknown outcomes are included.'
+            )
+          : t(
+              'Successful video tasks divided by terminal video tasks after excluding matching failures. Unknown outcomes are included.'
+            )}
       </p>
-      <dl className='grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 text-xs tabular-nums'>
-        <dt>{t('Samples')}</dt>
-        <dd>{props.stats.sample_count}</dd>
-        <dt>{t('Excluded failures')}</dt>
-        <dd>{props.stats.excluded_count}</dd>
-      </dl>
       <p className='text-foreground text-xs font-medium'>
         {t('Error phrases excluded from this rate')}
       </p>
@@ -79,40 +82,14 @@ export function FilteredVideoSuccessRateHelp(props: {
   )
 }
 
-export function PerformanceSampleContext(props: {
-  stats?: PerformanceStats
-  windowHours?: number
+export function PerformanceTimeContext(props: {
+  windowHours: number
   updatedAt?: number
 }) {
   const { t, i18n } = useTranslation()
-  const count = props.stats?.request_count
   return (
     <div className='text-muted-foreground flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-[11px]'>
-      {props.windowHours != null && (
-        <span>{t('Last {{hours}} hours', { hours: props.windowHours })}</span>
-      )}
-      {count != null && (
-        <span>
-          {count === 1
-            ? t('{{count}} sample', { count })
-            : t('{{count}} samples', { count })}
-        </span>
-      )}
-      {count != null && count > 0 && count < 20 && (
-        <span
-          title={t('Fewer than 20 samples')}
-          className='text-amber-600 dark:text-amber-400'
-        >
-          {t('Limited samples')}
-        </span>
-      )}
-      {(props.stats?.unknown_count ?? 0) > 0 && (
-        <span className='text-amber-600 dark:text-amber-400'>
-          {props.stats?.unknown_count === 1
-            ? t('{{count}} unknown result', { count: 1 })
-            : t('{{count}} unknown', { count: props.stats?.unknown_count })}
-        </span>
-      )}
+      <span>{t('Last {{hours}} hours', { hours: props.windowHours })}</span>
       {props.updatedAt != null && props.updatedAt > 0 && (
         <span>
           {t('Updated {{time}}', {
@@ -132,13 +109,15 @@ export function ModelPerformanceSummary(props: {
   windowHours?: number
   updatedAt?: number
   mediaModel?: boolean
+  imageErrorExclusions?: readonly string[]
   videoErrorExclusions?: readonly string[]
 }) {
   const { t } = useTranslation()
   const stats = props.stats
   const hasSamples = stats != null && stats.request_count !== 0
-  const filtered = stats?.video_filtered_success_rate
-  const media = isTaskPerformance(stats) || props.mediaModel || filtered != null
+  const filteredKinds = getFilteredMediaKinds([stats])
+  const media =
+    isTaskPerformance(stats) || props.mediaModel || filteredKinds.length > 0
   const deliveredMedia =
     stats?.workload === 'image' || stats?.workload === 'video'
   const successRate = hasSamples ? stats.success_rate : Number.NaN
@@ -163,17 +142,23 @@ export function ModelPerformanceSummary(props: {
       valueClassName: getSuccessRateTextClass(successRate),
     },
   ]
-  if (filtered) {
-    const rate = filtered.rate ?? Number.NaN
+  for (const kind of filteredKinds) {
+    const rate = stats?.[`${kind}_filtered_success_rate`]?.rate ?? Number.NaN
+    const label = filteredMediaRateLabel(t, kind, filteredKinds.length > 1)
     metrics.push({
       icon: HeartPulse,
-      label: t('Filtered success rate'),
+      label,
       value: formatUptimePct(rate),
       valueClassName: getSuccessRateTextClass(rate),
       help: (
-        <FilteredVideoSuccessRateHelp
-          stats={filtered}
-          exclusions={props.videoErrorExclusions}
+        <FilteredMediaSuccessRateHelp
+          kind={kind}
+          label={label}
+          exclusions={
+            kind === 'image'
+              ? props.imageErrorExclusions
+              : props.videoErrorExclusions
+          }
         />
       ),
     })
@@ -190,7 +175,9 @@ export function ModelPerformanceSummary(props: {
       <dl
         className={cn(
           'grid overflow-hidden rounded-lg',
-          media && !filtered ? 'sm:grid-cols-2' : 'sm:grid-cols-3',
+          metrics.length === 2 && 'sm:grid-cols-2',
+          metrics.length === 3 && 'sm:grid-cols-3',
+          metrics.length === 4 && 'sm:grid-cols-4',
           props.compact ? 'bg-muted/20 border sm:divide-x' : 'gap-2'
         )}
       >
@@ -221,8 +208,7 @@ export function ModelPerformanceSummary(props: {
           </div>
         ))}
       </dl>
-      <PerformanceSampleContext
-        stats={props.stats}
+      <PerformanceTimeContext
         windowHours={props.windowHours ?? 24}
         updatedAt={props.updatedAt}
       />

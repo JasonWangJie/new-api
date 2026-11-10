@@ -61,7 +61,10 @@ export function useUpdateOption() {
         // Always refresh system-options
         queryClient.invalidateQueries({ queryKey: ['system-options'] })
 
-        if (variables.key === 'perf_metrics_setting.video_error_exclusions') {
+        if (
+          variables.key === 'perf_metrics_setting.image_error_exclusions' ||
+          variables.key === 'perf_metrics_setting.video_error_exclusions'
+        ) {
           queryClient.invalidateQueries({ queryKey: ['perf-metrics'] })
           queryClient.invalidateQueries({ queryKey: ['perf-metrics-summary'] })
         }

@@ -137,9 +137,68 @@ describe('model cards', () => {
     expect(info).toHaveAttribute('aria-expanded', 'true')
     expect(within(popup).getByText('Reference file unavailable')).toBeVisible()
     expect(within(popup).getByText('Invalid aspect ratio')).toBeVisible()
+    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
+    expect(
+      within(popup).queryByText('Excluded failures')
+    ).not.toBeInTheDocument()
     expect(onModelClick).not.toHaveBeenCalled()
     await user.keyboard('{Escape}')
     await waitFor(() => expect(info).toHaveAttribute('aria-expanded', 'false'))
+  })
+
+  it('separates filtered image and video rates and rules on a mixed model card', async () => {
+    queryClient.setQueryData(['perf-metrics-summary', 24], {
+      success: true,
+      data: {
+        image_error_exclusions: ['Image source unavailable'],
+        video_error_exclusions: ['Video source unavailable'],
+        models: [
+          {
+            model_name: 'example-model',
+            workload: 'mixed',
+            request_count: 5,
+            unknown_count: 1,
+            avg_latency_ms: 1000,
+            avg_tps: 0,
+            success_rate: 60,
+            image_filtered_success_rate: {
+              rate: 100,
+              excluded_count: 1,
+              sample_count: 1,
+            },
+            video_filtered_success_rate: {
+              rate: 50,
+              excluded_count: 1,
+              sample_count: 2,
+            },
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ModelCardGrid models={[pricingModel()]} onModelClick={vi.fn()} />
+      </QueryClientProvider>
+    )
+    expect(screen.getByText('60.0%')).toBeVisible()
+    expect(screen.getByText('100.00%')).toBeVisible()
+    expect(screen.getByText('50.00%')).toBeVisible()
+    expect(screen.getByText('Image filtered success rate')).toBeVisible()
+    expect(screen.getByText('Video filtered success rate')).toBeVisible()
+    expect(screen.queryByText('5 samples')).not.toBeInTheDocument()
+    expect(screen.queryByText('1 unknown result')).not.toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(
+      screen.getByRole('button', { name: 'Show excluded image errors' })
+    )
+    const popup = await screen.findByRole('dialog', {
+      name: 'Image filtered success rate',
+    })
+    expect(within(popup).getByText('Image source unavailable')).toBeVisible()
+    expect(
+      within(popup).queryByText('Video source unavailable')
+    ).not.toBeInTheDocument()
+    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
   })
 
   it('shows separate generic and image cache prices including a free image cache', () => {
@@ -530,7 +589,7 @@ describe('model cards', () => {
     expect(onModelClick).toHaveBeenCalledWith('example-model')
   })
 
-  it('shows metrics loading until a successful response confirms that a model has no samples', async () => {
+  it('keeps metric placeholders without a sample notice after an empty response', async () => {
     let resolveRequest: (value: unknown) => void = () => undefined
     vi.spyOn(api, 'get').mockReturnValue(
       new Promise((resolve) => {
@@ -552,9 +611,13 @@ describe('model cards', () => {
     await act(async () =>
       resolveRequest({ data: { success: true, data: { models: [] } } })
     )
+    await waitFor(() =>
+      expect(within(metrics).queryByText('Loading...')).not.toBeInTheDocument()
+    )
     expect(
-      await within(metrics).findByText('No samples in the last 24 hours')
-    ).toBeVisible()
+      within(metrics).queryByText('No samples in the last 24 hours')
+    ).not.toBeInTheDocument()
+    expect(within(metrics).getByText('—%')).toBeVisible()
   })
 
   it.each([
@@ -566,7 +629,7 @@ describe('model cards', () => {
       expected: '3 successful requests',
     },
   ])(
-    'keeps $workload latency and sample context without a completion or throughput metric',
+    'keeps $workload latency and success rate without sample notices, completion, or throughput',
     (entry) => {
       render(
         <ModelCard
@@ -595,8 +658,10 @@ describe('model cards', () => {
       ).not.toBeInTheDocument()
       expect(within(metrics).getByText('120.00s')).toBeVisible()
       expect(within(metrics).getByText('60.0%')).toBeVisible()
-      expect(within(metrics).getByText('5 samples')).toBeVisible()
-      expect(within(metrics).getByText('1 unknown result')).toBeVisible()
+      expect(within(metrics).queryByText('5 samples')).not.toBeInTheDocument()
+      expect(
+        within(metrics).queryByText('1 unknown result')
+      ).not.toBeInTheDocument()
       expect(within(metrics).queryByText(/t\/s/)).not.toBeInTheDocument()
     }
   )
@@ -691,10 +756,8 @@ describe('model cards', () => {
       />
     )
     expect(screen.getByText('<1s')).toBeVisible()
-    expect(screen.getByText('1 sample')).toBeVisible()
-    expect(screen.getByTitle('Fewer than 20 samples')).toHaveTextContent(
-      'Limited samples'
-    )
+    expect(screen.queryByText('1 sample')).not.toBeInTheDocument()
+    expect(screen.queryByText('Limited samples')).not.toBeInTheDocument()
   })
 
   it('paginates the model cards and disables navigation at both boundaries', async () => {

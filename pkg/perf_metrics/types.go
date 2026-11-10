@@ -41,16 +41,19 @@ type MetricStats struct {
 	OutputCount    int64   `json:"output_count"`
 	Workload       string  `json:"workload"`
 
-	VideoFilteredSuccessRate *VideoFilteredSuccessRate `json:"video_filtered_success_rate,omitempty"`
+	VideoFilteredSuccessRate *FilteredSuccessRate `json:"video_filtered_success_rate,omitempty"`
+	ImageFilteredSuccessRate *FilteredSuccessRate `json:"image_filtered_success_rate,omitempty"`
 }
 
-// VideoFilteredSuccessRate counts async video terminal outcomes only. The rate
-// is null when all such samples were excluded.
-type VideoFilteredSuccessRate struct {
+// FilteredSuccessRate counts terminal outcomes for one async workload. The
+// rate is null when all of its samples were excluded.
+type FilteredSuccessRate struct {
 	Rate          *float64 `json:"rate"`
 	ExcludedCount int64    `json:"excluded_count"`
 	SampleCount   int64    `json:"sample_count"`
 }
+
+type VideoFilteredSuccessRate = FilteredSuccessRate
 
 type BucketPoint struct {
 	Ts int64 `json:"ts"`
@@ -72,6 +75,7 @@ type QueryResult struct {
 	UpdatedAt    int64         `json:"updated_at"`
 
 	VideoErrorExclusions []string `json:"video_error_exclusions,omitempty"`
+	ImageErrorExclusions []string `json:"image_error_exclusions,omitempty"`
 }
 
 type SuccessRatePoint struct {
@@ -91,6 +95,7 @@ type SummaryAllResult struct {
 	UpdatedAt   int64          `json:"updated_at"`
 
 	VideoErrorExclusions []string `json:"video_error_exclusions,omitempty"`
+	ImageErrorExclusions []string `json:"image_error_exclusions,omitempty"`
 }
 
 type bucketKey struct {
@@ -112,9 +117,35 @@ type counters struct {
 	outputCount    int64
 	workloads      uint8
 
-	videoRequestCount  int64
-	videoSuccessCount  int64
-	videoExcludedCount int64
+	videoFiltered taskFilterCounters
+	imageFiltered taskFilterCounters
+}
+
+type taskFilterCounters struct {
+	requestCount  int64
+	successCount  int64
+	excludedCount int64
+}
+
+func (c *taskFilterCounters) add(value taskFilterCounters) {
+	c.requestCount += value.requestCount
+	c.successCount += value.successCount
+	c.excludedCount += value.excludedCount
+}
+
+func (c taskFilterCounters) stats() *FilteredSuccessRate {
+	if c.requestCount == 0 {
+		return nil
+	}
+	filtered := &FilteredSuccessRate{
+		ExcludedCount: c.excludedCount,
+		SampleCount:   c.requestCount - c.excludedCount,
+	}
+	if filtered.SampleCount > 0 {
+		rate := float64(c.successCount) / float64(filtered.SampleCount) * 100
+		filtered.Rate = &rate
+	}
+	return filtered
 }
 
 const (
@@ -135,9 +166,8 @@ func (c *counters) add(value counters) {
 	c.generationMs += value.generationMs
 	c.outputCount += value.outputCount
 	c.workloads |= value.workloads
-	c.videoRequestCount += value.videoRequestCount
-	c.videoSuccessCount += value.videoSuccessCount
-	c.videoExcludedCount += value.videoExcludedCount
+	c.videoFiltered.add(value.videoFiltered)
+	c.imageFiltered.add(value.imageFiltered)
 }
 
 func (c counters) stats() MetricStats {
@@ -150,7 +180,7 @@ func (c counters) stats() MetricStats {
 	case videoWorkload:
 		workload = "video"
 	}
-	stats := MetricStats{
+	return MetricStats{
 		AvgTtftMs:    avg(c.ttftSumMs, c.ttftCount),
 		AvgLatencyMs: avg(c.totalLatencyMs, c.latencyCount),
 		SuccessRate:  successRate(c), AvgTps: avgTps(c),
@@ -158,20 +188,10 @@ func (c counters) stats() MetricStats {
 		FailureCount: c.requestCount - c.successCount - c.unknownCount,
 		UnknownCount: c.unknownCount, LatencyCount: c.latencyCount,
 		TotalLatencyMs: c.totalLatencyMs, OutputCount: c.outputCount,
-		Workload: workload,
+		Workload:                 workload,
+		VideoFilteredSuccessRate: c.videoFiltered.stats(),
+		ImageFilteredSuccessRate: c.imageFiltered.stats(),
 	}
-	if c.videoRequestCount > 0 {
-		filtered := &VideoFilteredSuccessRate{
-			ExcludedCount: c.videoExcludedCount,
-			SampleCount:   c.videoRequestCount - c.videoExcludedCount,
-		}
-		if filtered.SampleCount > 0 {
-			rate := float64(c.videoSuccessCount) / float64(filtered.SampleCount) * 100
-			filtered.Rate = &rate
-		}
-		stats.VideoFilteredSuccessRate = filtered
-	}
-	return stats
 }
 
 type atomicBucket struct {
