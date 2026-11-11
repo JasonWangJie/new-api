@@ -819,6 +819,34 @@ test.each([
   }
 )
 
+test.each([false, true])(
+  'image task details preview the result file URL directly (admin=%s)',
+  async (admin) => {
+    const link = '/v1/media/files/img_0123456789abcdef0123456789abcdef.png'
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      results: [{ ...detail.results[0], url: link }],
+    })
+    mount(
+      <ImageTaskDetails
+        id={task.id}
+        admin={admin}
+        userId={101}
+        canManage={admin}
+        onClose={vi.fn()}
+        onManage={vi.fn()}
+      />
+    )
+
+    expect(await screen.findByAltText('Generated image')).toHaveAttribute(
+      'src',
+      link
+    )
+    expect(imageRequest).not.toHaveBeenCalled()
+    expect(imageBlob).not.toHaveBeenCalled()
+  }
+)
+
 test('replacing a protected image releases the previous preview URL', async () => {
   const first = new Blob(['first'], { type: 'image/png' })
   const second = new Blob(['second'], { type: 'image/png' })

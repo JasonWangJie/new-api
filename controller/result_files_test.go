@@ -27,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -149,6 +150,96 @@ func queryStoredResultFiles(t *testing.T, f *canvasFixture, query string, token 
 		links[i] = item.URL
 	}
 	return links
+}
+
+func TestStoredResultFileImageDetails(t *testing.T) {
+	f, token := newStoredResultFixture(t)
+	require.NoError(t, f.db.AutoMigrate(&model.Channel{}))
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+	for _, backend := range []string{"local", "s3"} {
+		t.Run(backend, func(t *testing.T) {
+			profile := model.ImageStorageProfile{ProfileId: "detail-local", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}
+			if backend == "s3" {
+				var getMode atomic.Int32
+				profile, _ = storedResultS3Profile(t, f, &getMode)
+			} else {
+				require.NoError(t, f.db.Create(&profile).Error)
+			}
+			task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: f.user.Id, TokenId: token.Id, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ResultCount: 1, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(24 * time.Hour).Unix()}
+			require.NoError(t, f.db.Create(&task).Error)
+			object := storedResultImage(t, profile, task, 0, "image/png", data.Bytes())
+			require.NoError(t, f.db.Model(&object).Update("expires_at", task.ExpiresAt-3600).Error)
+			require.NoError(t, f.db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ObjectId: object.ObjectId}).Error)
+			var link string
+			for _, surface := range []struct {
+				name, accept string
+				userID       int
+				admin, view  bool
+				status       int
+			}{
+				{name: "other user detail", userID: task.UserId + 1, status: http.StatusNotFound},
+				{name: "other user view", userID: task.UserId + 1, view: true, status: http.StatusNotFound},
+				{name: "owner media detail issues file URL", userID: task.UserId, status: http.StatusOK},
+				{name: "administrator media detail reuses file URL", userID: task.UserId + 1, admin: true, status: http.StatusOK},
+				{name: "owner JSON view reuses file URL", userID: task.UserId, view: true, accept: "application/json", status: http.StatusOK},
+				{name: "administrator JSON view reuses file URL", userID: task.UserId + 1, admin: true, view: true, accept: "application/json", status: http.StatusOK},
+				{name: "owner preview redirects to file URL", userID: task.UserId, view: true, status: http.StatusTemporaryRedirect},
+			} {
+				t.Run(surface.name, func(t *testing.T) {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", surface.userID)
+					c.Params = gin.Params{{Key: "task_id", Value: task.TaskId}, {Key: "image_index", Value: "0"}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+					c.Request.Header.Set("Accept", surface.accept)
+					if surface.view {
+						ViewImageTaskResult(c, surface.admin)
+					} else {
+						GetMediaTask(c, surface.admin)
+					}
+					require.Equal(t, surface.status, recorder.Code, recorder.Body.String())
+					if surface.status == http.StatusNotFound {
+						var current model.ImageStorageObject
+						require.NoError(t, f.db.First(&current, object.Id).Error)
+						assert.Nil(t, current.ResultFileId, "unauthorized reads must not issue a public filename")
+						return
+					}
+					if surface.status == http.StatusTemporaryRedirect {
+						assert.Equal(t, link, recorder.Header().Get("Location"))
+						return
+					}
+					var response struct {
+						Data struct {
+							URL       string `json:"url"`
+							ExpiresAt int64  `json:"expires_at"`
+							Results   []struct {
+								URL string `json:"url"`
+							} `json:"results"`
+						} `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					actual := response.Data.URL
+					if !surface.view {
+						require.Len(t, response.Data.Results, 1)
+						actual = response.Data.Results[0].URL
+					} else {
+						assert.Equal(t, min(task.ExpiresAt, object.ExpiresAt), response.Data.ExpiresAt)
+					}
+					if link == "" {
+						require.Regexp(t, "^"+regexp.QuoteMeta(storedResultTestPath)+"img_[0-9a-f]{32}\\.png$", actual)
+						link = actual
+					}
+					assert.Equal(t, link, actual)
+				})
+			}
+			require.NotEmpty(t, link)
+			assert.Equal(t, []string{link}, queryStoredResultFiles(t, f, "/v1/images/tasks_async/"+task.TaskId, token))
+			content := f.request(http.MethodGet, link, "", "", "", "")
+			require.Equal(t, http.StatusOK, content.Code, content.Body.String())
+			assert.Equal(t, data.Bytes(), content.Body.Bytes())
+		})
+	}
 }
 
 func TestStoredResultFileImageLifecycle(t *testing.T) {

@@ -528,7 +528,6 @@ func GetImageTask(c *gin.Context, admin bool) {
 		if admin {
 			base = "/api/admin/async-image-tasks/"
 		}
-		cfg, cfgErr := service.GetImageRuntimeConfig(c.Request.Context())
 		for _, result := range saved {
 			object, ok := objectsByID[result.ObjectId]
 			if !ok {
@@ -539,10 +538,8 @@ func GetImageTask(c *gin.Context, admin bool) {
 			item := gin.H{"id": result.Id, "image_index": result.ImageIndex, "content_type": object.ContentType, "byte_size": object.ByteSize, "checksum": object.Checksum, "width": object.Width, "height": object.Height, "view_url": view, "created_at": result.CreatedAt, "expires_at": object.ExpiresAt}
 			if managed {
 				item["url"], item["authenticated"] = view, true
-			} else if cfgErr == nil {
-				if link, signErr := service.ImageObjectURL(c.Request.Context(), object, AsyncImageGatewayBase(), cfg.SignedURLExpiry); signErr == nil {
-					item["url"] = link
-				}
+			} else if link, err := service.ImageResultFileURL(c.Request.Context(), object, AsyncImageGatewayBase()); err == nil {
+				item["url"] = link
 			}
 			results = append(results, item)
 		}
@@ -643,19 +640,18 @@ func ViewImageTaskResult(c *gin.Context, admin bool) {
 		imageManagementError(c, 503, errors.New("Image storage object is unavailable"))
 		return
 	}
-	cfg, err := service.GetImageRuntimeConfig(ctx)
+	link, err := service.ImageResultFileURL(ctx, object, AsyncImageGatewayBase())
 	if err != nil {
-		imageManagementError(c, 503, err)
-		return
-	}
-	link, err := service.ImageObjectURL(ctx, object, AsyncImageGatewayBase(), cfg.SignedURLExpiry)
-	if err != nil {
-		imageManagementError(c, 503, errors.New("Image signing is unavailable"))
+		imageManagementError(c, 503, errors.New("Image file is unavailable"))
 		return
 	}
 	c.Header("Cache-Control", "private, no-store")
 	if strings.Contains(c.GetHeader("Accept"), "application/json") {
-		imageManagementData(c, gin.H{"url": link, "expires_at": min(object.ExpiresAt, time.Now().Unix()+int64(cfg.SignedURLExpiry))})
+		expiresAt := task.ExpiresAt
+		if expiresAt == 0 || object.ExpiresAt > 0 && object.ExpiresAt < expiresAt {
+			expiresAt = object.ExpiresAt
+		}
+		imageManagementData(c, gin.H{"url": link, "expires_at": expiresAt})
 		return
 	}
 	c.Redirect(http.StatusTemporaryRedirect, link)
