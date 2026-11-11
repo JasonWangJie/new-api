@@ -26,6 +26,7 @@ import { EmptyState } from '@/components/empty-state'
 import { SectionPageLayout } from '@/components/layout/components/section-page-layout'
 import { LoadingState } from '@/components/loading-state'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
 
@@ -36,6 +37,7 @@ import {
   type VideoFormSubmission,
 } from './components/video-capability-form'
 import { VideoResults } from './components/video-results'
+import { WorkbenchModelStatus } from './components/workbench-model-status'
 import { imageLabel } from './lib/image-labels'
 import { terminalImageStatus } from './lib/image-request'
 import {
@@ -56,7 +58,8 @@ export function VideoWorkbench(props: { userId: number }) {
   const { t } = useTranslation()
   const [tokenId, setTokenId] = useState('')
   const [modelId, setModelId] = useState('')
-  const [taskId, setTaskId] = useState(() =>
+  const [taskId, setTaskId] = useState('')
+  const [previousTaskId, setPreviousTaskId] = useState(() =>
     readWorkbenchTask(props.userId, 'video')
   )
   const keys = useQuery({
@@ -67,6 +70,10 @@ export function VideoWorkbench(props: { userId: number }) {
     queryKey: ['image-capabilities', props.userId, tokenId],
     queryFn: ({ signal }) => getImageCapabilities(Number(tokenId), signal),
     enabled: !!tokenId,
+    staleTime: 30_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+    meta: { errorToast: false },
   })
   const models = capabilities.data?.video_models || []
   const selectedModel = models.find(
@@ -89,6 +96,7 @@ export function VideoWorkbench(props: { userId: number }) {
   useEffect(() => {
     if (!isAxiosError(task.error) || task.error.response?.status !== 404) return
     rememberWorkbenchTask(props.userId, 'video', '')
+    setPreviousTaskId('')
     setTaskId('')
   }, [task.error, props.userId])
   const submit = useMutation({
@@ -194,21 +202,20 @@ export function VideoWorkbench(props: { userId: number }) {
                   label: `${entry.label} · ${entry.routing_platform === 'mixed' ? t('Mixed scheduling') : entry.provider}`,
                 }))}
                 disabled={
-                  submit.isPending || !tokenId || capabilities.isFetching
+                  submit.isPending || !tokenId || capabilities.isLoading
                 }
                 onChange={(id) => {
                   setModelId(id)
                   changed()
                 }}
               />
-              {capabilities.isError && (
-                <p
-                  role='alert'
-                  className='text-destructive text-sm wrap-anywhere'
-                >
-                  {capabilities.error.message}
-                </p>
-              )}
+              <WorkbenchModelStatus
+                loading={capabilities.isLoading}
+                error={capabilities.error}
+                onRetry={() => {
+                  void capabilities.refetch()
+                }}
+              />
               {selectedModel && (
                 <div
                   className='flex flex-wrap items-center gap-2'
@@ -288,6 +295,16 @@ export function VideoWorkbench(props: { userId: number }) {
                   </p>
                 </div>
               </div>
+              {!taskId && previousTaskId && !submit.isPending && (
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  onClick={() => setTaskId(previousTaskId)}
+                >
+                  {t('Load previous task')}
+                </Button>
+              )}
               {task.data && (
                 <Badge variant='outline'>
                   {t(imageLabel(task.data.task.status))}

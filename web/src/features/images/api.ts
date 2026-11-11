@@ -16,9 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isAxiosError } from 'axios'
 import { t } from 'i18next'
 
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
   ImageCapabilities,
@@ -44,13 +46,33 @@ export async function imageRequest<T>(
   return response.data.data
 }
 
-export const getImageCapabilities = (id: number, signal?: AbortSignal) =>
-  imageRequest<ImageCapabilities>(
-    `/api/user/image-workbench/capabilities/${id}`,
-    'GET',
-    undefined,
-    signal
-  )
+export async function getImageCapabilities(
+  id: number,
+  signal?: AbortSignal
+): Promise<ImageCapabilities> {
+  try {
+    const response = await api.request<{
+      success: boolean
+      message: string
+      data: ImageCapabilities
+    }>({
+      url: `/api/user/image-workbench/capabilities/${id}`,
+      method: 'GET',
+      signal,
+      timeout: 15_000,
+      disableDuplicate: true,
+    })
+    return requireServerSuccess(response.data).data
+  } catch (error) {
+    if (
+      isAxiosError(error) &&
+      ['ECONNABORTED', 'ETIMEDOUT'].includes(error.code || '')
+    ) {
+      throw new Error(t('Model loading timed out. Please try again.'))
+    }
+    throw error
+  }
+}
 export const imageTasksPath = (admin: boolean) =>
   `/api/${admin ? 'admin' : 'user'}/async-image-tasks`
 export const getImageRetainedRequest = (id: string, signal?: AbortSignal) =>

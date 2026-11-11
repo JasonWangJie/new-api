@@ -173,7 +173,160 @@ test('restores the prompt saved in session storage', () => {
   )
 })
 
-test('resumes an image task after reopening the workbench for its owner', async () => {
+test.each(['image', 'video'] as const)(
+  'opening the %s workbench leaves old tasks unloaded until requested',
+  async (media) => {
+    sessionStorage.setItem(`new-api:${media}-task:101`, 'previous_task')
+    imageApiMocks.getImageTask.mockReturnValue(new Promise(() => {}))
+    const user = userEvent.setup()
+    render(
+      <QueryClientProvider client={client}>
+        {media === 'image' ? (
+          <ImageWorkbench />
+        ) : (
+          <VideoWorkbench userId={101} />
+        )}
+      </QueryClientProvider>
+    )
+
+    expect(
+      screen.getByText(
+        media === 'image'
+          ? 'Your images will appear here'
+          : 'Your videos will appear here'
+      )
+    ).toBeVisible()
+    expect(screen.getByRole('combobox', { name: 'API Key' })).toBeEnabled()
+    expect(imageApiMocks.getImageTask).not.toHaveBeenCalled()
+    expect(imageApiMocks.imageBlob).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Load previous task' }))
+    await waitFor(() =>
+      expect(imageApiMocks.getImageTask).toHaveBeenCalledWith(
+        false,
+        'previous_task',
+        expect.any(AbortSignal)
+      )
+    )
+  }
+)
+
+test.each(['image', 'video'] as const)(
+  '%s models show initial loading and cached choices stay usable during refresh',
+  async (media) => {
+    keyApiMocks.getApiKeys.mockResolvedValue({
+      data: { items: [{ id: 7, name: 'Primary', status: 1 }] },
+    })
+    let resolveCapabilities!: (data: unknown) => void
+    imageApiMocks.getImageCapabilities.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveCapabilities = resolve
+      })
+    )
+    const user = userEvent.setup()
+    render(
+      <QueryClientProvider client={client}>
+        {media === 'image' ? (
+          <ImageWorkbench />
+        ) : (
+          <VideoWorkbench userId={101} />
+        )}
+      </QueryClientProvider>
+    )
+    await user.click(screen.getByRole('combobox', { name: 'API Key' }))
+    await user.click(await screen.findByRole('option', { name: 'Primary' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('Loading...')
+    expect(screen.getByRole('combobox', { name: 'Model' })).toBeDisabled()
+    await act(async () =>
+      resolveCapabilities({ models: [referenceImageModel], video_models: [] })
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+    )
+
+    imageApiMocks.getImageCapabilities.mockReturnValue(new Promise(() => {}))
+    await act(async () => {
+      void client.invalidateQueries({
+        queryKey: ['image-capabilities', 101, '7'],
+      })
+    })
+    await waitFor(() =>
+      expect(
+        client.isFetching({ queryKey: ['image-capabilities', 101, '7'] })
+      ).toBe(1)
+    )
+    expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+  }
+)
+
+test.each(['image', 'video'] as const)(
+  '%s model loading failure offers a manual retry that recovers the selector',
+  async (media) => {
+    client.setDefaultOptions({ queries: { retry: 1, retryDelay: 0 } })
+    keyApiMocks.getApiKeys.mockResolvedValue({
+      data: { items: [{ id: 7, name: 'Primary', status: 1 }] },
+    })
+    imageApiMocks.getImageCapabilities.mockRejectedValueOnce(
+      new Error('Model service unavailable')
+    )
+    const user = userEvent.setup()
+    render(
+      <QueryClientProvider client={client}>
+        {media === 'image' ? (
+          <ImageWorkbench />
+        ) : (
+          <VideoWorkbench userId={101} />
+        )}
+      </QueryClientProvider>
+    )
+    await user.click(screen.getByRole('combobox', { name: 'API Key' }))
+    await user.click(await screen.findByRole('option', { name: 'Primary' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Model service unavailable'
+    )
+    expect(imageApiMocks.getImageCapabilities).toHaveBeenCalledTimes(1)
+    imageApiMocks.getImageCapabilities.mockResolvedValue({
+      models: [referenceImageModel],
+      video_models: [],
+    })
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    )
+    expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+  }
+)
+
+test('switching media reuses the selected API key catalog without loading historical results', async () => {
+  keyApiMocks.getApiKeys.mockResolvedValue({
+    data: { items: [{ id: 7, name: 'Primary', status: 1 }] },
+  })
+  imageApiMocks.getImageCapabilities.mockResolvedValue({
+    models: [referenceImageModel],
+    video_models: [],
+  })
+  sessionStorage.setItem('new-api:image-task:101', 'old_image')
+  sessionStorage.setItem('new-api:video-task:101', 'old_video')
+  const user = userEvent.setup()
+  render(
+    <QueryClientProvider client={client}>
+      <ImageWorkbench />
+    </QueryClientProvider>
+  )
+  await user.click(screen.getByRole('combobox', { name: 'API Key' }))
+  await user.click(await screen.findByRole('option', { name: 'Primary' }))
+  await waitFor(() =>
+    expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+  )
+  await user.click(screen.getByRole('tab', { name: 'Video' }))
+  await user.click(screen.getByRole('combobox', { name: 'API Key' }))
+  await user.click(await screen.findByRole('option', { name: 'Primary' }))
+  expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+  expect(screen.getByText('Your videos will appear here')).toBeVisible()
+  expect(imageApiMocks.getImageCapabilities).toHaveBeenCalledTimes(1)
+  expect(imageApiMocks.getImageTask).not.toHaveBeenCalled()
+})
+
+test('resumes an image task when its owner explicitly loads the previous task', async () => {
   sessionStorage.setItem('new-api:image-task:101', 'image_in_progress')
   imageApiMocks.getImageTask.mockResolvedValue({
     task: { status: 'queued', progress: 0, cost: 0 },
@@ -185,6 +338,7 @@ test('resumes an image task after reopening the workbench for its owner', async 
       <ImageWorkbench />
     </QueryClientProvider>
   )
+  fireEvent.click(screen.getByRole('button', { name: 'Load previous task' }))
   expect(await screen.findByText('image_in_progress')).toBeVisible()
   expect(screen.getByRole('combobox', { name: 'API Key' })).toBeDisabled()
   expect(screen.getByLabelText('Reference image URLs')).toBeDisabled()
@@ -904,6 +1058,7 @@ test.each(['image', 'video'] as const)(
         )}
       </QueryClientProvider>
     )
+    fireEvent.click(screen.getByRole('button', { name: 'Load previous task' }))
     await waitFor(() =>
       expect(sessionStorage.getItem(`new-api:${media}-task:101`)).toBe('')
     )
@@ -939,6 +1094,7 @@ test.each(['image', 'video'] as const)(
         )}
       </QueryClientProvider>
     )
+    fireEvent.click(screen.getByRole('button', { name: 'Load previous task' }))
     expect(await screen.findByRole('alert')).toBeVisible()
     expect(sessionStorage.getItem(`new-api:${media}-task:101`)).toBe(
       'pending_task'
@@ -973,6 +1129,7 @@ test('continues video polling while a failed save has a scheduled retry', async 
       <VideoWorkbench userId={101} />
     </QueryClientProvider>
   )
+  fireEvent.click(screen.getByRole('button', { name: 'Load previous task' }))
   expect(await screen.findByRole('status')).toHaveTextContent('Storage failed')
   await act(async () => {
     await vi.advanceTimersByTimeAsync(3100)

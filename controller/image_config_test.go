@@ -385,6 +385,12 @@ func TestTabtabWorkbenchCapabilitiesDatabaseMatrix(t *testing.T) {
 			encodedPrices, err := common.Marshal(prices)
 			require.NoError(t, err)
 			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(encodedPrices)))
+			configurationReads := make(map[string]int)
+			callback := "workbench_configuration_reads"
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+				configurationReads[tx.Statement.Table]++
+			}))
+			t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove(callback)) })
 			for _, closed := range []bool{false, true} {
 				t.Run(fmt.Sprintf("closed_AUTO_%t", closed), func(t *testing.T) {
 					if closed {
@@ -394,8 +400,12 @@ func TestTabtabWorkbenchCapabilitiesDatabaseMatrix(t *testing.T) {
 					router.Use(func(c *gin.Context) { c.Set("id", user.Id) })
 					router.GET("/capabilities/:token_id", GetImageWorkbenchCapabilities)
 					recorder := httptest.NewRecorder()
+					clear(configurationReads)
 					router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/capabilities/"+strconv.Itoa(token.Id), nil))
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					assert.LessOrEqual(t, configurationReads["abilities"], 3, "listing several models and resolutions must reuse group routing data")
+					assert.LessOrEqual(t, configurationReads["image_storage_profiles"], 1, "one catalog request must open temporary storage at most once")
+					t.Logf("catalog configuration reads: abilities=%d temporary_storage=%d", configurationReads["abilities"], configurationReads["image_storage_profiles"])
 					assert.NotContains(t, recorder.Body.String(), "sk_private-capability-key")
 					var response struct {
 						Data struct {

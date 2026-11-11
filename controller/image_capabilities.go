@@ -49,6 +49,12 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 		return
 	}
 	usableGroups := service.GetUserUsableGroups(owner.Group)
+	var candidateCatalog service.ImageCandidateCatalog
+	groupAbilities := make(map[string][]model.Ability)
+	channelCache := make(map[int]*model.Channel)
+	var temporaryStorage *service.ImageStorage
+	var temporaryStorageErr error
+	storageChecked := false
 	for _, platform := range append(service.RegisteredImageProviders(), "mixed") {
 		type scopedCapability struct {
 			policy     model.ImageGroupPolicy
@@ -79,18 +85,25 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			// The adaptor declaration and configured abilities determine membership.
 			if policy.Id == 0 {
 				policy.Enabled = true
-				var abilities []model.Ability
-				if err := model.DB.WithContext(ctx).Where(map[string]any{"group": policy.Group, "enabled": true}).Find(&abilities).Error; err != nil {
-					imageManagementError(c, 503, err)
-					return
+				abilities, loaded := groupAbilities[policy.Group]
+				if !loaded {
+					if err := model.DB.WithContext(ctx).Where(map[string]any{"group": policy.Group, "enabled": true}).Find(&abilities).Error; err != nil {
+						imageManagementError(c, 503, err)
+						return
+					}
+					groupAbilities[policy.Group] = abilities
 				}
 				seen := make(map[string]bool)
 				for _, ability := range abilities {
 					if seen[ability.Model] {
 						continue
 					}
-					channel, err := model.CacheGetChannel(ability.ChannelId)
-					if err != nil {
+					channel, loaded := channelCache[ability.ChannelId]
+					if !loaded {
+						channel, _ = model.CacheGetChannel(ability.ChannelId)
+						channelCache[ability.ChannelId] = channel
+					}
+					if channel == nil {
 						continue
 					}
 					declared := service.ImageChannelCapability(*channel, ability.Model)
@@ -147,11 +160,17 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				if !cfg.AsyncEnabled || !common.RedisEnabled || common.RDB == nil || !service.ImageEncryptionAvailable() {
 					available = false
 					providerReason = "Async image service is disabled"
-				} else if store, err := service.GetImageStorage(ctx, "temporary"); err != nil {
-					available = false
-					providerReason = "Temporary image storage is unavailable"
 				} else {
-					versionFacts = append(versionFacts, store.Profile.ProfileId)
+					if !storageChecked {
+						temporaryStorage, temporaryStorageErr = service.GetImageStorage(ctx, "temporary")
+						storageChecked = true
+					}
+					if temporaryStorageErr != nil {
+						available = false
+						providerReason = "Temporary image storage is unavailable"
+					} else {
+						versionFacts = append(versionFacts, temporaryStorage.Profile.ProfileId)
+					}
 				}
 			}
 			resolutions := make([]string, 0, len(capability.Resolutions))
@@ -162,7 +181,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				candidateResolutions = append(candidateResolutions, "AUTO")
 			}
 			for _, resolution := range candidateResolutions {
-				candidates, err := service.ImageCandidateChannels(ctx, policy, capability.Id, resolution)
+				candidates, err := candidateCatalog.Channels(ctx, policy, capability.Id, resolution)
 				if err != nil {
 					imageManagementError(c, 503, err)
 					return
@@ -217,7 +236,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				continue
 			}
 			if !policy.AsyncEnabled {
-				channels, err = service.ImageCandidateChannels(ctx, policy, capability.Id, "")
+				channels, err = candidateCatalog.Channels(ctx, policy, capability.Id, "")
 				if err != nil {
 					imageManagementError(c, 503, err)
 					return
@@ -315,12 +334,21 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 			return
 		}
 		seen := make(map[string]bool)
+		type videoPolicyCatalog struct {
+			policy  model.ImageGroupPolicy
+			catalog []service.ImageModelCapability
+		}
+		providerPolicies := make(map[string]videoPolicyCatalog)
 		for _, ability := range abilities {
 			if token.ModelLimitsEnabled && !token.GetModelLimitsMap()[ability.Model] {
 				continue
 			}
-			channel, err := model.CacheGetChannel(ability.ChannelId)
-			if err != nil || channel.Status != common.ChannelStatusEnabled {
+			channel, loaded := channelCache[ability.ChannelId]
+			if !loaded {
+				channel, _ = model.CacheGetChannel(ability.ChannelId)
+				channelCache[ability.ChannelId] = channel
+			}
+			if channel == nil || channel.Status != common.ChannelStatusEnabled {
 				continue
 			}
 			candidates := generation.LookupEndpointCandidates("POST", "/v1/videos", ability.Model)
@@ -335,17 +363,26 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 				}
 				provider := candidate.Plugin.Meta.Key
 				key := provider + ":" + ability.Model
-				policy, catalog, err := service.ResolveImagePolicy(ctx, token, provider)
-				if err != nil {
-					imageManagementError(c, 503, err)
-					return
+				if seen[key] {
+					continue
 				}
+				resolved, loaded := providerPolicies[provider]
+				if !loaded {
+					policy, catalog, err := service.ResolveImagePolicy(ctx, token, provider)
+					if err != nil {
+						imageManagementError(c, 503, err)
+						return
+					}
+					resolved = videoPolicyCatalog{policy: policy, catalog: catalog}
+					providerPolicies[provider] = resolved
+				}
+				policy, catalog := resolved.policy, resolved.catalog
 				allowedGroup := policy.Group == ability.Group || policy.Group == "auto" && slices.Contains(service.GetUserAutoGroup(owner.Group), ability.Group)
 				if !allowedGroup || !service.GroupInUserUsableGroups(owner.Group, ability.Group) {
 					continue
 				}
 				matches, _ := model.ChannelSatisfiesFilters(channel, ability.Model, []gatewaydto.ChannelFilter{{Kind: gatewaydto.FilterTaskPluginIdentity, TaskPluginKey: provider, TaskPluginChannelTypes: candidate.Plugin.Meta.ChannelTypes}})
-				if seen[key] || !matches {
+				if !matches {
 					continue
 				}
 				seen[key] = true

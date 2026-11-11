@@ -59,6 +59,7 @@ import {
 } from './components/image-reference-input'
 import { ImageResults } from './components/image-results'
 import { ImageSelect } from './components/image-select'
+import { WorkbenchModelStatus } from './components/workbench-model-status'
 import { imageLabel, imagePlatformLabel } from './lib/image-labels'
 import {
   buildImageRequest,
@@ -141,7 +142,10 @@ function WorkbenchSession({ userId }: { userId: number }) {
   const [count, setCount] = useState(1)
   const [loadingReferences, setLoadingReferences] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [taskId, setTaskId] = useState(() => readWorkbenchTask(userId, 'image'))
+  const [taskId, setTaskId] = useState('')
+  const [previousTaskId, setPreviousTaskId] = useState(() =>
+    readWorkbenchTask(userId, 'image')
+  )
   const [results, setResults] = useState<{ id: string; url: string }[]>([])
   const [submissionError, setSubmissionError] = useState('')
   const [saveError, setSaveError] = useState('')
@@ -167,7 +171,10 @@ function WorkbenchSession({ userId }: { userId: number }) {
     queryKey: capabilitiesKey,
     queryFn: ({ signal }) => getImageCapabilities(Number(tokenId), signal),
     enabled: !!tokenId,
-    staleTime: 0,
+    staleTime: 30_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+    meta: { errorToast: false },
   })
   const models =
     capabilities.data?.models.filter((model) => model.available) || []
@@ -192,6 +199,7 @@ function WorkbenchSession({ userId }: { userId: number }) {
   useEffect(() => {
     if (!isAxiosError(task.error) || task.error.response?.status !== 404) return
     rememberWorkbenchTask(userId, 'image', '')
+    setPreviousTaskId('')
     setTaskId('')
   }, [task.error, userId])
   const taskImages = useQuery({
@@ -521,18 +529,22 @@ function WorkbenchSession({ userId }: { userId: number }) {
                   label: `${candidate.label || candidate.id} · ${t(imagePlatformLabel(candidate.platform))} · ${t(candidate.mode === 'async' ? 'Asynchronous' : 'Realtime')}`,
                 }))}
                 onChange={chooseModel}
-                disabled={busy || activeTask || !tokenId}
+                disabled={
+                  busy || activeTask || !tokenId || capabilities.isLoading
+                }
+              />
+              <WorkbenchModelStatus
+                loading={capabilities.isLoading}
+                error={capabilities.error}
+                onRetry={() => {
+                  void capabilities.refetch()
+                }}
               />
               {model?.platform === 'mixed' && (
                 <p role='status' className='text-muted-foreground text-sm'>
                   {t(
                     'Mixed scheduling accepts asynchronous image requests without provider. Explicit provider requests keep their platform routing.'
                   )}
-                </p>
-              )}
-              {capabilities.isError && (
-                <p role='alert' className='text-destructive text-sm'>
-                  {capabilities.error.message}
                 </p>
               )}
               {capabilities.data && !models.length && (
@@ -733,6 +745,16 @@ function WorkbenchSession({ userId }: { userId: number }) {
                   </p>
                 </div>
               </div>
+              {!taskId && !results.length && previousTaskId && !busy && (
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  onClick={() => setTaskId(previousTaskId)}
+                >
+                  {t('Load previous task')}
+                </Button>
+              )}
               {(taskId || results.length > 0) && (
                 <Badge variant='outline'>
                   {t(taskId ? 'Asynchronous' : 'Realtime')}

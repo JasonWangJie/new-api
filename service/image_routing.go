@@ -904,6 +904,59 @@ func ValidateMixedImagePoolMembers(ctx context.Context, ids []int) error {
 	return nil
 }
 
+// ImageCandidateCatalog reuses routing configuration while building one model
+// catalog. Keep it request-local so later requests observe configuration edits.
+type ImageCandidateCatalog struct {
+	groups map[string]imageCandidateGroup
+	pools  map[string][]model.ImageChannelPool
+}
+
+type imageCandidateGroup struct {
+	abilities []model.Ability
+	channels  []model.Channel
+}
+
+func (catalog *ImageCandidateCatalog) Channels(ctx context.Context, policy model.ImageGroupPolicy, modelName, resolution string) ([]model.Channel, error) {
+	group, found := catalog.groups[policy.Group]
+	if !found {
+		if err := model.DB.WithContext(ctx).Where(map[string]any{"group": policy.Group, "enabled": true}).Find(&group.abilities).Error; err != nil {
+			return nil, err
+		}
+		ids := make([]int, 0, len(group.abilities))
+		seen := make(map[int]bool)
+		for _, ability := range group.abilities {
+			if !seen[ability.ChannelId] {
+				seen[ability.ChannelId] = true
+				ids = append(ids, ability.ChannelId)
+			}
+		}
+		if len(ids) > 0 {
+			if err := model.DB.WithContext(ctx).Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Find(&group.channels).Error; err != nil {
+				return nil, err
+			}
+		}
+		if catalog.groups == nil {
+			catalog.groups = make(map[string]imageCandidateGroup)
+		}
+		catalog.groups[policy.Group] = group
+	}
+	if catalog.pools == nil {
+		var pools []model.ImageChannelPool
+		if err := model.DB.WithContext(ctx).Where("channel_id >= ?", 0).Find(&pools).Error; err != nil {
+			return nil, err
+		}
+		catalog.pools = make(map[string][]model.ImageChannelPool)
+		for _, pool := range pools {
+			catalog.pools[pool.BindingKey] = append(catalog.pools[pool.BindingKey], pool)
+		}
+	}
+	if policy.AsyncEnabled {
+		resolution = strings.ToUpper(strings.TrimSpace(resolution))
+	}
+	bindings := catalog.pools[ImagePoolBindingKey(policy, modelName, resolution)]
+	return imageCandidateChannels(policy, modelName, resolution, group.abilities, bindings, group.channels)
+}
+
 func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, modelName, resolution string) ([]model.Channel, error) {
 	if policy.AsyncEnabled {
 		resolution = strings.ToUpper(strings.TrimSpace(resolution))
@@ -940,8 +993,32 @@ func ImageCandidateChannels(ctx context.Context, policy model.ImageGroupPolicy, 
 	if err := model.DB.WithContext(ctx).Where("id IN ? AND status = ?", ids, common.ChannelStatusEnabled).Find(&channels).Error; err != nil {
 		return nil, err
 	}
+	return imageCandidateChannels(policy, modelName, resolution, abilities, bindings, channels)
+}
+
+func imageCandidateChannels(policy model.ImageGroupPolicy, modelName, resolution string, abilities []model.Ability, bindings []model.ImageChannelPool, channels []model.Channel) ([]model.Channel, error) {
+	if policy.Platform == "mixed" && len(bindings) == 0 {
+		return nil, nil
+	}
+	ids := make(map[int]bool)
+	for _, ability := range abilities {
+		if ability.Model == modelName {
+			ids[ability.ChannelId] = true
+		}
+	}
+	if len(ids) == 0 {
+		normalized := ratio_setting.RoutingMatchModelName(modelName)
+		for _, ability := range abilities {
+			if ability.Model == normalized {
+				ids[ability.ChannelId] = true
+			}
+		}
+	}
 	eligible := make([]model.Channel, 0, len(channels))
 	for _, channel := range channels {
+		if !ids[channel.Id] {
+			continue
+		}
 		if policy.AsyncEnabled {
 			var available bool
 			var err error

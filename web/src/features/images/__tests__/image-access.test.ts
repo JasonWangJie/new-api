@@ -1,3 +1,4 @@
+import { AxiosError, CanceledError } from 'axios'
 /*
 Copyright (C) 2023-2026 QuantumNous
 
@@ -20,13 +21,31 @@ import { afterEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
 
-import { authenticatedMediaBlob, imageBlob } from '../api'
+import { authenticatedMediaBlob, getImageCapabilities, imageBlob } from '../api'
 
 vi.mock('@/lib/api', () => ({ api: { request: vi.fn() } }))
 
 afterEach(() => {
   vi.resetAllMocks()
   vi.unstubAllGlobals()
+})
+
+test('model discovery has a finite wait and reports a readable timeout', async () => {
+  vi.mocked(api.request).mockRejectedValue(
+    new AxiosError('timeout', 'ECONNABORTED')
+  )
+  await expect(getImageCapabilities(7)).rejects.toThrow(
+    'Model loading timed out. Please try again.'
+  )
+  expect(api.request).toHaveBeenCalledWith(
+    expect.objectContaining({ timeout: 15_000 })
+  )
+})
+
+test('switching API keys preserves discovery cancellation without a timeout error', async () => {
+  const canceled = new CanceledError('canceled')
+  vi.mocked(api.request).mockRejectedValue(canceled)
+  await expect(getImageCapabilities(7)).rejects.toBe(canceled)
 })
 
 test.each(['image/png', 'image/gif', 'image/svg+xml; charset=utf-8'])(
