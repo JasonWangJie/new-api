@@ -190,6 +190,7 @@ function TaskCenterSession({
   const platforms = useQuery({
     queryKey: ['image-task-platforms', userId, admin],
     queryFn: ({ signal }) => getMediaTaskPlatforms(admin, signal),
+    enabled: admin,
   })
   const actionableSelection = useMemo(() => {
     const selected: RowSelectionState = {}
@@ -299,13 +300,15 @@ function TaskCenterSession({
         size: 212,
       },
       {
-        id: 'platform',
-        header: t('Platform'),
+        id: admin ? 'platform' : 'request_type',
+        header: admin ? t('Platform') : t('Request type'),
         cell: ({ row }) => (
           <div className='space-y-1.5 text-xs'>
-            <ImagePlatformBadge
-              platform={row.original.provider || row.original.platform}
-            />
+            {admin && (
+              <ImagePlatformBadge
+                platform={row.original.provider || row.original.platform}
+              />
+            )}
             <ImageRequestTypeBadge
               requestType={row.original.request_type}
               className='font-normal'
@@ -722,22 +725,29 @@ function TaskCenterSession({
   }
   const primaryFilters = (
     <>
-      <div className='col-span-2 min-w-0 xl:col-span-5'>
+      <div
+        className={cn(
+          'col-span-2 min-w-0',
+          admin ? 'xl:col-span-5' : 'xl:col-span-7'
+        )}
+      >
         {field('q', 'Search tasks')}
       </div>
-      <div className='min-w-0 xl:col-span-2'>
-        <ImageSelect
-          className='flex flex-col gap-1.5 space-y-0'
-          label={t('Platform')}
-          value={draft.platform}
-          options={choices(platforms.data || [])}
-          disabled={platforms.isPending}
-          onChange={(value) =>
-            setDraft((previous) => ({ ...previous, platform: value }))
-          }
-        />
-      </div>
-      <div className='min-w-0 xl:col-span-2'>
+      {admin && (
+        <div className='min-w-0 xl:col-span-2'>
+          <ImageSelect
+            className='flex flex-col gap-1.5 space-y-0'
+            label={t('Platform')}
+            value={draft.platform}
+            options={choices(platforms.data || [])}
+            disabled={platforms.isPending}
+            onChange={(value) =>
+              setDraft((previous) => ({ ...previous, platform: value }))
+            }
+          />
+        </div>
+      )}
+      <div className={cn('min-w-0 xl:col-span-2', !admin && 'col-span-2')}>
         <ImageSelect
           className='flex flex-col gap-1.5 space-y-0'
           label={t('Status')}
@@ -998,7 +1008,7 @@ function TaskCenterSession({
           onAutoRefreshChange={setAutoRefresh}
           onRefresh={() => {
             void tasks.refetch()
-            void platforms.refetch()
+            if (admin) void platforms.refetch()
           }}
         />
         {!isMobile && batchActions}
@@ -1119,7 +1129,7 @@ function TaskCenterSession({
               </DataTableMobileFilterPanel>
             </form>
           )}
-          {(tasks.isError || platforms.isError) && (
+          {(tasks.isError || (admin && platforms.isError)) && (
             <p role='alert' className='text-destructive shrink-0 text-sm'>
               {tasks.error?.message || platforms.error?.message}
             </p>

@@ -347,6 +347,200 @@ afterEach(() => {
 })
 
 test.each([
+  {
+    admin: false,
+    mobile: false,
+    platform: 'openai',
+    provider: undefined,
+    requestType: 'text_to_image',
+    label: 'Text to image',
+    platformLabel: 'OpenAI',
+  },
+  {
+    admin: true,
+    mobile: false,
+    platform: 'openai',
+    provider: undefined,
+    requestType: 'text_to_image',
+    label: 'Text to image',
+    platformLabel: 'OpenAI',
+  },
+  {
+    admin: false,
+    mobile: true,
+    platform: 'gemini',
+    provider: undefined,
+    requestType: 'image_to_image',
+    label: 'Image to image',
+    platformLabel: 'Gemini',
+  },
+  {
+    admin: true,
+    mobile: true,
+    platform: 'gemini',
+    provider: undefined,
+    requestType: 'image_to_image',
+    label: 'Image to image',
+    platformLabel: 'Gemini',
+  },
+  {
+    admin: false,
+    mobile: false,
+    platform: 'mixed',
+    provider: 'private-video-plugin',
+    requestType: 'reference_to_video',
+    label: 'References to video',
+    platformLabel: 'private-video-plugin',
+  },
+  {
+    admin: true,
+    mobile: false,
+    platform: 'mixed',
+    provider: 'private-video-plugin',
+    requestType: 'reference_to_video',
+    label: 'References to video',
+    platformLabel: 'private-video-plugin',
+  },
+  {
+    admin: false,
+    mobile: true,
+    platform: 'mixed',
+    provider: undefined,
+    requestType: 'text_to_video',
+    label: 'Text to video',
+    platformLabel: 'Mixed scheduling',
+  },
+  {
+    admin: true,
+    mobile: true,
+    platform: 'mixed',
+    provider: undefined,
+    requestType: 'text_to_video',
+    label: 'Text to video',
+    platformLabel: 'Mixed scheduling',
+  },
+  {
+    admin: false,
+    mobile: false,
+    platform: undefined,
+    provider: undefined,
+    requestType: 'image_to_image',
+    label: 'Image to image',
+    platformLabel: undefined,
+  },
+] as const)(
+  'platform visibility follows admin=$admin in the $requestType list and details (mobile=$mobile, provider=$provider)',
+  async ({
+    admin,
+    mobile,
+    platform,
+    provider,
+    requestType,
+    label,
+    platformLabel,
+  }) => {
+    if (mobile) setMobileViewport()
+    const displayedTask: ImageTask = {
+      ...task,
+      platform,
+      provider,
+      media_type: requestType.endsWith('_video') ? 'video' : 'image',
+      request_type: requestType,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [displayedTask],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: displayedTask,
+      results: [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    const openDetails = await screen.findByRole('button', { name: task.id })
+    const listTask = mobile
+      ? screen.getByRole('article', { name: task.id })
+      : screen.getByRole('row', { name: new RegExp(task.id) })
+    expect(within(listTask).getByText(label)).toBeVisible()
+    if (admin && platformLabel) {
+      expect(within(listTask).getByText(platformLabel)).toBeVisible()
+    } else {
+      for (const name of [
+        'OpenAI',
+        'Gemini',
+        'Mixed scheduling',
+        'private-video-plugin',
+      ]) {
+        expect(within(listTask).queryByText(name)).not.toBeInTheDocument()
+        expect(within(listTask).queryByTitle(name)).not.toBeInTheDocument()
+        expect(within(listTask).queryByLabelText(name)).not.toBeInTheDocument()
+      }
+    }
+    if (!mobile) {
+      expect(
+        screen.getByRole('columnheader', {
+          name: admin ? 'Platform' : 'Request type',
+        })
+      ).toBeVisible()
+    }
+    await user.click(openDetails)
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    expect(await within(dialog).findByText(label)).toBeVisible()
+    if (admin && platformLabel) {
+      expect(within(dialog).getByText(platformLabel)).toBeVisible()
+    } else {
+      for (const name of [
+        'OpenAI',
+        'Gemini',
+        'Mixed scheduling',
+        'private-video-plugin',
+      ]) {
+        expect(within(dialog).queryByText(name)).not.toBeInTheDocument()
+        expect(within(dialog).queryByTitle(name)).not.toBeInTheDocument()
+        expect(within(dialog).queryByLabelText(name)).not.toBeInTheDocument()
+      }
+    }
+  }
+)
+
+test.each([false, true])(
+  'user task filters omit platforms and refresh only tasks (mobile=%s)',
+  async (mobile) => {
+    if (mobile) setMobileViewport()
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter />)
+    await screen.findByRole('button', { name: task.id })
+    expect(
+      screen.queryByRole('combobox', { name: 'Platform' })
+    ).not.toBeInTheDocument()
+    expect(getMediaTaskPlatforms).not.toHaveBeenCalled()
+    const searchField = screen
+      .getByLabelText('Search tasks')
+      .closest('div')?.parentElement
+    expect(searchField).toHaveClass('xl:col-span-7')
+    const statusField = screen
+      .getByRole('combobox', { name: 'Status' })
+      .closest('div')?.parentElement
+    expect(statusField).toHaveClass('col-span-2')
+    await user.click(screen.getByRole('button', { name: /^More filters/ }))
+    expect(
+      screen.queryByRole('combobox', { name: 'Platform' })
+    ).not.toBeInTheDocument()
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Close' }))
+    const refresh = screen.getByRole('button', { name: 'Refresh' })
+    await waitFor(() => expect(refresh).toBeEnabled())
+    await user.click(refresh)
+    await waitFor(() => expect(getImageTasks).toHaveBeenCalledTimes(2))
+    expect(getMediaTaskPlatforms).not.toHaveBeenCalled()
+  }
+)
+
+test.each([
   { mobile: false, finishedAt: 0, expected: '—' },
   { mobile: true, finishedAt: 0, expected: '—' },
   { mobile: false, finishedAt: task.created_at, expected: '0.0s' },
@@ -1845,14 +2039,9 @@ test('administrator can apply the Unknown billing status filter', async () => {
   )
 })
 
-test.each([
-  { admin: false, mobile: false },
-  { admin: true, mobile: false },
-  { admin: false, mobile: true },
-  { admin: true, mobile: true },
-])(
-  'admin=$admin mobile=$mobile configured platforms stay visible and apply from page one',
-  async ({ admin, mobile }) => {
+test.each([false, true])(
+  'administrator configured platforms stay visible and apply from page one (mobile=%s)',
+  async (mobile) => {
     if (mobile) setMobileViewport()
     vi.mocked(getImageTasks).mockResolvedValue({
       items: [task],
@@ -1861,12 +2050,12 @@ test.each([
       stats: {},
     })
     const user = userEvent.setup()
-    mount(<ImageTaskCenter admin={admin} />)
+    mount(<ImageTaskCenter admin />)
     await screen.findByRole('button', { name: task.id })
     const platform = screen.getByRole('combobox', { name: 'Platform' })
     expect(platform).toBeVisible()
     expect(platform).toHaveTextContent('All')
-    expect(vi.mocked(getMediaTaskPlatforms).mock.calls.at(-1)?.[0]).toBe(admin)
+    expect(vi.mocked(getMediaTaskPlatforms).mock.calls.at(-1)?.[0]).toBe(true)
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     if (!mobile) {
       expect(
@@ -1879,11 +2068,9 @@ test.each([
         '2'
       )
     )
-    if (admin) {
-      await user.click(
-        screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
-      )
-    }
+    await user.click(
+      screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
+    )
 
     for (const option of [
       { label: 'Gemini', value: 'gemini', previous: null },
@@ -1911,15 +2098,13 @@ test.each([
           vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('platform')
         ).toBe(option.value)
       )
-      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[0]).toBe(admin)
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[0]).toBe(true)
       expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
         '1'
       )
-      if (admin) {
-        expect(
-          screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
-        ).not.toBeChecked()
-      }
+      expect(
+        screen.getAllByRole('checkbox', { name: `Select task ${task.id}` })[0]
+      ).not.toBeChecked()
     }
   }
 )
@@ -1932,7 +2117,7 @@ test.each([
   async ({ configured, labels }) => {
     vi.mocked(getMediaTaskPlatforms).mockResolvedValue(configured)
     const user = userEvent.setup()
-    mount(<ImageTaskCenter />)
+    mount(<ImageTaskCenter admin />)
     await screen.findByRole('button', { name: task.id })
     await user.click(screen.getByRole('combobox', { name: 'Platform' }))
     expect(
@@ -1949,7 +2134,7 @@ test('platform selection waits for configured options to load', async () => {
     })
   )
   const user = userEvent.setup()
-  mount(<ImageTaskCenter />)
+  mount(<ImageTaskCenter admin />)
   await screen.findByRole('button', { name: task.id })
   const platform = screen.getByRole('combobox', { name: 'Platform' })
   expect(platform).toBeDisabled()
@@ -1966,7 +2151,7 @@ test('platform lookup failure is visible without inventing configured options', 
     new Error('Platform lookup unavailable')
   )
   const user = userEvent.setup()
-  mount(<ImageTaskCenter />)
+  mount(<ImageTaskCenter admin />)
   expect(await screen.findByRole('alert')).toHaveTextContent(
     'Platform lookup unavailable'
   )
@@ -1979,7 +2164,7 @@ test('platform lookup failure is visible without inventing configured options', 
 test('refresh reloads platform options after the configured channels change', async () => {
   vi.mocked(getMediaTaskPlatforms).mockResolvedValueOnce(['openai'])
   const user = userEvent.setup()
-  mount(<ImageTaskCenter />)
+  mount(<ImageTaskCenter admin />)
   await screen.findByRole('button', { name: task.id })
   const platform = screen.getByRole('combobox', { name: 'Platform' })
   await user.click(platform)
@@ -2103,7 +2288,7 @@ test('mobile administrator floating refresh yields to bulk selection and returns
 })
 
 test.each([false, true])(
-  'admin=%s manual refresh spins until both task and platform requests finish',
+  'admin=%s manual refresh waits for tasks and administrator platform requests',
   async (admin) => {
     const user = userEvent.setup()
     mount(<ImageTaskCenter admin={admin} />)
@@ -2117,11 +2302,13 @@ test.each([false, true])(
         finishTasks = resolve
       })
     )
-    vi.mocked(getMediaTaskPlatforms).mockReturnValueOnce(
-      new Promise((resolve) => {
-        finishPlatforms = resolve
-      })
-    )
+    if (admin) {
+      vi.mocked(getMediaTaskPlatforms).mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishPlatforms = resolve
+        })
+      )
+    }
 
     await user.click(refresh)
     await waitFor(() => expect(refresh).toHaveAttribute('aria-busy', 'true'))
@@ -2129,27 +2316,33 @@ test.each([false, true])(
     expect(refresh.querySelector('svg')).toHaveClass('animate-spin')
     await user.click(refresh)
     expect(getImageTasks).toHaveBeenCalledTimes(2)
-    expect(getMediaTaskPlatforms).toHaveBeenCalledTimes(2)
+    expect(getMediaTaskPlatforms).toHaveBeenCalledTimes(admin ? 2 : 0)
 
     await act(async () => {
       finishTasks({ items: [task], total: 1, pages: 1, stats: {} })
     })
-    expect(refresh).toHaveAttribute('aria-busy', 'true')
-    expect(refresh).toBeDisabled()
-    await act(async () => {
-      finishPlatforms(['azure'])
-    })
+    if (admin) {
+      expect(refresh).toHaveAttribute('aria-busy', 'true')
+      expect(refresh).toBeDisabled()
+      await act(async () => {
+        finishPlatforms(['azure'])
+      })
+    }
     await waitFor(() => expect(refresh).toBeEnabled())
     expect(refresh).toHaveAttribute('aria-busy', 'false')
     expect(refresh.querySelector('svg')).not.toHaveClass('animate-spin')
   }
 )
 
-test.each(['tasks', 'platforms'])(
-  '%s request failure clears manual refresh loading and permits retry',
-  async (source) => {
+test.each([
+  { admin: false, source: 'tasks' },
+  { admin: true, source: 'tasks' },
+  { admin: true, source: 'platforms' },
+])(
+  'admin=$admin $source request failure clears manual refresh loading and permits retry',
+  async ({ admin, source }) => {
     const user = userEvent.setup()
-    mount(<ImageTaskCenter />)
+    mount(<ImageTaskCenter admin={admin} />)
     await screen.findByRole('button', { name: task.id })
     const refresh = screen.getByRole('button', { name: 'Refresh' })
     await waitFor(() => expect(refresh).toBeEnabled())
@@ -2249,7 +2442,7 @@ test.each([false, true])(
   async (mobile) => {
     if (mobile) setMobileViewport()
     const user = userEvent.setup()
-    mount(<ImageTaskCenter />)
+    mount(<ImageTaskCenter admin />)
     await screen.findByRole('button', { name: task.id })
     const platform = screen.getByRole('combobox', { name: 'Platform' })
     await user.click(platform)
@@ -2297,7 +2490,7 @@ test.each([
     if (mobile) setMobileViewport()
     const user = userEvent.setup()
     mount(<ImageTaskCenter admin={admin} />)
-    await screen.findByRole('combobox', { name: 'Platform' })
+    await screen.findByRole('button', { name: task.id })
     expect(screen.getByRole('combobox', { name: 'Status' })).toBeVisible()
     expect(
       screen.queryByRole('combobox', { name: 'Media type' })

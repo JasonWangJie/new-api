@@ -75,10 +75,12 @@ export function ImageTaskMobileCard(props: {
         <div className='flex items-start justify-between gap-2'>
           <div className='min-w-0 flex-1 space-y-2'>
             <div className='flex min-w-0 flex-wrap items-center gap-1.5'>
-              <ImagePlatformBadge
-                platform={task.provider || task.platform}
-                className='max-w-full wrap-anywhere whitespace-normal'
-              />
+              {props.admin && (
+                <ImagePlatformBadge
+                  platform={task.provider || task.platform}
+                  className='max-w-full wrap-anywhere whitespace-normal'
+                />
+              )}
               <ImageRequestTypeBadge
                 requestType={task.request_type}
                 className='h-auto max-w-full py-0.5 font-normal wrap-anywhere whitespace-normal'

@@ -421,7 +421,11 @@ export function ImageTaskDetails(props: {
                   pendingAction={issue?.pendingAction}
                   resultExpired={resultExpired}
                 />
-                <ImagePlatformBadge platform={data.platform} />
+                {props.admin && (
+                  <ImagePlatformBadge
+                    platform={data.provider || data.platform}
+                  />
+                )}
                 <ImageRequestTypeBadge requestType={data.request_type} />
               </div>
               {(canResume || canTerminate) && (
