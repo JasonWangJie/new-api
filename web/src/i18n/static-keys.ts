@@ -45,6 +45,7 @@ export const STATIC_I18N_KEYS = [
   'Next',
   'Current version',
   'Media settings require administrator storage permissions.',
+  'Media task refund requires reconciliation; retry after checking its billing',
   'Unsaved changes',
   'Save and activate',
   'Rules',

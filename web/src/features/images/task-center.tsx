@@ -503,7 +503,7 @@ function TaskCenterSession({
                 <Button
                   size={
                     row.original.status === 'expired' ||
-                    imageTaskVideoReconciliation(row.original)
+                    row.original.media_type === 'video'
                       ? 'xs'
                       : 'icon-sm'
                   }
@@ -514,9 +514,7 @@ function TaskCenterSession({
                     setOperation({
                       ids: [row.original.id],
                       action: 'terminate',
-                      checkExistingVideo: Boolean(
-                        imageTaskVideoReconciliation(row.original)
-                      ),
+                      checkExistingVideo: row.original.media_type === 'video',
                       confirmUpstreamChecked:
                         imageTaskRequiresTerminationConfirmation(row.original),
                       confirmQuotaReconciled:
@@ -527,7 +525,7 @@ function TaskCenterSession({
                 >
                   <Ban className='size-3.5' aria-hidden />
                   {(row.original.status === 'expired' ||
-                    imageTaskVideoReconciliation(row.original)) &&
+                    row.original.media_type === 'video') &&
                     t(imageTaskTerminationLabel(row.original))}
                 </Button>
               )}
@@ -635,7 +633,8 @@ function TaskCenterSession({
                 <ul className='max-h-40 space-y-1 overflow-auto [overflow-wrap:anywhere]'>
                   {failures.map((failure) => (
                     <li key={failure.id}>
-                      {failure.id}: {failure.reason}
+                      {failure.id}:{' '}
+                      {t(failure.reason, { defaultValue: failure.reason })}
                     </li>
                   ))}
                 </ul>
@@ -672,7 +671,9 @@ function TaskCenterSession({
       setOperation(null)
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
+        error instanceof Error
+          ? t(error.message, { defaultValue: error.message })
+          : t('Image request failed')
       )
     } finally {
       setBusy(false)
@@ -683,7 +684,14 @@ function TaskCenterSession({
     'Selected task IDs are fixed for this operation. Late results cannot change terminated tasks.'
   )
   if (operation?.confirmUpstreamChecked) {
-    confirmationDescription = `${t('Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.')} ${confirmationDescription}`
+    const terminationDescription = operation.checkExistingVideo
+      ? t(
+          'Verify the upstream task before continuing. This ends local processing and refunds any remaining charge, including settled charges. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
+        )
+      : t(
+          'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.'
+        )
+    confirmationDescription = `${terminationDescription} ${confirmationDescription}`
   }
   if (operation?.action === 'resume') {
     confirmationDescription = operation.checkExistingVideo
@@ -952,6 +960,9 @@ function TaskCenterSession({
           setOperation({
             ids: currentPending.map((task) => task.id),
             action: 'batch-terminate',
+            checkExistingVideo: currentPending.some(
+              (task) => task.media_type === 'video'
+            ),
             confirmUpstreamChecked: currentPending.some(
               imageTaskRequiresTerminationConfirmation
             ),
@@ -972,6 +983,9 @@ function TaskCenterSession({
           setOperation({
             ids: selectedPending.map((task) => task.id),
             action: 'batch-terminate',
+            checkExistingVideo: selectedPending.some(
+              (task) => task.media_type === 'video'
+            ),
             confirmUpstreamChecked: selectedPending.some(
               imageTaskRequiresTerminationConfirmation
             ),

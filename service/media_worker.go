@@ -652,6 +652,35 @@ func TerminateExpiredAsyncMediaJob(ctx context.Context, job model.AsyncMediaJob)
 	return completeAsyncMediaAgeRefund(ctx, stopped)
 }
 
+// TerminateAsyncMediaTask is the administrator's explicit local stop and full
+// refund. The model fences workers and commits the remaining charge atomically.
+func TerminateAsyncMediaTask(ctx context.Context, job model.AsyncMediaJob) error {
+	var task model.Task
+	err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	reason := "Terminated by administrator after upstream verification"
+	var diagnostics []string
+	if err == nil {
+		if fact := task.PrivateData.MediaRetryFact; fact != nil {
+			diagnostics = append(diagnostics, fact.Message)
+		}
+		diagnostics = append(diagnostics, VideoTaskFailureDiagnostic(&task))
+		if task.PrivateData.VideoReconciliation != nil {
+			diagnostics = append(diagnostics, task.PrivateData.VideoReconciliation.Reason)
+		}
+	}
+	diagnostics = append(diagnostics, job.ErrorMessage)
+	for _, diagnostic := range diagnostics {
+		if detail := VideoTaskFailureNotice(diagnostic).Detail; detail != "" {
+			reason += "\n" + detail
+			break
+		}
+	}
+	return model.TerminateAsyncMediaTask(ctx, job, VideoTaskFailureReason(reason), taskBillingOther(&task))
+}
+
 // The controller must require the existing explicit upstream-check confirmation.
 func ReconcileTerminatedAsyncMediaReservation(ctx context.Context, job model.AsyncMediaJob) error {
 	reconciled, err := model.ReconcileAgedAsyncMediaReservation(ctx, job)

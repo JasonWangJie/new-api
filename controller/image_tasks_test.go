@@ -84,7 +84,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetMainDatabaseType(common.DatabaseType(engine))
 			common.SetLogDatabaseType(common.DatabaseType(logEngine))
-			entities := []any{&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncImageUsageProjection{}, &model.QuotaData{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
+			entities := []any{&model.User{}, &model.UserSubscription{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.AsyncImageUsageProjection{}, &model.QuotaData{}, &model.ImageOutbox{}, &model.AsyncImageResult{}, &model.ImageStorageObject{}, &model.ImageStorageProfile{}, &model.Option{}, &model.Task{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaArtifactObject{}}
 			t.Cleanup(func() {
 				model.DB, model.LOG_DB = previousDB, previousLogDB
 				common.SetMainDatabaseType(previousType)
@@ -1437,7 +1437,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							} else {
 								assert.Equal(t, tc.upstreamProgress, view["upstream_progress"], surface)
 							}
-							assert.Equal(t, expectedTerminable, view["can_terminate"], surface)
+							assert.Equal(t, surface == "administrator" || expectedTerminable, view["can_terminate"], surface)
 						}
 						if tc.resultExpired {
 							recorder := httptest.NewRecorder()
@@ -2889,7 +2889,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					}
 				}
 			})
-			t.Run("expired task management preserves successful outcomes", func(t *testing.T) {
+			t.Run("expired videos can end while successful images remain protected", func(t *testing.T) {
 				for _, item := range []struct {
 					name      string
 					video     bool
@@ -2942,7 +2942,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							billing, nativeStatus = "settled", model.TaskStatusSuccess
 						}
 						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Provider: "drama", Status: "expired", StorageStatus: "expired", BillingStatus: billing, CreatedAt: now - model.AsyncMediaMaxTaskAgeSeconds - 60, ExpiresAt: now - 1, AttemptGeneration: 1}
-						native := model.Task{TaskID: id, UserId: 101, Status: nativeStatus, AttemptGeneration: 1}
+						native := model.Task{TaskID: id, UserId: 101, Status: nativeStatus, AttemptGeneration: 1, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: 201}}
 						require.NoError(t, db.Create(&job).Error)
 						require.NoError(t, db.Create(&native).Error)
 						view, _, err := videoJobView(c, job, true, false)
@@ -2953,21 +2953,205 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						}
 						assert.Equal(t, expectedStatus, view["status"])
 						assert.Equal(t, item.succeeded, view["result_expired"])
-						assert.Equal(t, !item.succeeded, view["can_terminate"])
+						assert.Equal(t, true, view["can_terminate"])
+						c.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(`{"confirm_upstream_checked":true}`))
 						ManageMediaTask(c, true, "terminate")
 						var saved model.AsyncMediaJob
 						require.NoError(t, db.Where("id = ?", job.ID).Take(&saved).Error)
+						assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						assert.Equal(t, "failed", saved.Status)
 						if item.succeeded {
-							assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
-							assert.Equal(t, job, saved)
+							assert.Equal(t, "not_billable", saved.BillingStatus)
 						} else {
-							assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-							assert.Equal(t, "failed", saved.Status)
 							assert.Equal(t, "refunded", saved.BillingStatus)
 						}
 						var savedNative model.Task
 						require.NoError(t, db.Where("id = ?", native.ID).Take(&savedNative).Error)
-						assert.Equal(t, nativeStatus, savedNative.Status, "ending local processing must preserve a completed upstream outcome")
+						assert.EqualValues(t, model.TaskStatusFailure, savedNative.Status)
+					})
+				}
+			})
+			t.Run("termination preserves unconfirmed submission funding", func(t *testing.T) {
+				for _, billing := range []string{"pending", "not_billable", "refunded", "reserving", "reserved", "unknown", "settled", "failed"} {
+					t.Run(billing, func(t *testing.T) {
+						id := "orphan-termination-" + billing
+						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, ChannelId: 301, Status: "submitting", BillingStatus: billing, RequestCipher: []byte("reservation-reconciliation-evidence"), CreatedAt: now, ExpiresAt: now + 3600, LeaseToken: "active-submission", LeaseExpiresAt: now + 120}
+						require.NoError(t, db.Create(&job).Error)
+						err := service.TerminateAsyncMediaTask(t.Context(), job)
+						var saved model.AsyncMediaJob
+						require.NoError(t, db.Take(&saved, job.ID).Error)
+						if billing != "pending" && billing != "not_billable" && billing != "refunded" {
+							require.Error(t, err)
+							assert.Equal(t, job, saved, "uncertain funding must remain available for reconciliation")
+							return
+						}
+						require.NoError(t, err)
+						assert.Equal(t, "failed", saved.Status)
+						assert.Empty(t, saved.RequestCipher)
+						assert.Empty(t, saved.LeaseToken)
+						assert.Greater(t, saved.AttemptGeneration, job.AttemptGeneration)
+						assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), job, map[string]any{"billing_status": "reserving"}), model.ErrImageConflict)
+					})
+				}
+			})
+			t.Run("administrator terminates videos in every state", func(t *testing.T) {
+				previousRedis, previousBatch, previousLog := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
+				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
+				t.Cleanup(func() {
+					common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = previousRedis, previousBatch, previousLog
+				})
+				for caseIndex, tc := range []struct {
+					name, status, storage, billing string
+					nativeStatus                   model.TaskStatus
+					leased, output, refunded       bool
+					subscription, reset            bool
+					refundFailure, logFailure      bool
+					originalReservation            int
+				}{
+					{name: "queued", status: "queued", nativeStatus: model.TaskStatusQueued},
+					{name: "submitting with live lease", status: "submitting", nativeStatus: model.TaskStatusSubmitted, leased: true},
+					{name: "processing with live lease", status: "submitted", nativeStatus: model.TaskStatusInProgress, leased: true},
+					{name: "reconciling output", status: "reconciling", nativeStatus: model.TaskStatusInProgress, output: true},
+					{name: "unknown", status: "execution_unknown", nativeStatus: model.TaskStatusUnknown, billing: "unknown"},
+					{name: "saving", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "saving", output: true},
+					{name: "storage failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "failed", output: true},
+					{name: "billing failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, billing: "failed", output: true},
+					{name: "succeeded", status: "succeeded", nativeStatus: model.TaskStatusSuccess, storage: "upstream", billing: "settled", output: true},
+					{name: "succeeded after partial settlement", status: "succeeded", nativeStatus: model.TaskStatusSuccess, billing: "settled", output: true, originalReservation: 250},
+					{name: "expired success", status: "expired", nativeStatus: model.TaskStatusSuccess, storage: "expired", billing: "settled", output: true},
+					{name: "expired pending", status: "expired", nativeStatus: model.TaskStatusUnknown, storage: "expired"},
+					{name: "failed charged", status: "failed", nativeStatus: model.TaskStatusFailure},
+					{name: "failed refunded", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "refunded", refunded: true},
+					{name: "subscription", status: "succeeded", nativeStatus: model.TaskStatusSuccess, subscription: true},
+					{name: "subscription reset", status: "succeeded", nativeStatus: model.TaskStatusSuccess, subscription: true, reset: true},
+					{name: "refund rollback", status: "submitted", nativeStatus: model.TaskStatusInProgress, refundFailure: true},
+					{name: "refund log replay", status: "succeeded", nativeStatus: model.TaskStatusSuccess, logFailure: true},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						id := "all-state-" + strings.ReplaceAll(tc.name, " ", "-")
+						quota := 100
+						if tc.refunded {
+							quota = 0
+						}
+						user := model.User{Username: fmt.Sprintf("video-end-%d", caseIndex), AffCode: fmt.Sprintf("video-end-%d", caseIndex), Quota: 1000 - quota, UsedQuota: quota, RequestCount: 1}
+						require.NoError(t, db.Create(&user).Error)
+						token := model.Token{UserId: user.Id, Key: id, RemainQuota: 1000 - quota, UsedQuota: quota}
+						require.NoError(t, db.Create(&token).Error)
+						channel := model.Channel{Name: id, UsedQuota: int64(quota)}
+						require.NoError(t, db.Create(&channel).Error)
+						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: "drama", Model: "video-model", Status: tc.status, StorageStatus: tc.storage, BillingStatus: tc.billing, Quota: quota, AttemptGeneration: 1, CreatedAt: now, ExpiresAt: now + 3600, RequestCipher: []byte("private-request"), ChannelCipher: []byte("private-channel")}
+						if tc.originalReservation > 0 {
+							job.Quota = tc.originalReservation
+						}
+						if job.StorageStatus == "" {
+							job.StorageStatus = "pending"
+						}
+						if job.BillingStatus == "" {
+							job.BillingStatus = "reserved"
+						}
+						if tc.leased {
+							job.LeaseToken, job.LeaseExpiresAt = "live-worker", now+3600
+						}
+						if tc.status == "expired" {
+							job.ExpiresAt = now - 1
+						}
+						native := model.Task{TaskID: id, UserId: user.Id, ChannelId: channel.Id, Platform: "drama", Status: tc.nativeStatus, Quota: quota, AttemptGeneration: 1, SubmitTime: now, PrivateData: model.TaskPrivateData{TokenId: token.Id, AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, BillingSource: "wallet", UpstreamTaskID: "upstream-" + id}}
+						var subscription model.UserSubscription
+						if tc.subscription {
+							period := now - 100
+							subscription = model.UserSubscription{UserId: user.Id, AmountTotal: 1000, AmountUsed: 100, StartTime: period, LastResetTime: period, EndTime: now + 3600, Status: "active"}
+							require.NoError(t, db.Create(&subscription).Error)
+							native.PrivateData.BillingSource, native.PrivateData.SubscriptionId, native.PrivateData.SubscriptionPeriodStart = "subscription", subscription.Id, &period
+							if tc.reset {
+								require.NoError(t, db.Model(&subscription).Updates(map[string]any{"last_reset_time": now, "amount_used": 40}).Error)
+							}
+						}
+						if tc.output {
+							native.PrivateData.ResultURL = "https://cdn.example/video.mp4"
+							native.PrivateData.MediaRetryFact = &mediaretry.Fact{HasOutput: true}
+						}
+						require.NoError(t, db.Create(&job).Error)
+						require.NoError(t, db.Create(&native).Error)
+						stale := native
+						if tc.refundFailure {
+							require.NoError(t, db.Model(&token).Update("used_quota", 0).Error)
+							require.Error(t, service.TerminateAsyncMediaTask(t.Context(), job))
+							var after model.Task
+							require.NoError(t, db.Take(&after, native.ID).Error)
+							assert.Equal(t, stale.Status, after.Status)
+							assert.Equal(t, quota, after.Quota)
+							require.NoError(t, db.Take(&user, user.Id).Error)
+							assert.Equal(t, 900, user.Quota, "failed token refund rolls the wallet back")
+							require.NoError(t, db.Model(&token).Update("used_quota", quota).Error)
+						}
+						if tc.logFailure {
+							const callback = "test:termination_log_unavailable"
+							require.NoError(t, logDB.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+								tx.AddError(errors.New("log database unavailable"))
+							}))
+							require.Error(t, service.TerminateAsyncMediaTask(t.Context(), job))
+							require.NoError(t, logDB.Callback().Create().Remove(callback))
+							require.NoError(t, db.Take(&job, job.ID).Error)
+							assert.Equal(t, "refunded", job.BillingStatus)
+							assert.NotEmpty(t, job.RefundLogPayload)
+							require.NoError(t, model.ReplayAsyncMediaRefundLogs(t.Context(), 100))
+						}
+						for range 2 {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Params = gin.Params{{Key: "task_id", Value: id}}
+							c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{"confirm_upstream_checked":true}`))
+							view, _, err := videoJobView(c, job, true, false)
+							require.NoError(t, err)
+							assert.Equal(t, true, view["can_terminate"])
+							ManageMediaTask(c, true, "terminate")
+							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+							require.NoError(t, db.Take(&job, job.ID).Error)
+						}
+						require.NoError(t, db.Take(&native, native.ID).Error)
+						assert.EqualValues(t, model.TaskStatusFailure, native.Status)
+						assert.Zero(t, native.Quota)
+						assert.Empty(t, native.PrivateData.ResultURL)
+						assert.Greater(t, native.AttemptGeneration, stale.AttemptGeneration)
+						assert.Equal(t, "failed", job.Status)
+						assert.Equal(t, "refunded", job.BillingStatus)
+						assert.Zero(t, job.Quota)
+						assert.Empty(t, job.RequestCipher)
+						assert.Empty(t, job.ChannelCipher)
+						assert.Empty(t, job.LeaseToken)
+						assert.Zero(t, job.LeaseExpiresAt)
+						require.NoError(t, db.Take(&user, user.Id).Error)
+						require.NoError(t, db.Take(&token, token.Id).Error)
+						require.NoError(t, db.Take(&channel, channel.Id).Error)
+						wallet := 1000
+						if tc.subscription {
+							wallet = 900
+							require.NoError(t, db.Take(&subscription, subscription.Id).Error)
+							used := int64(0)
+							if tc.reset {
+								used = 40
+							}
+							assert.Equal(t, used, subscription.AmountUsed)
+						}
+						assert.Equal(t, wallet, user.Quota)
+						assert.Zero(t, user.UsedQuota)
+						assert.Equal(t, 1, user.RequestCount)
+						assert.Equal(t, 1000, token.RemainQuota)
+						assert.Zero(t, token.UsedQuota)
+						assert.Zero(t, channel.UsedQuota)
+						var refunds []model.Log
+						require.NoError(t, logDB.Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Find(&refunds).Error)
+						if quota > 0 {
+							require.Len(t, refunds, 1)
+							assert.Equal(t, quota, refunds[0].Quota)
+						} else {
+							assert.Empty(t, refunds)
+						}
+						stale.Status = model.TaskStatusSuccess
+						won, err := stale.UpdateWithStatus(tc.nativeStatus)
+						require.NoError(t, err)
+						assert.False(t, won, "late worker cannot overwrite the administrator termination")
+						assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), model.AsyncMediaJob{ID: job.ID, LeaseToken: "live-worker", AttemptGeneration: 1}, map[string]any{"status": "submitted"}), model.ErrImageConflict)
 					})
 				}
 			})
@@ -2993,8 +3177,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "stored error with empty reason", manual: true, storedDiagnostic: true, want: http.StatusOK},
 					{name: "missing confirmation", missingConfirmation: true, want: http.StatusConflict},
 					{name: "owner cannot refund", owner: true, want: http.StatusForbidden},
-					{name: "known output is protected", output: true, want: http.StatusConflict},
-					{name: "active worker is protected", leased: true, want: http.StatusConflict},
+					{name: "known output can be ended", output: true, want: http.StatusOK},
+					{name: "active worker can be ended", leased: true, want: http.StatusOK},
 					{name: "interrupted refund is recoverable", refundFailure: true, want: http.StatusConflict},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
@@ -3037,7 +3221,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(body))
 						view, _, err := videoJobView(c, job, !tc.owner, true)
 						require.NoError(t, err)
-						assert.Equal(t, !tc.owner && !tc.output && !tc.leased, view["can_terminate"])
+						assert.Equal(t, !tc.owner, view["can_terminate"])
 						assert.Equal(t, true, view["termination_requires_reconciliation"])
 						assert.Contains(t, view["error_message"], "i/o timeout")
 						assert.NotContains(t, view["error_message"], "secret-canary")
@@ -3067,7 +3251,11 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							}
 							close(start)
 							workers.Wait()
-							assert.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, []int{<-responses, <-responses})
+							statuses := []int{<-responses, <-responses}
+							assert.Contains(t, statuses, http.StatusOK)
+							for _, status := range statuses {
+								assert.Contains(t, []int{http.StatusOK, http.StatusConflict}, status)
+							}
 						} else {
 							ManageMediaTask(c, !tc.owner, "terminate")
 							assert.Equal(t, tc.want, recorder.Code, recorder.Body.String())
@@ -3075,13 +3263,13 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						if tc.refundFailure {
 							var held model.AsyncMediaJob
 							require.NoError(t, db.First(&held, job.ID).Error)
-							assert.Equal(t, "age_limit_refund", held.ReferenceRecoveryStage)
+							assert.Equal(t, job.ReferenceRecoveryStage, held.ReferenceRecoveryStage)
+							assert.Equal(t, job.Status, held.Status, "failed refunds preserve the original task for an explicit retry")
 							var user model.User
 							require.NoError(t, db.First(&user, 101).Error)
 							assert.Equal(t, 900, user.Quota, "partial refund must roll back the wallet")
 							require.NoError(t, db.Model(&model.Token{}).Where("id = ?", 201).Update("used_quota", 100).Error)
-							require.NoError(t, db.Model(&held).Updates(map[string]any{"next_attempt_at": 0, "lease_expires_at": 0}).Error)
-							require.NoError(t, service.FailOverdueAsyncMediaJobs(t.Context(), 100))
+							require.NoError(t, service.TerminateAsyncMediaTask(t.Context(), held))
 						}
 						var saved model.Task
 						var savedJob model.AsyncMediaJob
@@ -3135,7 +3323,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, err)
 						assert.Equal(t, "failed", view["status"])
 						assert.Equal(t, "refunded", view["billing_status"])
-						assert.Equal(t, false, view["can_terminate"])
+						assert.Equal(t, true, view["can_terminate"])
 					})
 				}
 			})
@@ -3205,15 +3393,19 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+job.TaskId+"/terminate", strings.NewReader(item.body))
 						view, _, err := videoJobView(c, job, item.admin, false)
 						require.NoError(t, err)
-						assert.Equal(t, item.terminable, view["can_terminate"])
+						assert.Equal(t, item.admin || item.terminable, view["can_terminate"])
 						if item.provider != "" {
 							assert.Equal(t, true, view["termination_requires_reconciliation"], "age expiry must not bypass upstream verification for a dispatched unknown operation")
 						}
 						ManageMediaTask(c, item.admin, "terminate")
-						require.Equal(t, item.want, recorder.Code, recorder.Body.String())
+						want := item.want
+						if item.admin && want == http.StatusOK {
+							want = http.StatusConflict
+						}
+						require.Equal(t, want, recorder.Code, recorder.Body.String())
 						var stored model.AsyncMediaJob
 						require.NoError(t, db.Where("id = ?", job.ID).Take(&stored).Error)
-						if item.want != http.StatusOK {
+						if want != http.StatusOK {
 							assert.Equal(t, job, stored, "rejected termination must leave the job unchanged")
 							return
 						}
@@ -3870,13 +4062,13 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 		{name: "administrator may reconcile an expired unknown submission", stage: "unknown", admin: true, expired: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusOK},
 		{name: "administrator must confirm upstream verification", stage: "unknown", admin: true, body: `{}`, want: http.StatusConflict},
 		{name: "owner cannot reconcile unknown submission", stage: "unknown", body: `{"confirm_upstream_checked":true}`, want: http.StatusForbidden},
-		{name: "administrator cannot terminate an ordinary queued recovery", stage: "prepare", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
+		{name: "administrator can terminate an ordinary queued recovery", stage: "prepare", admin: true, body: `{"confirm_upstream_checked":true}`, want: http.StatusOK},
 		{name: "owner cannot terminate an ordinary queued recovery", stage: "prepare", body: `{"confirm_upstream_checked":true}`, want: http.StatusConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.Log{}, &model.AsyncImageLogReceipt{}, &model.MediaInputObject{}, &model.CanvasGrant{}))
 			require.NoError(t, db.Model(user).Updates(map[string]any{"quota": 900, "used_quota": 100, "request_count": 1}).Error)
 			require.NoError(t, db.Model(token).Updates(map[string]any{"remain_quota": 0, "used_quota": 100}).Error)
 			channel := model.Channel{Key: "original-upstream-key", UsedQuota: 100}
@@ -3909,7 +4101,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 				assert.EqualValues(t, model.TaskStatusFailure, storedTask.Status)
 				assert.Equal(t, "failed", storedJob.Status)
 				assert.Equal(t, "refunded", storedJob.BillingStatus)
-				assert.Equal(t, "age_limit_complete", storedJob.ReferenceRecoveryStage)
+				assert.Equal(t, model.AsyncMediaAdminTerminatedStage, storedJob.ReferenceRecoveryStage)
 				assert.Empty(t, storedJob.RequestCipher)
 				repeated := httptest.NewRecorder()
 				repeatContext, _ := gin.CreateTestContext(repeated)
@@ -3917,7 +4109,7 @@ func TestAsyncVideoReferenceRecoveryAdministratorReconciliation(t *testing.T) {
 				repeatContext.Params = c.Params
 				repeatContext.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(tc.body))
 				ManageMediaTask(repeatContext, tc.admin, "terminate")
-				assert.Equal(t, http.StatusConflict, repeated.Code, "confirmation cannot refund a second time")
+				assert.Equal(t, http.StatusOK, repeated.Code, "confirmation is idempotent and cannot refund a second time")
 			} else {
 				assert.Equal(t, task.Status, storedTask.Status)
 				assert.Equal(t, job.Status, storedJob.Status)

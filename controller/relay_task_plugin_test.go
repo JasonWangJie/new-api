@@ -379,14 +379,14 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 				{false, `{"confirm_upstream_checked":true}`, http.StatusForbidden},
 				{true, `{}`, http.StatusConflict},
 				{true, `{"confirm_upstream_checked":true}`, http.StatusOK},
-				{true, `{"confirm_upstream_checked":true}`, http.StatusConflict},
+				{true, `{"confirm_upstream_checked":true}`, http.StatusOK},
 			} {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Set("id", user.Id)
 				c.Params = gin.Params{{Key: "task_id", Value: initialJob.TaskId}}
 				c.Request = httptest.NewRequest(http.MethodPost, "/api/media/tasks/"+initialJob.TaskId+"/terminate", strings.NewReader(attempt.body))
-				if tc.refundFailure && attempt.code == http.StatusOK {
+				if tc.refundFailure && attempt.code == http.StatusOK && initialJob.ReferenceRecoveryStage != model.AsyncMediaAdminTerminatedStage {
 					const callback = "mixed-reconciliation-refund-failure"
 					require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
 						if tx.Statement.Table == "users" {
@@ -397,9 +397,10 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 					require.NoError(t, db.Callback().Update().Remove(callback))
 					require.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
 					require.NoError(t, db.First(&initialJob, initialJob.ID).Error)
-					assert.Equal(t, "age_limit_refund", initialJob.ReferenceRecoveryStage)
-					require.NoError(t, db.Model(&initialJob).Update("next_attempt_at", 0).Error)
-					require.NoError(t, service.FailOverdueAsyncMediaJobs(t.Context(), 100), "a confirmed refund retries without waiting for the task age limit")
+					assert.Equal(t, "execution_unknown", initialJob.Status)
+					assert.Equal(t, "unknown", initialJob.BillingStatus)
+					require.NoError(t, service.TerminateAsyncMediaTask(t.Context(), initialJob), "an explicit retry can finish an atomically rolled-back refund")
+					require.NoError(t, db.First(&initialJob, initialJob.ID).Error)
 					continue
 				}
 				ManageMediaTask(c, attempt.admin, "terminate")
@@ -410,7 +411,11 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 			require.NoError(t, db.First(user, user.Id).Error)
 			require.NoError(t, db.First(token, token.Id).Error)
 			assert.Equal(t, "failed", initialJob.Status)
-			assert.Equal(t, "refunded", initialJob.BillingStatus)
+			billingStatus := "refunded"
+			if reserved == 0 {
+				billingStatus = "not_billable"
+			}
+			assert.Equal(t, billingStatus, initialJob.BillingStatus)
 			assert.Zero(t, native.Quota)
 			assert.Equal(t, beforeWallet, user.Quota, "explicit reconciliation releases the original hold only once")
 			assert.Equal(t, beforeToken, token.RemainQuota)
@@ -2619,7 +2624,7 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 							}{
 								{false, `{"confirm_upstream_checked":true}`, http.StatusConflict},
 								{true, `{}`, http.StatusConflict},
-								{true, `{"confirm_upstream_checked":true}`, http.StatusOK},
+								{true, `{"confirm_upstream_checked":true}`, http.StatusConflict},
 								{true, `{"confirm_upstream_checked":true}`, http.StatusConflict},
 							} {
 								recorder := httptest.NewRecorder()
@@ -2631,15 +2636,15 @@ func TestDurableVideoSubmissionReservationReconciliationDatabase(t *testing.T) {
 								require.Equal(t, attempt.code, recorder.Code, recorder.Body.String())
 							}
 							require.NoError(t, db.First(&job, job.ID).Error)
-							assert.Equal(t, "failed", job.Status)
-							assert.Equal(t, "unknown", job.BillingStatus, "manual termination does not invent a refund")
+							assert.Equal(t, "execution_unknown", job.Status)
+							assert.Equal(t, "unknown", job.BillingStatus, "an orphaned hold cannot be refunded without its accounting identity")
 							assert.Equal(t, 100, job.Quota)
 							require.NoError(t, service.CleanupMediaObjects(t.Context()))
 							require.NoError(t, db.First(&job, job.ID).Error)
-							assert.Equal(t, "failed", job.Status, "retention cleanup must preserve the administrator's local termination")
-							assert.Equal(t, "expired", job.StorageStatus, "the confirmed local termination releases retained payloads")
-							assert.Empty(t, job.RequestCipher)
-							assert.Empty(t, job.ChannelCipher)
+							assert.Equal(t, "execution_unknown", job.Status, "retention cleanup must preserve the unresolved accounting identity")
+							assert.Equal(t, "pending", job.StorageStatus)
+							assert.Equal(t, originalRequest, job.RequestCipher)
+							assert.Equal(t, originalChannel, job.ChannelCipher)
 							require.NoError(t, db.First(&user, user.Id).Error)
 							require.NoError(t, db.First(&token, token.Id).Error)
 							assert.Equal(t, 900, user.Quota)

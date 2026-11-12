@@ -63,7 +63,10 @@ export function imageTaskCanTerminate(
   task: ImageTask,
   now = Date.now() / 1000
 ): boolean {
-  return task.can_terminate && !imageTaskResultExpired(task, now)
+  return (
+    task.can_terminate &&
+    (task.media_type === 'video' || !imageTaskResultExpired(task, now))
+  )
 }
 
 export function imageTaskCanResume(
@@ -102,7 +105,7 @@ export function imageTaskRequiresTerminationConfirmation(
   task: ImageTask
 ): boolean {
   return (
-    !!imageTaskVideoReconciliation(task) ||
+    task.media_type === 'video' ||
     !!task.termination_requires_quota_reconciliation ||
     (task.termination_requires_reconciliation ??
       task.status === 'execution_unknown')
@@ -110,7 +113,7 @@ export function imageTaskRequiresTerminationConfirmation(
 }
 
 export function imageTaskTerminationLabel(task: ImageTask): string {
-  if (imageTaskVideoReconciliation(task)) return 'End task and refund'
+  if (task.media_type === 'video') return 'End task and refund'
   return task.status === 'expired' ? 'Mark as failed' : 'Terminate'
 }
 

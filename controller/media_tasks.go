@@ -344,6 +344,9 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 		view["refunded_cost"] = float64(*task.PrivateData.RefundedQuota) / common.QuotaPerUnit
 	}
 	results := make([]gin.H, 0)
+	if admin {
+		view["can_terminate"], view["termination_requires_reconciliation"] = true, true
+	}
 	if ownerErr != nil || resultExpired || err == nil && task.Status == model.TaskStatusFailure {
 		return view, results, nil
 	}
@@ -393,7 +396,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	if len(results) == 0 {
 		view["storage_status"] = "expired"
 		if succeeded {
-			view["result_expired"], view["can_resume"], view["can_terminate"] = true, false, false
+			view["result_expired"], view["can_resume"], view["can_terminate"] = true, false, admin
 		} else {
 			view["status"], view["stage"] = "expired", "failed"
 		}
@@ -779,6 +782,30 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			return
 		}
 		imageManagementData(c, gin.H{"task_id": task.TaskId})
+		return
+	}
+	if action == "terminate" && admin {
+		var confirmation struct {
+			UpstreamChecked bool `json:"confirm_upstream_checked"`
+		}
+		if common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &confirmation) != nil || !confirmation.UpstreamChecked {
+			imageManagementError(c, http.StatusConflict, errors.New("Verify the upstream task before terminating local processing"))
+			return
+		}
+		var job model.AsyncMediaJob
+		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id")).Take(&job).Error; err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				status = http.StatusNotFound
+			}
+			imageManagementError(c, status, errors.New("Media task is unavailable"))
+			return
+		}
+		if err := service.TerminateAsyncMediaTask(c.Request.Context(), job); err != nil {
+			imageManagementError(c, http.StatusConflict, errors.New("Media task refund requires reconciliation; retry after checking its billing"))
+			return
+		}
+		imageManagementData(c, gin.H{"task_id": job.TaskId})
 		return
 	}
 	if action == "resume" && admin {

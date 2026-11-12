@@ -78,6 +78,77 @@ func (job AsyncMediaJob) HasPendingSubmissionReconciliation() bool {
 	return job.Status == "execution_unknown" && job.DispatchedAt > 0 && job.BillingStatus == "unknown"
 }
 
+// TerminateAsyncMediaTask ends local execution and refunds the remaining charge.
+// The caller must enforce administrator permission and explicit confirmation;
+// this operation never claims to cancel the provider's independent task.
+func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason string, other *LogOther) error {
+	if job.ID <= 0 || job.TaskId == "" || job.UserId <= 0 || strings.TrimSpace(reason) == "" {
+		return ErrImageConflict
+	}
+	if err := ConfirmAsyncMediaRefundLog(ctx, job.TaskId); err != nil {
+		return err
+	}
+	var current AsyncMediaJob
+	if err := DB.WithContext(ctx).Where("id = ? AND task_id = ? AND user_id = ?", job.ID, job.TaskId, job.UserId).Take(&current).Error; err != nil {
+		return err
+	}
+	if current.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
+		return nil
+	}
+	var task Task
+	err := DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
+	if err == nil {
+		from := task.Status
+		task.Status, task.FailReason, task.Progress, task.FinishTime = TaskStatusFailure, reason, "100%", time.Now().Unix()
+		won, _, err := settleTaskBilling(ctx, &task, from, 0, nil, "", &asyncMediaTermination{job: current, other: other})
+		if err != nil {
+			return err
+		}
+		if !won {
+			if err := DB.WithContext(ctx).Where("id = ?", current.ID).Take(&current).Error; err != nil {
+				return err
+			}
+			if current.ReferenceRecoveryStage != AsyncMediaAdminTerminatedStage {
+				return ErrTaskAttemptConflict
+			}
+		}
+		return ConfirmAsyncMediaRefundLog(context.WithoutCancel(ctx), job.TaskId)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	// Without a native task, no durable accounting identity exists for a
+	// positive or uncertain hold. Its submission owner must reconcile it first.
+	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var task Task
+		err := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", current.TaskId, current.UserId).Take(&task).Error
+		if err == nil {
+			return ErrTaskAttemptConflict
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := lockForUpdate(tx).Where("id = ?", current.ID).Take(&current).Error; err != nil {
+			return err
+		}
+		if current.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
+			return nil
+		}
+		if current.Quota != 0 || !slices.Contains([]string{"pending", "not_billable", "refunded"}, current.BillingStatus) || current.AttemptGeneration == math.MaxInt64 {
+			return ErrTaskAttemptConflict
+		}
+		billing := "not_billable"
+		if current.BillingStatus == "refunded" {
+			billing = "refunded"
+		}
+		return ChangeAsyncMediaJob(tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID), map[string]any{
+			"status": "failed", "billing_status": billing, "quota": 0, "error_message": reason,
+			"attempt_generation": current.AttemptGeneration + 1, "reference_recovery_stage": AsyncMediaAdminTerminatedStage,
+			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil,
+		}, "terminated")
+	})
+}
+
 // ExcludePendingSubmissionReconciliation filters before pagination so retained
 // unknown operations cannot starve cleanup of financially completed jobs.
 func ExcludePendingSubmissionReconciliation(query *gorm.DB) *gorm.DB {
@@ -374,6 +445,9 @@ func recordAsyncMediaNativeTaskTx(tx *gorm.DB, task Task, receipt bool) error {
 	}
 	if strings.HasPrefix(job.ReferenceRecoveryStage, "age_limit_") &&
 		(job.AttemptGeneration != task.AttemptGeneration || receipt || task.Status == TaskStatusSuccess) {
+		return ErrTaskAttemptConflict
+	}
+	if job.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
 		return ErrTaskAttemptConflict
 	}
 	if job.ChannelId != task.ChannelId || job.TokenId != task.PrivateData.TokenId || job.AttemptGeneration != task.AttemptGeneration {

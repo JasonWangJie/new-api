@@ -456,12 +456,19 @@ export function ImageTaskDetails(props: {
                       size='sm'
                       variant='destructive'
                       onClick={() => {
-                        if (data.termination_requires_quota_reconciliation) {
-                          props.onManage('terminate', true, true)
+                        if (isVideo) {
+                          props.onManage(
+                            'terminate',
+                            true,
+                            data.termination_requires_quota_reconciliation
+                              ? true
+                              : undefined,
+                            true
+                          )
                           return
                         }
-                        if (videoReconciliation) {
-                          props.onManage('terminate', true, undefined, true)
+                        if (data.termination_requires_quota_reconciliation) {
+                          props.onManage('terminate', true, true)
                           return
                         }
                         props.onManage(

@@ -1828,6 +1828,134 @@ test('ordinary users see the waiting video failure reason without administrator 
 })
 
 test.each([
+  { status: 'queued', source: 'list', mobile: false },
+  { status: 'invoking', source: 'details', mobile: false },
+  { status: 'processing', source: 'list', mobile: true },
+  { status: 'upstream_succeeded', source: 'details', mobile: true },
+  { status: 'uploading', source: 'list', mobile: false },
+  { status: 'billing_pending', source: 'details', mobile: false },
+  { status: 'succeeded', source: 'list', mobile: false },
+  { status: 'succeeded', source: 'details', mobile: true },
+  { status: 'failed', source: 'list', mobile: true },
+  { status: 'expired', source: 'details', mobile: false },
+  { status: 'storage_failed', source: 'list', mobile: false },
+  { status: 'billing_failed', source: 'details', mobile: false },
+  { status: 'execution_unknown', source: 'list', mobile: true },
+])(
+  'administrator can end and refund a $status video from $source after confirmation (mobile=$mobile)',
+  async ({ status, source, mobile }) => {
+    if (mobile) setMobileViewport()
+    const video: ImageTask = {
+      ...task,
+      media_type: 'video',
+      status,
+      billing_status: status === 'succeeded' ? 'settled' : 'reserved',
+      result_expired: status === 'succeeded',
+      can_terminate: true,
+    }
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [video],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: video,
+      results: [],
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    let scope: ReturnType<typeof within> = screen
+    if (source === 'details') {
+      await user.click(screen.getByRole('button', { name: task.id }))
+      scope = within(
+        await screen.findByRole('dialog', { name: 'Media task details' })
+      )
+    }
+    const terminate = scope.getByRole('button', {
+      name: 'End task and refund',
+    })
+    expect(terminate).toHaveTextContent('End task and refund')
+    await user.click(terminate)
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'End task and refund',
+    })
+    expect(confirmation).toHaveTextContent(
+      'This ends local processing and refunds any remaining charge, including settled charges. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
+    )
+    expect(imageRequest).not.toHaveBeenCalled()
+    await user.click(
+      within(confirmation).getByRole('button', { name: 'End task and refund' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        `/api/admin/media-tasks/${task.id}/terminate`,
+        'POST',
+        { confirm_upstream_checked: true }
+      )
+    )
+    await waitFor(() =>
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    )
+  }
+)
+
+test('video refund reconciliation errors are translated and keep confirmation available for retry', async () => {
+  const video = { ...task, media_type: 'video' as const, status: 'succeeded' }
+  vi.mocked(getImageTasks).mockResolvedValue({
+    items: [video],
+    total: 1,
+    pages: 1,
+    stats: {},
+  })
+  vi.mocked(imageRequest).mockRejectedValueOnce(
+    new Error(
+      'Media task refund requires reconciliation; retry after checking its billing'
+    )
+  )
+  i18next.addResourceBundle('zh', 'translation', zh.translation)
+  try {
+    const user = userEvent.setup()
+    mount(
+      <>
+        <Toaster />
+        <ImageTaskCenter admin />
+      </>
+    )
+    await user.click(
+      await screen.findByRole('button', { name: 'End task and refund' })
+    )
+    const confirmation = await screen.findByRole('alertdialog', {
+      name: 'End task and refund',
+    })
+    await act(async () => {
+      await i18next.changeLanguage('zh')
+    })
+    await user.click(
+      within(confirmation).getByRole('button', {
+        name: zh.translation['End task and refund'],
+      })
+    )
+    expect(
+      await screen.findByText('任务退款需要核对，请检查计费后重试')
+    ).toBeVisible()
+    expect(confirmation).toBeInTheDocument()
+    expect(
+      within(confirmation).getByRole('button', {
+        name: zh.translation['End task and refund'],
+      })
+    ).toBeEnabled()
+  } finally {
+    await act(async () => {
+      await i18next.changeLanguage('en')
+    })
+    i18next.removeResourceBundle('zh', 'translation')
+  }
+})
+
+test.each([
   {
     admin: false,
     canManage: true,
@@ -3106,19 +3234,29 @@ test.each([
       stats: {},
     })
     mount(<ImageTaskCenter admin />)
+    let terminationLabel = 'Terminate'
+    if (media_type === 'video') {
+      terminationLabel = 'End task and refund'
+    } else if (status === 'expired') {
+      terminationLabel = 'Mark as failed'
+    }
     const terminate = (
       await screen.findAllByRole('button', {
-        name: status === 'expired' ? 'Mark as failed' : 'Terminate',
+        name: terminationLabel,
       })
     )[0]
     await user.click(terminate)
     expect(imageRequest).not.toHaveBeenCalled()
     const confirm = await screen.findByRole('alertdialog', {
-      name: 'Terminate media tasks',
+      name:
+        media_type === 'video'
+          ? 'End task and refund'
+          : 'Terminate media tasks',
     })
     const needsConfirmation =
-      requiresConfirmation ?? status === 'execution_unknown'
-    if (needsConfirmation) {
+      media_type === 'video' ||
+      (requiresConfirmation ?? status === 'execution_unknown')
+    if (needsConfirmation && media_type !== 'video') {
       expect(confirm).toHaveTextContent(
         'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.'
       )
@@ -3126,15 +3264,21 @@ test.each([
     vi.mocked(imageRequest).mockRejectedValueOnce(
       new Error('Termination unavailable')
     )
-    await user.click(within(confirm).getByRole('button', { name: 'Continue' }))
+    const confirmLabel =
+      media_type === 'video' ? 'End task and refund' : 'Continue'
+    await user.click(
+      within(confirm).getByRole('button', { name: confirmLabel })
+    )
     await waitFor(() =>
       expect(
-        within(confirm).getByRole('button', { name: 'Continue' })
+        within(confirm).getByRole('button', { name: confirmLabel })
       ).toBeEnabled()
     )
     expect(confirm).toBeInTheDocument()
     vi.mocked(imageRequest).mockResolvedValueOnce({})
-    await user.click(within(confirm).getByRole('button', { name: 'Continue' }))
+    await user.click(
+      within(confirm).getByRole('button', { name: confirmLabel })
+    )
     await waitFor(() =>
       expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
     )
@@ -3509,7 +3653,7 @@ test('a 90-day file retention deadline survives browser timeout limits without p
 })
 
 test.each([false, true])(
-  'expired unsuccessful tasks remain actionable while successful expired results cannot be selected (mobile=%s)',
+  'video termination respects server permissions on expired tasks (mobile=%s)',
   async (mobile) => {
     if (mobile) setMobileViewport()
     const user = userEvent.setup()
@@ -3526,6 +3670,8 @@ test.each([false, true])(
       ...expired,
       id: 'video_successful_result_expired',
       task_id: 'video_successful_result_expired',
+      status: 'succeeded',
+      result_expired: true,
       billing_status: 'settled',
       can_terminate: false,
     }
@@ -3547,7 +3693,7 @@ test.each([false, true])(
       })
     ).toHaveAttribute('aria-disabled', 'true')
     expect(
-      screen.getAllByRole('button', { name: 'Mark as failed' })
+      screen.getAllByRole('button', { name: 'End task and refund' })
     ).toHaveLength(1)
     expect(
       screen.getByRole('button', { name: 'Terminate current page (1)' })
@@ -3571,7 +3717,7 @@ test.each([false, true])(
     expect(imageRequest).toHaveBeenCalledWith(
       `/api/admin/media-tasks/${expired.id}/terminate`,
       'POST',
-      undefined
+      { confirm_upstream_checked: true }
     )
   }
 )
@@ -3580,17 +3726,15 @@ test.each([
   {
     status: 'execution_unknown',
     requiresConfirmation: undefined,
-    wantConfirmation: true,
   },
-  { status: 'expired', requiresConfirmation: true, wantConfirmation: true },
+  { status: 'expired', requiresConfirmation: true },
   {
     status: 'execution_unknown',
     requiresConfirmation: false,
-    wantConfirmation: false,
   },
 ])(
-  'video $status details use server termination verification=$requiresConfirmation',
-  async ({ status, requiresConfirmation, wantConfirmation }) => {
+  'video $status details always request explicit termination confirmation (server flag=$requiresConfirmation)',
+  async ({ status, requiresConfirmation }) => {
     const onManage = vi.fn()
     vi.mocked(getImageTask).mockResolvedValue({
       ...detail,
@@ -3615,10 +3759,10 @@ test.each([
     const user = userEvent.setup()
     await user.click(
       await screen.findByRole('button', {
-        name: status === 'expired' ? 'Mark as failed' : 'Terminate',
+        name: 'End task and refund',
       })
     )
-    expect(onManage).toHaveBeenCalledWith('terminate', wantConfirmation)
+    expect(onManage).toHaveBeenCalledWith('terminate', true, undefined, true)
   }
 )
 
@@ -4085,7 +4229,9 @@ test.each([
       'Verify the upstream task before continuing.'
     )
     expect(confirmation).toHaveTextContent(
-      'releases any remaining reserved quota'
+      videoOnly
+        ? 'refunds any remaining charge, including settled charges'
+        : 'releases any remaining reserved quota'
     )
     expect(imageRequest).not.toHaveBeenCalled()
     vi.mocked(imageRequest).mockResolvedValue({})
@@ -4419,11 +4565,17 @@ test.each([false, true])(
         admin_permissions: { async_image_task: { read: true, manage: false } },
       },
     })
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [{ ...task, media_type: 'video', status: 'succeeded' }],
+      total: 1,
+      pages: 1,
+      stats: {},
+    })
     mount(<ImageTaskCenter admin />)
     await screen.findAllByText('Sunburst upstream')
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
     expect(
-      screen.queryByRole('button', { name: /Terminate/ })
+      screen.queryByRole('button', { name: /Terminate|End task and refund/ })
     ).not.toBeInTheDocument()
   }
 )

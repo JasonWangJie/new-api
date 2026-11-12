@@ -165,7 +165,7 @@ func TestAsyncVideoReconciliationManagementRetainsReservation(t *testing.T) {
 		assert.Equal(t, "reserved", view["billing_status"])
 		assert.Equal(t, 120, view["quota"])
 		assert.Equal(t, admin, view["can_resume"])
-		assert.Equal(t, false, view["can_terminate"])
+		assert.Equal(t, admin, view["can_terminate"])
 		assert.NotNil(t, view["video_reconciliation"])
 	}
 	for _, provider := range []string{"drama", "grok"} {

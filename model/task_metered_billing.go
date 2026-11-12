@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"math"
 	"slices"
 	"time"
 
@@ -89,10 +90,19 @@ func RecordMeasuredTaskSubmitAccounting(ctx context.Context, task *Task) (record
 // An unaffordable completion becomes a failure with a full reservation refund;
 // it never publishes a successful result that has not been paid for.
 func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, actualQuota int, usageFacts map[string]any, matchedTier string) (won bool, reservedQuota int, err error) {
+	return settleTaskBilling(ctx, task, fromStatus, actualQuota, usageFacts, matchedTier, nil)
+}
+
+type asyncMediaTermination struct {
+	job   AsyncMediaJob
+	other *LogOther
+}
+
+func settleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, actualQuota int, usageFacts map[string]any, matchedTier string, termination *asyncMediaTermination) (won bool, reservedQuota int, err error) {
 	if task == nil || task.ID <= 0 || task.Quota < 0 || actualQuota < 0 {
 		return false, 0, errors.New("invalid task settlement inputs")
 	}
-	if fromStatus == TaskStatusSuccess || fromStatus == TaskStatusFailure ||
+	if termination == nil && (fromStatus == TaskStatusSuccess || fromStatus == TaskStatusFailure) ||
 		(task.Status != TaskStatusSuccess && task.Status != TaskStatusFailure) {
 		return false, 0, errors.New("task settlement must transition from non-terminal to terminal")
 	}
@@ -135,10 +145,33 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if current.Status != fromStatus || current.Quota != reservedQuota || current.AttemptGeneration != task.AttemptGeneration || current.PrivateData.UpstreamTaskID != task.PrivateData.UpstreamTaskID {
 			return errMeasuredTaskCASLost
 		}
-		if current.PrivateData.AsyncMedia && current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput && task.Status == TaskStatusFailure {
+		var terminatedJob AsyncMediaJob
+		if termination != nil {
+			if err := lockForUpdate(tx).Where("id = ? AND task_id = ? AND user_id = ?", termination.job.ID, current.TaskID, current.UserId).Take(&terminatedJob).Error; err != nil {
+				return err
+			}
+			if terminatedJob.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
+				return errMeasuredTaskCASLost
+			}
+			if terminatedJob.AttemptGeneration != current.AttemptGeneration ||
+				terminatedJob.ChannelId != current.ChannelId || terminatedJob.TokenId != current.PrivateData.TokenId || !current.PrivateData.AsyncMedia ||
+				current.Quota > 0 && (!current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded) || terminatedJob.RefundLogPayload != "" {
+				return ErrTaskAttemptConflict
+			}
+			if current.AttemptGeneration == math.MaxInt64 {
+				return ErrTaskAttemptConflict
+			}
+			updated.AttemptGeneration = current.AttemptGeneration + 1
+			updated.PrivateData = current.PrivateData
+			updated.PrivateData.ResultURL, updated.PrivateData.PluginState, updated.PrivateData.UpstreamAsyncResponse = "", nil, nil
+			updated.PrivateData.VideoReconciliation, updated.PrivateData.MediaRetryFact = nil, nil
+			updated.PrivateData.VideoTerminalConfirmed = false
+			updated.Data = nil
+		}
+		if termination == nil && current.PrivateData.AsyncMedia && current.PrivateData.MediaRetryFact != nil && current.PrivateData.MediaRetryFact.HasOutput && task.Status == TaskStatusFailure {
 			return errors.New("confirmed video output requires billing reconciliation")
 		}
-		if current.PrivateData.AsyncMedia && task.Status == TaskStatusFailure && slices.ContainsFunc(current.PrivateData.VideoAttempts, func(attempt VideoTaskAttempt) bool { return attempt.Status == TaskStatusUnknown }) {
+		if termination == nil && current.PrivateData.AsyncMedia && task.Status == TaskStatusFailure && slices.ContainsFunc(current.PrivateData.VideoAttempts, func(attempt VideoTaskAttempt) bool { return attempt.Status == TaskStatusUnknown }) {
 			var job AsyncMediaJob
 			if err := lockForUpdate(tx).Where("task_id = ? AND user_id = ? AND attempt_generation = ?", current.TaskID, current.UserId, current.AttemptGeneration).Take(&job).Error; err != nil {
 				return err
@@ -147,14 +180,16 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 				return errors.New("unconfirmed video attempt requires billing reconciliation")
 			}
 		}
-		if current.PrivateData.DurableBilling && !current.PrivateData.SubmitAccountingRecorded {
+		if current.PrivateData.DurableBilling && !current.PrivateData.SubmitAccountingRecorded && (termination == nil || current.Quota > 0) {
 			return errors.New("task submission accounting is not yet recorded")
 		}
 		if current.UserId != task.UserId || current.ChannelId != task.ChannelId {
 			return errors.New("task settlement identity mismatch")
 		}
 		updated.PrivateData.BillingChannelID = current.BillingChannelID()
-		updated.PrivateData.MediaRetryFact = current.PrivateData.MediaRetryFact
+		if termination == nil {
+			updated.PrivateData.MediaRetryFact = current.PrivateData.MediaRetryFact
+		}
 		updated.PrivateData.MediaRetryFailedAt = current.PrivateData.MediaRetryFailedAt
 		updated.PrivateData.MediaRetryState = current.PrivateData.MediaRetryState
 		updated.PrivateData.MediaRetryDecision = current.PrivateData.MediaRetryDecision
@@ -339,7 +374,7 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 				}
 			}
 		}
-		if updated.Status == TaskStatusFailure && updated.Quota == 0 {
+		if updated.Status == TaskStatusFailure && updated.Quota == 0 && (termination == nil || reservedQuota > 0) {
 			updated.PrivateData.RefundedQuota = common.GetPointer(reservedQuota)
 		}
 		claim := tx.Model(&Task{}).Where("id = ? AND status = ? AND quota = ? AND attempt_generation = ?", task.ID, fromStatus, reservedQuota, task.AttemptGeneration).Select("*").Updates(&updated)
@@ -349,7 +384,58 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 		if claim.RowsAffected != 1 {
 			return errMeasuredTaskCASLost
 		}
-		if err := recordAsyncMediaNativeTaskTx(tx, *task, false); err != nil {
+		if termination != nil {
+			billing := "not_billable"
+			if reservedQuota > 0 || terminatedJob.BillingStatus == "refunded" || updated.PrivateData.RefundedQuota != nil && *updated.PrivateData.RefundedQuota > 0 {
+				billing = "refunded"
+			}
+			changes := map[string]any{"status": "failed", "billing_status": billing, "quota": 0,
+				"attempt_generation": updated.AttemptGeneration, "reference_recovery_stage": AsyncMediaAdminTerminatedStage,
+				"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil,
+				"error_message": updated.FailReason}
+			if reservedQuota > 0 {
+				other := termination.other
+				if other == nil {
+					other = NewLogOther()
+				}
+				other.SetPublic("is_task", true)
+				other.SetPublic("task_id", current.TaskID)
+				other.SetPublic("billing_phase", "administrator_termination")
+				other.SetPublic("pre_consumed_quota", reservedQuota)
+				other.SetPublic("actual_quota", 0)
+				other.SetPublic("reason", updated.FailReason)
+				modelName := current.Properties.OriginModelName
+				if bc := current.PrivateData.BillingContext; bc != nil && bc.OriginModelName != "" {
+					modelName = bc.OriginModelName
+				}
+				if modelName == "" {
+					modelName = terminatedJob.Model
+				}
+				refund := &Log{UserId: current.UserId, Username: user.Username, CreatedAt: common.GetTimestamp(),
+					Type: LogTypeRefund, Content: updated.FailReason, TokenName: token.Name, ModelName: modelName,
+					Quota: reservedQuota, ChannelId: current.BillingChannelID(), TokenId: current.PrivateData.TokenId,
+					Group: current.Group, Other: other.JSONString()}
+				ensureLogRequestId(refund)
+				payload, err := common.Marshal(refund)
+				if err != nil {
+					return err
+				}
+				changes["refund_log_payload"] = string(payload)
+			}
+			if err := tx.Model(&AsyncMediaJob{}).Where("id = ?", terminatedJob.ID).Updates(changes).Error; err != nil {
+				return err
+			}
+			var after AsyncMediaJob
+			if err := tx.Where("id = ?", terminatedJob.ID).Take(&after).Error; err != nil {
+				return err
+			}
+			if err := recordAsyncMediaEventTx(tx, after, "terminated", "", nil, ""); err != nil {
+				return err
+			}
+			if err := recordAsyncMediaTransitionTx(tx, terminatedJob, after, nil, ""); err != nil {
+				return err
+			}
+		} else if err := recordAsyncMediaNativeTaskTx(tx, *task, false); err != nil {
 			return err
 		}
 		if current.PrivateData.MediaRetryState != nil || current.PrivateData.MediaRetryDecision != nil {

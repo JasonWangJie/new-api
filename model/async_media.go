@@ -16,6 +16,7 @@ import (
 const (
 	AsyncMediaTaskAgeExceededReason   = "Task exceeded the maximum age of 4 hours"
 	AsyncMediaExpiredTerminatedReason = "Unsuccessful expired task terminated by administrator"
+	AsyncMediaAdminTerminatedStage    = "admin_terminated"
 )
 
 // AsyncMediaJob owns submission and storage leases. Upstream task accounting
@@ -425,8 +426,15 @@ func ConfirmAsyncMediaRefundLog(ctx context.Context, taskID string) error {
 			existing[0].Id = 0
 			projectUsage = existing[0] == *consume
 		}
-	} else if err := recordTaskBillingLogOnce(ctx, log, "video-refund:"+job.TaskId, fmt.Sprintf("%x", sha256.Sum256([]byte(job.RefundLogPayload)))); err != nil {
-		return err
+	} else {
+		eventID := "video-refund:" + job.TaskId
+		var other map[string]any
+		if common.UnmarshalJsonStr(log.Other, &other) == nil && other["billing_phase"] == "administrator_termination" {
+			eventID = "video-admin-refund:" + job.TaskId
+		}
+		if err := recordTaskBillingLogOnce(ctx, log, eventID, fmt.Sprintf("%x", sha256.Sum256([]byte(job.RefundLogPayload)))); err != nil {
+			return err
+		}
 	}
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current AsyncMediaJob
