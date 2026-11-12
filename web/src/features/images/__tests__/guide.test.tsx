@@ -136,6 +136,15 @@ test('output options state model scope and frame bounds without adding format-sp
     screen.getByRole('group', { name: 'Completed image response' })
   ).toHaveTextContent('/v1/media/files/')
   expect(
+    screen.getByRole('group', { name: 'Completed image response' })
+  ).toHaveTextContent('https://images.example.com/i/example.png')
+  expect(
+    screen.getByText(/Image result links may use an external image host/)
+  ).toBeVisible()
+  expect(
+    screen.getByText(/selected independently for each image/)
+  ).toHaveTextContent('allow redirects')
+  expect(
     screen.queryByRole('group', { name: /OpenAI|xAI|Drama|Sora|Doubao/ })
   ).not.toBeInTheDocument()
 })

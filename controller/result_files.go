@@ -22,6 +22,11 @@ func StoredResultFileContent(c *gin.Context) {
 			c.Status(http.StatusNotFound)
 			return
 		}
+		if link := service.ImageResultDeliveryURL(object); link != "" {
+			c.Header("Referrer-Policy", "no-referrer")
+			c.Redirect(http.StatusTemporaryRedirect, link)
+			return
+		}
 		c.Header("Content-Disposition", `inline; filename="`+filename+`"`)
 		serveImageObject(c, object, true)
 		return

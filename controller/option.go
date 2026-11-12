@@ -88,7 +88,7 @@ func GetOptions(c *gin.Context) {
 	optionValues := make(map[string]string)
 	common.OptionMapRWMutex.Lock()
 	for k, v := range common.OptionMap {
-		if k == "theme.frontend" || k == "billing_setting.billing_mode" || k == "billing_setting.billing_expr" {
+		if k == "theme.frontend" || k == "billing_setting.billing_mode" || k == "billing_setting.billing_expr" || k == "image_hosting_config" {
 			continue
 		}
 		value := common.Interface2String(v)
@@ -195,6 +195,10 @@ func UpdateOption(c *gin.Context) {
 	if model.IsModelPricingOption(option.Key) {
 		mixedVideoConfigurationMu.Lock()
 		defer mixedVideoConfigurationMu.Unlock()
+	}
+	if option.Key == "image_hosting_config" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Use the image hosting configuration endpoint"})
+		return
 	}
 	switch option.Key {
 	case perf_metrics_setting.VideoErrorExclusionsOptionKey, perf_metrics_setting.ImageErrorExclusionsOptionKey:

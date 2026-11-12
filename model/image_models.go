@@ -230,6 +230,8 @@ type AsyncImageStagingObject struct {
 	Checksum    string `gorm:"size:64"`
 	Width       int
 	Height      int
+	// Only anonymous public result URLs are retained for image-host ingestion.
+	SourceURL string `gorm:"type:text"`
 }
 
 // ImageStorageProfile revisions remain addressable for existing ObjectRefs.
@@ -251,17 +253,21 @@ type ImageStorageProfile struct {
 }
 
 type ImageStorageObject struct {
-	Id                   int    `json:"-"`
-	ObjectId             string `json:"id" gorm:"size:64;uniqueIndex"`
-	IdentityHash         string `json:"-" gorm:"size:64;uniqueIndex"`
-	ProfileId            string `json:"-" gorm:"size:64;index"`
-	Class                string `json:"-" gorm:"size:16"`
-	ObjectKey            string `json:"-" gorm:"size:255"`
-	ContentType          string `json:"content_type" gorm:"size:64"`
-	ByteSize             int64  `json:"byte_size" gorm:"type:bigint"`
-	Checksum             string `json:"checksum" gorm:"size:64"`
-	Width                int    `json:"width"`
-	Height               int    `json:"height"`
+	Id           int    `json:"-"`
+	ObjectId     string `json:"id" gorm:"size:64;uniqueIndex"`
+	IdentityHash string `json:"-" gorm:"size:64;uniqueIndex"`
+	ProfileId    string `json:"-" gorm:"size:64;index"`
+	Class        string `json:"-" gorm:"size:16"`
+	ObjectKey    string `json:"-" gorm:"size:255"`
+	ContentType  string `json:"content_type" gorm:"size:64"`
+	ByteSize     int64  `json:"byte_size" gorm:"type:bigint"`
+	Checksum     string `json:"checksum" gorm:"size:64"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	// Delivery is selected once per generated image; the original object stays
+	// available for protected reads, imports and recovery.
+	DeliverySource       string `json:"delivery_source,omitempty" gorm:"size:16"`
+	DeliveryURL          string `json:"-" gorm:"type:text"`
 	Status               string `json:"-" gorm:"size:16;index"`
 	DeleteLease          string `json:"-" gorm:"size:64"`
 	DeleteLeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`

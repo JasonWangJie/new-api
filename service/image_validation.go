@@ -32,6 +32,7 @@ type ImageBytes struct {
 	Checksum    string
 	Width       int
 	Height      int
+	SourceURL   string
 }
 
 const maxNormalizedImageTrailingBytes = 4 << 10
@@ -274,7 +275,11 @@ func DownloadImageReference(ctx context.Context, raw string, cfg ImageRuntimeCon
 // DownloadImageOutput tolerates mislabeled supported formats in upstream results.
 // References remain strict; outputs still require complete image validation.
 func DownloadImageOutput(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
-	return downloadImage(ctx, raw, cfg, true)
+	image, err := downloadImage(ctx, raw, cfg, true)
+	if err == nil && PublicUpstreamAsyncResultURL(raw) {
+		image.SourceURL = raw
+	}
+	return image, err
 }
 
 func downloadImage(ctx context.Context, raw string, cfg ImageRuntimeConfig, output bool) (ImageBytes, error) {
@@ -384,6 +389,9 @@ func DownloadUpstreamAsyncImages(ctx context.Context, urls []string, profile *dt
 		if err != nil {
 			return nil, err
 		}
+		if credentialless && PublicUpstreamAsyncResultURL(raw) {
+			image.SourceURL = raw
+		}
 		images = append(images, image)
 	}
 	return images, nil
@@ -393,7 +401,11 @@ var ErrUpstreamAsyncImageTransport = errors.New("image result transport failed")
 var ErrHuahuoImageResultURLExpired = errors.New("Huahuo image delivery URL may have expired")
 
 func DownloadHuahuoImageResult(ctx context.Context, raw string, cfg ImageRuntimeConfig) (ImageBytes, error) {
-	return downloadPublicUpstreamAsyncImage(ctx, raw, cfg, true)
+	image, err := downloadPublicUpstreamAsyncImage(ctx, raw, cfg, true)
+	if err == nil && PublicUpstreamAsyncResultURL(raw) {
+		image.SourceURL = raw
+	}
+	return image, err
 }
 
 func downloadPublicUpstreamAsyncImage(ctx context.Context, raw string, cfg ImageRuntimeConfig, httpsOnly bool) (ImageBytes, error) {

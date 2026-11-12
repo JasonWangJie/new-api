@@ -1823,3 +1823,69 @@ func TestSaveMediaPolicyAcceptsImageVideoCatalogAndRejectsCapabilityExpansion(t 
 	recorder = save([]service.ImageModelCapability{{Id: "grok-imagine-video-1.5", Label: "Legacy hand-authored video"}})
 	assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 }
+
+func TestImageHostingConfigurationRejectsGenericSecretAccessAndCrossSiteWrites(t *testing.T) {
+	common.OptionMapRWMutex.Lock()
+	previousMap := common.OptionMap
+	previous, existed := common.OptionMap["image_hosting_config"]
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMap["image_hosting_config"] = `{"token_cipher":"encrypted-private-value"}`
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		defer common.OptionMapRWMutex.Unlock()
+		if previousMap == nil {
+			common.OptionMap = nil
+			return
+		}
+		if existed {
+			common.OptionMap["image_hosting_config"] = previous
+		} else {
+			delete(common.OptionMap, "image_hosting_config")
+		}
+	})
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodGet, "/api/option/", nil)
+	GetOptions(requestContext)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "image_hosting_config")
+	assert.NotContains(t, recorder.Body.String(), "encrypted-private-value")
+
+	recorder = httptest.NewRecorder()
+	requestContext, _ = gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodPut, "/api/option/", strings.NewReader(`{"key":"image_hosting_config","value":"{}"}`))
+	UpdateOption(requestContext)
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "configuration endpoint")
+
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		origin      string
+		fetchSite   string
+		body        string
+		status      int
+	}{
+		{"form cannot change upload credentials", "application/x-www-form-urlencoded", "", "", `token=secret`, http.StatusUnsupportedMediaType},
+		{"foreign origin rejected", "application/json", "https://evil.example.com", "", `{}`, http.StatusForbidden},
+		{"downgraded origin rejected", "application/json", "http://console.example.com", "", `{}`, http.StatusForbidden},
+		{"cross-site browser rejected", "application/json", "", "cross-site", `{}`, http.StatusForbidden},
+		{"same origin still requires revision", "application/json", "https://console.example.com", "same-origin", `{}`, http.StatusPreconditionRequired},
+		{"API caller still requires revision", "application/json", "", "", `{}`, http.StatusPreconditionRequired},
+		{"video hosting is not silently enabled", "application/json", "", "", `{"revision":0,"video_enabled":true}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			requestContext, _ := gin.CreateTestContext(recorder)
+			requestContext.Request = httptest.NewRequest(http.MethodPut, "https://console.example.com/api/option/images/hosting", strings.NewReader(tc.body))
+			requestContext.Request.Header.Set("Content-Type", tc.contentType)
+			requestContext.Request.Header.Set("Origin", tc.origin)
+			requestContext.Request.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			UpdateImageHostingConfiguration(requestContext)
+			assert.Equal(t, tc.status, recorder.Code)
+		})
+	}
+}

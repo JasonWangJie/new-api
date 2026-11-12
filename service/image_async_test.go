@@ -6166,6 +6166,78 @@ func TestResolveImageReferenceTransportMode(t *testing.T) {
 	assert.Equal(t, "local", ResolveImageReferenceTransportMode("local", 2))
 }
 
+func TestAsyncImageHostingFallbackKeepsValidatedResults(t *testing.T) {
+	for _, scenario := range []struct {
+		name, fallback, wantSource string
+		protected                  bool
+	}{
+		{name: "URL falls back to original while Base64 stays local", fallback: "upstream", wantSource: "upstream"},
+		{name: "URL uses configured local fallback", fallback: "local", wantSource: "local"},
+		{name: "protected image never leaves controlled storage", fallback: "upstream", wantSource: "local", protected: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			db, task, _, cfg, _ := asyncImageWorkerFixture(t)
+			extra := []any{&model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.AsyncImageStagingObject{}, &model.AsyncImageResult{}, &model.CanvasGrant{}}
+			require.NoError(t, db.AutoMigrate(extra...))
+			t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(extra...)) })
+			hosting := DefaultImageHostingConfig()
+			hosting.Enabled, hosting.AllowPrivateNetwork = true, true
+			hosting.BaseURL, hosting.Retries, hosting.TimeoutSeconds = "https://127.0.0.1:1", 0, 1
+			hosting.FailureThreshold, hosting.URLFallback = 1, scenario.fallback
+			hosting, err := SaveImageHostingConfig(t.Context(), hosting, "private-upload-token", false, 0)
+			require.NoError(t, err)
+			if scenario.protected {
+				require.NoError(t, db.Create(&model.CanvasGrant{TokenID: task.TokenId, UserID: task.UserId, Subject: "protected-subject"}).Error)
+			}
+			valid := asyncImageBytesFixture(t)
+			sourceURL := "https://provider.example.com/generated.png?expires=2000000000"
+			staging := []model.AsyncImageStagingObject{
+				{TaskId: task.TaskId, ImageIndex: 0, Data: valid.Data, ContentType: valid.ContentType, Width: valid.Width, Height: valid.Height, Checksum: valid.Checksum, SourceURL: sourceURL},
+				{TaskId: task.TaskId, ImageIndex: 1, Data: valid.Data, ContentType: valid.ContentType, Width: valid.Width, Height: valid.Height, Checksum: valid.Checksum},
+			}
+			require.NoError(t, db.Create(&staging).Error)
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"status": model.ImageTaskUploading, "image_count": 2}).Error)
+			require.NoError(t, db.First(&task, task.Id).Error)
+			require.NoError(t, UploadAsyncImageTask(t.Context(), &task, cfg))
+			var results []model.AsyncImageResult
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Order("image_index").Find(&results).Error)
+			require.Len(t, results, 2)
+			for index, result := range results {
+				var object model.ImageStorageObject
+				require.NoError(t, db.Where("object_id = ?", result.ObjectId).Take(&object).Error)
+				want := "local"
+				if index == 0 {
+					want = scenario.wantSource
+				}
+				assert.Equal(t, want, object.DeliverySource)
+				assert.Equal(t, valid.Width, object.Width)
+				assert.Equal(t, valid.Height, object.Height)
+				if want == "upstream" {
+					assert.Equal(t, sourceURL, ImageResultDeliveryURL(object))
+				} else {
+					assert.Empty(t, ImageResultDeliveryURL(object))
+				}
+				store, err := GetImageObjectStorage(t.Context(), object)
+				require.NoError(t, err)
+				data, err := store.Read(t.Context(), object.ObjectKey, 1<<20)
+				require.NoError(t, err)
+				assert.Equal(t, valid.Data, data)
+				// A resumed local phase reuses its committed delivery choice.
+				before := object.DeliverySource
+				require.NoError(t, SelectImageResultDelivery(t.Context(), task, &object, valid))
+				assert.Equal(t, before, object.DeliverySource)
+			}
+			var current model.AsyncImageTask
+			require.NoError(t, db.First(&current, task.Id).Error)
+			assert.Equal(t, model.ImageTaskBillingPending, current.Status)
+			assert.Equal(t, 2, current.ResultCount)
+			assert.Zero(t, current.RetryCount)
+			assert.Equal(t, task.SelectedChannelCipher, current.SelectedChannelCipher)
+			assert.True(t, hosting.HasToken)
+		})
+	}
+}
+
 func TestAsyncImageLocalStorageAndDurableIntentRetry(t *testing.T) {
 	asyncImageKeyFixture(t)
 	previousDB := model.DB

@@ -59,6 +59,7 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
 import { ConfigurationConflict } from './components/configuration-conflict'
+import { ExternalImageHostingSettings } from './components/external-image-hosting-settings'
 import { ImageGroupSelect } from './components/image-group-select'
 import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
 import {
@@ -459,7 +460,7 @@ export function ImageSettings() {
   return (
     <div className='space-y-4'>
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
-        <TabsList className='h-auto flex-wrap'>
+        <TabsList className='max-w-full flex-wrap justify-start gap-y-1 group-data-horizontal/tabs:h-auto'>
           {[
             { id: 'runtime', label: 'Image runtime' },
             { id: 'storage', label: 'Image storage' },
@@ -468,7 +469,11 @@ export function ImageSettings() {
             { id: 'pool', label: 'Channel pools' },
             { id: 'routing', label: 'Routing preview' },
           ].map((item) => (
-            <TabsTrigger key={item.id} value={item.id}>
+            <TabsTrigger
+              key={item.id}
+              value={item.id}
+              className='h-auto min-h-7'
+            >
               {t(item.label)}
             </TabsTrigger>
           ))}
@@ -485,10 +490,13 @@ export function ImageSettings() {
         </div>
       )}{' '}
       {tab === 'storage' && (
-        <ImageStorageForm
-          config={config}
-          onSuccess={() => configuration.refetch()}
-        />
+        <div className='space-y-4'>
+          <ExternalImageHostingSettings />
+          <ImageStorageForm
+            config={config}
+            onSuccess={() => configuration.refetch()}
+          />
+        </div>
       )}{' '}
       {tab === 'policy' && (
         <ImagePolicyForm

@@ -79,6 +79,11 @@ export function AsyncImageGuide() {
               <p className='text-muted-foreground mt-3 font-mono text-xs break-all'>
                 {base}
               </p>
+              <p className='text-muted-foreground mt-3 text-sm'>
+                {t(
+                  'Image result links may use an external image host. Follow each returned URL without assuming the gateway hostname.'
+                )}
+              </p>
             </header>
             <StaticDataTable
               data={[...ASYNC_IMAGE_ENDPOINTS]}

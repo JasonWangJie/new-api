@@ -533,7 +533,7 @@ func TestAsyncImageAdminDiagnosticsRejectUserCredentials(t *testing.T) {
 	require.NoError(t, db.Create(&task).Error)
 	engine := gin.New()
 	SetApiRouter(engine)
-	for _, path := range []string{"/api/admin/async-image-tasks/reliability", "/api/admin/async-image-tasks/" + task.TaskId + "/request"} {
+	for _, path := range []string{"/api/admin/async-image-tasks/reliability", "/api/admin/async-image-tasks/" + task.TaskId + "/request", "/api/option/images/hosting"} {
 		for _, tc := range []struct {
 			name, credential string
 			status           int
@@ -552,6 +552,23 @@ func TestAsyncImageAdminDiagnosticsRejectUserCredentials(t *testing.T) {
 				}
 			})
 		}
+	}
+	for _, tc := range []struct {
+		name, credential string
+		status           int
+	}{{"anonymous hosting writer", "", 401}, {"ordinary hosting writer", userPAT, 403}, {"root hosting writer", rootPAT, 200}} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPut, "/api/option/images/hosting", strings.NewReader(`{"revision":0,"enabled":false,"token":"never-echo-hosting-token"}`))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.credential != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.credential)
+			}
+			engine.ServeHTTP(recorder, request)
+			assert.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+			assert.NotContains(t, recorder.Body.String(), "never-echo-hosting-token")
+			assert.NotContains(t, recorder.Body.String(), "token_cipher")
+		})
 	}
 }
 

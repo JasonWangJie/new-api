@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -150,6 +151,45 @@ func queryStoredResultFiles(t *testing.T, f *canvasFixture, query string, token 
 		links[i] = item.URL
 	}
 	return links
+}
+
+func TestStoredResultFilePerImageExternalDelivery(t *testing.T) {
+	f, token := newStoredResultFixture(t)
+	profile := model.ImageStorageProfile{ProfileId: "external-delivery-local", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}
+	require.NoError(t, f.db.Create(&profile).Error)
+	task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: f.user.Id, TokenId: token.Id, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ImageCount: 2, ResultCount: 2, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	require.NoError(t, f.db.Create(&task).Error)
+	var data bytes.Buffer
+	require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 3, 2))))
+	objects := make([]model.ImageStorageObject, 2)
+	for index := range objects {
+		objects[index] = storedResultImage(t, profile, task, index, "image/png", data.Bytes())
+		require.NoError(t, f.db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: index, ObjectId: objects[index].ObjectId}).Error)
+	}
+	oldLink, err := service.ImageResultFileURL(t.Context(), objects[0], storedResultTestBase)
+	require.NoError(t, err)
+	hosted := "https://images.example.com/i/generated.png"
+	require.NoError(t, f.db.Model(&objects[0]).Updates(map[string]any{"delivery_source": "hosted", "delivery_url": hosted}).Error)
+	query := "/v1/images/tasks_async/" + task.TaskId
+	links := queryStoredResultFiles(t, f, query, token)
+	require.Len(t, links, 2)
+	assert.Equal(t, hosted, links[0])
+	assert.Contains(t, links[1], "/v1/media/files/img_")
+	parsed, err := url.Parse(oldLink)
+	require.NoError(t, err)
+	router := gin.New()
+	router.GET("/v1/media/files/:filename", StoredResultFileContent)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, parsed.Path, nil))
+	require.Equal(t, http.StatusTemporaryRedirect, response.Code)
+	assert.Equal(t, hosted, response.Header().Get("Location"))
+	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	// A stale public filename must not redirect after the underlying result expires.
+	require.NoError(t, f.db.Model(&objects[0]).Update("expires_at", time.Now().Unix()-1).Error)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, parsed.Path, nil))
+	assert.Equal(t, http.StatusNotFound, response.Code)
+	assert.Empty(t, response.Header().Get("Location"))
 }
 
 func TestStoredResultFileImageDetails(t *testing.T) {
@@ -423,6 +463,20 @@ func TestStoredResultFileImageLifecycle(t *testing.T) {
 
 func TestStoredResultFileVideoLifecycle(t *testing.T) {
 	f, token := newStoredResultFixture(t)
+	var hostingConnections atomic.Int32
+	imageHost := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	imageHost.TLS = &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		hostingConnections.Add(1)
+		return nil, nil
+	}}
+	imageHost.StartTLS()
+	t.Cleanup(imageHost.Close)
+	hosting := service.DefaultImageHostingConfig()
+	hosting.Enabled, hosting.AllowPrivateNetwork, hosting.BaseURL = true, true, imageHost.URL
+	_, err := service.SaveImageHostingConfig(t.Context(), hosting, "video-isolation-upload-token", false, 0)
+	require.NoError(t, err)
 	f.router.GET("/v1/tasks/:key/artifacts", middleware.TokenAuth(), GetTaskArtifacts)
 	gateway := httptest.NewServer(f.router)
 	t.Cleanup(gateway.Close)
@@ -436,8 +490,9 @@ func TestStoredResultFileVideoLifecycle(t *testing.T) {
 	require.NoError(t, f.db.Create(&job).Error)
 	require.NoError(t, f.db.Create(&task).Error)
 	video := taskMediaMP4Fixture()
-	_, err := service.GetTaskArtifactStore().Persist(t.Context(), &task, types.TaskArtifact{Key: "video", Type: "video", MimeType: "video/mp4"}, bytes.NewReader(video))
+	_, err = service.GetTaskArtifactStore().Persist(t.Context(), &task, types.TaskArtifact{Key: "video", Type: "video", MimeType: "video/mp4"}, bytes.NewReader(video))
 	require.NoError(t, err)
+	assert.Zero(t, hostingConnections.Load(), "enabled image hosting must not receive video uploads")
 	var object model.MediaArtifactObject
 	require.NoError(t, f.db.First(&object, "task_id = ?", job.TaskId).Error)
 	query := "/v1/media/tasks_async/" + job.TaskId

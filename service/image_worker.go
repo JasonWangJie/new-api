@@ -1037,7 +1037,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	} else {
 		staging := make([]model.AsyncImageStagingObject, len(output.Images))
 		for i, image := range output.Images {
-			staging[i] = model.AsyncImageStagingObject{Data: image.Data, ContentType: image.ContentType, Checksum: image.Checksum, Width: image.Width, Height: image.Height}
+			staging[i] = model.AsyncImageStagingObject{Data: image.Data, ContentType: image.ContentType, Checksum: image.Checksum, Width: image.Width, Height: image.Height, SourceURL: image.SourceURL}
 		}
 		persistErr = model.StageAsyncImageOutput(ctx, *task, staging, bill)
 	}
@@ -1575,6 +1575,10 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		}
 		object, err := StoreImageIntent(ctx, intents[i], image, task.CreatedAt+int64(cfg.ResultRetentionDays)*86400)
 		if err != nil {
+			return err
+		}
+		image.SourceURL = saved.SourceURL
+		if err := SelectImageResultDelivery(ctx, *task, &object, image); err != nil {
 			return err
 		}
 		results[i] = model.AsyncImageResult{TaskId: task.TaskId, ImageIndex: i, ObjectId: object.ObjectId, CreatedAt: time.Now().Unix()}

@@ -312,7 +312,7 @@ export function asyncImageGuide(
           'Poll query_url with the submitting API key. Stages are queued, generating, saving, completed and failed. Download data[].url after stage=completed and status=succeeded, provided result_expired is not true and data is available.'
         ),
         t(
-          'Saved image and video links use /v1/media/files/. A successful upstream fallback can have result_source=upstream and storage_status=upstream. Expired results may retain a successful task status while returning empty data.'
+          'Local image and video links use /v1/media/files/. Image results may instead use configured image-host links or eligible upstream links, selected independently for each image. Use each complete returned URL and allow redirects. Expired results may retain a successful task status while returning empty data.'
         ),
         t(
           'Image result entries provide a URL; video entries may include content_type, byte_size and other metadata. Do not require video-only fields on image responses.'
@@ -346,6 +346,9 @@ export function asyncImageGuide(
               data: [
                 {
                   url: `${base}/v1/media/files/img_0123456789abcdef0123456789abcdef.svg`,
+                },
+                {
+                  url: 'https://images.example.com/i/example.png',
                 },
               ],
             },
