@@ -1834,23 +1834,28 @@ test.each([
   { status: 'upstream_succeeded', source: 'details', mobile: true },
   { status: 'uploading', source: 'list', mobile: false },
   { status: 'billing_pending', source: 'details', mobile: false },
-  { status: 'succeeded', source: 'list', mobile: false },
-  { status: 'succeeded', source: 'details', mobile: true },
   { status: 'failed', source: 'list', mobile: true },
+  {
+    status: 'failed',
+    source: 'details',
+    mobile: false,
+    billing_status: 'unknown',
+  },
+  { status: 'failed', source: 'list', mobile: false, billing_status: 'failed' },
   { status: 'expired', source: 'details', mobile: false },
   { status: 'storage_failed', source: 'list', mobile: false },
   { status: 'billing_failed', source: 'details', mobile: false },
   { status: 'execution_unknown', source: 'list', mobile: true },
 ])(
   'administrator can end and refund a $status video from $source after confirmation (mobile=$mobile)',
-  async ({ status, source, mobile }) => {
+  async ({ status, source, mobile, billing_status }) => {
     if (mobile) setMobileViewport()
     const video: ImageTask = {
       ...task,
       media_type: 'video',
       status,
-      billing_status: status === 'succeeded' ? 'settled' : 'reserved',
-      result_expired: status === 'succeeded',
+      billing_status: billing_status || 'reserved',
+      result_expired: true,
       can_terminate: true,
     }
     vi.mocked(getImageTasks).mockResolvedValue({
@@ -1883,7 +1888,7 @@ test.each([
       name: 'End task and refund',
     })
     expect(confirmation).toHaveTextContent(
-      'This ends local processing and refunds any remaining charge, including settled charges. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
+      'This ends the unfinished task locally and refunds its remaining charge. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
     )
     expect(imageRequest).not.toHaveBeenCalled()
     await user.click(
@@ -1903,7 +1908,12 @@ test.each([
 )
 
 test('video refund reconciliation errors are translated and keep confirmation available for retry', async () => {
-  const video = { ...task, media_type: 'video' as const, status: 'succeeded' }
+  const video = {
+    ...task,
+    media_type: 'video' as const,
+    status: 'failed',
+    billing_status: 'unknown',
+  }
   vi.mocked(getImageTasks).mockResolvedValue({
     items: [video],
     total: 1,
@@ -3652,9 +3662,52 @@ test('a 90-day file retention deadline survives browser timeout limits without p
   }
 })
 
-test.each([false, true])(
-  'video termination respects server permissions on expired tasks (mobile=%s)',
-  async (mobile) => {
+test.each([
+  {
+    mobile: false,
+    status: 'succeeded',
+    billing_status: 'settled',
+    result_expired: false,
+    can_terminate: true,
+  },
+  {
+    mobile: true,
+    status: 'succeeded',
+    billing_status: 'unknown',
+    result_expired: true,
+    can_terminate: true,
+  },
+  {
+    mobile: false,
+    status: 'failed',
+    billing_status: 'refunded',
+    result_expired: false,
+    can_terminate: true,
+  },
+  {
+    mobile: true,
+    status: 'failed',
+    billing_status: 'not_billable',
+    result_expired: false,
+    can_terminate: true,
+  },
+  {
+    mobile: false,
+    status: 'uploading',
+    billing_status: 'reserved',
+    result_expired: false,
+    can_terminate: false,
+  },
+  {
+    mobile: true,
+    status: 'upstream_succeeded',
+    billing_status: 'reserved',
+    result_expired: false,
+    can_terminate: false,
+  },
+])(
+  'completed or server-protected $status/$billing_status videos have no termination actions or batch selection (mobile=$mobile)',
+  async ({ mobile, status, billing_status, result_expired, can_terminate }) => {
     if (mobile) setMobileViewport()
     const user = userEvent.setup()
     const expired = {
@@ -3663,23 +3716,28 @@ test.each([false, true])(
       task_id: 'video_expired_unsuccessful',
       media_type: 'video' as const,
       status: 'expired',
-      billing_status: 'refunded',
+      billing_status: 'reserved',
       can_terminate: true,
     }
-    const successfulExpired = {
+    const completed = {
       ...expired,
-      id: 'video_successful_result_expired',
-      task_id: 'video_successful_result_expired',
-      status: 'succeeded',
-      result_expired: true,
-      billing_status: 'settled',
-      can_terminate: false,
+      id: 'video_completed_or_protected',
+      task_id: 'video_completed_or_protected',
+      status,
+      result_expired,
+      billing_status,
+      can_terminate,
     }
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [expired, successfulExpired],
+      items: [expired, completed],
       total: 2,
       pages: 1,
       stats: {},
+    })
+    vi.mocked(getImageTask).mockResolvedValue({
+      ...detail,
+      task: completed,
+      results: [],
     })
     mount(<ImageTaskCenter admin />)
     expect(
@@ -3689,7 +3747,7 @@ test.each([false, true])(
     ).not.toHaveAttribute('aria-disabled', 'true')
     expect(
       screen.getByRole('checkbox', {
-        name: `Select task ${successfulExpired.id}`,
+        name: `Select task ${completed.id}`,
       })
     ).toHaveAttribute('aria-disabled', 'true')
     expect(
@@ -3698,12 +3756,23 @@ test.each([false, true])(
     expect(
       screen.getByRole('button', { name: 'Terminate current page (1)' })
     ).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: completed.id }))
+    const details = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    expect(
+      within(details).queryByRole('button', { name: 'End task and refund' })
+    ).not.toBeInTheDocument()
+    await user.click(within(details).getByRole('button', { name: 'Close' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
     await user.click(
       screen.getByRole('checkbox', { name: 'Select current page' })
     )
     expect(
       screen.getByRole('checkbox', {
-        name: `Select task ${successfulExpired.id}`,
+        name: `Select task ${completed.id}`,
       })
     ).not.toBeChecked()
     await user.click(screen.getByRole('button', { name: 'Terminate selected' }))
@@ -4230,7 +4299,7 @@ test.each([
     )
     expect(confirmation).toHaveTextContent(
       videoOnly
-        ? 'refunds any remaining charge, including settled charges'
+        ? 'refunds its remaining charge'
         : 'releases any remaining reserved quota'
     )
     expect(imageRequest).not.toHaveBeenCalled()
@@ -4566,7 +4635,7 @@ test.each([false, true])(
       },
     })
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [{ ...task, media_type: 'video', status: 'succeeded' }],
+      items: [{ ...task, media_type: 'video', status: 'processing' }],
       total: 1,
       pages: 1,
       stats: {},

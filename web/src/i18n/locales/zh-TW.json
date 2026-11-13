@@ -7754,7 +7754,7 @@
     "Verify and Sign In": "驗證並登入",
     "Verify routing with Playground or your client": "使用 Playground 或你的用戶端驗證路由",
     "Verify Setup": "驗證設定",
-    "Verify the upstream task before continuing. This ends local processing and refunds any remaining charge, including settled charges. It does not cancel the upstream task. Already refunded amounts will not be refunded again.": "繼續前請核實上游任務。此操作會結束本機處理，退還尚未退回的費用（包括已結算費用），但不會取消上游任務。已退款金額不會重複退還。",
+    "Verify the upstream task before continuing. This ends the unfinished task locally and refunds its remaining charge. It does not cancel the upstream task. Already refunded amounts will not be refunded again.": "繼續前請核實上游任務。此操作會在本機結束未完成任務，並退還其尚未退回的費用，但不會取消上游任務。已退款金額不會重複退還。",
     "Verify the upstream task before continuing. This stops local processing and releases its reserved quota; it does not cancel the upstream task.": "請先核實上游任務狀態，再繼續操作。此操作僅終止本機處理並釋放預留額度，不會取消上游任務。",
     "Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.": "繼續前請核實上游任務。此操作會停止本地處理並釋放剩餘預留額度，但不會取消上游任務。",
     "Verify to view channel key": "驗證後查看渠道金鑰",

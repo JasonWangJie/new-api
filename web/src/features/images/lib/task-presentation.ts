@@ -63,9 +63,12 @@ export function imageTaskCanTerminate(
   task: ImageTask,
   now = Date.now() / 1000
 ): boolean {
+  if (!task.can_terminate) return false
+  if (task.media_type !== 'video') return !imageTaskResultExpired(task, now)
+  if (task.status === 'succeeded') return false
   return (
-    task.can_terminate &&
-    (task.media_type === 'video' || !imageTaskResultExpired(task, now))
+    task.status !== 'failed' ||
+    !['refunded', 'not_billable'].includes(task.billing_status)
   )
 }
 

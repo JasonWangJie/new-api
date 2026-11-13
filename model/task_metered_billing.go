@@ -153,9 +153,12 @@ func settleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			if terminatedJob.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
 				return errMeasuredTaskCASLost
 			}
+			if !terminatedJob.CanTerminateAsyncVideoTask(&current) {
+				return ErrImageConflict
+			}
 			if terminatedJob.AttemptGeneration != current.AttemptGeneration ||
 				terminatedJob.ChannelId != current.ChannelId || terminatedJob.TokenId != current.PrivateData.TokenId || !current.PrivateData.AsyncMedia ||
-				current.Quota > 0 && (!current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded) || terminatedJob.RefundLogPayload != "" {
+				current.Quota > 0 && (!current.PrivateData.DurableBilling || !current.PrivateData.SubmitAccountingRecorded || terminatedJob.VideoTaskRefundComplete(&current)) || terminatedJob.RefundLogPayload != "" {
 				return ErrTaskAttemptConflict
 			}
 			if current.AttemptGeneration == math.MaxInt64 {

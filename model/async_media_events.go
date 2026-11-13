@@ -78,6 +78,30 @@ func (job AsyncMediaJob) HasPendingSubmissionReconciliation() bool {
 	return job.Status == "execution_unknown" && job.DispatchedAt > 0 && job.BillingStatus == "unknown"
 }
 
+// VideoTaskRefundComplete also recognizes legacy failures whose refund cleared
+// the native charge before RefundedQuota existed. Explicit accounting failures
+// or uncertain reservations still need reconciliation unless a refund is known.
+func (job AsyncMediaJob) VideoTaskRefundComplete(task *Task) bool {
+	if job.BillingStatus == "refunded" || job.BillingStatus == "not_billable" {
+		return true
+	}
+	if task == nil || task.Status != TaskStatusFailure || task.Quota != 0 {
+		return false
+	}
+	return task.PrivateData.RefundedQuota != nil && *task.PrivateData.RefundedQuota >= 0 ||
+		!slices.Contains([]string{"unknown", "failed", "reserving"}, job.BillingStatus)
+}
+
+// CanTerminateAsyncVideoTask limits manual termination to unresolved work or
+// billing. A successful native task remains successful during output storage
+// and after retention expiry, regardless of a delayed job projection.
+func (job AsyncMediaJob) CanTerminateAsyncVideoTask(task *Task) bool {
+	if job.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage || job.Status == "succeeded" || task != nil && task.Status == TaskStatusSuccess {
+		return false
+	}
+	return (job.Status != "failed" && (task == nil || task.Status != TaskStatusFailure)) || !job.VideoTaskRefundComplete(task)
+}
+
 // TerminateAsyncMediaTask ends local execution and refunds the remaining charge.
 // The caller must enforce administrator permission and explicit confirmation;
 // this operation never claims to cancel the provider's independent task.
@@ -85,19 +109,19 @@ func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason stri
 	if job.ID <= 0 || job.TaskId == "" || job.UserId <= 0 || strings.TrimSpace(reason) == "" {
 		return ErrImageConflict
 	}
-	if err := ConfirmAsyncMediaRefundLog(ctx, job.TaskId); err != nil {
-		return err
-	}
 	var current AsyncMediaJob
 	if err := DB.WithContext(ctx).Where("id = ? AND task_id = ? AND user_id = ?", job.ID, job.TaskId, job.UserId).Take(&current).Error; err != nil {
 		return err
 	}
 	if current.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
-		return nil
+		return ConfirmAsyncMediaRefundLog(ctx, job.TaskId)
 	}
 	var task Task
 	err := DB.WithContext(ctx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
 	if err == nil {
+		if !current.CanTerminateAsyncVideoTask(&task) {
+			return ErrImageConflict
+		}
 		from := task.Status
 		task.Status, task.FailReason, task.Progress, task.FinishTime = TaskStatusFailure, reason, "100%", time.Now().Unix()
 		won, _, err := settleTaskBilling(ctx, &task, from, 0, nil, "", &asyncMediaTermination{job: current, other: other})
@@ -133,6 +157,9 @@ func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason stri
 		}
 		if current.ReferenceRecoveryStage == AsyncMediaAdminTerminatedStage {
 			return nil
+		}
+		if !current.CanTerminateAsyncVideoTask(nil) {
+			return ErrImageConflict
 		}
 		if current.Quota != 0 || !slices.Contains([]string{"pending", "not_billable", "refunded"}, current.BillingStatus) || current.AttemptGeneration == math.MaxInt64 {
 			return ErrTaskAttemptConflict

@@ -1295,7 +1295,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					expired                                                               bool
 					resultExpired                                                         bool
 					noTask, terminable                                                    bool
-					administratorTerminable                                               bool
+					administratorProtected                                                bool
 					output                                                                string
 				}{
 					{name: "local queue before submission", jobStatus: "queued", noTask: true, terminable: true, status: "queued", stage: "queued", progress: 0},
@@ -1308,29 +1308,29 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "missing upstream progress", taskStatus: model.TaskStatusInProgress, taskProgress: "30%", data: `{"status":"in_progress"}`, status: "invoking", stage: "generating", progress: 21},
 					{name: "invalid upstream progress", taskStatus: model.TaskStatusInProgress, taskProgress: "30%", data: `{"status":"in_progress","progress":101}`, status: "invoking", stage: "generating", progress: 21},
 					{name: "awaiting upstream billing", taskStatus: model.TaskStatusInProgress, taskProgress: "99%", data: `{"status":"completed","progress":100}`, status: "invoking", stage: "generating", progress: 69, upstreamProgress: float64(100)},
-					{name: "upstream completed", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
-					{name: "known completion supersedes unknown submission", jobStatus: "execution_unknown", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
-					{name: "completed awaiting storage", jobStatus: "succeeded", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100)},
+					{name: "upstream completed", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "known completion supersedes unknown submission", jobStatus: "execution_unknown", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "completed awaiting storage", jobStatus: "succeeded", taskStatus: model.TaskStatusSuccess, taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "upstream_succeeded", stage: "saving", progress: 70, upstreamProgress: float64(100), administratorProtected: true},
 					{name: "saving takes precedence", taskStatus: model.TaskStatusQueued, storage: "saving", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "uploading", stage: "saving", progress: 80, upstreamProgress: float64(0)},
 					{name: "storage failure takes precedence", taskStatus: model.TaskStatusQueued, storage: "failed", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "storage_failed", stage: "saving", progress: 80, upstreamProgress: float64(0)},
-					{name: "completed job takes precedence", taskStatus: model.TaskStatusQueued, jobStatus: "succeeded", storage: "upstream", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "succeeded", stage: "completed", progress: 100, upstreamProgress: float64(0)},
-					{name: "missing saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
-					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
-					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100)},
-					{name: "retained success remains successful after expiry", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "expired", jobBilling: "settled", billing: "settled", taskProgress: "100%", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "historical Drama success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "historical Sora success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "historical success derives settled cost from its native receipt", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "reserved", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "historical success with stale unknown billing keeps its settled cost", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "unknown", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "historical success cannot clear explicit billing failure", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "failed", billing: "failed", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "expired other provider cannot remain in the saving phase", taskStatus: model.TaskStatusSuccess, jobStatus: "submitted", provider: "sora", storage: "pending", billing: "settled", status: "expired", stage: "failed", progress: 100, expired: true},
-					{name: "completed job without native receipt remains successful", jobStatus: "succeeded", noTask: true, storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true},
-					{name: "native failure cannot become a success after file expiry", taskStatus: model.TaskStatusFailure, jobStatus: "succeeded", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true},
-					{name: "other provider expired native failure agrees with filters", taskStatus: model.TaskStatusFailure, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorTerminable: true},
-					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
-					{name: "expired Drama native failure remains failed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(100)},
-					{name: "historical Drama expired native failure remains failed", taskStatus: model.TaskStatusFailure, jobStatus: "expired", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorTerminable: true},
-					{name: "expired failed job without native task remains failed", noTask: true, jobStatus: "failed", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", expired: true},
+					{name: "completed job takes precedence", taskStatus: model.TaskStatusQueued, jobStatus: "succeeded", storage: "upstream", taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "succeeded", stage: "completed", progress: 100, upstreamProgress: float64(0), administratorProtected: true},
+					{name: "missing saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "expired saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "expired", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "foreign saved output", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "succeeded", output: "foreign", taskProgress: "100%", data: `{"status":"completed","progress":100}`, status: "succeeded", stage: "completed", progress: 100, resultExpired: true, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "retained success remains successful after expiry", taskStatus: model.TaskStatusSuccess, jobStatus: "succeeded", storage: "expired", jobBilling: "settled", billing: "settled", taskProgress: "100%", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "historical Drama success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "historical Sora success is recovered from native receipt", taskStatus: model.TaskStatusSuccess, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "historical success derives settled cost from its native receipt", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "reserved", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "historical success with stale unknown billing keeps its settled cost", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "unknown", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "historical success cannot clear explicit billing failure", taskStatus: model.TaskStatusSuccess, taskQuota: 240, jobStatus: "expired", storage: "expired", jobBilling: "failed", billing: "failed", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "expired other provider cannot remain in the saving phase", taskStatus: model.TaskStatusSuccess, jobStatus: "submitted", provider: "sora", storage: "pending", billing: "settled", status: "expired", stage: "failed", progress: 100, expired: true, administratorProtected: true},
+					{name: "completed job without native receipt remains successful", jobStatus: "succeeded", noTask: true, storage: "expired", jobBilling: "settled", billing: "settled", status: "succeeded", stage: "completed", progress: 100, expired: true, resultExpired: true, administratorProtected: true},
+					{name: "native failure cannot become a success after file expiry", taskStatus: model.TaskStatusFailure, jobStatus: "succeeded", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorProtected: true},
+					{name: "other provider expired native failure agrees with filters", taskStatus: model.TaskStatusFailure, jobStatus: "expired", provider: "sora", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorProtected: true},
+					{name: "failure takes precedence", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "expired Drama native failure remains failed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", data: `{"status":"failed","progress":100}`, billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(100), administratorProtected: true},
+					{name: "historical Drama expired native failure remains failed", taskStatus: model.TaskStatusFailure, jobStatus: "expired", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", progress: 100, expired: true, administratorProtected: true},
+					{name: "expired failed job without native task remains failed", noTask: true, jobStatus: "failed", storage: "expired", jobBilling: "refunded", billing: "refunded", status: "failed", stage: "failed", expired: true, administratorProtected: true},
 					{name: "failed task refund remains unconfirmed", taskStatus: model.TaskStatusFailure, taskProgress: "100%", taskQuota: 120, billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "zero task quota cannot clear known billing failure", taskStatus: model.TaskStatusFailure, taskProgress: "100%", jobBilling: "failed", billing: "failed", data: `{"status":"failed","progress":100}`, status: "failed", stage: "failed", progress: 10, upstreamProgress: float64(100)},
 					{name: "expiry takes precedence", taskStatus: model.TaskStatusQueued, taskProgress: "20%", data: `{"status":"queued","progress":0}`, status: "expired", stage: "failed", progress: 100, expired: true, upstreamProgress: float64(0)},
@@ -1407,7 +1407,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 								assert.Empty(t, view["data"], surface)
 							}
 							expectedStatus := tc.status
-							expectedTerminable := tc.terminable || surface == "administrator" && tc.administratorTerminable
+							expectedTerminable := tc.terminable
 							if tc.status == "execution_unknown" {
 								expectedStatus = "failed"
 								assert.Equal(t, "unknown", view["billing_status"], surface)
@@ -1437,7 +1437,10 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							} else {
 								assert.Equal(t, tc.upstreamProgress, view["upstream_progress"], surface)
 							}
-							assert.Equal(t, surface == "administrator" || expectedTerminable, view["can_terminate"], surface)
+							if surface == "administrator" {
+								expectedTerminable = !tc.administratorProtected
+							}
+							assert.Equal(t, expectedTerminable, view["can_terminate"], surface)
 						}
 						if tc.resultExpired {
 							recorder := httptest.NewRecorder()
@@ -2889,7 +2892,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					}
 				}
 			})
-			t.Run("expired videos can end while successful images remain protected", func(t *testing.T) {
+			t.Run("completed expired videos and successful images remain protected", func(t *testing.T) {
 				for _, item := range []struct {
 					name      string
 					video     bool
@@ -2953,21 +2956,16 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						}
 						assert.Equal(t, expectedStatus, view["status"])
 						assert.Equal(t, item.succeeded, view["result_expired"])
-						assert.Equal(t, true, view["can_terminate"])
+						assert.Equal(t, false, view["can_terminate"])
 						c.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.String(), strings.NewReader(`{"confirm_upstream_checked":true}`))
 						ManageMediaTask(c, true, "terminate")
 						var saved model.AsyncMediaJob
 						require.NoError(t, db.Where("id = ?", job.ID).Take(&saved).Error)
-						assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-						assert.Equal(t, "failed", saved.Status)
-						if item.succeeded {
-							assert.Equal(t, "not_billable", saved.BillingStatus)
-						} else {
-							assert.Equal(t, "refunded", saved.BillingStatus)
-						}
+						assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+						assert.Equal(t, job, saved)
 						var savedNative model.Task
 						require.NoError(t, db.Where("id = ?", native.ID).Take(&savedNative).Error)
-						assert.EqualValues(t, model.TaskStatusFailure, savedNative.Status)
+						assert.Equal(t, native, savedNative)
 					})
 				}
 			})
@@ -2994,7 +2992,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					})
 				}
 			})
-			t.Run("administrator terminates videos in every state", func(t *testing.T) {
+			t.Run("administrator terminates unresolved videos and protects completed tasks", func(t *testing.T) {
 				previousRedis, previousBatch, previousLog := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
 				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
 				t.Cleanup(func() {
@@ -3007,25 +3005,37 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					subscription, reset            bool
 					refundFailure, logFailure      bool
 					originalReservation            int
+					protected, refundMarker        bool
+					reconciliationConflict         bool
 				}{
 					{name: "queued", status: "queued", nativeStatus: model.TaskStatusQueued},
 					{name: "submitting with live lease", status: "submitting", nativeStatus: model.TaskStatusSubmitted, leased: true},
 					{name: "processing with live lease", status: "submitted", nativeStatus: model.TaskStatusInProgress, leased: true},
 					{name: "reconciling output", status: "reconciling", nativeStatus: model.TaskStatusInProgress, output: true},
 					{name: "unknown", status: "execution_unknown", nativeStatus: model.TaskStatusUnknown, billing: "unknown"},
-					{name: "saving", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "saving", output: true},
-					{name: "storage failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "failed", output: true},
-					{name: "billing failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, billing: "failed", output: true},
-					{name: "succeeded", status: "succeeded", nativeStatus: model.TaskStatusSuccess, storage: "upstream", billing: "settled", output: true},
-					{name: "succeeded after partial settlement", status: "succeeded", nativeStatus: model.TaskStatusSuccess, billing: "settled", output: true, originalReservation: 250},
-					{name: "expired success", status: "expired", nativeStatus: model.TaskStatusSuccess, storage: "expired", billing: "settled", output: true},
+					{name: "saving", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "saving", output: true, protected: true},
+					{name: "storage failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "failed", output: true, protected: true},
+					{name: "billing failed", status: "submitted", nativeStatus: model.TaskStatusSuccess, billing: "failed", output: true, protected: true},
+					{name: "succeeded", status: "succeeded", nativeStatus: model.TaskStatusSuccess, storage: "upstream", billing: "settled", output: true, protected: true},
+					{name: "succeeded after partial settlement", status: "succeeded", nativeStatus: model.TaskStatusSuccess, billing: "settled", output: true, originalReservation: 250, protected: true},
+					{name: "expired success", status: "expired", nativeStatus: model.TaskStatusSuccess, storage: "expired", billing: "settled", output: true, protected: true},
+					{name: "failed projection with native success", status: "failed", nativeStatus: model.TaskStatusSuccess, billing: "failed", output: true, protected: true},
+					{name: "success projection before native status", status: "succeeded", nativeStatus: model.TaskStatusInProgress, billing: "settled", output: true, protected: true},
 					{name: "expired pending", status: "expired", nativeStatus: model.TaskStatusUnknown, storage: "expired"},
 					{name: "failed charged", status: "failed", nativeStatus: model.TaskStatusFailure},
-					{name: "failed refunded", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "refunded", refunded: true},
-					{name: "subscription", status: "succeeded", nativeStatus: model.TaskStatusSuccess, subscription: true},
-					{name: "subscription reset", status: "succeeded", nativeStatus: model.TaskStatusSuccess, subscription: true, reset: true},
+					{name: "failed refunded", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "refunded", refunded: true, protected: true},
+					{name: "failed not billable", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "not_billable", refunded: true, protected: true},
+					{name: "refunded job with stale native quota", status: "failed", nativeStatus: model.TaskStatusInProgress, billing: "refunded", protected: true},
+					{name: "refunded active job with stale native quota", status: "submitted", nativeStatus: model.TaskStatusInProgress, billing: "refunded", reconciliationConflict: true},
+					{name: "not billable active job with stale native quota", status: "submitted", nativeStatus: model.TaskStatusInProgress, billing: "not_billable", reconciliationConflict: true},
+					{name: "refunded native with stale job status", status: "submitted", nativeStatus: model.TaskStatusFailure, billing: "reserved", refunded: true, refundMarker: true, protected: true},
+					{name: "legacy failed refund without marker", status: "submitted", nativeStatus: model.TaskStatusFailure, billing: "reserved", refunded: true, protected: true},
+					{name: "failed unknown zero quota", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "unknown", refunded: true},
+					{name: "failed accounting zero quota", status: "failed", nativeStatus: model.TaskStatusFailure, billing: "failed", refunded: true},
+					{name: "subscription", status: "submitted", nativeStatus: model.TaskStatusInProgress, subscription: true},
+					{name: "subscription reset", status: "submitted", nativeStatus: model.TaskStatusInProgress, subscription: true, reset: true},
 					{name: "refund rollback", status: "submitted", nativeStatus: model.TaskStatusInProgress, refundFailure: true},
-					{name: "refund log replay", status: "succeeded", nativeStatus: model.TaskStatusSuccess, logFailure: true},
+					{name: "refund log replay", status: "submitted", nativeStatus: model.TaskStatusInProgress, logFailure: true},
 				} {
 					t.Run(tc.name, func(t *testing.T) {
 						id := "all-state-" + strings.ReplaceAll(tc.name, " ", "-")
@@ -3070,9 +3080,41 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							native.PrivateData.ResultURL = "https://cdn.example/video.mp4"
 							native.PrivateData.MediaRetryFact = &mediaretry.Fact{HasOutput: true}
 						}
+						if tc.refundMarker {
+							native.PrivateData.RefundedQuota = common.GetPointer(100)
+						}
 						require.NoError(t, db.Create(&job).Error)
 						require.NoError(t, db.Create(&native).Error)
 						stale := native
+						if tc.protected || tc.reconciliationConflict {
+							recorder := httptest.NewRecorder()
+							c, _ := gin.CreateTestContext(recorder)
+							c.Params = gin.Params{{Key: "task_id", Value: id}}
+							c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{"confirm_upstream_checked":true}`))
+							view, _, err := videoJobView(c, job, true, true)
+							require.NoError(t, err)
+							assert.Equal(t, !tc.protected, view["can_terminate"])
+							ManageMediaTask(c, true, "terminate")
+							assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+							var after model.Task
+							var afterJob model.AsyncMediaJob
+							require.NoError(t, db.Take(&after, native.ID).Error)
+							require.NoError(t, db.Take(&afterJob, job.ID).Error)
+							assert.Equal(t, native, after, "completed task and its output must remain unchanged")
+							assert.Equal(t, job, afterJob, "completed task payloads and financial evidence must remain unchanged")
+							require.NoError(t, db.Take(&user, user.Id).Error)
+							require.NoError(t, db.Take(&token, token.Id).Error)
+							require.NoError(t, db.Take(&channel, channel.Id).Error)
+							assert.Equal(t, 1000-quota, user.Quota)
+							assert.Equal(t, quota, user.UsedQuota)
+							assert.Equal(t, 1000-quota, token.RemainQuota)
+							assert.Equal(t, quota, token.UsedQuota)
+							assert.EqualValues(t, quota, channel.UsedQuota)
+							var refunds int64
+							require.NoError(t, logDB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refunds).Error)
+							assert.Zero(t, refunds)
+							return
+						}
 						if tc.refundFailure {
 							require.NoError(t, db.Model(&token).Update("used_quota", 0).Error)
 							require.Error(t, service.TerminateAsyncMediaTask(t.Context(), job))
@@ -3103,7 +3145,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{"confirm_upstream_checked":true}`))
 							view, _, err := videoJobView(c, job, true, false)
 							require.NoError(t, err)
-							assert.Equal(t, true, view["can_terminate"])
+							assert.Equal(t, job.ReferenceRecoveryStage != model.AsyncMediaAdminTerminatedStage, view["can_terminate"])
 							ManageMediaTask(c, true, "terminate")
 							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 							require.NoError(t, db.Take(&job, job.ID).Error)
@@ -3114,7 +3156,11 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Empty(t, native.PrivateData.ResultURL)
 						assert.Greater(t, native.AttemptGeneration, stale.AttemptGeneration)
 						assert.Equal(t, "failed", job.Status)
-						assert.Equal(t, "refunded", job.BillingStatus)
+						expectedBilling := "refunded"
+						if quota == 0 {
+							expectedBilling = "not_billable"
+						}
+						assert.Equal(t, expectedBilling, job.BillingStatus)
 						assert.Zero(t, job.Quota)
 						assert.Empty(t, job.RequestCipher)
 						assert.Empty(t, job.ChannelCipher)
@@ -3152,6 +3198,82 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, err)
 						assert.False(t, won, "late worker cannot overwrite the administrator termination")
 						assert.ErrorIs(t, model.UpdateAsyncMediaJob(t.Context(), model.AsyncMediaJob{ID: job.ID, LeaseToken: "live-worker", AttemptGeneration: 1}, map[string]any{"status": "submitted"}), model.ErrImageConflict)
+					})
+				}
+			})
+			t.Run("completed videos without native tasks cannot be terminated", func(t *testing.T) {
+				for _, status := range []string{"succeeded", "failed"} {
+					id := "completed-orphan-" + status
+					billing := "settled"
+					if status == "failed" {
+						billing = "refunded"
+					}
+					job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: 101, TokenId: 201, Status: status, BillingStatus: billing, RequestCipher: []byte("preserved-payload"), CreatedAt: now, ExpiresAt: now + 3600}
+					require.NoError(t, db.Create(&job).Error)
+					view, _, err := videoJobView(taskSubmissionTestContext(), job, true, true)
+					require.NoError(t, err)
+					assert.Equal(t, false, view["can_terminate"])
+					assert.ErrorIs(t, service.TerminateAsyncMediaTask(t.Context(), job), model.ErrImageConflict)
+					var after model.AsyncMediaJob
+					require.NoError(t, db.Take(&after, job.ID).Error)
+					assert.Equal(t, job, after)
+				}
+			})
+			t.Run("video completion wins before termination acquires its locks", func(t *testing.T) {
+				for _, completed := range []string{"native", "job"} {
+					t.Run(completed, func(t *testing.T) {
+						id := "completion-before-termination-" + completed
+						user := model.User{Username: "complete-" + completed, AffCode: "complete-" + completed, Quota: 900, UsedQuota: 100, RequestCount: 1}
+						require.NoError(t, db.Create(&user).Error)
+						token := model.Token{UserId: user.Id, Key: id, RemainQuota: 900, UsedQuota: 100}
+						require.NoError(t, db.Create(&token).Error)
+						channel := model.Channel{Name: id, UsedQuota: 100}
+						require.NoError(t, db.Create(&channel).Error)
+						job := model.AsyncMediaJob{TaskId: id, IdentityHash: id, UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Status: "submitted", BillingStatus: "reserved", StorageStatus: "pending", Quota: 100, AttemptGeneration: 1, RequestCipher: []byte("preserved-request"), CreatedAt: now, ExpiresAt: now + 3600}
+						native := model.Task{TaskID: id, UserId: user.Id, ChannelId: channel.Id, Status: model.TaskStatusInProgress, Quota: 100, AttemptGeneration: 1, PrivateData: model.TaskPrivateData{AsyncMedia: true, TokenId: token.Id, DurableBilling: true, SubmitAccountingRecorded: true, BillingSource: "wallet"}}
+						require.NoError(t, db.Create(&job).Error)
+						require.NoError(t, db.Create(&native).Error)
+						view, _, err := videoJobView(taskSubmissionTestContext(), job, true, false)
+						require.NoError(t, err)
+						assert.Equal(t, true, view["can_terminate"])
+						reads := 0
+						var completionErr error
+						const callback = "test:video_completes_before_termination_lock"
+						require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+							if tx.Statement.Table != "tasks" {
+								return
+							}
+							reads++
+							if reads != 2 {
+								return
+							}
+							if completed == "native" {
+								completionErr = db.Model(&model.Task{}).Where("id = ?", native.ID).Updates(map[string]any{"status": model.TaskStatusSuccess, "private_data": model.TaskPrivateData{AsyncMedia: true, TokenId: token.Id, DurableBilling: true, SubmitAccountingRecorded: true, BillingSource: "wallet", ResultURL: "https://cdn.example/completed.mp4"}}).Error
+							} else {
+								completionErr = db.Model(&model.AsyncMediaJob{}).Where("id = ?", job.ID).Updates(map[string]any{"status": "succeeded", "billing_status": "settled"}).Error
+							}
+						}))
+						err = model.TerminateAsyncMediaTask(t.Context(), job, "Terminated by administrator", nil)
+						require.NoError(t, db.Callback().Query().Remove(callback))
+						require.NoError(t, completionErr)
+						require.Error(t, err)
+						require.NoError(t, db.Take(&native, native.ID).Error)
+						require.NoError(t, db.Take(&job, job.ID).Error)
+						assert.Equal(t, 100, native.Quota)
+						assert.EqualValues(t, 1, native.AttemptGeneration)
+						assert.EqualValues(t, 1, job.AttemptGeneration)
+						assert.NotEmpty(t, job.RequestCipher)
+						if completed == "native" {
+							assert.EqualValues(t, model.TaskStatusSuccess, native.Status)
+							assert.Equal(t, "https://cdn.example/completed.mp4", native.PrivateData.ResultURL)
+						} else {
+							assert.Equal(t, "succeeded", job.Status)
+						}
+						require.NoError(t, db.Take(&user, user.Id).Error)
+						assert.Equal(t, 900, user.Quota)
+						var refunds int64
+						require.NoError(t, logDB.Model(&model.Log{}).Where("user_id = ? AND type = ?", user.Id, model.LogTypeRefund).Count(&refunds).Error)
+						assert.Zero(t, refunds)
 					})
 				}
 			})
@@ -3323,7 +3445,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						require.NoError(t, err)
 						assert.Equal(t, "failed", view["status"])
 						assert.Equal(t, "refunded", view["billing_status"])
-						assert.Equal(t, true, view["can_terminate"])
+						assert.Equal(t, false, view["can_terminate"])
 					})
 				}
 			})

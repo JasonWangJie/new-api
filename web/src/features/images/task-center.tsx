@@ -686,7 +686,7 @@ function TaskCenterSession({
   if (operation?.confirmUpstreamChecked) {
     const terminationDescription = operation.checkExistingVideo
       ? t(
-          'Verify the upstream task before continuing. This ends local processing and refunds any remaining charge, including settled charges. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
+          'Verify the upstream task before continuing. This ends the unfinished task locally and refunds its remaining charge. It does not cancel the upstream task. Already refunded amounts will not be refunded again.'
         )
       : t(
           'Verify the upstream task before continuing. This stops local processing without cancelling the upstream task and releases any remaining reserved quota.'

@@ -237,11 +237,13 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 		}
 		if task.Status == model.TaskStatusFailure {
 			view["status"], view["stage"], view["error_message"] = "failed", "failed", service.VideoTaskFailureDiagnostic(&task)
-			if job.BillingStatus != "failed" {
-				view["billing_status"] = "failed"
-				if task.Quota == 0 {
-					view["billing_status"] = "refunded"
+			if job.VideoTaskRefundComplete(&task) {
+				view["billing_status"] = "refunded"
+				if job.BillingStatus == "not_billable" {
+					view["billing_status"] = "not_billable"
 				}
+			} else if !slices.Contains([]string{"unknown", "failed", "reserving"}, job.BillingStatus) {
+				view["billing_status"] = "failed"
 			}
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -345,7 +347,12 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	}
 	results := make([]gin.H, 0)
 	if admin {
-		view["can_terminate"], view["termination_requires_reconciliation"] = true, true
+		var native *model.Task
+		if err == nil {
+			native = &task
+		}
+		view["can_terminate"] = job.CanTerminateAsyncVideoTask(native)
+		view["termination_requires_reconciliation"] = view["can_terminate"]
 	}
 	if ownerErr != nil || resultExpired || err == nil && task.Status == model.TaskStatusFailure {
 		return view, results, nil
@@ -396,7 +403,7 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	if len(results) == 0 {
 		view["storage_status"] = "expired"
 		if succeeded {
-			view["result_expired"], view["can_resume"], view["can_terminate"] = true, false, admin
+			view["result_expired"], view["can_resume"], view["can_terminate"] = true, false, false
 		} else {
 			view["status"], view["stage"] = "expired", "failed"
 		}
@@ -802,7 +809,11 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			return
 		}
 		if err := service.TerminateAsyncMediaTask(c.Request.Context(), job); err != nil {
-			imageManagementError(c, http.StatusConflict, errors.New("Media task refund requires reconciliation; retry after checking its billing"))
+			message := "Media task refund requires reconciliation; retry after checking its billing"
+			if errors.Is(err, model.ErrImageConflict) {
+				message = "Media task cannot be changed in its current phase"
+			}
+			imageManagementError(c, http.StatusConflict, errors.New(message))
 			return
 		}
 		imageManagementData(c, gin.H{"task_id": job.TaskId})
