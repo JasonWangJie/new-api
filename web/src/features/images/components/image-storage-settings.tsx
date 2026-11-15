@@ -50,6 +50,7 @@ const storageSchema = z
     provider: z.string().min(1),
     root: z.string().max(4096),
     endpoint: z.string().max(2048),
+    public_base_url: z.string().trim().max(2048),
     bucket: z.string().max(255),
     region: z.string().max(128),
     prefix: z.string().max(1024),
@@ -58,6 +59,34 @@ const storageSchema = z
     secret_key: z.string().max(4096),
   })
   .superRefine((value, context) => {
+    if (
+      value.provider !== 'local' &&
+      (value.provider === 'r2' || value.public_base_url)
+    ) {
+      let valid = false
+      try {
+        const address = new URL(value.public_base_url)
+        valid =
+          address.protocol === 'https:' &&
+          !!address.hostname &&
+          !address.username &&
+          !address.password &&
+          !value.public_base_url.includes('?') &&
+          !value.public_base_url.includes('#') &&
+          address.hostname !== 'r2.cloudflarestorage.com' &&
+          !address.hostname.endsWith('.r2.cloudflarestorage.com')
+      } catch {
+        valid = false
+      }
+      if (!valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['public_base_url'],
+          message:
+            'Enter a public HTTPS domain without credentials, query parameters or fragments. Do not use the R2 S3 endpoint.',
+        })
+      }
+    }
     if (value.provider !== 'local' && !value.bucket.trim()) {
       context.addIssue({
         code: 'custom',
@@ -80,6 +109,7 @@ const emptyStorage: StorageValues = {
   provider: 'local',
   root: '',
   endpoint: '',
+  public_base_url: '',
   bucket: '',
   region: 'us-east-1',
   prefix: '',
@@ -97,7 +127,7 @@ export function ImageStorageForm(props: {
   const canManage = hasPermission(user, 'image_config', 'manage')
   const [editing, setEditing] = useState<ImageStorageProfile | null>(null)
   const [action, setAction] = useState<{
-    kind: 'activate' | 'credentials'
+    kind: 'activate' | 'credentials' | 'delete'
     profile: ImageStorageProfile
   } | null>(null)
   const [error, setError] = useState('')
@@ -125,6 +155,10 @@ export function ImageStorageForm(props: {
               ...values,
               profile_id: editing?.profile_id || '',
               backend: values.provider === 'local' ? 'local' : 's3',
+              public_base_url:
+                values.provider === 'local'
+                  ? ''
+                  : values.public_base_url.trim(),
               active: editing?.active ?? false,
             },
             ...(access_key && secret_key
@@ -163,8 +197,8 @@ export function ImageStorageForm(props: {
       const { access_key, secret_key } = form.getValues()
       try {
         return await imageRequest(
-          `/api/option/images/storage/${encodeURIComponent(action.profile.profile_id)}/${action.kind}`,
-          'POST',
+          `/api/option/images/storage/${encodeURIComponent(action.profile.profile_id)}${action.kind === 'delete' ? '' : `/${action.kind}`}`,
+          action.kind === 'delete' ? 'DELETE' : 'POST',
           {
             revision: props.config.storage_revision ?? 0,
             ...(action.kind === 'credentials'
@@ -175,18 +209,29 @@ export function ImageStorageForm(props: {
       } catch (cause) {
         const status = getServerErrorStatus(cause)
         throw Object.assign(
-          new Error(getServerErrorMessage(cause)),
+          new Error(t(getServerErrorMessage(cause))),
           status ? { isAxiosError: true, response: { status } } : {}
         )
       }
     },
     onSuccess: async () => {
+      if (
+        action?.kind === 'delete' &&
+        editing &&
+        (editing.channel_id || editing.profile_id) ===
+          (action.profile.channel_id || action.profile.profile_id)
+      ) {
+        setEditing(null)
+        form.reset(emptyStorage)
+      }
       setAction(null)
       form.setValue('access_key', '')
       form.setValue('secret_key', '')
       setError('')
       await props.onSuccess()
-      toast.success(t('Saved'))
+      toast.success(
+        t(action?.kind === 'delete' ? 'Storage channel removed' : 'Saved')
+      )
     },
     onError: (cause) => {
       setError(
@@ -207,6 +252,12 @@ export function ImageStorageForm(props: {
     onError: (cause) => handleServerError(cause),
   })
   const busy = save.isPending || operation.isPending || test.isPending
+  let formError = 'Check this value.'
+  if (form.formState.errors.public_base_url?.message) {
+    formError = form.formState.errors.public_base_url.message
+  } else if (form.formState.errors.secret_key?.message) {
+    formError = form.formState.errors.secret_key.message
+  }
   let actionTitle = 'Enable channel'
   let actionDescription =
     'This channel will replace the current writer for the same purpose. Existing files will stay in their original storage.'
@@ -214,6 +265,11 @@ export function ImageStorageForm(props: {
     actionTitle = 'Rotate channel credentials'
     actionDescription =
       'The new credentials will update historical revisions at this storage location. Other endpoints and buckets keep their credentials.'
+  }
+  if (action?.kind === 'delete') {
+    actionTitle = 'Delete storage channel'
+    actionDescription =
+      'Remove this inactive channel from the storage list? Historical configuration and existing images are kept. Uploads already in progress can finish.'
   }
   return (
     <SettingsCard
@@ -344,6 +400,24 @@ export function ImageStorageForm(props: {
                     >
                       {t('Test storage')}
                     </Button>
+                    <Button
+                      size='sm'
+                      variant='destructive'
+                      disabled={busy || item.active}
+                      title={
+                        item.active
+                          ? t(
+                              'Active storage channels cannot be deleted. Enable another channel for the same purpose first.'
+                            )
+                          : undefined
+                      }
+                      onClick={() => {
+                        setError('')
+                        setAction({ kind: 'delete', profile: item })
+                      }}
+                    >
+                      {t('Delete storage channel')}
+                    </Button>
                   </div>
                 ),
             },
@@ -432,6 +506,31 @@ export function ImageStorageForm(props: {
             </div>
             {provider !== 'local' && (
               <div className='space-y-3'>
+                <div className='space-y-2'>
+                  <Label
+                    htmlFor='storage-public-base-url'
+                    required={provider === 'r2'}
+                  >
+                    {t('Public access domain')}
+                  </Label>
+                  <Input
+                    id='storage-public-base-url'
+                    placeholder='https://images.example.com'
+                    {...form.register('public_base_url')}
+                    disabled={busy}
+                    aria-required={provider === 'r2'}
+                    aria-invalid={!!form.formState.errors.public_base_url}
+                    aria-describedby='storage-public-base-url-help'
+                  />
+                  <p
+                    id='storage-public-base-url-help'
+                    className='text-muted-foreground text-sm'
+                  >
+                    {t(
+                      'R2 requires a public bucket domain, such as a custom domain or r2.dev address. S3 domains are optional. Image results use this domain without signatures; leave it empty to use this site.'
+                    )}
+                  </p>
+                </div>
                 {editing?.credential_configured && (
                   <p className='text-muted-foreground text-sm'>
                     {t(
@@ -473,12 +572,7 @@ export function ImageStorageForm(props: {
             )}
             {Object.keys(form.formState.errors).length > 0 && (
               <p role='alert' className='text-destructive text-sm'>
-                {t(
-                  form.formState.errors.secret_key?.message ===
-                    'Enter both storage credentials.'
-                    ? 'Enter both storage credentials.'
-                    : 'Check this value.'
-                )}
+                {t(formError)}
               </p>
             )}
             <div className='flex flex-wrap gap-2'>
@@ -542,6 +636,7 @@ export function ImageStorageForm(props: {
           </div>
         }
         isLoading={operation.isPending}
+        destructive={action?.kind === 'delete'}
         handleConfirm={() => operation.mutate()}
       />
     </SettingsCard>

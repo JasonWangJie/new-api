@@ -81,6 +81,11 @@ export function AsyncImageGuide() {
               </p>
               <p className='text-muted-foreground mt-3 text-sm'>
                 {t(
+                  "R2 image results use unsigned URLs on the public storage domain. Local storage returns this site's file URLs. Public links remain readable until the stored object is deleted and any cached copies expire."
+                )}
+              </p>
+              <p className='text-muted-foreground mt-3 text-sm'>
+                {t(
                   'Image result links may use an external image host. Follow each returned URL without assuming the gateway hostname.'
                 )}
               </p>

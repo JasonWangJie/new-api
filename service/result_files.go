@@ -51,6 +51,9 @@ func ImageResultFileURL(ctx context.Context, object model.ImageStorageObject, ba
 	if link := ImageResultDeliveryURL(object); link != "" {
 		return link, nil
 	}
+	if link, err := ImageResultStorageURL(ctx, object); err != nil || link != "" {
+		return link, err
+	}
 	return storedResultFileURL(ctx, &model.ImageStorageObject{}, object.ObjectId, object.ResultFileId, "img_", object.ContentType, base, now)
 }
 

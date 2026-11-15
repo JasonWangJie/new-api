@@ -248,6 +248,7 @@ type ImageStorageProfile struct {
 	Provider             string `json:"provider" gorm:"size:32"`
 	Root                 string `json:"root" gorm:"type:text"`
 	Endpoint             string `json:"endpoint" gorm:"type:text"`
+	PublicBaseURL        string `json:"public_base_url" gorm:"type:text"`
 	Region               string `json:"region" gorm:"size:64"`
 	Bucket               string `json:"bucket" gorm:"size:255"`
 	Prefix               string `json:"prefix" gorm:"size:255"`

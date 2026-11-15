@@ -19,6 +19,28 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
+import type { ImageStorageProfile } from '../types'
+
+export function imageCleanupChannelOptions(profiles: ImageStorageProfile[]) {
+  const channels = new Map<string, ImageStorageProfile>()
+  // Snapshots are newest first; removed channels still need cleanup access.
+  for (const profile of profiles) {
+    const channelID = profile.channel_id || profile.profile_id
+    const selected = channels.get(channelID)
+    if (
+      !selected ||
+      (selected.current_revision === false &&
+        profile.current_revision !== false)
+    ) {
+      channels.set(channelID, profile)
+    }
+  }
+  return Array.from(channels, ([value, profile]) => ({
+    value,
+    label: profile.name || value,
+  }))
+}
+
 export const cleanupPolicySchema = z
   .object({
     id: z.string().min(1),

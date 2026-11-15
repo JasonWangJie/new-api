@@ -89,26 +89,28 @@ func TestImageStorageChannelCompatibility(t *testing.T) {
 	current, err := service.GetImageStorage(t.Context(), "temporary")
 	require.NoError(t, err)
 	assert.Equal(t, legacy.ProfileId, current.Profile.ProfileId)
-	request := func(path string, input any) *httptest.ResponseRecorder {
+	request := func(method, path string, input any) *httptest.ResponseRecorder {
 		encoded, err := common.Marshal(input)
 		require.NoError(t, err)
 		router := gin.New()
 		router.POST("/storage/:profile_id/activate", func(c *gin.Context) { SetImageStorageActive(c, true) })
 		router.POST("/storage/:profile_id/deactivate", func(c *gin.Context) { SetImageStorageActive(c, false) })
 		router.POST("/storage/:profile_id/credentials", RotateImageStorageCredentials)
+		router.PUT("/storage/:profile_id", UpdateImageStorage)
+		router.DELETE("/storage/:profile_id", DeleteImageStorage)
 		recorder := httptest.NewRecorder()
-		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded)))
+		router.ServeHTTP(recorder, httptest.NewRequest(method, path, bytes.NewReader(encoded)))
 		return recorder
 	}
-	assert.Equal(t, http.StatusPreconditionRequired, request("/storage/"+created.ProfileId+"/activate", gin.H{}).Code)
-	response := request("/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision})
+	assert.Equal(t, http.StatusPreconditionRequired, request(http.MethodPost, "/storage/"+created.ProfileId+"/activate", gin.H{}).Code)
+	response := request(http.MethodPost, "/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision})
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
-	assert.Equal(t, http.StatusConflict, request("/storage/"+legacy.ProfileId+"/activate", gin.H{"revision": revision}).Code)
+	assert.Equal(t, http.StatusConflict, request(http.MethodPost, "/storage/"+legacy.ProfileId+"/activate", gin.H{"revision": revision}).Code)
 	revision++
 	current, err = service.GetImageStorage(t.Context(), "temporary")
 	require.NoError(t, err)
 	assert.Equal(t, created.ProfileId, current.Profile.ProfileId)
-	assert.Equal(t, http.StatusBadRequest, request("/storage/"+created.ProfileId+"/deactivate", gin.H{"revision": revision}).Code, "the only active storage must remain available")
+	assert.Equal(t, http.StatusBadRequest, request(http.MethodPost, "/storage/"+created.ProfileId+"/deactivate", gin.H{"revision": revision}).Code, "the only active storage must remain available")
 	created.Name = "Edited channel"
 	edited, revision, err := service.SaveImageStorageChannel(t.Context(), created, nil, created.ProfileId, &revision)
 	require.NoError(t, err)
@@ -119,16 +121,21 @@ func TestImageStorageChannelCompatibility(t *testing.T) {
 	require.NoError(t, db.Where("profile_id = ?", created.ProfileId).Take(&previous).Error)
 	assert.False(t, previous.CurrentRevision)
 	assert.False(t, previous.Active)
-	assert.Equal(t, http.StatusConflict, request("/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision}).Code)
+	assert.Equal(t, http.StatusConflict, request(http.MethodPost, "/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision}).Code)
 	data, err = store.Read(t.Context(), "old.png", 100)
 	require.NoError(t, err)
 	assert.Equal(t, "old-bytes", string(data), "activation must not relocate old objects")
 
 	credentials := &service.ImageStorageCredentials{AccessKey: "test-access", SecretKey: "test-secret"}
-	r2, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "R2", Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "images"}, credentials, "", &revision)
+	for _, publicBase := range []string{"", "http://images.example.com", "https://user:password@images.example.com", "https://images.example.com?token=secret", "https://images.example.com#fragment", "https://account.r2.cloudflarestorage.com"} {
+		_, _, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", PublicBaseURL: publicBase, Bucket: "images"}, credentials, "", &revision)
+		require.Error(t, err, "R2 must use a public HTTPS domain without credentials or signatures")
+	}
+	r2, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "R2", Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", PublicBaseURL: "https://images.example.com", Bucket: "images"}, credentials, "", &revision)
 	require.NoError(t, err)
 	assert.Equal(t, "auto", r2.Region)
 	r2.Name = "R2 renamed"
+	r2.PublicBaseURL = " https://cdn.example.com/assets/ "
 	r2new, revision, err := service.SaveImageStorageChannel(t.Context(), r2, &service.ImageStorageCredentials{}, r2.ProfileId, &revision)
 	require.NoError(t, err)
 	for _, profile := range []model.ImageStorageProfile{r2, r2new} {
@@ -142,17 +149,143 @@ func TestImageStorageChannelCompatibility(t *testing.T) {
 	changedEndpoint.Endpoint = "https://different.example.test"
 	_, _, err = service.SaveImageStorageChannel(t.Context(), changedEndpoint, nil, r2new.ProfileId, &revision)
 	require.Error(t, err)
-	rotation := request("/storage/"+r2new.ProfileId+"/credentials", gin.H{"revision": revision, "credentials": service.ImageStorageCredentials{AccessKey: "rotated-access", SecretKey: "rotated-secret"}})
+	rotation := request(http.MethodPost, "/storage/"+r2new.ProfileId+"/credentials", gin.H{"revision": revision, "credentials": service.ImageStorageCredentials{AccessKey: "rotated-access", SecretKey: "rotated-secret"}})
 	require.Equal(t, http.StatusOK, rotation.Code, rotation.Body.String())
 	assert.NotContains(t, rotation.Body.String(), "rotated-secret")
 	profiles, err := model.ImageStorageChannelProfiles(t.Context(), r2.ChannelId)
 	require.NoError(t, err)
 	require.Len(t, profiles, 2)
 	for _, profile := range profiles {
+		assert.Equal(t, "https://cdn.example.com/assets", profile.PublicBaseURL, "editing a public domain also updates retained revisions at the same bucket")
 		payload, err := service.DecryptImagePayload(profile.CredentialCipher, "storage:"+profile.ProfileId)
 		require.NoError(t, err)
 		assert.Contains(t, string(payload), "rotated-secret")
 	}
+
+	t.Run("channel removal preserves historical bytes credentials and pending uploads", func(t *testing.T) {
+		require.NoError(t, db.AutoMigrate(&model.ImageStorageObject{}, &model.ImageUploadIntent{}))
+		beforeRevision, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		active, err := service.GetImageStorage(t.Context(), "temporary")
+		require.NoError(t, err)
+		activePath := "/storage/" + active.Profile.ProfileId
+		assert.Equal(t, http.StatusPreconditionRequired, request(http.MethodDelete, activePath, gin.H{}).Code)
+		rejected := request(http.MethodDelete, activePath, gin.H{"revision": beforeRevision})
+		require.Equal(t, http.StatusConflict, rejected.Code)
+		assert.Contains(t, rejected.Body.String(), "Active storage channels cannot be deleted. Enable another channel for the same purpose first.")
+		afterRejection, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, beforeRevision, afterRejection)
+		inactive, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "Removed channel", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir()}, nil, "", &beforeRevision)
+		require.NoError(t, err)
+		var encoded bytes.Buffer
+		require.NoError(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+		bitmap, err := service.ValidateImageBytes(encoded.Bytes(), "image/png", 1024, 10)
+		require.NoError(t, err)
+		now := time.Now().Unix()
+		intent := model.ImageUploadIntent{IntentKey: "removed-channel-existing", ProfileId: inactive.ProfileId, ObjectKey: "existing.png", Class: "temporary", ContentType: bitmap.ContentType, Checksum: bitmap.Checksum, ByteSize: int64(len(bitmap.Data)), Status: "pending", CreatedAt: now}
+		object, err := service.StoreImageIntent(t.Context(), intent, bitmap, now+3600)
+		require.NoError(t, err)
+		pending := intent
+		pending.IntentKey, pending.ObjectKey = "removed-channel-pending", "pending.png"
+		require.NoError(t, db.Create(&pending).Error)
+		path := "/storage/" + inactive.ProfileId
+		assert.Equal(t, http.StatusConflict, request(http.MethodDelete, path, gin.H{"revision": revision - 1}).Code)
+		removed := request(http.MethodDelete, path, gin.H{"revision": revision})
+		require.Equal(t, http.StatusOK, removed.Code, removed.Body.String())
+		var response struct {
+			Data struct {
+				Revision int64 `json:"storage_revision"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(removed.Body.Bytes(), &response))
+		revision++
+		assert.Equal(t, revision, response.Data.Revision)
+		for _, operation := range []struct {
+			method, path string
+			body         any
+		}{
+			{http.MethodDelete, path, gin.H{"revision": revision}},
+			{http.MethodPost, path + "/activate", gin.H{"revision": revision}},
+			{http.MethodPut, path, gin.H{"revision": revision, "profile": inactive}},
+		} {
+			assert.Equal(t, http.StatusConflict, request(operation.method, operation.path, operation.body).Code, "removed revisions cannot be restored by an old request")
+		}
+		for range 2 {
+			require.NoError(t, model.MigrateImageStorageChannels(db))
+		}
+		snapshot, currentRevision, err := model.GetImageStorageChannelSnapshot(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, revision, currentRevision)
+		index := slices.IndexFunc(snapshot, func(profile model.ImageStorageProfile) bool { return profile.ProfileId == inactive.ProfileId })
+		require.NotEqual(t, -1, index, "historical storage remains addressable")
+		assert.False(t, snapshot[index].CurrentRevision)
+		assert.False(t, snapshot[index].Active)
+		assert.Equal(t, inactive.Root, snapshot[index].Root)
+		assert.Equal(t, inactive.Namespace, snapshot[index].Namespace)
+		reopened, err := service.GetImageObjectStorage(t.Context(), object)
+		require.NoError(t, err)
+		data, err := reopened.Read(t.Context(), object.ObjectKey, 1024)
+		require.NoError(t, err)
+		assert.Equal(t, bitmap.Data, data)
+		reused, err := service.StoreImageIntent(t.Context(), intent, bitmap, now+3600)
+		require.NoError(t, err)
+		assert.Equal(t, object.ObjectId, reused.ObjectId)
+		finished, err := service.StoreImageIntent(t.Context(), pending, bitmap, now+3600)
+		require.NoError(t, err, "an upload reserved before removal must still finish at its original location")
+		assert.Equal(t, inactive.ProfileId, finished.ProfileId)
+		historical, err := model.ImageStorageChannelProfiles(t.Context(), inactive.ChannelId)
+		require.NoError(t, err)
+		require.Len(t, historical, 1, "cleanup policies can still resolve removed channel revisions")
+		var savedR2 model.ImageStorageProfile
+		require.NoError(t, db.Where("profile_id = ?", r2new.ProfileId).Take(&savedR2).Error)
+		r2Cipher := append([]byte(nil), savedR2.CredentialCipher...)
+		removed = request(http.MethodDelete, "/storage/"+r2new.ProfileId, gin.H{"revision": revision})
+		require.Equal(t, http.StatusOK, removed.Code, removed.Body.String())
+		require.NoError(t, db.Where("profile_id = ?", r2new.ProfileId).Take(&savedR2).Error)
+		assert.Equal(t, r2Cipher, savedR2.CredentialCipher)
+		assert.False(t, savedR2.CurrentRevision)
+		_, err = service.OpenImageStorage(t.Context(), savedR2)
+		require.NoError(t, err, "removal does not revoke credentials needed by retained images")
+	})
+	t.Run("activation and removal share one revision winner", func(t *testing.T) {
+		revision, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		profile, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "Race channel", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir()}, nil, "", &revision)
+		require.NoError(t, err)
+		body, err := common.Marshal(gin.H{"revision": revision})
+		require.NoError(t, err)
+		router := gin.New()
+		router.POST("/storage/:profile_id/activate", func(c *gin.Context) { SetImageStorageActive(c, true) })
+		router.DELETE("/storage/:profile_id", DeleteImageStorage)
+		start := make(chan struct{})
+		results := make(chan *httptest.ResponseRecorder, 2)
+		var workers sync.WaitGroup
+		for _, operation := range []struct{ method, suffix string }{{http.MethodPost, "/activate"}, {http.MethodDelete, ""}} {
+			workers.Go(func() {
+				<-start
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest(operation.method, "/storage/"+profile.ProfileId+operation.suffix, bytes.NewReader(body)))
+				results <- recorder
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		statuses := make([]int, 0, 2)
+		for result := range results {
+			statuses = append(statuses, result.Code)
+		}
+		assert.ElementsMatch(t, []int{http.StatusOK, http.StatusConflict}, statuses)
+		currentRevision, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, revision+1, currentRevision)
+		require.NoError(t, db.Where("profile_id = ?", profile.ProfileId).Take(&profile).Error)
+		assert.Equal(t, profile.Active, profile.CurrentRevision, "the result is either active/current or inactive/removed")
+		var active int64
+		require.NoError(t, db.Model(&model.ImageStorageProfile{}).Where("class = ? AND active = ?", "temporary", true).Count(&active).Error)
+		assert.EqualValues(t, 1, active)
+	})
 
 	t.Run("concurrent activation has one revision winner", func(t *testing.T) {
 		revision, err := model.GetImageStorageRevision(t.Context())

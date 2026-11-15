@@ -142,6 +142,9 @@ test('output options state model scope and frame bounds without adding format-sp
     screen.getByText(/Image result links may use an external image host/)
   ).toBeVisible()
   expect(
+    screen.getByText(/R2 image results use unsigned URLs/)
+  ).toHaveTextContent("Local storage returns this site's file URLs")
+  expect(
     screen.getByText(/selected independently for each image/)
   ).toHaveTextContent('allow redirects')
   expect(

@@ -15,10 +15,32 @@ func imageStorageWriteError(c *gin.Context, err error) {
 	status, message := http.StatusBadRequest, "Image storage configuration is invalid or unavailable"
 	if errors.Is(err, model.ErrOptionRevisionConflict) {
 		status, message = http.StatusConflict, err.Error()
+	} else if errors.Is(err, model.ErrActiveImageStorageChannel) {
+		status, message = http.StatusConflict, model.ErrActiveImageStorageChannel.Error()
 	} else if errors.Is(err, gorm.ErrRecordNotFound) {
 		status, message = http.StatusNotFound, "Image storage profile was not found"
 	}
 	imageManagementError(c, status, errors.New(message))
+}
+
+func DeleteImageStorage(c *gin.Context) {
+	var input struct {
+		Revision *int64 `json:"revision"`
+	}
+	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 4096), &input); err != nil {
+		imageStorageWriteError(c, err)
+		return
+	}
+	if input.Revision == nil {
+		imageManagementError(c, http.StatusPreconditionRequired, errors.New("Configuration revision is required. Reload it before saving"))
+		return
+	}
+	revision, err := model.RemoveImageStorageChannel(c.Request.Context(), c.Param("profile_id"), *input.Revision)
+	if err != nil {
+		imageStorageWriteError(c, err)
+		return
+	}
+	imageManagementData(c, gin.H{"storage_revision": revision})
 }
 
 func UpdateImageStorage(c *gin.Context) {
@@ -67,6 +89,12 @@ func SetImageStorageActive(c *gin.Context, active bool) {
 			return errors.New("enable another storage channel before disabling the current channel")
 		}
 		if active {
+			if err := service.ValidateImageStoragePublicBaseURL(profile.PublicBaseURL); err != nil {
+				return err
+			}
+			if profile.Provider == "r2" && profile.PublicBaseURL == "" {
+				return errors.New("R2 storage requires a public access domain")
+			}
 			if _, err := service.OpenImageStorage(c.Request.Context(), profile); err != nil {
 				return err
 			}

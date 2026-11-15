@@ -389,6 +389,7 @@ export type ImageStorageProfile = {
   provider: string
   root: string
   endpoint: string
+  public_base_url?: string
   bucket: string
   region: string
   prefix: string

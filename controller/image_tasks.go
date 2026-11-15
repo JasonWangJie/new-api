@@ -539,7 +539,7 @@ func GetImageTask(c *gin.Context, admin bool) {
 			if managed {
 				item["url"], item["authenticated"] = view, true
 			} else if link, err := service.ImageResultFileURL(c.Request.Context(), object, AsyncImageGatewayBase()); err == nil {
-				item["url"] = link
+				item["url"], item["view_url"] = link, link
 			}
 			results = append(results, item)
 		}

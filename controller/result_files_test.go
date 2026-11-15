@@ -282,6 +282,65 @@ func TestStoredResultFileImageDetails(t *testing.T) {
 	}
 }
 
+func TestStoredResultFilePublicStorageURL(t *testing.T) {
+	for _, provider := range []string{"r2", "custom_s3"} {
+		t.Run(provider, func(t *testing.T) {
+			f, token := newStoredResultFixture(t)
+			require.NoError(t, f.db.AutoMigrate(&model.Channel{}))
+			var getMode atomic.Int32
+			profile, reads := storedResultS3Profile(t, f, &getMode)
+			profile.Provider, profile.Prefix, profile.Namespace = provider, "media files", "revision-A"
+			require.NoError(t, f.db.Save(&profile).Error)
+			task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: f.user.Id, TokenId: token.Id, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ResultCount: 1, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
+			require.NoError(t, f.db.Create(&task).Error)
+			var data bytes.Buffer
+			require.NoError(t, png.Encode(&data, image.NewRGBA(image.Rect(0, 0, 2, 2))))
+			object := storedResultImage(t, profile, task, 0, "image/png", data.Bytes())
+			require.NoError(t, f.db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ObjectId: object.ObjectId}).Error)
+			oldLinks := queryStoredResultFiles(t, f, "/v1/images/tasks_async/"+task.TaskId, token)
+			require.Len(t, oldLinks, 1)
+			require.Contains(t, oldLinks[0], storedResultTestPath)
+			require.NoError(t, f.db.Model(&profile).Update("public_base_url", "https://cdn.example.com/assets/").Error)
+			expected := "https://cdn.example.com/assets/media%20files/revision-A/" + object.ObjectKey
+			readsBefore := reads.Load()
+			for _, query := range []string{"/v1/images/tasks_async/", "/v1/media/tasks_async/"} {
+				assert.Equal(t, []string{expected}, queryStoredResultFiles(t, f, query+task.TaskId, token))
+			}
+			for _, admin := range []bool{false, true} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", task.UserId)
+				c.Params = gin.Params{{Key: "task_id", Value: task.TaskId}}
+				c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+				GetMediaTask(c, admin)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var response struct {
+					Data struct {
+						Results []struct {
+							URL     string `json:"url"`
+							ViewURL string `json:"view_url"`
+						} `json:"results"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				require.Len(t, response.Data.Results, 1)
+				assert.Equal(t, expected, response.Data.Results[0].URL)
+				assert.Equal(t, expected, response.Data.Results[0].ViewURL)
+			}
+			redirect := f.request(http.MethodGet, oldLinks[0], "", "", "", "")
+			require.Equal(t, http.StatusTemporaryRedirect, redirect.Code)
+			assert.Equal(t, expected, redirect.Header().Get("Location"))
+			assert.Equal(t, readsBefore, reads.Load(), "returning a public storage link must not download or proxy the object")
+			// Activating local storage affects new uploads, not the location of existing results.
+			require.NoError(t, f.db.Model(&profile).Update("active", false).Error)
+			require.NoError(t, f.db.Create(&model.ImageStorageProfile{ProfileId: "new-local", Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}).Error)
+			assert.Equal(t, []string{expected}, queryStoredResultFiles(t, f, "/v1/images/tasks_async/"+task.TaskId, token))
+			require.NoError(t, f.db.Model(&object).Update("expires_at", time.Now().Unix()-1).Error)
+			assert.Equal(t, http.StatusNotFound, f.request(http.MethodGet, oldLinks[0], "", "", "", "").Code)
+		})
+	}
+}
+
 func TestStoredResultFileImageLifecycle(t *testing.T) {
 	f, token := newStoredResultFixture(t)
 	gateway := httptest.NewServer(f.router)
@@ -592,6 +651,7 @@ func TestStoredResultFileVideoLifecycle(t *testing.T) {
 
 func TestStoredResultFileMigrationAndStableIssuance(t *testing.T) {
 	f, token := newStoredResultFixture(t)
+	require.NoError(t, f.db.Create(&model.ImageStorageProfile{ProfileId: "historical-profile", Class: "temporary", Backend: "local", Root: t.TempDir()}).Error)
 	versionSQL := "SELECT sqlite_version()"
 	if f.db.Dialector.Name() != "sqlite" {
 		versionSQL = "SELECT version()"

@@ -17,7 +17,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
@@ -55,6 +62,7 @@ const config: ImageAdminConfiguration = {
       provider: 'r2',
       root: '',
       endpoint: 'https://account.r2.cloudflarestorage.com',
+      public_base_url: 'https://images.example.com',
       bucket: 'images',
       region: 'auto',
       prefix: 'generated',
@@ -105,6 +113,9 @@ test('editing a channel leaves saved credentials unchanged when fields are blank
   await user.click(screen.getByRole('button', { name: 'Edit' }))
   expect(screen.getByLabelText('Access key')).toHaveValue('')
   expect(screen.getByLabelText('Secret key')).toHaveValue('')
+  expect(
+    screen.getByLabelText('Public access domain', { exact: false })
+  ).toHaveValue('https://images.example.com')
   await user.click(screen.getByRole('button', { name: 'Save storage channel' }))
   await waitFor(() => expect(imageRequest).toHaveBeenCalled())
   expect(vi.mocked(imageRequest).mock.calls[0].slice(0, 2)).toEqual([
@@ -113,6 +124,99 @@ test('editing a channel leaves saved credentials unchanged when fields are blank
   ])
   expect(vi.mocked(imageRequest).mock.calls[0][2]).not.toHaveProperty(
     'credentials'
+  )
+  expect(vi.mocked(imageRequest).mock.calls[0][2]).toHaveProperty(
+    'profile.public_base_url',
+    'https://images.example.com'
+  )
+})
+
+test.each([
+  '',
+  'http://images.example.com',
+  'https://account.r2.cloudflarestorage.com',
+  'https://user:password@images.example.com',
+  'https://images.example.com?token=value',
+  'https://images.example.com#image',
+])(
+  'R2 rejects an invalid public access domain %j before saving',
+  async (domain) => {
+    renderStorage()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const input = screen.getByLabelText('Public access domain', {
+      exact: false,
+    })
+    await user.clear(input)
+    if (domain) await user.type(input, domain)
+    await user.click(
+      screen.getByRole('button', { name: 'Save storage channel' })
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Enter a public HTTPS domain without credentials, query parameters or fragments. Do not use the R2 S3 endpoint.'
+    )
+    expect(input).toHaveAttribute('aria-invalid', 'true')
+    expect(imageRequest).not.toHaveBeenCalled()
+  }
+)
+
+test('R2 saves a public domain with a path prefix and no signing options', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({})
+  renderStorage()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  const input = screen.getByLabelText('Public access domain', { exact: false })
+  await user.clear(input)
+  await user.type(input, 'https://images.example.com/public')
+  await user.click(screen.getByRole('button', { name: 'Save storage channel' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/storage/profile-1',
+      'PUT',
+      expect.objectContaining({
+        profile: expect.objectContaining({
+          public_base_url: 'https://images.example.com/public',
+        }),
+      })
+    )
+  )
+})
+
+test('other S3 providers can save without a public access domain', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({})
+  renderStorage({
+    ...config,
+    storage_profiles: config.storage_profiles.map((profile) => ({
+      ...profile,
+      provider: 's3',
+      public_base_url: '',
+    })),
+  })
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  await user.click(screen.getByRole('button', { name: 'Save storage channel' }))
+  await waitFor(() => expect(imageRequest).toHaveBeenCalled())
+  expect(vi.mocked(imageRequest).mock.calls[0][2]).toHaveProperty(
+    'profile.public_base_url',
+    ''
+  )
+})
+
+test('switching an edited R2 channel to local storage clears its public domain', async () => {
+  vi.mocked(imageRequest).mockResolvedValue({})
+  renderStorage()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  await user.click(screen.getByRole('combobox', { name: 'Provider' }))
+  await user.click(screen.getByRole('option', { name: 'local' }))
+  expect(
+    screen.queryByLabelText('Public access domain', { exact: false })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Save storage channel' }))
+  await waitFor(() => expect(imageRequest).toHaveBeenCalled())
+  expect(vi.mocked(imageRequest).mock.calls[0][2]).toHaveProperty(
+    'profile.public_base_url',
+    ''
   )
 })
 
@@ -127,6 +231,9 @@ test('the active channel explains replacement without offering a failing stop ac
     )
   ).toBeVisible()
   expect(imageRequest).not.toHaveBeenCalled()
+  expect(
+    screen.getByRole('button', { name: 'Delete storage channel' })
+  ).toBeDisabled()
 })
 
 test('read-only administrators cannot change channels or run write tests', () => {
@@ -139,6 +246,142 @@ test('read-only administrators cannot change channels or run write tests', () =>
     screen.queryByRole('button', { name: 'Test storage' })
   ).not.toBeInTheDocument()
   expect(screen.getByText('Main R2')).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Delete storage channel' })
+  ).not.toBeInTheDocument()
+})
+
+test('deleting an inactive channel confirms retention, submits only the revision, and resets its editing form after refresh', async () => {
+  const initial = {
+    ...config,
+    storage_profiles: config.storage_profiles.map((profile) => ({
+      ...profile,
+      active: false,
+    })),
+  }
+  const client = new QueryClient()
+  const onSuccess = vi.fn()
+  const view = render(
+    <QueryClientProvider client={client}>
+      <ImageStorageForm config={initial} onSuccess={onSuccess} />
+    </QueryClientProvider>
+  )
+  onSuccess.mockImplementation(async () => {
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <ImageStorageForm
+          config={{
+            ...initial,
+            storage_revision: 8,
+            storage_profiles: initial.storage_profiles.map((profile) => ({
+              ...profile,
+              current_revision: false,
+            })),
+          }}
+          onSuccess={onSuccess}
+        />
+      </QueryClientProvider>
+    )
+  })
+  let finishDelete!: (value: unknown) => void
+  vi.mocked(imageRequest).mockReturnValue(
+    new Promise((resolve) => {
+      finishDelete = resolve
+    })
+  )
+  const user = userEvent.setup()
+  const saveButton = screen.getByRole('button', {
+    name: 'Save storage channel',
+  })
+  await user.click(screen.getByRole('button', { name: 'Edit' }))
+  await user.type(screen.getByLabelText('Secret key'), 'unsaved-draft-secret')
+  await user.click(
+    screen.getByRole('button', { name: 'Delete storage channel' })
+  )
+  expect(screen.getByRole('alertdialog')).toHaveTextContent(
+    'Historical configuration and existing images are kept.'
+  )
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Cancel',
+    })
+  )
+  expect(imageRequest).not.toHaveBeenCalled()
+  await user.click(
+    screen.getByRole('button', { name: 'Delete storage channel' })
+  )
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Continue',
+    })
+  )
+  expect(imageRequest).toHaveBeenCalledExactlyOnceWith(
+    '/api/option/images/storage/profile-1',
+    'DELETE',
+    { revision: 7 }
+  )
+  expect(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Continue',
+    })
+  ).toBeDisabled()
+  expect(saveButton).toBeDisabled()
+  await act(async () => {
+    finishDelete({ storage_revision: 8 })
+  })
+  await waitFor(() =>
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  )
+  expect(onSuccess).toHaveBeenCalledOnce()
+  expect(screen.queryByText('Main R2')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('Storage channel name')).toHaveValue('')
+  expect(
+    screen.queryByRole('button', { name: 'Cancel editing' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Secret key')).not.toBeInTheDocument()
+})
+
+test('a conflicting channel deletion keeps the channel and offers reloading saved settings', async () => {
+  vi.mocked(imageRequest).mockRejectedValue({
+    isAxiosError: true,
+    response: {
+      status: 409,
+      data: {
+        message:
+          'Active storage channels cannot be deleted. Enable another channel for the same purpose first.',
+      },
+    },
+  })
+  const onSuccess = renderStorage({
+    ...config,
+    storage_profiles: config.storage_profiles.map((profile) => ({
+      ...profile,
+      active: false,
+    })),
+  })
+  const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: 'Delete storage channel' })
+  )
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Continue',
+    })
+  )
+  expect(
+    await within(screen.getByRole('alertdialog')).findByRole('alert')
+  ).toHaveTextContent('Active storage channels cannot be deleted.')
+  expect(onSuccess).not.toHaveBeenCalled()
+  await user.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: 'Cancel',
+    })
+  )
+  expect(screen.getByText('Main R2')).toBeVisible()
+  await user.click(
+    screen.getByRole('button', { name: 'Reload saved settings' })
+  )
+  expect(onSuccess).toHaveBeenCalledOnce()
 })
 
 test('storage activity shows the serving node snapshot and can be refreshed', async () => {

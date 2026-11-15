@@ -63,6 +63,7 @@ func SetApiRouter(router *gin.Engine) {
 	imageOptions.DELETE("/pool/:binding_key", middleware.RequirePermission(authz.ImageConfigManage), controller.DeleteImageChannelPool)
 	imageOptions.POST("/storage", middleware.RequirePermission(authz.ImageConfigManage), controller.SaveImageStorage)
 	imageOptions.PUT("/storage/:profile_id", middleware.RequirePermission(authz.ImageConfigManage), controller.UpdateImageStorage)
+	imageOptions.DELETE("/storage/:profile_id", middleware.RequirePermission(authz.ImageConfigManage), controller.DeleteImageStorage)
 	imageOptions.POST("/storage/:profile_id/activate", middleware.RequirePermission(authz.ImageConfigManage), func(c *gin.Context) { controller.SetImageStorageActive(c, true) })
 	imageOptions.POST("/storage/:profile_id/deactivate", middleware.RequirePermission(authz.ImageConfigManage), func(c *gin.Context) { controller.SetImageStorageActive(c, false) })
 	imageOptions.POST("/storage/:profile_id/credentials", middleware.RequirePermission(authz.ImageConfigManage), controller.RotateImageStorageCredentials)

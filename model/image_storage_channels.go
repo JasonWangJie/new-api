@@ -12,6 +12,33 @@ import (
 
 const imageStorageRevisionKey = "image_storage_revision"
 
+var ErrActiveImageStorageChannel = errors.New("Active storage channels cannot be deleted. Enable another channel for the same purpose first.")
+
+// RemoveImageStorageChannel hides a disabled channel from configuration while
+// preserving its location and credentials for existing objects and upload intents.
+func RemoveImageStorageChannel(ctx context.Context, profileID string, expected int64) (int64, error) {
+	return WithImageStorageRevision(ctx, &expected, func(tx *gorm.DB) error {
+		var profile ImageStorageProfile
+		if err := tx.Where("profile_id = ?", profileID).Take(&profile).Error; err != nil {
+			return err
+		}
+		if !profile.CurrentRevision {
+			return ErrOptionRevisionConflict
+		}
+		if profile.Active {
+			return ErrActiveImageStorageChannel
+		}
+		result := tx.Model(&ImageStorageProfile{}).Where("id = ? AND current_revision = ? AND active = ?", profile.Id, true, false).Update("current_revision", false)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrOptionRevisionConflict
+		}
+		return nil
+	})
+}
+
 // ImagePublicationLeaseSeconds protects the handoff from durable bytes to their
 // task, input or library reference, including retries of old upload intents.
 const ImagePublicationLeaseSeconds = 720

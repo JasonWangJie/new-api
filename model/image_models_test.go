@@ -1608,6 +1608,30 @@ type legacyStorageProfile20261114 struct {
 
 func (legacyStorageProfile20261114) TableName() string { return "image_storage_profiles" }
 
+// Baseline schema from 6c20571d4, before public storage delivery domains.
+type legacyStorageProfile20261115 struct {
+	ChannelId        string `gorm:"size:64;index"`
+	Name             string `gorm:"size:120"`
+	CurrentRevision  bool
+	Namespace        string `gorm:"size:64"`
+	Id               int
+	ProfileId        string `gorm:"size:64;uniqueIndex"`
+	Class            string `gorm:"size:16;index"`
+	Backend          string `gorm:"size:16"`
+	Provider         string `gorm:"size:32"`
+	Root             string `gorm:"type:text"`
+	Endpoint         string `gorm:"type:text"`
+	Region           string `gorm:"size:64"`
+	Bucket           string `gorm:"size:255"`
+	Prefix           string `gorm:"size:255"`
+	PathStyle        bool
+	CredentialCipher []byte
+	Active           bool
+	CreatedAt        int64 `gorm:"type:bigint"`
+}
+
+func (legacyStorageProfile20261115) TableName() string { return "image_storage_profiles" }
+
 // Baseline schema from 9280757f5, before storage-channel and cleanup upgrades.
 type legacyStorageObject20261114 struct {
 	Id           int    `json:"-"`
@@ -1659,12 +1683,8 @@ type legacyCleanupJob20261114 struct {
 func (legacyCleanupJob20261114) TableName() string { return "image_cleanup_jobs" }
 
 func TestImageStorageCleanupSchemaUpgrade(t *testing.T) {
-	for _, baseline := range []bool{false, true} {
-		name := "fresh"
-		if baseline {
-			name = "upgrade"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, baseline := range []string{"fresh", "upgrade", "upgrade_latest"} {
+		t.Run(baseline, func(t *testing.T) {
 			db := imageTestDatabase(t, "storage-schema")
 			var version string
 			versionQuery := "SELECT version()"
@@ -1674,11 +1694,17 @@ func TestImageStorageCleanupSchemaUpgrade(t *testing.T) {
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("database version: %s", version)
 			require.NoError(t, db.AutoMigrate(&Option{}))
-			if baseline {
+			if baseline == "upgrade" {
 				require.NoError(t, db.AutoMigrate(&legacyStorageProfile20261114{}, &legacyStorageObject20261114{}, &legacyCleanupJob20261114{}))
 				require.NoError(t, db.Create(&legacyStorageProfile20261114{ProfileId: "old-storage", Class: "temporary", Backend: "local", Provider: "local", Root: "/preserved/images", Active: true, CredentialCipher: []byte("unchanged-key-material")}).Error)
 				require.NoError(t, db.Create(&legacyStorageObject20261114{ObjectId: "old-image", IdentityHash: "unchanged-identity", ProfileId: "old-storage", Class: "temporary", ObjectKey: "results/old.png", Status: "active", ByteSize: 1234, CreatedAt: 100, ExpiresAt: 180 * 86400}).Error)
 				require.NoError(t, db.Create(&legacyCleanupJob20261114{JobId: "old-job", Scope: "expired", Filters: `{"user_id":0}`, Cursor: 123, Status: "running", Processed: 17, DeletedBytes: 999, CreatedAt: 101}).Error)
+			}
+			if baseline == "upgrade_latest" {
+				require.NoError(t, db.AutoMigrate(&legacyStorageProfile20261115{}, &ImageStorageObject{}, &ImageCleanupJob{}))
+				require.NoError(t, db.Create(&legacyStorageProfile20261115{ProfileId: "old-storage", ChannelId: "existing-channel", Name: "Existing channel", CurrentRevision: true, Namespace: "existing-namespace", Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "existing-bucket", Prefix: "existing-prefix", Region: "auto", Active: true, CredentialCipher: []byte("unchanged-key-material")}).Error)
+				require.NoError(t, db.Create(&legacyStorageProfile20261115{ProfileId: "historical-storage", ChannelId: "existing-channel", Namespace: "historical-namespace", Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "historical-bucket", CredentialCipher: []byte("historical-key-material")}).Error)
+				require.NoError(t, db.Create(&ImageStorageObject{ObjectId: "latest-image", IdentityHash: "latest-identity", ProfileId: "historical-storage", Class: "temporary", ObjectKey: "results/latest.png", Status: "active", Checksum: "latest-checksum", ByteSize: 5678, CreatedAt: 101, ExpiresAt: 180 * 86400}).Error)
 			}
 			require.NoError(t, db.Create(&Option{Key: "image_runtime_config", Value: `{"task_retention_days":180,"result_retention_days":180,"worker_concurrency":150}`}).Error)
 			for range 2 {
@@ -1687,7 +1713,7 @@ func TestImageStorageCleanupSchemaUpgrade(t *testing.T) {
 			var option Option
 			require.NoError(t, db.Where(map[string]any{"key": "image_runtime_config"}).Take(&option).Error)
 			assert.JSONEq(t, `{"task_retention_days":180,"result_retention_days":180,"worker_concurrency":150}`, option.Value)
-			if baseline {
+			if baseline == "upgrade" {
 				var profile ImageStorageProfile
 				require.NoError(t, db.Where("profile_id = ?", "old-storage").Take(&profile).Error)
 				assert.Equal(t, "old-storage", profile.ChannelId)
@@ -1713,13 +1739,55 @@ func TestImageStorageCleanupSchemaUpgrade(t *testing.T) {
 				assert.EqualValues(t, 1, runnable, "legacy jobs remain selectable after nullable column additions")
 
 			}
+			if baseline == "upgrade_latest" {
+				var profile, historical ImageStorageProfile
+				require.NoError(t, db.Where("profile_id = ?", "old-storage").Take(&profile).Error)
+				assert.Equal(t, "existing-channel", profile.ChannelId)
+				assert.Equal(t, "Existing channel", profile.Name)
+				assert.Equal(t, "existing-namespace", profile.Namespace)
+				assert.True(t, profile.Active)
+				assert.True(t, profile.CurrentRevision)
+				assert.Equal(t, "existing-bucket", profile.Bucket)
+				assert.Equal(t, "existing-prefix", profile.Prefix)
+				assert.Equal(t, []byte("unchanged-key-material"), profile.CredentialCipher)
+				require.NoError(t, db.Where("profile_id = ?", "historical-storage").Take(&historical).Error)
+				assert.Equal(t, profile.ChannelId, historical.ChannelId)
+				assert.Equal(t, "historical-namespace", historical.Namespace)
+				assert.Equal(t, "historical-bucket", historical.Bucket)
+				assert.Equal(t, []byte("historical-key-material"), historical.CredentialCipher)
+				assert.False(t, historical.Active)
+				assert.False(t, historical.CurrentRevision)
+				var object ImageStorageObject
+				require.NoError(t, db.Where("object_id = ?", "latest-image").Take(&object).Error)
+				assert.Equal(t, historical.ProfileId, object.ProfileId)
+				assert.Equal(t, "results/latest.png", object.ObjectKey)
+				assert.Equal(t, "latest-checksum", object.Checksum)
+				assert.EqualValues(t, 5678, object.ByteSize)
+				require.Error(t, db.Create(&ImageStorageProfile{ProfileId: profile.ProfileId}).Error)
+			}
+			var publicProfile ImageStorageProfile
+			if baseline == "fresh" {
+				publicProfile = ImageStorageProfile{ProfileId: "new-storage", ChannelId: "new-channel", Class: "temporary", Backend: "s3", Provider: "r2", Active: true, CurrentRevision: true}
+				require.NoError(t, db.Create(&publicProfile).Error)
+			} else {
+				require.NoError(t, db.Where("profile_id = ?", "old-storage").Take(&publicProfile).Error)
+			}
+			assert.Empty(t, publicProfile.PublicBaseURL, "existing storage keeps gateway delivery until a domain is explicitly configured")
+			publicProfile.PublicBaseURL = "https://images.example.com/assets"
+			require.NoError(t, db.Save(&publicProfile).Error)
+			for range 2 {
+				require.NoError(t, MigrateImageModels(db))
+			}
+			var reloaded ImageStorageProfile
+			require.NoError(t, db.Where("profile_id = ?", publicProfile.ProfileId).Take(&reloaded).Error)
+			assert.Equal(t, publicProfile.PublicBaseURL, reloaded.PublicBaseURL)
 			job := ImageCleanupJob{JobId: "new-job", Status: "completed_with_errors", Source: "manual"}
 			require.NoError(t, db.Create(&job).Error)
 			require.Error(t, db.Create(&ImageCleanupJob{JobId: job.JobId}).Error)
 			entry := ImageCleanupRetry{JobId: job.JobId, ObjectId: "one", Outcome: "retry"}
 			require.NoError(t, db.Create(&entry).Error)
 			require.Error(t, db.Create(&ImageCleanupRetry{JobId: job.JobId, ObjectId: "one"}).Error)
-			t.Logf("storage migration fresh=%v dialect=%s", !baseline, db.Dialector.Name())
+			t.Logf("storage migration baseline=%s dialect=%s", baseline, db.Dialector.Name())
 		})
 	}
 }

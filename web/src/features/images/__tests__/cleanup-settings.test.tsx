@@ -274,6 +274,87 @@ test('idle storage cleanup history refreshes after a minute to remove server-exp
   ).toBe(true)
 })
 
+test('scheduled and manual cleanup retain removed channels and prefer current names without duplicate revisions', async () => {
+  mockJobs()
+  const revisions: ImageStorageProfile[] = [
+    {
+      ...profiles[0],
+      profile_id: 'removed-new',
+      channel_id: 'removed-r2',
+      name: 'Removed R2',
+      current_revision: false,
+    },
+    {
+      ...profiles[0],
+      profile_id: 'old-main',
+      name: 'Old main name',
+      current_revision: false,
+    },
+    {
+      ...profiles[0],
+      profile_id: 'removed-old',
+      channel_id: 'removed-r2',
+      name: 'Old removed name',
+      current_revision: false,
+    },
+    { ...profiles[0], current_revision: true },
+  ]
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ImageCleanupConfigForm
+        initial={{
+          ...settings,
+          policies: [
+            {
+              id: 'retained-policy',
+              name: 'Existing cleanup',
+              enabled: true,
+              channel_id: 'removed-r2',
+              older_than: 180,
+              age_unit: 'days',
+              schedule_type: 'daily',
+              interval_minutes: 1440,
+              daily_time: '03:00',
+              timezone: 'Asia/Shanghai',
+            },
+          ],
+        }}
+        profiles={revisions}
+        canManage
+        onSaved={vi.fn()}
+      />
+      <ImageCleanupPanel profiles={revisions} />
+    </QueryClientProvider>
+  )
+  const user = userEvent.setup()
+  const selectors = screen.getAllByRole('combobox', { name: 'Storage channel' })
+  expect(selectors[0]).toHaveTextContent('Removed R2')
+  for (const selector of selectors) {
+    await user.click(selector)
+    expect(screen.getAllByRole('option')).toHaveLength(2)
+    expect(screen.getByRole('option', { name: 'Main R2' })).toBeVisible()
+    expect(
+      screen.queryByRole('option', { name: 'Old main name' })
+    ).not.toBeInTheDocument()
+    await user.click(screen.getByRole('option', { name: 'Removed R2' }))
+  }
+  await user.click(screen.getByRole('button', { name: 'Preview cleanup' }))
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/admin/image-library/cleanup-jobs/preview',
+      'POST',
+      {
+        scope: 'all',
+        filters: {
+          channel_id: 'removed-r2',
+          older_than: 180,
+          age_unit: 'days',
+        },
+      }
+    )
+  )
+})
+
 test('cancelling the confirmation does not create a cleanup job', async () => {
   mockJobs()
   renderPanel()
@@ -470,7 +551,7 @@ test('an interval policy can be saved without an unused daily time', async () =>
   )
   const interval = screen.getByRole('spinbutton', { name: 'Interval (hours)' })
   expect(interval).toHaveValue(1)
-  expect(interval).toHaveAttribute('min', '1')
+  expect(interval).toHaveAttribute('min', String(5 / 60))
   expect(interval).toHaveAttribute('max', '720')
   await userEvent
     .setup()
@@ -532,6 +613,177 @@ test('interval hours are converted to minutes when a cleanup policy is saved', a
       })
     )
   )
+})
+
+function renderIntervalPolicies(intervals: number[], canManage = true) {
+  const initial: CleanupConfig = {
+    ...settings,
+    policies: intervals.map((minutes, index) => ({
+      id: `interval-${index}`,
+      name: `Interval policy ${index}`,
+      enabled: false,
+      channel_id: 'r2-main',
+      older_than: 48,
+      age_unit: 'hours',
+      schedule_type: 'interval',
+      interval_minutes: minutes,
+      daily_time: '',
+      timezone: 'Asia/Shanghai',
+    })),
+  }
+  vi.mocked(imageRequest).mockImplementation(
+    async (_url, _method, input) => input
+  )
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ImageCleanupConfigForm
+        initial={initial}
+        profiles={profiles}
+        canManage={canManage}
+        onSaved={vi.fn().mockResolvedValue(undefined)}
+      />
+    </QueryClientProvider>
+  )
+  return initial
+}
+
+test.each([5, 15, 61, 43200])(
+  'a cleanup interval of %s minutes can be entered and saved exactly',
+  async (minutes) => {
+    renderIntervalPolicies([60])
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('combobox', { name: 'Interval unit' }))
+    await user.click(screen.getByRole('option', { name: 'Minutes' }))
+    const input = screen.getByRole('spinbutton', { name: 'Interval (minutes)' })
+    expect(input).toHaveValue(60)
+    await user.clear(input)
+    await user.type(input, String(minutes))
+    await user.click(
+      screen.getByRole('button', { name: 'Save cleanup settings' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        '/api/admin/image-library/cleanup-config',
+        'PUT',
+        expect.objectContaining({
+          policies: [expect.objectContaining({ interval_minutes: minutes })],
+        })
+      )
+    )
+    const payload = vi.mocked(imageRequest).mock.calls[0][2] as CleanupConfig
+    expect(payload.policies[0]).not.toHaveProperty('interval_unit')
+  }
+)
+
+test.each([5, 61])(
+  'an existing %s minute policy survives switching display units and saving',
+  async (minutes) => {
+    const initial = renderIntervalPolicies([minutes])
+    const user = userEvent.setup()
+    expect(
+      screen.getByRole('spinbutton', { name: 'Interval (minutes)' })
+    ).toHaveValue(minutes)
+    await user.click(screen.getByRole('combobox', { name: 'Interval unit' }))
+    await user.click(screen.getByRole('option', { name: 'Hours' }))
+    expect(
+      screen.getByRole('spinbutton', { name: 'Interval (hours)' })
+    ).toHaveValue(minutes / 60)
+    await user.click(
+      screen.getByRole('button', { name: 'Save cleanup settings' })
+    )
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        '/api/admin/image-library/cleanup-config',
+        'PUT',
+        initial
+      )
+    )
+  }
+)
+
+test.each(['', '4', '43201', '5.5'])(
+  'an invalid minute interval "%s" prevents saving',
+  async (value) => {
+    renderIntervalPolicies([15])
+    const user = userEvent.setup()
+    const input = screen.getByRole('spinbutton', { name: 'Interval (minutes)' })
+    await user.clear(input)
+    if (value) await user.type(input, value)
+    await user.click(
+      screen.getByRole('button', { name: 'Save cleanup settings' })
+    )
+    expect(input).not.toBeValid()
+    expect(imageRequest).not.toHaveBeenCalled()
+  }
+)
+
+test('decimal hours are saved as exact whole minutes without floating point rejection', async () => {
+  renderIntervalPolicies([60])
+  const user = userEvent.setup()
+  const input = screen.getByRole('spinbutton', { name: 'Interval (hours)' })
+  await user.clear(input)
+  await user.type(input, '1.05')
+  await user.click(
+    screen.getByRole('button', { name: 'Save cleanup settings' })
+  )
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/admin/image-library/cleanup-config',
+      'PUT',
+      expect.objectContaining({
+        policies: [expect.objectContaining({ interval_minutes: 63 })],
+      })
+    )
+  )
+})
+
+test('hours that convert to fractional minutes cannot be saved', async () => {
+  renderIntervalPolicies([60])
+  const user = userEvent.setup()
+  const input = screen.getByRole('spinbutton', { name: 'Interval (hours)' })
+  await user.clear(input)
+  await user.type(input, '0.11')
+  await user.click(
+    screen.getByRole('button', { name: 'Save cleanup settings' })
+  )
+  await waitFor(() => expect(input).toHaveAttribute('aria-invalid', 'true'))
+  expect(screen.getByRole('alert')).toHaveTextContent('Check this value.')
+  expect(imageRequest).not.toHaveBeenCalled()
+})
+
+test('removing a policy preserves the remaining policy display unit and duration', async () => {
+  renderIntervalPolicies([60, 120])
+  const user = userEvent.setup()
+  await user.click(
+    screen.getAllByRole('combobox', { name: 'Interval unit' })[1]
+  )
+  await user.click(screen.getByRole('option', { name: 'Minutes' }))
+  await user.click(screen.getAllByRole('button', { name: 'Remove policy' })[0])
+  expect(
+    screen.getByRole('spinbutton', { name: 'Interval (minutes)' })
+  ).toHaveValue(120)
+  await user.click(
+    screen.getByRole('button', { name: 'Save cleanup settings' })
+  )
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/admin/image-library/cleanup-config',
+      'PUT',
+      expect.objectContaining({
+        policies: [
+          expect.objectContaining({ id: 'interval-1', interval_minutes: 120 }),
+        ],
+      })
+    )
+  )
+})
+
+test('read-only cleanup settings disable the interval input and unit selector', () => {
+  renderIntervalPolicies([15], false)
+  expect(
+    screen.getByRole('spinbutton', { name: 'Interval (minutes)' })
+  ).toBeDisabled()
+  expect(screen.getByRole('combobox', { name: 'Interval unit' })).toBeDisabled()
 })
 
 test.each([1900000000, 0])(

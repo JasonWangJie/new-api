@@ -474,6 +474,16 @@ func SaveImageStorageChannel(ctx context.Context, profile model.ImageStorageProf
 			if err := tx.Model(&model.ImageStorageProfile{}).Where("profile_id = ?", previousID).Updates(map[string]any{"current_revision": false, "active": false}).Error; err != nil {
 				return err
 			}
+			// Public delivery domains belong to a bucket location. Updating one
+			// also makes retained objects at that location directly accessible;
+			// their prefixes, namespaces and physical locations never change.
+			if profile.Backend == "s3" {
+				if err := tx.Model(&model.ImageStorageProfile{}).
+					Where("channel_id = ? AND backend = ? AND provider = ? AND endpoint = ? AND bucket = ?", profile.ChannelId, profile.Backend, profile.Provider, profile.Endpoint, profile.Bucket).
+					Update("public_base_url", profile.PublicBaseURL).Error; err != nil {
+					return err
+				}
+			}
 		}
 		if profile.Active {
 			if err := tx.Model(&model.ImageStorageProfile{}).Where("class = ? AND active = ?", profile.Class, true).Update("active", false).Error; err != nil {
@@ -493,6 +503,16 @@ func SaveImageStorageChannel(ctx context.Context, profile model.ImageStorageProf
 func prepareImageStorageProfile(ctx context.Context, profile model.ImageStorageProfile, credential *ImageStorageCredentials) (model.ImageStorageProfile, error) {
 	if profile.Class != "temporary" && profile.Class != "durable" {
 		return profile, errors.New("invalid image storage class")
+	}
+	profile.PublicBaseURL = strings.TrimRight(strings.TrimSpace(profile.PublicBaseURL), "/")
+	if profile.Backend == "local" {
+		profile.PublicBaseURL = ""
+	}
+	if err := ValidateImageStoragePublicBaseURL(profile.PublicBaseURL); err != nil {
+		return profile, err
+	}
+	if profile.Provider == "r2" && profile.PublicBaseURL == "" {
+		return profile, errors.New("R2 storage requires a public access domain")
 	}
 	if profile.Backend == "local" && profile.Root == "" {
 		executable, err := os.Executable()
@@ -537,6 +557,45 @@ func prepareImageStorageProfile(ctx context.Context, profile model.ImageStorageP
 		return profile, err
 	}
 	return profile, nil
+}
+
+// ValidateImageStoragePublicBaseURL checks the anonymous object delivery origin,
+// which is separate from the authenticated S3 upload endpoint.
+func ValidateImageStoragePublicBaseURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	base, err := url.Parse(raw)
+	if err != nil || len(raw) > 2048 || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.ForceQuery || base.Fragment != "" || strings.Contains(raw, "#") {
+		return errors.New("public access domain requires HTTPS without credentials, query or fragment")
+	}
+	host := strings.ToLower(base.Hostname())
+	if host == "r2.cloudflarestorage.com" || strings.HasSuffix(host, ".r2.cloudflarestorage.com") {
+		return errors.New("use an R2 public access domain instead of the S3 API endpoint")
+	}
+	return nil
+}
+
+// ImageResultStorageURL follows the object's own storage revision, even after
+// another channel becomes active. Legacy private storage keeps its gateway URL.
+func ImageResultStorageURL(ctx context.Context, object model.ImageStorageObject) (string, error) {
+	var profile model.ImageStorageProfile
+	if err := model.DB.WithContext(ctx).Where("profile_id = ?", object.ProfileId).Take(&profile).Error; err != nil {
+		return "", err
+	}
+	if profile.Backend != "s3" || profile.PublicBaseURL == "" {
+		return "", nil
+	}
+	if err := ValidateImageStoragePublicBaseURL(profile.PublicBaseURL); err != nil {
+		return "", err
+	}
+	base, err := url.Parse(profile.PublicBaseURL)
+	if err != nil {
+		return "", err
+	}
+	base.Path = path.Join(base.Path, profile.Prefix, profile.Namespace, object.ObjectKey)
+	base.RawPath = ""
+	return base.String(), nil
 }
 
 func ImageObjectURL(ctx context.Context, object model.ImageStorageObject, base string, seconds int) (string, error) {

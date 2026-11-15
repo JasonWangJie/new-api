@@ -40,6 +40,7 @@ import {
   cleanupIsActive,
   cleanupJobsPath,
   cleanupRequestSchema,
+  imageCleanupChannelOptions,
   translateImageCleanupMessage,
   type CleanupConfig,
   type CleanupJob,
@@ -98,6 +99,9 @@ export function ImageCleanupConfigForm(props: {
 }) {
   const { t } = useTranslation()
   const [saveError, setSaveError] = useState('')
+  const [intervalUnits, setIntervalUnits] = useState<
+    Record<string, 'minutes' | 'hours'>
+  >({})
   const form = useForm<CleanupConfig>({
     resolver: zodResolver(cleanupConfigSchema),
     defaultValues: props.initial,
@@ -108,12 +112,7 @@ export function ImageCleanupConfigForm(props: {
     keyName: 'formKey',
   })
   const values = form.watch()
-  const channels = props.profiles
-    .filter((profile) => profile.current_revision !== false)
-    .map((profile) => ({
-      value: profile.channel_id || profile.profile_id,
-      label: profile.name || profile.channel_id || profile.profile_id,
-    }))
+  const channels = imageCleanupChannelOptions(props.profiles)
   const save = useMutation({
     mutationFn: () => {
       const values = form.getValues()
@@ -277,6 +276,10 @@ export function ImageCleanupConfigForm(props: {
           ))}
         </div>
         {policies.fields.map((policy, index) => {
+          const intervalUnit =
+            intervalUnits[policy.formKey] ??
+            (policy.interval_minutes % 60 === 0 ? 'hours' : 'minutes')
+          const intervalFactor = intervalUnit === 'hours' ? 60 : 1
           const nextRunAt = props.initial.policies.find(
             (saved) => saved.id === policy.id
           )?.next_run_at
@@ -376,32 +379,70 @@ export function ImageCleanupConfigForm(props: {
                   }
                 />
                 {values.policies[index]?.schedule_type === 'interval' ? (
-                  <div className='space-y-2'>
-                    <Label htmlFor={`cleanup-policy-interval-${index}`}>
-                      {t('Interval (hours)')}
-                    </Label>
-                    <Input
-                      id={`cleanup-policy-interval-${index}`}
-                      type='number'
-                      min={1}
-                      max={720}
-                      step={1}
-                      value={
-                        Number.isFinite(
-                          values.policies[index]?.interval_minutes
-                        )
-                          ? values.policies[index].interval_minutes / 60
-                          : ''
-                      }
-                      onChange={(event) =>
-                        form.setValue(
-                          `policies.${index}.interval_minutes`,
-                          event.target.valueAsNumber * 60
-                        )
+                  <>
+                    <div className='space-y-2'>
+                      <Label htmlFor={`cleanup-policy-interval-${index}`}>
+                        {intervalUnit === 'hours'
+                          ? t('Interval (hours)')
+                          : t('Interval (minutes)')}
+                      </Label>
+                      <Input
+                        id={`cleanup-policy-interval-${index}`}
+                        type='number'
+                        required
+                        min={5 / intervalFactor}
+                        max={43200 / intervalFactor}
+                        step={intervalUnit === 'hours' ? 'any' : 1}
+                        value={
+                          Number.isFinite(
+                            values.policies[index]?.interval_minutes
+                          )
+                            ? values.policies[index].interval_minutes /
+                              intervalFactor
+                            : ''
+                        }
+                        onChange={(event) => {
+                          let minutes =
+                            event.target.valueAsNumber * intervalFactor
+                          const rounded = Math.round(minutes)
+                          // Correct conversion noise without rounding fractional minutes.
+                          if (
+                            intervalUnit === 'hours' &&
+                            Math.abs(minutes - rounded) <=
+                              Number.EPSILON *
+                                Math.max(1, Math.abs(minutes)) *
+                                4
+                          ) {
+                            minutes = rounded
+                          }
+                          form.setValue(
+                            `policies.${index}.interval_minutes`,
+                            minutes
+                          )
+                        }}
+                        disabled={disabled}
+                        aria-invalid={
+                          !!form.formState.errors.policies?.[index]
+                            ?.interval_minutes
+                        }
+                      />
+                    </div>
+                    <ImageSelect
+                      label={t('Interval unit')}
+                      value={intervalUnit}
+                      options={[
+                        { value: 'minutes', label: t('Minutes') },
+                        { value: 'hours', label: t('Hours') },
+                      ]}
+                      onChange={(value) =>
+                        setIntervalUnits((units) => ({
+                          ...units,
+                          [policy.formKey]: value as 'minutes' | 'hours',
+                        }))
                       }
                       disabled={disabled}
                     />
-                  </div>
+                  </>
                 ) : (
                   <>
                     <div className='space-y-2'>
@@ -522,12 +563,7 @@ export function ImageCleanupPanel(props: { profiles?: ImageStorageProfile[] }) {
     refetchOnWindowFocus: false,
   })
   const profiles = props.profiles || config.data?.storage_profiles || []
-  const channels = profiles
-    .filter((profile) => profile.current_revision !== false)
-    .map((profile) => ({
-      value: profile.channel_id || profile.profile_id,
-      label: profile.name || profile.channel_id || profile.profile_id,
-    }))
+  const channels = imageCleanupChannelOptions(profiles)
   const form = useForm<CleanupRequestForm>({
     resolver: zodResolver(cleanupRequestSchema),
     defaultValues: {
