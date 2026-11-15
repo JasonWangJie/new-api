@@ -60,6 +60,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { imageRequest } from './api'
 import { ConfigurationConflict } from './components/configuration-conflict'
 import { ExternalImageHostingSettings } from './components/external-image-hosting-settings'
+import { ImageCleanupSettings } from './components/image-cleanup-settings'
 import { ImageGroupSelect } from './components/image-group-select'
 import { ImagePolicyExampleDialog } from './components/image-policy-example-dialog'
 import {
@@ -69,6 +70,7 @@ import {
 import { ImageRoutingPreview } from './components/image-routing-preview'
 import { ImageRuntimeStatus } from './components/image-runtime-status'
 import { ImageSelect } from './components/image-select'
+import { ImageStorageForm } from './components/image-storage-settings'
 import { isConfigurationConflict } from './lib/configuration-conflict'
 import {
   imageLabel,
@@ -78,11 +80,10 @@ import {
   isVideoModelEntry,
   normalizeMediaModelCatalog,
 } from './lib/image-labels'
-import type { ImageAdminConfiguration, ImageStorageProfile } from './types'
+import type { ImageAdminConfiguration } from './types'
 import { VideoConfiguration } from './video-settings'
 
 type ImageConfiguration = ImageAdminConfiguration
-type StorageProfile = ImageStorageProfile
 type RuntimeField = {
   key: string
   label: string
@@ -116,6 +117,12 @@ const RUNTIME_FIELDS: readonly RuntimeField[] = [
   },
   { key: 'worker_concurrency', label: 'Workers', min: 1 },
   { key: 'image_concurrency', label: 'Image concurrency', min: 1 },
+  {
+    key: 'storage_upload_concurrency',
+    label: 'Storage upload concurrency',
+    min: 1,
+    max: 32,
+  },
   {
     key: 'max_reference_images',
     label: 'Maximum reference images',
@@ -496,6 +503,7 @@ export function ImageSettings() {
             config={config}
             onSuccess={() => configuration.refetch()}
           />
+          <ImageCleanupSettings profiles={config.storage_profiles} />
         </div>
       )}{' '}
       {tab === 'policy' && (
@@ -640,7 +648,9 @@ export function ImageRuntimeForm({
                 type='number'
                 min={min}
                 max={max}
-                value={Number(values[key])}
+                value={Number(
+                  values[key] ?? (key === 'storage_upload_concurrency' ? 4 : 0)
+                )}
                 onChange={(event) => {
                   setValues((previous) => ({
                     ...previous,
@@ -759,221 +769,6 @@ export function ImageRuntimeForm({
           </Button>
         </div>
       </form>
-    </SettingsCard>
-  )
-}
-
-function ImageStorageForm({
-  config,
-  onSuccess,
-}: {
-  config: ImageConfiguration
-  onSuccess: () => Promise<unknown>
-}) {
-  const { t } = useTranslation()
-  const [profile, setProfile] = useState<StorageProfile>({
-    profile_id: '',
-    class: 'temporary',
-    backend: 'local',
-    provider: 'local',
-    root: '',
-    endpoint: '',
-    bucket: '',
-    region: 'us-east-1',
-    prefix: '',
-    active: true,
-    path_style: false,
-  })
-  const [accessKey, setAccessKey] = useState('')
-  const [secretKey, setSecretKey] = useState('')
-  const [busy, setBusy] = useState(false)
-  const save = async () => {
-    setBusy(true)
-    try {
-      await imageRequest('/api/option/images/storage', 'POST', {
-        profile,
-        credentials:
-          profile.backend === 's3'
-            ? { access_key: accessKey, secret_key: secretKey }
-            : undefined,
-      })
-      setAccessKey('')
-      setSecretKey('')
-      await onSuccess()
-      toast.success(t('Saved'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    } finally {
-      setBusy(false)
-    }
-  }
-  const test = async (id: string) => {
-    setBusy(true)
-    try {
-      await imageRequest(`/api/option/images/storage/${id}/test`, 'POST', {})
-      toast.success(t('Storage write, read and delete verified'))
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    } finally {
-      setBusy(false)
-    }
-  }
-  return (
-    <SettingsCard
-      title={t('Image storage')}
-      description={t(
-        'Local files use the deployment directory and year/month/day folders. Storage revisions remain available for existing images.'
-      )}
-    >
-      <div className='space-y-5'>
-        <StaticDataTable
-          data={config.storage_profiles}
-          getRowKey={(item) => item.profile_id}
-          columns={[
-            {
-              id: 'class',
-              header: t('Purpose'),
-              cell: (item) => `${t(imageLabel(item.class))} · ${item.provider}`,
-            },
-            {
-              id: 'location',
-              header: t('Location'),
-              cell: (item) => (
-                <span className='text-xs break-all'>
-                  {item.root || `${item.endpoint} / ${item.bucket}`}
-                </span>
-              ),
-            },
-            {
-              id: 'active',
-              header: t('Active'),
-              cell: (item) => t(item.active ? 'Yes' : 'No'),
-            },
-            {
-              id: 'test',
-              header: t('Actions'),
-              cell: (item) => (
-                <Button
-                  size='sm'
-                  variant='outline'
-                  disabled={busy}
-                  onClick={() => void test(item.profile_id)}
-                >
-                  {t('Test storage')}
-                </Button>
-              ),
-            },
-          ]}
-        />
-        <form
-          className='space-y-4'
-          onSubmit={(event) => {
-            event.preventDefault()
-            void save()
-          }}
-        >
-          <div className='grid gap-3 sm:grid-cols-2'>
-            <ImageSelect
-              label={t('Purpose')}
-              value={profile.class}
-              options={['temporary', 'durable'].map((value) => ({
-                value,
-                label: t(imageLabel(value)),
-              }))}
-              onChange={(value) =>
-                setProfile((previous) => ({ ...previous, class: value }))
-              }
-            />
-            <ImageSelect
-              label={t('Provider')}
-              value={profile.provider}
-              options={config.storage_providers.map((value) => ({
-                value,
-                label: value,
-              }))}
-              onChange={(value) =>
-                setProfile((previous) => ({
-                  ...previous,
-                  provider: value,
-                  backend: value === 'local' ? 'local' : 's3',
-                }))
-              }
-            />
-            {(profile.backend === 'local'
-              ? [{ key: 'root', label: 'Storage directory (optional)' }]
-              : [
-                  { key: 'endpoint', label: 'S3 endpoint' },
-                  { key: 'bucket', label: 'Bucket' },
-                  { key: 'region', label: 'Region' },
-                  { key: 'prefix', label: 'Object prefix' },
-                ]
-            ).map(({ key, label }) => (
-              <div key={key} className='space-y-2'>
-                <Label htmlFor={`image-storage-${key}`}>{t(label)}</Label>
-                <Input
-                  id={`image-storage-${key}`}
-                  value={profile[key as keyof StorageProfile] as string}
-                  onChange={(event) =>
-                    setProfile((previous) => ({
-                      ...previous,
-                      [key]: event.target.value,
-                    }))
-                  }
-                  disabled={busy}
-                />
-              </div>
-            ))}
-          </div>
-          {profile.backend === 's3' && (
-            <div className='grid gap-3 sm:grid-cols-2'>
-              <div className='space-y-2'>
-                <Label htmlFor='image-access-key'>{t('Access key')}</Label>
-                <Input
-                  id='image-access-key'
-                  type='password'
-                  autoComplete='off'
-                  value={accessKey}
-                  onChange={(event) => setAccessKey(event.target.value)}
-                  disabled={busy}
-                />
-              </div>
-              <div className='space-y-2'>
-                <Label htmlFor='image-secret-key'>{t('Secret key')}</Label>
-                <Input
-                  id='image-secret-key'
-                  type='password'
-                  autoComplete='off'
-                  value={secretKey}
-                  onChange={(event) => setSecretKey(event.target.value)}
-                  disabled={busy}
-                />
-              </div>
-              <div className='flex items-center gap-2'>
-                <Checkbox
-                  id='image-path-style'
-                  checked={profile.path_style}
-                  onCheckedChange={(checked) =>
-                    setProfile((previous) => ({
-                      ...previous,
-                      path_style: checked,
-                    }))
-                  }
-                />
-                <Label htmlFor='image-path-style'>
-                  {t('Path-style access')}
-                </Label>
-              </div>
-            </div>
-          )}
-          <Button type='submit' disabled={busy}>
-            {t('Save storage revision')}
-          </Button>
-        </form>
-      </div>
     </SettingsCard>
   )
 }

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"image"
@@ -39,12 +40,15 @@ func GetImageConfiguration(c *gin.Context) {
 		imageManagementError(c, 503, err)
 		return
 	}
-	var profiles []model.ImageStorageProfile
 	var policies []model.ImageGroupPolicy
 	var pools []model.ImageChannelPool
-	if err := model.DB.WithContext(ctx).Order("id DESC").Find(&profiles).Error; err != nil {
+	profiles, storageRevision, err := model.GetImageStorageChannelSnapshot(ctx)
+	if err != nil {
 		imageManagementError(c, 503, err)
 		return
+	}
+	for i := range profiles {
+		profiles[i].CredentialConfigured = len(profiles[i].CredentialCipher) > 0
 	}
 	if err := model.DB.WithContext(ctx).Find(&policies).Error; err != nil {
 		imageManagementError(c, 503, err)
@@ -115,7 +119,7 @@ func GetImageConfiguration(c *gin.Context) {
 			modelExpressions[name] = expression
 		}
 	}
-	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates, "mixed_video_billing_expr": mixedOverrides, "mixed_video_model_billing_expr": modelExpressions, "mixed_video_usage_schema": billing_setting.MixedVideoUsageSchema()})
+	imageManagementData(c, gin.H{"image_providers": service.RegisteredImageProviders(), "media_providers": service.RegisteredMediaProviders(), "routing_platforms": append(service.RegisteredMediaProviders(), "mixed"), "runtime": cfg, "storage_profiles": profiles, "storage_revision": storageRevision, "storage_upload_status": service.GetImageStorageUploadStatus(), "policies": policies, "pools": pools, "storage_providers": []string{"local", "aws", "aliyun", "tencent", "qiniu", "r2", "custom_s3"}, "video_readiness": readiness, "video_plugin_templates": templates, "mixed_video_billing_expr": mixedOverrides, "mixed_video_model_billing_expr": modelExpressions, "mixed_video_usage_schema": billing_setting.MixedVideoUsageSchema()})
 }
 
 func GetImageChannelPoolOptions(c *gin.Context) {
@@ -219,9 +223,10 @@ func GetImageRuntimeStatus(c *gin.Context) {
 		return
 	}
 	imageManagementData(c, gin.H{
-		"node":       common.NodeName,
-		"configured": gin.H{"worker_concurrency": cfg.Workers, "recovery_interval_seconds": cfg.RecoveryInterval},
-		"effective":  service.GetAsyncImageWorkerStatus(),
+		"node":                  common.NodeName,
+		"configured":            gin.H{"worker_concurrency": cfg.Workers, "recovery_interval_seconds": cfg.RecoveryInterval},
+		"effective":             service.GetAsyncImageWorkerStatus(),
+		"storage_upload_status": service.GetImageStorageUploadStatus(),
 	})
 }
 
@@ -230,7 +235,7 @@ func UpdateImageRuntime(c *gin.Context) {
 	input := struct {
 		service.ImageRuntimeConfig
 		Revision *int64 `json:"revision"`
-	}{ImageRuntimeConfig: service.ImageRuntimeConfig{FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds, TimeoutRetries: defaults.TimeoutRetries, TimeoutRetryBase: defaults.TimeoutRetryBase, TimeoutRetryMax: defaults.TimeoutRetryMax}}
+	}{ImageRuntimeConfig: service.ImageRuntimeConfig{StorageUploadConcurrency: defaults.StorageUploadConcurrency, FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds, TimeoutRetries: defaults.TimeoutRetries, TimeoutRetryBase: defaults.TimeoutRetryBase, TimeoutRetryMax: defaults.TimeoutRetryMax}}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
 		return
@@ -687,21 +692,39 @@ func SaveImageStorage(c *gin.Context) {
 	var input struct {
 		Profile     model.ImageStorageProfile        `json:"profile"`
 		Credentials *service.ImageStorageCredentials `json:"credentials"`
+		Revision    *int64                           `json:"revision"`
 	}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
 		return
 	}
-	profile, err := service.SaveImageStorageProfile(c.Request.Context(), input.Profile, input.Credentials)
+	profile, revision, err := service.SaveImageStorageChannel(c.Request.Context(), input.Profile, input.Credentials, "", input.Revision)
 	if err != nil {
-		imageManagementError(c, 400, errors.New("Image storage configuration is invalid or unavailable"))
+		imageStorageWriteError(c, err)
 		return
 	}
-	imageManagementData(c, profile)
+	// Preserve the legacy endpoint response when no revision was supplied.
+	if input.Revision == nil {
+		imageManagementData(c, profile)
+		return
+	}
+	imageManagementData(c, gin.H{"profile": profile, "storage_revision": revision})
 }
 
 func TestImageStorage(c *gin.Context) {
-	ctx := c.Request.Context()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	cfg, err := service.GetImageRuntimeConfig(ctx)
+	if err != nil {
+		imageManagementError(c, 503, errors.New("Image storage is unavailable"))
+		return
+	}
+	ctx, release, err := service.AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		imageManagementError(c, 503, errors.New("Image storage is busy"))
+		return
+	}
+	defer release()
 	var profile model.ImageStorageProfile
 	if err := model.DB.WithContext(ctx).Where("profile_id = ?", c.Param("profile_id")).Take(&profile).Error; err != nil {
 		imageManagementError(c, 404, errors.New("Image storage profile was not found"))
@@ -729,10 +752,10 @@ func TestImageStorage(c *gin.Context) {
 		deleteErr = model.DB.WithContext(ctx).Model(&model.ImageStorageObject{}).Where("object_id = ?", object.ObjectId).Update("status", "deleted").Error
 	}
 	if writeErr != nil || deleteErr != nil {
-		imageManagementError(c, 503, errors.New("Image storage read/write/delete test failed; its cleanup intent is retained"))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "Image storage read/write/delete test failed; its cleanup intent is retained", "data": gin.H{"write": writeErr == nil, "read": writeErr == nil, "delete": deleteErr == nil}})
 		return
 	}
-	imageManagementData(c, gin.H{"write": true, "read": true, "delete": true})
+	imageManagementData(c, gin.H{"write": true, "read": true, "delete": true, "physical_cleanup_supported": store.PhysicalDeletionSupported(ctx) == nil})
 }
 
 func GetTokenImageMappings(c *gin.Context) {

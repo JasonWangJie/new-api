@@ -3,9 +3,12 @@ package controller
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -40,6 +44,325 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestImageStorageChannelCompatibility(t *testing.T) {
+	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
+	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
+	previousDB, previousType := model.DB, common.MainDatabaseType()
+	model.DB = db
+	common.SetMainDatabaseType(common.DatabaseType(dialect))
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousType)
+		connection, err := db.DB()
+		if assert.NoError(t, err) {
+			assert.NoError(t, connection.Close())
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.Option{}, &model.ImageStorageProfile{}))
+	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "storage:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "storage")
+	legacy := model.ImageStorageProfile{ProfileId: "legacy-storage", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir(), Active: true}
+	require.NoError(t, db.Create(&model.ImageStorageProfile{ProfileId: "older-active-storage", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir(), Active: true}).Error)
+	require.NoError(t, db.Create(&legacy).Error)
+	require.NoError(t, os.WriteFile(filepath.Join(legacy.Root, "old.png"), []byte("old-bytes"), 0600))
+	for range 2 {
+		require.NoError(t, model.MigrateImageStorageChannels(db.WithContext(t.Context())))
+	}
+	require.NoError(t, db.Where("profile_id = ?", legacy.ProfileId).Take(&legacy).Error)
+	assert.Equal(t, legacy.ProfileId, legacy.ChannelId)
+	assert.Empty(t, legacy.Namespace)
+	assert.True(t, legacy.CurrentRevision)
+	var older model.ImageStorageProfile
+	require.NoError(t, db.Where("profile_id = ?", "older-active-storage").Take(&older).Error)
+	assert.False(t, older.Active, "migration keeps the same latest active row the old reader selected")
+	store, err := service.OpenImageStorage(t.Context(), legacy)
+	require.NoError(t, err)
+	data, err := store.Read(t.Context(), "old.png", 100)
+	require.NoError(t, err)
+	assert.Equal(t, "old-bytes", string(data))
+	revision := int64(0)
+	created, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "New channel", Class: "temporary", Backend: "local", Provider: "local", Root: t.TempDir()}, nil, "", &revision)
+	require.NoError(t, err)
+	assert.False(t, created.Active)
+	assert.NotEmpty(t, created.Namespace)
+	current, err := service.GetImageStorage(t.Context(), "temporary")
+	require.NoError(t, err)
+	assert.Equal(t, legacy.ProfileId, current.Profile.ProfileId)
+	request := func(path string, input any) *httptest.ResponseRecorder {
+		encoded, err := common.Marshal(input)
+		require.NoError(t, err)
+		router := gin.New()
+		router.POST("/storage/:profile_id/activate", func(c *gin.Context) { SetImageStorageActive(c, true) })
+		router.POST("/storage/:profile_id/deactivate", func(c *gin.Context) { SetImageStorageActive(c, false) })
+		router.POST("/storage/:profile_id/credentials", RotateImageStorageCredentials)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded)))
+		return recorder
+	}
+	assert.Equal(t, http.StatusPreconditionRequired, request("/storage/"+created.ProfileId+"/activate", gin.H{}).Code)
+	response := request("/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, http.StatusConflict, request("/storage/"+legacy.ProfileId+"/activate", gin.H{"revision": revision}).Code)
+	revision++
+	current, err = service.GetImageStorage(t.Context(), "temporary")
+	require.NoError(t, err)
+	assert.Equal(t, created.ProfileId, current.Profile.ProfileId)
+	assert.Equal(t, http.StatusBadRequest, request("/storage/"+created.ProfileId+"/deactivate", gin.H{"revision": revision}).Code, "the only active storage must remain available")
+	created.Name = "Edited channel"
+	edited, revision, err := service.SaveImageStorageChannel(t.Context(), created, nil, created.ProfileId, &revision)
+	require.NoError(t, err)
+	assert.Equal(t, created.ChannelId, edited.ChannelId)
+	assert.NotEqual(t, created.ProfileId, edited.ProfileId)
+	assert.True(t, edited.Active)
+	var previous model.ImageStorageProfile
+	require.NoError(t, db.Where("profile_id = ?", created.ProfileId).Take(&previous).Error)
+	assert.False(t, previous.CurrentRevision)
+	assert.False(t, previous.Active)
+	assert.Equal(t, http.StatusConflict, request("/storage/"+created.ProfileId+"/activate", gin.H{"revision": revision}).Code)
+	data, err = store.Read(t.Context(), "old.png", 100)
+	require.NoError(t, err)
+	assert.Equal(t, "old-bytes", string(data), "activation must not relocate old objects")
+
+	credentials := &service.ImageStorageCredentials{AccessKey: "test-access", SecretKey: "test-secret"}
+	r2, revision, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Name: "R2", Class: "temporary", Backend: "s3", Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "images"}, credentials, "", &revision)
+	require.NoError(t, err)
+	assert.Equal(t, "auto", r2.Region)
+	r2.Name = "R2 renamed"
+	r2new, revision, err := service.SaveImageStorageChannel(t.Context(), r2, &service.ImageStorageCredentials{}, r2.ProfileId, &revision)
+	require.NoError(t, err)
+	for _, profile := range []model.ImageStorageProfile{r2, r2new} {
+		payload, err := service.DecryptImagePayload(profile.CredentialCipher, "storage:"+profile.ProfileId)
+		require.NoError(t, err)
+		var actual service.ImageStorageCredentials
+		require.NoError(t, common.Unmarshal(payload, &actual))
+		assert.Equal(t, *credentials, actual)
+	}
+	changedEndpoint := r2new
+	changedEndpoint.Endpoint = "https://different.example.test"
+	_, _, err = service.SaveImageStorageChannel(t.Context(), changedEndpoint, nil, r2new.ProfileId, &revision)
+	require.Error(t, err)
+	rotation := request("/storage/"+r2new.ProfileId+"/credentials", gin.H{"revision": revision, "credentials": service.ImageStorageCredentials{AccessKey: "rotated-access", SecretKey: "rotated-secret"}})
+	require.Equal(t, http.StatusOK, rotation.Code, rotation.Body.String())
+	assert.NotContains(t, rotation.Body.String(), "rotated-secret")
+	profiles, err := model.ImageStorageChannelProfiles(t.Context(), r2.ChannelId)
+	require.NoError(t, err)
+	require.Len(t, profiles, 2)
+	for _, profile := range profiles {
+		payload, err := service.DecryptImagePayload(profile.CredentialCipher, "storage:"+profile.ProfileId)
+		require.NoError(t, err)
+		assert.Contains(t, string(payload), "rotated-secret")
+	}
+
+	t.Run("concurrent activation has one revision winner", func(t *testing.T) {
+		revision, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		results := make(chan error, 2)
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		for range 2 {
+			root := t.TempDir()
+			workers.Go(func() {
+				<-start
+				_, _, err := service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Class: "temporary", Backend: "local", Provider: "local", Root: root, Active: true}, nil, "", &revision)
+				results <- err
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		accepted, rejected := 0, 0
+		for err := range results {
+			if err == nil {
+				accepted++
+			} else {
+				require.ErrorIs(t, err, model.ErrOptionRevisionConflict)
+				rejected++
+			}
+		}
+		assert.Equal(t, 1, accepted)
+		assert.Equal(t, 1, rejected)
+		var active int64
+		require.NoError(t, db.Model(&model.ImageStorageProfile{}).Where("class = ? AND active = ?", "temporary", true).Count(&active).Error)
+		assert.EqualValues(t, 1, active)
+	})
+	t.Run("channel snapshot pairs rows with their revision without writing", func(t *testing.T) {
+		before, beforeRevision, err := model.GetImageStorageChannelSnapshot(t.Context())
+		require.NoError(t, err)
+		activeIndex := slices.IndexFunc(before, func(profile model.ImageStorageProfile) bool {
+			return profile.Class == "temporary" && profile.Active
+		})
+		require.NotEqual(t, -1, activeIndex)
+		previousActive := before[activeIndex].ProfileId
+		root := t.TempDir()
+		start := make(chan struct{})
+		var saved model.ImageStorageProfile
+		var observed []model.ImageStorageProfile
+		var savedRevision, observedRevision int64
+		var saveErr, readErr error
+		var workers sync.WaitGroup
+		workers.Go(func() {
+			<-start
+			saved, savedRevision, saveErr = service.SaveImageStorageChannel(t.Context(), model.ImageStorageProfile{Class: "temporary", Backend: "local", Provider: "local", Root: root, Active: true}, nil, "", &beforeRevision)
+		})
+		workers.Go(func() {
+			<-start
+			observed, observedRevision, readErr = model.GetImageStorageChannelSnapshot(t.Context())
+		})
+		close(start)
+		workers.Wait()
+		require.NoError(t, saveErr)
+		require.NoError(t, readErr)
+		assert.Equal(t, beforeRevision+1, savedRevision)
+		activeIndex = slices.IndexFunc(observed, func(profile model.ImageStorageProfile) bool {
+			return profile.Class == "temporary" && profile.Active
+		})
+		require.NotEqual(t, -1, activeIndex)
+		switch observedRevision {
+		case beforeRevision:
+			assert.Equal(t, previousActive, observed[activeIndex].ProfileId)
+		case savedRevision:
+			assert.Equal(t, saved.ProfileId, observed[activeIndex].ProfileId)
+		default:
+			t.Fatalf("snapshot returned unrelated storage revision %d", observedRevision)
+		}
+		after, afterRevision, err := model.GetImageStorageChannelSnapshot(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, savedRevision, afterRevision)
+		assert.True(t, slices.ContainsFunc(after, func(profile model.ImageStorageProfile) bool {
+			return profile.ProfileId == saved.ProfileId && profile.Active
+		}))
+		persistedRevision, err := model.GetImageStorageRevision(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, savedRevision, persistedRevision, "reading settings must not invalidate an open administrator form")
+	})
+
+	t.Run("deletion is bounded and verifies with HEAD", func(t *testing.T) {
+		var mu sync.Mutex
+		var methods []string
+		mode := "missing"
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			methods = append(methods, r.Method)
+			if r.URL.Query().Has("versioning") {
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`))
+				return
+			}
+			assert.Contains(t, r.URL.Path, "/"+r2new.Namespace+"/picture.png")
+			if mode == "unavailable" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			if r.Method == http.MethodHead && mode == "missing" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+		previousTransport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = previousTransport }()
+		profile := r2new
+		profile.Endpoint, profile.PathStyle = server.URL, true
+		store, err := service.OpenImageStorage(t.Context(), profile)
+		require.NoError(t, err)
+		budgetCalls := 0
+		ctx := service.WithImageStorageRequestBudget(t.Context(), func(context.Context) error { budgetCalls++; return nil })
+		require.NoError(t, store.Delete(ctx, "picture.png"))
+		assert.Equal(t, []string{http.MethodDelete, http.MethodHead}, methods)
+		assert.Equal(t, 2, budgetCalls)
+		require.ErrorIs(t, store.PhysicalDeletionSupported(ctx), service.ErrImageStorageVersioned)
+		mu.Lock()
+		methods = nil
+		mode = "unavailable"
+		mu.Unlock()
+		require.Error(t, store.Delete(ctx, "picture.png"))
+		assert.Equal(t, []string{http.MethodDelete}, methods, "cleanup retries belong to the persistent job, not the SDK")
+	})
+	t.Run("local deletion respects cancellation before touching bytes", func(t *testing.T) {
+		blocked := service.WithImageStorageRequestBudget(t.Context(), func(context.Context) error { return context.Canceled })
+		require.ErrorIs(t, store.Delete(blocked, "old.png"), context.Canceled)
+		_, err := os.Stat(filepath.Join(legacy.Root, "old.png"))
+		require.NoError(t, err)
+		calls := 0
+		allowed := service.WithImageStorageRequestBudget(t.Context(), func(context.Context) error { calls++; return nil })
+		require.NoError(t, store.Delete(allowed, "old.png"))
+		assert.Equal(t, 1, calls)
+	})
+	t.Run("old confirmed intents protect publication handoff", func(t *testing.T) {
+		require.NoError(t, db.AutoMigrate(&model.User{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.AsyncImageTask{}, &model.AsyncImageResult{}, &model.ImageLibraryItem{}, &model.ImagePublication{}, &model.ImageInputObject{}, &model.ImageInputAlias{}, &model.ImageInputTaskReference{}))
+		owner := model.User{Username: "publication-owner", AffCode: "publication-owner"}
+		require.NoError(t, db.Create(&owner).Error)
+		var encoded bytes.Buffer
+		require.NoError(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+		bitmap, err := service.ValidateImageBytes(encoded.Bytes(), "image/png", 1024, 10)
+		require.NoError(t, err)
+		for _, purpose := range []string{"durable", "temporary"} {
+			t.Run(purpose, func(t *testing.T) {
+				now := time.Now().Unix()
+				profile, err := service.SaveImageStorageProfile(t.Context(), model.ImageStorageProfile{Class: purpose, Backend: "local", Provider: "local", Root: t.TempDir()}, nil)
+				require.NoError(t, err)
+				intent := model.ImageUploadIntent{IntentKey: "old-publication-" + purpose, UserId: owner.Id, ProfileId: profile.ProfileId, ObjectKey: "old-publication.png", Class: purpose, ContentType: bitmap.ContentType, Checksum: bitmap.Checksum, ByteSize: int64(len(bitmap.Data)), Status: "pending", CreatedAt: now - 7*86400}
+				object, err := service.StoreImageIntent(t.Context(), intent, bitmap, now-1)
+				require.NoError(t, err)
+				reason, err := service.ImageCleanupProtectionReason(t.Context(), object)
+				require.NoError(t, err)
+				assert.Equal(t, "reference", reason)
+				_, err = model.ClaimImageObjectDeletion(t.Context(), object.ObjectId, "first-cleaner", now, 60)
+				require.ErrorIs(t, err, model.ErrImageConflict, "bytes must be protected before their owner reference is registered")
+				require.NoError(t, db.Model(&model.ImageUploadIntent{}).Where("intent_key = ?", intent.IntentKey).Update("lease_expires_at", 0).Error)
+				reason, err = service.ImageCleanupProtectionReason(t.Context(), object)
+				require.NoError(t, err)
+				assert.Empty(t, reason)
+				object.ExpiresAt = now + 3600
+				require.NoError(t, db.Model(&model.ImageStorageObject{}).Where("object_id = ?", object.ObjectId).Update("expires_at", object.ExpiresAt).Error)
+				reason, err = service.ImageCleanupProtectionReason(t.Context(), object)
+				require.NoError(t, err)
+				assert.Equal(t, "retention", reason, "an unreferenced object must still honor its own retention period")
+				_, err = model.ClaimImageObjectDeletion(t.Context(), object.ObjectId, "retention-cleaner", now, 60)
+				require.ErrorIs(t, err, model.ErrImageConflict)
+				object.ExpiresAt = now - 1
+				require.NoError(t, db.Model(&model.ImageStorageObject{}).Where("object_id = ?", object.ObjectId).Update("expires_at", object.ExpiresAt).Error)
+				reused, err := service.StoreImageIntent(t.Context(), intent, bitmap, now-1)
+				require.NoError(t, err)
+				assert.Equal(t, object.ObjectId, reused.ObjectId)
+				assert.Equal(t, intent.CreatedAt, reused.CreatedAt, "publication reservation does not rewrite object metadata")
+				_, err = model.ClaimImageObjectDeletion(t.Context(), object.ObjectId, "retry-cleaner", now, 60)
+				require.ErrorIs(t, err, model.ErrImageConflict, "reusing old bytes must renew publication protection")
+				if purpose == "durable" {
+					_, _, err := model.CommitImageLibraryItem(t.Context(), model.ImageLibraryItem{AssetId: "publication-library", UserId: owner.Id, ObjectId: object.ObjectId, SourceKey: "publication-library", Fingerprint: "publication-library", CreatedAt: now, ExpiresAt: now + 3600}, 10, 1<<20, "")
+					require.NoError(t, err)
+				} else {
+					input := model.ImageInputObject{InputId: "publication-input", TokenId: 7, KeyHash: "publication-input", Fingerprint: "publication-input", IntentKey: intent.IntentKey, ByteSize: object.ByteSize, Status: "reserved", LeaseExpiresAt: now + 600, CreatedAt: now, ExpiresAt: now + 3600}
+					require.NoError(t, db.Create(&input).Error)
+					require.NoError(t, model.ConfirmImageInput(t.Context(), input, object, "publication-input-url"))
+				}
+				require.NoError(t, db.Model(&model.ImageUploadIntent{}).Where("intent_key = ?", intent.IntentKey).Update("lease_expires_at", 0).Error)
+				_, err = model.ClaimImageObjectDeletion(t.Context(), object.ObjectId, "referenced-cleaner", now, 60)
+				require.ErrorIs(t, err, model.ErrImageConflict)
+				if purpose == "durable" {
+					require.NoError(t, db.Model(&model.ImageLibraryItem{}).Where("object_id = ?", object.ObjectId).Update("deleted_at", now).Error)
+				} else {
+					require.NoError(t, db.Model(&model.ImageInputObject{}).Where("object_id = ?", object.ObjectId).Update("expires_at", now-1).Error)
+				}
+				_, err = model.ClaimImageObjectDeletion(t.Context(), object.ObjectId, "final-cleaner", now, 60)
+				require.NoError(t, err)
+				_, err = service.StoreImageIntent(t.Context(), intent, bitmap, now-1)
+				require.Error(t, err, "publication cannot revive an object already claimed for deletion")
+				var saved model.ImageUploadIntent
+				require.NoError(t, db.Where("intent_key = ?", intent.IntentKey).Take(&saved).Error)
+				assert.Zero(t, saved.LeaseExpiresAt)
+			})
+		}
+	})
+}
 
 func TestVideoRoutingManagementAPI(t *testing.T) {
 	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")

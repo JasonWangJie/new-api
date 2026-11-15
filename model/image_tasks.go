@@ -21,13 +21,31 @@ const upstreamImageResultEvent = "upstream_result_received"
 // tombstones while removing expired prompt, payload and reference content.
 func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
 	now := time.Now().Unix()
-	taskError := DB.WithContext(ctx).Model(&AsyncImageTask{}).
-		Where("expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
-		Updates(map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}).Error
-	retentionError := DB.WithContext(ctx).Model(&AsyncImageTask{}).
-		Where("request_retain_until > 0 AND request_retain_until <= ? AND request_cipher IS NOT NULL AND status IN ?", now, []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).
-		Update("request_cipher", nil).Error
-	return errors.Join(taskError, retentionError)
+	policies := []struct {
+		condition string
+		statuses  []string
+		updates   map[string]any
+	}{
+		{"expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}},
+		{"request_retain_until > 0 AND request_retain_until <= ? AND status IN ? AND request_cipher IS NOT NULL", []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, map[string]any{"request_cipher": nil}},
+	}
+	var failures []error
+	for _, policy := range policies {
+		var ids []int
+		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where(policy.condition, now, policy.statuses).Order("id").Limit(200).Pluck("id", &ids).Error; err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		// Recheck retention and terminal state after selection so active recovery
+		// remains protected even when it races this bounded maintenance batch.
+		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where("id IN ?", ids).Where(policy.condition, now, policy.statuses).Updates(policy.updates).Error; err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 // AcceptAsyncImageTask serializes admission on its user and Token and commits the task,

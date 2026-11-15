@@ -17,19 +17,62 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 var ErrImageObjectMissing = errors.New("image storage object is missing")
+var ErrImageStorageVersioned = errors.New("physical cleanup is unavailable for versioned storage")
+
+type imageStorageClientIdentity struct {
+	ProfileID   string
+	Endpoint    string
+	Region      string
+	PathStyle   bool
+	Credentials [32]byte
+}
+
+var imageStorageClients = struct {
+	sync.Mutex
+	clients map[imageStorageClientIdentity]*s3.Client
+}{clients: make(map[imageStorageClientIdentity]*s3.Client)}
+
+type imageStorageRequestBudgetKey struct{}
+
+// WithImageStorageRequestBudget applies a request budget to every S3 HTTP request.
+func WithImageStorageRequestBudget(ctx context.Context, acquire func(context.Context) error) context.Context {
+	return context.WithValue(ctx, imageStorageRequestBudgetKey{}, acquire)
+}
+
+type imageStorageTransport struct{}
+
+func imageStorageCleanupOptions(ctx context.Context) func(*s3.Options) {
+	return func(options *s3.Options) {
+		if _, limited := ctx.Value(imageStorageRequestBudgetKey{}).(func(context.Context) error); limited {
+			options.Retryer = aws.NopRetryer{}
+		}
+	}
+}
+
+func (imageStorageTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if acquire, ok := request.Context().Value(imageStorageRequestBudgetKey{}).(func(context.Context) error); ok {
+		if err := acquire(request.Context()); err != nil {
+			return nil, err
+		}
+	}
+	return http.DefaultTransport.RoundTrip(request)
+}
 
 type ImageStorageCredentials struct {
 	AccessKey    string `json:"access_key"`
@@ -80,12 +123,28 @@ func OpenImageStorage(ctx context.Context, profile model.ImageStorageProfile) (*
 	if credential.AccessKey == "" || credential.SecretKey == "" {
 		return nil, errors.New("S3 image storage credentials are required")
 	}
-	store.Client = s3.NewFromConfig(aws.Config{Region: profile.Region, Credentials: credentials.NewStaticCredentialsProvider(credential.AccessKey, credential.SecretKey, credential.SessionToken), HTTPClient: &http.Client{Timeout: 60 * time.Second}, RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired, ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired}, func(options *s3.Options) {
+	identity := imageStorageClientIdentity{ProfileID: profile.ProfileId, Endpoint: profile.Endpoint, Region: profile.Region, PathStyle: profile.PathStyle, Credentials: sha256.Sum256(profile.CredentialCipher)}
+	imageStorageClients.Lock()
+	defer imageStorageClients.Unlock()
+	if client := imageStorageClients.clients[identity]; client != nil {
+		store.Client = client
+		return store, nil
+	}
+	store.Client = s3.NewFromConfig(aws.Config{Region: profile.Region, Credentials: credentials.NewStaticCredentialsProvider(credential.AccessKey, credential.SecretKey, credential.SessionToken), HTTPClient: &http.Client{Timeout: 60 * time.Second, Transport: imageStorageTransport{}}, RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired, ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired}, func(options *s3.Options) {
 		options.UsePathStyle = profile.PathStyle
 		if profile.Endpoint != "" {
 			options.BaseEndpoint = aws.String(strings.TrimSuffix(profile.Endpoint, "/"))
 		}
 	})
+	// Credential rotation changes the identity. Bound retained clients even when
+	// administrators repeatedly edit channels or many historical revisions exist.
+	if len(imageStorageClients.clients) >= 64 {
+		for key := range imageStorageClients.clients {
+			delete(imageStorageClients.clients, key)
+			break
+		}
+	}
+	imageStorageClients.clients[identity] = store.Client
 	return store, nil
 }
 
@@ -128,6 +187,9 @@ func (store *ImageStorage) LocalPath(key string, createParent bool) (string, err
 	if key == "" || path.IsAbs(key) || path.Clean(key) != key || strings.ContainsAny(key, "\\:\x00") || key == ".." || strings.HasPrefix(key, "../") {
 		return "", errors.New("invalid image object key")
 	}
+	if store.Profile.Namespace != "" {
+		key = path.Join(store.Profile.Namespace, key)
+	}
 	root := store.Profile.Root
 	target := filepath.Join(root, filepath.FromSlash(key))
 	relative, err := filepath.Rel(root, target)
@@ -163,7 +225,9 @@ func (store *ImageStorage) LocalPath(key string, createParent bool) (string, err
 	return target, nil
 }
 
-func (store *ImageStorage) Key(key string) string { return path.Join(store.Profile.Prefix, key) }
+func (store *ImageStorage) Key(key string) string {
+	return path.Join(store.Profile.Prefix, store.Profile.Namespace, key)
+}
 
 // OpenS3Object opens a private S3 object with the configured storage credentials.
 // A negative length means storage did not return Content-Length. The caller
@@ -296,6 +360,11 @@ func (store *ImageStorage) Put(ctx context.Context, key string, image ImageBytes
 
 func (store *ImageStorage) Delete(ctx context.Context, key string) error {
 	if store.Profile.Backend == "local" {
+		if acquire, ok := ctx.Value(imageStorageRequestBudgetKey{}).(func(context.Context) error); ok {
+			if err := acquire(ctx); err != nil {
+				return err
+			}
+		}
 		filename, err := store.LocalPath(key, false)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -307,21 +376,121 @@ func (store *ImageStorage) Delete(ctx context.Context, key string) error {
 			return err
 		}
 	} else {
-		if _, err := store.Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(store.Profile.Bucket), Key: aws.String(store.Key(key))}); err != nil {
+		if _, err := store.Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(store.Profile.Bucket), Key: aws.String(store.Key(key))}, imageStorageCleanupOptions(ctx)); err != nil {
 			return err
 		}
 	}
-	_, err := store.Read(ctx, key, 1)
-	if errors.Is(err, ErrImageObjectMissing) {
+	if store.Profile.Backend == "local" {
 		return nil
 	}
-	if err == nil {
-		return errors.New("deleted image still exists")
+	_, err := store.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(store.Profile.Bucket), Key: aws.String(store.Key(key))}, imageStorageCleanupOptions(ctx))
+	var apiError smithy.APIError
+	if errors.As(err, &apiError) && (apiError.ErrorCode() == "NoSuchKey" || apiError.ErrorCode() == "NotFound") {
+		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return errors.New("deleted image still exists")
+}
+
+// PhysicalDeletionSupported refuses S3 buckets whose DELETE only adds markers.
+func (store *ImageStorage) PhysicalDeletionSupported(ctx context.Context) error {
+	endpoint, _ := url.Parse(store.Profile.Endpoint)
+	if store.Profile.Backend == "local" || store.Profile.Provider == "r2" && endpoint != nil && strings.HasSuffix(endpoint.Hostname(), ".r2.cloudflarestorage.com") {
+		return nil
+	}
+	versioning, err := store.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(store.Profile.Bucket)}, imageStorageCleanupOptions(ctx))
+	if err != nil {
+		return fmt.Errorf("storage versioning could not be verified: %w", err)
+	}
+	if versioning.Status == s3types.BucketVersioningStatusEnabled || versioning.Status == s3types.BucketVersioningStatusSuspended {
+		return ErrImageStorageVersioned
+	}
+	return nil
 }
 
 func SaveImageStorageProfile(ctx context.Context, profile model.ImageStorageProfile, credential *ImageStorageCredentials) (model.ImageStorageProfile, error) {
+	profile, _, err := SaveImageStorageChannel(ctx, profile, credential, "", nil)
+	return profile, err
+}
+
+// SaveImageStorageChannel creates an immutable location revision; object refs never move.
+func SaveImageStorageChannel(ctx context.Context, profile model.ImageStorageProfile, credential *ImageStorageCredentials, previousID string, expected *int64) (model.ImageStorageProfile, int64, error) {
+	var saved model.ImageStorageProfile
+	revision, err := model.WithImageStorageRevision(ctx, expected, func(tx *gorm.DB) error {
+		var previous model.ImageStorageProfile
+		if previousID != "" {
+			if err := tx.Where("profile_id = ?", previousID).Take(&previous).Error; err != nil {
+				return err
+			}
+			if !previous.CurrentRevision {
+				return model.ErrOptionRevisionConflict
+			}
+			if profile.Class != previous.Class {
+				return errors.New("storage purpose cannot be changed")
+			}
+			profile.Active = previous.Active
+		}
+		profile.ChannelId = previous.ChannelId
+		if profile.ChannelId == "" {
+			profile.ChannelId = "isc_" + common.GetUUID()
+		}
+		profile.Id = 0
+		profile.ProfileId = "isp_" + common.GetUUID()
+		profile.Namespace = profile.ProfileId
+		profile.CurrentRevision = true
+		profile.CreatedAt = time.Now().Unix()
+		profile.CredentialCipher = nil
+		profile.Name = strings.TrimSpace(profile.Name)
+		if profile.Name == "" {
+			profile.Name = strings.TrimSpace(profile.Provider + " " + profile.Class)
+		}
+		if !utf8.ValidString(profile.Name) || utf8.RuneCountInString(profile.Name) > 120 {
+			return errors.New("storage name exceeds supported limits")
+		}
+		if credential != nil && credential.AccessKey == "" && credential.SecretKey == "" && credential.SessionToken == "" {
+			credential = nil
+		}
+		if credential == nil && previousID != "" && profile.Backend == "s3" {
+			if profile.Endpoint != previous.Endpoint || profile.Provider != previous.Provider {
+				return errors.New("changing storage endpoint requires credentials")
+			}
+			data, err := DecryptImagePayload(previous.CredentialCipher, "storage:"+previous.ProfileId)
+			if err != nil {
+				return err
+			}
+			credential = &ImageStorageCredentials{}
+			if err := common.Unmarshal(data, credential); err != nil {
+				return err
+			}
+		}
+		var err error
+		profile, err = prepareImageStorageProfile(ctx, profile, credential)
+		if err != nil {
+			return err
+		}
+		if previousID != "" {
+			if err := tx.Model(&model.ImageStorageProfile{}).Where("profile_id = ?", previousID).Updates(map[string]any{"current_revision": false, "active": false}).Error; err != nil {
+				return err
+			}
+		}
+		if profile.Active {
+			if err := tx.Model(&model.ImageStorageProfile{}).Where("class = ? AND active = ?", profile.Class, true).Update("active", false).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Create(&profile).Error; err != nil {
+			return err
+		}
+		profile.CredentialConfigured = len(profile.CredentialCipher) > 0
+		saved = profile
+		return nil
+	})
+	return saved, revision, err
+}
+
+func prepareImageStorageProfile(ctx context.Context, profile model.ImageStorageProfile, credential *ImageStorageCredentials) (model.ImageStorageProfile, error) {
 	if profile.Class != "temporary" && profile.Class != "durable" {
 		return profile, errors.New("invalid image storage class")
 	}
@@ -345,15 +514,15 @@ func SaveImageStorageProfile(ctx context.Context, profile model.ImageStorageProf
 			return profile, errors.New("an explicit HTTPS endpoint is required for this storage provider")
 		}
 	}
+	if profile.Provider == "r2" && profile.Region == "" {
+		profile.Region = "auto"
+	}
 	if profile.Prefix != "" && (path.Clean(profile.Prefix) != profile.Prefix || strings.HasPrefix(profile.Prefix, "/") || strings.Contains(profile.Prefix, "..") || strings.ContainsAny(profile.Prefix, "\\:\x00")) {
 		return profile, errors.New("invalid image storage prefix")
 	}
 	if profile.Provider == "superbed" {
 		return profile, errors.New("Superbed is not supported")
 	}
-	profile.Id = 0
-	profile.ProfileId = "isp_" + common.GetUUID()
-	profile.CreatedAt = time.Now().Unix()
 	if credential != nil {
 		data, err := common.Marshal(credential)
 		if err != nil {
@@ -367,15 +536,7 @@ func SaveImageStorageProfile(ctx context.Context, profile model.ImageStorageProf
 	if _, err := OpenImageStorage(ctx, profile); err != nil {
 		return profile, err
 	}
-	err := model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if profile.Active {
-			if err := tx.Model(&model.ImageStorageProfile{}).Where("class = ? AND active = ?", profile.Class, true).Update("active", false).Error; err != nil {
-				return err
-			}
-		}
-		return tx.Create(&profile).Error
-	})
-	return profile, err
+	return profile, nil
 }
 
 func ImageObjectURL(ctx context.Context, object model.ImageStorageObject, base string, seconds int) (string, error) {
@@ -430,6 +591,20 @@ func VerifyImageObjectSignature(objectId, expires, keyId, signature string) bool
 // StoreImageIntent records the deterministic identity before external I/O.
 // Every retry uses that same profile/key and confirms its complete bytes.
 func StoreImageIntent(ctx context.Context, intent model.ImageUploadIntent, image ImageBytes, expiresAt int64) (model.ImageStorageObject, error) {
+	if !ImageStorageUploadReserved(ctx) {
+		cfg, err := GetImageRuntimeConfig(ctx)
+		if err != nil {
+			return model.ImageStorageObject{}, err
+		}
+		operation, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+		defer cancel()
+		reserved, release, err := AcquireImageStorageUpload(operation, cfg)
+		if err != nil {
+			return model.ImageStorageObject{}, err
+		}
+		defer release()
+		ctx = reserved
+	}
 	result := model.DB.WithContext(ctx).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "intent_key"}}, DoNothing: true}).Create(&intent)
 	if result.Error != nil {
 		return model.ImageStorageObject{}, result.Error
@@ -441,11 +616,10 @@ func StoreImageIntent(ctx context.Context, intent model.ImageUploadIntent, image
 	if saved.Checksum != image.Checksum || saved.ByteSize != int64(len(image.Data)) || saved.ProfileId != intent.ProfileId || saved.ObjectKey != intent.ObjectKey {
 		return model.ImageStorageObject{}, model.ErrImageConflict
 	}
-	// A confirmed object is immutable. Reuse it without taking an upload lease
-	// or writing again, including concurrent deferred publication syncs.
+	// A confirmed object is immutable. Reserve only its publication handoff,
+	// under the same object lock as cleanup; never rewrite the physical bytes.
 	if saved.Status == "confirmed" {
-		var existing model.ImageStorageObject
-		err := model.DB.WithContext(ctx).Where("identity_hash = ? AND status = ?", ImageIdentityHash(saved.ProfileId, saved.ObjectKey), "active").Take(&existing).Error
+		existing, err := model.ReserveConfirmedImagePublication(ctx, saved, ImageIdentityHash(saved.ProfileId, saved.ObjectKey), time.Now().Unix())
 		if err != nil {
 			return existing, err
 		}
@@ -467,7 +641,7 @@ func StoreImageIntent(ctx context.Context, intent model.ImageUploadIntent, image
 		return existing, nil
 	}
 	lease := common.GetUUID()
-	claim := model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Where("id = ? AND status IN ? AND lease_expires_at <= ?", saved.Id, []string{"pending", "confirmed", "uploading"}, time.Now().Unix()).Updates(map[string]any{"status": "uploading", "lease_token": lease, "lease_expires_at": time.Now().Unix() + 720})
+	claim := model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Where("id = ? AND status IN ? AND lease_expires_at <= ?", saved.Id, []string{"pending", "uploading"}, time.Now().Unix()).Updates(map[string]any{"status": "uploading", "lease_token": lease, "lease_expires_at": time.Now().Unix() + 720})
 	if claim.Error != nil {
 		return model.ImageStorageObject{}, claim.Error
 	}
@@ -483,7 +657,7 @@ func StoreImageIntent(ctx context.Context, intent model.ImageUploadIntent, image
 		return object, err
 	}
 	err = model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		confirmation := tx.Model(&model.ImageUploadIntent{}).Where("id = ? AND lease_token = ? AND status = ?", saved.Id, lease, "uploading").Updates(map[string]any{"status": "confirmed", "lease_token": "", "lease_expires_at": 0})
+		confirmation := tx.Model(&model.ImageUploadIntent{}).Where("id = ? AND lease_token = ? AND status = ?", saved.Id, lease, "uploading").Updates(map[string]any{"status": "confirmed", "lease_token": "", "lease_expires_at": time.Now().Unix() + model.ImagePublicationLeaseSeconds})
 		if confirmation.Error != nil {
 			return confirmation.Error
 		}

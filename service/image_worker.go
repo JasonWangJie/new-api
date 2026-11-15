@@ -197,11 +197,6 @@ func StartAsyncImageWorkers(parent context.Context) context.CancelFunc {
 			if err := RebuildAsyncImageQueue(ctx); err != nil && ctx.Err() == nil {
 				common.SysError("image recovery is waiting for database or Redis availability")
 			}
-			if current, err := GetImageRuntimeConfig(ctx); err == nil {
-				if err := MaintainImageStorage(ctx, current); err != nil && ctx.Err() == nil {
-					common.SysError("image storage maintenance is waiting for database or storage availability")
-				}
-			}
 		})
 	})
 	asyncImageWorkerPools.Lock()
@@ -1520,6 +1515,13 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 }
 
 func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg ImageRuntimeConfig) error {
+	ctx, release, err := AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+	defer cancel()
 	if task.Status != model.ImageTaskUploading {
 		if err := model.TransitionImageTask(ctx, *task, map[string]any{"status": model.ImageTaskUploading, "progress": 70}, "uploading", "", ""); err != nil {
 			return err
@@ -1528,8 +1530,11 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return err
 		}
 	}
-	var staging []model.AsyncImageStagingObject
-	if err := model.DB.WithContext(ctx).Where("task_id = ?", task.TaskId).Order("image_index").Find(&staging).Error; err != nil {
+	var staging []struct {
+		model.AsyncImageStagingObject
+		ByteSize int64
+	}
+	if err := model.DB.WithContext(ctx).Model(&model.AsyncImageStagingObject{}).Select("id, task_id, image_index, content_type, checksum, LENGTH(data) AS byte_size").Where("task_id = ?", task.TaskId).Order("image_index").Find(&staging).Error; err != nil {
 		return err
 	}
 	if len(staging) != task.ImageCount || len(staging) == 0 {
@@ -1545,7 +1550,7 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			return err
 		}
 		for i, image := range staging {
-			intents = append(intents, model.ImageUploadIntent{IntentKey: ImageIdentityHash("async-result", task.TaskId, strconv.Itoa(i)), TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ImageIndex: i, Class: "temporary", ProfileId: store.Profile.ProfileId, ObjectKey: ImageResultObjectKey(*task, i, image.ContentType), ContentType: image.ContentType, ByteSize: int64(len(image.Data)), Checksum: image.Checksum, Status: "pending", CreatedAt: time.Now().Unix()})
+			intents = append(intents, model.ImageUploadIntent{IntentKey: ImageIdentityHash("async-result", task.TaskId, strconv.Itoa(i)), TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ImageIndex: i, Class: "temporary", ProfileId: store.Profile.ProfileId, ObjectKey: ImageResultObjectKey(*task, i, image.ContentType), ContentType: image.ContentType, ByteSize: image.ByteSize, Checksum: image.Checksum, Status: "pending", CreatedAt: time.Now().Unix()})
 		}
 		if err := model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for _, intent := range intents {
@@ -1565,7 +1570,11 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		return model.ErrImageConflict
 	}
 	results := make([]model.AsyncImageResult, len(staging))
-	for i, saved := range staging {
+	for i, metadata := range staging {
+		var saved model.AsyncImageStagingObject
+		if err := model.DB.WithContext(ctx).Where("id = ? AND task_id = ?", metadata.Id, task.TaskId).Take(&saved).Error; err != nil {
+			return err
+		}
 		image, err := validateStoredImageBytes(saved.Data, saved.ContentType, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 		if err != nil {
 			return err

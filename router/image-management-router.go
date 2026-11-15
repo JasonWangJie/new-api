@@ -42,6 +42,10 @@ func setImageManagementRouter(api *gin.RouterGroup) {
 	admin.GET("/image-library/:asset_id/view", read, controller.ViewAdminImageLibraryItem)
 	admin.GET("/image-library/migration", read, controller.ImageLibraryMigration)
 	admin.GET("/image-library/cleanup-jobs", read, controller.ListImageCleanupJobs)
+	admin.GET("/image-library/cleanup-config", read, controller.GetImageCleanupConfig)
+	admin.PUT("/image-library/cleanup-config", manage, controller.SaveImageCleanupConfig)
 	admin.POST("/image-library/cleanup-jobs/preview", manage, controller.PreviewImageCleanup)
 	admin.POST("/image-library/cleanup-jobs", manage, controller.CreateImageCleanup)
+	admin.GET("/image-library/cleanup-jobs/:job_id", read, controller.GetImageCleanupJob)
+	admin.POST("/image-library/cleanup-jobs/:job_id/:action", manage, controller.ControlImageCleanupJob)
 }

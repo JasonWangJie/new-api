@@ -380,6 +380,10 @@ export type ImagePublication = {
 export type CursorPage<T> = { items: T[]; next_cursor: string }
 export type ImageStorageProfile = {
   profile_id: string
+  channel_id?: string
+  name?: string
+  current_revision?: boolean
+  credential_configured?: boolean
   class: string
   backend: string
   provider: string
@@ -419,6 +423,8 @@ export type VideoPluginTemplate = {
   video_profiles: VideoCapability[]
 }
 export type ImageAdminConfiguration = {
+  storage_revision?: number
+  storage_upload_status?: { limit: number; active: number; queued: number }
   mixed_video_billing_expr?: Record<string, string>
   mixed_video_model_billing_expr?: Record<string, string>
   mixed_video_usage_schema?: BillingUsageSchema

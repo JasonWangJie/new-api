@@ -86,11 +86,17 @@ func asyncImageWorkerFixture(t *testing.T) (*gorm.DB, model.AsyncImageTask, Asyn
 	}
 	common.RDB, common.RedisEnabled = client, true
 	entities := []any{&model.MediaRetryPolicyVersion{}, &model.MediaRetryEvent{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.User{}, &model.Token{}, &model.UserSubscription{}, &model.SubscriptionPlan{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.ImageOutbox{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.ImageStorageProfile{}}
+	// Storage scenarios migrate these tables after the base fixture is ready.
+	// Real database subtests share their disposable database, unlike SQLite's
+	// in-memory fixture, so their staged bytes and object identities need reset.
+	storageEntities := []any{&model.AsyncImageStagingObject{}, &model.AsyncImageResult{}, &model.ImageUploadIntent{}, &model.ImageStorageObject{}, &model.ImageLibraryItem{}, &model.ImagePublication{}}
+	require.NoError(t, db.Migrator().DropTable(storageEntities...))
 	t.Cleanup(func() {
 		model.DB, common.RDB, common.RedisEnabled = previousDB, previousRedis, previousEnabled
 		common.SetMainDatabaseType(previousType)
 		ImageChannelCapabilityFunc, EstimateAsyncImageQuotaFunc, ExecuteAsyncImageFunc = previousCapability, previousEstimate, previousExecute
 		assert.NoError(t, client.Close())
+		assert.NoError(t, db.Migrator().DropTable(storageEntities...))
 		assert.NoError(t, db.Migrator().DropTable(entities...))
 		connection, openErr := db.DB()
 		if assert.NoError(t, openErr) {
@@ -6245,6 +6251,7 @@ func TestAsyncImageLocalStorageAndDurableIntentRetry(t *testing.T) {
 	require.NoError(t, err)
 	model.DB = db
 	t.Cleanup(func() { model.DB = previousDB; sqlDB, _ := db.DB(); _ = sqlDB.Close() })
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
 	require.NoError(t, model.MigrateImageModels(db))
 	require.NoError(t, model.MigrateImageModels(db))
 	profile, err := SaveImageStorageProfile(context.Background(), model.ImageStorageProfile{Class: "temporary", Backend: "local", Root: t.TempDir(), Active: true}, nil)

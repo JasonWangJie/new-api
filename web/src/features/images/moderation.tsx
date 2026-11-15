@@ -29,7 +29,6 @@ import { SectionPageLayout } from '@/components/layout'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
@@ -37,6 +36,7 @@ import { hasPermission } from '@/lib/admin-permissions'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { imageRequest } from './api'
+import { ImageCleanupPanel } from './components/image-cleanup-settings'
 import { ImageResults } from './components/image-results'
 import { ImageSelect } from './components/image-select'
 import { imageLabel } from './lib/image-labels'
@@ -103,14 +103,6 @@ export function ImageModeration() {
     null
   )
   const [metadata, setMetadata] = useState('')
-  const [scope, setScope] = useState('expired')
-  const [cleanupUser, setCleanupUser] = useState('')
-  const [cleanupPreview, setCleanupPreview] = useState<{
-    matched_items: number
-    matched_bytes: number
-    preview_fingerprint: string
-  } | null>(null)
-  const [cleanupConfirm, setCleanupConfirm] = useState(false)
   const [feedback, setFeedback] = useState<
     { id: string; status: string; reason?: string }[]
   >([])
@@ -119,6 +111,7 @@ export function ImageModeration() {
     MODERATION_TABS[0]
   const list = useQuery({
     queryKey: ['image-moderation', user?.id, tab, status, cursor],
+    enabled: tab !== 'cleanup-jobs',
     queryFn: ({ signal }) =>
       imageRequest<CursorPage<ModerationRow | AssetRow>>(
         `${active.path}?${new URLSearchParams({ status, cursor, limit: '30' })}`,
@@ -388,41 +381,6 @@ export function ImageModeration() {
       setBusy(false)
     }
   }
-  const previewCleanup = async () => {
-    try {
-      setCleanupPreview(
-        await imageRequest(
-          '/api/admin/image-library/cleanup-jobs/preview',
-          'POST',
-          { scope, filters: { user_id: cleanupUser ? Number(cleanupUser) : 0 } }
-        )
-      )
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    }
-  }
-  const createCleanup = async () => {
-    if (!cleanupPreview) return
-    setBusy(true)
-    try {
-      await imageRequest('/api/admin/image-library/cleanup-jobs', 'POST', {
-        scope,
-        filters: { user_id: cleanupUser ? Number(cleanupUser) : 0 },
-        preview_fingerprint: cleanupPreview.preview_fingerprint,
-      })
-      setCleanupConfirm(false)
-      setCleanupPreview(null)
-      await list.refetch()
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t('Image request failed')
-      )
-    } finally {
-      setBusy(false)
-    }
-  }
   return (
     <SectionPageLayout>
       <SectionPageLayout.Title>{t('Image Moderation')}</SectionPageLayout.Title>
@@ -473,186 +431,140 @@ export function ImageModeration() {
               ))}
             </TabsList>
           </Tabs>
-          <div className='flex flex-wrap items-end gap-3'>
-            <div className='w-56'>
-              <ImageSelect
-                label={t('Status')}
-                value={status}
-                options={[
-                  { value: '', label: t('All') },
-                  ...[
-                    'pending_review',
-                    'approved_pending_sync',
-                    'synced',
-                    'published',
-                    'hidden',
-                    'rejected',
-                    'withdrawn',
-                    'open',
-                    'resolved',
-                    'dismissed',
-                    'queued',
-                    'running',
-                    'completed',
-                    'completed_with_errors',
-                  ].map((value) => ({ value, label: t(imageLabel(value)) })),
-                ]}
-                onChange={(value) => {
-                  setStatus(value)
-                  setCursor('')
-                  setHistory([])
-                  setSelection({})
-                }}
-              />
-            </div>
-            {canManage && tab === 'publications' && (
-              <>
-                <Button
-                  disabled={!table.getSelectedRowModel().rows.length}
-                  onClick={() =>
-                    openOperation(
-                      table
-                        .getSelectedRowModel()
-                        .rows.map((row) => String(row.original.id)),
-                      'approve'
-                    )
-                  }
-                >
-                  {t('Approve selected')}
-                </Button>
-                <Button
-                  variant='outline'
-                  disabled={!table.getSelectedRowModel().rows.length}
-                  onClick={() =>
-                    openOperation(
-                      table
-                        .getSelectedRowModel()
-                        .rows.map((row) => String(row.original.id)),
-                      'reject'
-                    )
-                  }
-                >
-                  {t('Reject selected')}
-                </Button>
-              </>
-            )}
-          </div>
-          {tab === 'submission-requests' && (
-            <p
-              role='status'
-              className='bg-muted/30 rounded-lg border p-3 text-sm'
-            >
-              {t(
-                'Local submissions contain metadata only. Approval allows later sync; the original image has not been reviewed.'
-              )}
-            </p>
-          )}
-          {list.isError && (
-            <p role='alert' className='text-destructive text-sm'>
-              {list.error.message}
-            </p>
-          )}
-          {feedback.length > 0 && (
-            <div aria-live='polite' className='text-xs'>
-              {feedback.map((result) => (
-                <p key={result.id}>
-                  {result.id}: {t(imageLabel(result.status))} {result.reason}
-                </p>
-              ))}
-            </div>
-          )}
-          <DataTablePage
-            table={table}
-            columns={columns}
-            toolbarProps={null}
-            showPagination={false}
-            isLoading={list.isLoading}
-            isFetching={list.isFetching}
-            emptyTitle={t('No items found')}
-            showMobileBulkActions
-            mobileProps={{
-              enableRowSelection: canManage && tab === 'publications',
-            }}
-          />
-          <div className='flex justify-end gap-2'>
-            <Button
-              variant='outline'
-              disabled={!history.length}
-              onClick={() => {
-                setCursor(history.at(-1) || '')
-                setHistory((previous) => previous.slice(0, -1))
-                setSelection({})
-              }}
-            >
-              {t('Previous')}
-            </Button>
-            <Button
-              variant='outline'
-              disabled={!list.data?.next_cursor}
-              onClick={() => {
-                setHistory((previous) => [...previous, cursor])
-                setCursor(list.data?.next_cursor || '')
-                setSelection({})
-              }}
-            >
-              {t('Next')}
-            </Button>
-          </div>
-          {canManage && tab === 'cleanup-jobs' && (
-            <section className='space-y-3 rounded-xl border p-4'>
-              <h3 className='font-medium'>{t('Clean unreferenced images')}</h3>
-              <div className='grid gap-3 sm:grid-cols-3'>
-                <ImageSelect
-                  label={t('Scope')}
-                  value={scope}
-                  options={[
-                    'expired',
-                    'deleted',
-                    'user',
-                    'async_results',
-                    'all',
-                  ].map((value) => ({ value, label: t(imageLabel(value)) }))}
-                  onChange={(value) => {
-                    setScope(value)
-                    setCleanupPreview(null)
-                  }}
-                />
-                <div className='space-y-2'>
-                  <Label htmlFor='cleanup-user'>{t('User ID')}</Label>
-                  <Input
-                    id='cleanup-user'
-                    type='number'
-                    min={1}
-                    value={cleanupUser}
-                    onChange={(event) => {
-                      setCleanupUser(event.target.value)
-                      setCleanupPreview(null)
+          {tab === 'cleanup-jobs' ? (
+            <ImageCleanupPanel />
+          ) : (
+            <>
+              <div className='flex flex-wrap items-end gap-3'>
+                <div className='w-56'>
+                  <ImageSelect
+                    label={t('Status')}
+                    value={status}
+                    options={[
+                      { value: '', label: t('All') },
+                      ...[
+                        'pending_review',
+                        'approved_pending_sync',
+                        'synced',
+                        'published',
+                        'hidden',
+                        'rejected',
+                        'withdrawn',
+                        'open',
+                        'resolved',
+                        'dismissed',
+                        'queued',
+                        'running',
+                        'completed',
+                        'completed_with_errors',
+                      ].map((value) => ({
+                        value,
+                        label: t(imageLabel(value)),
+                      })),
+                    ]}
+                    onChange={(value) => {
+                      setStatus(value)
+                      setCursor('')
+                      setHistory([])
+                      setSelection({})
                     }}
                   />
                 </div>
-                <Button
-                  variant='outline'
-                  className='self-end'
-                  onClick={() => void previewCleanup()}
-                >
-                  {t('Preview cleanup')}
-                </Button>
+                {canManage && tab === 'publications' && (
+                  <>
+                    <Button
+                      disabled={!table.getSelectedRowModel().rows.length}
+                      onClick={() =>
+                        openOperation(
+                          table
+                            .getSelectedRowModel()
+                            .rows.map((row) => String(row.original.id)),
+                          'approve'
+                        )
+                      }
+                    >
+                      {t('Approve selected')}
+                    </Button>
+                    <Button
+                      variant='outline'
+                      disabled={!table.getSelectedRowModel().rows.length}
+                      onClick={() =>
+                        openOperation(
+                          table
+                            .getSelectedRowModel()
+                            .rows.map((row) => String(row.original.id)),
+                          'reject'
+                        )
+                      }
+                    >
+                      {t('Reject selected')}
+                    </Button>
+                  </>
+                )}
               </div>
-              {cleanupPreview && (
-                <div className='flex items-center justify-between gap-3 text-sm'>
-                  <span>
-                    {cleanupPreview.matched_items} ·{' '}
-                    {(cleanupPreview.matched_bytes / 1048576).toFixed(1)} MiB
-                  </span>
-                  <Button
-                    variant='destructive'
-                    onClick={() => setCleanupConfirm(true)}
-                  >
-                    {t('Create cleanup job')}
-                  </Button>
+              {tab === 'submission-requests' && (
+                <p
+                  role='status'
+                  className='bg-muted/30 rounded-lg border p-3 text-sm'
+                >
+                  {t(
+                    'Local submissions contain metadata only. Approval allows later sync; the original image has not been reviewed.'
+                  )}
+                </p>
+              )}
+              {list.isError && (
+                <p role='alert' className='text-destructive text-sm'>
+                  {list.error.message}
+                </p>
+              )}
+              {feedback.length > 0 && (
+                <div aria-live='polite' className='text-xs'>
+                  {feedback.map((result) => (
+                    <p key={result.id}>
+                      {result.id}: {t(imageLabel(result.status))}{' '}
+                      {result.reason}
+                    </p>
+                  ))}
                 </div>
               )}
-            </section>
+              <DataTablePage
+                table={table}
+                columns={columns}
+                toolbarProps={null}
+                showPagination={false}
+                isLoading={list.isLoading}
+                isFetching={list.isFetching}
+                emptyTitle={t('No items found')}
+                showMobileBulkActions
+                mobileProps={{
+                  enableRowSelection: canManage && tab === 'publications',
+                }}
+              />
+              <div className='flex justify-end gap-2'>
+                <Button
+                  variant='outline'
+                  disabled={!history.length}
+                  onClick={() => {
+                    setCursor(history.at(-1) || '')
+                    setHistory((previous) => previous.slice(0, -1))
+                    setSelection({})
+                  }}
+                >
+                  {t('Previous')}
+                </Button>
+                <Button
+                  variant='outline'
+                  disabled={!list.data?.next_cursor}
+                  onClick={() => {
+                    setHistory((previous) => [...previous, cursor])
+                    setCursor(list.data?.next_cursor || '')
+                    setSelection({})
+                  }}
+                >
+                  {t('Next')}
+                </Button>
+              </div>
+            </>
           )}
           <ConfirmDialog
             open={!!operation}
@@ -679,17 +591,6 @@ export function ImageModeration() {
               maxLength={10000}
             />
           </ConfirmDialog>
-          <ConfirmDialog
-            open={cleanupConfirm}
-            onOpenChange={setCleanupConfirm}
-            title={t('Delete unreferenced image files')}
-            desc={t(
-              'References are checked again before deletion. Deleted files cannot be restored.'
-            )}
-            destructive
-            isLoading={busy}
-            handleConfirm={() => void createCleanup()}
-          />
           {preview && (
             <Dialog
               open

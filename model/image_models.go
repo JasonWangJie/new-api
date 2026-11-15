@@ -236,27 +236,32 @@ type AsyncImageStagingObject struct {
 
 // ImageStorageProfile revisions remain addressable for existing ObjectRefs.
 type ImageStorageProfile struct {
-	Id               int    `json:"id"`
-	ProfileId        string `json:"profile_id" gorm:"size:64;uniqueIndex"`
-	Class            string `json:"class" gorm:"size:16;index"`
-	Backend          string `json:"backend" gorm:"size:16"`
-	Provider         string `json:"provider" gorm:"size:32"`
-	Root             string `json:"root" gorm:"type:text"`
-	Endpoint         string `json:"endpoint" gorm:"type:text"`
-	Region           string `json:"region" gorm:"size:64"`
-	Bucket           string `json:"bucket" gorm:"size:255"`
-	Prefix           string `json:"prefix" gorm:"size:255"`
-	PathStyle        bool   `json:"path_style"`
-	CredentialCipher []byte `json:"-"`
-	Active           bool   `json:"active"`
-	CreatedAt        int64  `json:"created_at" gorm:"type:bigint"`
+	ChannelId            string `json:"channel_id" gorm:"size:64;index"`
+	Name                 string `json:"name" gorm:"size:120"`
+	CurrentRevision      bool   `json:"current_revision"`
+	Namespace            string `json:"namespace,omitempty" gorm:"size:64"`
+	CredentialConfigured bool   `json:"credential_configured" gorm:"-"`
+	Id                   int    `json:"id"`
+	ProfileId            string `json:"profile_id" gorm:"size:64;uniqueIndex"`
+	Class                string `json:"class" gorm:"size:16;index"`
+	Backend              string `json:"backend" gorm:"size:16"`
+	Provider             string `json:"provider" gorm:"size:32"`
+	Root                 string `json:"root" gorm:"type:text"`
+	Endpoint             string `json:"endpoint" gorm:"type:text"`
+	Region               string `json:"region" gorm:"size:64"`
+	Bucket               string `json:"bucket" gorm:"size:255"`
+	Prefix               string `json:"prefix" gorm:"size:255"`
+	PathStyle            bool   `json:"path_style"`
+	CredentialCipher     []byte `json:"-"`
+	Active               bool   `json:"active"`
+	CreatedAt            int64  `json:"created_at" gorm:"type:bigint"`
 }
 
 type ImageStorageObject struct {
-	Id           int    `json:"-"`
+	Id           int    `json:"-" gorm:"index:idx_image_cleanup_scan,priority:3"`
 	ObjectId     string `json:"id" gorm:"size:64;uniqueIndex"`
 	IdentityHash string `json:"-" gorm:"size:64;uniqueIndex"`
-	ProfileId    string `json:"-" gorm:"size:64;index"`
+	ProfileId    string `json:"-" gorm:"size:64;index;index:idx_image_cleanup_scan,priority:1"`
 	Class        string `json:"-" gorm:"size:16"`
 	ObjectKey    string `json:"-" gorm:"size:255"`
 	ContentType  string `json:"content_type" gorm:"size:64"`
@@ -268,7 +273,7 @@ type ImageStorageObject struct {
 	// available for protected reads, imports and recovery.
 	DeliverySource       string `json:"delivery_source,omitempty" gorm:"size:16"`
 	DeliveryURL          string `json:"-" gorm:"type:text"`
-	Status               string `json:"-" gorm:"size:16;index"`
+	Status               string `json:"-" gorm:"size:16;index;index:idx_image_cleanup_scan,priority:2"`
 	DeleteLease          string `json:"-" gorm:"size:64"`
 	DeleteLeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`
 	CreatedAt            int64  `json:"created_at" gorm:"type:bigint"`
@@ -285,8 +290,8 @@ type ImageUploadIntent struct {
 	TokenId        int    `gorm:"index"`
 	ImageIndex     int
 	Class          string `gorm:"size:16"`
-	ProfileId      string `gorm:"size:64"`
-	ObjectKey      string `gorm:"size:255"`
+	ProfileId      string `gorm:"size:64;index:idx_image_intent_location,priority:1"`
+	ObjectKey      string `gorm:"size:255;index:idx_image_intent_location,priority:2,length:96"`
 	ContentType    string `gorm:"size:64"`
 	ByteSize       int64  `gorm:"type:bigint"`
 	Checksum       string `gorm:"size:64"`
@@ -470,22 +475,38 @@ type ImageReport struct {
 }
 
 type ImageCleanupJob struct {
-	Id             int    `json:"id"`
-	JobId          string `json:"job_id" gorm:"size:64;uniqueIndex"`
-	Scope          string `json:"scope" gorm:"size:32"`
-	Filters        string `json:"filters" gorm:"type:text"`
-	Cursor         int    `json:"-"`
-	UserId         int    `json:"user_id"`
-	Status         string `json:"status" gorm:"size:16;index"`
-	LeaseToken     string `json:"-" gorm:"size:64"`
-	LeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`
-	Total          int64  `json:"total"`
-	Processed      int64  `json:"processed"`
-	DeletedBytes   int64  `json:"deleted_bytes" gorm:"type:bigint"`
-	Errors         int64  `json:"errors"`
-	LastError      string `json:"last_error,omitempty" gorm:"type:text"`
-	CreatedAt      int64  `json:"created_at" gorm:"type:bigint"`
-	FinishedAt     int64  `json:"finished_at" gorm:"type:bigint"`
+	Source           string `json:"source" gorm:"size:16"`
+	PreviewToken     string `json:"-" gorm:"type:text"`
+	CutoffAt         int64  `json:"cutoff_at" gorm:"type:bigint"`
+	MaxObjectID      int    `json:"-"`
+	Scanned          int64  `json:"scanned"`
+	Matched          int64  `json:"matched_items"`
+	MatchedBytes     int64  `json:"matched_bytes" gorm:"type:bigint"`
+	Protected        int64  `json:"protected_items"`
+	ReferenceSkipped int64  `json:"reference_skipped"`
+	RetentionSkipped int64  `json:"retention_skipped"`
+	LocationSkipped  int64  `json:"location_skipped"`
+	Deleted          int64  `json:"deleted"`
+	Skipped          int64  `json:"skipped"`
+	NextAttemptAt    int64  `json:"next_attempt_at" gorm:"type:bigint"`
+	Control          string `json:"-" gorm:"size:16"`
+	PolicyID         string `json:"policy_id" gorm:"size:64"`
+	Id               int    `json:"id"`
+	JobId            string `json:"job_id" gorm:"size:64;uniqueIndex"`
+	Scope            string `json:"scope" gorm:"size:32"`
+	Filters          string `json:"filters" gorm:"type:text"`
+	Cursor           int    `json:"-"`
+	UserId           int    `json:"user_id"`
+	Status           string `json:"status" gorm:"size:32;index"`
+	LeaseToken       string `json:"-" gorm:"size:64"`
+	LeaseExpiresAt   int64  `json:"-" gorm:"type:bigint"`
+	Total            int64  `json:"total"`
+	Processed        int64  `json:"processed"`
+	DeletedBytes     int64  `json:"deleted_bytes" gorm:"type:bigint"`
+	Errors           int64  `json:"errors"`
+	LastError        string `json:"last_error,omitempty" gorm:"type:text"`
+	CreatedAt        int64  `json:"created_at" gorm:"type:bigint"`
+	FinishedAt       int64  `json:"finished_at" gorm:"type:bigint"`
 }
 
 type ImageModerationEvent struct {
@@ -501,7 +522,13 @@ func MigrateImageModels(db *gorm.DB) error {
 	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}); err != nil {
 		return err
 	}
-	return db.AutoMigrate(&ImageGroupPolicy{}, &TokenImagePlatformMapping{}, &ImageChannelPool{}, &AsyncImageTask{}, &AsyncImageIdempotency{}, &AsyncImageEvent{}, &ImageOutbox{}, &AsyncImageStagingObject{}, &ImageStorageProfile{}, &ImageStorageObject{}, &ImageUploadIntent{}, &AsyncImageResult{}, &AsyncImageBill{}, &AsyncImageUsageProjection{}, &ImageInputAdmission{}, &ImageUploadAdmissionTicket{}, &ImageInputObject{}, &ImageInputAlias{}, &ImageInputTaskReference{}, &ImageLibraryItem{}, &ImagePublication{}, &ImageSubmissionRequest{}, &ImageReport{}, &ImageCleanupJob{}, &ImageModerationEvent{})
+	if err := db.AutoMigrate(&ImageGroupPolicy{}, &TokenImagePlatformMapping{}, &ImageChannelPool{}, &AsyncImageTask{}, &AsyncImageIdempotency{}, &AsyncImageEvent{}, &ImageOutbox{}, &AsyncImageStagingObject{}, &ImageStorageProfile{}, &ImageStorageObject{}, &ImageUploadIntent{}, &AsyncImageResult{}, &AsyncImageBill{}, &AsyncImageUsageProjection{}, &ImageInputAdmission{}, &ImageUploadAdmissionTicket{}, &ImageInputObject{}, &ImageInputAlias{}, &ImageInputTaskReference{}, &ImageLibraryItem{}, &ImagePublication{}, &ImageSubmissionRequest{}, &ImageReport{}, &ImageCleanupJob{}, &ImageModerationEvent{}); err != nil {
+		return err
+	}
+	if err := MigrateImageCleanupModels(db); err != nil {
+		return err
+	}
+	return MigrateImageStorageChannels(db)
 }
 
 // TransitionImageTask owns the state CAS and its event/outbox transaction.

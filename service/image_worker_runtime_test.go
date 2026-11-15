@@ -7,6 +7,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -165,4 +166,79 @@ func TestAsyncImageWorkerRuntimeStatusTracksLivePool(t *testing.T) {
 	assert.Equal(t, AsyncImageWorkerStatus{Running: true, WorkerConcurrency: 4, ActiveWorkers: 4, RecoveryIntervalSeconds: 15}, GetAsyncImageWorkerStatus())
 	stopSecond()
 	assert.Equal(t, AsyncImageWorkerStatus{}, GetAsyncImageWorkerStatus())
+}
+
+func TestImageStorageUploadCapacityDrainsAndCancels(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		capacity := imageUploadCapacity{limit: 2, changed: make(chan struct{})}
+		first, releaseFirst, err := capacity.acquire(t.Context(), 2, 1)
+		require.NoError(t, err)
+		_, releaseSecond, err := capacity.acquire(t.Context(), 2, 1)
+		require.NoError(t, err)
+		_, nestedRelease, err := capacity.acquire(first, 2, 1)
+		require.NoError(t, err)
+		nestedRelease()
+		assert.Equal(t, 2, capacity.active, "nested writes must share one lease")
+		queuedCtx, cancel := context.WithCancel(t.Context())
+		completed := make(chan error, 1)
+		go func() {
+			_, release, err := capacity.acquire(queuedCtx, 1, 2)
+			if release != nil {
+				release()
+			}
+			completed <- err
+		}()
+		synctest.Wait()
+		assert.Equal(t, 1, capacity.queued)
+		releaseFirst()
+		releaseFirst()
+		synctest.Wait()
+		assert.Equal(t, 1, capacity.active, "shrinking drains in-flight work without cancelling it")
+		assert.Equal(t, 1, capacity.queued)
+		cancel()
+		synctest.Wait()
+		require.ErrorIs(t, <-completed, context.Canceled)
+		assert.Zero(t, capacity.queued)
+		releaseSecond()
+		assert.Zero(t, capacity.active)
+		_, release, err := capacity.acquire(t.Context(), 2, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 1, capacity.limit, "an older task snapshot must not undo a lower limit")
+		release()
+	})
+}
+
+func TestImageStorageUploadQueueBoundAndConfigCompatibility(t *testing.T) {
+	capacity := imageUploadCapacity{limit: 1, changed: make(chan struct{}), queued: 256}
+	_, release, err := capacity.acquire(t.Context(), 1, 0)
+	require.ErrorIs(t, err, ErrImageStorageBusy)
+	assert.Nil(t, release)
+	assert.Zero(t, capacity.active)
+	cfg := DefaultImageRuntimeConfig()
+	require.NoError(t, common.UnmarshalJsonStr(`{"worker_concurrency":150,"image_concurrency":155,"result_retention_days":180,"task_retention_days":180}`, &cfg))
+	require.NoError(t, cfg.Validate())
+	assert.Equal(t, 4, cfg.StorageUploadConcurrency)
+	assert.Equal(t, 180, cfg.ResultRetentionDays)
+	assert.Equal(t, 150, cfg.Workers)
+	for _, limit := range []int{0, 33} {
+		cfg.StorageUploadConcurrency = limit
+		assert.Error(t, cfg.Validate())
+	}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := DefaultImageRuntimeConfig()
+		cfg.UploadTimeout = 5
+		ctx, release, err := AcquireImageStorageUpload(t.Context(), cfg)
+		require.NoError(t, err)
+		defer release()
+		deadline, present := ctx.Deadline()
+		require.True(t, present, "capacity admission must establish a total upload deadline")
+		assert.Equal(t, time.Now().Add(5*time.Second), deadline)
+		nested, releaseNested, err := AcquireImageStorageUpload(ctx, cfg)
+		require.NoError(t, err)
+		defer releaseNested()
+		assert.Same(t, ctx, nested, "nested uploads inherit the original deadline and capacity")
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	})
 }

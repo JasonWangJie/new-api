@@ -457,7 +457,7 @@ func imageDatabaseFixture(t *testing.T) (*gorm.DB, AsyncImageTask, AsyncImageBil
 		initCol()
 		common.RedisEnabled, common.DataExportEnabled, common.LogConsumeEnabled = previousRedis, previousExport, previousLogs
 	})
-	require.NoError(t, db.AutoMigrate(&User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}, &TaskPerfSample{}, &AsyncMediaJob{}, &AsyncMediaEvent{}))
+	require.NoError(t, db.AutoMigrate(&Option{}, &User{}, &Token{}, &Channel{}, &UserSubscription{}, &SubscriptionPlan{}, &QuotaData{}, &TaskPerfSample{}, &AsyncMediaJob{}, &AsyncMediaEvent{}))
 	require.NoError(t, logDB.AutoMigrate(&Log{}))
 	require.NoError(t, MigrateImageLogs(logDB))
 	user := User{Username: "image-test", Quota: 1000, Status: common.UserStatusEnabled}
@@ -1573,4 +1573,153 @@ func TestAsyncImageFailedRequestRetentionDoesNotEraseActiveRecovery(t *testing.T
 	var savedBill AsyncImageBill
 	require.NoError(t, db.Where("task_id = ?", bill.TaskId).Take(&savedBill).Error)
 	assert.Equal(t, bill.Status, savedBill.Status, "payload erasure must not settle or refund money")
+	backlog := make([]AsyncImageTask, 201)
+	for i := range backlog {
+		backlog[i] = AsyncImageTask{TaskId: fmt.Sprintf("cleanup-backlog-%d", i), Status: ImageTaskSucceeded, ExpiresAt: now - 1, RequestCipher: []byte("expired"), PromptSummary: "expired prompt"}
+	}
+	require.NoError(t, db.CreateInBatches(backlog, 50).Error)
+	require.NoError(t, EraseExpiredAsyncImageTaskContent(t.Context()))
+	var remaining int64
+	require.NoError(t, db.Model(&AsyncImageTask{}).Where("task_id LIKE ? AND request_cipher IS NOT NULL", "cleanup-backlog-%").Count(&remaining).Error)
+	assert.EqualValues(t, 1, remaining, "large backlogs yield between bounded write batches")
+	require.NoError(t, EraseExpiredAsyncImageTaskContent(t.Context()))
+	require.NoError(t, db.Model(&AsyncImageTask{}).Where("task_id LIKE ? AND request_cipher IS NOT NULL", "cleanup-backlog-%").Count(&remaining).Error)
+	assert.Zero(t, remaining)
+
+}
+
+// Baseline schema from 9280757f5, before storage-channel and cleanup upgrades.
+type legacyStorageProfile20261114 struct {
+	Id               int    `json:"id"`
+	ProfileId        string `json:"profile_id" gorm:"size:64;uniqueIndex"`
+	Class            string `json:"class" gorm:"size:16;index"`
+	Backend          string `json:"backend" gorm:"size:16"`
+	Provider         string `json:"provider" gorm:"size:32"`
+	Root             string `json:"root" gorm:"type:text"`
+	Endpoint         string `json:"endpoint" gorm:"type:text"`
+	Region           string `json:"region" gorm:"size:64"`
+	Bucket           string `json:"bucket" gorm:"size:255"`
+	Prefix           string `json:"prefix" gorm:"size:255"`
+	PathStyle        bool   `json:"path_style"`
+	CredentialCipher []byte `json:"-"`
+	Active           bool   `json:"active"`
+	CreatedAt        int64  `json:"created_at" gorm:"type:bigint"`
+}
+
+func (legacyStorageProfile20261114) TableName() string { return "image_storage_profiles" }
+
+// Baseline schema from 9280757f5, before storage-channel and cleanup upgrades.
+type legacyStorageObject20261114 struct {
+	Id           int    `json:"-"`
+	ObjectId     string `json:"id" gorm:"size:64;uniqueIndex"`
+	IdentityHash string `json:"-" gorm:"size:64;uniqueIndex"`
+	ProfileId    string `json:"-" gorm:"size:64;index"`
+	Class        string `json:"-" gorm:"size:16"`
+	ObjectKey    string `json:"-" gorm:"size:255"`
+	ContentType  string `json:"content_type" gorm:"size:64"`
+	ByteSize     int64  `json:"byte_size" gorm:"type:bigint"`
+	Checksum     string `json:"checksum" gorm:"size:64"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	// Delivery is selected once per generated image; the original object stays
+	// available for protected reads, imports and recovery.
+	DeliverySource       string `json:"delivery_source,omitempty" gorm:"size:16"`
+	DeliveryURL          string `json:"-" gorm:"type:text"`
+	Status               string `json:"-" gorm:"size:16;index"`
+	DeleteLease          string `json:"-" gorm:"size:64"`
+	DeleteLeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`
+	CreatedAt            int64  `json:"created_at" gorm:"type:bigint"`
+	ExpiresAt            int64  `json:"expires_at" gorm:"type:bigint;index"`
+
+	ResultFileId *string `json:"-" gorm:"size:64;uniqueIndex:idx_image_storage_objects_result_file_id"`
+}
+
+func (legacyStorageObject20261114) TableName() string { return "image_storage_objects" }
+
+// Baseline schema from 9280757f5, before storage-channel and cleanup upgrades.
+type legacyCleanupJob20261114 struct {
+	Id             int    `json:"id"`
+	JobId          string `json:"job_id" gorm:"size:64;uniqueIndex"`
+	Scope          string `json:"scope" gorm:"size:32"`
+	Filters        string `json:"filters" gorm:"type:text"`
+	Cursor         int    `json:"-"`
+	UserId         int    `json:"user_id"`
+	Status         string `json:"status" gorm:"size:16;index"`
+	LeaseToken     string `json:"-" gorm:"size:64"`
+	LeaseExpiresAt int64  `json:"-" gorm:"type:bigint"`
+	Total          int64  `json:"total"`
+	Processed      int64  `json:"processed"`
+	DeletedBytes   int64  `json:"deleted_bytes" gorm:"type:bigint"`
+	Errors         int64  `json:"errors"`
+	LastError      string `json:"last_error,omitempty" gorm:"type:text"`
+	CreatedAt      int64  `json:"created_at" gorm:"type:bigint"`
+	FinishedAt     int64  `json:"finished_at" gorm:"type:bigint"`
+}
+
+func (legacyCleanupJob20261114) TableName() string { return "image_cleanup_jobs" }
+
+func TestImageStorageCleanupSchemaUpgrade(t *testing.T) {
+	for _, baseline := range []bool{false, true} {
+		name := "fresh"
+		if baseline {
+			name = "upgrade"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := imageTestDatabase(t, "storage-schema")
+			var version string
+			versionQuery := "SELECT version()"
+			if db.Dialector.Name() == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("database version: %s", version)
+			require.NoError(t, db.AutoMigrate(&Option{}))
+			if baseline {
+				require.NoError(t, db.AutoMigrate(&legacyStorageProfile20261114{}, &legacyStorageObject20261114{}, &legacyCleanupJob20261114{}))
+				require.NoError(t, db.Create(&legacyStorageProfile20261114{ProfileId: "old-storage", Class: "temporary", Backend: "local", Provider: "local", Root: "/preserved/images", Active: true, CredentialCipher: []byte("unchanged-key-material")}).Error)
+				require.NoError(t, db.Create(&legacyStorageObject20261114{ObjectId: "old-image", IdentityHash: "unchanged-identity", ProfileId: "old-storage", Class: "temporary", ObjectKey: "results/old.png", Status: "active", ByteSize: 1234, CreatedAt: 100, ExpiresAt: 180 * 86400}).Error)
+				require.NoError(t, db.Create(&legacyCleanupJob20261114{JobId: "old-job", Scope: "expired", Filters: `{"user_id":0}`, Cursor: 123, Status: "running", Processed: 17, DeletedBytes: 999, CreatedAt: 101}).Error)
+			}
+			require.NoError(t, db.Create(&Option{Key: "image_runtime_config", Value: `{"task_retention_days":180,"result_retention_days":180,"worker_concurrency":150}`}).Error)
+			for range 2 {
+				require.NoError(t, MigrateImageModels(db))
+			}
+			var option Option
+			require.NoError(t, db.Where(map[string]any{"key": "image_runtime_config"}).Take(&option).Error)
+			assert.JSONEq(t, `{"task_retention_days":180,"result_retention_days":180,"worker_concurrency":150}`, option.Value)
+			if baseline {
+				var profile ImageStorageProfile
+				require.NoError(t, db.Where("profile_id = ?", "old-storage").Take(&profile).Error)
+				assert.Equal(t, "old-storage", profile.ChannelId)
+				assert.True(t, profile.Active)
+				assert.True(t, profile.CurrentRevision)
+				assert.Empty(t, profile.Namespace)
+				assert.Equal(t, "/preserved/images", profile.Root)
+				assert.Equal(t, []byte("unchanged-key-material"), profile.CredentialCipher)
+				var object ImageStorageObject
+				require.NoError(t, db.Where("object_id = ?", "old-image").Take(&object).Error)
+				assert.Equal(t, "results/old.png", object.ObjectKey)
+				assert.EqualValues(t, 180*86400, object.ExpiresAt)
+				assert.Equal(t, "unchanged-identity", object.IdentityHash)
+				assert.Error(t, db.Create(&ImageStorageObject{ObjectId: "duplicate", IdentityHash: object.IdentityHash}).Error)
+				var job ImageCleanupJob
+				require.NoError(t, db.Where("job_id = ?", "old-job").Take(&job).Error)
+				assert.Equal(t, 123, job.Cursor)
+				assert.EqualValues(t, 17, job.Processed)
+				assert.EqualValues(t, 999, job.DeletedBytes)
+				assert.Equal(t, "running", job.Status)
+				var runnable int64
+				require.NoError(t, db.Model(&ImageCleanupJob{}).Where("job_id = ? AND next_attempt_at <= ? AND control = ?", job.JobId, time.Now().Unix(), "").Count(&runnable).Error)
+				assert.EqualValues(t, 1, runnable, "legacy jobs remain selectable after nullable column additions")
+
+			}
+			job := ImageCleanupJob{JobId: "new-job", Status: "completed_with_errors", Source: "manual"}
+			require.NoError(t, db.Create(&job).Error)
+			require.Error(t, db.Create(&ImageCleanupJob{JobId: job.JobId}).Error)
+			entry := ImageCleanupRetry{JobId: job.JobId, ObjectId: "one", Outcome: "retry"}
+			require.NoError(t, db.Create(&entry).Error)
+			require.Error(t, db.Create(&ImageCleanupRetry{JobId: job.JobId, ObjectId: "one"}).Error)
+			t.Logf("storage migration fresh=%v dialect=%s", !baseline, db.Dialector.Name())
+		})
+	}
 }

@@ -434,6 +434,17 @@ func UploadAsyncImageInput(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", "SC upload requires multipart/form-data and one file field")
 		return
 	}
+	ctx, release, err := service.AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		AsyncImagePublicError(c, 503, "storage_unavailable", "Image storage upload capacity is unavailable")
+		return
+	}
+	defer release()
+	ctx, cancelUpload := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+	defer cancelUpload()
+	uploadBody := c.Request.Body
+	stopBodyClose := context.AfterFunc(ctx, func() { _ = uploadBody.Close() })
+	defer stopBodyClose()
 	reader := multipart.NewReader(http.MaxBytesReader(c.Writer, c.Request.Body, cfg.SingleUploadBytes+64<<10), params["boundary"])
 	var data []byte
 	var filename, declared string

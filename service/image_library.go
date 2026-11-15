@@ -122,6 +122,13 @@ func ArchiveAsyncImageResult(ctx context.Context, userId int, taskId string, ind
 	if err != nil {
 		return model.ImageLibraryItem{}, false, err
 	}
+	ctx, release, err := AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		return model.ImageLibraryItem{}, false, err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+	defer cancel()
 	data, err := store.Read(ctx, object.ObjectKey, cfg.LibraryImageBytes)
 	if err != nil {
 		return model.ImageLibraryItem{}, false, err

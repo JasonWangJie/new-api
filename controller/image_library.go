@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -257,6 +258,17 @@ func importImageLibrary(c *gin.Context, fromURL bool) {
 	if key == "" {
 		key = common.GetUUID()
 	}
+	ctx, release, err := service.AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		imageLibraryFailure(c, err)
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+	defer cancel()
+	uploadBody := c.Request.Body
+	stopBodyClose := context.AfterFunc(ctx, func() { _ = uploadBody.Close() })
+	defer stopBodyClose()
 	var metadata service.ImageAssetMetadata
 	var image service.ImageBytes
 	if fromURL {
@@ -516,6 +528,17 @@ func SyncDeferredImageSubmission(c *gin.Context) {
 		imageLibraryFailure(c, err)
 		return
 	}
+	ctx, release, err := service.AcquireImageStorageUpload(ctx, cfg)
+	if err != nil {
+		imageLibraryFailure(c, err)
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.UploadTimeout)*time.Second)
+	defer cancel()
+	uploadBody := c.Request.Body
+	stopBodyClose := context.AfterFunc(ctx, func() { _ = uploadBody.Close() })
+	defer stopBodyClose()
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.LibraryImageBytes+64<<10)
 	if err := c.Request.ParseMultipartForm(64 << 10); err != nil {
 		imageLibraryFailure(c, err)

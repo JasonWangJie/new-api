@@ -9,7 +9,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm/clause"
 )
 
 type imageCleanupRequest struct {
@@ -18,84 +17,106 @@ type imageCleanupRequest struct {
 	PreviewFingerprint string                      `json:"preview_fingerprint"`
 }
 
+func imageCleanupResponse(job model.ImageCleanupJob, actor int) any {
+	token := ""
+	if job.Status == "preview_ready" && job.UserId == actor {
+		token = job.PreviewToken
+	}
+	return struct {
+		model.ImageCleanupJob
+		PreviewFingerprint string `json:"preview_fingerprint,omitempty"`
+	}{job, token}
+}
+
 func PreviewImageCleanup(c *gin.Context) {
 	var request imageCleanupRequest
 	if err := common.DecodeJson(io.LimitReader(c.Request.Body, 4096), &request); err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	query, err := service.ImageCleanupCandidates(c.Request.Context(), request.Scope, request.Filters)
+	job, err := service.NewImageCleanupPreview(c.Request.Context(), request.Scope, request.Filters, c.GetInt("id"))
 	if err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	var summary struct {
-		Count int64
-		Bytes int64
-	}
-	if err := query.Select("COUNT(*) AS count, COALESCE(SUM(byte_size),0) AS bytes").Scan(&summary).Error; err != nil {
-		imageLibraryFailure(c, err)
-		return
-	}
-	preview, err := service.SignImageCleanupPreview(request.Scope, request.Filters, c.GetInt("id"), time.Now().Unix())
-	if err != nil {
-		imageManagementError(c, 503, errors.New("Stable image keys are required for cleanup previews"))
-		return
-	}
-	imageManagementData(c, gin.H{"matched_items": summary.Count, "matched_bytes": summary.Bytes, "preview_fingerprint": preview})
+	service.WakeImageCleanup()
+	imageManagementData(c, imageCleanupResponse(job, c.GetInt("id")))
 }
+
 func CreateImageCleanup(c *gin.Context) {
 	var request imageCleanupRequest
 	if err := common.DecodeJson(io.LimitReader(c.Request.Body, 4096), &request); err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	if !service.ValidateImageCleanupPreview(request.PreviewFingerprint, request.Scope, request.Filters, c.GetInt("id"), time.Now().Unix()) {
-		imageLibraryFailure(c, errors.New("preview the same cleanup scope and filters before creating a job"))
-		return
-	}
-	query, err := service.ImageCleanupCandidates(c.Request.Context(), request.Scope, request.Filters)
+	job, err := service.ConfirmImageCleanupPreview(c.Request.Context(), request.Scope, request.Filters, request.PreviewFingerprint, c.GetInt("id"))
 	if err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	var count int64
-	if err := query.Count(&count).Error; err != nil {
-		imageLibraryFailure(c, err)
-		return
-	}
-	filters, err := common.Marshal(request.Filters)
-	if err != nil {
-		imageLibraryFailure(c, err)
-		return
-	}
-	job := model.ImageCleanupJob{JobId: "imgclean_" + service.ImageIdentityHash(request.PreviewFingerprint)[:32], Scope: request.Scope, Filters: string(filters), UserId: c.GetInt("id"), Status: "queued", Total: count, CreatedAt: time.Now().Unix()}
-	if err := model.DB.WithContext(c.Request.Context()).Clauses(clause.OnConflict{DoNothing: true}).Create(&job).Error; err != nil {
-		imageLibraryFailure(c, err)
-		return
-	}
-	if err := model.DB.WithContext(c.Request.Context()).Where("job_id = ? AND user_id = ?", job.JobId, c.GetInt("id")).Take(&job).Error; err != nil {
-		imageLibraryFailure(c, err)
-		return
-	}
-	imageManagementData(c, job)
+	service.WakeImageCleanup()
+	imageManagementData(c, imageCleanupResponse(job, c.GetInt("id")))
 }
+
 func ListImageCleanupJobs(c *gin.Context) {
-	query, limit, err := imageLibraryPage(c, model.DB.WithContext(c.Request.Context()).Model(&model.ImageCleanupJob{}), "")
+	jobs, err := model.RecentImageCleanupJobs(c.Request.Context(), time.Now().Unix())
 	if err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	var jobs []model.ImageCleanupJob
-	if err := query.Find(&jobs).Error; err != nil {
+	items := make([]any, 0, len(jobs))
+	for _, job := range jobs {
+		items = append(items, imageCleanupResponse(job, c.GetInt("id")))
+	}
+	imageManagementData(c, gin.H{"items": items, "next_cursor": ""})
+}
+
+func GetImageCleanupJob(c *gin.Context) {
+	var job model.ImageCleanupJob
+	if err := model.DB.WithContext(c.Request.Context()).Where("job_id = ?", c.Param("job_id")).Take(&job).Error; err != nil {
 		imageLibraryFailure(c, err)
 		return
 	}
-	next := ""
-	if len(jobs) > limit {
-		jobs = jobs[:limit]
-		last := jobs[len(jobs)-1]
-		next = imageNextCursor(last.CreatedAt, last.Id)
+	imageManagementData(c, imageCleanupResponse(job, c.GetInt("id")))
+}
+
+func ControlImageCleanupJob(c *gin.Context) {
+	job, err := service.ControlImageCleanup(c.Request.Context(), c.Param("job_id"), c.Param("action"))
+	if err != nil {
+		imageLibraryFailure(c, err)
+		return
 	}
-	imageManagementData(c, gin.H{"items": jobs, "next_cursor": next})
+	service.WakeImageCleanup()
+	_ = model.DB.WithContext(c.Request.Context()).Create(&model.ImageModerationEvent{SubjectId: job.JobId, ActorId: c.GetInt("id"), Action: "cleanup_" + c.Param("action"), CreatedAt: time.Now().Unix()}).Error
+	imageManagementData(c, imageCleanupResponse(job, c.GetInt("id")))
+}
+
+func GetImageCleanupConfig(c *gin.Context) {
+	cfg, err := service.GetImageCleanupConfig(c.Request.Context())
+	if err != nil {
+		imageLibraryFailure(c, err)
+		return
+	}
+	imageManagementData(c, struct {
+		service.ImageCleanupConfig
+		Runtime service.ImageCleanupRuntimeStatus `json:"runtime"`
+	}{cfg, service.GetImageCleanupRuntimeStatus()})
+}
+
+func SaveImageCleanupConfig(c *gin.Context) {
+	cfg := service.DefaultImageCleanupConfig()
+	if err := common.DecodeJson(io.LimitReader(c.Request.Body, 128<<10), &cfg); err != nil {
+		imageLibraryFailure(c, err)
+		return
+	}
+	if err := service.SaveImageCleanupConfig(c.Request.Context(), cfg); err != nil {
+		if errors.Is(err, model.ErrOptionRevisionConflict) {
+			imageManagementError(c, 409, err)
+		} else {
+			imageLibraryFailure(c, err)
+		}
+		return
+	}
+	service.WakeImageCleanup()
+	GetImageCleanupConfig(c)
 }

@@ -84,6 +84,11 @@ export function AsyncImageGuide() {
                   'Image result links may use an external image host. Follow each returned URL without assuming the gateway hostname.'
                 )}
               </p>
+              <p>
+                {t(
+                  'Storage channel changes preserve existing image locations. Cleanup skips images still protected by task retention or active library references.'
+                )}
+              </p>
             </header>
             <StaticDataTable
               data={[...ASYNC_IMAGE_ENDPOINTS]}

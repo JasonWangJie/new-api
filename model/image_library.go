@@ -281,7 +281,24 @@ func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if object.Status == "deleting" && object.DeleteLeaseExpiresAt > now {
 			return ErrImageConflict
 		}
+		if object.ExpiresAt > now {
+			return ErrImageConflict
+		}
 		var count int64
+		// An upload is durable before its result manifest is registered. The
+		// intent remains a live reference throughout upload and settlement.
+		if err := tx.Model(&ImageUploadIntent{}).Where("profile_id = ? AND object_key = ? AND (status IN ? OR lease_expires_at > ?)", object.ProfileId, object.ObjectKey, []string{"pending", "uploading"}, now).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrImageConflict
+		}
+		if err := tx.Model(&ImageUploadIntent{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_upload_intents.task_id").Where("image_upload_intents.profile_id = ? AND image_upload_intents.object_key = ? AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", object.ProfileId, object.ObjectKey, now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return ErrImageConflict
+		}
 		if err := tx.Model(&ImageLibraryItem{}).Where("object_id = ? AND deleted_at = 0 AND (expires_at = 0 OR expires_at > ?)", objectId, now).Count(&count).Error; err != nil {
 			return err
 		}
@@ -294,7 +311,7 @@ func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if count > 0 {
 			return ErrImageConflict
 		}
-		if err := tx.Model(&AsyncImageResult{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_results.task_id").Where("async_image_results.object_id = ? AND (async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", objectId, now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
+		if err := tx.Model(&AsyncImageResult{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_results.task_id").Where("async_image_results.object_id = ? AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", objectId, now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
 			return err
 		}
 		if count > 0 {
