@@ -489,7 +489,7 @@ func previewImageCleanupSlice(ctx context.Context, job model.ImageCleanupJob, le
 			completed = false
 			break
 		}
-		reason, err := ImageCleanupProtectionReason(scan, object)
+		reason, err := imageCleanupProtectionReason(scan, object, filters)
 		if err != nil {
 			if scan.Err() != nil {
 				completed = false

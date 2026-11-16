@@ -257,6 +257,14 @@ func QueryAsyncImage(c *gin.Context) {
 		}
 	}
 	resultExpired := task.Status == model.ImageTaskSucceeded && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix()
+	if !resultExpired {
+		deleted, err := service.ImageTasksWithDeletedResults(ctx, []model.AsyncImageTask{task})
+		if err != nil {
+			AsyncImagePublicError(c, 503, "storage_unavailable", "Image results are unavailable")
+			return
+		}
+		resultExpired = deleted[task.TaskId]
+	}
 	if task.Terminal() && task.ExpiresAt > 0 && task.ExpiresAt <= time.Now().Unix() && !resultExpired {
 		AsyncImagePublicError(c, 404, "task_not_found", "Image task was not found")
 		return

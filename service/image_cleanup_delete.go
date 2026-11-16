@@ -289,6 +289,7 @@ func executeImageCleanupObject(ctx context.Context, job model.ImageCleanupJob, l
 	if err := common.UnmarshalJsonStr(job.Filters, &filters); err != nil {
 		return err
 	}
+	filters.IgnoreRetention = job.Source == "scheduled" && job.PolicyID != "" && filters.ChannelID != "" && filters.CutoffAt > 0 && len(filters.ProfileIDs) > 0
 	eligible, err := ImageCleanupCandidates(ctx, job.Scope, filters)
 	if err != nil {
 		return err
@@ -298,7 +299,7 @@ func executeImageCleanupObject(ctx context.Context, job model.ImageCleanupJob, l
 		return err
 	}
 	if count == 0 {
-		reason, err := ImageCleanupProtectionReason(ctx, candidate)
+		reason, err := imageCleanupProtectionReason(ctx, candidate, filters)
 		if err != nil {
 			return err
 		}
@@ -340,7 +341,11 @@ func executeImageCleanupObject(ctx context.Context, job model.ImageCleanupJob, l
 		err = store.PhysicalDeletionSupported(operation)
 	}
 	if err == nil {
-		object, err = model.ClaimImageObjectDeletion(operation, candidate.ObjectId, lease, time.Now().Unix(), cfg.RequestTimeoutSeconds+30)
+		if filters.IgnoreRetention {
+			object, err = model.ClaimImageObjectPolicyDeletion(operation, candidate.ObjectId, lease, time.Now().Unix(), cfg.RequestTimeoutSeconds+30, filters.CutoffAt, filters.ProfileIDs)
+		} else {
+			object, err = model.ClaimImageObjectDeletion(operation, candidate.ObjectId, lease, time.Now().Unix(), cfg.RequestTimeoutSeconds+30)
+		}
 	}
 	if !configurationError && (errors.Is(err, errImageSharedLocation) || errors.Is(err, model.ErrImageConflict) || errors.Is(err, gorm.ErrRecordNotFound)) {
 		if candidate.Status == "deleting" && candidate.DeleteLeaseExpiresAt > time.Now().Unix() {
@@ -348,7 +353,7 @@ func executeImageCleanupObject(ctx context.Context, job model.ImageCleanupJob, l
 		}
 		entry.LastError = "location"
 		if !errors.Is(err, errImageSharedLocation) {
-			reason, checkErr := ImageCleanupProtectionReason(ctx, candidate)
+			reason, checkErr := imageCleanupProtectionReason(ctx, candidate, filters)
 			if checkErr != nil {
 				return checkErr
 			}

@@ -20,6 +20,8 @@ type ImageCleanupFilters struct {
 	// Frozen server-side fields are never accepted from a management request.
 	CutoffAt   int64    `json:"cutoff_at,omitempty"`
 	ProfileIDs []string `json:"profile_ids,omitempty"`
+	// Only scheduled jobs may bypass retention; management requests cannot set it.
+	IgnoreRetention bool `json:"-"`
 }
 
 func (filters ImageCleanupFilters) AgeSeconds() (int64, error) {
@@ -99,34 +101,50 @@ func ImageCleanupCandidates(ctx context.Context, scope string, filters ImageClea
 	now := time.Now().Unix()
 	// Live references are excluded at preview time and checked again under an
 	// object lock immediately before physical deletion.
-	query = query.Where("expires_at = 0 OR expires_at <= ?", now)
+	if !filters.IgnoreRetention {
+		query = query.Where("expires_at = 0 OR expires_at <= ?", now)
+	}
+	protectedTasks := model.DB.WithContext(ctx).Model(&model.AsyncImageTask{}).Select("task_id")
+	terminal := []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}
+	if filters.IgnoreRetention {
+		archives := model.DB.WithContext(ctx).Model(&model.ImageOutbox{}).Select("aggregate_id").Where("kind = ? AND status = ?", "library_archive", "pending")
+		protectedTasks = protectedTasks.Where("status NOT IN ? OR task_id IN (?)", terminal, archives)
+	} else {
+		protectedTasks = protectedTasks.Where("expires_at = 0 OR expires_at > ? OR status NOT IN ?", now, terminal)
+	}
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageLibraryItem{}).Select("1").Where("image_library_items.object_id = image_storage_objects.object_id AND deleted_at = 0 AND (expires_at = 0 OR expires_at > ?)", now))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageLibraryItem{}).Select("1").Joins("JOIN image_publications ON image_publications.asset_id = image_library_items.asset_id").Where("image_library_items.object_id = image_storage_objects.object_id AND image_publications.status IN ? AND (image_publications.expires_at = 0 OR image_publications.expires_at > ?)", []string{"pending_review", "published", "hidden"}, now))
-	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).Select("1").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_results.task_id").Where("async_image_results.object_id = image_storage_objects.object_id AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", now, []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}))
+	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).Select("1").Where("async_image_results.object_id = image_storage_objects.object_id AND task_id IN (?)", protectedTasks))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Select("1").Where("image_input_objects.object_id = image_storage_objects.object_id AND status IN ? AND (expires_at > ? OR lease_expires_at > ?)", []string{"active", "reserved", "uploading"}, now, now))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Select("1").Joins("JOIN image_input_task_references ON image_input_task_references.input_id = image_input_objects.input_id").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").Where("image_input_objects.object_id = image_storage_objects.object_id AND async_image_tasks.status NOT IN ?", []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("1").Where("image_upload_intents.profile_id = image_storage_objects.profile_id AND image_upload_intents.object_key = image_storage_objects.object_key AND (image_upload_intents.status IN ? OR image_upload_intents.lease_expires_at > ?)", []string{"pending", "uploading"}, now))
-	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("1").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_upload_intents.task_id").Where("image_upload_intents.profile_id = image_storage_objects.profile_id AND image_upload_intents.object_key = image_storage_objects.object_key AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", now, []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}))
+	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("1").Where("image_upload_intents.profile_id = image_storage_objects.profile_id AND image_upload_intents.object_key = image_storage_objects.object_key AND task_id IN (?)", protectedTasks))
 	return query, nil
 }
 
 // ImageCleanupProtectionReason classifies only the reason for retaining an
 // object. The candidate query remains the source of truth for live references.
 func ImageCleanupProtectionReason(ctx context.Context, object model.ImageStorageObject) (string, error) {
+	return imageCleanupProtectionReason(ctx, object, ImageCleanupFilters{})
+}
+
+func imageCleanupProtectionReason(ctx context.Context, object model.ImageStorageObject, filters ImageCleanupFilters) (string, error) {
 	now := time.Now().Unix()
-	if object.ExpiresAt > now {
+	if !filters.IgnoreRetention && object.ExpiresAt > now {
 		return "retention", nil
 	}
-	var task model.AsyncImageTask
-	retainedTask := model.DB.WithContext(ctx).Select("id").Where("status IN ? AND (expires_at = 0 OR expires_at > ?)", []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}, now).
-		Where("task_id IN (?) OR task_id IN (?)", model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).Select("task_id").Where("object_id = ?", object.ObjectId), model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("task_id").Where("profile_id = ? AND object_key = ?", object.ProfileId, object.ObjectKey)).Limit(1).Find(&task)
-	if retainedTask.Error != nil {
-		return "", retainedTask.Error
+	if !filters.IgnoreRetention {
+		var task model.AsyncImageTask
+		retainedTask := model.DB.WithContext(ctx).Select("id").Where("status IN ? AND (expires_at = 0 OR expires_at > ?)", []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}, now).
+			Where("task_id IN (?) OR task_id IN (?)", model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).Select("task_id").Where("object_id = ?", object.ObjectId), model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("task_id").Where("profile_id = ? AND object_key = ?", object.ProfileId, object.ObjectKey)).Limit(1).Find(&task)
+		if retainedTask.Error != nil {
+			return "", retainedTask.Error
+		}
+		if retainedTask.RowsAffected > 0 {
+			return "retention", nil
+		}
 	}
-	if retainedTask.RowsAffected > 0 {
-		return "retention", nil
-	}
-	query, err := ImageCleanupCandidates(ctx, "all", ImageCleanupFilters{})
+	query, err := ImageCleanupCandidates(ctx, "all", filters)
 	if err != nil {
 		return "", err
 	}

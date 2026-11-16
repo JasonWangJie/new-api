@@ -181,6 +181,10 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 	if len(tasks) == 0 {
 		return items, nil
 	}
+	deletedResults, err := service.ImageTasksWithDeletedResults(ctx, tasks)
+	if err != nil {
+		return nil, err
+	}
 	taskIDs := make([]string, 0, len(tasks))
 	tokenIDs, userIDs, channelIDs := make([]int, 0, len(tasks)), make([]int, 0, len(tasks)), make([]int, 0, len(tasks))
 	histories := make(map[string][]service.ImageChannelAttempt)
@@ -264,6 +268,9 @@ func imageTasksToDTO(ctx context.Context, tasks []model.AsyncImageTask, admin, i
 	}
 	for _, task := range tasks {
 		data := imageTaskDTO(task, admin)
+		if deletedResults[task.TaskId] {
+			data["result_expired"] = true
+		}
 		if bill, found := refundedBills[task.TaskId]; found && bill.UserId == task.UserId && bill.TokenId == task.TokenId {
 			data["refunded_cost"] = float64(bill.ReservedQuota) / common.QuotaPerUnit
 		}
@@ -475,6 +482,12 @@ func GetImageTask(c *gin.Context, admin bool) {
 		imageManagementError(c, status, errors.New("Image task is unavailable"))
 		return
 	}
+	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)
+	if err != nil {
+		imageManagementError(c, 503, err)
+		return
+	}
+	resultExpired, _ := items[0]["result_expired"].(bool)
 	var events []model.AsyncImageEvent
 	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", task.TaskId).Order("id").Find(&events).Error; err != nil {
 		imageManagementError(c, 503, err)
@@ -503,7 +516,7 @@ func GetImageTask(c *gin.Context, admin bool) {
 		}
 	}
 	results := make([]gin.H, 0)
-	if task.ResultsAvailable() && task.ResultSource != model.ImageResultSourceUpstream {
+	if task.ResultsAvailable() && !resultExpired && task.ResultSource != model.ImageResultSourceUpstream {
 		var saved []model.AsyncImageResult
 		if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", task.TaskId).Order("image_index").Find(&saved).Error; err != nil {
 			imageManagementError(c, 503, err)
@@ -562,11 +575,6 @@ func GetImageTask(c *gin.Context, admin bool) {
 			}
 			results = append(results, item)
 		}
-	}
-	items, err := imageTasksToDTO(c.Request.Context(), []model.AsyncImageTask{task}, admin, true)
-	if err != nil {
-		imageManagementError(c, 503, err)
-		return
 	}
 	if admin && task.UpstreamTaskId != "" {
 		items[0]["upstream_task_id"] = task.UpstreamTaskId
@@ -636,7 +644,15 @@ func ViewImageTaskResult(c *gin.Context, admin bool) {
 		return
 	}
 	var object model.ImageStorageObject
-	if err := model.DB.WithContext(ctx).Where("object_id = ? AND status = ?", result.ObjectId, "active").Take(&object).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("object_id = ?", result.ObjectId).Take(&object).Error; err != nil {
+		imageManagementError(c, 503, errors.New("Image storage object is unavailable"))
+		return
+	}
+	if object.Status == "deleted" {
+		imageManagementError(c, 404, errors.New("Image task result was not found"))
+		return
+	}
+	if object.Status != "active" {
 		imageManagementError(c, 503, errors.New("Image storage object is unavailable"))
 		return
 	}

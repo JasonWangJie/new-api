@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"time"
 
@@ -270,7 +271,21 @@ func ClaimUnconfirmedImageIntent(ctx context.Context, id int, lease string, seco
 // ClaimImageObjectDeletion holds the same object lock used when registering a
 // task manifest, library asset or publication. No file operation occurs here.
 func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now int64, leaseSeconds int) (ImageStorageObject, error) {
+	return claimImageObjectDeletion(ctx, objectId, lease, now, leaseSeconds, 0, nil)
+}
+
+// ClaimImageObjectPolicyDeletion uses a scheduled policy's frozen age and storage
+// revisions instead of retention. Active consumers still protect the object.
+func ClaimImageObjectPolicyDeletion(ctx context.Context, objectId, lease string, now int64, leaseSeconds int, cutoffAt int64, profileIDs []string) (ImageStorageObject, error) {
+	if cutoffAt <= 0 || len(profileIDs) == 0 {
+		return ImageStorageObject{}, ErrImageConflict
+	}
+	return claimImageObjectDeletion(ctx, objectId, lease, now, leaseSeconds, cutoffAt, profileIDs)
+}
+
+func claimImageObjectDeletion(ctx context.Context, objectId, lease string, now int64, leaseSeconds int, cutoffAt int64, profileIDs []string) (ImageStorageObject, error) {
 	var object ImageStorageObject
+	ignoreRetention := cutoffAt > 0
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockForUpdate(tx).Where("object_id = ?", objectId).Take(&object).Error; err != nil {
 			return err
@@ -281,8 +296,19 @@ func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if object.Status == "deleting" && object.DeleteLeaseExpiresAt > now {
 			return ErrImageConflict
 		}
-		if object.ExpiresAt > now {
+		if ignoreRetention && (object.CreatedAt >= cutoffAt || !slices.Contains(profileIDs, object.ProfileId)) {
 			return ErrImageConflict
+		}
+		if !ignoreRetention && object.ExpiresAt > now {
+			return ErrImageConflict
+		}
+		protectedTasks := tx.Model(&AsyncImageTask{}).Select("task_id")
+		terminal := []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}
+		if ignoreRetention {
+			archives := tx.Model(&ImageOutbox{}).Select("aggregate_id").Where("kind = ? AND status = ?", "library_archive", "pending")
+			protectedTasks = protectedTasks.Where("status NOT IN ? OR task_id IN (?)", terminal, archives)
+		} else {
+			protectedTasks = protectedTasks.Where("expires_at = 0 OR expires_at > ? OR status NOT IN ?", now, terminal)
 		}
 		var count int64
 		// An upload is durable before its result manifest is registered. The
@@ -293,7 +319,7 @@ func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if count > 0 {
 			return ErrImageConflict
 		}
-		if err := tx.Model(&ImageUploadIntent{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_upload_intents.task_id").Where("image_upload_intents.profile_id = ? AND image_upload_intents.object_key = ? AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", object.ProfileId, object.ObjectKey, now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
+		if err := tx.Model(&ImageUploadIntent{}).Where("profile_id = ? AND object_key = ? AND task_id IN (?)", object.ProfileId, object.ObjectKey, protectedTasks).Count(&count).Error; err != nil {
 			return err
 		}
 		if count > 0 {
@@ -311,7 +337,7 @@ func ClaimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if count > 0 {
 			return ErrImageConflict
 		}
-		if err := tx.Model(&AsyncImageResult{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = async_image_results.task_id").Where("async_image_results.object_id = ? AND (async_image_tasks.expires_at = 0 OR async_image_tasks.expires_at > ? OR async_image_tasks.status NOT IN ?)", objectId, now, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
+		if err := tx.Model(&AsyncImageResult{}).Where("object_id = ? AND task_id IN (?)", objectId, protectedTasks).Count(&count).Error; err != nil {
 			return err
 		}
 		if count > 0 {

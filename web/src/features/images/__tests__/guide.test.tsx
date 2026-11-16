@@ -148,6 +148,14 @@ test('output options state model scope and frame bounds without adding format-sp
     screen.getByText(/selected independently for each image/)
   ).toHaveTextContent('allow redirects')
   expect(
+    screen.getByText(
+      /Storage channel changes preserve existing image locations/
+    )
+  ).toHaveTextContent('before task or result retention ends')
+  expect(screen.getByText(/After confirmed image cleanup/)).toHaveTextContent(
+    'result_expired=true with empty data'
+  )
+  expect(
     screen.queryByRole('group', { name: /OpenAI|xAI|Drama|Sora|Doubao/ })
   ).not.toBeInTheDocument()
 })

@@ -16,6 +16,32 @@ const storedResultFilePath = "/v1/media/files/"
 
 var storedResultFileIDPattern = regexp.MustCompile(`^(img_|vid_)[0-9a-f]{32}$`)
 
+// ImageTasksWithDeletedResults identifies confirmed cleanup without treating a
+// missing manifest, missing object or in-progress deletion as normal expiry.
+func ImageTasksWithDeletedResults(ctx context.Context, tasks []model.AsyncImageTask) (map[string]bool, error) {
+	taskIDs := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		if task.Status == model.ImageTaskSucceeded && task.ResultSource != model.ImageResultSourceUpstream {
+			taskIDs = append(taskIDs, task.TaskId)
+		}
+	}
+	deleted := make(map[string]bool)
+	if len(taskIDs) == 0 {
+		return deleted, nil
+	}
+	var deletedIDs []string
+	if err := model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).
+		Joins("JOIN image_storage_objects ON image_storage_objects.object_id = async_image_results.object_id").
+		Where("async_image_results.task_id IN ? AND image_storage_objects.status = ?", taskIDs, "deleted").
+		Distinct().Pluck("async_image_results.task_id", &deletedIDs).Error; err != nil {
+		return nil, err
+	}
+	for _, id := range deletedIDs {
+		deleted[id] = true
+	}
+	return deleted, nil
+}
+
 func storedResultFileName(fileID, contentType string) string {
 	if !storedResultFileIDPattern.MatchString(fileID) {
 		return ""

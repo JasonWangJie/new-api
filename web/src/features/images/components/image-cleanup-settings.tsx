@@ -149,7 +149,7 @@ export function ImageCleanupConfigForm(props: {
     <SettingsCard
       title={t('Scheduled image cleanup')}
       description={t(
-        'Cleanup only removes old, unreferenced managed images. Published images and files still used by tasks or the image library are protected.'
+        'Scheduled cleanup follows the configured image age regardless of task or result retention. Active tasks, library images and published images remain protected. Manual cleanup still respects retention periods.'
       )}
     >
       <section

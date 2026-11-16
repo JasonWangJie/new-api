@@ -4,8 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -609,4 +615,234 @@ func TestImageCleanupHistoryMaintenanceSurvivesStorageConfigurationFailure(t *te
 	var count int64
 	require.NoError(t, db.Model(&model.ImageCleanupJob{}).Where("job_id = ?", job.JobId).Count(&count).Error)
 	assert.Zero(t, count, "storage maintenance must not prevent the bounded history pass")
+}
+
+func TestImageCleanupScheduledPolicyDeletesRetainedResults(t *testing.T) {
+	for _, backend := range []string{"local", "r2"} {
+		t.Run(backend, func(t *testing.T) {
+			db, profile := imageCleanupFixture(t)
+			var deletes atomic.Int32
+			var server *httptest.Server
+			if backend == "r2" {
+				var mu sync.Mutex
+				files := map[string][]byte{}
+				server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					defer mu.Unlock()
+					if r.URL.Query().Has("versioning") {
+						w.Header().Set("Content-Type", "application/xml")
+						_, _ = io.WriteString(w, `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`)
+						return
+					}
+					switch r.Method {
+					case http.MethodPut:
+						data, err := io.ReadAll(r.Body)
+						if err != nil {
+							http.Error(w, "invalid upload", http.StatusBadRequest)
+							return
+						}
+						files[r.URL.Path] = data
+					case http.MethodDelete:
+						delete(files, r.URL.Path)
+						deletes.Add(1)
+						w.WriteHeader(http.StatusNoContent)
+					case http.MethodGet, http.MethodHead:
+						data, ok := files[r.URL.Path]
+						if !ok {
+							w.WriteHeader(http.StatusNotFound)
+							if r.Method == http.MethodGet {
+								_, _ = io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+							}
+							return
+						}
+						w.Header().Set("Content-Type", "image/png")
+						w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+						if r.Method == http.MethodGet {
+							_, _ = w.Write(data)
+						}
+					default:
+						w.WriteHeader(http.StatusMethodNotAllowed)
+					}
+				}))
+				t.Cleanup(server.Close)
+				previousTransport := http.DefaultTransport
+				http.DefaultTransport = server.Client().Transport
+				t.Cleanup(func() { http.DefaultTransport = previousTransport })
+				profile = model.ImageStorageProfile{ProfileId: "cleanup-r2", ChannelId: "cleanup-r2-channel", Namespace: "cleanup-r2", CurrentRevision: true, Class: "temporary", Backend: "s3", Provider: "r2", Bucket: "cleanup-images", Region: "auto", Endpoint: server.URL, PublicBaseURL: "https://images.example.test", PathStyle: true}
+				data, err := common.Marshal(ImageStorageCredentials{AccessKey: "synthetic-access", SecretKey: "synthetic-secret"})
+				require.NoError(t, err)
+				profile.CredentialCipher, err = EncryptImagePayload(data, "storage:"+profile.ProfileId)
+				require.NoError(t, err)
+				require.NoError(t, db.Create(&profile).Error)
+			}
+			now := time.Now().Unix()
+			var task model.AsyncImageTask
+			require.NoError(t, db.First(&task).Error)
+			require.NoError(t, db.Model(&task).Updates(map[string]any{"status": model.ImageTaskSucceeded, "billing_status": "succeeded", "result_count": 1, "image_count": 1, "quota": 100, "created_at": now - 3*3600, "expires_at": now + 180*86400}).Error)
+			require.NoError(t, db.First(&task, task.Id).Error)
+			image := asyncImageBytesFixture(t)
+			intent := model.ImageUploadIntent{IntentKey: "policy-source", TaskId: task.TaskId, UserId: task.UserId, ProfileId: profile.ProfileId, ObjectKey: "result.png", Class: "temporary", ContentType: image.ContentType, ByteSize: int64(len(image.Data)), Checksum: image.Checksum, Status: "pending", CreatedAt: now - 3*3600}
+			object, err := StoreImageIntent(t.Context(), intent, image, now+180*86400)
+			require.NoError(t, err)
+			require.NoError(t, db.Model(&model.ImageUploadIntent{}).Where("intent_key = ?", intent.IntentKey).Update("lease_expires_at", 0).Error)
+			require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ObjectId: object.ObjectId, CreatedAt: intent.CreatedAt}).Error)
+			store, err := OpenImageStorage(t.Context(), profile)
+			require.NoError(t, err)
+			var filters ImageCleanupFilters
+			require.NoError(t, common.UnmarshalJsonStr(fmt.Sprintf(`{"channel_id":%q,"older_than":2,"age_unit":"hours","ignore_retention":true}`, profile.ChannelId), &filters))
+			manual, err := NewImageCleanupPreview(t.Context(), "all", filters, task.UserId)
+			require.NoError(t, err)
+			cfg := DefaultImageCleanupConfig()
+			require.NoError(t, runImageCleanupSlice(t.Context(), manual, cfg, &imageCleanupBudget{}))
+			require.NoError(t, db.First(&manual, manual.Id).Error)
+			assert.EqualValues(t, 0, manual.Matched, "a request cannot bypass retention by injecting ignore_retention")
+			assert.EqualValues(t, 1, manual.RetentionSkipped)
+			manual, err = ConfirmImageCleanupPreview(t.Context(), "all", filters, manual.PreviewToken, task.UserId)
+			require.NoError(t, err)
+			require.NoError(t, runImageCleanupSlice(t.Context(), manual, cfg, &imageCleanupBudget{}))
+			require.NoError(t, db.First(&manual, manual.Id).Error)
+			assert.EqualValues(t, 0, manual.Deleted)
+			assert.EqualValues(t, 1, manual.RetentionSkipped)
+			data, err := store.Read(t.Context(), object.ObjectKey, 1024)
+			require.NoError(t, err)
+			assert.Equal(t, image.Data, data)
+			cfg.Enabled = true
+			cfg.Policies = []ImageCleanupPolicy{{ID: "two-hours", Name: "Two-hour cleanup", Enabled: true, ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "hours", ScheduleType: "interval", IntervalMinutes: 15, Timezone: "Asia/Shanghai"}}
+			require.NoError(t, scheduleImageCleanup(t.Context(), cfg, time.Unix(now, 0)))
+			var scheduled model.ImageCleanupJob
+			require.NoError(t, db.Where("source = ? AND policy_id = ?", "scheduled", "two-hours").Take(&scheduled).Error)
+			require.NoError(t, runImageCleanupSlice(t.Context(), scheduled, cfg, &imageCleanupBudget{}))
+			require.NoError(t, db.First(&scheduled, scheduled.Id).Error)
+			assert.Equal(t, "completed", scheduled.Status)
+			assert.EqualValues(t, 1, scheduled.Deleted)
+			assert.EqualValues(t, len(image.Data), scheduled.DeletedBytes)
+			assert.Zero(t, scheduled.Errors)
+			require.NoError(t, db.First(&object, object.Id).Error)
+			assert.Equal(t, "deleted", object.Status)
+			_, err = store.Read(t.Context(), object.ObjectKey, 1024)
+			assert.ErrorIs(t, err, ErrImageObjectMissing, "cleanup must remove physical bytes")
+			if server != nil {
+				request, err := http.NewRequestWithContext(t.Context(), http.MethodHead, server.URL+"/"+profile.Bucket+"/"+store.Key(object.ObjectKey), nil)
+				require.NoError(t, err)
+				response, err := server.Client().Do(request)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				assert.Equal(t, http.StatusNotFound, response.StatusCode, "R2 HEAD confirms the object is absent")
+			}
+			require.NoError(t, runImageCleanupSlice(t.Context(), scheduled, cfg, &imageCleanupBudget{}))
+			require.NoError(t, db.First(&scheduled, scheduled.Id).Error)
+			assert.EqualValues(t, 1, scheduled.Deleted, "replaying a completed job cannot double-count deletion")
+			if backend == "r2" {
+				assert.EqualValues(t, 1, deletes.Load())
+			}
+			var savedTask model.AsyncImageTask
+			require.NoError(t, db.First(&savedTask, task.Id).Error)
+			assert.Equal(t, task.Status, savedTask.Status)
+			assert.Equal(t, task.BillingStatus, savedTask.BillingStatus)
+			assert.Equal(t, task.ExpiresAt, savedTask.ExpiresAt)
+			assert.Equal(t, task.Quota, savedTask.Quota)
+			var user model.User
+			var token model.Token
+			require.NoError(t, db.First(&user, task.UserId).Error)
+			require.NoError(t, db.First(&token, task.TokenId).Error)
+			assert.Equal(t, 1000, user.Quota)
+			assert.Equal(t, 1000, token.RemainQuota)
+		})
+	}
+}
+
+func TestImageCleanupScheduledPolicyPreservesAgeScopeAndLiveConsumers(t *testing.T) {
+	db, profile := imageCleanupFixture(t)
+	now := time.Now().Unix()
+	cutoff := now - 2*3600
+	otherProfile := model.ImageStorageProfile{ProfileId: "other-location", ChannelId: "other-channel", Class: "temporary", Backend: "local", Root: t.TempDir()}
+	require.NoError(t, db.Create(&otherProfile).Error)
+	filters := ImageCleanupFilters{ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "hours", CutoffAt: cutoff, ProfileIDs: []string{profile.ProfileId}, IgnoreRetention: true}
+	for _, scenario := range []struct {
+		name     string
+		eligible bool
+	}{
+		{name: "retained-completed", eligible: true},
+		{name: "new-image"},
+		{name: "exact-age-boundary"},
+		{name: "other-location"},
+		{name: "running-manifest"},
+		{name: "running-confirmed-intent"},
+		{name: "live-library"},
+		{name: "published-deleted-library"},
+		{name: "live-input"},
+		{name: "input-for-running-task"},
+		{name: "uploading-intent"},
+		{name: "publication-lease"},
+		{name: "pending-archive"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			object := model.ImageStorageObject{ObjectId: scenario.name, IdentityHash: scenario.name, ProfileId: profile.ProfileId, ObjectKey: scenario.name + ".png", Status: "active", Class: "temporary", CreatedAt: cutoff - 1, ExpiresAt: now + 180*86400}
+			switch scenario.name {
+			case "new-image":
+				object.CreatedAt = now
+			case "exact-age-boundary":
+				object.CreatedAt = cutoff
+			case "other-location":
+				object.ProfileId = otherProfile.ProfileId
+			}
+			require.NoError(t, db.Create(&object).Error)
+			task := model.AsyncImageTask{TaskId: "task-" + scenario.name, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", ResultCount: 1, CreatedAt: object.CreatedAt, ExpiresAt: now + 180*86400}
+			if scenario.name == "running-manifest" || scenario.name == "running-confirmed-intent" {
+				task.Status = model.ImageTaskUploading
+			}
+			require.NoError(t, db.Create(&task).Error)
+			if scenario.name != "running-confirmed-intent" {
+				require.NoError(t, db.Create(&model.AsyncImageResult{TaskId: task.TaskId, ObjectId: object.ObjectId}).Error)
+			}
+			switch scenario.name {
+			case "running-confirmed-intent", "uploading-intent", "publication-lease":
+				intent := model.ImageUploadIntent{IntentKey: "intent-" + scenario.name, ProfileId: object.ProfileId, ObjectKey: object.ObjectKey, Status: "confirmed"}
+				if scenario.name == "running-confirmed-intent" {
+					intent.TaskId = task.TaskId
+				} else if scenario.name == "uploading-intent" {
+					intent.Status = "uploading"
+				} else {
+					intent.LeaseExpiresAt = now + 600
+				}
+				require.NoError(t, db.Create(&intent).Error)
+			case "live-library", "published-deleted-library":
+				item := model.ImageLibraryItem{AssetId: "asset-" + scenario.name, SourceKey: "source-" + scenario.name, ObjectId: object.ObjectId, ExpiresAt: now + 86400}
+				if scenario.name == "published-deleted-library" {
+					item.DeletedAt, item.ExpiresAt = now, now-1
+				}
+				require.NoError(t, db.Create(&item).Error)
+				if scenario.name == "published-deleted-library" {
+					require.NoError(t, db.Create(&model.ImagePublication{PublicationId: "publication", AssetId: item.AssetId, Status: "published", ExpiresAt: now + 86400}).Error)
+				}
+			case "live-input", "input-for-running-task":
+				input := model.ImageInputObject{InputId: "input-" + scenario.name, KeyHash: scenario.name, ObjectId: object.ObjectId, Status: "active", ExpiresAt: now + 86400}
+				if scenario.name == "input-for-running-task" {
+					input.Status, input.ExpiresAt = "deleted", now-1
+				}
+				require.NoError(t, db.Create(&input).Error)
+				if scenario.name == "input-for-running-task" {
+					consumer := model.AsyncImageTask{TaskId: "active-input-consumer", Status: model.ImageTaskInvoking}
+					require.NoError(t, db.Create(&consumer).Error)
+					require.NoError(t, db.Create(&model.ImageInputTaskReference{TaskId: consumer.TaskId, InputId: input.InputId}).Error)
+				}
+			case "pending-archive":
+				require.NoError(t, db.Create(&model.ImageOutbox{EventKey: "pending-archive", AggregateId: task.TaskId, Kind: "library_archive", Status: "pending"}).Error)
+			}
+			query, err := ImageCleanupCandidates(t.Context(), "all", filters)
+			require.NoError(t, err)
+			var count int64
+			require.NoError(t, query.Where("object_id = ?", object.ObjectId).Count(&count).Error)
+			assert.Equal(t, scenario.eligible, count == 1, "the age policy must preserve scope and active consumers")
+			claimed, err := model.ClaimImageObjectPolicyDeletion(t.Context(), object.ObjectId, "policy-cleaner", now, 120, cutoff, filters.ProfileIDs)
+			if scenario.eligible {
+				require.NoError(t, err)
+				assert.Equal(t, "deleting", claimed.Status)
+			} else {
+				assert.ErrorIs(t, err, model.ErrImageConflict, "the locked deletion check must reject newly protected objects too")
+				require.NoError(t, db.First(&object, object.Id).Error)
+				assert.Equal(t, "active", object.Status)
+			}
+		})
+	}
 }

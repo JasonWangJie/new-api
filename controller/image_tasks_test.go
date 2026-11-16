@@ -1237,6 +1237,92 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				assert.Equal(t, tokenBefore, tokenAfter)
 				assert.Equal(t, logsBefore, logsAfter, "file expiry must not repeat a financial adjustment")
 			})
+			t.Run("cleaned image results keep retained successful task metadata without links", func(t *testing.T) {
+				retained := model.AsyncImageTask{TaskId: "asyncimg_policy_cleaned", UserId: 101, TokenId: 201, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Progress: 100, Quota: 240, ImageCount: 2, ResultCount: 2, CreatedAt: now - 3*3600, ExpiresAt: now + 180*86400}
+				require.NoError(t, db.Create(&retained).Error)
+				objects := []model.ImageStorageObject{
+					{ObjectId: "policy-cleaned-live-sibling", IdentityHash: "policy-cleaned-live-sibling", ProfileId: "presentation-profile", ContentType: "image/png", Status: "active", ExpiresAt: retained.ExpiresAt},
+					{ObjectId: "policy-cleaned-deleted", IdentityHash: "policy-cleaned-deleted", ProfileId: "presentation-profile", ContentType: "image/png", Status: "deleted", ExpiresAt: retained.ExpiresAt},
+				}
+				require.NoError(t, db.Create(&objects).Error)
+				results := []model.AsyncImageResult{{TaskId: retained.TaskId, ImageIndex: 0, ObjectId: objects[0].ObjectId}, {TaskId: retained.TaskId, ImageIndex: 1, ObjectId: objects[1].ObjectId}}
+				require.NoError(t, db.Create(&results).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&results).Error)
+					assert.NoError(t, db.Delete(&objects).Error)
+					assert.NoError(t, db.Delete(&retained).Error)
+				})
+				for _, surface := range []string{"public", "owner", "administrator"} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Set("token_id", 201)
+					c.Params = gin.Params{{Key: "task_id", Value: retained.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/v1/media/tasks_async/"+retained.TaskId, nil)
+					if surface == "public" {
+						QueryAsyncImage(c)
+					} else {
+						GetImageTask(c, surface == "administrator")
+					}
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var view gin.H
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &view))
+					if surface == "public" {
+						assert.Empty(t, view["data"])
+						assert.Equal(t, "expired", view["storage_status"])
+					} else {
+						assert.Empty(t, view["data"].(map[string]any)["results"])
+						view = view["data"].(map[string]any)["task"].(map[string]any)
+						assert.EqualValues(t, retained.ExpiresAt, view["expires_at"])
+						assert.EqualValues(t, retained.Quota, view["quota"])
+						assert.Equal(t, "succeeded", view["billing_status"])
+					}
+					assert.Equal(t, "succeeded", view["status"], surface)
+					assert.Equal(t, true, view["result_expired"], surface)
+				}
+				items, err := imageTasksToDTO(t.Context(), []model.AsyncImageTask{retained}, false, false)
+				require.NoError(t, err)
+				assert.Equal(t, true, items[0]["result_expired"])
+				for _, admin := range []bool{false, true} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Params = gin.Params{{Key: "task_id", Value: retained.TaskId}, {Key: "image_index", Value: "1"}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+					ViewImageTaskResult(c, admin)
+					assert.Equal(t, http.StatusNotFound, recorder.Code, recorder.Body.String())
+				}
+				for _, state := range []string{"deleting", "missing"} {
+					if state == "deleting" {
+						require.NoError(t, db.Model(&objects[1]).Update("status", state).Error)
+					} else {
+						require.NoError(t, db.Delete(&objects[1]).Error)
+					}
+					items, err := imageTasksToDTO(t.Context(), []model.AsyncImageTask{retained}, false, false)
+					require.NoError(t, err)
+					assert.Equal(t, false, items[0]["result_expired"], state)
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Set("token_id", 201)
+					c.Params = gin.Params{{Key: "task_id", Value: retained.TaskId}}
+					c.Request = httptest.NewRequest(http.MethodGet, "/v1/images/tasks_async/"+retained.TaskId, nil)
+					QueryAsyncImage(c)
+					assert.Equal(t, http.StatusServiceUnavailable, recorder.Code, state)
+					for _, admin := range []bool{false, true} {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Set("id", 101)
+						c.Params = gin.Params{{Key: "task_id", Value: retained.TaskId}, {Key: "image_index", Value: "1"}}
+						c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+						ViewImageTaskResult(c, admin)
+						assert.Equal(t, http.StatusServiceUnavailable, recorder.Code, state)
+					}
+				}
+				var unchanged model.AsyncImageTask
+				require.NoError(t, db.Take(&unchanged, retained.Id).Error)
+				assert.Equal(t, retained, unchanged, "file cleanup must not change task retention or accounting")
+			})
 			t.Run("successful image metadata survives file expiry without links", func(t *testing.T) {
 				expired := model.AsyncImageTask{TaskId: "asyncimg_file_expiry", UserId: 101, TokenId: 201, Status: model.ImageTaskSucceeded, BillingStatus: "succeeded", Progress: 100, ResultCount: 1, ExpiresAt: now - 1, PromptSummary: "expired-private-prompt", RequestCipher: []byte("expired-private-request")}
 				require.NoError(t, db.Create(&expired).Error)
