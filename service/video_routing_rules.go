@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -46,7 +47,7 @@ func ValidateVideoRoutingConfig(ctx context.Context, config model.VideoRoutingCo
 		if len(rule.Targets) == 0 || len(rule.Targets) > 20 {
 			return fmt.Errorf("Rule %q requires between 1 and 20 targets", rule.ID)
 		}
-		for key, values := range map[string][]string{"groups": rule.Match.Groups, "models": rule.Match.Models, "resolutions": rule.Match.Resolutions, "modes": rule.Match.Modes, "video_inputs": rule.Match.VideoInputs} {
+		for key, values := range map[string][]string{"groups": rule.Match.Groups, "models": rule.Match.Models, "resolutions": rule.Match.Resolutions, "modes": rule.Match.Modes, "video_inputs": rule.Match.VideoInputs, "image_inputs": rule.Match.ImageInputs} {
 			if len(values) > 100 {
 				return fmt.Errorf("Rule %q has too many %s", rule.ID, key)
 			}
@@ -72,6 +73,10 @@ func ValidateVideoRoutingConfig(ctx context.Context, config model.VideoRoutingCo
 				case "video_inputs":
 					if value != "none" && value != "video" {
 						return fmt.Errorf("Rule %q contains an invalid reference video condition", rule.ID)
+					}
+				case "image_inputs":
+					if value != "none" && value != "image" {
+						return fmt.Errorf("Rule %q contains an invalid reference image condition", rule.ID)
 					}
 				}
 			}
@@ -165,6 +170,17 @@ func videoRoutingTargetCanMatch(match model.VideoRoutingMatch, target model.Vide
 		if mode.Name == "edit_video" || mode.Name == "extend_video" || len(match.Modes) > 0 && !slices.Contains(match.Modes, mode.Name) {
 			continue
 		}
+		if len(match.ImageInputs) == 1 {
+			hasImage := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool {
+				return input.Kind == "image" && input.MaxItems > 0 && len(input.Sources) > 0
+			})
+			requiresImage := slices.ContainsFunc(mode.Inputs, func(input jsplugin.VideoInputProfile) bool {
+				return input.Kind == "image" && input.Required
+			})
+			if match.ImageInputs[0] == "image" && !hasImage || match.ImageInputs[0] == "none" && requiresImage {
+				continue
+			}
+		}
 		resolutions := mode.Resolutions
 		if len(resolutions) == 0 {
 			resolutions = []string{""}
@@ -211,9 +227,10 @@ func MatchVideoRoutingRules(config model.VideoRoutingConfig, group, publicModel,
 	}
 	resolution, _ := facts["resolution"].(string)
 	videoInput, _ := facts["video_input"].(string)
+	imageInput, _ := facts["image_input"].(string)
 	seconds, hasSeconds := videoNumber(facts["seconds"])
 	for _, rule := range config.Rules {
-		if !rule.Enabled || len(rule.Match.Groups) > 0 && !slices.Contains(rule.Match.Groups, group) || len(rule.Match.Models) > 0 && !slices.Contains(rule.Match.Models, publicModel) || len(rule.Match.Modes) > 0 && !slices.Contains(rule.Match.Modes, mode) || len(rule.Match.Resolutions) > 0 && !slices.Contains(rule.Match.Resolutions, resolution) || len(rule.Match.VideoInputs) > 0 && !slices.Contains(rule.Match.VideoInputs, videoInput) {
+		if !rule.Enabled || len(rule.Match.Groups) > 0 && !slices.Contains(rule.Match.Groups, group) || len(rule.Match.Models) > 0 && !slices.Contains(rule.Match.Models, publicModel) || len(rule.Match.Modes) > 0 && !slices.Contains(rule.Match.Modes, mode) || len(rule.Match.Resolutions) > 0 && !slices.Contains(rule.Match.Resolutions, resolution) || len(rule.Match.VideoInputs) > 0 && !slices.Contains(rule.Match.VideoInputs, videoInput) || len(rule.Match.ImageInputs) > 0 && !slices.Contains(rule.Match.ImageInputs, imageInput) {
 			continue
 		}
 		bounds := rule.Match.Seconds
@@ -228,4 +245,103 @@ func MatchVideoRoutingRules(config model.VideoRoutingConfig, group, publicModel,
 		matched = append(matched, rule)
 	}
 	return matched
+}
+
+// VideoRoutingImageInput uses the same material identities as source admission
+// and decoder conservation checks. Routing facts stay outside the billing schema.
+func VideoRoutingImageInput(body map[string]any, files []map[string]any, selectors ...[]jsplugin.VideoRetryInput) string {
+	if len(VideoRoutingImageInventory(body, files, selectors...)) > 0 {
+		return "image"
+	}
+	return "none"
+}
+
+// VideoRoutingImageInventory supplements canonical media with the selected
+// plugin's precise input declarations. Unrelated metadata is never scanned.
+func VideoRoutingImageInventory(body map[string]any, files []map[string]any, selectors ...[]jsplugin.VideoRetryInput) map[string]int {
+	images := make(map[string]int)
+	view := mixedVideoMediaAliases(body)
+	for identity, count := range videoMediaInventory(view, files) {
+		if strings.HasPrefix(identity, "image:") {
+			images[strings.TrimPrefix(identity, "image:")] = count
+		}
+	}
+	for _, name := range []string{"image", "last_frame", "reference_images"} {
+		for _, value := range videoMediaValues(name, view) {
+			if classifyVideoInputSource(value, name) == "file_id" {
+				if identity, _ := videoRoutingImageLeaf(value, ""); identity != "" {
+					images[identity]++
+				}
+			}
+		}
+	}
+	for _, identity := range videoRoutingDeclaredImageInputs(body, selectors...) {
+		images[identity]++
+	}
+	return images
+}
+
+func videoRoutingDeclaredImageInputs(body map[string]any, selectors ...[]jsplugin.VideoRetryInput) map[string]string {
+	images := make(map[string]string)
+	for _, inputs := range selectors {
+		for _, selector := range inputs {
+			// These roots are already accounted for by the canonical inventory.
+			root, _, _ := strings.Cut(strings.TrimPrefix(selector.Path, "/"), "/")
+			if slices.Contains([]string{"image", "input_reference", "input_reference[]", "first_frame", "first_image", "start_frame", "last_frame", "last_image", "end_frame", "reference_images", "images", "image_urls", "referenceImages", "input_images", "content", "references"}, root) || strings.HasPrefix(selector.Path, "/metadata/content/") {
+				continue
+			}
+			slots := []videoRetrySlot{{Value: body}}
+			for part := range strings.SplitSeq(strings.TrimPrefix(selector.Path, "/"), "/") {
+				var next []videoRetrySlot
+				for _, slot := range slots {
+					switch value := slot.Value.(type) {
+					case map[string]any:
+						if child, present := value[part]; present {
+							next = append(next, videoRetrySlot{Path: slot.Path + "/" + part, Value: child, Parent: value})
+						}
+					case []any:
+						if part == "*" {
+							for i, child := range value {
+								next = append(next, videoRetrySlot{Path: slot.Path + "/" + strconv.Itoa(i), Value: child})
+							}
+						}
+					}
+				}
+				slots = next
+			}
+			for _, slot := range slots {
+				kind := selector.Kind
+				if kind == "media" {
+					kind, _ = slot.Parent["type"].(string)
+				}
+				if !slices.Contains([]string{"image", "first_frame", "last_frame", "reference_image"}, kind) {
+					continue
+				}
+				if identity, path := videoRoutingImageLeaf(slot.Value, slot.Path); identity != "" {
+					images[path] = identity
+				}
+			}
+		}
+	}
+	return images
+}
+
+func videoRoutingImageLeaf(value any, path string) (string, string) {
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text), path
+	}
+	if object, ok := value.(map[string]any); ok {
+		if ref, _ := object["__fileRef"].(string); ref != "" {
+			return "upload:" + ref, path + "/__fileRef"
+		}
+		if fileID, _ := object["file_id"].(string); strings.TrimSpace(fileID) != "" {
+			return "file_id:" + strings.TrimSpace(fileID), path + "/file_id"
+		}
+		for _, field := range []string{"url", "image_url", "source"} {
+			if identity, leaf := videoRoutingImageLeaf(object[field], path+"/"+field); identity != "" {
+				return identity, leaf
+			}
+		}
+	}
+	return "", path
 }

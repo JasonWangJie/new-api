@@ -435,6 +435,13 @@ test('draft preview shows original billing parameters and the rewritten executio
     screen.getByRole('spinbutton', { name: 'Duration (seconds)' }),
     '20'
   )
+  expect(
+    screen.getByRole('combobox', { name: 'Reference image' })
+  ).toHaveTextContent('Unknown')
+  await user.click(screen.getByRole('combobox', { name: 'Reference image' }))
+  await user.click(
+    await screen.findByRole('option', { name: 'With reference image' })
+  )
   vi.mocked(imageRequest).mockResolvedValueOnce({
     eligible: [],
     excluded: [],
@@ -443,7 +450,12 @@ test('draft preview shows original billing parameters and the rewritten executio
       rule_id: rule.id,
       rule_name: rule.name,
       matched_rules: [{ id: rule.id, name: rule.name }],
-      source: { model: 'seedance2.5-A', resolution: '480p', seconds: 20 },
+      source: {
+        model: 'seedance2.5-A',
+        resolution: '480p',
+        seconds: 20,
+        image_input: 'image',
+      },
       targets: [
         {
           channel_id: 20,
@@ -465,6 +477,9 @@ test('draft preview shows original billing parameters and the rewritten executio
     )
   ).toBeVisible()
   expect(screen.getByRole('cell', { name: '720p' })).toBeVisible()
+  expect(
+    screen.getByText('Reference image: With reference image')
+  ).toBeVisible()
   expect(imageRequest).toHaveBeenLastCalledWith(
     '/api/option/images/routing/preview',
     'POST',
@@ -472,6 +487,7 @@ test('draft preview shows original billing parameters and the rewritten executio
       model: 'seedance2.5-A',
       resolution: '480p',
       seconds: 20,
+      image_input: 'image',
       video_routing_config: initial,
     })
   )
@@ -488,6 +504,137 @@ test('draft preview shows original billing parameters and the rewritten executio
   ).not.toBeInTheDocument()
   expect(screen.getByRole('textbox', { name: 'Model' })).toHaveValue(
     'seedance2.5-A'
+  )
+})
+
+test.each([
+  {
+    previous: undefined,
+    selected: 'With reference image',
+    expected: ['image'],
+  },
+  { previous: ['image'], selected: 'No reference image', expected: ['none'] },
+  { previous: ['none'], selected: 'All', expected: [] },
+] as const)(
+  'a $selected image condition is applied to the draft and persisted independently of reference video',
+  async ({ previous, selected, expected }) => {
+    const user = userEvent.setup()
+    const existing = structuredClone(initial)
+    existing.rules[0].match.image_inputs = previous ? [...previous] : undefined
+    existing.rules[0].match.video_inputs = ['video']
+    render(form(existing))
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    const dialog = screen.getByRole('dialog')
+    const imageCondition = within(dialog).getByRole('combobox', {
+      name: 'Reference image',
+    })
+    if (previous === undefined) expect(imageCondition).toHaveTextContent('All')
+    await user.click(imageCondition)
+    await user.click(await screen.findByRole('option', { name: selected }))
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Apply to draft' })
+    )
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    )
+    const ruleCell = screen.getByRole('cell', {
+      name: new RegExp(`^${rule.name} seedance2\\.5-A`),
+    })
+    if (expected.length) expect(ruleCell).toHaveTextContent(selected)
+    else expect(ruleCell).not.toHaveTextContent('No reference image')
+    expect(
+      vi.mocked(imageRequest).mock.calls.some((call) => call[1] === 'PUT')
+    ).toBe(false)
+    await user.click(screen.getByRole('button', { name: 'Save routing rules' }))
+    await waitFor(() =>
+      expect(imageRequest).toHaveBeenCalledWith(
+        VIDEO_ROUTING_URL,
+        'PUT',
+        expect.objectContaining({
+          rules: [
+            expect.objectContaining({
+              match: expect.objectContaining({
+                image_inputs: [...expected],
+                video_inputs: ['video'],
+              }),
+            }),
+          ],
+        })
+      )
+    )
+    await user.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(
+      within(screen.getByRole('dialog')).getByRole('combobox', {
+        name: 'Reference image',
+      })
+    ).toHaveTextContent(selected)
+  }
+)
+
+test.each([
+  { selected: 'Unknown', expected: undefined },
+  { selected: 'No reference image', expected: 'none' },
+])(
+  'preview sends the $selected image dimension without assuming it from the mode',
+  async ({ selected, expected }) => {
+    const user = userEvent.setup()
+    render(form())
+    await user.type(
+      screen.getByRole('textbox', { name: 'Model' }),
+      'seedance2.5-A'
+    )
+    await user.click(screen.getByRole('combobox', { name: 'Generation mode' }))
+    await user.click(
+      await screen.findByRole('option', { name: 'Image to video' })
+    )
+    await user.click(screen.getByRole('combobox', { name: 'Reference image' }))
+    await user.click(await screen.findByRole('option', { name: selected }))
+    vi.mocked(imageRequest).mockResolvedValueOnce({
+      eligible: [],
+      excluded: [],
+      routing_groups: ['default'],
+    })
+    await user.click(screen.getByRole('button', { name: 'Preview routing' }))
+    const payload = vi.mocked(imageRequest).mock.calls.at(-1)?.[2]
+    expect(payload).toMatchObject({ mode: 'image_to_video' })
+    if (expected === undefined) {
+      expect(payload).not.toHaveProperty('image_input')
+    } else {
+      expect(payload).toHaveProperty('image_input', expected)
+    }
+  }
+)
+
+test('editing another rule field preserves an existing pair of image conditions', async () => {
+  const user = userEvent.setup()
+  const apply = vi.fn()
+  render(
+    <QueryClientProvider client={client}>
+      <VideoRoutingRuleEditor
+        rule={{
+          ...rule,
+          match: { ...rule.match, image_inputs: ['none', 'image'] },
+        }}
+        config={config}
+        onApply={apply}
+        onClose={vi.fn()}
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    screen.getByRole('combobox', { name: 'Reference image' })
+  ).toHaveTextContent('All')
+  await user.type(
+    screen.getByRole('textbox', { name: 'Rule name' }),
+    ' updated'
+  )
+  await user.click(screen.getByRole('button', { name: 'Apply to draft' }))
+  await waitFor(() =>
+    expect(apply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        match: expect.objectContaining({ image_inputs: ['none', 'image'] }),
+      })
+    )
   )
 })
 

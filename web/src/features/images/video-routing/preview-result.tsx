@@ -39,6 +39,13 @@ export function VideoRoutingPreviewResult(props: {
         {props.result.source.resolution || '—'} ·{' '}
         {props.result.source.seconds ?? '—'} s
       </p>
+      <p className='text-sm'>
+        {t('Reference image')}:{' '}
+        {props.result.source.image_input === undefined && t('Unknown')}
+        {props.result.source.image_input === 'none' && t('No reference image')}
+        {props.result.source.image_input === 'image' &&
+          t('With reference image')}
+      </p>
       {props.result.matched_rules?.length > 1 && (
         <Alert>
           <AlertDescription>

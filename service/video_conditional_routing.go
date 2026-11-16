@@ -43,6 +43,8 @@ type VideoRoutingSnapshot struct {
 	SourceContentType string                     `json:"source_content_type"`
 	SourceModel       string                     `json:"source_model"`
 	SourceFacts       map[string]any             `json:"source_facts"`
+	ImageInputsFrozen bool                       `json:"image_inputs_frozen,omitempty"`
+	SourceImageInputs []jsplugin.VideoRetryInput `json:"source_image_inputs,omitempty"`
 	Targets           []VideoRoutingFrozenTarget `json:"targets"`
 	TargetIndex       int                        `json:"target_index"`
 	Fallback          bool                       `json:"fallback"`
@@ -99,7 +101,7 @@ func (request AsyncVideoRequest) ExecutionModel(publicModel string) string {
 
 // PlanVideoRouting freezes all targets without selecting credentials or making
 // network calls. The public request and public price never use target defaults.
-func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule model.VideoRoutingRule, group, publicModel, operation string, raw []byte, contentType string, facts map[string]any, userID, pinnedChannelID int, filters []dto.ChannelFilter) (*VideoRoutingSnapshot, *MixedVideoCandidate, []byte, string, error) {
+func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule model.VideoRoutingRule, group, publicModel, operation string, raw []byte, contentType string, facts map[string]any, userID, pinnedChannelID int, filters []dto.ChannelFilter, sourceImageInputs ...[]jsplugin.VideoRetryInput) (*VideoRoutingSnapshot, *MixedVideoCandidate, []byte, string, error) {
 	encodedRule, err := common.Marshal(rule)
 	if err != nil {
 		return nil, nil, nil, "", err
@@ -109,6 +111,10 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 		return nil, nil, nil, "", err
 	}
 	snapshot := &VideoRoutingSnapshot{Revision: config.Revision, Rule: frozenRule, SourceBody: slices.Clone(raw), SourceContentType: contentType, SourceModel: publicModel, SourceFacts: maps.Clone(facts), TargetIndex: -1, PinnedChannelID: pinnedChannelID}
+	if len(sourceImageInputs) > 0 {
+		snapshot.ImageInputsFrozen = true
+		snapshot.SourceImageInputs = slices.Clone(sourceImageInputs[0])
+	}
 	for _, filter := range filters {
 		snapshot.Filters = append(snapshot.Filters, VideoRoutingFilter{Kind: filter.Kind, RequestPath: filter.RequestPath, TaskPluginKey: filter.TaskPluginKey, TaskPluginKeys: slices.Clone(filter.TaskPluginKeys), TaskPluginChannelTypes: slices.Clone(filter.TaskPluginChannelTypes)})
 	}
@@ -118,6 +124,9 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 	for index, target := range rule.Targets {
 		frozen := VideoRoutingFrozenTarget{Target: target}
 		candidate, body, ct, err := DecodeVideoRoutingTarget(ctx, target, group, operation, raw, contentType, userID)
+		if err == nil && snapshot.ImageInputsFrozen {
+			err = snapshot.ValidateImageMaterials(raw, contentType, operation, candidate)
+		}
 		if err == nil && pinnedChannelID > 0 && target.ChannelID != pinnedChannelID {
 			err = errors.New("target conflicts with the pinned channel")
 		}
@@ -165,6 +174,9 @@ func DecodeFrozenVideoRoutingTarget(ctx context.Context, snapshot *VideoRoutingS
 	if candidate.UpstreamModel != target.UpstreamModel || candidate.Binding.Plugin.Meta.Key != target.PluginKey || candidate.Binding.Plugin.Engine.SourceFingerprint() != target.PluginHash {
 		return candidate, nil, "", errors.New("conditional video target mapping or plugin changed")
 	}
+	if err := snapshot.ValidateImageMaterials(snapshot.SourceBody, snapshot.SourceContentType, operation, candidate); err != nil {
+		return candidate, nil, "", err
+	}
 	if snapshot.PinnedChannelID > 0 && candidate.Channel.Id != snapshot.PinnedChannelID {
 		return candidate, nil, "", errors.New("conditional video channel pin changed")
 	}
@@ -180,7 +192,11 @@ func DecodeFrozenVideoRoutingTarget(ctx context.Context, snapshot *VideoRoutingS
 func DecodeVideoExecution(ctx context.Context, request AsyncVideoRequest, channel model.Channel, publicModel, group string, overrides VideoModelOverrides, userID int) (MixedVideoCandidate, error) {
 	target := request.ConditionalRouting.ActiveTarget()
 	if target == nil {
-		return DecodeMixedVideoCandidate(ctx, channel, publicModel, request.Operation, request.Body, overrides, userID, request.ContentType)
+		candidate, err := DecodeMixedVideoCandidate(ctx, channel, publicModel, request.Operation, request.Body, overrides, userID, request.ContentType)
+		if err == nil {
+			err = request.ConditionalRouting.ValidateImageMaterials(request.Body, request.ContentType, request.Operation, candidate)
+		}
+		return candidate, err
 	}
 	candidate, _, _, err := DecodeFrozenVideoRoutingTarget(ctx, request.ConditionalRouting, request.ConditionalRouting.TargetIndex, group, request.Operation, userID, request.frozenVideoMappingChannel())
 	if err != nil {
@@ -194,10 +210,50 @@ func DecodeVideoExecution(ctx context.Context, request AsyncVideoRequest, channe
 		return candidate, err
 	}
 	candidate, err = request.decodeMixedVideoRetryCandidate(ctx, channel, target.Target.Model, body, ct, VideoModelOverrides{}, userID)
+	if err == nil {
+		err = request.ConditionalRouting.ValidateImageMaterials(request.Body, request.ContentType, request.Operation, candidate)
+	}
 	if err == nil && (candidate.UpstreamModel != target.UpstreamModel || candidate.Binding.Plugin.Engine.SourceFingerprint() != target.PluginHash || !request.ValidateMixedVideoMapping(candidate)) {
 		err = errors.New("conditional video execution identity changed")
 	}
 	return candidate, err
+}
+
+// ValidateImageMaterials interprets the same current body through the frozen
+// source paths and the target's paths. Localized data URIs and upload references
+// are compared to themselves, never to historical remote URLs. Old snapshots
+// retain their established validation when no image-path snapshot was frozen.
+func (snapshot *VideoRoutingSnapshot) ValidateImageMaterials(raw []byte, contentType, operation string, candidate MixedVideoCandidate) error {
+	if snapshot == nil || !snapshot.ImageInputsFrozen {
+		return nil
+	}
+	view, body, err := MixedVideoRequestContext(raw, contentType, operation)
+	if err != nil {
+		return err
+	}
+	inputs, _ := videoRetryInputSelectors(candidate.Binding.Plugin)
+	expected := VideoRoutingImageInventory(body, view.Files, snapshot.SourceImageInputs)
+	actual := VideoRoutingImageInventory(body, view.Files, inputs)
+	if !maps.Equal(expected, actual) {
+		return errors.New("conditional video target changed the source image materials or counts")
+	}
+	decoded, _ := candidate.Intent["requestBody"].(map[string]any)
+	decodedImages := VideoRoutingImageInventory(decoded, view.Files, inputs)
+	before := videoRoutingDeclaredImageInputs(body, inputs)
+	generic := VideoRoutingImageInventory(decoded, view.Files)
+	for path, identity := range videoRoutingDeclaredImageInputs(decoded, inputs) {
+		// Decoders may mirror an existing canonical image into a native slot.
+		// Only newly synthesized mirrors can be ignored; existing distinct
+		// input positions keep their multiplicity, including identical URLs.
+		if _, existed := before[path]; !existed && generic[identity] > 0 && decodedImages[identity] > actual[identity] {
+			decodedImages[identity]--
+			generic[identity]--
+		}
+	}
+	if !maps.Equal(actual, decodedImages) {
+		return errors.New("conditional video decoder changed the source image materials or counts")
+	}
+	return nil
 }
 
 // ConditionalVideoRetryCandidates preserves rule order and intersects it with
@@ -246,6 +302,9 @@ func ConditionalVideoRetryCandidates(ctx context.Context, job model.AsyncMediaJo
 			continue
 		}
 		candidate, err := request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, snapshot.SourceBody, snapshot.SourceContentType, capability.VideoOverrides, job.UserId)
+		if err == nil {
+			err = snapshot.ValidateImageMaterials(snapshot.SourceBody, snapshot.SourceContentType, request.Operation, candidate)
+		}
 		if err == nil && videoRoutingRetryAllowed(channel, request, candidate) {
 			channels = append(channels, channel)
 		}
@@ -312,6 +371,9 @@ func RebindConditionalVideoRequest(ctx context.Context, job model.AsyncMediaJob,
 		}
 	}
 	candidate, err := request.decodeMixedVideoRetryCandidate(ctx, channel, job.Model, snapshot.SourceBody, snapshot.SourceContentType, overrides, job.UserId)
+	if err == nil {
+		err = snapshot.ValidateImageMaterials(snapshot.SourceBody, snapshot.SourceContentType, request.Operation, candidate)
+	}
 	if err != nil {
 		return candidate, fmt.Errorf("original video route: %w", err)
 	}
@@ -350,9 +412,19 @@ func applyVideoRoutingBody(request *AsyncVideoRequest, body []byte, contentType,
 // NormalizeVideoRoutingAdmissionDefaults preserves ordinary routing when no
 // compatible source variant could match. If any variant can match, all source
 // defaults must agree before a rule is allowed to choose an execution target.
-// knownVideoInput is only used by parameter-only administrative previews;
-// admission leaves it empty and derives the fact from actual request materials.
-func NormalizeVideoRoutingAdmissionDefaults(config model.VideoRoutingConfig, publicModel string, groups []string, raw []byte, contentType, operation string, profilesByGroup map[string][]jsplugin.VideoProfile, knownVideoInput string) ([]byte, string, map[string]any, error) {
+// Known input overrides are only used by parameter-only administrative previews.
+// An explicitly passed empty image override means unknown, while admission omits
+// the override and derives image presence from actual request materials.
+type VideoRoutingAdmissionInputs struct {
+	SourcesByGroup  map[string][]VideoRoutingSourceProfile
+	KnownImageInput *string
+}
+
+func NormalizeVideoRoutingAdmissionDefaults(config model.VideoRoutingConfig, publicModel string, groups []string, raw []byte, contentType, operation string, profilesByGroup map[string][]jsplugin.VideoProfile, knownVideoInput string, inputs ...VideoRoutingAdmissionInputs) ([]byte, string, map[string]any, error) {
+	var input VideoRoutingAdmissionInputs
+	if len(inputs) > 0 {
+		input = inputs[0]
+	}
 	profiles := make([]jsplugin.VideoProfile, 0)
 	for _, group := range groups {
 		profiles = append(profiles, profilesByGroup[group]...)
@@ -363,7 +435,16 @@ func NormalizeVideoRoutingAdmissionDefaults(config model.VideoRoutingConfig, pub
 			return nil, "", nil, err
 		}
 		for _, group := range groups {
-			for _, profile := range profilesByGroup[group] {
+			var sourceImages map[string]int
+			hasSourceImages, ambiguousImages, potentialMatch := false, false, false
+			sources := input.SourcesByGroup[group]
+			if len(sources) == 0 {
+				for _, profile := range profilesByGroup[group] {
+					sources = append(sources, VideoRoutingSourceProfile{Profile: profile})
+				}
+			}
+			for _, source := range sources {
+				profile := source.Profile
 				for _, mode := range profile.Modes {
 					variant := profile
 					variant.Modes = []jsplugin.VideoModeProfile{mode}
@@ -378,10 +459,27 @@ func NormalizeVideoRoutingAdmissionDefaults(config model.VideoRoutingConfig, pub
 					if knownVideoInput != "" {
 						facts["video_input"] = knownVideoInput
 					}
+					if input.KnownImageInput == nil {
+						facts["image_input"] = VideoRoutingImageInput(body, view.Files, source.Inputs)
+						images := VideoRoutingImageInventory(body, view.Files, source.Inputs)
+						if !hasSourceImages {
+							sourceImages, hasSourceImages = images, true
+						} else if !maps.Equal(sourceImages, images) {
+							ambiguousImages = true
+						}
+					} else if *input.KnownImageInput != "" {
+						facts["image_input"] = *input.KnownImageInput
+					}
 					if len(MatchVideoRoutingRules(config, group, publicModel, mode.Name, facts)) > 0 {
-						return NormalizeVideoRoutingSourceDefaults(raw, contentType, operation, profiles)
+						potentialMatch = true
 					}
 				}
+			}
+			if potentialMatch {
+				if ambiguousImages {
+					return nil, "", nil, errors.New("source video image materials are ambiguous; use canonical image or reference_images fields")
+				}
+				return NormalizeVideoRoutingSourceDefaults(raw, contentType, operation, profiles)
 			}
 		}
 	}

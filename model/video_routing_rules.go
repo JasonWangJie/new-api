@@ -33,6 +33,7 @@ type VideoRoutingMatch struct {
 	Resolutions []string            `json:"resolutions"`
 	Modes       []string            `json:"modes"`
 	VideoInputs []string            `json:"video_inputs"`
+	ImageInputs []string            `json:"image_inputs"`
 	Seconds     VideoRoutingSeconds `json:"seconds"`
 }
 
@@ -98,7 +99,7 @@ func normalizeVideoRoutingCollections(config VideoRoutingConfig) VideoRoutingCon
 	}
 	for i := range config.Rules {
 		match := &config.Rules[i].Match
-		for _, values := range []*[]string{&match.Groups, &match.Models, &match.Resolutions, &match.Modes, &match.VideoInputs} {
+		for _, values := range []*[]string{&match.Groups, &match.Models, &match.Resolutions, &match.Modes, &match.VideoInputs, &match.ImageInputs} {
 			if *values == nil {
 				*values = []string{}
 			}

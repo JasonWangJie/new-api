@@ -76,12 +76,14 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		profiles := make([]jsplugin.VideoProfile, 0)
 		profilesByGroup := make(map[string][]jsplugin.VideoProfile, len(groups))
+		routingSources := make(map[string][]service.VideoRoutingSourceProfile, len(groups))
 		for _, group := range groups {
 			poolPolicy := policy
 			poolPolicy.Group = group
-			variants, err := service.MixedVideoModelProfiles(c.Request.Context(), poolPolicy, publicModel, capability.VideoOverrides, true)
+			variants, sourceVariants, err := service.MixedVideoModelRoutingProfiles(c.Request.Context(), poolPolicy, publicModel, capability.VideoOverrides, true)
 			if err == nil {
 				profilesByGroup[group] = variants
+				routingSources[group] = sourceVariants
 				profiles = append(profiles, variants...)
 			}
 		}
@@ -107,7 +109,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 			c.Set("conditional_video_rules_config", config)
 			routingConfig = config
 		}
-		raw, contentType, body, err := service.NormalizeVideoRoutingAdmissionDefaults(routingConfig, publicModel, groups, raw, c.GetHeader("Content-Type"), operation, profilesByGroup, "")
+		raw, contentType, body, err := service.NormalizeVideoRoutingAdmissionDefaults(routingConfig, publicModel, groups, raw, c.GetHeader("Content-Type"), operation, profilesByGroup, "", service.VideoRoutingAdmissionInputs{SourcesByGroup: routingSources})
 		if err != nil {
 			AsyncImagePublicError(c, 400, "invalid_request", err.Error())
 			c.Abort()
@@ -164,6 +166,11 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 					continue
 				}
 				candidate, err := service.DecodeMixedVideoCandidate(c.Request.Context(), channel, publicModel, operation, raw, capability.VideoOverrides, token.UserId, c.GetHeader("Content-Type"))
+				if value, found := c.Get(service.VideoRoutingContextKey); err == nil && found {
+					if snapshot, ok := value.(*service.VideoRoutingSnapshot); ok {
+						err = snapshot.ValidateImageMaterials(raw, contentType, operation, candidate)
+					}
+				}
 				if err != nil {
 					rejection = err
 					continue

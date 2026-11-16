@@ -236,6 +236,29 @@ export function VideoRoutingRuleEditor(props: {
                 />
               </div>
             ))}
+            <ImageSelect
+              label={t('Reference image')}
+              value={
+                rule.match.image_inputs?.length === 1
+                  ? rule.match.image_inputs[0]
+                  : 'all'
+              }
+              options={[
+                { value: 'all', label: t('All') },
+                { value: 'none', label: t('No reference image') },
+                { value: 'image', label: t('With reference image') },
+              ]}
+              onChange={(value) =>
+                setRule({
+                  ...rule,
+                  match: {
+                    ...rule.match,
+                    image_inputs:
+                      value === 'none' || value === 'image' ? [value] : [],
+                  },
+                })
+              }
+            />
           </div>
           <div className='grid gap-4 sm:grid-cols-2'>
             {(['min', 'max'] as const).map((bound) => (

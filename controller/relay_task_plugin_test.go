@@ -574,7 +574,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 			require.NoError(t, db.Create(&policy).Error)
 			require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: service.MediaPoolBindingKey(policy, "seedance2.5-A", "1K", "video"), Group: "default", Platform: "mixed", Mode: "model", Model: "seedance2.5-A", ChannelId: channels[0].Id, Priority: 1}).Error)
 			minimum := 15
-			routing := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "upgrade", Name: "Upgrade", Enabled: true, Match: model.VideoRoutingMatch{Models: []string{"seedance2.5-A"}, Resolutions: []string{"480p"}, Seconds: model.VideoRoutingSeconds{Min: &minimum, MinExclusive: true}}, Targets: []model.VideoRoutingTarget{{ChannelID: channels[1].Id, Model: "seedance2.5-E", Resolution: "720p"}, {ChannelID: channels[2].Id, Model: "seedance2.5-E", Resolution: "720p"}}, OnExhausted: "fail"}}}
+			routing := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "upgrade", Name: "Upgrade", Enabled: true, Match: model.VideoRoutingMatch{Models: []string{"seedance2.5-A"}, Resolutions: []string{"480p"}, ImageInputs: []string{"none"}, Seconds: model.VideoRoutingSeconds{Min: &minimum, MinExclusive: true}}, Targets: []model.VideoRoutingTarget{{ChannelID: channels[1].Id, Model: "seedance2.5-E", Resolution: "720p"}, {ChannelID: channels[2].Id, Model: "seedance2.5-E", Resolution: "720p"}}, OnExhausted: "fail"}}}
 			if tc.originalFallback {
 				routing.Rules[0].OnExhausted = "original"
 			}
@@ -654,8 +654,10 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 			require.NoError(t, common.Unmarshal(plain, &frozen))
 			require.NotNil(t, frozen.ConditionalRouting)
 			assert.Equal(t, "480p", frozen.ConditionalRouting.SourceFacts["resolution"])
+			assert.Equal(t, "none", frozen.ConditionalRouting.SourceFacts["image_input"])
 			assert.Equal(t, "480p", frozen.Details.RequestedResolution)
 			assert.Equal(t, "seedance2.5-A", frozen.Billing.Tiered.ModelName)
+			assert.NotContains(t, frozen.Billing.Tiered.UsageFacts, "image_input")
 			assert.Equal(t, 100, frozen.Billing.Price.Quota)
 			assert.Contains(t, string(frozen.Body), `"resolution":"720p"`)
 			for _, admin := range []bool{false, true} {

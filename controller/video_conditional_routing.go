@@ -2,11 +2,13 @@ package controller
 
 import (
 	"io"
+	"maps"
 	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -28,8 +30,17 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 	if !service.VideoRoutingAppliesToSource(config, route.Model, groups) {
 		return false
 	}
+	view, body, err := service.MixedVideoRequestContext(raw, contentType, route.Operation)
+	if err != nil {
+		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
+		c.Abort()
+		return true
+	}
 	sourceModes := make(map[string]string)
+	sourceInputs := make(map[string][]jsplugin.VideoRetryInput)
 	for _, group := range groups {
+		var sourceImages map[string]int
+		ambiguousImages, potentialMatch := false, false
 		check, groupPolicy := *route, policy
 		groupPolicy.Group = group
 		check.Group, check.BindingKey = group, service.MediaPoolBindingKey(groupPolicy, route.Model, route.Resolution, "video")
@@ -53,8 +64,21 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 			if mode == "" {
 				mode = "text_to_video"
 			}
-			sourceModes[group] = mode
-			break
+			inputs := candidate.Binding.Plugin.Meta.VideoRetryInputs
+			images := service.VideoRoutingImageInventory(body, view.Files, inputs)
+			if _, found := sourceModes[group]; !found {
+				sourceModes[group], sourceInputs[group], sourceImages = mode, inputs, images
+			} else if !maps.Equal(sourceImages, images) {
+				ambiguousImages = true
+			}
+			candidateFacts := maps.Clone(facts)
+			candidateFacts["image_input"] = service.VideoRoutingImageInput(body, view.Files, inputs)
+			potentialMatch = potentialMatch || len(service.MatchVideoRoutingRules(config, group, route.Model, mode, candidateFacts)) > 0
+		}
+		if ambiguousImages && potentialMatch {
+			AsyncImagePublicError(c, 400, "invalid_request", "Source video image materials are ambiguous; use canonical image or reference_images fields")
+			c.Abort()
+			return true
 		}
 	}
 	constraints := service.GetChannelConstraints(c)
@@ -67,8 +91,10 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 		one := config
 		one.Rules = []model.VideoRoutingRule{rule}
 		for _, group := range groups {
+			routingFacts := maps.Clone(facts)
+			routingFacts["image_input"] = service.VideoRoutingImageInput(body, view.Files, sourceInputs[group])
 			mode, validSource := sourceModes[group]
-			if !validSource || len(service.MatchVideoRoutingRules(one, group, route.Model, mode, facts)) == 0 {
+			if !validSource || len(service.MatchVideoRoutingRules(one, group, route.Model, mode, routingFacts)) == 0 {
 				continue
 			}
 			check, groupPolicy := *route, policy
@@ -82,7 +108,7 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 				c.Abort()
 				return true
 			}
-			snapshot, candidate, dispatch, dispatchType, err := service.PlanVideoRouting(c.Request.Context(), config, rule, group, route.Model, route.Operation, raw, contentType, facts, token.UserId, pinnedID, constraints.Filters)
+			snapshot, candidate, dispatch, dispatchType, err := service.PlanVideoRouting(c.Request.Context(), config, rule, group, route.Model, route.Operation, raw, contentType, routingFacts, token.UserId, pinnedID, constraints.Filters, sourceInputs[group])
 			if err != nil {
 				AsyncImagePublicError(c, 400, "provider_unavailable", err.Error())
 				c.Abort()

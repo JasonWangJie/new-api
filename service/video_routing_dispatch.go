@@ -63,6 +63,9 @@ func RefreshConditionalVideoAdmission(ctx context.Context, job *model.AsyncMedia
 				continue
 			}
 			candidate, err := DecodeMixedVideoCandidate(ctx, channel, job.Model, request.Operation, snapshot.SourceBody, capability.VideoOverrides, job.UserId, snapshot.SourceContentType)
+			if err == nil {
+				err = snapshot.ValidateImageMaterials(snapshot.SourceBody, snapshot.SourceContentType, request.Operation, candidate)
+			}
 			if err != nil || len(ImageChannelAccounts(channel, ImageAccountRouting{})) == 0 {
 				continue
 			}

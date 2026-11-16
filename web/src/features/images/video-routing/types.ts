@@ -32,6 +32,7 @@ export type VideoRoutingRule = {
     resolutions: string[]
     modes: string[]
     video_inputs: ('none' | 'video')[]
+    image_inputs?: ('none' | 'image')[]
     seconds: {
       min?: number
       max?: number
@@ -62,7 +63,12 @@ export type ConditionalRoutingPreview = {
   matched_rules: { id: string; name: string }[]
   rule_id: string
   rule_name: string
-  source: { model: string; resolution: string; seconds?: number }
+  source: {
+    model: string
+    resolution: string
+    seconds?: number
+    image_input?: 'none' | 'image'
+  }
   targets: {
     channel_id: number
     model: string

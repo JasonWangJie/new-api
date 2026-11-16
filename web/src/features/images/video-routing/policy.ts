@@ -32,6 +32,10 @@ export const videoRoutingRuleSchema = z.object({
     resolutions: z.array(z.string().min(1)).max(100),
     modes: z.array(z.string().min(1)).max(100),
     video_inputs: z.array(z.enum(['none', 'video'])).max(2),
+    image_inputs: z
+      .array(z.enum(['none', 'image']))
+      .max(2)
+      .optional(),
     seconds: z
       .object({
         min: z.number().int().min(1).max(3600).optional(),
@@ -85,6 +89,7 @@ export function newVideoRoutingRule(): VideoRoutingRule {
       resolutions: [],
       modes: [],
       video_inputs: [],
+      image_inputs: [],
       seconds: { min_exclusive: false, max_exclusive: false },
     },
     targets: [{ channel_id: 0, model: '', resolution: '' }],

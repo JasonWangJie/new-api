@@ -38,7 +38,7 @@ type VideoRoutingPreviewTarget struct {
 
 // videoRoutingPreviewProfileForInputs checks known media kinds before removing
 // content requirements that a parameter-only preview cannot verify.
-func videoRoutingPreviewProfileForInputs(profile jsplugin.VideoProfile, mode, videoInput string) (jsplugin.VideoProfile, error) {
+func videoRoutingPreviewProfileForInputs(profile jsplugin.VideoProfile, mode, videoInput, imageInput string) (jsplugin.VideoProfile, error) {
 	index := slices.IndexFunc(profile.Modes, func(candidate jsplugin.VideoModeProfile) bool { return candidate.Name == mode })
 	if index < 0 {
 		return jsplugin.VideoProfile{}, fmt.Errorf("video mode %q is not enabled", mode)
@@ -53,6 +53,16 @@ func videoRoutingPreviewProfileForInputs(profile jsplugin.VideoProfile, mode, vi
 		return input.Kind == "video" && input.Required
 	}) {
 		return jsplugin.VideoProfile{}, errors.New("video reference input is required by the selected mode")
+	}
+	if imageInput == "image" && !slices.ContainsFunc(selected.Inputs, func(input jsplugin.VideoInputProfile) bool {
+		return input.Kind == "image" && input.MaxItems > 0 && len(input.Sources) > 0
+	}) {
+		return jsplugin.VideoProfile{}, errors.New("image reference input is not supported by the selected mode")
+	}
+	if imageInput == "none" && slices.ContainsFunc(selected.Inputs, func(input jsplugin.VideoInputProfile) bool {
+		return input.Kind == "image" && input.Required
+	}) {
+		return jsplugin.VideoProfile{}, errors.New("image reference input is required by the selected mode")
 	}
 	selected.Inputs = nil
 	profile.Modes = []jsplugin.VideoModeProfile{selected}
@@ -92,6 +102,9 @@ func PreviewConditionalVideoRouting(ctx context.Context, input MediaRoutingPrevi
 	if input.VideoInput != "" {
 		facts["video_input"] = input.VideoInput
 	}
+	if input.ImageInput != "" {
+		facts["image_input"] = input.ImageInput
+	}
 	mode := input.Operation
 	if input.Mode != "" {
 		mode = input.Mode
@@ -125,7 +138,7 @@ func PreviewConditionalVideoRouting(ctx context.Context, input MediaRoutingPrevi
 			return false, err
 		}
 		for _, profile := range profiles {
-			profile, err := videoRoutingPreviewProfileForInputs(profile, mode, input.VideoInput)
+			profile, err := videoRoutingPreviewProfileForInputs(profile, mode, input.VideoInput, input.ImageInput)
 			if err != nil {
 				continue
 			}
@@ -136,6 +149,9 @@ func PreviewConditionalVideoRouting(ctx context.Context, input MediaRoutingPrevi
 		}
 	}
 	result := &VideoRoutingPreview{MatchedRules: []VideoRoutingRuleMatch{}, Source: map[string]any{"model": input.Model, "resolution": facts["resolution"], "seconds": facts["seconds"]}, Targets: []VideoRoutingPreviewTarget{}}
+	if input.ImageInput != "" {
+		result.Source["image_input"] = input.ImageInput
+	}
 	var matched *model.VideoRoutingRule
 	selectedGroup := ""
 	for _, rule := range config.Rules {
@@ -202,7 +218,7 @@ func PreviewConditionalVideoRouting(ctx context.Context, input MediaRoutingPrevi
 			} else {
 				profile, validationErr := EffectiveMixedVideoExecutionProfile(binding, target.Model, upstream, tier, VideoModelOverrides{})
 				if validationErr == nil {
-					profile, validationErr = videoRoutingPreviewProfileForInputs(profile, mode, input.VideoInput)
+					profile, validationErr = videoRoutingPreviewProfileForInputs(profile, mode, input.VideoInput, input.ImageInput)
 				}
 				if validationErr == nil {
 					var rewritten []byte

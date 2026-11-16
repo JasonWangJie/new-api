@@ -95,6 +95,7 @@ export function ImageRoutingPreview(props: {
     seconds: '',
     provider: '',
     video_input: 'none',
+    image_input: '',
   })
   const preview = useMutation({
     mutationFn: () =>
@@ -116,6 +117,9 @@ export function ImageRoutingPreview(props: {
               provider: values.provider.trim() || undefined,
               mode: values.operation,
               video_input: values.video_input,
+              ...(values.image_input
+                ? { image_input: values.image_input }
+                : {}),
               video_routing_config: props.videoRoutingConfig,
             }
           : {}),
@@ -299,6 +303,17 @@ export function ImageRoutingPreview(props: {
                   onChange={(event) => change('provider', event.target.value)}
                 />
               </div>
+              <ImageSelect
+                label={t('Reference image')}
+                value={values.image_input}
+                disabled={preview.isPending}
+                options={[
+                  { value: '', label: t('Unknown') },
+                  { value: 'none', label: t('No reference image') },
+                  { value: 'image', label: t('With reference image') },
+                ]}
+                onChange={(value) => change('image_input', value)}
+              />
               <ImageSelect
                 label={t('Reference video')}
                 value={values.video_input}

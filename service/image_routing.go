@@ -55,6 +55,7 @@ type MediaRoutingPreviewRequest struct {
 	Provider           string                    `json:"provider,omitempty"`
 	Mode               string                    `json:"mode,omitempty"`
 	VideoInput         string                    `json:"video_input,omitempty"`
+	ImageInput         string                    `json:"image_input,omitempty"`
 	VideoRoutingConfig *model.VideoRoutingConfig `json:"video_routing_config,omitempty"`
 	ExecutionMode      string                    `json:"execution_mode"`
 	Group              string                    `json:"group"`
@@ -333,7 +334,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 				continue
 			}
 			for _, profile := range variants {
-				profile, err := videoRoutingPreviewProfileForInputs(profile, input.Operation, input.VideoInput)
+				profile, err := videoRoutingPreviewProfileForInputs(profile, input.Operation, input.VideoInput, input.ImageInput)
 				if err != nil {
 					continue
 				}
@@ -374,7 +375,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			if requiresResolution {
 				err = errors.New("an explicit video resolution is required for model mapping")
 			} else {
-				_, _, videoParameters, err = NormalizeVideoRoutingAdmissionDefaults(config, input.Model, routingGroups, raw, "application/json", operation, profilesByGroup, input.VideoInput)
+				_, _, videoParameters, err = NormalizeVideoRoutingAdmissionDefaults(config, input.Model, routingGroups, raw, "application/json", operation, profilesByGroup, input.VideoInput, VideoRoutingAdmissionInputs{KnownImageInput: &input.ImageInput})
 			}
 		} else {
 			_, _, videoParameters, err = NormalizeMixedVideoDefaults(raw, "application/json", operation, profiles)

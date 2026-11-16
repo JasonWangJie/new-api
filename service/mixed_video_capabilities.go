@@ -82,7 +82,20 @@ func MixedVideoModelProfiles(ctx context.Context, policy model.ImageGroupPolicy,
 	return mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool)
 }
 
-func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, error) {
+// VideoRoutingSourceProfile retains provider-owned material paths separately
+// from the deduplicated public capability view.
+type VideoRoutingSourceProfile struct {
+	Profile jsplugin.VideoProfile
+	Inputs  []jsplugin.VideoRetryInput
+}
+
+func MixedVideoModelRoutingProfiles(ctx context.Context, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, []VideoRoutingSourceProfile, error) {
+	var sources []VideoRoutingSourceProfile
+	profiles, err := mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool, &sources)
+	return profiles, sources, err
+}
+
+func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool, routingSources ...*[]VideoRoutingSourceProfile) ([]jsplugin.VideoProfile, error) {
 	if err := ValidateMixedVideoOverridesStatic(overrides); err != nil {
 		return nil, err
 	}
@@ -172,6 +185,10 @@ func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.Im
 				}
 				if len(profile.Modes) == 0 {
 					continue
+				}
+				for _, sources := range routingSources {
+					inputs, _ := videoRetryInputSelectors(binding.Plugin)
+					*sources = append(*sources, VideoRoutingSourceProfile{Profile: profile, Inputs: slices.Clone(inputs)})
 				}
 				encoded, err := common.Marshal(profile)
 				if err != nil {

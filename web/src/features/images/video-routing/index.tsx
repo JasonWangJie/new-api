@@ -193,6 +193,13 @@ export function VideoRoutingForm(props: {
             <p className='text-muted-foreground text-xs break-all'>
               {rule.match.models.join(', ') || t('All')}
             </p>
+            {rule.match.image_inputs?.length === 1 && (
+              <p className='text-muted-foreground text-xs'>
+                {rule.match.image_inputs[0] === 'image'
+                  ? t('With reference image')
+                  : t('No reference image')}
+              </p>
+            )}
           </div>
         ),
       },

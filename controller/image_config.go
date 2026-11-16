@@ -170,6 +170,10 @@ func PreviewMediaRouting(c *gin.Context) {
 		imageManagementError(c, 400, errors.New("Invalid reference video condition"))
 		return
 	}
+	if input.ImageInput != "" && input.ImageInput != "none" && input.ImageInput != "image" {
+		imageManagementError(c, 400, errors.New("Invalid reference image condition"))
+		return
+	}
 	input.Group, input.Model = strings.TrimSpace(input.Group), strings.TrimSpace(input.Model)
 	if input.ExecutionMode == "" {
 		input.ExecutionMode = "async"

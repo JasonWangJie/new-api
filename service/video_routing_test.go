@@ -302,7 +302,7 @@ func TestVideoRoutingConfigurationRevisionAndMatching(t *testing.T) {
 	assert.False(t, config.Enabled)
 	assert.Zero(t, config.Revision)
 	minSeconds, maxSeconds := 15, 30
-	rule := model.VideoRoutingRule{ID: "long-video", Name: "Long videos", Enabled: true, OnExhausted: "original", Targets: []model.VideoRoutingTarget{{ChannelID: channel.Id, Model: "target-alias", Resolution: "720p"}}, Match: model.VideoRoutingMatch{Groups: []string{"default"}, Models: []string{"seedance2.5-A"}, Resolutions: []string{"480p", "720p"}, Modes: []string{"text_to_video"}, VideoInputs: []string{"none"}, Seconds: model.VideoRoutingSeconds{Min: &minSeconds, Max: &maxSeconds, MinExclusive: true}}}
+	rule := model.VideoRoutingRule{ID: "long-video", Name: "Long videos", Enabled: true, OnExhausted: "original", Targets: []model.VideoRoutingTarget{{ChannelID: channel.Id, Model: "target-alias", Resolution: "720p"}}, Match: model.VideoRoutingMatch{Groups: []string{"default"}, Models: []string{"seedance2.5-A"}, Resolutions: []string{"480p", "720p"}, Modes: []string{"text_to_video"}, VideoInputs: []string{"none"}, ImageInputs: []string{"none"}, Seconds: model.VideoRoutingSeconds{Min: &minSeconds, Max: &maxSeconds, MinExclusive: true}}}
 	config.Enabled, config.Rules = true, []model.VideoRoutingRule{rule}
 	require.NoError(t, ValidateVideoRoutingConfig(t.Context(), config))
 	saved, err := model.SaveVideoRoutingConfig(t.Context(), config, config.Revision)
@@ -332,12 +332,12 @@ func TestVideoRoutingConfigurationRevisionAndMatching(t *testing.T) {
 		{name: "invalid duration", seconds: math.NaN()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			facts := map[string]any{"seconds": tc.seconds, "resolution": "480p", "video_input": "none"}
+			facts := map[string]any{"seconds": tc.seconds, "resolution": "480p", "video_input": "none", "image_input": "none"}
 			matches := MatchVideoRoutingRules(saved, "default", "seedance2.5-A", "text_to_video", facts)
 			assert.Equal(t, tc.matches, len(matches) == 1)
 		})
 	}
-	facts := map[string]any{"seconds": 20, "resolution": "480p", "video_input": "none"}
+	facts := map[string]any{"seconds": 20, "resolution": "480p", "video_input": "none", "image_input": "none"}
 	assert.Empty(t, MatchVideoRoutingRules(saved, "other", "seedance2.5-A", "text_to_video", facts))
 	assert.Empty(t, MatchVideoRoutingRules(saved, "default", "other", "text_to_video", facts))
 	assert.Empty(t, MatchVideoRoutingRules(saved, "default", "seedance2.5-A", "edit_video", facts))
@@ -377,6 +377,7 @@ func TestVideoRoutingConfigurationRevisionAndMatching(t *testing.T) {
 		assert.NotNil(t, current.Rules[0].Match.Resolutions)
 		assert.NotNil(t, current.Rules[0].Match.Modes)
 		assert.NotNil(t, current.Rules[0].Match.VideoInputs)
+		assert.NotNil(t, current.Rules[0].Match.ImageInputs)
 	}
 	unavailable := model.VideoRoutingConfig{Version: 1, Rules: []model.VideoRoutingRule{rule}}
 	unavailable.Rules[0].Targets = []model.VideoRoutingTarget{{ChannelID: channel.Id + 1000, Model: "target-alias", Resolution: "720p"}}
@@ -861,10 +862,10 @@ func TestVideoRoutingPreviewKnownVideoInputs(t *testing.T) {
 	assert.Empty(t, preview.Eligible)
 	assert.Contains(t, preview.Reasons, "video_parameters_not_supported")
 	requiredVideo := jsplugin.VideoProfile{Modes: []jsplugin.VideoModeProfile{{Name: "reference_to_video", Inputs: []jsplugin.VideoInputProfile{{Name: "video", Kind: "video", Sources: []string{"url"}, MaxItems: 1, Required: true}}}}}
-	_, err = videoRoutingPreviewProfileForInputs(requiredVideo, "reference_to_video", "none")
+	_, err = videoRoutingPreviewProfileForInputs(requiredVideo, "reference_to_video", "none", "")
 	require.ErrorContains(t, err, "required by the selected mode")
 	for _, knownInput := range []string{"", "video"} {
-		_, err = videoRoutingPreviewProfileForInputs(requiredVideo, "reference_to_video", knownInput)
+		_, err = videoRoutingPreviewProfileForInputs(requiredVideo, "reference_to_video", knownInput, "")
 		require.NoError(t, err)
 	}
 	assert.Len(t, requiredVideo.Modes[0].Inputs, 1, "preview must preserve the real capability's input requirements")
@@ -886,11 +887,15 @@ func TestVideoRoutingAdmissionDefaultsOnlyForPotentialMatches(t *testing.T) {
 		{name: "reference rule ignores text request", match: model.VideoRoutingMatch{Modes: []string{"reference_to_video"}}},
 		{name: "resolution misses", match: model.VideoRoutingMatch{Resolutions: []string{"720p"}}},
 		{name: "reference video misses", match: model.VideoRoutingMatch{VideoInputs: []string{"video"}}},
+		{name: "reference image misses", match: model.VideoRoutingMatch{ImageInputs: []string{"image"}}},
+		{name: "no reference image matches", match: model.VideoRoutingMatch{ImageInputs: []string{"none"}}, ambiguous: true},
 		{name: "seconds misses", match: model.VideoRoutingMatch{Seconds: model.VideoRoutingSeconds{Min: common.GetPointer(16)}}},
 		{name: "one default matches", match: model.VideoRoutingMatch{Seconds: model.VideoRoutingSeconds{Min: common.GetPointer(4), Max: common.GetPointer(4)}}, ambiguous: true},
 		{name: "model misses", match: model.VideoRoutingMatch{Models: []string{"other"}}},
 		{name: "group misses", match: model.VideoRoutingMatch{Groups: []string{"other"}}},
 		{name: "reference rule matches reference request", body: `{"model":"public","prompt":"test","image":"https://source.test/reference.png"}`, match: model.VideoRoutingMatch{Modes: []string{"reference_to_video"}}, ambiguous: true},
+		{name: "image condition matches reference request", body: `{"model":"public","prompt":"test","image":"https://source.test/reference.png"}`, match: model.VideoRoutingMatch{ImageInputs: []string{"image"}}, ambiguous: true},
+		{name: "no image condition misses reference request", body: `{"model":"public","prompt":"test","image":"https://source.test/reference.png"}`, match: model.VideoRoutingMatch{ImageInputs: []string{"none"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := tc.body
@@ -919,6 +924,314 @@ func TestVideoRoutingAdmissionDefaultsOnlyForPotentialMatches(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, float64(5), normalized["seconds"], "another group's default must not create a possible rule match")
+		})
+	}
+	for _, knownImage := range []string{"", "none", "image"} {
+		t.Run("preview image="+knownImage, func(t *testing.T) {
+			config := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "no-image", Enabled: true, Match: model.VideoRoutingMatch{ImageInputs: []string{"none"}}}}}
+			_, _, normalized, err := NormalizeVideoRoutingAdmissionDefaults(config, "public", []string{"default"}, []byte(`{"model":"public","prompt":"preview"}`), "application/json", "create", map[string][]jsplugin.VideoProfile{"default": profiles}, "", VideoRoutingAdmissionInputs{KnownImageInput: &knownImage})
+			if knownImage == "none" {
+				require.ErrorContains(t, err, "seconds default is ambiguous")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, float64(4), normalized["seconds"], "unknown preview images must not match a no-image condition")
+		})
+	}
+}
+
+func TestVideoRoutingImageConditionsUseActualMaterials(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, input string
+	}{
+		{name: "text", body: `{}`, input: "none"},
+		{name: "empty image", body: `{"image":"  ","reference_images":[]}`, input: "none"},
+		{name: "mode is not material", body: `{"mode":"image_to_video","image_input":"image"}`, input: "none"},
+		{name: "primary", body: `{"image":"https://source.test/a.png"}`, input: "image"},
+		{name: "primary file ID", body: `{"image":{"file_id":"file-reference"}}`, input: "image"},
+		{name: "content file ID", body: `{"content":[{"type":"image_url","image_url":{"file_id":"file-reference"}}]}`, input: "image"},
+		{name: "upload reference URL", body: `{"input_reference":"https://source.test/a.png"}`, input: "image"},
+		{name: "first frame", body: `{"first_frame":"https://source.test/a.png"}`, input: "image"},
+		{name: "first image alias", body: `{"first_image":"https://source.test/a.png"}`, input: "image"},
+		{name: "start frame alias", body: `{"start_frame":"https://source.test/a.png"}`, input: "image"},
+		{name: "last frame", body: `{"last_frame":"https://source.test/a.png"}`, input: "image"},
+		{name: "last image alias", body: `{"last_image":"https://source.test/a.png"}`, input: "image"},
+		{name: "end frame alias", body: `{"end_frame":"https://source.test/a.png"}`, input: "image"},
+		{name: "images", body: `{"images":["https://source.test/a.png"]}`, input: "image"},
+		{name: "canonical references", body: `{"reference_images":[{"url":"https://source.test/a.png"}]}`, input: "image"},
+		{name: "image URLs alias", body: `{"image_urls":["https://source.test/a.png"]}`, input: "image"},
+		{name: "camel case alias", body: `{"referenceImages":["https://source.test/a.png"]}`, input: "image"},
+		{name: "input images alias", body: `{"input_images":["https://source.test/a.png"]}`, input: "image"},
+		{name: "input reference array", body: `{"input_reference[]":["https://source.test/a.png"]}`, input: "image"},
+		{name: "typed references", body: `{"references":[{"type":"image","role":"reference","source":"https://source.test/a.png"}]}`, input: "image"},
+		{name: "typed first frame", body: `{"references":[{"type":"image","role":"first_frame","source":"https://source.test/a.png"}]}`, input: "image"},
+		{name: "content", body: `{"content":[{"type":"image_url","image_url":{"url":"https://source.test/a.png"}}]}`, input: "image"},
+		{name: "metadata content", body: `{"metadata":{"content":[{"type":"image_url","role":"last_frame","image_url":{"url":"https://source.test/a.png"}}]}}`, input: "image"},
+		{name: "video only", body: `{"references":[{"type":"video","source":"https://source.test/a.mp4"}]}`, input: "none"},
+		{name: "audio only", body: `{"reference_audios":["https://source.test/a.mp3"]}`, input: "none"},
+		{name: "mixed media", body: `{"reference_videos":["https://source.test/a.mp4"],"reference_audios":["https://source.test/a.mp3"],"reference_images":["https://source.test/a.png"]}`, input: "image"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			require.NoError(t, common.Unmarshal([]byte(tc.body), &body))
+			assert.Equal(t, tc.input, VideoRoutingImageInput(body, nil))
+			billingFacts, err := MixedVideoPublicFacts(body, "create", nil)
+			require.NoError(t, err)
+			assert.NotContains(t, billingFacts, "image_input", "routing dimensions may not expand the frozen billing usage schema")
+		})
+	}
+	for _, field := range []string{"image", "input_reference", "input_reference[]", "last_frame", "reference_images", "reference_videos"} {
+		t.Run("multipart "+field, func(t *testing.T) {
+			var raw bytes.Buffer
+			writer := multipart.NewWriter(&raw)
+			part, err := writer.CreateFormFile(field, "material.bin")
+			require.NoError(t, err)
+			_, err = part.Write([]byte("material"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			view, body, err := MixedVideoRequestContext(raw.Bytes(), writer.FormDataContentType(), "create")
+			require.NoError(t, err)
+			expected := "image"
+			if field == "reference_videos" {
+				expected = "none"
+			}
+			assert.Equal(t, expected, VideoRoutingImageInput(body, view.Files))
+		})
+	}
+}
+
+func TestVideoRoutingImageConditionMatchingAndValidation(t *testing.T) {
+	rule := model.VideoRoutingRule{ID: "image", Name: "Image", Enabled: true, OnExhausted: "fail", Targets: []model.VideoRoutingTarget{{ChannelID: 1, Model: "target"}}}
+	for _, tc := range []struct {
+		name   string
+		inputs []string
+		fact   string
+		match  bool
+	}{
+		{name: "legacy omitted selector", match: true},
+		{name: "wildcard with image", fact: "image", match: true},
+		{name: "no image matches", inputs: []string{"none"}, fact: "none", match: true},
+		{name: "no image excludes image", inputs: []string{"none"}, fact: "image"},
+		{name: "unknown does not mean no image", inputs: []string{"none"}},
+		{name: "image matches", inputs: []string{"image"}, fact: "image", match: true},
+		{name: "image excludes no image", inputs: []string{"image"}, fact: "none"},
+		{name: "unknown does not mean image", inputs: []string{"image"}},
+		{name: "both values match image", inputs: []string{"none", "image"}, fact: "image", match: true},
+		{name: "both values match none", inputs: []string{"none", "image"}, fact: "none", match: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rule.Match.ImageInputs = tc.inputs
+			config := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{rule}}
+			assert.Equal(t, tc.match, len(MatchVideoRoutingRules(config, "default", "public", "reference_to_video", map[string]any{"image_input": tc.fact, "video_input": "video"})) == 1)
+			config.Enabled = false
+			require.NoError(t, ValidateVideoRoutingConfig(t.Context(), config))
+		})
+	}
+	for _, values := range [][]string{{"video"}, {"image", "image"}, {"none", " image"}, {""}} {
+		rule.Match.ImageInputs = values
+		require.Error(t, ValidateVideoRoutingConfig(t.Context(), model.VideoRoutingConfig{Version: 1, Rules: []model.VideoRoutingRule{rule}}))
+	}
+}
+
+func TestVideoRoutingPreviewKnownImageInputs(t *testing.T) {
+	db, _, target := videoRoutingFixture(t)
+	source := target
+	source.Id, source.Models, source.ModelMapping = 0, "seedance2.5-A", nil
+	require.NoError(t, db.Create(&source).Error)
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: source.Models, ChannelId: source.Id, Enabled: true}).Error)
+	policy := model.ImageGroupPolicy{PolicyKey: ImageIdentityHash("default", "mixed"), Group: "default", Platform: "mixed", PoolMode: "model", Enabled: true, AsyncEnabled: true, Models: `[{"id":"seedance2.5-A","media_type":"video"}]`}
+	require.NoError(t, db.Create(&policy).Error)
+	require.NoError(t, db.Create(&model.ImageChannelPool{BindingKey: MediaPoolBindingKey(policy, source.Models, "1K", "video"), Group: "default", Platform: "mixed", ChannelId: source.Id, Priority: 1}).Error)
+	rule := model.VideoRoutingRule{ID: "with-image", Name: "With image", Enabled: true, Match: model.VideoRoutingMatch{Models: []string{source.Models}, ImageInputs: []string{"image"}}, Targets: []model.VideoRoutingTarget{{ChannelID: target.Id, Model: "target-alias"}}, OnExhausted: "fail"}
+	config := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{rule}}
+	require.NoError(t, ValidateVideoRoutingConfig(t.Context(), config))
+	saved, err := model.SaveVideoRoutingConfig(t.Context(), config, 0)
+	require.NoError(t, err)
+	loaded, err := model.GetVideoRoutingConfig(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, saved, loaded)
+	seconds := 10
+	input := MediaRoutingPreviewRequest{Group: "default", Platform: "mixed", MediaType: "video", Model: source.Models, Operation: "reference_to_video", Resolution: "720p", Seconds: &seconds}
+	for _, tc := range []struct {
+		name, condition, known string
+		matched                bool
+	}{
+		{name: "with image", condition: "image", known: "image", matched: true},
+		{name: "with image excludes none", condition: "image", known: "none"},
+		{name: "with image excludes unknown", condition: "image"},
+		{name: "no image", condition: "none", known: "none", matched: true},
+		{name: "no image excludes image", condition: "none", known: "image"},
+		{name: "no image excludes unknown", condition: "none"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.Rules[0].Match.ImageInputs = []string{tc.condition}
+			input.ImageInput, input.VideoRoutingConfig = tc.known, &config
+			preview, err := PreviewMediaRouting(t.Context(), input)
+			require.NoError(t, err)
+			if !tc.matched {
+				assert.Nil(t, preview.ConditionalRouting)
+				return
+			}
+			require.NotNil(t, preview.ConditionalRouting)
+			assert.Equal(t, tc.known, preview.ConditionalRouting.Source["image_input"])
+			require.Len(t, preview.ConditionalRouting.Targets, 1)
+			assert.True(t, preview.ConditionalRouting.Targets[0].Eligible)
+		})
+	}
+	// The persisted rule is used when no unsaved draft is supplied.
+	input.VideoRoutingConfig, input.ImageInput = nil, "image"
+	preview, err := PreviewMediaRouting(t.Context(), input)
+	require.NoError(t, err)
+	require.NotNil(t, preview.ConditionalRouting)
+	assert.Equal(t, rule.ID, preview.ConditionalRouting.RuleID)
+	// Known images cannot make a text-only mode eligible, and known absence
+	// cannot satisfy a required primary image in a frame-generation mode.
+	frameMapping := `{"target-alias":"seedance2.5-G"}`
+	target.ModelMapping = &frameMapping
+	require.NoError(t, db.Model(&target).Update("model_mapping", frameMapping).Error)
+	for _, tc := range []struct {
+		mode, known, failure string
+	}{
+		{mode: "text_to_video", known: "image", failure: "not supported"},
+		{mode: "image_to_video", known: "none", failure: "required"},
+		{mode: "image_to_video", known: "image"},
+		{mode: "reference_to_video", known: "none"},
+	} {
+		t.Run(tc.mode+"_"+tc.known, func(t *testing.T) {
+			binding, upstream, err := MixedVideoChannelBinding(target, "target-alias", "create", "")
+			require.NoError(t, err)
+			profile, err := EffectiveMixedVideoExecutionProfile(binding, "target-alias", upstream, "", VideoModelOverrides{})
+			require.NoError(t, err)
+			_, err = videoRoutingPreviewProfileForInputs(profile, tc.mode, "", tc.known)
+			if tc.failure != "" {
+				require.ErrorContains(t, err, tc.failure)
+			} else {
+				require.NoError(t, err)
+			}
+			conditional := config
+			conditional.Rules = []model.VideoRoutingRule{rule}
+			conditional.Rules[0].Match.Modes = []string{tc.mode}
+			conditional.Rules[0].Match.ImageInputs = []string{tc.known}
+			err = ValidateVideoRoutingConfig(t.Context(), conditional)
+			if tc.failure != "" {
+				require.ErrorContains(t, err, "no compatible mode")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestVideoRoutingNativeImagesRespectSourcePlugin(t *testing.T) {
+	previous := jsplugin.DefaultRegistry
+	jsplugin.DefaultRegistry = jsplugin.NewRegistry()
+	t.Cleanup(func() { jsplugin.DefaultRegistry = previous })
+	for _, key := range []string{"hailuo", "kling", "vidu", "xai"} {
+		source, err := os.ReadFile(filepath.Join("..", "plugins", "tasks", key, "plugin.js"))
+		require.NoError(t, err)
+		_, err = jsplugin.DefaultRegistry.RegisterFactory(string(source), jsplugin.Options{Key: key})
+		require.NoError(t, err)
+	}
+	for _, tc := range []struct {
+		name, key, upstream, fields string
+		images                      int
+	}{
+		{name: "hailuo first frame", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"metadata":{"first_frame_image":"https://source.test/a.png"}`, images: 1},
+		{name: "hailuo last frame", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"metadata":{"last_frame_image":"https://source.test/a.png"}`, images: 1},
+		{name: "hailuo subject array", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"metadata":{"subject_reference":[{"type":"character","image":["https://source.test/a.png"]}]}`, images: 1},
+		{name: "hailuo canonical mirror", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"image":"https://source.test/a.png"`, images: 1},
+		{name: "hailuo ignored kling field", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"metadata":{"image":"https://source.test/a.png"}`},
+		{name: "hailuo empty subject", key: "hailuo", upstream: "MiniMax-Hailuo-2.3", fields: `"metadata":{"subject_reference":[]}`},
+		{name: "kling image", key: "kling", upstream: "kling-v1", fields: `"metadata":{"image":"https://source.test/a.png"}`, images: 1},
+		{name: "kling tail", key: "kling", upstream: "kling-v1", fields: `"metadata":{"image_tail":"https://source.test/a.png"}`, images: 1},
+		{name: "kling ignores hailuo field", key: "kling", upstream: "kling-v1", fields: `"metadata":{"first_frame_image":"https://source.test/a.png"}`},
+		{name: "vidu images", key: "vidu", upstream: "vidu1.5", fields: `"metadata":{"action":"image_to_video","images":["https://source.test/a.png"]}`, images: 1},
+		{name: "vidu empty images", key: "vidu", upstream: "vidu1.5", fields: `"metadata":{"action":"image_to_video","images":[]}`},
+		{name: "xai string keyframe", key: "xai", upstream: "grok-imagine-video-1.5", fields: `"keyframes":[{"image":"https://source.test/a.png","timestamp_s":2}]`, images: 1},
+		{name: "xai wrapped keyframe", key: "xai", upstream: "grok-imagine-video-1.5", fields: `"keyframes":[{"image":{"url":"https://source.test/a.png"},"timestamp_s":2}]`, images: 1},
+		{name: "xai repeated image two frames", key: "xai", upstream: "grok-imagine-video-1.5", fields: `"keyframes":[{"image":{"url":"https://source.test/a.png"},"timestamp_s":2},{"image":{"url":"https://source.test/a.png"},"timestamp_s":4}]`, images: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setting, mapping := fmt.Sprintf(`{"task_plugin_key":%q}`, tc.key), fmt.Sprintf(`{"public":%q}`, tc.upstream)
+			channel := model.Channel{Id: 1, Type: constant.ChannelTypeTaskPlugin, Models: "public", Group: "default", Status: common.ChannelStatusEnabled, Setting: &setting, ModelMapping: &mapping}
+			binding, upstream, err := MixedVideoChannelBinding(channel, "public", "create")
+			require.NoError(t, err)
+			profile, err := EffectiveMixedVideoExecutionProfile(binding, "public", upstream, "", VideoModelOverrides{})
+			require.NoError(t, err)
+			raw, ct, body, err := NormalizeMixedVideoDefaults([]byte(fmt.Sprintf(`{"model":"public","prompt":"test","seconds":6,"resolution":"720p",%s}`, tc.fields)), "application/json", "create", []jsplugin.VideoProfile{profile})
+			require.NoError(t, err)
+			candidate, err := DecodeMixedVideoCandidate(t.Context(), channel, "public", "create", raw, VideoModelOverrides{}, 0, ct)
+			require.NoError(t, err)
+			inputs := candidate.Binding.Plugin.Meta.VideoRetryInputs
+			inventory := VideoRoutingImageInventory(body, nil, inputs)
+			count := 0
+			for _, n := range inventory {
+				count += n
+			}
+			assert.Equal(t, tc.images, count)
+			expected := "none"
+			if tc.images > 0 {
+				expected = "image"
+			}
+			assert.Equal(t, expected, VideoRoutingImageInput(body, nil, inputs))
+			snapshot := &VideoRoutingSnapshot{ImageInputsFrozen: true, SourceImageInputs: inputs}
+			require.NoError(t, snapshot.ValidateImageMaterials(raw, ct, "create", candidate))
+			if tc.name == "hailuo canonical mirror" {
+				decoded := candidate.Intent["requestBody"].(map[string]any)
+				decoded["metadata"].(map[string]any)["last_frame_image"] = "https://source.test/a.png"
+				require.ErrorContains(t, snapshot.ValidateImageMaterials(raw, ct, "create", candidate), "decoder changed", "a canonical image grants only one equivalent native mirror")
+			}
+			if tc.name == "hailuo first frame" {
+				otherSetting, otherMapping := `{"task_plugin_key":"kling"}`, `{"public":"kling-v1"}`
+				channel.Setting, channel.ModelMapping = &otherSetting, &otherMapping
+				other, err := DecodeMixedVideoCandidate(t.Context(), channel, "public", "create", raw, VideoModelOverrides{}, 0, ct)
+				require.NoError(t, err, "the target really accepts the request while ignoring the native image")
+				require.ErrorContains(t, snapshot.ValidateImageMaterials(raw, ct, "create", other), "changed the source image materials")
+				request := AsyncVideoRequest{Body: raw, ContentType: ct, Operation: "create", ConditionalRouting: snapshot}
+				_, err = DecodeVideoExecution(t.Context(), request, channel, "public", "default", VideoModelOverrides{}, 0)
+				require.ErrorContains(t, err, "changed the source image materials", "ordinary-route fallback must conserve native images too")
+				snapshot.ImageInputsFrozen = false
+				_, err = DecodeVideoExecution(t.Context(), request, channel, "public", "default", VideoModelOverrides{}, 0)
+				require.NoError(t, err, "historical snapshots preserve their established semantics")
+			}
+			if tc.images == 2 {
+				encoded, err := common.Marshal(candidate.Intent["requestBody"])
+				require.NoError(t, err)
+				var decoded map[string]any
+				require.NoError(t, common.Unmarshal(encoded, &decoded))
+				decoded["keyframes"] = decoded["keyframes"].([]any)[:1]
+				candidate.Intent["requestBody"] = decoded
+				require.ErrorContains(t, snapshot.ValidateImageMaterials(raw, ct, "create", candidate), "decoder changed", "one of two identical image identities may not disappear")
+			}
+		})
+	}
+}
+
+func TestVideoRoutingNativeImageDefaultsRequireConsistentSources(t *testing.T) {
+	profile := jsplugin.VideoProfile{Models: []string{"public"}, Modes: []jsplugin.VideoModeProfile{{Name: "reference_to_video", Duration: &jsplugin.VideoDurationProfile{Min: 4, Max: 30, Step: 1, Default: 4}, Inputs: []jsplugin.VideoInputProfile{{Name: "image", Kind: "image", Sources: []string{"url"}, MaxItems: 1}}}}}
+	profiles := map[string][]jsplugin.VideoProfile{"default": {profile}}
+	inputs := VideoRoutingAdmissionInputs{SourcesByGroup: map[string][]VideoRoutingSourceProfile{"default": {
+		{Profile: profile, Inputs: []jsplugin.VideoRetryInput{{Path: "/metadata/first_frame_image", Kind: "image"}}},
+		{Profile: profile, Inputs: []jsplugin.VideoRetryInput{{Path: "/metadata/image", Kind: "image"}}},
+	}}}
+	config := model.VideoRoutingConfig{Version: 1, Enabled: true, Rules: []model.VideoRoutingRule{{ID: "images", Enabled: true, Match: model.VideoRoutingMatch{ImageInputs: []string{"image"}}}}}
+	for _, tc := range []struct {
+		name, fields, model string
+		conflict            bool
+	}{
+		{name: "native meaning differs", fields: `"metadata":{"first_frame_image":"https://source.test/a.png"}`, model: "public", conflict: true},
+		{name: "canonical meaning agrees", fields: `"image":"https://source.test/a.png"`, model: "public"},
+		{name: "unrelated rule retains ordinary routing", fields: `"metadata":{"first_frame_image":"https://source.test/a.png"}`, model: "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.Rules[0].Match.Models = []string{tc.model}
+			_, _, body, err := NormalizeVideoRoutingAdmissionDefaults(config, "public", []string{"default"}, []byte(fmt.Sprintf(`{"model":"public","prompt":"test",%s}`, tc.fields)), "application/json", "create", profiles, "", inputs)
+			if tc.conflict {
+				require.ErrorContains(t, err, "image materials are ambiguous")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, float64(4), body["seconds"])
 		})
 	}
 }
