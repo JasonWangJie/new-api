@@ -289,7 +289,7 @@ func executeImageCleanupObject(ctx context.Context, job model.ImageCleanupJob, l
 	if err := common.UnmarshalJsonStr(job.Filters, &filters); err != nil {
 		return err
 	}
-	filters.IgnoreRetention = job.Source == "scheduled" && job.PolicyID != "" && filters.ChannelID != "" && filters.CutoffAt > 0 && len(filters.ProfileIDs) > 0
+	filters.IgnoreRetention = imageCleanupIgnoresRetention(job, filters)
 	eligible, err := ImageCleanupCandidates(ctx, job.Scope, filters)
 	if err != nil {
 		return err

@@ -151,7 +151,12 @@ test('output options state model scope and frame bounds without adding format-sp
     screen.getByText(
       /Storage channel changes preserve existing image locations/
     )
-  ).toHaveTextContent('before task or result retention ends')
+  ).toHaveTextContent('manual previews with a storage channel and image age')
+  expect(
+    screen.getByText(
+      /Storage channel changes preserve existing image locations/
+    )
+  ).toHaveTextContent('Existing manual previews keep their original rules')
   expect(screen.getByText(/After confirmed image cleanup/)).toHaveTextContent(
     'result_expired=true with empty data'
   )

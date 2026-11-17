@@ -91,7 +91,7 @@ export function AsyncImageGuide() {
               </p>
               <p>
                 {t(
-                  'Storage channel changes preserve existing image locations. Scheduled cleanup may delete completed results before task or result retention ends. Active tasks, library images and published images remain protected.'
+                  'Storage channel changes preserve existing image locations. Scheduled cleanup and new manual previews with a storage channel and image age may delete completed results before task or result retention ends. Existing manual previews keep their original rules. Active tasks, library images and published images remain protected.'
                 )}
               </p>
               <p>

@@ -101,12 +101,12 @@ func TestImageCleanupPreviewAgeSnapshotProtectionAndDelete(t *testing.T) {
 		}
 		intent := model.ImageUploadIntent{IntentKey: name, ProfileId: profile.ProfileId, ObjectKey: name + ".png", Class: "temporary", ContentType: image.ContentType, Checksum: image.Checksum, ByteSize: int64(len(image.Data)), Status: "pending", CreatedAt: created}
 		var err error
-		objects[i], err = StoreImageIntent(t.Context(), intent, image, now-1)
+		objects[i], err = StoreImageIntent(t.Context(), intent, image, now+180*86400)
 		require.NoError(t, err)
 		require.NoError(t, db.Model(&model.ImageUploadIntent{}).Where("intent_key = ?", intent.IntentKey).Update("lease_expires_at", 0).Error)
 	}
 	require.NoError(t, db.Create(&model.ImageLibraryItem{AssetId: "live", ObjectId: objects[1].ObjectId, SourceKey: "live", ExpiresAt: now + 86400}).Error)
-	filters := ImageCleanupFilters{ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "days"}
+	filters := ImageCleanupFilters{ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "days", CutoffAt: now + 86400, ProfileIDs: []string{"client-supplied-profile"}}
 	job, err := NewImageCleanupPreview(t.Context(), "all", filters, 7)
 	require.NoError(t, err)
 	// Added after preview, even an old backfilled row is outside its snapshot.
@@ -374,6 +374,121 @@ func TestImageCleanupSliceSharesRetryAndFreshDispatchBudget(t *testing.T) {
 	assert.Zero(t, GetImageCleanupRuntimeStatus().ActiveWorkers)
 }
 
+func TestImageCleanupMaintainsReadyBacklogAcrossPages(t *testing.T) {
+	for _, initialStatus := range []string{"previewing", "queued", "legacy queued null control"} {
+		t.Run(initialStatus, func(t *testing.T) {
+			db, profile := imageCleanupFixture(t)
+			require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.ImageModerationEvent{}, &model.ImageUploadAdmissionTicket{}))
+			t.Cleanup(func() {
+				assert.NoError(t, db.Migrator().DropTable(&model.SystemTask{}, &model.ImageModerationEvent{}, &model.ImageUploadAdmissionTicket{}))
+			})
+			cfg := DefaultImageCleanupConfig()
+			cfg.BatchSize, cfg.ScanPagesPerSecond = 20, 5
+			require.NoError(t, SaveImageCleanupConfig(t.Context(), cfg))
+			now := time.Now().Unix()
+			objects := make([]model.ImageStorageObject, 21)
+			for i := range objects {
+				id := fmt.Sprintf("retained-page-%02d", i)
+				objects[i] = model.ImageStorageObject{ObjectId: id, IdentityHash: id, ProfileId: profile.ProfileId, ObjectKey: id + ".png", Status: "active", CreatedAt: 1, ExpiresAt: now + 86400}
+			}
+			require.NoError(t, db.Create(&objects).Error)
+			status := initialStatus
+			if initialStatus == "legacy queued null control" {
+				status = "queued"
+			}
+			job := model.ImageCleanupJob{JobId: "continuous-backlog", Source: "manual", Scope: "all", Filters: "{}", Status: status, UserId: 7, MaxObjectID: objects[len(objects)-1].Id, CreatedAt: now}
+			require.NoError(t, db.Create(&job).Error)
+			if initialStatus == "legacy queued null control" {
+				require.NoError(t, db.Model(&job).UpdateColumn("control", nil).Error)
+			}
+			require.NoError(t, MaintainImageCleanup(t.Context()))
+			require.NoError(t, db.First(&job, job.Id).Error)
+			assert.EqualValues(t, len(objects), job.Scanned, "one invocation must continue past its first page without a scheduler wakeup")
+			assert.EqualValues(t, len(objects), job.RetentionSkipped)
+			assert.Zero(t, job.Deleted, "manual cleanup still protects retained files")
+			if initialStatus == "previewing" {
+				assert.Equal(t, "preview_ready", job.Status)
+				assert.NotEmpty(t, job.PreviewToken)
+				assert.Zero(t, job.Matched)
+			} else {
+				assert.Equal(t, "completed", job.Status)
+				assert.EqualValues(t, len(objects), job.Skipped)
+			}
+			assert.Empty(t, job.LeaseToken)
+			assert.Zero(t, job.LeaseExpiresAt)
+			assert.Empty(t, job.Control)
+			var active int64
+			require.NoError(t, db.Model(&model.ImageStorageObject{}).Where("status = ?", "active").Count(&active).Error)
+			assert.EqualValues(t, len(objects), active)
+		})
+	}
+}
+
+func TestImageCleanupContinuationHonorsWaitingAndStoppedWork(t *testing.T) {
+	for _, scenario := range []string{"future retry", "active lease", "paused", "pending pause control", "resource pressure", "cancelled parent"} {
+		t.Run(scenario, func(t *testing.T) {
+			db, profile := imageCleanupFixture(t)
+			require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.ImageModerationEvent{}, &model.ImageUploadAdmissionTicket{}))
+			t.Cleanup(func() {
+				assert.NoError(t, db.Migrator().DropTable(&model.SystemTask{}, &model.ImageModerationEvent{}, &model.ImageUploadAdmissionTicket{}))
+			})
+			now := time.Now().Unix()
+			object := model.ImageStorageObject{ObjectId: "waiting-object", IdentityHash: "waiting-object", ProfileId: profile.ProfileId, ObjectKey: "waiting.png", Status: "active", CreatedAt: 1, ExpiresAt: now - 1}
+			require.NoError(t, db.Create(&object).Error)
+			job := model.ImageCleanupJob{JobId: "waiting-job", Source: "manual", Scope: "all", Filters: "{}", Status: "queued", MaxObjectID: object.Id, CreatedAt: now}
+			var retry model.ImageCleanupRetry
+			switch scenario {
+			case "future retry":
+				job.Cursor = object.Id
+				retry = model.ImageCleanupRetry{JobId: job.JobId, ObjectId: object.ObjectId, Outcome: "retry", Attempts: 2, NextAttemptAt: now + 3600}
+				require.NoError(t, db.Create(&retry).Error)
+			case "active lease":
+				job.Status, job.LeaseToken, job.LeaseExpiresAt = "running", "another-worker", now+3600
+			case "paused":
+				job.Status, job.Control = "paused", "pause"
+			case "pending pause control":
+				job.Control = "pause"
+			case "resource pressure":
+				imageCleanupLoad.mu.Lock()
+				imageCleanupLoad.reason = "Cleanup is waiting for CPU or memory pressure to fall"
+				imageCleanupLoad.mu.Unlock()
+			}
+			require.NoError(t, db.Create(&job).Error)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "cancelled parent" {
+				cancel()
+			}
+			err := MaintainImageCleanup(ctx)
+			if scenario == "cancelled parent" {
+				assert.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.NoError(t, err, "waiting work must yield to its deadline or control rather than keep looping")
+			}
+			var saved model.ImageCleanupJob
+			require.NoError(t, db.First(&saved, job.Id).Error)
+			assert.Equal(t, job.Status, saved.Status)
+			assert.Equal(t, job.Control, saved.Control)
+			assert.Equal(t, job.LeaseToken, saved.LeaseToken)
+			assert.Equal(t, job.LeaseExpiresAt, saved.LeaseExpiresAt)
+			assert.Zero(t, saved.Scanned)
+			assert.Zero(t, saved.Deleted)
+			if scenario == "future retry" || scenario == "resource pressure" {
+				assert.Greater(t, saved.NextAttemptAt, now)
+			}
+			if scenario == "future retry" {
+				var pending model.ImageCleanupRetry
+				require.NoError(t, db.First(&pending, retry.Id).Error)
+				assert.Equal(t, retry.Attempts, pending.Attempts)
+				assert.Equal(t, retry.NextAttemptAt, pending.NextAttemptAt)
+				assert.Equal(t, "retry", pending.Outcome)
+			}
+			require.NoError(t, db.First(&object, object.Id).Error)
+			assert.Equal(t, "active", object.Status)
+		})
+	}
+}
+
 func TestImageCleanupPreviewBudgetPreservesCursor(t *testing.T) {
 	db, profile := imageCleanupFixture(t)
 	object := model.ImageStorageObject{ObjectId: "preview-later", IdentityHash: "preview-later", ProfileId: profile.ProfileId, ObjectKey: "preview-later", Status: "active", CreatedAt: 1}
@@ -617,13 +732,16 @@ func TestImageCleanupHistoryMaintenanceSurvivesStorageConfigurationFailure(t *te
 	assert.Zero(t, count, "storage maintenance must not prevent the bounded history pass")
 }
 
-func TestImageCleanupScheduledPolicyDeletesRetainedResults(t *testing.T) {
-	for _, backend := range []string{"local", "r2"} {
-		t.Run(backend, func(t *testing.T) {
+func TestImageCleanupAgeBasedJobsDeleteRetainedResults(t *testing.T) {
+	for _, scenario := range []struct{ backend, source string }{
+		{"local", "scheduled"}, {"r2", "scheduled"},
+		{"local", "manual"}, {"r2", "manual"},
+	} {
+		t.Run(scenario.backend+"/"+scenario.source, func(t *testing.T) {
 			db, profile := imageCleanupFixture(t)
 			var deletes atomic.Int32
 			var server *httptest.Server
-			if backend == "r2" {
+			if scenario.backend == "r2" {
 				var mu sync.Mutex
 				files := map[string][]byte{}
 				server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -692,10 +810,14 @@ func TestImageCleanupScheduledPolicyDeletesRetainedResults(t *testing.T) {
 			require.NoError(t, common.UnmarshalJsonStr(fmt.Sprintf(`{"channel_id":%q,"older_than":2,"age_unit":"hours","ignore_retention":true}`, profile.ChannelId), &filters))
 			manual, err := NewImageCleanupPreview(t.Context(), "all", filters, task.UserId)
 			require.NoError(t, err)
+			// A preview created before this change keeps its original retention
+			// behavior, including when its existing token is confirmed now.
+			manual.Source = "manual"
+			require.NoError(t, db.Model(&manual).Update("source", manual.Source).Error)
 			cfg := DefaultImageCleanupConfig()
 			require.NoError(t, runImageCleanupSlice(t.Context(), manual, cfg, &imageCleanupBudget{}))
 			require.NoError(t, db.First(&manual, manual.Id).Error)
-			assert.EqualValues(t, 0, manual.Matched, "a request cannot bypass retention by injecting ignore_retention")
+			assert.EqualValues(t, 0, manual.Matched, "client JSON cannot expand a legacy preview's deletion scope")
 			assert.EqualValues(t, 1, manual.RetentionSkipped)
 			manual, err = ConfirmImageCleanupPreview(t.Context(), "all", filters, manual.PreviewToken, task.UserId)
 			require.NoError(t, err)
@@ -706,11 +828,24 @@ func TestImageCleanupScheduledPolicyDeletesRetainedResults(t *testing.T) {
 			data, err := store.Read(t.Context(), object.ObjectKey, 1024)
 			require.NoError(t, err)
 			assert.Equal(t, image.Data, data)
-			cfg.Enabled = true
-			cfg.Policies = []ImageCleanupPolicy{{ID: "two-hours", Name: "Two-hour cleanup", Enabled: true, ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "hours", ScheduleType: "interval", IntervalMinutes: 15, Timezone: "Asia/Shanghai"}}
-			require.NoError(t, scheduleImageCleanup(t.Context(), cfg, time.Unix(now, 0)))
 			var scheduled model.ImageCleanupJob
-			require.NoError(t, db.Where("source = ? AND policy_id = ?", "scheduled", "two-hours").Take(&scheduled).Error)
+			if scenario.source == "scheduled" {
+				cfg.Enabled = true
+				cfg.Policies = []ImageCleanupPolicy{{ID: "two-hours", Name: "Two-hour cleanup", Enabled: true, ChannelID: profile.ChannelId, OlderThan: 2, AgeUnit: "hours", ScheduleType: "interval", IntervalMinutes: 15, Timezone: "Asia/Shanghai"}}
+				require.NoError(t, scheduleImageCleanup(t.Context(), cfg, time.Unix(now, 0)))
+				require.NoError(t, db.Where("source = ? AND policy_id = ?", "scheduled", "two-hours").Take(&scheduled).Error)
+			} else {
+				scheduled, err = NewImageCleanupPreview(t.Context(), "all", filters, task.UserId)
+				require.NoError(t, err)
+				require.NoError(t, runImageCleanupSlice(t.Context(), scheduled, cfg, &imageCleanupBudget{}))
+				require.NoError(t, db.First(&scheduled, scheduled.Id).Error)
+				assert.EqualValues(t, 1, scheduled.Matched, "new manual previews ignore object and terminal-task retention")
+				assert.Zero(t, scheduled.RetentionSkipped)
+				_, err = store.Read(t.Context(), object.ObjectKey, 1024)
+				require.NoError(t, err, "a preview must not delete physical bytes")
+				scheduled, err = ConfirmImageCleanupPreview(t.Context(), "all", filters, scheduled.PreviewToken, task.UserId)
+				require.NoError(t, err)
+			}
 			require.NoError(t, runImageCleanupSlice(t.Context(), scheduled, cfg, &imageCleanupBudget{}))
 			require.NoError(t, db.First(&scheduled, scheduled.Id).Error)
 			assert.Equal(t, "completed", scheduled.Status)
@@ -732,7 +867,7 @@ func TestImageCleanupScheduledPolicyDeletesRetainedResults(t *testing.T) {
 			require.NoError(t, runImageCleanupSlice(t.Context(), scheduled, cfg, &imageCleanupBudget{}))
 			require.NoError(t, db.First(&scheduled, scheduled.Id).Error)
 			assert.EqualValues(t, 1, scheduled.Deleted, "replaying a completed job cannot double-count deletion")
-			if backend == "r2" {
+			if scenario.backend == "r2" {
 				assert.EqualValues(t, 1, deletes.Load())
 			}
 			var savedTask model.AsyncImageTask

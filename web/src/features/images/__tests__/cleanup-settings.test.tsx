@@ -127,6 +127,9 @@ function mockJobs() {
 test('manual cleanup freezes the selected age and channel in the confirmed preview', async () => {
   mockJobs()
   renderPanel()
+  expect(screen.getByText(/New previews use image age/)).toHaveTextContent(
+    'existing previews keep their original rules'
+  )
   const user = userEvent.setup()
   await user.click(screen.getByRole('combobox', { name: 'Storage channel' }))
   await user.click(screen.getByRole('option', { name: 'Main R2' }))
@@ -188,6 +191,7 @@ test('storage cleanup shows only the latest five jobs without paging and refresh
   let items = Array.from({ length: 7 }, (_, index) => ({
     ...job,
     job_id: `history-${7 - index}`,
+    source: index === 0 ? 'manual_age' : job.source,
     status: 'completed',
   }))
   vi.mocked(imageRequest).mockImplementation(async (url) => {
@@ -198,6 +202,7 @@ test('storage cleanup shows only the latest five jobs without paging and refresh
   const table = await screen.findByRole('table')
   await within(table).findByText('history-7')
   expect(within(table).getAllByRole('row')).toHaveLength(6)
+  expect(within(table).getAllByText('Manual')).toHaveLength(5)
   expect(within(table).getByText('history-3')).toBeVisible()
   expect(within(table).queryByText('history-2')).not.toBeInTheDocument()
   expect(within(table).queryByText('history-1')).not.toBeInTheDocument()

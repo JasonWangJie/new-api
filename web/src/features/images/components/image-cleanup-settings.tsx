@@ -149,7 +149,7 @@ export function ImageCleanupConfigForm(props: {
     <SettingsCard
       title={t('Scheduled image cleanup')}
       description={t(
-        'Scheduled cleanup follows the configured image age regardless of task or result retention. Active tasks, library images and published images remain protected. Manual cleanup still respects retention periods.'
+        'Scheduled cleanup and new manual previews with a storage channel and image age ignore task and result retention periods. Active tasks, library images and published images remain protected.'
       )}
     >
       <section
@@ -657,7 +657,7 @@ export function ImageCleanupPanel(props: { profiles?: ImageStorageProfile[] }) {
     <SettingsCard
       title={t('Cleanup jobs')}
       description={t(
-        'Age is measured from file creation. Preview fixes the cutoff time; live references are checked again before deletion. Deleted files cannot be restored.'
+        'New previews use image age instead of task or result retention; existing previews keep their original rules. Age is measured from file creation. Preview fixes the cutoff time; live references are checked again before deletion. Deleted files cannot be restored.'
       )}
     >
       <div className='space-y-4'>
@@ -835,6 +835,7 @@ export function ImageCleanupPanel(props: { profiles?: ImageStorageProfile[] }) {
                         {
                           scheduled: 'Scheduled',
                           manual: 'Manual',
+                          manual_age: 'Manual',
                           legacy: 'Legacy',
                         } as Record<string, string>
                       )[job.source] || 'Legacy'

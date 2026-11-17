@@ -53,7 +53,11 @@ func NewImageCleanupPreview(ctx context.Context, scope string, filters ImageClea
 	if err != nil {
 		return model.ImageCleanupJob{}, err
 	}
-	job := model.ImageCleanupJob{JobId: "imgclean_" + common.GetUUID(), Scope: scope, Filters: string(data), UserId: actor, Source: "manual", Status: "previewing", CutoffAt: filters.CutoffAt, MaxObjectID: maxID, CreatedAt: time.Now().Unix()}
+	source := "manual"
+	if filters.ChannelID != "" && filters.CutoffAt > 0 && len(filters.ProfileIDs) > 0 {
+		source = "manual_age"
+	}
+	job := model.ImageCleanupJob{JobId: "imgclean_" + common.GetUUID(), Scope: scope, Filters: string(data), UserId: actor, Source: source, Status: "previewing", CutoffAt: filters.CutoffAt, MaxObjectID: maxID, CreatedAt: time.Now().Unix()}
 	err = model.DB.WithContext(ctx).Create(&job).Error
 	return job, err
 }
@@ -125,14 +129,7 @@ func (imageCleanupHandler) NewPayload() any         { return nil }
 func init()                                         { RegisterSystemTaskHandler(imageCleanupHandler{}) }
 
 func (imageCleanupHandler) Run(parent context.Context, task *model.SystemTask, runner string) {
-	cfg, err := GetImageCleanupConfig(parent)
-	if err != nil {
-		failSystemTask(task, runner, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(parent, time.Duration(cfg.RequestTimeoutSeconds+15)*time.Second)
-	defer cancel()
-	err = MaintainImageCleanup(ctx)
+	err := MaintainImageCleanup(parent)
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		failSystemTask(task, runner, err)
 		return
@@ -143,10 +140,36 @@ func (imageCleanupHandler) Run(parent context.Context, task *model.SystemTask, r
 }
 
 func MaintainImageCleanup(ctx context.Context) error {
-	cfg, err := GetImageCleanupConfig(ctx)
-	if err != nil {
-		return err
+	var budget, scanBudget imageCleanupBudget
+	for {
+		cfg, err := GetImageCleanupConfig(ctx)
+		if err != nil {
+			return err
+		}
+		budget.SetRate(cfg.RequestsPerSecond)
+		scanBudget.SetRate(cfg.ScanPagesPerSecond)
+		// Each pass has its own I/O deadline. Ready backlog continues under the
+		// system task's renewable lease instead of waiting for the scheduler.
+		pass, cancel := context.WithTimeout(ctx, time.Duration(cfg.RequestTimeoutSeconds+15)*time.Second)
+		err = maintainImageCleanupPass(pass, cfg, &budget, &scanBudget)
+		passErr := pass.Err()
+		cancel()
+		if err != nil {
+			return err
+		}
+		if passErr != nil {
+			return passErr
+		}
+		var ready model.ImageCleanupJob
+		now := time.Now().Unix()
+		result := model.DB.WithContext(ctx).Select("id").Where("status IN ? AND COALESCE(control, '') = ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"previewing", "queued", "running"}, "", now, now).Limit(1).Find(&ready)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
 	}
+}
+
+func maintainImageCleanupPass(ctx context.Context, cfg ImageCleanupConfig, budget, scanBudget *imageCleanupBudget) error {
 	if err := scheduleImageCleanup(ctx, cfg, time.Now()); err != nil {
 		return err
 	}
@@ -163,16 +186,14 @@ func MaintainImageCleanup(ctx context.Context) error {
 			common.SysLog("Image cleanup history reached its time budget; continuing cleanup work")
 		}
 	}
-	budget := &imageCleanupBudget{interval: time.Second / time.Duration(cfg.RequestsPerSecond)}
 	ctx = WithImageStorageRequestBudget(ctx, budget.Wait)
-	ctx, err = withImageCleanupProfiles(ctx)
+	ctx, err := withImageCleanupProfiles(ctx)
 	if err != nil {
 		return err
 	}
-	scanBudget := &imageCleanupBudget{interval: time.Second / time.Duration(cfg.ScanPagesPerSecond)}
 	var jobs []model.ImageCleanupJob
 	now := time.Now().Unix()
-	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"previewing", "queued", "running"}, now, now).Order("next_attempt_at,id").Limit(2).Find(&jobs).Error; err != nil {
+	if err := model.DB.WithContext(ctx).Where("status IN ? AND COALESCE(control, '') = ? AND lease_expires_at <= ? AND next_attempt_at <= ?", []string{"previewing", "queued", "running"}, "", now, now).Order("next_attempt_at,id").Limit(2).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for _, job := range jobs {
@@ -275,6 +296,14 @@ type imageCleanupBudget struct {
 	interval time.Duration
 }
 
+// SetRate changes the next request spacing without discarding reservations
+// already made by the preceding cleanup pass.
+func (budget *imageCleanupBudget) SetRate(perSecond int) {
+	budget.mu.Lock()
+	budget.interval = time.Second / time.Duration(perSecond)
+	budget.mu.Unlock()
+}
+
 func (budget *imageCleanupBudget) Wait(ctx context.Context) error {
 	budget.mu.Lock()
 	now := time.Now()
@@ -307,7 +336,7 @@ func runImageCleanupSlice(parent context.Context, job model.ImageCleanupJob, cfg
 	dispatchUntil := time.Now().Add(5 * time.Second)
 	dispatched := 0
 	lease := common.GetUUID()
-	claim := model.DB.WithContext(parent).Model(&model.ImageCleanupJob{}).Where("id = ? AND status IN ? AND lease_expires_at <= ?", job.Id, []string{"previewing", "queued", "running"}, time.Now().Unix()).Updates(map[string]any{"lease_token": lease, "lease_expires_at": time.Now().Unix() + 120})
+	claim := model.DB.WithContext(parent).Model(&model.ImageCleanupJob{}).Where("id = ? AND status IN ? AND COALESCE(control, '') = ? AND lease_expires_at <= ?", job.Id, []string{"previewing", "queued", "running"}, "", time.Now().Unix()).Updates(map[string]any{"lease_token": lease, "lease_expires_at": time.Now().Unix() + 120, "control": ""})
 	if claim.Error != nil || claim.RowsAffected != 1 {
 		return claim.Error
 	}
@@ -352,6 +381,7 @@ func runImageCleanupSlice(parent context.Context, job model.ImageCleanupJob, cfg
 	if err := common.UnmarshalJsonStr(job.Filters, &filters); err != nil {
 		return failImageCleanup(ctx, job, lease, err)
 	}
+	filters.IgnoreRetention = imageCleanupIgnoresRetention(job, filters)
 	// Old queued jobs have no high-water mark. Freeze one on first execution.
 	if job.Source == "" {
 		if err := model.DB.WithContext(ctx).Model(&model.ImageStorageObject{}).Select("COALESCE(MAX(id),0)").Scan(&job.MaxObjectID).Error; err != nil {
@@ -459,7 +489,7 @@ func runImageCleanupSlice(parent context.Context, job model.ImageCleanupJob, cfg
 	if ctx.Err() != nil {
 		return nil
 	}
-	updates := map[string]any{"cursor": cursor, "status": "queued", "next_attempt_at": time.Now().Unix() + 1}
+	updates := map[string]any{"cursor": cursor, "status": "queued", "next_attempt_at": time.Now().Unix()}
 	if allDispatched && len(objects) < cfg.BatchSize {
 		var retries, failures int64
 		if err := model.DB.WithContext(ctx).Model(&model.ImageCleanupRetry{}).Where("job_id = ? AND outcome = ? AND attempts < ?", job.JobId, "retry", 3).Count(&retries).Error; err != nil {
@@ -528,7 +558,7 @@ func previewImageCleanupSlice(ctx context.Context, job model.ImageCleanupJob, le
 		job.Cursor = object.Id
 	}
 	updates := map[string]any{"cursor": job.Cursor, "scanned": job.Scanned, "matched": job.Matched, "matched_bytes": job.MatchedBytes, "protected": job.Protected, "reference_skipped": job.ReferenceSkipped, "retention_skipped": job.RetentionSkipped, "location_skipped": job.LocationSkipped, "last_error": ""}
-	updates["next_attempt_at"] = time.Now().Unix() + 1
+	updates["next_attempt_at"] = time.Now().Unix()
 	if !completed {
 		updates["last_error"] = "Preview scanning reached its resource budget and will continue"
 	}

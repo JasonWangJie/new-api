@@ -20,8 +20,13 @@ type ImageCleanupFilters struct {
 	// Frozen server-side fields are never accepted from a management request.
 	CutoffAt   int64    `json:"cutoff_at,omitempty"`
 	ProfileIDs []string `json:"profile_ids,omitempty"`
-	// Only scheduled jobs may bypass retention; management requests cannot set it.
+	// Retention behavior comes from the persisted job version, never client JSON.
 	IgnoreRetention bool `json:"-"`
+}
+
+func imageCleanupIgnoresRetention(job model.ImageCleanupJob, filters ImageCleanupFilters) bool {
+	return (job.Source == "manual_age" || (job.Source == "scheduled" && job.PolicyID != "")) &&
+		filters.ChannelID != "" && filters.CutoffAt > 0 && len(filters.ProfileIDs) > 0
 }
 
 func (filters ImageCleanupFilters) AgeSeconds() (int64, error) {
