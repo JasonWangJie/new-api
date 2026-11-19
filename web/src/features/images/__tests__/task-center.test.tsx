@@ -40,6 +40,7 @@ import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { formatTimestampToDate } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import {
   getImageTask,
@@ -2204,6 +2205,195 @@ test('administrator can apply the Unknown billing status filter', async () => {
     ).toBe('unknown')
   )
 })
+
+test('billing reconciliation options submit their exact billing status filters', async () => {
+  const user = userEvent.setup()
+  mount(<ImageTaskCenter admin />)
+  await screen.findByRole('button', { name: task.id })
+  await user.click(screen.getByRole('button', { name: 'More filters' }))
+
+  for (const [label, value] of [
+    ['Pre-consumed', 'reserved'],
+    ['Confirming billing', 'reserving'],
+    ['Settled', 'settled'],
+    ['Refunded', 'refunded'],
+  ]) {
+    await user.click(screen.getByRole('combobox', { name: 'Billing status' }))
+    await user.click(screen.getByRole('option', { name: label }))
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('billing_status')
+      ).toBe(value)
+    )
+  }
+})
+
+test('reserved amounts use configured quota units and distinguish zero from unavailable totals', async () => {
+  const previousCurrency = useSystemConfigStore.getState().config.currency
+  try {
+    useSystemConfigStore.getState().setConfig({
+      currency: { ...previousCurrency, quotaPerUnit: 1000000 },
+    })
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [task],
+      total: 1,
+      pages: 1,
+      stats: { quota: 28800000 },
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin />)
+    await screen.findByRole('button', { name: task.id })
+    await user.click(
+      screen.getByRole('button', { name: 'Unsettled video charges' })
+    )
+    const statistics = screen.getByLabelText('Task statistics')
+    expect(await within(statistics).findByText('$28.8')).toBeVisible()
+    for (const [quota, expected] of [
+      [0, '$0'],
+      [null, '—'],
+    ] as const) {
+      vi.mocked(getImageTasks).mockResolvedValue({
+        items: [],
+        total: 0,
+        pages: 0,
+        stats: { quota },
+      })
+      await user.click(screen.getByRole('button', { name: 'Refresh' }))
+      await waitFor(() =>
+        expect(
+          within(statistics).getByText('Pre-consumed amount').nextElementSibling
+        ).toHaveTextContent(expected)
+      )
+    }
+  } finally {
+    useSystemConfigStore.getState().setConfig({ currency: previousCurrency })
+  }
+})
+
+test.each([
+  { admin: false, mobile: false },
+  { admin: true, mobile: false },
+  { admin: false, mobile: true },
+  { admin: true, mobile: true },
+])(
+  'unsettled video shortcut preserves applied filters and shows the complete reserved amount (admin=$admin mobile=$mobile)',
+  async ({ admin, mobile }) => {
+    if (mobile) setMobileViewport()
+    vi.mocked(getImageTasks).mockResolvedValue({
+      items: [
+        {
+          ...task,
+          media_type: 'video',
+          billing_status: 'reserved',
+          cost: 0.12,
+        },
+      ],
+      total: 45,
+      pages: 3,
+      stats: { quota: 28800000, succeeded_cost: 1680.35 },
+    })
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin={admin} />)
+    await screen.findByRole('button', { name: task.id })
+    const initialParams = new URLSearchParams(
+      vi.mocked(getImageTasks).mock.calls[0]?.[1]
+    )
+    const statistics = screen.getByLabelText('Task statistics')
+    expect(within(statistics).getByText('$1680.35')).toBeVisible()
+    expect(
+      screen.queryByText(
+        'Reserved video charges are included in net deductions and excluded from successful task cost. Totals follow the selected date range.'
+      )
+    ).not.toBeInTheDocument()
+    await user.type(screen.getByLabelText('Search tasks'), 'applied-city')
+    await user.click(screen.getByRole('combobox', { name: 'Status' }))
+    await user.click(screen.getByRole('option', { name: 'Failed' }))
+    if (admin) {
+      await user.click(screen.getByRole('combobox', { name: 'Platform' }))
+      await user.click(screen.getByRole('option', { name: 'OpenAI' }))
+    }
+    await user.click(screen.getByRole('button', { name: 'More filters' }))
+    await user.type(screen.getByLabelText('Group'), 'applied-group')
+    await user.click(screen.getByRole('combobox', { name: 'Media type' }))
+    await user.click(screen.getByRole('option', { name: 'Image' }))
+    await user.click(screen.getByRole('combobox', { name: 'Request type' }))
+    await user.click(screen.getByRole('option', { name: 'Text to image' }))
+    await user.click(screen.getByRole('button', { name: 'Apply filters' }))
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('group')).toBe(
+        'applied-group'
+      )
+    )
+    await user.click(screen.getByRole('button', { name: 'Go to next page' }))
+    await waitFor(() =>
+      expect(vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('page')).toBe(
+        '2'
+      )
+    )
+    if (admin) {
+      await user.click(
+        screen.getByRole('checkbox', { name: `Select task ${task.id}` })
+      )
+    }
+    await user.clear(screen.getByLabelText('Search tasks'))
+    await user.type(screen.getByLabelText('Search tasks'), 'unapplied-city')
+    const shortcut = screen.getByRole('button', {
+      name: 'Unsettled video charges',
+    })
+    expect(shortcut).toHaveAttribute('aria-pressed', 'false')
+    await user.click(shortcut)
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].get('billing_status')
+      ).toBe('reserved')
+    )
+    const params = vi.mocked(getImageTasks).mock.calls.at(-1)?.[1]
+    expect(params?.get('media_type')).toBe('video')
+    expect(params?.get('q')).toBe('applied-city')
+    expect(params?.get('group')).toBe('applied-group')
+    expect(params?.get('platform')).toBe(admin ? 'openai' : null)
+    expect(params?.has('status')).toBe(false)
+    expect(params?.has('request_type')).toBe(false)
+    expect(params?.get('page')).toBe('1')
+    for (const key of ['start_date', 'end_date', 'timezone']) {
+      expect(params?.get(key)).toBe(initialParams.get(key))
+    }
+    expect(screen.getByLabelText('Search tasks')).toHaveValue('applied-city')
+    expect(shortcut).toHaveAttribute('aria-pressed', 'true')
+    expect(
+      within(statistics).getByText('Pre-consumed amount').nextElementSibling
+    ).toHaveTextContent('$57.6')
+    expect(
+      within(statistics).queryByText('Successful task cost')
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'Reserved video charges are included in net deductions and excluded from successful task cost. Totals follow the selected date range.'
+      )
+    ).toBeVisible()
+    if (admin) {
+      expect(
+        screen.getByRole('checkbox', { name: `Select task ${task.id}` })
+      ).not.toBeChecked()
+    }
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    await waitFor(() =>
+      expect(
+        vi.mocked(getImageTasks).mock.calls.at(-1)?.[1].has('billing_status')
+      ).toBe(false)
+    )
+    expect(shortcut).toHaveAttribute('aria-pressed', 'false')
+    expect(
+      within(statistics).getByText('Successful task cost').nextElementSibling
+    ).toHaveTextContent('$1680.35')
+    expect(
+      screen.queryByText(
+        'Reserved video charges are included in net deductions and excluded from successful task cost. Totals follow the selected date range.'
+      )
+    ).not.toBeInTheDocument()
+  }
+)
 
 test.each([false, true])(
   'administrator configured platforms stay visible and apply from page one (mobile=%s)',

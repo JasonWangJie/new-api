@@ -56,6 +56,7 @@ import dayjs from '@/lib/dayjs'
 import { formatTimestampToDate, formatUseTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import {
   getImageTask,
@@ -128,6 +129,9 @@ function TaskCenterSession({
   admin: boolean
 }) {
   const { t } = useTranslation()
+  const quotaPerUnit = useSystemConfigStore(
+    (state) => state.config.currency.quotaPerUnit
+  )
   const searchPlaceholder = admin
     ? t('Task ID, model, specifications or channel name')
     : t('Task ID, model or specifications')
@@ -151,6 +155,8 @@ function TaskCenterSession({
     media_type: '',
   })
   const [filters, setFilters] = useState(draft)
+  const unsettledVideos =
+    filters.media_type === 'video' && filters.billing_status === 'reserved'
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: 20,
@@ -830,11 +836,19 @@ function TaskCenterSession({
         value={draft.billing_status}
         options={choices([
           'pending',
+          'reserving',
+          'reserved',
           'succeeded',
+          'settled',
+          'refunded',
           'not_billable',
           'failed',
           'unknown',
-        ])}
+        ]).map((option) =>
+          option.value === 'reserved'
+            ? { ...option, label: t('Pre-consumed') }
+            : option
+        )}
         onChange={(value) =>
           setDraft((previous) => ({
             ...previous,
@@ -900,6 +914,12 @@ function TaskCenterSession({
     .rows.map((row) => row.original)
     .filter((task) => imageTaskCanTerminate(task, now))
   const stats = tasks.data?.stats
+  let costLabel = t('Successful task cost')
+  let cost = stats?.succeeded_cost
+  if (filters.billing_status === 'reserved') {
+    costLabel = t('Pre-consumed amount')
+    cost = stats?.quota == null ? null : stats.quota / quotaPerUnit
+  }
   const statistics = [
     {
       label: t('Processing'),
@@ -940,11 +960,11 @@ function TaskCenterSession({
       dot: 'bg-cyan-500',
     },
     {
-      label: t('Successful task cost'),
+      label: costLabel,
       value:
-        stats?.succeeded_cost == null
+        cost == null
           ? '—'
-          : `$${stats.succeeded_cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`,
+          : `$${cost.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')}`,
       color: 'text-primary',
       shell: 'border-primary/20 bg-primary/10',
       dot: 'bg-primary',
@@ -1071,6 +1091,38 @@ function TaskCenterSession({
               </div>
             ))}
           </dl>
+          <div className='flex shrink-0 flex-wrap items-center gap-2'>
+            <Button
+              type='button'
+              size='sm'
+              variant={unsettledVideos ? 'secondary' : 'outline'}
+              className='h-auto min-h-9 max-w-full whitespace-normal'
+              aria-pressed={unsettledVideos}
+              onClick={() => {
+                const next = {
+                  ...filters,
+                  media_type: 'video',
+                  billing_status: 'reserved',
+                  status: '',
+                  request_type: '',
+                }
+                setDraft(next)
+                setFilters(next)
+                setPagination((previous) => ({ ...previous, pageIndex: 0 }))
+                setSelection({})
+                setMobileFiltersOpen(false)
+              }}
+            >
+              {t('Unsettled video charges')}
+            </Button>
+            {unsettledVideos && (
+              <p className='text-muted-foreground min-w-0 text-xs'>
+                {t(
+                  'Reserved video charges are included in net deductions and excluded from successful task cost. Totals follow the selected date range.'
+                )}
+              </p>
+            )}
+          </div>
           {admin && filters.media_type !== 'video' && (
             <ImageReliabilityPanel
               userId={userId}
