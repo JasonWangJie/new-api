@@ -409,10 +409,11 @@ func TestTabtabImageModelContracts(t *testing.T) {
 		{"gpt-image-2-r", `,"quality":"high"`, `{"prompt":"draw","size":"1K","ratio":"1:1","quality":"high"}`},
 		{"gpt-image-2.5-r", `,"size":"4K","ratio":"9:16"`, `{"prompt":"draw","size":"4K","ratio":"9:16"}`},
 		{"seedream-5-pro", `,"size":"2K","ratio":"9:21"`, `{"prompt":"draw","size":"2K","ratio":"9:21"}`},
+		{"seedream-5.5", `,"background":"transparent","ratio":"16:9"`, `{"prompt":"draw","size":"1K","ratio":"16:9","background":"transparent"}`},
 		{"mj", ``, `{"prompt":"draw"}`},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
-			body, err := service.TabtabImageSubmission([]byte(`{"model":"`+tc.model+`","prompt":"draw","n":1`+tc.fields+`}`), tc.model, 1)
+			body, err := service.TabtabImageSubmission([]byte(`{"model":"`+tc.model+`","prompt":"draw","n":1`+tc.fields+`}`), tc.model, 1, nil)
 			require.NoError(t, err)
 			var envelope map[string]common.RawMessage
 			require.NoError(t, common.Unmarshal(body, &envelope))
@@ -425,13 +426,13 @@ func TestTabtabImageModelContracts(t *testing.T) {
 			assert.True(t, capability.Generate)
 			assert.Equal(t, "tabtab", capability.Provider)
 			assert.False(t, capability.TokenUsage)
-			catalog, supported := service.TabtabWorkbenchImageCapability(tc.model, service.ImageModelCapability{MaxOutputImages: dto.MaxImageN, Resolutions: []string{"1K", "2K", "4K"}})
+			catalog, supported := service.TabtabWorkbenchImageCapability(tc.model, service.ImageModelCapability{MaxOutputImages: dto.MaxImageN, Resolutions: []string{"1K", "2K", "4K"}}, nil)
 			require.True(t, supported)
 			assert.Equal(t, 1, catalog.MaxOutputImages)
 			switch tc.model {
 			case "mj", "gemini-3.1-flash-lite-image":
 				assert.Equal(t, []string{"AUTO"}, catalog.Resolutions)
-			case "seedream-5-pro", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst":
+			case "seedream-5-pro", "seedream-5.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst":
 				assert.Equal(t, []string{"1K", "2K"}, catalog.Resolutions)
 			default:
 				assert.Equal(t, []string{"1K", "2K", "4K"}, catalog.Resolutions)
@@ -450,13 +451,17 @@ func TestTabtabImageModelContracts(t *testing.T) {
 		{"unavailable extreme ratio", "gemini-3-pro-image", `,"ratio":"8:1"`},
 		{"fixed lite size", "gemini-3.1-flash-lite-image", `,"resolution":"2K"`},
 		{"seedream 4K", "seedream-5-pro", `,"size":"4K"`},
+		{"seedream 5.5 4K", "seedream-5.5", `,"size":"4K"`},
+		{"seedream transparent ratio", "seedream-5.5", `,"background":"transparent","ratio":"21:9"`},
+		{"seedream 5.5 unsupported format", "seedream-5.5", `,"output_format":"webp"`},
+		{"seedream 5 pro unsupported background", "seedream-5-pro", `,"background":"transparent"`},
 		{"unsupported mask", "gpt-image-2-r", `,"mask":"https://cdn.example/mask.png"`},
 		{"unsupported mj size", "mj", `,"size":"1K"`},
 		{"private reference", "gpt-image-2", `,"images":["https://127.0.0.1/image.png"]`},
 		{"invalid inline reference", "gpt-image-2", `,"images":["data:image/png;base64,!"]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := service.TabtabImageSubmission([]byte(`{"model":"`+tc.model+`","prompt":"draw","n":1`+tc.fields+`}`), tc.model, 1)
+			_, err := service.TabtabImageSubmission([]byte(`{"model":"`+tc.model+`","prompt":"draw","n":1`+tc.fields+`}`), tc.model, 1, nil)
 			require.Error(t, err)
 		})
 	}
@@ -481,7 +486,7 @@ func TestTabtabImageModelContracts(t *testing.T) {
 			require.NoError(t, validateMixedImageChannelRequest(channel, request))
 			encoded, err := common.Marshal(request.Native)
 			require.NoError(t, err)
-			body, err := service.TabtabImageSubmission(encoded, request.Model, request.Count)
+			body, err := service.TabtabImageSubmission(encoded, request.Model, request.Count, nil)
 			require.NoError(t, err)
 			var envelope map[string]common.RawMessage
 			require.NoError(t, common.Unmarshal(body, &envelope))
@@ -551,15 +556,35 @@ func TestTabtabImageModelContracts(t *testing.T) {
 	}
 	assert.NotContains(t, service.SanitizeAsyncImageDiagnostic("provider failed with sk_test-secret-value", 200), "sk_test-secret-value")
 	policy := service.ImageModelCapability{Resolutions: []string{"1K", "4K"}, Qualities: []string{"high", "xhigh"}, Formats: []string{"png", "gif"}, Backgrounds: []string{"opaque", "unsupported"}, MaxOutputImages: 5}
-	projected, supported := service.TabtabWorkbenchImageCapability("gpt-image-2", policy)
+	projected, supported := service.TabtabWorkbenchImageCapability("gpt-image-2", policy, nil)
 	require.True(t, supported)
 	assert.Equal(t, []string{"1K"}, projected.Resolutions)
 	assert.Equal(t, []string{"high"}, projected.Qualities)
 	assert.Equal(t, []string{"png"}, projected.Formats)
 	assert.Equal(t, []string{"opaque"}, projected.Backgrounds)
 	assert.Equal(t, []string{"1K", "4K"}, policy.Resolutions, "capability projection must not mutate the administrator policy")
-	_, supported = service.TabtabWorkbenchImageCapability("gpt-image-2", service.ImageModelCapability{Resolutions: []string{"4K"}})
+	_, supported = service.TabtabWorkbenchImageCapability("gpt-image-2", service.ImageModelCapability{Resolutions: []string{"4K"}}, nil)
 	assert.False(t, supported, "an impossible policy resolution must not be advertised as executable")
+
+	for _, tc := range []struct {
+		channelType int
+		profiles    string
+		wantError   string
+	}{
+		{constant.ChannelTypeTabTab, `{"future-seedream":"seedream-5.5"}`, ""},
+		{constant.ChannelTypeTabTab, `{"seedream-5.5":"mj"}`, "cannot override built-in"},
+		{constant.ChannelTypeTabTab, `{"future-seedream":"unrecognized"}`, "invalid TabTab image profile"},
+		{constant.ChannelTypeTabTab, `{"future-*":"seedream-5.5"}`, "invalid TabTab image model name"},
+		{constant.ChannelTypeNewAPI, `{"future-seedream":"seedream-5.5"}`, "requires a TabTab channel"},
+	} {
+		channel := model.Channel{Type: tc.channelType, OtherSettings: `{"tabtab_image_model_profiles":` + tc.profiles + `}`}
+		err := channel.ValidateSettings()
+		if tc.wantError == "" {
+			require.NoError(t, err)
+		} else {
+			require.ErrorContains(t, err, tc.wantError)
+		}
+	}
 }
 
 func TestTabtabHTTPFailureAcceptanceBarrier(t *testing.T) {
@@ -605,19 +630,27 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 	}
 	db, err := gorm.Open(dialector, &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
+	entities := []any{&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}, &model.Channel{}, &model.Ability{}, &model.ImageGroupPolicy{}}
 	model.DB, constant.CountToken, common.RedisEnabled = db, false, false
 	common.SetMainDatabaseType(common.DatabaseType(db.Dialector.Name()))
 	t.Cleanup(func() {
 		model.DB, constant.CountToken, common.RedisEnabled = previousDB, previousCount, previousRedis
 		common.SetMainDatabaseType(previousType)
-		assert.NoError(t, db.Migrator().DropTable(&model.AsyncImageBill{}, &model.AsyncImageEvent{}, &model.AsyncImageTask{}, &model.ImageInputAlias{}, &model.UserSubscription{}, &model.Token{}, &model.User{}))
+		assert.NoError(t, db.Migrator().DropTable(entities...))
 		connection, err := db.DB()
 		require.NoError(t, err)
 		require.NoError(t, connection.Close())
 	})
 	t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "tabtab:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
 	t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "tabtab")
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.UserSubscription{}, &model.TaskPerfSample{}, &model.AsyncImageTask{}, &model.AsyncImageEvent{}, &model.AsyncImageBill{}, &model.ImageInputAlias{}))
+	require.NoError(t, db.AutoMigrate(entities...))
+	versionQuery := "SELECT sqlite_version()"
+	if db.Dialector.Name() != "sqlite" {
+		versionQuery = "SELECT VERSION()"
+	}
+	var databaseVersion string
+	require.NoError(t, db.Raw(versionQuery).Scan(&databaseVersion).Error)
+	t.Logf("%s %s", db.Dialector.Name(), databaseVersion)
 	user := model.User{Username: "tabtab-user", Status: common.UserStatusEnabled, Quota: 1000000}
 	require.NoError(t, db.Create(&user).Error)
 	token := model.Token{UserId: user.Id, Key: "tabtab-test-token", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
@@ -629,16 +662,21 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
 		mask, failure, rejected bool
+		seedreamProfile         bool
 		override                string
 		httpReceiptConflict     bool
 		failureBody             string
 		wantRequestID           string
 	}{
-		{name: "relative result"}, {name: "image edit and mask", mask: true}, {name: "terminal failure", failure: true}, {name: "explicit rejection", rejected: true}, {name: "override bypass", override: `{"args":{"n":128}}`}, {name: "HTTP refusal with receipt", httpReceiptConflict: true},
+		{name: "relative result"}, {name: "image edit and mask", mask: true}, {name: "configured image model", seedreamProfile: true}, {name: "terminal failure", failure: true}, {name: "explicit rejection", rejected: true}, {name: "override bypass", override: `{"args":{"n":128}}`}, {name: "HTTP refusal with receipt", httpReceiptConflict: true},
 		{name: "terminal failure with provider metadata", failure: true, failureBody: `{"code":"OK","message":"success","data":{"id":"USG_test","usage_record_id":"USG_test","request_id":"MTASK_accepted","model":"gpt-image-2","model_code":"gpt-image-2","status":"failed","charged_points":0,"results":[],"error_code":"UPSTREAM_UNAVAILABLE","error_message":"generate failed","generation_time_ms":33029,"provider_request_id":"3c7705ed-76ba-4b7c-a1d2-471d624810ed","created_at":"2026-10-29T05:22:01.76606Z","updated_at":"2026-10-29T05:22:34.82783Z"},"request_id":"REQ_poll"}`, wantRequestID: "3c7705ed-76ba-4b7c-a1d2-471d624810ed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			creates, polls, downloads := 0, 0, 0
+			upstreamModel := "gpt-image-2"
+			if tc.seedreamProfile {
+				upstreamModel = "future-seedream"
+			}
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "Bearer tabtab-upstream-test", r.Header.Get("Authorization"))
 				w.Header().Set("Content-Type", "application/json")
@@ -651,12 +689,18 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 						Args  map[string]any `json:"args"`
 					}
 					require.NoError(t, common.DecodeJson(r.Body, &received))
-					assert.Equal(t, "gpt-image-2", received.Model)
+					assert.Equal(t, upstreamModel, received.Model)
 					assert.Equal(t, "draw", received.Args["prompt"])
 					assert.NotContains(t, received.Args, "n")
 					if tc.mask {
 						assert.Equal(t, []any{reference}, received.Args["images"])
 						assert.Equal(t, reference, received.Args["mask"])
+					}
+					if tc.seedreamProfile {
+						assert.Equal(t, "2K", received.Args["size"])
+						assert.Equal(t, "16:9", received.Args["ratio"])
+						assert.Equal(t, "transparent", received.Args["background"])
+						assert.Equal(t, []any{reference}, received.Args["images"])
 					}
 					if tc.rejected {
 						_, _ = w.Write([]byte(`{"code":"POINTS_NOT_ENOUGH","message":"Not enough points"}`))
@@ -691,7 +735,7 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 				}
 			}))
 			defer upstream.Close()
-			mapping := `{"image-alias":"image-intermediate","image-intermediate":"gpt-image-2"}`
+			mapping := `{"image-alias":"image-intermediate","image-intermediate":"` + upstreamModel + `"}`
 			channel := &model.Channel{Id: 64, Type: constant.ChannelTypeTabTab, Key: "tabtab-upstream-test", BaseURL: &upstream.URL, Status: common.ChannelStatusEnabled, Models: "image-alias", Group: "default", ModelMapping: &mapping}
 			if tc.override != "" {
 				channel.ParamOverride = &tc.override
@@ -700,6 +744,29 @@ func TestTabtabAsyncImageLifecycle(t *testing.T) {
 			if tc.mask {
 				request.Kind, request.SourcePath = "image_to_image", "/v1/images/edits_async"
 				request.Parts = []service.AsyncImageInputPart{{Type: "image_url", URL: reference}, {Type: "mask", URL: reference}}
+			}
+			if tc.seedreamProfile {
+				require.NoError(t, db.Create(channel).Error)
+				require.NoError(t, db.Create(&model.Ability{Group: "default", Model: request.Model, ChannelId: channel.Id, Enabled: true}).Error)
+				options, err := service.GetImagePoolSelectionOptions(t.Context(), "default", "mixed")
+				require.NoError(t, err)
+				assert.Empty(t, options.Models)
+				channel.OtherSettings = `{"tabtab_image_model_profiles":{"future-seedream":"seedream-5.5"}}`
+				require.NoError(t, channel.ValidateSettings())
+				require.NoError(t, db.Model(channel).Update("settings", channel.OtherSettings).Error)
+				options, err = service.GetImagePoolSelectionOptions(t.Context(), "default", "mixed")
+				require.NoError(t, err)
+				require.Len(t, options.Models, 1)
+				assert.Equal(t, request.Model, options.Models[0].Id)
+				assert.Equal(t, []int{channel.Id}, options.Models[0].ChannelIds)
+				parsed, err := service.ParseAsyncImageRequest([]byte(`{"provider":"tabtab","model":"image-alias","prompt":"draw","resolution":"2K","aspect_ratio":"16:9","background":"transparent"}`),
+					"application/json", "/v1/images/generations_async", service.DefaultImageRuntimeConfig())
+				require.NoError(t, err)
+				parsed.Billing = request.Billing
+				request = parsed
+				request.Kind = "image_to_image"
+				request.Parts = []service.AsyncImageInputPart{{Type: "image_url", URL: reference}}
+				require.NoError(t, validateMixedImageChannelRequest(*channel, request))
 			}
 			task := model.AsyncImageTask{TaskId: "tabtab-" + tc.name, UserId: user.Id, TokenId: token.Id, Group: "default", Status: model.ImageTaskInvoking, Version: 1, LeaseToken: "worker", LeaseExpiresAt: time.Now().Unix() + 120}
 			payload, err := common.Marshal(request)

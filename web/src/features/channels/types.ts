@@ -135,6 +135,7 @@ export interface ChannelOtherSettings {
   upstream_model_update_last_detected_models?: string[]
   advanced_custom?: AdvancedCustomConfig
   upstream_async?: UpstreamAsyncConfig
+  tabtab_image_model_profiles?: Record<string, string>
 }
 
 export type UpstreamAsyncMediaType = 'image' | 'video'

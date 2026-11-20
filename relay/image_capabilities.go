@@ -324,7 +324,7 @@ func validateMixedImageChannelRequest(ch model.Channel, request service.AsyncIma
 		}
 	}
 	if ch.Type == constant.ChannelTypeTabTab {
-		if _, err := service.TabtabImageSubmission(data, info.UpstreamModelName, request.Count); err != nil {
+		if _, err := service.TabtabImageSubmission(data, info.UpstreamModelName, request.Count, otherSettings.TabtabImageModelProfiles); err != nil {
 			return err
 		}
 	}
@@ -494,7 +494,7 @@ func imageChannelCapability(ch model.Channel, modelName string) dto.ImageCapabil
 		capability.Parameters = append(slices.Clone(capability.Parameters), "output_format", "frame_count", "frame_duration_ms")
 	}
 	if ch.Type == constant.ChannelTypeTabTab {
-		capability = service.TabtabImageCapability(modelName)
+		capability = service.TabtabImageCapability(modelName, ch.GetOtherSettings().TabtabImageModelProfiles)
 	}
 	if ch.Type == constant.ChannelTypeNewAPI && ch.GetSetting().TianyueMediaCompatibility {
 		capability.Mask = false

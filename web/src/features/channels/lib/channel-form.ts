@@ -22,6 +22,7 @@ import {
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
+  CHANNEL_TYPE_TABTAB,
   CHANNEL_TYPE_TASK_PLUGIN,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
@@ -40,6 +41,7 @@ import {
   stringifyAdvancedCustomConfig,
   validateAdvancedCustomConfig,
 } from './advanced-custom'
+import { getChannelTypeConfig } from './channel-type-config'
 import { parseModelsString } from './model-mapping-validation'
 import { isChannelConfiguredVideoPlugin } from './task-video-models'
 
@@ -387,6 +389,7 @@ export const channelFormSchema = z
       .string()
       .optional()
       .refine(isOptionalJsonObject, ERROR_MESSAGES.INVALID_JSON),
+    tabtab_image_model_profiles: z.string().optional(),
     advanced_custom: z.string().optional(),
     other: z.string().optional(),
     // Multi-key options (not sent to backend directly)
@@ -453,6 +456,41 @@ export const channelFormSchema = z
     upstream_model_update_ignored_models: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (
+      data.type === CHANNEL_TYPE_TABTAB &&
+      data.tabtab_image_model_profiles?.trim()
+    ) {
+      const value = data.tabtab_image_model_profiles
+      const templates =
+        getChannelTypeConfig(CHANNEL_TYPE_TABTAB).supportedModels ?? []
+      if (!isOptionalModelMapping(value)) {
+        addRequiredIssue(
+          ctx,
+          'tabtab_image_model_profiles',
+          'Model mapping must be a JSON object with string values'
+        )
+      } else {
+        const profiles = JSON.parse(value) as Record<string, string>
+        const entries = Object.entries(profiles)
+        if (
+          entries.length > 128 ||
+          entries.some(
+            ([model, template]) =>
+              !model ||
+              new TextEncoder().encode(model).length > 191 ||
+              /[\p{White_Space}\p{Cc},*]/u.test(model) ||
+              templates.includes(model) ||
+              !templates.includes(template)
+          )
+        ) {
+          addRequiredIssue(
+            ctx,
+            'tabtab_image_model_profiles',
+            'Map new upstream models to built-in TabTab templates'
+          )
+        }
+      }
+    }
     if (
       data.type === CHANNEL_TYPE_TASK_PLUGIN &&
       data.video_resolution_model_mapping?.length
@@ -640,6 +678,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   param_override: '',
   header_override: '',
   settings: '{}',
+  tabtab_image_model_profiles: '',
   other: '',
   multi_key_mode: 'single',
   multi_key_type: 'random',
@@ -837,6 +876,7 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
   let advancedCustom = ''
+  let tabtabImageModelProfiles = ''
 
   if (channel.settings) {
     try {
@@ -866,6 +906,16 @@ export function transformChannelToFormDefaults(
       if (parsed.advanced_custom) {
         advancedCustom = stringifyAdvancedCustomConfig(parsed.advanced_custom)
       }
+      if (
+        channel.type === CHANNEL_TYPE_TABTAB &&
+        parsed.tabtab_image_model_profiles
+      ) {
+        tabtabImageModelProfiles = JSON.stringify(
+          parsed.tabtab_image_model_profiles,
+          null,
+          2
+        )
+      }
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to parse channel settings:', error)
@@ -893,6 +943,7 @@ export function transformChannelToFormDefaults(
     param_override: channel.param_override || '',
     header_override: channel.header_override || '',
     settings: channel.settings || '{}',
+    tabtab_image_model_profiles: tabtabImageModelProfiles,
     other: channel.other || '',
     multi_key_mode: 'single',
     multi_key_type: channel.channel_info.multi_key_mode || 'random',
@@ -1038,6 +1089,20 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to parse existing settings:', error)
+    }
+  }
+
+  delete settingsObj.tabtab_image_model_profiles
+  if (
+    formData.type === CHANNEL_TYPE_TABTAB &&
+    formData.tabtab_image_model_profiles?.trim()
+  ) {
+    const profiles = JSON.parse(formData.tabtab_image_model_profiles) as Record<
+      string,
+      string
+    >
+    if (Object.keys(profiles).length) {
+      settingsObj.tabtab_image_model_profiles = profiles
     }
   }
 

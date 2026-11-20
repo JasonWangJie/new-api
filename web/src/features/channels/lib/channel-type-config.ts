@@ -65,6 +65,7 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       'gpt-image-2-r',
       'gpt-image-2.5-r',
       'seedream-5-pro',
+      'seedream-5.5',
       'mj',
     ],
     hints: {

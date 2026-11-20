@@ -21,6 +21,7 @@ import type { FieldErrors, FieldPath } from 'react-hook-form'
 import {
   CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_OLLAMA,
+  CHANNEL_TYPE_TABTAB,
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   MODEL_FETCHABLE_TYPES,
   OPENAI_FIELD_PASSTHROUGH_TYPES,
@@ -61,6 +62,7 @@ const CONFIGURATION_BLOCKS = {
       'image_reference_timeout_retry_same_channel',
       'tianyue_media_compatibility',
       'image_resolution_model_mapping',
+      'tabtab_image_model_profiles',
       'video_resolution_model_mapping',
       'image_max_reference_bytes',
       'image_attempt_timeout_seconds',
@@ -165,6 +167,8 @@ export function getChannelConfigurationState(
       values.video_reference_transport_mode === 'inline' ||
       values.image_reference_timeout_retry_same_channel ||
       values.image_resolution_model_mapping?.length ||
+      (values.type === CHANNEL_TYPE_TABTAB &&
+        hasConfiguredJson(values.tabtab_image_model_profiles)) ||
       values.video_resolution_model_mapping?.length ||
       values.image_max_reference_bytes ||
       values.image_attempt_timeout_seconds ||

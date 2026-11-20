@@ -453,7 +453,7 @@ test('changing built-in providers updates server-provided URL placeholders witho
   )
 })
 
-test('TabTab offers asynchronous image models and saves its channel without a video plugin binding', async () => {
+test('TabTab offers Seedream 5.5 and saves new image model templates without a video plugin binding', async () => {
   const post = vi
     .spyOn(api, 'post')
     .mockResolvedValue({ data: { success: true } })
@@ -485,14 +485,32 @@ test('TabTab offers asynchronous image models and saves its channel without a vi
     screen.getByRole('combobox', { name: 'Select models or add custom ones' })
   )
   expect(screen.getByRole('option', { name: 'gpt-image-2' })).toBeVisible()
-  await user.click(
-    screen.getByRole('option', { name: 'gemini-nano-banana-2.1' })
-  )
+  await user.click(screen.getByRole('option', { name: 'seedream-5.5' }))
   await user.keyboard('{Escape}')
   await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
   expect(
     screen.queryByRole('button', { name: 'Configure upstream async' })
   ).not.toBeInTheDocument()
+  const templates = screen.getByRole('group', {
+    name: 'TabTab image model templates',
+  })
+  await user.click(within(templates).getByRole('button', { name: 'Add Row' }))
+  await user.type(
+    within(templates).getByPlaceholderText('future-seedream'),
+    'next-seedream'
+  )
+  const template = within(templates).getByPlaceholderText('seedream-5.5')
+  await user.type(template, 'unknown-model')
+  await user.click(screen.getByRole('button', { name: 'Create Channel' }))
+  expect(
+    await within(templates).findByText(
+      'Map new upstream models to built-in TabTab templates'
+    )
+  ).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+
+  await user.clear(template)
+  await user.type(template, 'seedream-5.5')
   await user.click(screen.getByRole('button', { name: 'Create Channel' }))
   await waitFor(() => expect(post).toHaveBeenCalled())
   const payload = post.mock.calls[0]?.[1] as {
@@ -502,17 +520,49 @@ test('TabTab offers asynchronous image models and saves its channel without a vi
       key: string
       models: string
       setting: string
+      settings: string
     }
   }
   expect(payload.channel).toMatchObject({
     type: CHANNEL_TYPE_TABTAB,
     name: 'TabTab',
     key: 'sk_fixture',
-    models: 'gemini-nano-banana-2.1',
+    models: 'seedream-5.5',
   })
   expect(JSON.parse(payload.channel.setting)).not.toHaveProperty(
     'task_plugin_key'
   )
+  expect(JSON.parse(payload.channel.settings)).toHaveProperty(
+    'tabtab_image_model_profiles',
+    { 'next-seedream': 'seedream-5.5' }
+  )
+})
+
+test('editing a TabTab model template preserves other settings and removing it clears the stored field', () => {
+  const profiles = { 'next-seedream': 'seedream-5.5' }
+  const values = transformChannelToFormDefaults({
+    ...editingChannel,
+    type: CHANNEL_TYPE_TABTAB,
+    models: 'next-seedream',
+    settings: JSON.stringify({
+      tabtab_image_model_profiles: profiles,
+      disable_task_polling_sleep: true,
+    }),
+  })
+  const save = (patch: Partial<typeof values>) =>
+    JSON.parse(
+      transformFormDataToUpdatePayload({ ...values, ...patch }, 42).settings ||
+        '{}'
+    )
+
+  expect(save({})).toMatchObject({
+    tabtab_image_model_profiles: profiles,
+    disable_task_polling_sleep: true,
+  })
+  expect(save({ tabtab_image_model_profiles: '' })).not.toHaveProperty(
+    'tabtab_image_model_profiles'
+  )
+  expect(save({ type: 1 })).not.toHaveProperty('tabtab_image_model_profiles')
 })
 
 test('switching a TabTab video draft to the image provider keeps its key and removes the task plugin binding from the saved channel', async () => {

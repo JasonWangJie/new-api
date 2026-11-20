@@ -222,7 +222,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 			}
 		}
 		if info.ChannelType == constant.ChannelTypeTabTab && c.GetString("async_image_resume_task") == "" {
-			jsonData, err = service.TabtabImageSubmission(jsonData, info.UpstreamModelName, imageCount)
+			jsonData, err = service.TabtabImageSubmission(jsonData, info.UpstreamModelName, imageCount, info.ChannelOtherSettings.TabtabImageModelProfiles)
 			if err != nil {
 				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			}
@@ -247,7 +247,7 @@ func ExecuteImageRequest(c *gin.Context, info *relaycommon.RelayInfo, reserve bo
 		return nil, billingErr
 	}
 	if info.ChannelType == constant.ChannelTypeTabTab {
-		if err := validateMixedImageTokenUsage(&service.MediaBillingSnapshot{Price: info.PriceData, Tiered: info.TieredBillingSnapshot}, service.TabtabImageCapability(info.UpstreamModelName), asyncProfile); err != nil {
+		if err := validateMixedImageTokenUsage(&service.MediaBillingSnapshot{Price: info.PriceData, Tiered: info.TieredBillingSnapshot}, service.TabtabImageCapability(info.UpstreamModelName, info.ChannelOtherSettings.TabtabImageModelProfiles), asyncProfile); err != nil {
 			return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeModelPriceError, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 	}

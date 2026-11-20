@@ -1122,6 +1122,14 @@ func (channel *Channel) ValidateSettings() error {
 	if err := channelOtherSettings.UpstreamAsync.Validate(); err != nil {
 		return err
 	}
+	if len(channelOtherSettings.TabtabImageModelProfiles) > 0 {
+		if channel.Type != constant.ChannelTypeTabTab {
+			return fmt.Errorf("tabtab_image_model_profiles requires a TabTab channel")
+		}
+		if err := channelOtherSettings.TabtabImageModelProfiles.Validate(); err != nil {
+			return err
+		}
+	}
 	if preset := common.GetAdvancedCustomPreset(channel.Type); preset != nil {
 		channelOtherSettings.AdvancedCustom = preset
 	}

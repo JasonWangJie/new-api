@@ -20,31 +20,30 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-var tabtabImageModels = []string{
-	"gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image",
-	"gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2-r", "gpt-image-2.5-r", "seedream-5-pro", "mj",
-}
-
 // TabtabImageCapability advertises the Task API contract, independently of the
 // upstream's synchronous Gemini/OpenAI endpoints and their token usage.
-func TabtabImageCapability(modelName string) dto.ImageCapability {
-	known := modelName == "" || slices.Contains(tabtabImageModels, modelName)
+func TabtabImageCapability(modelName string, profiles dto.TabtabImageModelProfiles) dto.ImageCapability {
+	template := profiles.Template(modelName)
+	known := modelName == "" || template != ""
 	parameters := []string{"model", "prompt", "n", "response_format"}
-	mask := strings.HasPrefix(modelName, "gpt-image-") && !strings.HasSuffix(modelName, "-r")
+	mask := strings.HasPrefix(template, "gpt-image-") && !strings.HasSuffix(template, "-r")
 	switch {
-	case modelName == "mj":
-	case modelName == "gemini-3.1-flash-lite-image":
+	case template == "mj":
+	case template == "gemini-3.1-flash-lite-image":
 		parameters = append(parameters, "ratio", "aspect_ratio")
 	case mask:
 		parameters = append(parameters, "size", "quality", "background", "output_format", "width", "height", "mask")
 	default:
 		parameters = append(parameters, "size", "resolution", "ratio", "aspect_ratio")
-		if strings.HasSuffix(modelName, "-r") {
+		if strings.HasSuffix(template, "-r") {
 			parameters = append(parameters, "quality")
+		}
+		if template == "seedream-5.5" {
+			parameters = append(parameters, "background")
 		}
 	}
 	return dto.ImageCapability{
-		Provider: "tabtab", Protocol: "openai_images", Models: slices.Clone(tabtabImageModels),
+		Provider: "tabtab", Protocol: "openai_images", Models: profiles.SupportedModels(),
 		Generate: known, Edit: known, ReferenceField: "images",
 		Mask: mask, Parameters: parameters,
 	}
@@ -52,15 +51,16 @@ func TabtabImageCapability(modelName string) dto.ImageCapability {
 
 // TabtabWorkbenchImageCapability intersects an administrator's catalog with
 // the mapped model's executable Task API dimensions without changing policy.
-func TabtabWorkbenchImageCapability(modelName string, capability ImageModelCapability) (ImageModelCapability, bool) {
-	declared := TabtabImageCapability(modelName)
+func TabtabWorkbenchImageCapability(modelName string, capability ImageModelCapability, profiles dto.TabtabImageModelProfiles) (ImageModelCapability, bool) {
+	declared := TabtabImageCapability(modelName, profiles)
 	if !declared.Generate || modelName == "" {
 		return capability, false
 	}
 	capability.MaxOutputImages = 1
 	capability.AllowHalfK = false
 	resolutions := []string{"1K", "2K", "4K"}
-	if modelName == "seedream-5-pro" || slices.Contains(declared.Parameters, "width") {
+	template := profiles.Template(modelName)
+	if template == "seedream-5-pro" || template == "seedream-5.5" || slices.Contains(declared.Parameters, "width") {
 		resolutions = []string{"1K", "2K"}
 	}
 	if !slices.Contains(declared.Parameters, "size") {
@@ -79,13 +79,16 @@ func TabtabWorkbenchImageCapability(modelName string, capability ImageModelCapab
 	formats, backgrounds := []string(nil), []string(nil)
 	if slices.Contains(declared.Parameters, "quality") {
 		qualities = []string{"auto", "low", "medium", "high"}
-		if modelName != "gpt-image-2" {
+		if template != "gpt-image-2" {
 			qualities = append(qualities, "xhigh", "max")
 		}
 	}
 	if slices.Contains(declared.Parameters, "output_format") {
 		formats = []string{"png", "jpeg", "webp"}
 		backgrounds = []string{"auto", "opaque", "transparent"}
+	}
+	if template == "seedream-5.5" {
+		backgrounds = []string{"opaque", "transparent"}
 	}
 	for _, dimension := range []struct {
 		current *[]string
@@ -109,14 +112,15 @@ func TabtabWorkbenchImageCapability(modelName string, capability ImageModelCapab
 
 // TabtabImageSubmission runs on the canonical JSON after parameter overrides.
 // Task API has no count parameter: one accepted task represents one image.
-func TabtabImageSubmission(body []byte, modelName string, count int) ([]byte, error) {
+func TabtabImageSubmission(body []byte, modelName string, count int, profiles dto.TabtabImageModelProfiles) ([]byte, error) {
 	if len(body) > 50<<20 {
 		return nil, errors.New("TabTab image request exceeds 50 MiB")
 	}
 	if count != 1 {
 		return nil, errors.New("TabTab Task API image requests require n=1")
 	}
-	if !slices.Contains(tabtabImageModels, modelName) {
+	template := profiles.Template(modelName)
+	if template == "" {
 		return nil, errors.New("unsupported TabTab image model")
 	}
 	var fields map[string]common.RawMessage
@@ -174,7 +178,7 @@ func TabtabImageSubmission(body []byte, modelName string, count int) ([]byte, er
 		ratio = alternate
 	}
 	size, resolution := stringsByName["size"], strings.ToUpper(stringsByName["resolution"])
-	gpt := strings.HasPrefix(modelName, "gpt-image-") && !strings.HasSuffix(modelName, "-r")
+	gpt := strings.HasPrefix(template, "gpt-image-") && !strings.HasSuffix(template, "-r")
 	if gpt {
 		if resolution != "" && resolution != "AUTO" {
 			mapped, err := MapOpenAIImageDimensions(resolution, ratio)
@@ -225,7 +229,7 @@ func TabtabImageSubmission(body []byte, modelName string, count int) ([]byte, er
 			args["size"] = size
 		}
 		qualities := []string{"auto", "low", "medium", "high"}
-		if modelName != "gpt-image-2" {
+		if template != "gpt-image-2" {
 			qualities = append(qualities, "xhigh", "max")
 		}
 		if value := stringsByName["quality"]; value != "" {
@@ -257,12 +261,15 @@ func TabtabImageSubmission(body []byte, modelName string, count int) ([]byte, er
 			args["mask"] = mask
 		}
 	} else {
-		for _, name := range []string{"mask", "width", "height", "background", "output_format"} {
+		for _, name := range []string{"mask", "width", "height", "output_format"} {
 			if _, exists := fields[name]; exists {
 				return nil, fmt.Errorf("TabTab %s does not support %s", modelName, name)
 			}
 		}
-		if modelName == "mj" {
+		if _, exists := fields["background"]; exists && template != "seedream-5.5" {
+			return nil, fmt.Errorf("TabTab %s does not support background", modelName)
+		}
+		if template == "mj" {
 			if size != "" && size != "auto" || resolution != "" && resolution != "AUTO" || ratio != "" && ratio != "auto" || stringsByName["quality"] != "" {
 				return nil, errors.New("TabTab MJ image tasks support only prompt and reference images")
 			}
@@ -297,46 +304,59 @@ func TabtabImageSubmission(body []byte, modelName string, count int) ([]byte, er
 			ratio = "1:1"
 		}
 		ratios := []string{"auto", "21:9", "16:9", "5:4", "4:3", "3:2", "1:1", "2:3", "3:4", "4:5", "9:16"}
-		if modelName == "gemini-nano-banana-2.1" || modelName == "gemini-3.1-flash-image" {
+		if template == "gemini-nano-banana-2.1" || template == "gemini-3.1-flash-image" {
 			ratios = append(ratios, "8:1", "4:1", "1:4", "1:8")
 		}
-		if strings.HasSuffix(modelName, "-r") {
+		if strings.HasSuffix(template, "-r") {
 			ratios = []string{"1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2"}
 		}
-		if modelName == "seedream-5-pro" {
+		seedream := template == "seedream-5-pro" || template == "seedream-5.5"
+		if seedream {
 			ratios = []string{"21:9", "2:1", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16", "1:2", "9:21"}
 		}
 		if !slices.Contains(ratios, ratio) {
 			return nil, errors.New("unsupported TabTab image aspect ratio")
 		}
 		args["ratio"] = ratio
+		if background := stringsByName["background"]; template == "seedream-5.5" && background != "" {
+			switch background {
+			case "opaque":
+			case "transparent":
+				if !slices.Contains([]string{"1:1", "3:4", "16:9", "4:3", "9:16"}, ratio) {
+					return nil, errors.New("TabTab Seedream transparent background does not support the requested aspect ratio")
+				}
+			default:
+				return nil, errors.New("unsupported TabTab Seedream image background")
+			}
+			args["background"] = background
+		}
 		if size != "" && size != "auto" && resolution != "" && resolution != "AUTO" && strings.ToUpper(size) != resolution {
 			return nil, errors.New("TabTab size and resolution must match")
 		}
 		if resolution == "" || resolution == "AUTO" {
 			resolution = strings.ToUpper(size)
 		}
-		if modelName == "gemini-3.1-flash-lite-image" {
+		if template == "gemini-3.1-flash-lite-image" {
 			if resolution != "" && resolution != "AUTO" {
 				return nil, errors.New("TabTab flash lite image has a fixed size")
 			}
 		} else {
 			if resolution == "" || resolution == "AUTO" {
 				resolution = "2K"
-				if strings.HasSuffix(modelName, "-r") || modelName == "seedream-5-pro" {
+				if strings.HasSuffix(template, "-r") || seedream {
 					resolution = "1K"
 				}
 			}
 			if !slices.Contains([]string{"1K", "2K", "4K"}, resolution) {
 				return nil, errors.New("TabTab image size must be 1K, 2K or 4K")
 			}
-			if modelName == "seedream-5-pro" && resolution == "4K" {
+			if seedream && resolution == "4K" {
 				return nil, errors.New("TabTab Seedream image size must be 1K or 2K")
 			}
 			args["size"] = resolution
 		}
 		if value := stringsByName["quality"]; value != "" {
-			if !strings.HasSuffix(modelName, "-r") || !slices.Contains([]string{"auto", "low", "medium", "high", "xhigh", "max"}, value) {
+			if !strings.HasSuffix(template, "-r") || !slices.Contains([]string{"auto", "low", "medium", "high", "xhigh", "max"}, value) {
 				return nil, errors.New("unsupported TabTab image quality")
 			}
 			args["quality"] = value

@@ -292,6 +292,7 @@ const SENSITIVE_FORM_FIELDS = [
   'image_reference_timeout_retry_same_channel',
   'tianyue_media_compatibility',
   'image_resolution_model_mapping',
+  'tabtab_image_model_profiles',
   'video_resolution_model_mapping',
   'image_max_reference_bytes',
   'image_attempt_timeout_seconds',
@@ -1993,6 +1994,43 @@ export function ChannelMutateDrawer({
           models={currentModelsArray}
           disabled={sensitiveLocked || isSubmitting}
         />
+        {currentType === CHANNEL_TYPE_TABTAB && (
+          <FormField
+            control={form.control}
+            name='tabtab_image_model_profiles'
+            render={({ field }) => (
+              <FormItem className='space-y-3 sm:col-span-2'>
+                <FormControl>
+                  <fieldset
+                    ref={field.ref}
+                    tabIndex={-1}
+                    className='min-w-0 space-y-2'
+                  >
+                    <legend className='text-sm font-medium'>
+                      {t('TabTab image model templates')}
+                    </legend>
+                    <FormDescription>
+                      {t(
+                        'Match the final upstream model to a built-in TabTab model with the same parameters. Requests still send the final upstream model name.'
+                      )}
+                    </FormDescription>
+                    <JsonEditor
+                      value={field.value || ''}
+                      onChange={field.onChange}
+                      disabled={sensitiveLocked || isSubmitting}
+                      keyLabel={t('Upstream model')}
+                      valueLabel={t('Built-in template model')}
+                      keyPlaceholder='future-seedream'
+                      valuePlaceholder='seedream-5.5'
+                      template={{ 'future-seedream': 'seedream-5.5' }}
+                    />
+                    <FormMessage />
+                  </fieldset>
+                </FormControl>
+              </FormItem>
+            )}
+          />
+        )}
         {currentType === CHANNEL_TYPE_TASK_PLUGIN && (
           <ResolutionModelMapping
             media='video'

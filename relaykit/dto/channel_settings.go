@@ -235,6 +235,9 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
 	UpstreamAsync                         *UpstreamAsyncConfig  `json:"upstream_async,omitempty"`
+
+	TabtabImageModelProfiles TabtabImageModelProfiles `json:"tabtab_image_model_profiles,omitempty"`
+
 	// OllamaOpenAIChat routes Ollama chat completions to the OpenAI-compatible
 	// /v1/chat/completions endpoint. When unset, chat completions keep using
 	// the native /api/chat protocol.

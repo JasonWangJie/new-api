@@ -188,6 +188,37 @@ export function asyncImageGuide(
       examples: [],
     },
     {
+      id: 'seedream-5-5',
+      title: 'seedream-5.5',
+      paragraphs: [
+        t(
+          'Use the existing image generation or editing endpoint with model=seedream-5.5. These limits apply when the route uses the Seedream 5.5 task profile. Availability depends on your account and site configuration.'
+        ),
+        t(
+          'n must be 1. Use resolution 1K (default) or 2K and an aspect_ratio of 21:9, 2:1, 16:9, 3:2, 4:3, 1:1 (default), 3:4, 2:3, 9:16, 1:2 or 9:21.'
+        ),
+        t(
+          'Optional background: opaque or transparent. Omit it for the upstream default (opaque). Transparent backgrounds support only 1:1, 3:4, 16:9, 4:3 and 9:16. Editing requires at least one reference image. If no channel can run the request, the gateway rejects it before creating a task.'
+        ),
+      ],
+      examples: [
+        {
+          title: t('Parameters'),
+          code: JSON.stringify(
+            {
+              model: 'seedream-5.5',
+              n: 1,
+              resolution: '1K',
+              aspect_ratio: '1:1',
+              background: 'transparent',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    },
+    {
       id: 'video',
       title: t('Video generation scenarios'),
       paragraphs: [

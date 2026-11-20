@@ -256,7 +256,7 @@ func GetImageWorkbenchCapabilities(c *gin.Context) {
 					continue
 				}
 				var supported bool
-				capability, supported = service.TabtabWorkbenchImageCapability(mappedModel, capability)
+				capability, supported = service.TabtabWorkbenchImageCapability(mappedModel, capability, channels[0].GetOtherSettings().TabtabImageModelProfiles)
 				if !supported {
 					continue
 				}
