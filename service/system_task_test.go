@@ -107,6 +107,61 @@ func TestSystemTaskSchedulerSkipsDisabled(t *testing.T) {
 	assert.Equal(t, int64(0), countSystemTasks(t, handler.taskType))
 }
 
+func TestSystemTaskAsyncPollSchedulesFromStartWithoutOverlapping(t *testing.T) {
+	setupMeasuredTaskBillingDB(t)
+	db := model.DB
+	require.NoError(t, db.AutoMigrate(&model.SystemTask{}, &model.SystemTaskLock{}))
+	t.Cleanup(func() {
+		assert.NoError(t, db.Migrator().DropTable(&model.SystemTask{}, &model.SystemTaskLock{}))
+	})
+	finished := make(chan error, 1)
+	poll := &stubScheduledHandler{
+		taskType: model.SystemTaskTypeAsyncTaskPoll,
+		enabled:  true,
+		interval: 30 * time.Second,
+		onRun: func(_ context.Context, task *model.SystemTask, runnerID string) {
+			finished <- model.FinishSystemTask(task.TaskID, runnerID, model.SystemTaskStatusSucceeded, nil, "")
+		},
+	}
+	other := &stubScheduledHandler{taskType: "other_scheduled", enabled: true, interval: time.Minute}
+	withSystemTaskRegistry(t, poll, other)
+
+	runSystemTaskScheduler()
+	require.Zero(t, countSystemTasks(t, poll.taskType))
+	require.EqualValues(t, 1, countSystemTasks(t, other.taskType))
+
+	prior, err := model.CreateSystemTask(poll.taskType, nil, nil)
+	require.NoError(t, err)
+	_, claimed, err := model.ClaimSystemTask(prior.ID, poll.taskType, "runner-peer", systemTaskLockUntil())
+	require.NoError(t, err)
+	require.True(t, claimed)
+	due := time.Now().Truncate(time.Second)
+	require.NoError(t, model.DB.Model(&model.SystemTask{}).Where("id = ?", prior.ID).Update("created_at", due.Add(-30*time.Second).Unix()).Error)
+
+	runAsyncTaskPollScheduler("runner-local", due)
+	require.EqualValues(t, 1, countSystemTasks(t, poll.taskType), "the previous round is still running")
+	require.NoError(t, model.FinishSystemTask(prior.TaskID, "runner-peer", model.SystemTaskStatusSucceeded, nil, ""))
+
+	assert.Equal(t, time.Second, runAsyncTaskPollScheduler("runner-local", due.Add(-time.Second)))
+	require.EqualValues(t, 1, countSystemTasks(t, poll.taskType))
+	runAsyncTaskPollScheduler("runner-local", due)
+	select {
+	case err := <-finished:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the next polling round did not run")
+	}
+	require.EqualValues(t, 2, countSystemTasks(t, poll.taskType), "the previous round's recent completion does not reset the interval")
+	require.EqualValues(t, 1, countSystemTasks(t, other.taskType))
+
+	poll.interval = time.Second
+	latest, err := model.GetLatestSystemTask(poll.taskType)
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	assert.Equal(t, 500*time.Millisecond, runAsyncTaskPollScheduler("runner-local", time.Unix(latest.CreatedAt, 0).Add(500*time.Millisecond)))
+	assert.EqualValues(t, 2, countSystemTasks(t, poll.taskType))
+}
+
 func TestSystemTaskClaimPassDispatchesByType(t *testing.T) {
 	truncate(t)
 

@@ -3079,6 +3079,8 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 				}
 			})
 			t.Run("administrator terminates unresolved videos and protects completed tasks", func(t *testing.T) {
+				t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "test")
+				t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "test:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
 				previousRedis, previousBatch, previousLog := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled
 				common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled = false, false, true
 				t.Cleanup(func() {
@@ -3090,6 +3092,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					leased, output, refunded       bool
 					subscription, reset            bool
 					refundFailure, logFailure      bool
+					aged                           bool
 					originalReservation            int
 					protected, refundMarker        bool
 					reconciliationConflict         bool
@@ -3097,6 +3100,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					{name: "queued", status: "queued", nativeStatus: model.TaskStatusQueued},
 					{name: "submitting with live lease", status: "submitting", nativeStatus: model.TaskStatusSubmitted, leased: true},
 					{name: "processing with live lease", status: "submitted", nativeStatus: model.TaskStatusInProgress, leased: true},
+					{name: "age limit refund", status: "submitted", nativeStatus: model.TaskStatusFailure, aged: true},
 					{name: "reconciling output", status: "reconciling", nativeStatus: model.TaskStatusInProgress, output: true},
 					{name: "unknown", status: "execution_unknown", nativeStatus: model.TaskStatusUnknown, billing: "unknown"},
 					{name: "saving", status: "submitted", nativeStatus: model.TaskStatusSuccess, storage: "saving", output: true, protected: true},
@@ -3152,6 +3156,26 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							job.ExpiresAt = now - 1
 						}
 						native := model.Task{TaskID: id, UserId: user.Id, ChannelId: channel.Id, Platform: "drama", Status: tc.nativeStatus, Quota: quota, AttemptGeneration: 1, SubmitTime: now, PrivateData: model.TaskPrivateData{TokenId: token.Id, AsyncMedia: true, DurableBilling: true, SubmitAccountingRecorded: true, BillingSource: "wallet", UpstreamTaskID: "upstream-" + id}}
+						showFailedRequest := tc.name == "processing with live lease" || tc.aged
+						if showFailedRequest || tc.name == "failed refunded" {
+							job.Model = ""
+							native.Properties = model.Properties{OriginModelName: "public-video-alias", UpstreamModelName: "private-video-target"}
+						}
+						if showFailedRequest {
+							request := service.AsyncVideoRequest{
+								Body:        []byte(`{"model":"public-video-alias","seconds":8,"resolution":"720p","seed":0,"authorization":"request-secret-canary"}`),
+								ContentType: "application/json",
+								Channel:     model.Channel{Key: "channel-credential-canary"},
+							}
+							plain, err := common.Marshal(request)
+							require.NoError(t, err)
+							job.RequestCipher, err = service.EncryptImagePayload(plain, "media-request:"+id)
+							require.NoError(t, err)
+						}
+						if tc.aged {
+							job.CreatedAt -= model.AsyncMediaMaxTaskAgeSeconds + 60
+							native.PrivateData.VideoTerminalConfirmed = true
+						}
 						var subscription model.UserSubscription
 						if tc.subscription {
 							period := now - 100
@@ -3180,6 +3204,10 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							view, _, err := videoJobView(c, job, true, true)
 							require.NoError(t, err)
 							assert.Equal(t, !tc.protected, view["can_terminate"])
+							if tc.name == "failed refunded" {
+								assert.Equal(t, "public-video-alias", view["model"], "older refunds can fall back to the original public model")
+								assert.Nil(t, view["request_parameters"], "missing historical requests must not be fabricated")
+							}
 							ManageMediaTask(c, true, "terminate")
 							assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
 							var after model.Task
@@ -3224,17 +3252,23 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 							assert.NotEmpty(t, job.RefundLogPayload)
 							require.NoError(t, model.ReplayAsyncMediaRefundLogs(t.Context(), 100))
 						}
-						for range 2 {
-							recorder := httptest.NewRecorder()
-							c, _ := gin.CreateTestContext(recorder)
-							c.Params = gin.Params{{Key: "task_id", Value: id}}
-							c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{"confirm_upstream_checked":true}`))
-							view, _, err := videoJobView(c, job, true, false)
-							require.NoError(t, err)
-							assert.Equal(t, job.ReferenceRecoveryStage != model.AsyncMediaAdminTerminatedStage, view["can_terminate"])
-							ManageMediaTask(c, true, "terminate")
-							require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+						if tc.aged {
+							require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), job, service.DefaultMediaRuntimeConfig()))
 							require.NoError(t, db.Take(&job, job.ID).Error)
+							assert.Equal(t, "age_limit_complete", job.ReferenceRecoveryStage)
+						} else {
+							for range 2 {
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Params = gin.Params{{Key: "task_id", Value: id}}
+								c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/media-tasks/"+id+"/terminate", strings.NewReader(`{"confirm_upstream_checked":true}`))
+								view, _, err := videoJobView(c, job, true, false)
+								require.NoError(t, err)
+								assert.Equal(t, job.ReferenceRecoveryStage != model.AsyncMediaAdminTerminatedStage, view["can_terminate"])
+								ManageMediaTask(c, true, "terminate")
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								require.NoError(t, db.Take(&job, job.ID).Error)
+							}
 						}
 						require.NoError(t, db.Take(&native, native.ID).Error)
 						assert.EqualValues(t, model.TaskStatusFailure, native.Status)
@@ -3248,7 +3282,38 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						}
 						assert.Equal(t, expectedBilling, job.BillingStatus)
 						assert.Zero(t, job.Quota)
-						assert.Empty(t, job.RequestCipher)
+						if showFailedRequest {
+							plain, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+id)
+							require.NoError(t, err)
+							var snapshot map[string]any
+							require.NoError(t, common.Unmarshal(plain, &snapshot))
+							assert.Len(t, snapshot, 1)
+							assert.Contains(t, snapshot, "request_details")
+							for _, list := range []bool{true, false} {
+								recorder := httptest.NewRecorder()
+								c, _ := gin.CreateTestContext(recorder)
+								c.Params = gin.Params{{Key: "task_id", Value: id}}
+								c.Request = httptest.NewRequest(http.MethodGet, "/?task_id="+id, nil)
+								if list {
+									ListMediaTasks(c, true)
+									assert.NotContains(t, recorder.Body.String(), "request_parameters")
+								} else {
+									GetMediaTask(c, true)
+									assert.Contains(t, recorder.Body.String(), `"request_parameters":{`)
+									assert.Contains(t, recorder.Body.String(), `"authorization":"[redacted]"`)
+									assert.Contains(t, recorder.Body.String(), `"seed":0`)
+								}
+								require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+								assert.Contains(t, recorder.Body.String(), `"model":"public-video-alias"`)
+								assert.Contains(t, recorder.Body.String(), `"requested_seconds":8`)
+								assert.Contains(t, recorder.Body.String(), `"requested_resolution":"720p"`)
+								for _, private := range []string{"request-secret-canary", "channel-credential-canary", "private-video-target"} {
+									assert.NotContains(t, recorder.Body.String(), private)
+								}
+							}
+						} else {
+							assert.Empty(t, job.RequestCipher)
+						}
 						assert.Empty(t, job.ChannelCipher)
 						assert.Empty(t, job.LeaseToken)
 						assert.Zero(t, job.LeaseExpiresAt)

@@ -238,7 +238,8 @@ func UpdateImageRuntime(c *gin.Context) {
 	defaults := service.DefaultImageRuntimeConfig()
 	input := struct {
 		service.ImageRuntimeConfig
-		Revision *int64 `json:"revision"`
+		Revision     *int64 `json:"revision"`
+		PollInterval *int   `json:"poll_interval_seconds"`
 	}{ImageRuntimeConfig: service.ImageRuntimeConfig{StorageUploadConcurrency: defaults.StorageUploadConcurrency, FailedRequestRetentionHours: defaults.FailedRequestRetentionHours, AccountCooldownSeconds: defaults.AccountCooldownSeconds, SupplierRetryCapacity: defaults.SupplierRetryCapacity, SupplierRetryWindowSeconds: defaults.SupplierRetryWindowSeconds, TimeoutRetries: defaults.TimeoutRetries, TimeoutRetryBase: defaults.TimeoutRetryBase, TimeoutRetryMax: defaults.TimeoutRetryMax}}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
@@ -249,6 +250,16 @@ func UpdateImageRuntime(c *gin.Context) {
 		return
 	}
 	cfg := input.ImageRuntimeConfig
+	if input.PollInterval == nil {
+		current, err := service.GetImageRuntimeConfig(c.Request.Context())
+		if err != nil {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image runtime configuration is unavailable"))
+			return
+		}
+		cfg.PollInterval = current.PollInterval
+	} else {
+		cfg.PollInterval = *input.PollInterval
+	}
 	if err := service.SaveImageRuntimeConfig(c.Request.Context(), cfg, *input.Revision); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, model.ErrOptionRevisionConflict) {

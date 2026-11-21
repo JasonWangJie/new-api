@@ -1865,9 +1865,11 @@ func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
 		t.Run(kind, func(t *testing.T) {
 			key := "image_runtime_config"
 			var defaults any = service.DefaultImageRuntimeConfig()
+			wantPollInterval := 10
 			update, get := UpdateImageRuntime, GetImageConfiguration
 			if kind == "video" {
 				key, defaults, update, get = "media_runtime_config", service.DefaultMediaRuntimeConfig(), UpdateMediaConfiguration, GetMediaConfiguration
+				wantPollInterval = 30
 			}
 			t.Cleanup(func() { assert.NoError(t, db.Where(map[string]any{"key": key}).Delete(&model.Option{}).Error) })
 			encoded, err := common.Marshal(defaults)
@@ -1875,6 +1877,7 @@ func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
 			var body map[string]any
 			require.NoError(t, common.Unmarshal(encoded, &body))
 			delete(body, "revision")
+			delete(body, "poll_interval_seconds")
 			if kind == "video" {
 				delete(body, "reconciliation_timeout_minutes")
 				delete(body, "reconciliation_poll_interval_seconds")
@@ -1894,10 +1897,12 @@ func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
 				var response struct {
 					Data struct {
 						Revision                   *int64 `json:"revision"`
+						PollInterval               int    `json:"poll_interval_seconds"`
 						ReconciliationTimeout      int    `json:"reconciliation_timeout_minutes"`
 						ReconciliationPollInterval int    `json:"reconciliation_poll_interval_seconds"`
 						Runtime                    struct {
-							Revision *int64 `json:"revision"`
+							Revision     *int64 `json:"revision"`
+							PollInterval int    `json:"poll_interval_seconds"`
 						} `json:"runtime"`
 					} `json:"data"`
 				}
@@ -1905,7 +1910,9 @@ func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
 				revision := response.Data.Revision
 				if kind == "image" {
 					revision = response.Data.Runtime.Revision
+					assert.Equal(t, wantPollInterval, response.Data.Runtime.PollInterval)
 				} else {
+					assert.Equal(t, wantPollInterval, response.Data.PollInterval)
 					assert.Equal(t, 1440, response.Data.ReconciliationTimeout)
 					assert.Equal(t, 60, response.Data.ReconciliationPollInterval)
 				}
@@ -2022,6 +2029,24 @@ func verifyMediaConfigurationRevisions(t *testing.T, db *gorm.DB) {
 					assert.EqualValues(t, 9007199254740991, readRevision(), "revision must never overflow the JavaScript-safe boundary")
 				})
 			}
+			t.Run("polling interval", func(t *testing.T) {
+				require.NoError(t, db.Where(map[string]any{"key": key}).Delete(&model.Option{}).Error)
+				body["revision"] = 0
+				for _, invalid := range []any{-1, 0, 0.5, 3601} {
+					body["poll_interval_seconds"] = invalid
+					assert.Equal(t, http.StatusBadRequest, request(update, http.MethodPut, body).Code)
+				}
+				body["poll_interval_seconds"] = 23
+				recorder := request(update, http.MethodPut, body)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				wantPollInterval = 23
+				assert.EqualValues(t, 1, readRevision())
+				delete(body, "poll_interval_seconds")
+				body["revision"] = 1
+				recorder = request(update, http.MethodPut, body)
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				assert.EqualValues(t, 2, readRevision(), "an older client does not reset the saved interval")
+			})
 		})
 	}
 }

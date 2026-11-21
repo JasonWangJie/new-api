@@ -3029,31 +3029,46 @@ test.each([
       id: 'video_missing_specifications',
       requested_size: '',
     }
+    const refunded: ImageTask = {
+      ...video,
+      id: 'video_refunded_requested_specifications',
+      model: 'refunded-video-model',
+      status: 'failed',
+      billing_status: 'refunded',
+      progress: 100,
+      finished_at: video.created_at + 10,
+      requested_seconds: 15,
+      requested_resolution: '1080p',
+      actual_size: '',
+      can_terminate: false,
+    }
     vi.mocked(getImageTasks).mockResolvedValue({
-      items: [video, resolutionOnly, unavailable, task],
-      total: 4,
+      items: [video, resolutionOnly, unavailable, refunded, task],
+      total: 5,
       pages: 1,
       stats: {},
     })
     mount(<ImageTaskCenter admin={admin} />)
     await screen.findByRole('button', { name: video.id })
-    for (const [id, expected] of [
-      [video.id, '8s · 720p'],
-      [resolutionOnly.id, '1280x720'],
-      [unavailable.id, '—'],
-      [task.id, '2K'],
-    ]) {
+    for (const [item, expected] of [
+      [video, '8s · 720p'],
+      [resolutionOnly, '1280x720'],
+      [unavailable, '—'],
+      [refunded, '15s · 1080p'],
+      [task, '2K'],
+    ] as const) {
       const container = mobile
-        ? screen.getByRole('article', { name: id })
-        : screen.getByRole('button', { name: id }).closest('tr')
+        ? screen.getByRole('article', { name: item.id })
+        : screen.getByRole('button', { name: item.id }).closest('tr')
       assert(container)
+      const modelName = within(container).getByText(item.model, { exact: true })
+      expect(modelName).toBeVisible()
       const specifications = mobile
         ? within(container).getByText('Resolution').nextElementSibling
-        : within(container).getByText(id === task.id ? task.model : video.model)
-            .parentElement
+        : modelName.parentElement
       assert(specifications)
       expect(specifications).toHaveTextContent(expected)
-      if (id !== task.id) {
+      if (item.media_type === 'video') {
         expect(container).not.toHaveTextContent('1920x1080')
         expect(container).not.toHaveTextContent('undefined')
       }
@@ -4056,12 +4071,13 @@ test('a selected task that becomes successful on refresh is excluded from termin
 })
 
 test.each([
-  { admin: false, mobile: false },
-  { admin: true, mobile: false },
-  { admin: false, mobile: true },
+  { admin: false, mobile: false, refunded: false },
+  { admin: true, mobile: false, refunded: false },
+  { admin: false, mobile: true, refunded: false },
+  { admin: true, mobile: false, refunded: true },
 ])(
-  'video details show requested duration and resolution before reference links and open original parameters on demand (admin=$admin mobile=$mobile)',
-  async ({ admin, mobile }) => {
+  'video details show requested duration and resolution before reference links and open original parameters on demand (admin=$admin mobile=$mobile refunded=$refunded)',
+  async ({ admin, mobile, refunded }) => {
     if (mobile) setMobileViewport()
     const parameters = {
       model: 'video-model',
@@ -4075,9 +4091,17 @@ test.each([
       task: {
         ...task,
         media_type: 'video',
+        model: parameters.model,
+        ...(refunded && {
+          status: 'failed',
+          billing_status: 'refunded',
+          progress: 100,
+          finished_at: task.created_at + 10,
+          can_terminate: false,
+        }),
         requested_seconds: 8,
         requested_resolution: '720p',
-        actual_size: '1920x1080',
+        actual_size: refunded ? '' : '1920x1080',
         request_parameters: parameters,
         reference_media: [
           { type: 'image', url: 'https://example.com/first-frame.png' },
@@ -4102,6 +4126,9 @@ test.each([
       name: 'Media task details',
     })
     expect(await within(details).findByText('Requested duration')).toBeVisible()
+    expect(
+      within(details).getByText(parameters.model, { exact: true })
+    ).toBeVisible()
     const requestedSpecifications = within(details)
       .getByText('Requested duration')
       .closest('dl')
@@ -4133,6 +4160,7 @@ test.each([
     const trigger = within(details).getByRole('button', {
       name: 'View request parameters',
     })
+    expect(trigger).toBeEnabled()
     await user.click(trigger)
     const parametersDialog = await screen.findByRole('dialog', {
       name: 'Original request parameters',

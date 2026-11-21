@@ -26,6 +26,7 @@ type MediaRuntimeConfig struct {
 	StatusConcurrency          int    `json:"status_concurrency"`
 	SubmitTimeout              int    `json:"submit_timeout_seconds"`
 	PollTimeout                int    `json:"poll_timeout_seconds"`
+	PollInterval               int    `json:"poll_interval_seconds"`
 	ReconciliationTimeout      int    `json:"reconciliation_timeout_minutes"`
 	ReconciliationPollInterval int    `json:"reconciliation_poll_interval_seconds"`
 	StorageRetries             int    `json:"storage_retry_attempts"`
@@ -43,7 +44,7 @@ type VideoReadiness struct {
 }
 
 func DefaultMediaRuntimeConfig() MediaRuntimeConfig {
-	return MediaRuntimeConfig{LocalPath: "data/media", RetentionDays: 90, SignedURLExpiry: 3600, MaxFileBytes: 1 << 30, DownloadTimeout: 900, DownloadConcurrency: 2, SubmitConcurrency: 2, StatusConcurrency: 8, SubmitTimeout: 120, PollTimeout: 30, ReconciliationTimeout: 1440, ReconciliationPollInterval: 60, StorageRetries: 5}
+	return MediaRuntimeConfig{LocalPath: "data/media", RetentionDays: 90, SignedURLExpiry: 3600, MaxFileBytes: 1 << 30, DownloadTimeout: 900, DownloadConcurrency: 2, SubmitConcurrency: 2, StatusConcurrency: 8, SubmitTimeout: 120, PollTimeout: 30, PollInterval: 30, ReconciliationTimeout: 1440, ReconciliationPollInterval: 60, StorageRetries: 5}
 }
 
 // Older configuration clients omit the added worker settings. Preserve their
@@ -75,6 +76,9 @@ func (cfg MediaRuntimeConfig) Validate() error {
 	}
 	if cfg.PollTimeout < 1 || cfg.PollTimeout > 300 {
 		return errors.New("video polling timeout must be between 1 and 300 seconds")
+	}
+	if cfg.PollInterval < 1 || cfg.PollInterval > 3600 {
+		return errors.New("video polling interval must be between 1 and 3600 seconds")
 	}
 	if cfg.ReconciliationTimeout < 1 || cfg.ReconciliationTimeout > 10080 {
 		return errors.New("video reconciliation timeout must be between 1 and 10080 minutes")
@@ -126,6 +130,9 @@ func SaveMediaRuntimeConfig(ctx context.Context, cfg MediaRuntimeConfig, expecte
 		expected = &expectedRevision[0]
 	}
 	_, err = model.SaveVersionedOption(ctx, "media_runtime_config", string(data), expected)
+	if err == nil {
+		notifyAsyncTaskPollScheduler()
+	}
 	return err
 }
 

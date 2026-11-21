@@ -44,6 +44,7 @@ type MediaSettings = {
   submit_concurrency: number
   status_concurrency: number
   submit_timeout_seconds: number
+  poll_interval_seconds: number
   poll_timeout_seconds: number
   reconciliation_timeout_minutes: number
   reconciliation_poll_interval_seconds: number
@@ -87,6 +88,7 @@ function MediaSettingsForm(props: {
     submit_concurrency: props.initial.submit_concurrency || 2,
     status_concurrency: props.initial.status_concurrency || 8,
     submit_timeout_seconds: props.initial.submit_timeout_seconds || 120,
+    poll_interval_seconds: props.initial.poll_interval_seconds ?? 30,
     poll_timeout_seconds: props.initial.poll_timeout_seconds ?? 30,
     reconciliation_timeout_minutes:
       props.initial.reconciliation_timeout_minutes ?? 1440,
@@ -135,6 +137,11 @@ function MediaSettingsForm(props: {
       key: 'submit_timeout_seconds',
       label: 'Video submit timeout (seconds)',
       max: 86400,
+    },
+    {
+      key: 'poll_interval_seconds',
+      label: 'Video upstream polling interval (seconds)',
+      max: 3600,
     },
     {
       key: 'poll_timeout_seconds',

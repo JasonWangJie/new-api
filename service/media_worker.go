@@ -285,7 +285,7 @@ func DispatchAsyncMediaJobs(ctx context.Context, cfg MediaRuntimeConfig) (*sync.
 			if slot != 1 {
 				continue
 			}
-			claimed, err := model.ClaimAsyncMediaJob(ctx, &job, lease, leaseSeconds)
+			claimed, err := model.ClaimAsyncMediaJob(ctx, &job, lease, leaseSeconds, RetainTerminalAsyncVideoRequestDetails)
 			if err != nil || !claimed {
 				_ = redis.ZRem(ctx, slotKey, lease).Err()
 				if err != nil {
@@ -316,7 +316,7 @@ func ProcessAsyncMediaJob(parent context.Context, job model.AsyncMediaJob, cfg M
 		if job.ReferenceRecoveryStage == "age_limit_refund" {
 			return completeAsyncMediaAgeRefund(parent, job)
 		}
-		stopped, err := model.FailAgedAsyncMediaJob(parent, job, time.Now().Unix(), true)
+		stopped, err := model.FailAgedAsyncMediaJob(parent, job, time.Now().Unix(), true, RetainTerminalAsyncVideoRequestDetails)
 		if errors.Is(err, model.ErrImageConflict) {
 			return nil
 		}
@@ -614,7 +614,7 @@ func FailOverdueAsyncMediaJobs(ctx context.Context, limit int) error {
 		err = nil
 		if job.ReferenceRecoveryStage != "age_limit_refund" {
 			var stopped model.AsyncMediaJob
-			stopped, err = model.FailAgedAsyncMediaJob(ctx, job, now, true)
+			stopped, err = model.FailAgedAsyncMediaJob(ctx, job, now, true, RetainTerminalAsyncVideoRequestDetails)
 			if err == nil {
 				job, candidate = stopped, stopped
 			}
@@ -645,7 +645,7 @@ func FailOverdueAsyncMediaJobs(ctx context.Context, limit int) error {
 // historical unsuccessful records, without asserting upstream verification.
 func TerminateExpiredAsyncMediaJob(ctx context.Context, job model.AsyncMediaJob) error {
 	automatic := job.CreatedAt > 0 && job.CreatedAt <= time.Now().Unix()-model.AsyncMediaMaxTaskAgeSeconds
-	stopped, err := model.FailAgedAsyncMediaJob(ctx, job, time.Now().Unix(), automatic)
+	stopped, err := model.FailAgedAsyncMediaJob(ctx, job, time.Now().Unix(), automatic, RetainTerminalAsyncVideoRequestDetails)
 	if err != nil {
 		return err
 	}
@@ -678,12 +678,12 @@ func TerminateAsyncMediaTask(ctx context.Context, job model.AsyncMediaJob) error
 			break
 		}
 	}
-	return model.TerminateAsyncMediaTask(ctx, job, VideoTaskFailureReason(reason), taskBillingOther(&task))
+	return model.TerminateAsyncMediaTask(ctx, job, VideoTaskFailureReason(reason), taskBillingOther(&task), RetainTerminalAsyncVideoRequestDetails)
 }
 
 // The controller must require the existing explicit upstream-check confirmation.
 func ReconcileTerminatedAsyncMediaReservation(ctx context.Context, job model.AsyncMediaJob) error {
-	reconciled, err := model.ReconcileAgedAsyncMediaReservation(ctx, job)
+	reconciled, err := model.ReconcileAgedAsyncMediaReservation(ctx, job, RetainTerminalAsyncVideoRequestDetails)
 	if err != nil {
 		return err
 	}
@@ -716,5 +716,11 @@ func completeAsyncMediaAgeRefund(ctx context.Context, job model.AsyncMediaJob) e
 	}
 	query := model.DB.WithContext(ctx).Model(&model.AsyncMediaJob{}).
 		Where("id = ? AND status = ? AND attempt_generation = ? AND reference_recovery_stage = ?", job.ID, "failed", job.AttemptGeneration, "age_limit_refund")
-	return model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": "refunded", "quota": 0, "reference_recovery_stage": "age_limit_complete", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0, "request_cipher": nil, "channel_cipher": nil}, "")
+	// A refund queued by an older worker can still have its execution envelope.
+	// Never restore a request already cleared by the retention sweep.
+	var requestCipher any
+	if snapshot := RetainTerminalAsyncVideoRequestDetails(job); len(snapshot) > 0 {
+		requestCipher = gorm.Expr("CASE WHEN expires_at <= ? THEN NULL WHEN request_cipher IS NULL THEN request_cipher ELSE ? END", time.Now().Unix(), snapshot)
+	}
+	return model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": "refunded", "quota": 0, "reference_recovery_stage": "age_limit_complete", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0, "request_cipher": requestCipher, "channel_cipher": nil}, "")
 }

@@ -25,6 +25,7 @@ type ImageRuntimeConfig struct {
 	Workers                     int    `json:"worker_concurrency"`
 	WorkerLease                 int    `json:"worker_lease_seconds"`
 	RecoveryInterval            int    `json:"recovery_interval_seconds"`
+	PollInterval                int    `json:"poll_interval_seconds"`
 	ExecutionTimeout            int    `json:"execution_timeout_seconds"`
 	AttemptTimeout              int    `json:"account_attempt_timeout_seconds"`
 	ImageConcurrency            int    `json:"image_concurrency"`
@@ -86,7 +87,7 @@ type ImageRuntimeConfig struct {
 }
 
 func DefaultImageRuntimeConfig() ImageRuntimeConfig {
-	return ImageRuntimeConfig{StorageUploadConcurrency: 4, TimeoutRetries: 2, TimeoutRetryBase: 5, TimeoutRetryMax: 10, FailedRequestRetentionHours: 24, AccountCooldownSeconds: 60, SupplierRetryCapacity: 10, SupplierRetryWindowSeconds: 60, Workers: 4, WorkerLease: 120, RecoveryInterval: 30, ExecutionTimeout: 1200, AttemptTimeout: 300, ImageConcurrency: 4, StorageRetries: 5, BillingRetries: 10, RetryBackoff: 30, OpenAIReferenceMode: "passthrough_fallback_local", GeminiReferenceMode: "passthrough", GeminiAccountSwitches: 3, FailureThreshold: 5, Cooldown: 300, ReferenceRetries: 2, ReferenceRetryBase: 15, ReferenceRetryMax: 60, TransientRetries: 3, TransientRetryBase: 15, TransientRetryMax: 60, CapacityRetries: 5, CapacityRetryBase: 30, CapacityRetryMax: 300, TotalRetries: 16, RetryJitter: 20, RetryAfterMax: 900, DownloadMaxBytes: 32 << 20, DownloadMaxPixels: 80_000_000, MaxReferences: 14, DownloadTimeout: 30, DownloadRedirects: 3, ReferenceConcurrency: 8, ReferenceCacheTTL: 60, ReferenceCacheBytes: 128 << 20, UploadTimeout: 300, UploadsPerMinute: 20, InputBytesPerKey: 1 << 30, SingleUploadBytes: 32 << 20, SignedURLExpiry: 3600, InputRetentionHours: 24, TaskRetentionDays: 90, ResultRetentionDays: 90, PromptPreview: true, PromptPreviewChars: 160, LibraryRetentionDays: 90, LibraryItems: 1000, LibraryBytes: 5 << 30, LibraryImageBytes: 20 << 20, LibraryImagePixels: 40_000_000, ImportsPerMinute: 20, SubmissionsPerMinute: 10}
+	return ImageRuntimeConfig{StorageUploadConcurrency: 4, TimeoutRetries: 2, TimeoutRetryBase: 5, TimeoutRetryMax: 10, FailedRequestRetentionHours: 24, AccountCooldownSeconds: 60, SupplierRetryCapacity: 10, SupplierRetryWindowSeconds: 60, Workers: 4, WorkerLease: 120, RecoveryInterval: 30, PollInterval: 10, ExecutionTimeout: 1200, AttemptTimeout: 300, ImageConcurrency: 4, StorageRetries: 5, BillingRetries: 10, RetryBackoff: 30, OpenAIReferenceMode: "passthrough_fallback_local", GeminiReferenceMode: "passthrough", GeminiAccountSwitches: 3, FailureThreshold: 5, Cooldown: 300, ReferenceRetries: 2, ReferenceRetryBase: 15, ReferenceRetryMax: 60, TransientRetries: 3, TransientRetryBase: 15, TransientRetryMax: 60, CapacityRetries: 5, CapacityRetryBase: 30, CapacityRetryMax: 300, TotalRetries: 16, RetryJitter: 20, RetryAfterMax: 900, DownloadMaxBytes: 32 << 20, DownloadMaxPixels: 80_000_000, MaxReferences: 14, DownloadTimeout: 30, DownloadRedirects: 3, ReferenceConcurrency: 8, ReferenceCacheTTL: 60, ReferenceCacheBytes: 128 << 20, UploadTimeout: 300, UploadsPerMinute: 20, InputBytesPerKey: 1 << 30, SingleUploadBytes: 32 << 20, SignedURLExpiry: 3600, InputRetentionHours: 24, TaskRetentionDays: 90, ResultRetentionDays: 90, PromptPreview: true, PromptPreviewChars: 160, LibraryRetentionDays: 90, LibraryItems: 1000, LibraryBytes: 5 << 30, LibraryImageBytes: 20 << 20, LibraryImagePixels: 40_000_000, ImportsPerMinute: 20, SubmissionsPerMinute: 10}
 }
 
 func GetImageRuntimeConfig(ctx context.Context) (ImageRuntimeConfig, error) {
@@ -110,6 +111,9 @@ func GetImageRuntimeConfig(ctx context.Context) (ImageRuntimeConfig, error) {
 }
 
 func (cfg ImageRuntimeConfig) Validate() error {
+	if cfg.PollInterval < 1 || cfg.PollInterval > 3600 {
+		return errors.New("image polling interval must be between 1 and 3600 seconds")
+	}
 	if cfg.StorageUploadConcurrency < 1 || cfg.StorageUploadConcurrency > 32 {
 		return errors.New("image storage upload concurrency must be between 1 and 32")
 	}

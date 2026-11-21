@@ -94,8 +94,9 @@ func SettleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 }
 
 type asyncMediaTermination struct {
-	job   AsyncMediaJob
-	other *LogOther
+	job             AsyncMediaJob
+	other           *LogOther
+	requestSnapshot []AsyncMediaRequestSnapshot
 }
 
 func settleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, actualQuota int, usageFacts map[string]any, matchedTier string, termination *asyncMediaTermination) (won bool, reservedQuota int, err error) {
@@ -394,8 +395,9 @@ func settleTaskBilling(ctx context.Context, task *Task, fromStatus TaskStatus, a
 			}
 			changes := map[string]any{"status": "failed", "billing_status": billing, "quota": 0,
 				"attempt_generation": updated.AttemptGeneration, "reference_recovery_stage": AsyncMediaAdminTerminatedStage,
-				"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil,
-				"error_message": updated.FailReason}
+				"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "channel_cipher": nil,
+				"request_cipher": terminalAsyncMediaRequestCipher(terminatedJob, time.Now().Unix(), termination.requestSnapshot),
+				"error_message":  updated.FailReason}
 			if reservedQuota > 0 {
 				other := termination.other
 				if other == nil {

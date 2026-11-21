@@ -89,6 +89,8 @@ type RuntimeField = {
   label: string
   min?: number
   max?: number
+  defaultValue?: number
+  required?: boolean
 }
 const RUNTIME_FIELDS: readonly RuntimeField[] = [
   {
@@ -118,10 +120,19 @@ const RUNTIME_FIELDS: readonly RuntimeField[] = [
   { key: 'worker_concurrency', label: 'Workers', min: 1 },
   { key: 'image_concurrency', label: 'Image concurrency', min: 1 },
   {
+    key: 'poll_interval_seconds',
+    label: 'Image upstream polling interval (seconds)',
+    min: 1,
+    max: 3600,
+    defaultValue: 10,
+    required: true,
+  },
+  {
     key: 'storage_upload_concurrency',
     label: 'Storage upload concurrency',
     min: 1,
     max: 32,
+    defaultValue: 4,
   },
   {
     key: 'max_reference_images',
@@ -209,6 +220,11 @@ const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
     key: 'recovery_interval_seconds',
     description:
       'Seconds between scans for expired worker leases and recoverable tasks.',
+  },
+  {
+    key: 'poll_interval_seconds',
+    description:
+      'Seconds to wait before checking an accepted upstream image task again.',
   },
   {
     key: 'execution_timeout_seconds',
@@ -640,28 +656,32 @@ export function ImageRuntimeForm({
           disabled={busy}
         />
         <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
-          {RUNTIME_FIELDS.map(({ key, label, min, max }) => (
-            <div key={key} className='space-y-2'>
-              <Label htmlFor={key}>{t(label)}</Label>
-              <Input
-                id={key}
-                type='number'
-                min={min}
-                max={max}
-                value={Number(
-                  values[key] ?? (key === 'storage_upload_concurrency' ? 4 : 0)
-                )}
-                onChange={(event) => {
-                  setValues((previous) => ({
-                    ...previous,
-                    [key]: event.target.valueAsNumber,
-                  }))
-                  setAdvanced('')
-                }}
-                disabled={busy}
-              />
-            </div>
-          ))}
+          {RUNTIME_FIELDS.map(
+            ({ key, label, min, max, defaultValue, required }) => {
+              const value = Number(values[key] ?? defaultValue ?? 0)
+              return (
+                <div key={key} className='space-y-2'>
+                  <Label htmlFor={key}>{t(label)}</Label>
+                  <Input
+                    id={key}
+                    type='number'
+                    min={min}
+                    max={max}
+                    required={required}
+                    value={Number.isNaN(value) ? '' : value}
+                    onChange={(event) => {
+                      setValues((previous) => ({
+                        ...previous,
+                        [key]: event.target.valueAsNumber,
+                      }))
+                      setAdvanced('')
+                    }}
+                    disabled={busy}
+                  />
+                </div>
+              )
+            }
+          )}
         </div>
         <div className='grid gap-3 sm:grid-cols-2'>
           {['openai', 'gemini'].map((platform) => (

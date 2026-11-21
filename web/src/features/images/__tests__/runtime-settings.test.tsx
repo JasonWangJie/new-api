@@ -160,6 +160,33 @@ test('edits the global reference-image limit in the normal runtime form', async 
   expect(onSuccess).toHaveBeenCalledOnce()
 })
 
+test('saves the image upstream polling interval from the runtime form', async () => {
+  vi.mocked(imageRequest).mockResolvedValue(undefined)
+  render(<ImageRuntimeForm initial={runtime} onSuccess={vi.fn()} />)
+  const interval = screen.getByRole('spinbutton', {
+    name: 'Image upstream polling interval (seconds)',
+  })
+  expect(interval).toHaveValue(10)
+
+  const user = userEvent.setup()
+  const save = screen.getByRole('button', { name: 'Save' })
+  await user.clear(interval)
+  await user.click(save)
+  expect(interval).toBeInvalid()
+  expect(imageRequest).not.toHaveBeenCalled()
+
+  await user.type(interval, '18')
+  await user.click(save)
+
+  await waitFor(() =>
+    expect(imageRequest).toHaveBeenCalledWith(
+      '/api/option/images/runtime',
+      'PUT',
+      { ...runtime, poll_interval_seconds: 18 }
+    )
+  )
+})
+
 test('saves disabled encrypted retention and bounded retry controls from the runtime form', async () => {
   vi.mocked(imageRequest).mockResolvedValue(undefined)
   render(<ImageRuntimeForm initial={runtime} onSuccess={vi.fn()} />)

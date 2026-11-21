@@ -1570,8 +1570,13 @@ func TestAsyncImageWorkerAcceptedTaskWaitsForLocalCapacityWithoutRefund(t *testi
 			}
 			assert.Zero(t, calls)
 			require.NoError(t, common.RDB.ZRem(t.Context(), busyKey, "busy-worker").Err())
+			cfg.PollInterval = 23
+			beforePoll := time.Now().Unix()
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
 			assert.Equal(t, 1, calls, "released capacity resumes the original upstream job")
+			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&task).Error)
+			assert.GreaterOrEqual(t, task.NextAttemptAt, beforePoll+23)
+			assert.LessOrEqual(t, task.NextAttemptAt, time.Now().Unix()+23)
 		})
 	}
 }

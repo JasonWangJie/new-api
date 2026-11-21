@@ -250,14 +250,18 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 		return nil, nil, err
 	}
 	routing := task.PrivateData.VideoRouting
+	hasExecutionRequest := false
 	if routing == nil && len(job.RequestCipher) > 0 {
 		if plain, decryptErr := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId); decryptErr == nil {
 			var request service.AsyncVideoRequest
-			if common.Unmarshal(plain, &request) == nil && request.ConditionalRouting != nil {
-				executionModel, _ := service.ResolveImageChannelUpstreamModel(request.Channel, job.Model)
-				routing = request.ConditionalRouting.Audit(executionModel)
-				if details := request.RequestDetails(); details != nil && details.RequestedResolution != "" {
-					view["requested_resolution"] = details.RequestedResolution
+			if common.Unmarshal(plain, &request) == nil {
+				hasExecutionRequest = len(request.Body) > 0
+				if request.ConditionalRouting != nil {
+					executionModel, _ := service.ResolveImageChannelUpstreamModel(request.Channel, job.Model)
+					routing = request.ConditionalRouting.Audit(executionModel)
+					if details := request.RequestDetails(); details != nil && details.RequestedResolution != "" {
+						view["requested_resolution"] = details.RequestedResolution
+					}
 				}
 			}
 		}
@@ -272,7 +276,18 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 			view["video_routing"] = routing
 		}
 	}
-	hideExecution := !admin && (routing != nil || errors.Is(err, gorm.ErrRecordNotFound) && len(job.RequestCipher) == 0 && (job.ExpiresAt <= now || job.Status == "failed" || job.Status == "expired"))
+	if strings.TrimSpace(job.Model) == "" {
+		originalModel := strings.TrimSpace(task.Properties.OriginModelName)
+		if originalModel == "" && task.PrivateData.BillingContext != nil {
+			originalModel = strings.TrimSpace(task.PrivateData.BillingContext.OriginModelName)
+		}
+		if routing != nil && strings.TrimSpace(routing.SourceModel) != "" {
+			originalModel = strings.TrimSpace(routing.SourceModel)
+		}
+		view["model"] = originalModel
+	}
+	// A display-only snapshot does not identify the original routing of an orphaned job.
+	hideExecution := !admin && (routing != nil || errors.Is(err, gorm.ErrRecordNotFound) && !hasExecutionRequest && (job.ExpiresAt <= now || job.Status == "failed" || job.Status == "expired"))
 	if hideExecution {
 		delete(view, "platform")
 		delete(view, "provider")
@@ -521,7 +536,8 @@ func UpdateMediaConfiguration(c *gin.Context) {
 	defaults := service.DefaultMediaRuntimeConfig()
 	input := struct {
 		service.MediaRuntimeConfig
-		Revision *int64 `json:"revision"`
+		Revision     *int64 `json:"revision"`
+		PollInterval *int   `json:"poll_interval_seconds"`
 	}{MediaRuntimeConfig: service.MediaRuntimeConfig{PollTimeout: defaults.PollTimeout, ReconciliationTimeout: defaults.ReconciliationTimeout, ReconciliationPollInterval: defaults.ReconciliationPollInterval}}
 	if err := common.DecodeJson(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20), &input); err != nil {
 		imageManagementError(c, 400, err)
@@ -532,6 +548,16 @@ func UpdateMediaConfiguration(c *gin.Context) {
 		return
 	}
 	cfg := input.MediaRuntimeConfig
+	if input.PollInterval == nil {
+		current, err := service.GetMediaRuntimeConfig(c.Request.Context())
+		if err != nil {
+			imageManagementError(c, http.StatusServiceUnavailable, err)
+			return
+		}
+		cfg.PollInterval = current.PollInterval
+	} else {
+		cfg.PollInterval = *input.PollInterval
+	}
 	if err := service.SaveMediaRuntimeConfig(c.Request.Context(), cfg, *input.Revision); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, model.ErrOptionRevisionConflict) {
@@ -601,12 +627,7 @@ func GetMediaTask(c *gin.Context, admin bool) {
 	// Complete request parameters and caller-owned signed reference URLs remain
 	// owner/admin detail data. Management lists project specifications only.
 	if details := videoJobRequestDetails(job.AsyncMediaJob); details != nil {
-		if details.RequestedSeconds != nil {
-			view["requested_seconds"] = *details.RequestedSeconds
-		}
-		if details.RequestedResolution != "" {
-			view["requested_resolution"] = details.RequestedResolution
-		}
+		projectVideoRequestSpecifications(view, details)
 		if len(details.ReferenceMedia) > 0 {
 			view["reference_media"] = details.ReferenceMedia
 		}
@@ -638,7 +659,20 @@ func videoJobRequestDetails(job model.AsyncMediaJob) *service.AsyncVideoRequestD
 	if common.Unmarshal(plain, &request) != nil {
 		return nil
 	}
-	return request.RequestDetails()
+	return service.PublicVideoRoutingBody(request).RequestDetails()
+}
+
+func projectVideoRequestSpecifications(view gin.H, details *service.AsyncVideoRequestDetails) {
+	if view["model"] == "" {
+		modelName, _ := details.RequestParameters["model"].(string)
+		view["model"] = strings.TrimSpace(modelName)
+	}
+	if details.RequestedSeconds != nil {
+		view["requested_seconds"] = *details.RequestedSeconds
+	}
+	if details.RequestedResolution != "" {
+		view["requested_resolution"] = details.RequestedResolution
+	}
 }
 
 // videoTaskAudit projects only persisted milestones. In particular, a native
@@ -983,7 +1017,7 @@ func ManageMediaTask(c *gin.Context, admin bool, action string) {
 			query = query.Where("status = ? AND dispatched_at = 0 AND attempt_generation = 0", "queued")
 			updates["billing_status"] = "not_billable"
 		}
-		updates["status"], updates["request_cipher"] = "failed", nil
+		updates["status"], updates["request_cipher"] = "failed", service.RetainTerminalAsyncVideoRequestDetails(job)
 		updates["lease_token"], updates["lease_expires_at"], updates["next_attempt_at"] = "", 0, 0
 	default:
 		imageManagementError(c, 400, errors.New("Invalid media task operation"))
@@ -1237,12 +1271,7 @@ func ListMediaTasks(c *gin.Context, admin bool) {
 			return
 		}
 		if details := videoJobRequestDetails(job.AsyncMediaJob); details != nil {
-			if details.RequestedSeconds != nil {
-				view["requested_seconds"] = *details.RequestedSeconds
-			}
-			if details.RequestedResolution != "" {
-				view["requested_resolution"] = details.RequestedResolution
-			}
+			projectVideoRequestSpecifications(view, details)
 		}
 		byID[job.TaskId] = view
 		jobs = append(jobs, job.AsyncMediaJob)

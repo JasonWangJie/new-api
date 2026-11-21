@@ -105,7 +105,7 @@ func (job AsyncMediaJob) CanTerminateAsyncVideoTask(task *Task) bool {
 // TerminateAsyncMediaTask ends local execution and refunds the remaining charge.
 // The caller must enforce administrator permission and explicit confirmation;
 // this operation never claims to cancel the provider's independent task.
-func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason string, other *LogOther) error {
+func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason string, other *LogOther, snapshot ...AsyncMediaRequestSnapshot) error {
 	if job.ID <= 0 || job.TaskId == "" || job.UserId <= 0 || strings.TrimSpace(reason) == "" {
 		return ErrImageConflict
 	}
@@ -124,7 +124,7 @@ func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason stri
 		}
 		from := task.Status
 		task.Status, task.FailReason, task.Progress, task.FinishTime = TaskStatusFailure, reason, "100%", time.Now().Unix()
-		won, _, err := settleTaskBilling(ctx, &task, from, 0, nil, "", &asyncMediaTermination{job: current, other: other})
+		won, _, err := settleTaskBilling(ctx, &task, from, 0, nil, "", &asyncMediaTermination{job: current, other: other, requestSnapshot: snapshot})
 		if err != nil {
 			return err
 		}
@@ -171,7 +171,8 @@ func TerminateAsyncMediaTask(ctx context.Context, job AsyncMediaJob, reason stri
 		return ChangeAsyncMediaJob(tx.Model(&AsyncMediaJob{}).Where("id = ?", current.ID), map[string]any{
 			"status": "failed", "billing_status": billing, "quota": 0, "error_message": reason,
 			"attempt_generation": current.AttemptGeneration + 1, "reference_recovery_stage": AsyncMediaAdminTerminatedStage,
-			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil,
+			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "channel_cipher": nil,
+			"request_cipher": terminalAsyncMediaRequestCipher(current, time.Now().Unix(), snapshot),
 		}, "terminated")
 	})
 }
@@ -212,7 +213,7 @@ func ExpireAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64) erro
 
 // FailAgedAsyncMediaJob fences every prior worker before local timeout policy
 // ends the operation. Unknown accounting remains held for reconciliation.
-func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, automatic bool) (AsyncMediaJob, error) {
+func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, automatic bool, snapshot ...AsyncMediaRequestSnapshot) (AsyncMediaJob, error) {
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task Task
 		taskErr := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error
@@ -275,7 +276,8 @@ func FailAgedAsyncMediaJob(ctx context.Context, job AsyncMediaJob, now int64, au
 			}
 		}
 		updates := map[string]any{"status": "failed", "billing_status": billing, "reference_recovery_stage": stage, "attempt_generation": generation,
-			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "request_cipher": nil, "channel_cipher": nil, "error_message": reason}
+			"lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0, "channel_cipher": nil, "error_message": reason,
+			"request_cipher": terminalAsyncMediaRequestCipher(current, now, snapshot)}
 		if billing == "refunded" || billing == "not_billable" {
 			updates["quota"] = 0
 		}
@@ -314,7 +316,7 @@ func (job AsyncMediaJob) CanTerminateVideoReconciliation(task Task, now int64) b
 // ReconcileAgedAsyncMediaReservation authorizes one refund only after the
 // administrator explicitly verifies the unknown upstream operation. Initial
 // and replacement submissions share the same durable accounting boundary.
-func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, error) {
+func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob, snapshot ...AsyncMediaRequestSnapshot) (AsyncMediaJob, error) {
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task Task
 		if err := lockForUpdate(tx).Where("task_id = ? AND user_id = ?", job.TaskId, job.UserId).Take(&task).Error; err != nil {
@@ -354,7 +356,8 @@ func ReconcileAgedAsyncMediaReservation(ctx context.Context, job AsyncMediaJob) 
 		if err := tx.Model(&Task{}).Where("id = ? AND status = ? AND attempt_generation = ?", task.ID, task.Status, task.AttemptGeneration).Updates(map[string]any{"status": TaskStatusUnknown, "attempt_generation": generation}).Error; err != nil {
 			return err
 		}
-		changes := map[string]any{"status": "failed", "attempt_generation": generation, "billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0}
+		changes := map[string]any{"status": "failed", "attempt_generation": generation, "billing_status": "reserved", "reference_recovery_stage": "age_limit_refund", "next_attempt_at": 0, "lease_token": "", "lease_expires_at": 0,
+			"request_cipher": terminalAsyncMediaRequestCipher(current, time.Now().Unix(), snapshot), "channel_cipher": nil}
 		if unknownExecution || waitingReconciliation {
 			changes["error_message"] = job.ErrorMessage
 		}

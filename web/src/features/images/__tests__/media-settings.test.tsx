@@ -52,6 +52,7 @@ const mediaSettings = {
   submit_concurrency: 2,
   status_concurrency: 8,
   submit_timeout_seconds: 120,
+  poll_interval_seconds: 30,
   poll_timeout_seconds: 30,
   reconciliation_timeout_minutes: 1440,
   reconciliation_poll_interval_seconds: 60,
@@ -451,6 +452,9 @@ test('shows success feedback after media settings are saved', async () => {
   const submitTimeout = screen.getByRole('spinbutton', {
     name: 'Video submit timeout (seconds)',
   })
+  const pollInterval = screen.getByRole('spinbutton', {
+    name: 'Video upstream polling interval (seconds)',
+  })
   const pollTimeout = screen.getByRole('spinbutton', {
     name: 'Video upstream polling timeout (seconds)',
   })
@@ -463,6 +467,8 @@ test('shows success feedback after media settings are saved', async () => {
   await user.type(statusConcurrency, '9')
   await user.clear(submitTimeout)
   await user.type(submitTimeout, '140')
+  await user.clear(pollInterval)
+  await user.type(pollInterval, '21')
   await user.clear(pollTimeout)
   await user.click(screen.getByRole('button', { name: 'Save' }))
   expect(pollTimeout).toBeInvalid()
@@ -484,6 +490,7 @@ test('shows success feedback after media settings are saved', async () => {
         submit_concurrency: 3,
         status_concurrency: 9,
         submit_timeout_seconds: 140,
+        poll_interval_seconds: 21,
         poll_timeout_seconds: 45,
       }
     )
@@ -492,9 +499,10 @@ test('shows success feedback after media settings are saved', async () => {
   expect(onSuccess).toHaveBeenCalledOnce()
 })
 
-test('uses a 30 second polling timeout when older settings omit it', async () => {
+test('uses 30 seconds for the video polling interval and timeout when older settings omit them', async () => {
   vi.mocked(imageRequest).mockResolvedValue({
     ...mediaSettings,
+    poll_interval_seconds: undefined,
     poll_timeout_seconds: undefined,
   })
   const client = new QueryClient({
@@ -506,6 +514,11 @@ test('uses a 30 second polling timeout when older settings omit it', async () =>
       <MediaSettingsCard />
     </QueryClientProvider>
   )
+  expect(
+    await screen.findByRole('spinbutton', {
+      name: 'Video upstream polling interval (seconds)',
+    })
+  ).toHaveValue(30)
   expect(
     await screen.findByRole('spinbutton', {
       name: 'Video upstream polling timeout (seconds)',

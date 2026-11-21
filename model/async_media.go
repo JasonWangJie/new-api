@@ -55,6 +55,18 @@ type AsyncMediaJob struct {
 	ExpiresAt              int64  `json:"expires_at"`
 }
 
+// AsyncMediaRequestSnapshot converts a job's request into encrypted display
+// data with no replay inputs or upstream credentials. It runs under the job
+// lock and must derive the snapshot from the supplied row without querying another store.
+type AsyncMediaRequestSnapshot func(AsyncMediaJob) []byte
+
+func terminalAsyncMediaRequestCipher(job AsyncMediaJob, now int64, snapshot []AsyncMediaRequestSnapshot) []byte {
+	if job.ExpiresAt <= now || len(job.RequestCipher) == 0 || len(snapshot) == 0 || snapshot[0] == nil {
+		return nil
+	}
+	return snapshot[0](job)
+}
+
 type MediaArtifactObject struct {
 	ID           int    `json:"-"`
 	ObjectId     string `json:"object_id" gorm:"size:64;uniqueIndex"`
@@ -139,10 +151,10 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 	return job, reused, err
 }
 
-func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int) (bool, error) {
+func ClaimAsyncMediaJob(ctx context.Context, job *AsyncMediaJob, lease string, seconds int, snapshot ...AsyncMediaRequestSnapshot) (bool, error) {
 	now := time.Now().Unix()
 	if job.CreatedAt > 0 && job.CreatedAt <= now-AsyncMediaMaxTaskAgeSeconds {
-		_, err := FailAgedAsyncMediaJob(ctx, *job, now, true)
+		_, err := FailAgedAsyncMediaJob(ctx, *job, now, true, snapshot...)
 		if errors.Is(err, ErrImageConflict) {
 			return false, nil
 		}

@@ -941,7 +941,8 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if err := model.DB.WithContext(ctx).Where("task_id = ? AND lease_token = ?", task.TaskId, task.LeaseToken).Take(task).Error; err != nil {
 				return err
 			}
-			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, min(time.Now().Unix()+10, model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout)), "upstream_pending", "")
+			nextPoll := min(time.Now().Unix()+int64(cfg.PollInterval), model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout))
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, nextPoll, "upstream_pending", "")
 		}
 		if task.DispatchedAt == 0 && task.UpstreamTaskId == "" && task.UpstreamSucceededAt == 0 {
 			if errors.Is(err, model.ErrImageQuotaCacheUnavailable) {
@@ -992,7 +993,8 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 			if plan.Decision.Matched {
 				return model.TransitionImageTask(context.WithoutCancel(ctx), *task, plan.Updates, plan.EventType, plan.EventMessage, plan.OutboxKind, plan.Event)
 			}
-			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, min(time.Now().Unix()+10, model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout)), "recovered", "Upstream image task polling will continue")
+			nextPoll := min(time.Now().Unix()+int64(cfg.PollInterval), model.AsyncImageExecutionDeadline(*task, cfg.ExecutionTimeout))
+			return model.ScheduleAsyncImagePoll(context.WithoutCancel(ctx), *task, nextPoll, "recovered", "Upstream image task polling will continue")
 		}
 		if task.UpstreamSucceededAt == 0 && task.DispatchedAt > 0 && (failure.Code == 602 || failure.Code == 605 || failure.Code == 606 || failure.Code == 603 && (failure.SubmissionRejected || failure.SynchronousRetryableResponse) || failure.HTTPStatus == 429 || failure.ExecutionUnknown) {
 			_ = RecordImageCircuit(context.WithoutCancel(ctx), "async", channel.Id, false, cfg)

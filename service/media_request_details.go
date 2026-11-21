@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
@@ -293,6 +294,16 @@ func (details *AsyncVideoRequestDetails) collectReferenceMedia(value any, mediaT
 	}
 }
 
+// RetainTerminalAsyncVideoRequestDetails discards the execution envelope and
+// retains only the encrypted display snapshot within the job's retention window.
+func RetainTerminalAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
+	if job.ExpiresAt <= time.Now().Unix() {
+		return nil
+	}
+	job.Status = "failed"
+	return retainAsyncVideoRequestDetails(job)
+}
+
 // retainAsyncVideoRequestDetails keeps recoverable input until generation has
 // finished. Legacy tasks retain only their bounded encrypted display snapshot.
 func retainAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
@@ -317,7 +328,7 @@ func retainAsyncVideoRequestDetails(job model.AsyncMediaJob) []byte {
 			return job.RequestCipher
 		}
 	}
-	details := request.RequestDetails()
+	details := PublicVideoRoutingBody(request).RequestDetails()
 	if details == nil {
 		return nil
 	}

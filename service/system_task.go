@@ -25,6 +25,7 @@ const (
 	// pass runs, independent of how often the runner wakes to claim tasks.
 	systemTaskSchedulerInterval = 15 * time.Second
 	systemTaskStaleLockInterval = 30 * time.Second
+	asyncTaskPollRefresh        = 5 * time.Second
 )
 
 // SystemTaskHandler executes a claimed task of a specific type. Run owns the
@@ -108,7 +109,8 @@ var (
 	// systemTaskWakeup signals the runner to check for runnable tasks
 	// immediately instead of waiting for the idle poll. Buffered so a signal
 	// raised while the runner is busy is not lost and is handled on the next loop.
-	systemTaskWakeup = make(chan struct{}, 1)
+	systemTaskWakeup    = make(chan struct{}, 1)
+	asyncTaskPollWakeup = make(chan struct{}, 1)
 )
 
 // notifySystemTaskRunner wakes the runner without blocking. If a wakeup is
@@ -120,6 +122,13 @@ func notifySystemTaskRunner() {
 	}
 }
 
+func notifyAsyncTaskPollScheduler() {
+	select {
+	case asyncTaskPollWakeup <- struct{}{}:
+	default:
+	}
+}
+
 func StartSystemTaskRunner() {
 	systemTaskRunnerOnce.Do(func() {
 		if !common.IsMasterNode {
@@ -127,6 +136,17 @@ func StartSystemTaskRunner() {
 		}
 
 		runnerID := fmt.Sprintf("%s-%s", common.NodeName, common.GetRandomString(8))
+		gopool.Go(func() {
+			timer := time.NewTimer(0)
+			defer timer.Stop()
+			for {
+				select {
+				case <-timer.C:
+				case <-asyncTaskPollWakeup:
+				}
+				timer.Reset(runAsyncTaskPollScheduler(runnerID, time.Now()))
+			}
+		})
 		gopool.Go(func() {
 			logger.LogInfo(context.Background(), fmt.Sprintf("system task runner started: runner=%s idle_interval=%s", runnerID, systemTaskRunnerIdleInterval))
 
@@ -235,25 +255,64 @@ func runSystemTaskClaimPass(runnerID string) {
 	}
 	for _, handler := range handlers {
 		task := pendingTasks[handler.Type()]
-		if task == nil {
-			continue
+		if task != nil {
+			dispatchSystemTask(handler, task, runnerID)
 		}
-		claimedTask, claimed, err := model.ClaimSystemTask(task.ID, handler.Type(), runnerID, systemTaskLockUntil())
-		if err != nil {
-			logger.LogWarn(context.Background(), fmt.Sprintf("system task claim failed: %v", err))
-			continue
-		}
-		if !claimed {
-			continue
-		}
-		dispatchHandler := handler
-		dispatchTask := claimedTask
-		gopool.Go(func() {
-			runWithLeaseHeartbeat(dispatchTask, runnerID, func(ctx context.Context) {
-				dispatchHandler.Run(ctx, dispatchTask, runnerID)
-			})
-		})
 	}
+}
+
+func dispatchSystemTask(handler SystemTaskHandler, task *model.SystemTask, runnerID string) {
+	claimedTask, claimed, err := model.ClaimSystemTask(task.ID, handler.Type(), runnerID, systemTaskLockUntil())
+	if err != nil {
+		logger.LogWarn(context.Background(), fmt.Sprintf("system task claim failed: %v", err))
+		return
+	}
+	if !claimed {
+		return
+	}
+	gopool.Go(func() {
+		if task.Type == model.SystemTaskTypeAsyncTaskPoll {
+			defer notifyAsyncTaskPollScheduler()
+		}
+		runWithLeaseHeartbeat(claimedTask, runnerID, func(ctx context.Context) {
+			handler.Run(ctx, claimedTask, runnerID)
+		})
+	})
+}
+
+// Polling rounds use their start-to-start cadence. Recheck periodically to
+// discover newly submitted work, configuration writes and completions on peer
+// nodes without scanning other system task types at this frequency.
+func runAsyncTaskPollScheduler(runnerID string, now time.Time) time.Duration {
+	systemTaskHandlersMu.RLock()
+	handler, ok := systemTaskHandlers[model.SystemTaskTypeAsyncTaskPoll].(ScheduledSystemTaskHandler)
+	systemTaskHandlersMu.RUnlock()
+	if !ok || !handler.Enabled() {
+		return asyncTaskPollRefresh
+	}
+	latest, err := model.GetLatestSystemTask(handler.Type())
+	if err != nil {
+		logger.LogWarn(context.Background(), fmt.Sprintf("async task poll scheduler query failed: %v", err))
+		return asyncTaskPollRefresh
+	}
+	if latest != nil {
+		switch latest.Status {
+		case model.SystemTaskStatusRunning:
+			return asyncTaskPollRefresh
+		case model.SystemTaskStatusPending:
+			dispatchSystemTask(handler, latest, runnerID)
+			return asyncTaskPollRefresh
+		default:
+			due := time.Unix(latest.CreatedAt, 0).Add(handler.Interval())
+			if remaining := due.Sub(now); remaining > 0 {
+				return min(asyncTaskPollRefresh, remaining)
+			}
+		}
+	}
+	if task := createScheduledSystemTask(handler); task != nil {
+		dispatchSystemTask(handler, task, runnerID)
+	}
+	return asyncTaskPollRefresh
 }
 
 // runSystemTaskScheduler creates a new task row for each enabled scheduled
@@ -267,7 +326,7 @@ func runSystemTaskScheduler() {
 	taskTypes := make([]string, 0, len(handlers))
 	for _, handler := range handlers {
 		scheduled, ok := handler.(ScheduledSystemTaskHandler)
-		if !ok || !scheduled.Enabled() {
+		if !ok || scheduled.Type() == model.SystemTaskTypeAsyncTaskPoll || !scheduled.Enabled() {
 			continue
 		}
 		scheduledHandlers = append(scheduledHandlers, scheduled)
@@ -288,18 +347,24 @@ func runSystemTaskScheduler() {
 				continue // not due yet
 			}
 		}
-		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
-			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())
-			if activeErr == nil && activeTask != nil {
-				continue
-			}
-			if activeErr != nil {
-				logger.LogWarn(context.Background(), fmt.Sprintf("system task scheduler active lookup failed: type=%s err=%v", scheduled.Type(), activeErr))
-			}
-			logger.LogWarn(context.Background(), fmt.Sprintf("system task scheduler create failed: type=%s err=%v", scheduled.Type(), err))
-			continue
-		}
+		createScheduledSystemTask(scheduled)
 	}
+}
+
+func createScheduledSystemTask(handler ScheduledSystemTaskHandler) *model.SystemTask {
+	task, err := model.CreateSystemTask(handler.Type(), handler.NewPayload(), nil)
+	if err == nil {
+		return task
+	}
+	activeTask, activeErr := model.GetActiveSystemTask(handler.Type())
+	if activeErr == nil && activeTask != nil {
+		return nil
+	}
+	if activeErr != nil {
+		logger.LogWarn(context.Background(), fmt.Sprintf("system task scheduler active lookup failed: type=%s err=%v", handler.Type(), activeErr))
+	}
+	logger.LogWarn(context.Background(), fmt.Sprintf("system task scheduler create failed: type=%s err=%v", handler.Type(), err))
+	return nil
 }
 
 // runWithLeaseHeartbeat renews the per-type lock on a background ticker while

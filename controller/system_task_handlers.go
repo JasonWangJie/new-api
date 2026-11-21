@@ -143,7 +143,13 @@ func (asyncTaskPollHandler) Enabled() bool {
 	return constant.UpdateTask && model.HasUnfinishedSyncTasks()
 }
 
-func (asyncTaskPollHandler) Interval() time.Duration { return 15 * time.Second }
+func (asyncTaskPollHandler) Interval() time.Duration {
+	cfg, err := service.GetMediaRuntimeConfig(context.Background())
+	if err != nil {
+		cfg = service.DefaultMediaRuntimeConfig()
+	}
+	return time.Duration(cfg.PollInterval) * time.Second
+}
 
 func (asyncTaskPollHandler) NewPayload() any { return nil }
 
