@@ -45,6 +45,10 @@ def fake_command(tool, arguments):
         temporary.write_text(json.dumps(state), encoding="utf-8")
         temporary.replace(state_path)
 
+    def configured_image():
+        settings = dict(line.split("=", 1) for line in (root / "image.env").read_text(encoding="utf-8").splitlines())
+        return f'{settings["APP_IMAGE_REPOSITORY"]}:{settings["APP_IMAGE_TAG"]}'
+
     if tool == "flock":
         return int(state.get("lock_fail", False))
     if tool == "git":
@@ -99,8 +103,7 @@ def fake_command(tool, arguments):
         command = args[0]
         if command == "config":
             if "--format" in args:
-                settings = dict(line.split("=", 1) for line in (root / "image.env").read_text(encoding="utf-8").splitlines())
-                print(json.dumps({"services": {"new-api": {"image": f'{settings["APP_IMAGE_REPOSITORY"]}:{settings["APP_IMAGE_TAG"]}'}}}))
+                print(json.dumps({"services": {"new-api": {"image": configured_image()}}}))
             return 0
         if command == "ps":
             if state["app_running"]:
@@ -132,9 +135,17 @@ def fake_command(tool, arguments):
             sys.stdin.read()
             print("Fake archive contents")
             return 0
-        if command == "exec" and "redis" in args:
-            print("OK")
-            return 0
+        if args[:3] == ["exec", "-T", "redis"]:
+            if not state["redis_running"]:
+                raise RuntimeError(f"Redis is stopped: {args}")
+            if "redis-cli SAVE" in args[-1]:
+                if state.get("redis_save_fail"):
+                    return 1
+                print("OK")
+                return 0
+            if args[3] == "timeout" and "redis-cli PING" in args[-1]:
+                return 124 if state.get("redis_ping_fail") else 0
+            raise RuntimeError(f"Unexpected Redis command: {args}")
         if command == "up":
             service = args[-1]
             if service == "redis":
@@ -144,7 +155,8 @@ def fake_command(tool, arguments):
             elif service == "new-api":
                 if state.get("app_up_fail"):
                     return 1
-                state.update(app_running=True, active_image=NEW_IMAGE, active_id=NEW_ID)
+                image = configured_image()
+                state.update(app_running=True, active_image=image, active_id=OLD_ID if image == OLD_IMAGE else NEW_ID)
             else:
                 raise RuntimeError(f"Unexpected compose service: {service}")
             save()
@@ -188,6 +200,7 @@ class UpdateConfirmTest(unittest.TestCase):
         self.original_image_env = f"APP_IMAGE_TAG={OLD_SHA}\nAPP_IMAGE_REPOSITORY=new-api-fork\n"
         (self.root / "image.env").write_text(self.original_image_env, encoding="utf-8")
         (self.root / "data" / "retained.txt").write_text("existing runtime data", encoding="utf-8")
+        (self.root / "logs" / "retained.log").write_text("existing application log", encoding="utf-8")
         self.initial_state = {
             "head": OLD_SHA, "next_sha": NEW_SHA, "container": "container-old",
             "active_image": OLD_IMAGE, "active_id": OLD_ID,
@@ -246,8 +259,12 @@ class UpdateConfirmTest(unittest.TestCase):
         state.pop("built_id", None)
         self.write_state(state)
         bin_directory = '"$(cygpath -u "$TEST_ROOT")/bin"' if os.name == "nt" else '"$TEST_ROOT/bin"'
-        script = "update-confirm.sh" if entrypoint == "confirm" else "manage.sh"
-        arguments = "" if entrypoint == "confirm" else " update --ready"
+        script, arguments = {
+            "confirm": ("update-confirm.sh", ""),
+            "ready": ("manage.sh", " update --ready"),
+            "backup": ("manage.sh", " backup"),
+            "backup-keep-stopped": ("manage.sh", " backup --keep-stopped"),
+        }[entrypoint]
         launcher = (f'export PATH={bin_directory}:"$PATH"; '
                     'printf "%s" "$BASHPID" > "$TEST_ROOT/bash.pid"; '
                     f'exec /usr/bin/bash "$NEWAPI_DEPLOY_DIR/{script}"{arguments}')
@@ -296,7 +313,7 @@ class UpdateConfirmTest(unittest.TestCase):
         backups = self.root / "backups"
         if backups.exists():
             shutil.rmtree(backups)
-        if entrypoint == "ready":
+        if entrypoint != "confirm":
             backups.mkdir()
         self.environment["NEWAPI_PORT"] = "4040"
 
@@ -342,33 +359,86 @@ class UpdateConfirmTest(unittest.TestCase):
         self.assertFalse(any(event[:2] == ["compose", "build"] for event in self.events()), self.output())
         self.assertFalse(any(event[0] == "compose" and event[1] in ("stop", "start", "up") for event in self.events()), self.output())
 
-    def test_confirmation_completes_backup_and_switch(self):
-        self.environment.update(APP_IMAGE_REPOSITORY="untrusted-repository", APP_IMAGE_TAG="untrusted-tag")
-        self.start()
-        self.wait_for_confirmation()
-        self.assertEqual(0, self.finish(), self.output())
-        state = self.state()
-        self.assertTrue(state["app_running"])
-        self.assertTrue(state["redis_running"])
-        self.assertEqual(NEW_IMAGE, state["active_image"])
-        self.assertEqual("new-api-fork", state["build_repository"])
-        self.assertEqual(NEW_SHA, state["build_tag"])
-        self.assertIn(f"APP_IMAGE_TAG={NEW_SHA}\n", (self.root / "image.env").read_text(encoding="utf-8"))
+    def assert_backup(self, expected_checksums):
         backups = list((self.root / "backups").iterdir())
         self.assertEqual(1, len(backups))
         backup = backups[0]
         self.assertTrue((backup / "COMPLETE").is_file())
         self.assertEqual(self.original_image_env, (backup / "image.env").read_text(encoding="utf-8"))
+        checked_files = []
         for line in (backup / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
             digest, filename = line.split(maxsplit=1)
-            self.assertEqual(digest, hashlib.sha256((backup / Path(filename).name).read_bytes()).hexdigest())
-        with tarfile.open(backup / "runtime-files.tar.gz") as archive:
-            names = archive.getnames()
-        self.assertIn("data/retained.txt", names)
-        self.assertNotIn("images", names)
-        actions = [(event[1], event[-1]) for event in self.events() if event[0] == "compose" and event[1] in ("build", "stop", "up", "start")]
-        self.assertEqual([("build", "new-api"), ("stop", "new-api"), ("stop", "redis"),
-                          ("up", "redis"), ("up", "new-api")], actions, self.output())
+            name = Path(filename).name
+            self.assertEqual(digest, hashlib.sha256((backup / name).read_bytes()).hexdigest())
+            checked_files.append(name)
+        self.assertCountEqual(expected_checksums, checked_files)
+        return backup
+
+    def test_updates_complete_runtime_backup_and_switch_without_postgres_dump(self):
+        for entrypoint in ("ready", "confirm"):
+            with self.subTest(entrypoint=entrypoint):
+                self.reset_deployment(entrypoint, dump_fail=True)
+                if entrypoint == "confirm":
+                    self.environment.update(APP_IMAGE_REPOSITORY="untrusted-repository", APP_IMAGE_TAG="untrusted-tag")
+                self.start(entrypoint)
+                if entrypoint == "confirm":
+                    self.wait_for_confirmation()
+                self.assertEqual(0, self.finish(), self.output())
+                state = self.state()
+                self.assertTrue(state["app_running"])
+                self.assertTrue(state["redis_running"])
+                self.assertEqual(NEW_IMAGE, state["active_image"])
+                if entrypoint == "confirm":
+                    self.assertEqual("new-api-fork", state["build_repository"])
+                self.assertEqual(NEW_SHA, state["build_tag"])
+                self.assertIn(f"APP_IMAGE_TAG={NEW_SHA}\n", (self.root / "image.env").read_text(encoding="utf-8"))
+                backup = self.assert_backup(["runtime-files.tar.gz"])
+                self.assertFalse((backup / "main-db.dump").exists())
+                self.assertFalse((backup / "dump-contents.txt").exists())
+                self.assertTrue((backup / "runtime-files-list.txt").is_file())
+                with tarfile.open(backup / "runtime-files.tar.gz") as archive:
+                    names = archive.getnames()
+                self.assertIn("data/retained.txt", names)
+                self.assertIn("redis-data", names)
+                self.assertNotIn("images", names)
+                self.assertFalse(any(name == "logs" or name.startswith("logs/") for name in names))
+                self.assertEqual("existing application log", (self.root / "logs" / "retained.log").read_text(encoding="utf-8"))
+                events = self.events()
+                self.assertFalse(any(event[:4] == ["compose", "exec", "-T", "postgres"] for event in events))
+                lifecycle = [event for event in events if event[0] == "compose" and event[1] in ("build", "stop", "up", "start")]
+                actions = [(event[1], event[-1]) for event in lifecycle]
+                self.assertEqual([("build", "new-api"), ("stop", "new-api"), ("stop", "redis"),
+                                  ("up", "redis"), ("up", "new-api")], actions, self.output())
+                _, _, redis_stop, redis_up, app_up = lifecycle
+                self.assertNotIn("--wait", redis_up)
+                save, ping = [event for event in events if event[:4] == ["compose", "exec", "-T", "redis"]]
+                self.assertIn("redis-cli SAVE", save[-1])
+                self.assertLess(events.index(save), events.index(redis_stop))
+                self.assertEqual(["timeout", "120"], ping[4:6])
+                self.assertIn("redis-cli PING", ping[-1])
+                self.assertIn('REDISCLI_AUTH="$REDIS_PASSWORD"', ping[-1])
+                self.assertLess(events.index(redis_up), events.index(ping))
+                self.assertLess(events.index(ping), events.index(app_up))
+
+    def test_manual_backup_keeps_postgres_dump(self):
+        for entrypoint in ("backup", "backup-keep-stopped"):
+            with self.subTest(entrypoint=entrypoint):
+                self.reset_deployment(entrypoint)
+                self.start(entrypoint)
+                self.assertEqual(0, self.finish(), self.output())
+                backup = self.assert_backup(["main-db.dump", "runtime-files.tar.gz"])
+                self.assertTrue((backup / "main-db.dump").is_file())
+                self.assertTrue((backup / "dump-contents.txt").is_file())
+                with tarfile.open(backup / "runtime-files.tar.gz") as archive:
+                    self.assertIn("logs/retained.log", archive.getnames())
+                events = self.events()
+                database_commands = [event[4] for event in events if event[:4] == ["compose", "exec", "-T", "postgres"]]
+                self.assertEqual(["pg_dump", "pg_restore"], database_commands)
+                redis_up = next(event for event in events if event[:2] == ["compose", "up"] and event[-1] == "redis")
+                self.assertIn("--wait", redis_up)
+                self.assertEqual(entrypoint == "backup", self.state()["app_running"])
+                self.assertTrue(self.state()["redis_running"])
+                self.assertEqual(OLD_IMAGE, self.state()["active_image"])
 
     def test_waiting_state_changes_are_rejected_before_stopping(self):
         for change in ("config", "container", "active_id", "built_id"):
@@ -388,11 +458,19 @@ class UpdateConfirmTest(unittest.TestCase):
                     self.change_state(container="container-old", active_id=OLD_ID, built_id=NEW_ID)
 
     def test_backup_failures_restore_original_services(self):
-        for failure in ("dump_fail", "redis_up_fail"):
-            with self.subTest(failure=failure):
-                self.change_state(**{failure: True})
-                self.start()
-                self.wait_for_confirmation()
+        failures = (
+            ("confirm", "redis_save_fail"),
+            ("confirm", "redis_up_fail"),
+            ("confirm", "redis_ping_fail"),
+            ("ready", "redis_ping_fail"),
+            ("backup", "dump_fail"),
+        )
+        for entrypoint, failure in failures:
+            with self.subTest(entrypoint=entrypoint, failure=failure):
+                self.reset_deployment(entrypoint, **{failure: True})
+                self.start(entrypoint)
+                if entrypoint == "confirm":
+                    self.wait_for_confirmation()
                 self.assertNotEqual(0, self.finish(), self.output())
                 self.assertTrue(self.state()["app_running"], self.output())
                 self.assertTrue(self.state()["redis_running"], self.output())
@@ -400,10 +478,9 @@ class UpdateConfirmTest(unittest.TestCase):
                 self.assertEqual(self.original_image_env, (self.root / "image.env").read_text(encoding="utf-8"))
                 self.assertIn(["compose", "start", "new-api"], self.events())
                 self.assert_no_cache_cleanup()
-                if failure == "redis_up_fail":
+                if failure in ("redis_up_fail", "redis_ping_fail"):
                     self.assertIn(["compose", "start", "redis"], self.events())
-                self.change_state(**{failure: False})
-                shutil.rmtree(self.root / "backups")
+                self.assertFalse(any((self.root / "backups").glob("*/COMPLETE")))
 
     def test_failures_after_switch_do_not_roll_back(self):
         for failure in ("app_up_fail", "health_fail"):
@@ -440,7 +517,7 @@ class UpdateConfirmTest(unittest.TestCase):
                         self.assertEqual(prune_fail, warning in self.output(), self.output())
 
     def test_unsuccessful_or_unnecessary_updates_do_not_clean_cache(self):
-        failures = ("no_update", "build_fail", "dump_fail", "redis_up_fail", "app_up_fail", "health_fail")
+        failures = ("no_update", "build_fail", "redis_save_fail", "redis_up_fail", "app_up_fail", "health_fail")
         for entrypoint in ("confirm", "ready"):
             for failure in failures:
                 with self.subTest(entrypoint=entrypoint, failure=failure):

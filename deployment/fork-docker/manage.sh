@@ -44,7 +44,8 @@ case "$action" in
 esac
 
 backup_runtime() {
-  local app_container old_image
+  local backup_scope=$1 app_container old_image
+  local -a backup_artifacts=() runtime_files=(.env image.env compose.fork.yml compose-env.sh manage.sh data)
   app_container=$(dc ps --status running -q new-api)
   [[ -n $app_container ]] || { echo '应用未运行，先检查 status 和 logs。'; return 1; }
   old_image=$(docker inspect --format '{{.Config.Image}}' "$app_container")
@@ -56,17 +57,31 @@ backup_runtime() {
   docker image inspect --format '{{.Id}}' "$old_image" > "$backup_dir/old-image-id.txt"
   dc stop --timeout 60 new-api
   app_stopped=1
-  dc exec -T postgres pg_dump -U newapi -d newapi -Fc > "$backup_dir/main-db.dump"
-  test -s "$backup_dir/main-db.dump"
-  dc exec -T postgres pg_restore --list < "$backup_dir/main-db.dump" > "$backup_dir/dump-contents.txt"
+  if [[ $backup_scope == full ]]; then
+    dc exec -T postgres pg_dump -U newapi -d newapi -Fc > "$backup_dir/main-db.dump"
+    test -s "$backup_dir/main-db.dump"
+    dc exec -T postgres pg_restore --list < "$backup_dir/main-db.dump" > "$backup_dir/dump-contents.txt"
+    backup_artifacts+=("$backup_dir/main-db.dump")
+    runtime_files+=(logs)
+  fi
   dc exec -T redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli SAVE' | grep -q OK
   dc stop --timeout 30 redis
   redis_stopped=1
-  tar -czf "$backup_dir/runtime-files.tar.gz" .env image.env compose.fork.yml compose-env.sh manage.sh data logs redis-data
+  tar -czf "$backup_dir/runtime-files.tar.gz" "${runtime_files[@]}" redis-data
   tar -tzf "$backup_dir/runtime-files.tar.gz" > "$backup_dir/runtime-files-list.txt"
-  dc up -d --no-deps --no-build --pull never --wait --wait-timeout 120 redis
+  if [[ $backup_scope == full ]]; then
+    dc up -d --no-deps --no-build --pull never --wait --wait-timeout 120 redis
+  else
+    dc up -d --no-deps --no-build --pull never redis
+    echo '正在等待 Redis 就绪（最多 120 秒）。'
+    dc exec -T redis timeout 120 sh -c '
+      until REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli PING 2>/dev/null | grep -qx PONG; do
+        sleep 1
+      done
+    '
+  fi
   redis_stopped=0
-  sha256sum "$backup_dir/main-db.dump" "$backup_dir/runtime-files.tar.gz" > "$backup_dir/SHA256SUMS"
+  sha256sum "${backup_artifacts[@]}" "$backup_dir/runtime-files.tar.gz" > "$backup_dir/SHA256SUMS"
   touch "$backup_dir/COMPLETE"
 }
 
@@ -100,7 +115,7 @@ case "$action" in
     ;;
   backup)
     [[ ${2:-} == "" || ${2:-} == --keep-stopped ]] || { echo "备份参数错误"; exit 2; }
-    backup_runtime
+    backup_runtime full
     if [[ ${2:-} == --keep-stopped ]]; then
       echo "备份完成，应用保持停止：$backup_dir"
       exit 0
@@ -132,7 +147,8 @@ case "$action" in
     fi
     echo '先构建新镜像；这一阶段原应用继续运行。'
     APP_IMAGE_TAG="$next_sha" dc build --pull new-api
-    backup_runtime
+    echo '更新前仅备份 Redis 和运行文件。'
+    backup_runtime runtime-only
     printf 'APP_IMAGE_TAG=%s\nAPP_IMAGE_REPOSITORY=%s\n' "$next_sha" "$image_repository" > image.env.new
     chmod 600 image.env.new
     mv image.env.new image.env

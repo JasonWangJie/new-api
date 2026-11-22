@@ -86,6 +86,7 @@ echo "镜像 ID：$next_image_id"
 echo '现在等待你的确认，尚未停服或开始备份；等待没有超时。'
 echo '请自行暂停新任务提交，等待已有任务完成（包括结果保存、结算）。脚本不会自动排空任务。'
 echo '等待期间持有部署锁，其他管理脚本的启动、备份和更新操作会被阻止。'
+echo '更新前仅备份 Redis 和运行文件。'
 echo '确认现在停服、备份并更新，请输入 UPDATE 后回车；其他输入取消：'
 if ! IFS= TMOUT=0 read -r confirmation; then
   echo '未收到完整确认，已取消；原服务继续运行。'
@@ -112,21 +113,24 @@ printf '%s\n' "$old_image" > "$backup_dir/old-image.txt"
 printf '%s\n' "$old_image_id" > "$backup_dir/old-image-id.txt"
 app_stopped=1
 dc stop --timeout 60 new-api
-dc exec -T postgres pg_dump -U newapi -d newapi -Fc > "$backup_dir/main-db.dump"
-test -s "$backup_dir/main-db.dump"
-dc exec -T postgres pg_restore --list < "$backup_dir/main-db.dump" > "$backup_dir/dump-contents.txt"
 dc exec -T redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli SAVE' | grep -q OK
 redis_stopped=1
 dc stop --timeout 30 redis
-backup_files=(.env image.env compose.fork.yml compose-env.sh manage.sh data logs redis-data)
+backup_files=(.env image.env compose.fork.yml compose-env.sh manage.sh data redis-data)
 if [[ -f update-confirm.sh ]]; then
   backup_files+=(update-confirm.sh)
 fi
 tar -czf "$backup_dir/runtime-files.tar.gz" "${backup_files[@]}"
 tar -tzf "$backup_dir/runtime-files.tar.gz" > "$backup_dir/runtime-files-list.txt"
-dc up -d --no-deps --no-build --pull never --wait --wait-timeout 120 redis
+dc up -d --no-deps --no-build --pull never redis
+echo '正在等待 Redis 就绪（最多 120 秒）。'
+dc exec -T redis timeout 120 sh -c '
+  until REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli PING 2>/dev/null | grep -qx PONG; do
+    sleep 1
+  done
+'
 redis_stopped=0
-sha256sum "$backup_dir/main-db.dump" "$backup_dir/runtime-files.tar.gz" > "$backup_dir/SHA256SUMS"
+sha256sum "$backup_dir/runtime-files.tar.gz" > "$backup_dir/SHA256SUMS"
 touch "$backup_dir/COMPLETE"
 
 printf 'APP_IMAGE_TAG=%s\nAPP_IMAGE_REPOSITORY=%s\n' "$next_sha" "$image_repository" > image.env.new

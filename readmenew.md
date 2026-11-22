@@ -1,5 +1,9 @@
 # new-api 补充说明与功能索引
 
+## 缩短部署更新停机时间（2026-11-22，待提交，未发布）
+
+`manage.sh update --ready` 和 `update-confirm.sh` 的更新前归档包含 Redis 数据、部署配置、脚本与 `data`，原有应用日志继续保存在服务器。Redis 启动后立即发送带认证的 `PING`，未就绪时每秒重试，等待上限 120 秒。更新期间 PostgreSQL 继续运行，恢复更新前的数据库需使用独立备份。`manage.sh backup`（含 `--keep-stopped`）与 `export.sh` 仍收录日志和 PostgreSQL 转储。详见[部署说明](wiki/04-首页与部署.md#update-backup-scope)和[本月台账](wiki/14-2026年11月代码变更台账.md#update-backup-scope-20261122)。
+
 ## 失败退款的视频任务保留请求参数（2026-11-21，待提交，未发布）
 
 在「异步任务中心」中，视频进入失败终态或退款后，列表继续显示原请求模型与规格，详情继续显示请求时长、分辨率和可查看、复制的脱敏原始请求参数。请求快照加密保存至任务原留存期。历史请求快照已清除时，仍可从已有任务记录显示原模型。详见[视频任务详情](wiki/05-异步视频与统一媒体任务.md#failed-video-request-details-20261121)及[本月台账](wiki/14-2026年11月代码变更台账.md#failed-video-request-details-20261121)。
@@ -1015,7 +1019,7 @@ Drama 上游仍在排队时，用户和管理员任务中心、媒体任务详�
 - 登录、注册和找回密码页采用与首页一致的赛博身份网关视觉：全屏动效背景（雷达、数据雨、流星、星座连线等）、玻璃面板、错落入场和动画暂停控制。
 - 新增适用于 Fork 部署的 Docker Compose、首次安装、离线导出、备份、更新、恢复和运行管理脚本。
 - 部署栈使用 PostgreSQL、Redis、健康检查、日志轮转和本地数据目录。
-- `manage.sh backup` 和 `update --ready` 备份 PostgreSQL、Redis、配置、日志及 `data`，跳过生成图片所在的 `images` 目录。图片通过服务器目录挂载持久化，正常升级后继续保留；完整离线导出或迁移使用 `export.sh`，仍包含图片。
+- `manage.sh backup` 备份 PostgreSQL、Redis、配置、日志及 `data`。`manage.sh update --ready` 与 `update-confirm.sh` 的更新备份包含 Redis 数据、配置、脚本和 `data`。生成图片继续通过 `images` 目录挂载持久化。包含数据库和图片的完整离线导出或迁移使用 `export.sh`。
 
 ### 异步视频与统一媒体任务
 
