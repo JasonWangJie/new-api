@@ -204,7 +204,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						Data struct {
 							Items []gin.H
 							Stats struct {
-								AverageDurationMS float64 `json:"average_duration_ms"`
+								AverageDurationMS *float64 `json:"average_duration_ms"`
 							}
 						}
 					}
@@ -218,7 +218,7 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 						assert.Zero(t, item["finished_at"])
 						assert.Nil(t, item["duration_ms"])
 					}
-					assert.Equal(t, float64(3500), list.Data.Stats.AverageDurationMS)
+					assert.Nil(t, list.Data.Stats.AverageDurationMS)
 
 					recorder = httptest.NewRecorder()
 					c, _ = gin.CreateTestContext(recorder)
@@ -231,6 +231,50 @@ func TestImageTaskPresentationDatabaseMatrix(t *testing.T) {
 					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &detail))
 					assert.Equal(t, float64(now-28), detail.Data.Task["finished_at"])
 					assert.Equal(t, float64(2000), detail.Data.Task["duration_ms"])
+				}
+			})
+			t.Run("average duration uses successful image and video tasks across pages", func(t *testing.T) {
+				images := []model.AsyncImageTask{
+					{TaskId: "asyncimg_duration_succeeded", Status: model.ImageTaskSucceeded, FinishedAt: now - 20},
+					{TaskId: "asyncimg_duration_failed", Status: model.ImageTaskFailed, FinishedAt: now},
+					{TaskId: "asyncimg_duration_missing_finish", Status: model.ImageTaskSucceeded},
+				}
+				for i := range images {
+					images[i].Group, images[i].UserId, images[i].TokenId, images[i].CreatedAt = "average-duration", 101, 201, now-60
+				}
+				video := model.AsyncMediaJob{TaskId: "task_duration_succeeded", IdentityHash: "video-duration-succeeded", UserId: 101, TokenId: 201, Provider: "drama", Group: "average-duration", Status: "succeeded", StorageStatus: "upstream", BillingStatus: "settled", CreatedAt: now - 60, ExpiresAt: now + 3600}
+				receipt := model.Task{TaskID: video.TaskId, UserId: 101, Status: model.TaskStatusSuccess, FinishTime: now - 40}
+				require.NoError(t, db.Create(&images).Error)
+				require.NoError(t, db.Create(&video).Error)
+				require.NoError(t, db.Create(&receipt).Error)
+				t.Cleanup(func() {
+					assert.NoError(t, db.Delete(&receipt).Error)
+					assert.NoError(t, db.Delete(&video).Error)
+					assert.NoError(t, db.Delete(&images).Error)
+				})
+				date := time.Unix(video.CreatedAt, 0).UTC().Format(time.DateOnly)
+				params := url.Values{"group": {video.Group}, "page_size": {"1"}, "start_date": {date}, "end_date": {date}}
+				for _, admin := range []bool{false, true} {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", 101)
+					c.Request = httptest.NewRequest(http.MethodGet, "/?"+params.Encode(), nil)
+					ListMediaTasks(c, admin)
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					var response struct {
+						Data struct {
+							Items []gin.H
+							Total int
+							Stats struct {
+								AverageDurationMS *float64 `json:"average_duration_ms"`
+							}
+						}
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+					require.NotNil(t, response.Data.Stats.AverageDurationMS)
+					assert.Len(t, response.Data.Items, 1)
+					assert.Equal(t, 4, response.Data.Total)
+					assert.Equal(t, float64(30000), *response.Data.Stats.AverageDurationMS)
 				}
 			})
 			t.Run("refunded task costs", func(t *testing.T) {
