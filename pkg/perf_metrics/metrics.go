@@ -142,6 +142,26 @@ func Query(params QueryParams) (QueryResult, error) {
 	})
 
 	result := buildQueryResult(params.Model, merged)
+	recentModels, recentGroups, err := model.GetRecentTaskPerfOutcomes(params.Model, params.Group, endTs, params.Groups, videoExclusions, imageExclusions)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	if outcomes, ok := recentModels[params.Model]; ok {
+		result.Summary.RecentTaskOutcomes = &outcomes
+	}
+	for i := range result.Groups {
+		group := &result.Groups[i]
+		if outcomes, ok := recentGroups[group.Group]; ok {
+			group.RecentTaskOutcomes = &outcomes
+			delete(recentGroups, group.Group)
+		}
+	}
+	for group, outcomes := range recentGroups {
+		result.Groups = append(result.Groups, GroupResult{
+			Group: group, MetricStats: MetricStats{RecentTaskOutcomes: &outcomes}, Series: []BucketPoint{},
+		})
+	}
+	sort.Slice(result.Groups, func(i, j int) bool { return result.Groups[i].Group < result.Groups[j].Group })
 	result.WindowHours, result.UpdatedAt = params.Hours, endTs
 	result.VideoErrorExclusions = videoExclusions
 	result.ImageErrorExclusions = imageExclusions
@@ -212,14 +232,23 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		return true
 	})
 
+	recentModels, _, err := model.GetRecentTaskPerfOutcomes("", "", endTs, groups, videoExclusions, imageExclusions)
+	if err != nil {
+		return SummaryAllResult{}, err
+	}
+	for name := range recentModels {
+		if _, ok := totals[name]; !ok {
+			totals[name] = counters{}
+		}
+	}
 	models := make([]ModelSummary, 0, len(totals))
 	for name, total := range totals {
-		if total.requestCount == 0 {
-			continue
-		}
 		stats := total.stats()
 		stats.SuccessRate = math.Round(stats.SuccessRate*100) / 100
 		stats.AvgTps = math.Round(stats.AvgTps*100) / 100
+		if outcomes, ok := recentModels[name]; ok {
+			stats.RecentTaskOutcomes = &outcomes
+		}
 		models = append(models, ModelSummary{
 			ModelName:           name,
 			MetricStats:         stats,
@@ -227,6 +256,9 @@ func QuerySummaryAll(hours int, groups []string) (SummaryAllResult, error) {
 		})
 	}
 	sort.Slice(models, func(i, j int) bool {
+		if models[i].RequestCount == models[j].RequestCount {
+			return models[i].ModelName < models[j].ModelName
+		}
 		return models[i].RequestCount > models[j].RequestCount
 	})
 

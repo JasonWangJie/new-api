@@ -88,7 +88,7 @@ afterEach(() => {
 })
 
 describe('model cards', () => {
-  it('opens the configured video exclusions beside the raw and filtered card rates', async () => {
+  it('uses the same recent video outcomes for the card rate and status strip even without hourly samples', () => {
     queryClient.setQueryData(['perf-metrics-summary', 24], {
       success: true,
       data: {
@@ -100,10 +100,11 @@ describe('model cards', () => {
           {
             model_name: 'example-model',
             workload: 'video',
-            request_count: 4,
+            request_count: 0,
             avg_latency_ms: 15000,
             avg_tps: 0,
-            success_rate: 25,
+            success_rate: 0,
+            recent_task_outcomes: ['failure', 'unknown', 'success'],
             video_filtered_success_rate: {
               rate: 50,
               excluded_count: 2,
@@ -113,40 +114,23 @@ describe('model cards', () => {
         ],
       },
     })
-    const onModelClick = vi.fn()
     render(
       <QueryClientProvider client={queryClient}>
-        <ModelCardGrid models={[pricingModel()]} onModelClick={onModelClick} />
+        <ModelCardGrid models={[pricingModel()]} onModelClick={vi.fn()} />
       </QueryClientProvider>
     )
 
-    expect(screen.getByText('25.0%')).toBeVisible()
-    expect(screen.getByText('50.00%')).toBeVisible()
-    const info = screen.getByRole('button', {
-      name: 'Show excluded video errors',
-    })
-    expect(info).toHaveAttribute('aria-expanded', 'false')
-
-    const user = userEvent.setup()
-    info.focus()
-    await user.keyboard('{Enter}')
-
-    const popup = await screen.findByRole('dialog', {
-      name: 'Filtered success rate',
-    })
-    expect(info).toHaveAttribute('aria-expanded', 'true')
-    expect(within(popup).getByText('Reference file unavailable')).toBeVisible()
-    expect(within(popup).getByText('Invalid aspect ratio')).toBeVisible()
-    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
+    expect(screen.getByText('33.33%')).toBeVisible()
+    expect(screen.queryByText('50.00%')).not.toBeInTheDocument()
+    const strip = screen.getByRole('list', { name: 'Last 20 tasks' })
     expect(
-      within(popup).queryByText('Excluded failures')
-    ).not.toBeInTheDocument()
-    expect(onModelClick).not.toHaveBeenCalled()
-    await user.keyboard('{Escape}')
-    await waitFor(() => expect(info).toHaveAttribute('aria-expanded', 'false'))
+      within(strip)
+        .getAllByRole('listitem')
+        .map((item) => item.textContent)
+    ).toEqual(['Failed', 'Unknown', 'Success'])
   })
 
-  it('separates filtered image and video rates and rules on a mixed model card', async () => {
+  it('shows an empty media card trend when every recent task has been excluded', () => {
     queryClient.setQueryData(['perf-metrics-summary', 24], {
       success: true,
       data: {
@@ -161,6 +145,7 @@ describe('model cards', () => {
             avg_latency_ms: 1000,
             avg_tps: 0,
             success_rate: 60,
+            recent_task_outcomes: [],
             image_filtered_success_rate: {
               rate: 100,
               excluded_count: 1,
@@ -180,25 +165,10 @@ describe('model cards', () => {
         <ModelCardGrid models={[pricingModel()]} onModelClick={vi.fn()} />
       </QueryClientProvider>
     )
-    expect(screen.getByText('60.0%')).toBeVisible()
-    expect(screen.getByText('100.00%')).toBeVisible()
-    expect(screen.getByText('50.00%')).toBeVisible()
-    expect(screen.getByText('Image filtered success rate')).toBeVisible()
-    expect(screen.getByText('Video filtered success rate')).toBeVisible()
-    expect(screen.queryByText('5 samples')).not.toBeInTheDocument()
-    expect(screen.queryByText('1 unknown result')).not.toBeInTheDocument()
-    const user = userEvent.setup()
-    await user.click(
-      screen.getByRole('button', { name: 'Show excluded image errors' })
-    )
-    const popup = await screen.findByRole('dialog', {
-      name: 'Image filtered success rate',
-    })
-    expect(within(popup).getByText('Image source unavailable')).toBeVisible()
-    expect(
-      within(popup).queryByText('Video source unavailable')
-    ).not.toBeInTheDocument()
-    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
+    expect(screen.getByText('No data available')).toBeVisible()
+    expect(screen.queryByText('60.0%')).not.toBeInTheDocument()
+    expect(screen.queryByText('100.00%')).not.toBeInTheDocument()
+    expect(screen.queryByText('50.00%')).not.toBeInTheDocument()
   })
 
   it('shows separate generic and image cache prices including a free image cache', () => {

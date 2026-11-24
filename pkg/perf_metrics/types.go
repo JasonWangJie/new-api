@@ -43,6 +43,9 @@ type MetricStats struct {
 
 	VideoFilteredSuccessRate *FilteredSuccessRate `json:"video_filtered_success_rate,omitempty"`
 	ImageFilteredSuccessRate *FilteredSuccessRate `json:"image_filtered_success_rate,omitempty"`
+	// RecentTaskOutcomes is ordered oldest to newest. A present empty list means
+	// task observations exist, but none were eligible for the recent status.
+	RecentTaskOutcomes *[]string `json:"recent_task_outcomes,omitempty"`
 }
 
 // FilteredSuccessRate counts terminal outcomes for one async workload. The

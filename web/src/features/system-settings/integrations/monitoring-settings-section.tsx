@@ -212,14 +212,14 @@ export function MonitoringSettingsSection({
       name: 'perf_metrics_setting.image_error_exclusions',
       label: t('Async image error exclusions'),
       description: t(
-        'Final image failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
+        'Matching failures are skipped when selecting the last 20 tasks. Matching is case-sensitive.'
       ),
     },
     {
       name: 'perf_metrics_setting.video_error_exclusions',
       label: t('Async video error exclusions'),
       description: t(
-        'Final video failures containing any keyword are excluded from the filtered success rate. Matching is case-sensitive. Leave blank to hide the metric.'
+        'Matching failures are skipped when selecting the last 20 tasks. Matching is case-sensitive.'
       ),
     },
   ] as const

@@ -74,8 +74,8 @@ const groups = [
 ]
 
 it.each(['overview', 'performance'])(
-  'uses the server model summary in the %s view instead of averaging group rates',
-  async (view) => {
+  'uses the recent task outcomes to show a single model success rate in the %s view',
+  (view) => {
     client.setQueryData(['perf-metrics', model.model_name], {
       success: true,
       data: {
@@ -104,6 +104,7 @@ it.each(['overview', 'performance'])(
           avg_latency_ms: 120000,
           avg_tps: 0,
           success_rate: 1,
+          recent_task_outcomes: ['success', 'failure'],
           video_filtered_success_rate: {
             rate: 1.02,
             excluded_count: 2,
@@ -131,24 +132,18 @@ it.each(['overview', 'performance'])(
       </QueryClientProvider>
     )
     const summary = screen.getByLabelText('Model performance summary')
-    expect(within(summary).getByText('1.00%')).toBeVisible()
-    expect(within(summary).getByText('1.02%')).toBeVisible()
+    expect(within(summary).getByText('50.00%')).toBeVisible()
+    expect(within(summary).queryByText('1.00%')).not.toBeInTheDocument()
+    expect(within(summary).queryByText('1.02%')).not.toBeInTheDocument()
     expect(
       screen.queryByRole('columnheader', { name: 'Samples' })
     ).not.toBeInTheDocument()
-    await userEvent.setup().click(
-      within(summary).getByRole('button', {
-        name: 'Show excluded video errors',
-      })
-    )
-    const popup = await screen.findByRole('dialog', {
-      name: 'Filtered success rate',
-    })
-    expect(within(popup).getByText('Reference file unavailable')).toBeVisible()
-    expect(within(popup).queryByText('Samples')).not.toBeInTheDocument()
+    const strip = screen.getByRole('list', { name: 'Last 20 tasks' })
     expect(
-      within(popup).queryByText('Excluded failures')
-    ).not.toBeInTheDocument()
+      within(strip)
+        .getAllByRole('listitem')
+        .map((item) => item.textContent)
+    ).toEqual(['Success', 'Failed'])
     expect(within(summary).queryByText('3 images')).not.toBeInTheDocument()
     expect(within(summary).queryByText('100 samples')).not.toBeInTheDocument()
     expect(within(summary).queryByText('2 unknown')).not.toBeInTheDocument()
@@ -161,13 +156,14 @@ it.each(['overview', 'performance'])(
   }
 )
 
-it('shows separate filtered columns for mixed models and a placeholder when all image observations are excluded', () => {
+it('shows one success-rate column with the group’s recent task outcomes for mixed models', () => {
   const summary = {
     workload: 'mixed',
     request_count: 3,
     avg_latency_ms: 1000,
     avg_tps: 0,
     success_rate: 33.33,
+    recent_task_outcomes: ['success', 'unknown'],
     image_filtered_success_rate: {
       rate: null,
       excluded_count: 1,
@@ -196,26 +192,28 @@ it('shows separate filtered columns for mixed models and a placeholder when all 
   )
   const table = within(screen.getByRole('table'))
   expect(
-    table.getByRole('columnheader', { name: 'Image filtered success rate' })
+    table.getByRole('columnheader', { name: 'Success rate' })
   ).toBeVisible()
   expect(
-    table.getByRole('columnheader', { name: 'Video filtered success rate' })
-  ).toBeVisible()
-  expect(table.getByRole('cell', { name: '—' })).toBeVisible()
-  expect(table.getByRole('cell', { name: '100.00%' })).toBeVisible()
+    table.queryByRole('columnheader', { name: /filtered success rate/i })
+  ).not.toBeInTheDocument()
+  expect(table.getByText('50.00%')).toBeVisible()
+  const strip = table.getByRole('list', { name: 'Last 20 tasks' })
+  expect(within(strip).getByText('Success')).toBeInTheDocument()
+  expect(within(strip).getByText('Unknown')).toBeInTheDocument()
   expect(table.queryByRole('columnheader', { name: 'Samples' })).toBeNull()
 })
 
-it('shows an unavailable filtered rate when all video observations are excluded', () => {
+it('shows an unavailable video rate when all recent observations are excluded', () => {
   render(
     <ModelPerformanceSummary
-      videoErrorExclusions={['Reference file unavailable']}
       stats={{
         workload: 'video',
         request_count: 3,
         avg_latency_ms: 0,
         avg_tps: 0,
         success_rate: 0,
+        recent_task_outcomes: [],
         video_filtered_success_rate: {
           rate: null,
           excluded_count: 3,
@@ -225,8 +223,10 @@ it('shows an unavailable filtered rate when all video observations are excluded'
     />
   )
   const summary = screen.getByLabelText('Model performance summary')
-  expect(within(summary).getByText('0.00%')).toBeVisible()
-  expect(within(summary).getByText('Filtered success rate')).toBeVisible()
+  expect(within(summary).queryByText('0.00%')).not.toBeInTheDocument()
+  expect(
+    within(summary).queryByText('Filtered success rate')
+  ).not.toBeInTheDocument()
   expect(within(summary).getAllByText('—')).toHaveLength(2)
 })
 

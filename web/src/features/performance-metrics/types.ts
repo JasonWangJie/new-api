@@ -22,6 +22,8 @@ export type FilteredSuccessRate = {
   sample_count: number
 }
 
+export type TaskOutcome = 'success' | 'failure' | 'unknown'
+
 export type PerformanceStats = {
   avg_ttft_ms?: number
   avg_latency_ms: number
@@ -35,6 +37,7 @@ export type PerformanceStats = {
   total_latency_ms?: number
   output_count?: number
   workload?: 'relay' | 'image' | 'video' | 'mixed'
+  recent_task_outcomes?: TaskOutcome[]
   image_filtered_success_rate?: FilteredSuccessRate
   video_filtered_success_rate?: FilteredSuccessRate
 }

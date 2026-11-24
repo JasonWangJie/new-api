@@ -1,7 +1,9 @@
 package model
 
 import (
+	"cmp"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -58,6 +60,26 @@ func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, gro
 		"SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END) AS failure_count, " +
 		"SUM(CASE WHEN outcome = 'unknown' THEN 1 ELSE 0 END) AS unknown_count, " +
 		"SUM(latency_count) AS latency_count, SUM(latency_ms) AS total_latency_ms, SUM(output_count) AS output_count"
+	exclusion, args := taskPerfErrorExclusion(videoErrorExclusions, imageErrorExclusions)
+	if exclusion != "" {
+		columns += ", SUM(CASE WHEN " + exclusion + " THEN 1 ELSE 0 END) AS excluded_count"
+	}
+	query := DB.Model(&TaskPerfSample{}).Select(columns, args...).
+		Where("completed_at >= ? AND completed_at <= ?", startTs, endTs)
+	if modelName != "" {
+		query = query.Where(modelCol+" = ?", modelName)
+	}
+	if group != "" {
+		query = query.Where(groupCol+" = ?", group)
+	}
+	if groups != nil {
+		query = query.Where(groupCol+" IN ?", groups)
+	}
+	err := query.Group(modelCol + ", " + groupCol + ", kind, bucket_ts").Order("bucket_ts ASC").Scan(&rows).Error
+	return rows, err
+}
+
+func taskPerfErrorExclusion(videoErrorExclusions, imageErrorExclusions []string) (string, []any) {
 	var args []any
 	var filteredWorkloads []string
 	for _, filter := range []struct {
@@ -92,14 +114,39 @@ func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, gro
 			"SELECT 1 FROM "+filter.table+" job WHERE "+identity+" AND job.status IN ('failed', 'expired') AND ("+
 			strings.Join(matches, " OR ")+")))")
 	}
-	if len(filteredWorkloads) > 0 {
-		columns += ", SUM(CASE WHEN outcome = 'failure' AND (" +
-			strings.Join(filteredWorkloads, " OR ") + ") THEN 1 ELSE 0 END) AS excluded_count"
+	if len(filteredWorkloads) == 0 {
+		return "", nil
 	}
-	query := DB.Model(&TaskPerfSample{}).Select(columns, args...).
-		Where("completed_at >= ? AND completed_at <= ?", startTs, endTs)
+	return "outcome = 'failure' AND (" + strings.Join(filteredWorkloads, " OR ") + ")", args
+}
+
+const recentTaskPerfLimit = 20
+
+type recentTaskPerfRow struct {
+	ModelName   string
+	SampleGroup string
+	CompletedAt int64
+	ID          int64
+	Outcome     string
+	Excluded    bool
+}
+
+// GetRecentTaskPerfOutcomes reads retained task observations oldest first. A
+// missing map entry means no observations, while an empty slice means every
+// observed outcome was excluded. Per-group results are returned for one model.
+func GetRecentTaskPerfOutcomes(modelName, group string, endTs int64, groups, videoErrorExclusions, imageErrorExclusions []string) (map[string][]string, map[string][]string, error) {
+	if groups != nil && len(groups) == 0 {
+		return nil, nil, nil
+	}
+	modelCol, groupCol := perfIdentityColumns()
+	query := DB.Model(&TaskPerfSample{}).
+		Where("completed_at <= ? AND outcome IN ('success', 'failure', 'unknown')", endTs)
+	identityColumns := modelCol + " AS model_name"
+	partition := "model_name"
 	if modelName != "" {
 		query = query.Where(modelCol+" = ?", modelName)
+		identityColumns += ", " + groupCol + " AS sample_group"
+		partition += ", sample_group"
 	}
 	if group != "" {
 		query = query.Where(groupCol+" = ?", group)
@@ -107,8 +154,104 @@ func GetTaskPerfMetricBuckets(modelName, group string, startTs, endTs int64, gro
 	if groups != nil {
 		query = query.Where(groupCol+" IN ?", groups)
 	}
-	err := query.Group(modelCol + ", " + groupCol + ", kind, bucket_ts").Order("bucket_ts ASC").Scan(&rows).Error
-	return rows, err
+	exclusion, args := taskPerfErrorExclusion(videoErrorExclusions, imageErrorExclusions)
+	var rows []recentTaskPerfRow
+	if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
+		var err error
+		rows, err = recentTaskPerfRowsMySQL(query, modelName != "", identityColumns, exclusion, args)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		excluded := "0"
+		if exclusion != "" {
+			excluded = "CASE WHEN " + exclusion + " THEN 1 ELSE 0 END"
+		}
+		candidates := query.Select(identityColumns+", completed_at, id, outcome, "+excluded+" AS excluded", args...)
+		// Rank valid outcomes before excluded failures. The first excluded row
+		// survives only for an identity with no valid outcomes at all.
+		ranked := DB.Table("(?) AS candidates", candidates).
+			Select("candidates.*, ROW_NUMBER() OVER (PARTITION BY " + partition +
+				" ORDER BY excluded, completed_at DESC, id DESC) AS sample_rank")
+		if err := DB.Table("(?) AS ranked", ranked).
+			Where("sample_rank <= ? AND (excluded = 0 OR sample_rank = 1)", recentTaskPerfLimit).
+			Scan(&rows).Error; err != nil {
+			return nil, nil, err
+		}
+	}
+
+	modelRows := make(map[string][]recentTaskPerfRow)
+	groupRows := make(map[string][]recentTaskPerfRow)
+	for _, row := range rows {
+		modelSamples := modelRows[row.ModelName]
+		groupSamples := groupRows[row.SampleGroup]
+		if !row.Excluded {
+			modelSamples = append(modelSamples, row)
+			if modelName != "" {
+				groupSamples = append(groupSamples, row)
+			}
+		}
+		modelRows[row.ModelName] = modelSamples
+		if modelName != "" {
+			groupRows[row.SampleGroup] = groupSamples
+		}
+	}
+	return recentTaskPerfOutcomes(modelRows), recentTaskPerfOutcomes(groupRows), nil
+}
+
+// MySQL 5.7 does not have window functions. Batching per-identity subqueries
+// keeps both round trips and transferred outcomes bounded.
+func recentTaskPerfRowsMySQL(query *gorm.DB, byGroup bool, identityColumns, exclusion string, args []any) ([]recentTaskPerfRow, error) {
+	var identities []recentTaskPerfRow
+	if err := query.Session(&gorm.Session{}).Distinct(identityColumns).Scan(&identities).Error; err != nil {
+		return nil, err
+	}
+	for i := range identities {
+		identities[i].Excluded = true
+	}
+	rows := slices.Clone(identities)
+	modelCol, groupCol := perfIdentityColumns()
+	for batch := range slices.Chunk(identities, 64) {
+		selects := make([]string, 0, len(batch))
+		subqueries := make([]any, 0, len(batch))
+		for _, identity := range batch {
+			subquery := query.Session(&gorm.Session{}).Where(modelCol+" = ?", identity.ModelName)
+			if byGroup {
+				subquery = subquery.Where(groupCol+" = ?", identity.SampleGroup)
+			}
+			if exclusion != "" {
+				subquery = subquery.Where("NOT ("+exclusion+")", args...)
+			}
+			subqueries = append(subqueries, subquery.Select(identityColumns+", completed_at, id, outcome").
+				Order("completed_at DESC, id DESC").Limit(recentTaskPerfLimit))
+			selects = append(selects, "SELECT * FROM (?) AS recent")
+		}
+		var results []recentTaskPerfRow
+		if err := DB.Raw(strings.Join(selects, " UNION ALL "), subqueries...).Scan(&results).Error; err != nil {
+			return nil, err
+		}
+		rows = append(rows, results...)
+	}
+	return rows, nil
+}
+
+func recentTaskPerfOutcomes(identities map[string][]recentTaskPerfRow) map[string][]string {
+	outcomes := make(map[string][]string, len(identities))
+	for key, rows := range identities {
+		slices.SortFunc(rows, func(a, b recentTaskPerfRow) int {
+			if order := cmp.Compare(b.CompletedAt, a.CompletedAt); order != 0 {
+				return order
+			}
+			return cmp.Compare(b.ID, a.ID)
+		})
+		latest := rows[:min(len(rows), recentTaskPerfLimit)]
+		ordered := make([]string, len(latest))
+		for i, row := range latest {
+			ordered[len(latest)-i-1] = row.Outcome
+		}
+		outcomes[key] = ordered
+	}
+	return outcomes
 }
 
 func recordImageTaskPerfSampleTx(tx *gorm.DB, taskID, beforeStatus string) error {

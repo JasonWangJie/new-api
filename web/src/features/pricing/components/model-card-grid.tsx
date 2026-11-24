@@ -89,6 +89,9 @@ export function ModelCardGrid(props: ModelCardGridProps) {
       <PerformanceTimeContext
         windowHours={perfQuery.data?.data.window_hours ?? 24}
         updatedAt={perfQuery.data?.data.updated_at}
+        showWindow={pagedModels.some(
+          (model) => perfMap.get(model.model_name)?.recent_task_outcomes == null
+        )}
       />
       <div className='grid grid-cols-1 gap-3 sm:gap-4 md:grid-cols-2 xl:grid-cols-3'>
         {pagedModels.map((model) => (
@@ -102,8 +105,6 @@ export function ModelCardGrid(props: ModelCardGridProps) {
             selectedGroup={props.selectedGroup}
             perf={perfMap.get(model.model_name || '')}
             perfStatus={perfStatus}
-            imageErrorExclusions={perfQuery.data?.data.image_error_exclusions}
-            videoErrorExclusions={perfQuery.data?.data.video_error_exclusions}
             onClick={() => props.onModelClick(model.model_name || '')}
           />
         ))}

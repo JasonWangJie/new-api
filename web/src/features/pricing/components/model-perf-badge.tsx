@@ -24,8 +24,8 @@ import {
   formatLatency,
   formatThroughput,
   formatUptimePct,
+  getDisplayedSuccessRate,
   getSuccessRateDotClass,
-  getSuccessRateTextClass,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
 import type {
@@ -34,11 +34,7 @@ import type {
 } from '@/features/performance-metrics/types'
 import { cn } from '@/lib/utils'
 
-import {
-  filteredMediaRateLabel,
-  getFilteredMediaKinds,
-} from '../lib/model-performance'
-import { FilteredMediaSuccessRateHelp } from './model-performance-summary'
+import { RecentTaskStatus } from './recent-task-status'
 
 export type ModelPerfBadgeData = PerformanceStats & {
   recent_success_series?: SuccessRatePoint[]
@@ -48,8 +44,6 @@ export interface ModelPerfBadgeProps extends React.HTMLAttributes<HTMLDivElement
   perf: ModelPerfBadgeData | undefined
   mediaModel?: boolean
   status?: 'loading' | 'error' | 'ready'
-  imageErrorExclusions?: readonly string[]
-  videoErrorExclusions?: readonly string[]
 }
 
 const STATUS_SLOTS = Array.from({ length: 24 }, (_, slot) => slot)
@@ -59,29 +53,34 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
 ) {
   const { t } = useTranslation()
   const hasSamples = props.perf != null && props.perf.request_count !== 0
-  const filteredKinds = getFilteredMediaKinds([props.perf])
+  const outcomes = props.perf?.recent_task_outcomes
   const media =
-    isTaskPerformance(props.perf) ||
-    props.mediaModel ||
-    filteredKinds.length > 0
+    isTaskPerformance(props.perf) || props.mediaModel || outcomes != null
   const deliveredMedia =
-    props.perf?.workload === 'image' || props.perf?.workload === 'video'
+    props.perf?.workload === 'image' ||
+    props.perf?.workload === 'video' ||
+    (outcomes != null && !hasSamples)
   const latencyText = hasSamples
     ? formatLatency(props.perf?.avg_latency_ms ?? 0, props.perf?.latency_count)
     : '—'
   const throughputText = (
     hasSamples ? formatThroughput(props.perf?.avg_tps ?? 0) : '—'
   ).replace(' t/s', 't/s')
-  const successRate = props.perf?.success_rate
-  const hasSuccessRate =
-    hasSamples &&
-    successRate != null &&
+  const successRate = getDisplayedSuccessRate(props.perf)
+  let successRateText = '—%'
+  if (outcomes) {
+    successRateText = formatUptimePct(successRate)
+  } else if (
     Number.isFinite(successRate) &&
     successRate >= 0 &&
     successRate <= 100
+  ) {
+    successRateText = `${successRate.toFixed(1)}%`
+  }
   // Hourly points with timestamps, anchored to the client's current hour.
   // Hours without traffic stay gray. Slot 23 is the current, partial hour.
   const statusRates = useMemo(() => {
+    if (outcomes) return []
     const currentHourStart = Math.floor(Date.now() / 1000 / 3600) * 3600
     const ratesByHour = new Map<number, number>()
     for (const point of props.perf?.recent_success_series ?? []) {
@@ -91,7 +90,7 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
       const hourStart = currentHourStart - (23 - slot) * 3600
       return ratesByHour.get(hourStart)
     })
-  }, [props.perf?.recent_success_series])
+  }, [outcomes, props.perf?.recent_success_series])
 
   let statusMessage: React.ReactNode = null
   if (props.status === 'loading') {
@@ -106,86 +105,63 @@ export const ModelPerfBadge = memo(function ModelPerfBadge(
 
   return (
     <div
-      aria-label={t('Performance metrics for the last 24 hours')}
+      aria-label={
+        outcomes
+          ? t('Model performance summary')
+          : t('Performance metrics for the last 24 hours')
+      }
       className={cn('flex w-full min-w-0 flex-col gap-2', props.className)}
     >
       <div className='flex w-full min-w-0 flex-wrap items-center justify-between gap-3'>
         <dl className='flex min-w-0 flex-1 basis-60 flex-wrap items-start gap-x-3 gap-y-2 text-xs tabular-nums'>
-          <div className='w-24 shrink-0'>
+          <div className={outcomes ? 'max-w-full min-w-24' : 'w-24 shrink-0'}>
             <dt
-              title={t('Request success rate sampled over the last 24 hours')}
+              title={
+                outcomes
+                  ? t('Last 20 tasks')
+                  : t('Request success rate sampled over the last 24 hours')
+              }
               className='text-muted-foreground flex items-center justify-between gap-1 text-[11px] leading-4'
             >
-              <span>{t('Status')}</span>
-              <span className='font-mono'>
-                {hasSuccessRate ? `${successRate.toFixed(1)}%` : '—%'}
-              </span>
+              <span>{outcomes ? t('Success rate') : t('Status')}</span>
+              <span className='font-mono'>{successRateText}</span>
             </dt>
-            <dd
-              role='img'
-              aria-label={t(
-                'Recent success-rate samples; gray bars indicate missing data.'
-              )}
-              title={t(
-                'Recent success-rate samples; gray bars indicate missing data.'
-              )}
-              className='mt-1 flex h-3 w-24 items-center gap-px'
-            >
-              {STATUS_SLOTS.map((slot) => {
-                const rate = statusRates[slot]
-                return (
-                  <span
-                    key={slot}
-                    aria-hidden
-                    className={cn(
-                      'h-full w-[3px] shrink-0 rounded-xs',
-                      rate != null &&
-                        Number.isFinite(rate) &&
-                        rate >= 0 &&
-                        rate <= 100
-                        ? getSuccessRateDotClass(rate)
-                        : 'bg-muted-foreground/15'
-                    )}
-                  />
-                )
-              })}
-            </dd>
+            {outcomes ? (
+              <dd className='mt-1'>
+                <RecentTaskStatus outcomes={outcomes} className='h-3' />
+              </dd>
+            ) : (
+              <dd
+                role='img'
+                aria-label={t(
+                  'Recent success-rate samples; gray bars indicate missing data.'
+                )}
+                title={t(
+                  'Recent success-rate samples; gray bars indicate missing data.'
+                )}
+                className='mt-1 flex h-3 w-24 items-center gap-px'
+              >
+                {STATUS_SLOTS.map((slot) => {
+                  const rate = statusRates[slot]
+                  return (
+                    <span
+                      key={slot}
+                      aria-hidden
+                      className={cn(
+                        'h-full w-[3px] shrink-0 rounded-xs',
+                        rate != null &&
+                          Number.isFinite(rate) &&
+                          rate >= 0 &&
+                          rate <= 100
+                          ? getSuccessRateDotClass(rate)
+                          : 'bg-muted-foreground/15'
+                      )}
+                    />
+                  )
+                })}
+              </dd>
+            )}
           </div>
-          {filteredKinds.map((kind) => {
-            const rate =
-              props.perf?.[`${kind}_filtered_success_rate`]?.rate ?? Number.NaN
-            const label = filteredMediaRateLabel(
-              t,
-              kind,
-              filteredKinds.length > 1
-            )
-            return (
-              <div key={kind} className='max-w-full min-w-0'>
-                <dt className='text-muted-foreground flex items-center gap-1 text-[11px] leading-4'>
-                  <span className='min-w-0 [overflow-wrap:anywhere]'>
-                    {label}
-                  </span>
-                  <FilteredMediaSuccessRateHelp
-                    kind={kind}
-                    label={label}
-                    exclusions={
-                      kind === 'image'
-                        ? props.imageErrorExclusions
-                        : props.videoErrorExclusions
-                    }
-                  />
-                </dt>
-                <dd
-                  className={cn(
-                    'mt-1 font-mono whitespace-nowrap',
-                    getSuccessRateTextClass(rate)
-                  )}
-                >
-                  {formatUptimePct(rate)}
-                </dd>
-              </div>
-            )
-          })}
           <div
             title={
               deliveredMedia ? t('Average delivery time') : t('Average latency')

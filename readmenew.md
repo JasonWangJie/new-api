@@ -1,5 +1,9 @@
 # new-api 补充说明与功能索引
 
+## 模型广场最近 20 次异步任务状态（2026-11-24，待提交，未发布）
+
+模型卡片、详情概览与性能页的异步任务成功率统一按最近最多 20 个有效终态样本计算。状态条与百分比使用同一批样本。系统先应用图片、视频各自的错误过滤规则，再继续往前补足样本。性能分组按各自分组取样。详见[模型广场说明](wiki/07-站内文档中心.md#recent-task-performance-20261124)和[本月台账](wiki/14-2026年11月代码变更台账.md#recent-task-performance-20261124)。
+
 ## 缩短部署更新停机时间（2026-11-22，待提交，未发布）
 
 `manage.sh update --ready` 和 `update-confirm.sh` 的更新前归档包含 Redis 数据、部署配置、脚本与 `data`，原有应用日志继续保存在服务器。Redis 启动后立即发送带认证的 `PING`，未就绪时每秒重试，等待上限 120 秒。更新期间 PostgreSQL 继续运行，恢复更新前的数据库需使用独立备份。`manage.sh backup`（含 `--keep-stopped`）与 `export.sh` 仍收录日志和 PostgreSQL 转储。详见[部署说明](wiki/04-首页与部署.md#update-backup-scope)和[本月台账](wiki/14-2026年11月代码变更台账.md#update-backup-scope-20261122)。

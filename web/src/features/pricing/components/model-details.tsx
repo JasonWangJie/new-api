@@ -261,7 +261,11 @@ function OverviewSummaryGrid(props: { model: PricingModel }) {
     )
   }
   if (metricsQuery.isLoading) return <LoadingState className='min-h-0 p-4' />
-  if (!metricsQuery.data?.data.groups.length) {
+  const summary = getPerformanceSummary(metricsQuery.data?.data)
+  if (
+    !metricsQuery.data?.data.groups.length &&
+    !summary?.recent_task_outcomes
+  ) {
     return (
       <EmptyState
         title={t('Performance data is not yet available for this model.')}
@@ -274,14 +278,9 @@ function OverviewSummaryGrid(props: { model: PricingModel }) {
     <ModelPerformanceSummary
       compact
       mediaModel={isMediaModel(props.model)}
-      stats={getModelPerformanceStats(
-        props.model,
-        getPerformanceSummary(metricsQuery.data?.data)
-      )}
+      stats={getModelPerformanceStats(props.model, summary)}
       windowHours={metricsQuery.data?.data.window_hours}
       updatedAt={metricsQuery.data?.data.updated_at}
-      imageErrorExclusions={metricsQuery.data?.data.image_error_exclusions}
-      videoErrorExclusions={metricsQuery.data?.data.video_error_exclusions}
     />
   )
 }

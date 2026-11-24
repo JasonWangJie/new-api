@@ -35,6 +35,7 @@ import {
   formatLatency,
   formatThroughput,
   formatUptimePct,
+  getDisplayedSuccessRate,
   getPerformanceSummary,
   isTaskPerformance,
 } from '@/features/performance-metrics/lib/format'
@@ -43,8 +44,6 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type { UptimeDayPoint } from '../lib/mock-stats'
 import {
-  filteredMediaRateLabel,
-  getFilteredMediaKinds,
   getModelPerformanceStats,
   isMediaModel,
 } from '../lib/model-performance'
@@ -52,6 +51,7 @@ import type { PricingModel } from '../types'
 import { LatencyTrendChart, UptimeTrendChart } from './model-details-charts'
 import { UptimeSparkline } from './model-details-uptime-sparkline'
 import { ModelPerformanceSummary } from './model-performance-summary'
+import { RecentTaskStatus } from './recent-task-status'
 
 function toLatencySeries(
   groups: PerformanceGroup[],
@@ -140,7 +140,11 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
     props.model,
     getPerformanceSummary(metricsQuery.data?.data)
   )
-  const media = isTaskPerformance(summary) || groups.some(isTaskPerformance)
+  const outcomes = summary?.recent_task_outcomes
+  const media =
+    outcomes != null ||
+    isTaskPerformance(summary) ||
+    groups.some(isTaskPerformance)
   const mixed =
     summary?.workload === 'mixed' ||
     groups.some((group) => group.workload === 'mixed')
@@ -150,7 +154,10 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
     () => toLatencySeries(groups, media ? 'avg_latency_ms' : 'avg_ttft_ms'),
     [groups, media]
   )
-  const uptimeSeries = useMemo(() => toUptimeSeries(groups), [groups])
+  const uptimeSeries = useMemo(
+    () => (outcomes ? [] : toUptimeSeries(groups)),
+    [groups, outcomes]
+  )
 
   if (metricsQuery.isError) {
     return (
@@ -162,7 +169,7 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
     )
   }
   if (metricsQuery.isLoading) return <LoadingState className='min-h-0 p-6' />
-  if (groups.length === 0) {
+  if (groups.length === 0 && !outcomes) {
     return (
       <EmptyState
         title={t('Performance data is not yet available for this model.')}
@@ -194,34 +201,25 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
       cellClassName: tableStyles.compactCell,
       cell: (perf) => (
         <div className='space-y-1'>
-          <span>{formatUptimePct(perf.success_rate)}</span>
-          <UptimeSparkline
-            size='sm'
-            showOverall={false}
-            series={perf.series.map((point) => ({
-              date: new Date(point.ts * 1000).toISOString(),
-              uptime_pct: point.success_rate,
-              incidents: point.success_rate < 100 ? 1 : 0,
-              outage_minutes: 0,
-            }))}
-          />
+          <span>{formatUptimePct(getDisplayedSuccessRate(perf))}</span>
+          {perf.recent_task_outcomes ? (
+            <RecentTaskStatus outcomes={perf.recent_task_outcomes} />
+          ) : (
+            <UptimeSparkline
+              size='sm'
+              showOverall={false}
+              series={perf.series.map((point) => ({
+                date: new Date(point.ts * 1000).toISOString(),
+                uptime_pct: point.success_rate,
+                incidents: point.success_rate < 100 ? 1 : 0,
+                outage_minutes: 0,
+              }))}
+            />
+          )}
         </div>
       ),
     },
   ]
-  const filteredKinds = getFilteredMediaKinds(groups)
-  for (const kind of filteredKinds) {
-    columns.push({
-      id: `filtered-${kind}-success`,
-      header: filteredMediaRateLabel(t, kind, filteredKinds.length > 1),
-      className: tableStyles.compactHeaderCellRight,
-      cellClassName: tableStyles.compactNumericCell,
-      cell: (perf) =>
-        formatUptimePct(
-          perf[`${kind}_filtered_success_rate`]?.rate ?? Number.NaN
-        ),
-    })
-  }
   if (!media) {
     columns.splice(
       1,
@@ -250,8 +248,6 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
         mediaModel={isMediaModel(props.model)}
         windowHours={metricsQuery.data?.data.window_hours}
         updatedAt={metricsQuery.data?.data.updated_at}
-        imageErrorExclusions={metricsQuery.data?.data.image_error_exclusions}
-        videoErrorExclusions={metricsQuery.data?.data.video_error_exclusions}
       />
       <section>
         <SectionHeader icon={HeartPulse} title={t('Per-group performance')} />
@@ -275,14 +271,23 @@ export function ModelDetailsPerformance(props: { model: PricingModel }) {
           metricLabel={media ? latencyLabel : t('Average TTFT')}
         />
       </section>
-      <section>
-        <SectionHeader
-          icon={HeartPulse}
-          title={t('Availability (last 24h)')}
-          description={t('Request success rate sampled over the last 24 hours')}
-        />
-        <UptimeTrendChart series={uptimeSeries} />
-      </section>
+      {outcomes ? (
+        <section>
+          <SectionHeader icon={HeartPulse} title={t('Last 20 tasks')} />
+          <RecentTaskStatus outcomes={outcomes} className='h-5 gap-1' />
+        </section>
+      ) : (
+        <section>
+          <SectionHeader
+            icon={HeartPulse}
+            title={t('Availability (last 24h)')}
+            description={t(
+              'Request success rate sampled over the last 24 hours'
+            )}
+          />
+          <UptimeTrendChart series={uptimeSeries} />
+        </section>
+      )}
     </div>
   )
 }

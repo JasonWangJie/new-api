@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +125,94 @@ func TestModelPerformanceQueryWindowAndGroupIsolation(t *testing.T) {
 	}
 	assert.Equal(t, int64(1), byModel["CaseModel"].SuccessCount)
 	assert.Equal(t, int64(1), byModel["casemodel"].FailureCount)
+}
+
+func TestModelPerformanceRecentTaskOutcomes(t *testing.T) {
+	db := performanceDatabase(t)
+	entities := []any{&model.TaskPerfSample{}, &model.PerfMetric{}, &model.AsyncMediaJob{}, &model.AsyncImageTask{}, &model.Option{}}
+	require.NoError(t, db.Migrator().DropTable(entities...))
+	require.NoError(t, db.AutoMigrate(entities...))
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	require.NoError(t, model.UpdateOptionsBulk(map[string]string{
+		perf_metrics_setting.VideoErrorExclusionsOptionKey: "Invalid input",
+		perf_metrics_setting.ImageErrorExclusionsOptionKey: "Unsupported image",
+	}))
+
+	now := time.Now().Unix()
+	samples := []model.TaskPerfSample{
+		{TaskId: "older-than-latest", Kind: "video", ModelName: "video-demo", Group: "default", Outcome: "failure", CompletedAt: now - 72*3600},
+		{TaskId: "older-than-window", Kind: "video", ModelName: "video-demo", Group: "default", Outcome: "success", CompletedAt: now - 49*3600},
+		{TaskId: "sparse", Kind: "video", ModelName: "sparse-video", Group: "vip", Outcome: "success", CompletedAt: now - 48*3600},
+	}
+	for i := range 17 {
+		samples = append(samples, model.TaskPerfSample{
+			TaskId: "delivered-" + strconv.Itoa(i), Kind: "video", ModelName: "video-demo",
+			Group: "default", Outcome: "success", CompletedAt: now - 7200 + int64(i),
+		})
+	}
+	samples = append(samples,
+		model.TaskPerfSample{TaskId: "unknown", Kind: "video", ModelName: "video-demo", Group: "default", Outcome: "unknown", CompletedAt: now - 3605},
+		model.TaskPerfSample{TaskId: "different-case", Kind: "video", ModelName: "video-demo", Group: "vip", Outcome: "failure", CompletedAt: now - 3605},
+		model.TaskPerfSample{TaskId: "hidden-group", Kind: "video", ModelName: "video-demo", Group: "Default", Outcome: "failure", CompletedAt: now - 40},
+		model.TaskPerfSample{TaskId: "image-excluded", Kind: "image", ModelName: "image-demo", Group: "default", Outcome: "failure", CompletedAt: now - 30},
+	)
+	jobs := []model.AsyncMediaJob{
+		{TaskId: "unknown", IdentityHash: "unknown", Status: "failed", ErrorMessage: "Invalid input"},
+		{TaskId: "different-case", IdentityHash: "different-case", Status: "failed", ErrorMessage: "invalid input"},
+	}
+	for i := range 23 {
+		id := "excluded-" + strconv.Itoa(i)
+		samples = append(samples, model.TaskPerfSample{
+			TaskId: id, Kind: "video", ModelName: "video-demo", Group: "default",
+			Outcome: "failure", CompletedAt: now - 30 + int64(i),
+		})
+		jobs = append(jobs, model.AsyncMediaJob{TaskId: id, IdentityHash: id, Status: "failed", ErrorMessage: "Invalid input"})
+	}
+	for i := range samples {
+		samples[i].BucketTs = samples[i].CompletedAt - samples[i].CompletedAt%3600
+	}
+	require.NoError(t, db.Create(&samples).Error)
+	require.NoError(t, db.Create(&jobs).Error)
+	require.NoError(t, db.Create(&model.AsyncImageTask{TaskId: "image-excluded", Status: model.ImageTaskFailed, ErrorMessage: "Unsupported image"}).Error)
+
+	visibleGroups := []string{"default", "vip"}
+	details, err := Query(QueryParams{Model: "video-demo", Groups: visibleGroups})
+	require.NoError(t, err)
+	want := append(slices.Repeat([]string{"success"}, 18), "unknown", "failure")
+	require.NotNil(t, details.Summary.RecentTaskOutcomes)
+	assert.Equal(t, want, *details.Summary.RecentTaskOutcomes)
+	require.Len(t, details.Groups, 2)
+	assert.Equal(t, "default", details.Groups[0].Group)
+	require.NotNil(t, details.Groups[0].RecentTaskOutcomes)
+	assert.Equal(t, append([]string{"failure"}, want[:19]...), *details.Groups[0].RecentTaskOutcomes)
+	assert.Equal(t, "vip", details.Groups[1].Group)
+	require.NotNil(t, details.Groups[1].RecentTaskOutcomes)
+	assert.Equal(t, []string{"failure"}, *details.Groups[1].RecentTaskOutcomes)
+
+	summary, err := QuerySummaryAll(24, visibleGroups)
+	require.NoError(t, err)
+	models := make(map[string]ModelSummary, len(summary.Models))
+	for _, row := range summary.Models {
+		models[row.ModelName] = row
+	}
+	assert.Equal(t, details.Summary.RecentTaskOutcomes, models["video-demo"].RecentTaskOutcomes)
+	assert.Zero(t, models["sparse-video"].RequestCount)
+	require.NotNil(t, models["sparse-video"].RecentTaskOutcomes)
+	assert.Equal(t, []string{"success"}, *models["sparse-video"].RecentTaskOutcomes)
+	require.NotNil(t, models["image-demo"].RecentTaskOutcomes)
+	assert.Equal(t, []string{}, *models["image-demo"].RecentTaskOutcomes)
+	encoded, err := common.Marshal(models["image-demo"])
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"recent_task_outcomes":[]`)
+	assert.NotContains(t, string(encoded), "Unsupported image")
 }
 
 func TestModelPerformanceTaskDelivery(t *testing.T) {
@@ -258,7 +347,11 @@ func TestModelPerformanceTaskDelivery(t *testing.T) {
 	require.NoError(t, db.Model(&model.TaskPerfSample{}).Where("task_id = ?", job.TaskId).Update("completed_at", now-25*3600).Error)
 	result, err = Query(QueryParams{Model: "public-video", Hours: 24})
 	require.NoError(t, err)
-	assert.Empty(t, result.Groups)
+	require.Len(t, result.Groups, 1)
+	assert.Empty(t, result.Groups[0].Series)
+	assert.Zero(t, result.Groups[0].RequestCount)
+	require.NotNil(t, result.Groups[0].RecentTaskOutcomes)
+	assert.Equal(t, []string{"success"}, *result.Groups[0].RecentTaskOutcomes)
 	result, err = Query(QueryParams{Model: "public-video", Hours: 48})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), result.Summary.RequestCount)
@@ -266,6 +359,7 @@ func TestModelPerformanceTaskDelivery(t *testing.T) {
 	result, err = Query(QueryParams{Model: "public-video", Hours: 48})
 	require.NoError(t, err)
 	assert.Zero(t, result.Summary.RequestCount, "configured retention also removes durable task observations")
+	assert.Nil(t, result.Summary.RecentTaskOutcomes)
 	result, err = Query(QueryParams{Model: "public-image", Hours: 24})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), result.Summary.RequestCount, "retention preserves samples inside the boundary")
@@ -337,6 +431,7 @@ func TestModelPerformanceVideoErrorExclusions(t *testing.T) {
 	require.NotNil(t, filtered.Rate)
 	assert.Equal(t, float64(25), *filtered.Rate)
 	result.Summary.VideoFilteredSuccessRate = nil
+	result.Summary.RecentTaskOutcomes = raw.Summary.RecentTaskOutcomes
 	assert.Equal(t, raw.Summary, result.Summary, "raw metrics and average latency retain their original scope")
 
 	params.Group = "default"
@@ -478,6 +573,7 @@ func TestModelPerformanceImageErrorExclusions(t *testing.T) {
 	assert.Equal(t, float64(50), *video.Rate)
 	unfiltered := result.Summary
 	unfiltered.ImageFilteredSuccessRate, unfiltered.VideoFilteredSuccessRate = nil, nil
+	unfiltered.RecentTaskOutcomes = raw.Summary.RecentTaskOutcomes
 	assert.Equal(t, raw.Summary, unfiltered)
 	require.Len(t, result.Groups, 2)
 	defaultGroup := result.Groups[0]

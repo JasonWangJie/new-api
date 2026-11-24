@@ -22,6 +22,17 @@ export function isTaskPerformance(stats?: PerformanceStats): boolean {
   return stats?.workload != null && stats.workload !== 'relay'
 }
 
+export function getDisplayedSuccessRate(stats?: PerformanceStats): number {
+  const outcomes = stats?.recent_task_outcomes
+  if (outcomes) {
+    if (outcomes.length === 0) return Number.NaN
+    const successes = outcomes.filter((outcome) => outcome === 'success').length
+    return (successes / outcomes.length) * 100
+  }
+  if (!stats || stats.request_count === 0) return Number.NaN
+  return stats.success_rate
+}
+
 export function getPerformanceSummary(
   data?: PerformanceMetricsData['data']
 ): PerformanceStats | undefined {
