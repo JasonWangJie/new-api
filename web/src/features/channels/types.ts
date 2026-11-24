@@ -269,6 +269,30 @@ export interface ChannelTestResponse {
   }
 }
 
+export type InteractiveChannelTestMode = 'chat' | 'image'
+
+export interface InteractiveChannelTestModel {
+  model: string
+  default_mode?: InteractiveChannelTestMode | ''
+  chat_endpoint_types?: string[]
+  image_endpoint_types?: string[]
+}
+
+export interface InteractiveChannelTestRequest {
+  model: string
+  mode: InteractiveChannelTestMode
+  prompt: string
+  endpoint_type: string
+}
+
+export interface InteractiveChannelTestResult {
+  model: string
+  mode: InteractiveChannelTestMode
+  endpoint_type: string
+  text?: string
+  image?: { data_url: string; width: number; height: number }
+}
+
 export interface ChannelBalanceResponse {
   success: boolean
   message?: string

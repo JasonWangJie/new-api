@@ -35,6 +35,9 @@ import type {
   GetChannelResponse,
   GetChannelsParams,
   GetChannelsResponse,
+  InteractiveChannelTestModel,
+  InteractiveChannelTestRequest,
+  InteractiveChannelTestResult,
   MultiKeyManageParams,
   MultiKeyStatusResponse,
   SearchChannelsParams,
@@ -267,6 +270,43 @@ export async function testChannel(
     channelActionConfig({ params })
   )
   return res.data
+}
+
+export async function getInteractiveChannelTestModels(
+  id: number,
+  signal?: AbortSignal
+): Promise<InteractiveChannelTestModel[]> {
+  const response = await api.get<{
+    success: boolean
+    message?: string
+    data?: { models: InteractiveChannelTestModel[] }
+  }>(
+    `/api/channel/test/${id}/options`,
+    channelActionConfig({ signal, disableDuplicate: true })
+  )
+  return requireServerSuccess(response.data).data?.models ?? []
+}
+
+export async function runInteractiveChannelTest(
+  id: number,
+  request: InteractiveChannelTestRequest,
+  signal: AbortSignal
+) {
+  const response = await api.post<{
+    success: boolean
+    message?: string
+    error_code?: string
+    time?: number
+    data?: InteractiveChannelTestResult
+  }>(
+    `/api/channel/test/${id}`,
+    request,
+    channelActionConfig({
+      signal,
+      timeout: request.mode === 'image' ? 190_000 : 100_000,
+    })
+  )
+  return requireServerSuccess(response.data)
 }
 
 /**

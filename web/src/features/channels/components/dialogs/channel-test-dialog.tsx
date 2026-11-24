@@ -72,6 +72,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Tooltip,
   TooltipContent,
@@ -93,6 +94,7 @@ import type {
   SearchChannelsResponse,
 } from '../../types'
 import { useChannels } from '../channels-provider'
+import { InteractiveChannelTest } from './interactive-channel-test'
 
 type ChannelTestDialogProps = {
   open: boolean
@@ -322,6 +324,7 @@ function ChannelTestDialogContent({
   const batchProgressToastIdRef = useRef<ReturnType<
     typeof toast.loading
   > | null>(null)
+  const [activeTestTab, setActiveTestTab] = useState('interactive')
   const [endpointType, setEndpointType] = useState('auto')
   const [isStreamTest, setIsStreamTest] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -389,6 +392,7 @@ function ChannelTestDialogContent({
 
   const resetState = useCallback(() => {
     batchStopRequestedRef.current = true
+    setActiveTestTab('interactive')
     setEndpointType('auto')
     setIsStreamTest(false)
     setSearchTerm('')
@@ -969,7 +973,11 @@ function ChannelTestDialogContent({
             <span className='min-w-0 truncate'>{currentRow.name}</span>
           </span>
         }
-        contentClassName='max-h-[90vh] overflow-hidden sm:max-w-4xl'
+        contentClassName={
+          activeTestTab === 'interactive'
+            ? 'max-h-[90dvh] overflow-hidden sm:max-w-xl'
+            : 'max-h-[90dvh] overflow-hidden sm:max-w-4xl'
+        }
         contentHeight='auto'
         bodyClassName='space-y-4'
         footer={
@@ -978,152 +986,179 @@ function ChannelTestDialogContent({
           </Button>
         }
       >
-        <div className='max-h-[78vh] space-y-4 overflow-y-auto py-4 pr-1'>
-          <div className='grid gap-4 md:grid-cols-2'>
-            <div className='grid gap-2'>
-              <Label htmlFor='endpoint-type'>{t('Endpoint Type')}</Label>
-              <Combobox
-                options={endpointSelectItems}
-                value={endpointType}
-                onValueChange={handleEndpointTypeChange}
-                id='endpoint-type'
-                className='w-full min-w-0'
-                placeholder={t('Auto detect (default)')}
+        <Tabs
+          value={activeTestTab}
+          onValueChange={setActiveTestTab}
+          className='gap-3'
+        >
+          <TabsList
+            aria-label={t('Test Channel Connection')}
+            className='w-full sm:w-fit'
+          >
+            <TabsTrigger value='interactive'>
+              {t('Interactive Test')}
+            </TabsTrigger>
+            <TabsTrigger value='batch'>{t('Batch Test')}</TabsTrigger>
+          </TabsList>
+          <TabsContent value='interactive'>
+            {open && activeTestTab === 'interactive' && (
+              <InteractiveChannelTest
+                channelId={currentChannelId}
+                defaultModel={defaultTestModel}
+                endpointOptions={endpointSelectItems}
               />
-              <p className='text-muted-foreground text-xs'>
-                {t(
-                  'Override the endpoint used for testing. Leave empty to auto detect.'
-                )}
-              </p>
-            </div>
-            <div className='grid gap-2'>
-              <Label htmlFor='stream-toggle'>{t('Stream Mode')}</Label>
-              <div className='flex items-center gap-2'>
-                <Switch
-                  id='stream-toggle'
-                  checked={effectiveStreamTest}
-                  onCheckedChange={setIsStreamTest}
-                  disabled={streamDisabled}
+            )}
+          </TabsContent>
+          <TabsContent
+            value='batch'
+            className='max-h-[78vh] space-y-4 overflow-y-auto py-4 pr-1'
+          >
+            <div className='grid gap-4 md:grid-cols-2'>
+              <div className='grid gap-2'>
+                <Label htmlFor='endpoint-type'>{t('Endpoint Type')}</Label>
+                <Combobox
+                  options={endpointSelectItems}
+                  value={endpointType}
+                  onValueChange={handleEndpointTypeChange}
+                  id='endpoint-type'
+                  className='w-full min-w-0'
+                  placeholder={t('Auto detect (default)')}
                 />
-                <span className='text-sm'>
-                  {effectiveStreamTest ? t('Enabled') : t('Disabled')}
-                </span>
-              </div>
-              <p className='text-muted-foreground text-xs'>
-                {t('Enable streaming mode for the test request.')}
-              </p>
-            </div>
-          </div>
-
-          <div className='space-y-3 max-sm:has-[div[role="toolbar"]]:pb-16'>
-            <div className='flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between'>
-              <div className='min-w-0 space-y-2'>
-                <p className='text-sm font-medium'>{t('Channel models')}</p>
                 <p className='text-muted-foreground text-xs'>
-                  {t('Select models to run batch tests.')}
-                </p>
-                <div className='flex flex-wrap items-center gap-2'>
-                  {isBatchTesting ? (
-                    <Button
-                      variant='outline'
-                      size='sm'
-                      onClick={handleStopBatchTest}
-                      disabled={isBatchStopRequested}
-                    >
-                      {isBatchStopRequested
-                        ? t('Stopping...')
-                        : t('Stop testing')}
-                    </Button>
-                  ) : (
-                    <>
-                      <Button
-                        size='sm'
-                        onClick={() => handleBatchTest(filteredModels)}
-                        disabled={isAnyTesting || filteredModels.length === 0}
-                      >
-                        {testAllButtonLabel}
-                      </Button>
-                      {successModels.length > 0 && (
-                        <Button
-                          variant='outline'
-                          size='sm'
-                          onClick={handleSelectSuccessfulModels}
-                        >
-                          <CheckCircle2 data-icon='inline-start' />
-                          {t('Select successful models ({{count}})', {
-                            count: successModels.length,
-                          })}
-                        </Button>
-                      )}
-                      {failedModels.length > 0 && (
-                        <Button
-                          variant='outline'
-                          size='sm'
-                          onClick={() => setIsDeleteFailedDialogOpen(true)}
-                        >
-                          <Trash2 data-icon='inline-start' />
-                          {t('Delete failed models ({{count}})', {
-                            count: failedModels.length,
-                          })}
-                        </Button>
-                      )}
-                    </>
+                  {t(
+                    'Override the endpoint used for testing. Leave empty to auto detect.'
                   )}
+                </p>
+              </div>
+              <div className='grid gap-2'>
+                <Label htmlFor='stream-toggle'>{t('Stream Mode')}</Label>
+                <div className='flex items-center gap-2'>
+                  <Switch
+                    id='stream-toggle'
+                    checked={effectiveStreamTest}
+                    onCheckedChange={setIsStreamTest}
+                    disabled={streamDisabled}
+                  />
+                  <span className='text-sm'>
+                    {effectiveStreamTest ? t('Enabled') : t('Disabled')}
+                  </span>
+                </div>
+                <p className='text-muted-foreground text-xs'>
+                  {t('Enable streaming mode for the test request.')}
+                </p>
+              </div>
+            </div>
+
+            <div className='space-y-3 max-sm:has-[div[role="toolbar"]]:pb-16'>
+              <div className='flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between'>
+                <div className='min-w-0 space-y-2'>
+                  <p className='text-sm font-medium'>{t('Channel models')}</p>
+                  <p className='text-muted-foreground text-xs'>
+                    {t('Select models to run batch tests.')}
+                  </p>
+                  <div className='flex flex-wrap items-center gap-2'>
+                    {isBatchTesting ? (
+                      <Button
+                        variant='outline'
+                        size='sm'
+                        onClick={handleStopBatchTest}
+                        disabled={isBatchStopRequested}
+                      >
+                        {isBatchStopRequested
+                          ? t('Stopping...')
+                          : t('Stop testing')}
+                      </Button>
+                    ) : (
+                      <>
+                        <Button
+                          size='sm'
+                          onClick={() => handleBatchTest(filteredModels)}
+                          disabled={isAnyTesting || filteredModels.length === 0}
+                        >
+                          {testAllButtonLabel}
+                        </Button>
+                        {successModels.length > 0 && (
+                          <Button
+                            variant='outline'
+                            size='sm'
+                            onClick={handleSelectSuccessfulModels}
+                          >
+                            <CheckCircle2 data-icon='inline-start' />
+                            {t('Select successful models ({{count}})', {
+                              count: successModels.length,
+                            })}
+                          </Button>
+                        )}
+                        {failedModels.length > 0 && (
+                          <Button
+                            variant='outline'
+                            size='sm'
+                            onClick={() => setIsDeleteFailedDialogOpen(true)}
+                          >
+                            <Trash2 data-icon='inline-start' />
+                            {t('Delete failed models ({{count}})', {
+                              count: failedModels.length,
+                            })}
+                          </Button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className='flex flex-col gap-2 sm:flex-row sm:items-center'>
+                  <Input
+                    placeholder={t('Filter models...')}
+                    value={searchTerm}
+                    onChange={handleSearchTermChange}
+                    className='sm:w-64'
+                  />
                 </div>
               </div>
-              <div className='flex flex-col gap-2 sm:flex-row sm:items-center'>
-                <Input
-                  placeholder={t('Filter models...')}
-                  value={searchTerm}
-                  onChange={handleSearchTermChange}
-                  className='sm:w-64'
+
+              <div className='space-y-3'>
+                <DataTableView
+                  table={table}
+                  containerClassName='rounded-md'
+                  containerProps={{
+                    role: 'region',
+                    'aria-label': t('Channel models'),
+                  }}
+                  tableContainerClassName='max-h-90 overflow-auto **:data-[slot=table-container]:overflow-visible'
+                  tableClassName='w-max min-w-full table-auto'
+                  pinnedColumns={[
+                    {
+                      columnId: 'actions',
+                      side: 'right',
+                      cellClassName: 'bg-popover',
+                    },
+                  ]}
+                  colgroup={
+                    <colgroup>
+                      <col className='w-10 min-w-10' />
+                      <col className='w-auto' />
+                      <col className='w-28' />
+                      <col className='w-80' />
+                      <col className='w-px' />
+                    </colgroup>
+                  }
+                  getColumnClassName={(columnId) =>
+                    getTestTableColumnClass(columnId)
+                  }
+                  emptyContent={
+                    models.length
+                      ? t('No models matched your search.')
+                      : t('This channel has no configured models.')
+                  }
+                  emptyCellClassName='text-muted-foreground h-16 text-center text-sm'
                 />
+
+                <DataTablePagination table={table} />
               </div>
+
+              <TestModelsBulkActions table={table} />
             </div>
-
-            <div className='space-y-3'>
-              <DataTableView
-                table={table}
-                containerClassName='rounded-md'
-                containerProps={{
-                  role: 'region',
-                  'aria-label': t('Channel models'),
-                }}
-                tableContainerClassName='max-h-90 overflow-auto **:data-[slot=table-container]:overflow-visible'
-                tableClassName='w-max min-w-full table-auto'
-                pinnedColumns={[
-                  {
-                    columnId: 'actions',
-                    side: 'right',
-                    cellClassName: 'bg-popover',
-                  },
-                ]}
-                colgroup={
-                  <colgroup>
-                    <col className='w-10 min-w-10' />
-                    <col className='w-auto' />
-                    <col className='w-28' />
-                    <col className='w-80' />
-                    <col className='w-px' />
-                  </colgroup>
-                }
-                getColumnClassName={(columnId) =>
-                  getTestTableColumnClass(columnId)
-                }
-                emptyContent={
-                  models.length
-                    ? t('No models matched your search.')
-                    : t('This channel has no configured models.')
-                }
-                emptyCellClassName='text-muted-foreground h-16 text-center text-sm'
-              />
-
-              <DataTablePagination table={table} />
-            </div>
-
-            <TestModelsBulkActions table={table} />
-          </div>
-        </div>
+          </TabsContent>
+        </Tabs>
       </Dialog>
       <ConfirmDialog
         open={isDeleteFailedDialogOpen}

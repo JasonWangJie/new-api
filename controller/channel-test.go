@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,18 @@ type testResult struct {
 	context     *gin.Context
 	localErr    error
 	newAPIError *types.NewAPIError
+	output      *channelTestOutput
+}
+
+func supportsChannelTest(channelType int) bool {
+	switch channelType {
+	case constant.ChannelTypeMidjourney, constant.ChannelTypeMidjourneyPlus, constant.ChannelTypeSunoAPI,
+		constant.ChannelTypeKling, constant.ChannelTypeJimeng, constant.ChannelTypeDoubaoVideo,
+		constant.ChannelTypeVidu, constant.ChannelTypeTaskPlugin:
+		return false
+	default:
+		return true
+	}
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
@@ -69,22 +82,12 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, interactive *channelTestInput) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	tik := time.Now()
-	var unsupportedTestChannelTypes = []int{
-		constant.ChannelTypeMidjourney,
-		constant.ChannelTypeMidjourneyPlus,
-		constant.ChannelTypeSunoAPI,
-		constant.ChannelTypeKling,
-		constant.ChannelTypeJimeng,
-		constant.ChannelTypeDoubaoVideo,
-		constant.ChannelTypeVidu,
-		constant.ChannelTypeTaskPlugin,
-	}
-	if lo.Contains(unsupportedTestChannelTypes, channel.Type) {
+	if !supportsChannelTest(channel.Type) {
 		channelTypeName := constant.GetChannelTypeName(channel.Type)
 		return testResult{
 			localErr: fmt.Errorf("%s channel test is not supported", channelTypeName),
@@ -150,6 +153,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		requestPath = strings.Replace(requestPath, ":generateContent", ":streamGenerateContent", 1)
 	}
 	c.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, requestPath, nil)
+	if interactive != nil {
+		common.SetContextKey(c, constant.ContextKeyInteractiveChannelTest, true)
+		c.Set(common.RequestIdKey, interactive.requestID)
+	}
 
 	cache, err := model.GetUserCache(testUserID)
 	if err != nil {
@@ -165,7 +172,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("channel", channel.Type)
 	c.Set("base_url", channel.GetBaseURL())
-	group, _ := model.GetUserGroup(testUserID, false)
+	group := cache.Group
+	if interactive == nil {
+		group, _ = model.GetUserGroup(testUserID, false)
+	}
 	c.Set("group", group)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
@@ -228,6 +238,14 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	if interactive != nil {
+		if err := applyInteractiveChannelTestPrompt(request, interactive); err != nil {
+			return testResult{context: c, localErr: err}
+		}
+		if imageRequest, ok := request.(*dto.ImageRequest); ok && channel.Type == constant.ChannelTypeTabTab {
+			imageRequest.Size = ""
+		}
+	}
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -240,14 +258,19 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	info.IsChannelTest = true
+	if interactive != nil {
+		// The downstream response is assembled after the test completes.
+		info.DisablePing = true
+	}
 	info.InitChannelMeta(c)
 
-	err = attachTestBillingRequestInput(info, request)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+	if interactive == nil {
+		if err := attachTestBillingRequestInput(info, request); err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+			}
 		}
 	}
 
@@ -270,6 +293,12 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	testModel = info.UpstreamModelName
 	// 更新请求中的模型名称
 	request.SetModelName(testModel)
+	if interactive != nil && relayFormat == types.RelayFormatGemini {
+		info.RequestURLPath = strings.Replace(info.RequestURLPath, "{model}", url.PathEscape(testModel), 1)
+		if isStream {
+			info.RequestURLPath += "?alt=sse"
+		}
+	}
 
 	apiType, _ := common.ChannelType2APIType(channel.Type)
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
@@ -289,17 +318,16 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 
-	//// 创建一个用于日志的 info 副本，移除 ApiKey
-	//logInfo := info
-	//logInfo.ApiKey = ""
-	common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
-
-	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+	var priceData hosttypes.PriceData
+	if interactive == nil {
+		common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+			}
 		}
 	}
 
@@ -431,6 +459,22 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 
+	if interactive != nil && interactive.Mode == channelTestModeImage {
+		if err := validateInteractiveChannelImageRequest(jsonData, relayFormat); err != nil {
+			return testResult{
+				context: c, localErr: err,
+				newAPIError: types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid),
+			}
+		}
+		if channel.Type == constant.ChannelTypeTabTab {
+			output, err := runInteractiveTabtabImageTest(c, info, interactive, jsonData)
+			if err != nil {
+				return testResult{context: c, localErr: err, newAPIError: err}
+			}
+			return testResult{context: c, output: output}
+		}
+	}
+
 	requestBody := bytes.NewBuffer(jsonData)
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
 	resp, err := adaptor.DoRequest(c, info, requestBody)
@@ -445,6 +489,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	if resp != nil {
 		httpResp = resp.(*http.Response)
 		if httpResp.StatusCode != http.StatusOK {
+			if interactive != nil {
+				err := readInteractiveChannelTestError(c, httpResp)
+				return testResult{context: c, localErr: err, newAPIError: err}
+			}
 			err := service.RelayErrorHandler(c.Request.Context(), httpResp, true)
 			common.SysError(fmt.Sprintf(
 				"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -462,6 +510,13 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
 			}
 		}
+		if interactive != nil {
+			responseLimit := int64(channelTestTextResponseLimit)
+			if interactive.Mode == channelTestModeImage {
+				responseLimit = channelTestImageResponseLimit
+			}
+			httpResp.Body = http.MaxBytesReader(nil, httpResp.Body, responseLimit)
+		}
 	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
@@ -470,6 +525,30 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			localErr:    respErr,
 			newAPIError: respErr,
 		}
+	}
+	if interactive != nil {
+		if !info.StreamStatus.IsNormalEnd() {
+			err := errors.New("Upstream stream ended before the test completed")
+			return testResult{
+				context: c, localErr: err,
+				newAPIError: types.NewError(err, types.ErrorCodeBadResponseBody),
+			}
+		}
+		respBody := w.Body.Bytes()
+		if err := validateTestResponseBody(respBody, isStream); err != nil {
+			return testResult{
+				context: c, localErr: err,
+				newAPIError: types.NewError(err, types.ErrorCodeBadResponseBody),
+			}
+		}
+		output, err := readInteractiveChannelTestOutput(c, respBody, interactive, isStream)
+		if err != nil {
+			return testResult{
+				context: c, localErr: err,
+				newAPIError: types.NewError(err, types.ErrorCodeBadResponseBody),
+			}
+		}
+		return testResult{context: c, output: output}
 	}
 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
 	if usageErr != nil {
@@ -515,7 +594,6 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		Group:            info.UsingGroup,
 		Other:            other,
 	})
-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
 	return testResult{
 		context:     c,
 		localErr:    nil,
@@ -874,7 +952,7 @@ func TestChannel(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, nil)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -921,7 +999,7 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	summary := channelTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 	tik := time.Now()
-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), nil)
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary

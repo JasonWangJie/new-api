@@ -12,6 +12,7 @@ import (
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	hostconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -310,6 +311,22 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
+// Interactive probes can return upstream text, so retain effective credentials
+// in the synthetic request context for redaction before that text leaves the server.
+func trackChannelTestCredentials(c *gin.Context, headers http.Header, overrides map[string]string) {
+	if !common2.GetContextKeyBool(c, hostconstant.ContextKeyInteractiveChannelTest) {
+		return
+	}
+	values := make([]string, 0, len(overrides)+8)
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Api-Key", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token", "X-Amz-Security-Token", "Cookie"} {
+		values = append(values, headers.Values(name)...)
+	}
+	for _, value := range overrides {
+		values = append(values, value)
+	}
+	common2.SetContextKey(c, hostconstant.ContextKeyChannelTestCredentials, values)
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
@@ -333,6 +350,7 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		return nil, err
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
+	trackChannelTestCredentials(c, req.Header, headerOverride)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -365,6 +383,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 		return nil, err
 	}
 	applyHeaderOverrideToRequest(req, headerOverride)
+	trackChannelTestCredentials(c, req.Header, headerOverride)
 	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
@@ -488,9 +507,8 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
-	if c.GetBool("async_image_execution") {
-		// The worker owns the attempt deadline, including response body reads.
-		// Keep synchronous relay cancellation behavior unchanged.
+	if c.GetBool("async_image_execution") || common2.GetContextKeyBool(c, hostconstant.ContextKeyInteractiveChannelTest) {
+		// The worker or interactive test owns the upstream deadline, including response body reads.
 		req = req.WithContext(c.Request.Context())
 	}
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)

@@ -1200,6 +1200,19 @@ func buildGeminiAsyncImageParts(ctx context.Context, task model.AsyncImageTask, 
 }
 
 func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string, cfg service.ImageRuntimeConfig) ([]service.ImageBytes, error) {
+	return extractImageOutputs(ctx, body, platform, cfg, dto.MaxImageN)
+}
+
+// ExtractSingleImageOutput validates that the provider supplied one complete preview.
+func ExtractSingleImageOutput(ctx context.Context, body []byte, platform string, cfg service.ImageRuntimeConfig) (service.ImageBytes, error) {
+	images, err := extractImageOutputs(ctx, body, platform, cfg, 1)
+	if err != nil {
+		return service.ImageBytes{}, err
+	}
+	return images[0], nil
+}
+
+func extractImageOutputs(ctx context.Context, body []byte, platform string, cfg service.ImageRuntimeConfig, maxImages int) ([]service.ImageBytes, error) {
 	var references []string
 	openAIResponse := platform == "openai"
 	if !openAIResponse {
@@ -1261,8 +1274,8 @@ func ExtractAsyncImageOutputs(ctx context.Context, body []byte, platform string,
 			}
 		}
 	}
-	if len(references) == 0 || len(references) > dto.MaxImageN {
-		return nil, fmt.Errorf("upstream must return between 1 and %d complete images", dto.MaxImageN)
+	if len(references) == 0 || len(references) > maxImages {
+		return nil, fmt.Errorf("upstream must return between 1 and %d complete images", maxImages)
 	}
 	images := make([]service.ImageBytes, 0, len(references))
 	for _, reference := range references {
