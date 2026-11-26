@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -5882,6 +5883,78 @@ func TestAsyncImageOutputMIMECompatibility(t *testing.T) {
 			if tc.wantError != "" {
 				assert.ErrorContains(t, err, tc.wantError)
 			}
+		})
+	}
+}
+
+func TestAsyncImageStagedRasterValidation(t *testing.T) {
+	pngImage := asyncImageBytesFixture(t)
+	badPNG := bytes.Clone(pngImage.Data)
+	badPNG[len(badPNG)-1] ^= 1 // Damage the IEND CRC without changing the PNG header.
+	var jpegData bytes.Buffer
+	require.NoError(t, jpeg.Encode(&jpegData, image.NewRGBA(image.Rect(0, 0, 3, 2)), nil))
+	cfg := DefaultImageRuntimeConfig()
+
+	for _, tc := range []struct {
+		name, mime string
+		data, bad  []byte
+	}{
+		{"PNG", "image/png", pngImage.Data, badPNG},
+		{"JPEG", "image/jpeg", jpegData.Bytes(), jpegData.Bytes()[:jpegData.Len()-1]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "data:" + tc.mime + ";base64," + base64.StdEncoding.EncodeToString(tc.data)
+			output, err := DownloadImageOutput(t.Context(), raw, cfg)
+			require.NoError(t, err)
+			require.Equal(t, tc.mime, output.ContentType)
+			require.Equal(t, tc.data, output.Data)
+			staged := model.AsyncImageStagingObject{
+				Data: bytes.Clone(output.Data), ContentType: output.ContentType,
+				Checksum: output.Checksum, Width: output.Width, Height: output.Height,
+			}
+			maxBytes, maxPixels := int64(len(output.Data)), int64(output.Width*output.Height)
+
+			validated, err := validatedImageOutputs.validateStaged(staged, maxBytes, maxPixels)
+			require.NoError(t, err)
+			assert.Equal(t, output, validated)
+
+			var restarted imageOutputValidationCache
+			legacy := staged
+			legacy.Data = append(bytes.Clone(staged.Data), []byte("legacy suffix")...)
+			validated, err = restarted.validateStaged(legacy, int64(len(legacy.Data)), maxPixels)
+			require.NoError(t, err)
+			assert.Equal(t, output, validated, "an old row without a cache entry still uses container normalization")
+
+			_, err = validatedImageOutputs.validateStaged(staged, maxBytes-1, maxPixels)
+			assert.Error(t, err, "a verified image must fit the current byte limit")
+			_, err = validatedImageOutputs.validateStaged(staged, maxBytes, maxPixels-1)
+			assert.Error(t, err, "a verified image must fit the current pixel limit")
+
+			wrongDimensions := staged
+			wrongDimensions.Width, wrongDimensions.Height = 1, 1
+			_, err = validatedImageOutputs.validateStaged(wrongDimensions, maxBytes, 1)
+			assert.Error(t, err, "smaller staged dimensions must not bypass the pixel limit")
+			validated, err = validatedImageOutputs.validateStaged(wrongDimensions, maxBytes, maxPixels)
+			require.NoError(t, err)
+			assert.Equal(t, output, validated, "legacy dimension metadata may differ from the decoded image")
+
+			wrongMIME := staged
+			wrongMIME.ContentType = "image/webp"
+			_, err = validatedImageOutputs.validateStaged(wrongMIME, maxBytes, maxPixels)
+			assert.ErrorContains(t, err, "declared image MIME does not match its bytes")
+
+			wrongHash := staged
+			wrongHash.Checksum = strings.Repeat("0", 64)
+			_, err = validatedImageOutputs.validateStaged(wrongHash, maxBytes, maxPixels)
+			assert.ErrorIs(t, err, model.ErrImageConflict)
+
+			corrupted := staged
+			corrupted.Data = tc.bad
+			_, err = validatedImageOutputs.validateStaged(corrupted, maxBytes, maxPixels)
+			assert.Error(t, err, "altered bytes must not reuse the original validation")
+			corrupted.Checksum = fmt.Sprintf("%x", sha256.Sum256(corrupted.Data))
+			_, err = validatedImageOutputs.validateStaged(corrupted, maxBytes, maxPixels)
+			assert.Error(t, err, "a matching database checksum alone cannot validate corrupt data")
 		})
 	}
 }

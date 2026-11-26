@@ -339,7 +339,12 @@ func validateImageOutputBytes(data []byte, declared string, maxBytes, maxPixels 
 			declared = ""
 		}
 	}
-	return validateStoredImageBytes(data, declared, maxBytes, maxPixels)
+	image, err := validateStoredImageBytes(data, declared, maxBytes, maxPixels)
+	if err != nil {
+		return ImageBytes{}, err
+	}
+	validatedImageOutputs.remember(image)
+	return image, nil
 }
 
 // Stored outputs include animated GIF and passive SVG; reference inputs retain

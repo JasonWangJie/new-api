@@ -582,7 +582,7 @@ func PreviewMediaRouting(ctx context.Context, input MediaRoutingPreviewRequest) 
 			if candidate.AvailableAccounts == 0 {
 				candidate.Reasons = append(candidate.Reasons, "no_enabled_account")
 			}
-			if candidate.UpstreamModel == "" && (input.MediaType != "video" || input.Platform != "mixed") {
+			if input.MediaType == "image" {
 				var mappingErr error
 				candidate.UpstreamModel, mappingErr = ResolveImageChannelUpstreamModel(channel, input.Model)
 				if mappingErr != nil {

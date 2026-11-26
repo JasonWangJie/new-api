@@ -1590,12 +1590,9 @@ func UploadAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		if err := model.DB.WithContext(ctx).Where("id = ? AND task_id = ?", metadata.Id, task.TaskId).Take(&saved).Error; err != nil {
 			return err
 		}
-		image, err := validateStoredImageBytes(saved.Data, saved.ContentType, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
+		image, err := validatedImageOutputs.validateStaged(saved, cfg.DownloadMaxBytes, cfg.DownloadMaxPixels)
 		if err != nil {
 			return err
-		}
-		if image.Checksum != saved.Checksum {
-			return model.ErrImageConflict
 		}
 		object, err := StoreImageIntent(ctx, intents[i], image, task.CreatedAt+int64(cfg.ResultRetentionDays)*86400)
 		if err != nil {
