@@ -125,6 +125,58 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+test('read-only rules show and copy the complete rule ID', async () => {
+  const policy = fixture()
+  const rule = policy.rules[0]
+  rule.id = '080f8831-9847-4565-bca0-e7e753b268db'
+  const user = userEvent.setup()
+
+  show(<RetryPolicyForm initial={policy} canManage={false} />)
+
+  const row = within(screen.getByRole('row', { name: /Reference repair/ }))
+  expect(row.getByText(rule.id)).toBeVisible()
+  await user.click(row.getByRole('button', { name: 'Copy rule ID' }))
+  expect(await navigator.clipboard.readText()).toBe(rule.id)
+})
+
+test('read-only rules can be filtered by name or ID and restored by clearing the search', async () => {
+  const policy = fixture()
+  const reference = policy.rules[0]
+  reference.id = '080f8831-9847-4565-bca0-e7e753b268db'
+  const capacity = {
+    ...copyRetryRule(reference),
+    id: 'fe537acc-06a3-4c92-8d8b-acf3285a248f',
+    name: 'Capacity fallback',
+  }
+  policy.rules.push(capacity)
+  const user = userEvent.setup()
+  show(<RetryPolicyForm initial={policy} canManage={false} />)
+  const search = screen.getByRole('searchbox', { name: 'Search rules...' })
+
+  await user.type(search, 'rEpAiR')
+  expect(screen.getByRole('row', { name: /Reference repair/ })).toBeVisible()
+  expect(screen.queryByRole('row', { name: /Capacity fallback/ })).toBeNull()
+
+  await user.clear(search)
+  await user.type(search, '06A3-4C92')
+  expect(screen.getByRole('row', { name: /Capacity fallback/ })).toBeVisible()
+  expect(screen.queryByRole('row', { name: /Reference repair/ })).toBeNull()
+
+  await user.clear(search)
+  await user.paste(`  ${reference.id}  `)
+  expect(screen.getByRole('row', { name: /Reference repair/ })).toBeVisible()
+  expect(screen.queryByRole('row', { name: /Capacity fallback/ })).toBeNull()
+
+  await user.clear(search)
+  await user.type(search, 'unlisted rule')
+  expect(screen.getByText('No matching rules')).toBeVisible()
+
+  await user.clear(search)
+  expect(screen.getByRole('row', { name: /Reference repair/ })).toBeVisible()
+  expect(screen.getByRole('row', { name: /Capacity fallback/ })).toBeVisible()
+  expect(imageRequest).not.toHaveBeenCalled()
+})
+
 test('reopening after a successful save keeps the saved policy and revision', async () => {
   useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role: 100 })
   const policy = fixture()
@@ -369,7 +421,7 @@ test('removes a rule from the draft after confirmation and saves it with the cur
   )
 })
 
-test('shows recently edited rules first while moving rules by execution priority', async () => {
+test('shows recently edited rules first and moves filtered rules by global execution priority', async () => {
   const policy = fixture()
   const original = {
     ...policy.rules[0],
@@ -389,6 +441,11 @@ test('shows recently edited rules first while moving rules by execution priority
   show(<RetryPolicyForm initial={policy} canManage />)
   expect(screen.getAllByRole('row')[1]).toHaveTextContent('New reference rule')
   const user = userEvent.setup()
+  await user.type(
+    screen.getByPlaceholderText('Filter by name or ID...'),
+    'new reference'
+  )
+  expect(screen.queryByRole('row', { name: /Reference repair/ })).toBeNull()
   await user.click(
     within(screen.getByRole('row', { name: /New reference rule/ })).getByRole(
       'button',
@@ -782,6 +839,8 @@ test('opens sample occurrences and creates a draft from the selected task failur
           stage: 'prepare',
           count: 2,
           task_count: 2,
+          executed_count: 1,
+          succeeded_task_count: 1,
           last_seen: 1,
           latest_event_id: 8,
         },
@@ -817,10 +876,19 @@ test('opens sample occurrences and creates a draft from the selected task failur
     />
   )
   const user = userEvent.setup()
+  const sampleRow = await screen.findByRole('row', { name: /reference failed/ })
+  expect(
+    screen.getByRole('columnheader', { name: 'Rule for latest event' })
+  ).toBeVisible()
+  expect(
+    within(sampleRow).getByRole('cell', { name: 'Unmatched' })
+  ).toBeVisible()
+  expect(within(sampleRow).getAllByRole('cell', { name: '1' })).toHaveLength(2)
   await user.click(await screen.findByRole('button', { name: 'Details' }))
   const dialog = await screen.findByRole('dialog')
   expect(await within(dialog).findByText('task-with-error')).toBeVisible()
   expect(within(dialog).getByText('22')).toBeVisible()
+  expect(within(dialog).getByText('Built-in policy')).toBeVisible()
   expect(within(dialog).getByText('Succeeded')).toBeVisible()
   await user.click(
     within(dialog).getByRole('button', { name: 'Create rule from error' })

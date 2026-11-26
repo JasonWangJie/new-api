@@ -27,9 +27,11 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SettingsCard } from '@/features/system-settings/components/settings-card'
@@ -127,6 +129,7 @@ export function RetryPolicyForm(props: {
   const [dirty, setDirty] = useState(() => Boolean(props.initialSaveError))
   const [resumedError, setResumedError] = useState(props.initialSaveError)
   const [tab, setTab] = useState('rules')
+  const [ruleSearch, setRuleSearch] = useState('')
   const [editor, setEditor] = useState<RetryRule | null>(() =>
     props.source && props.canManage ? newRetryRule(props.source) : null
   )
@@ -149,8 +152,15 @@ export function RetryPolicyForm(props: {
   })
   const saveError = save.error || resumedError
   const editable = props.canManage && !save.isPending
+  const ruleQuery = ruleSearch.trim().toLowerCase()
   const displayedRules = policy.rules
     .map((rule, priorityIndex) => ({ rule, priorityIndex }))
+    .filter(
+      ({ rule }) =>
+        !ruleQuery ||
+        rule.name.toLowerCase().includes(ruleQuery) ||
+        rule.id.toLowerCase().includes(ruleQuery)
+    )
     .sort((a, b) => (b.rule.updated_at ?? 0) - (a.rule.updated_at ?? 0))
   function update(next: RetryPolicy) {
     setPolicy(next)
@@ -322,12 +332,22 @@ export function RetryPolicyForm(props: {
               </Button>
             )}
           </div>
+          <Input
+            type='search'
+            aria-label={t('Search rules...')}
+            placeholder={t('Filter by name or ID...')}
+            value={ruleSearch}
+            onChange={(event) => setRuleSearch(event.target.value)}
+            className='sm:max-w-xs'
+          />
           <StaticDataTable
             data={displayedRules}
             getRowKey={({ rule }) => rule.id}
-            emptyContent={t(
-              'No custom rules. Built-in policies remain active.'
-            )}
+            emptyContent={
+              policy.rules.length > 0
+                ? t('No matching rules')
+                : t('No custom rules. Built-in policies remain active.')
+            }
             columns={[
               {
                 id: 'rule',
@@ -335,6 +355,18 @@ export function RetryPolicyForm(props: {
                 cell: ({ rule }) => (
                   <div className='min-w-48 space-y-1'>
                     <p className='font-medium'>{rule.name}</p>
+                    <div className='text-muted-foreground flex max-w-sm items-center gap-1 text-xs'>
+                      <span className='shrink-0'>{t('Rule ID')}</span>
+                      <code className='min-w-0 wrap-anywhere whitespace-normal'>
+                        {rule.id}
+                      </code>
+                      <CopyButton
+                        value={rule.id}
+                        tooltip={t('Copy rule ID')}
+                        className='size-7'
+                        iconClassName='size-3'
+                      />
+                    </div>
                     {!!rule.updated_at && (
                       <p className='text-muted-foreground text-xs'>
                         {t('Last updated')} ·{' '}

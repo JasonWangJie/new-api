@@ -16,6 +16,26 @@ import (
 var errImageRetryPolicyChanged = errors.New("image retry policy changed before dispatch")
 var errImageRetryPolicyUnavailable = errors.New("image retry policy is unavailable")
 
+func isHuahuoImageJobFailure(fact mediaretry.Fact) bool {
+	return fact.Provider == constant.HuahuoImagePluginKey && fact.HasUpstreamTask && !fact.HasOutput
+}
+
+func canEvaluateImageRetryPolicy(fact mediaretry.Fact) bool {
+	return !isHuahuoImageJobFailure(fact) || !fact.Unknown && fact.ImageEvidence != nil && fact.ImageEvidence.UpstreamTerminal
+}
+
+func evaluateImageRetryPolicy(policy mediaretry.Policy, fact mediaretry.Fact, state mediaretry.State) (mediaretry.Decision, error) {
+	if !canEvaluateImageRetryPolicy(fact) {
+		return mediaretry.Decision{}, nil
+	}
+	decision, err := evaluateMediaRetryPolicy(policy, fact, state)
+	if isHuahuoImageJobFailure(fact) && (decision.RequestedAction == mediaretry.SameChannel || decision.RequestedAction == mediaretry.LocalSameChannel || decision.RequestedAction == mediaretry.PollSameJob) {
+		// A confirmed failure permits a new generation on another channel only.
+		decision.Action, decision.BlockedReason = mediaretry.Stop, "other_channel_required"
+	}
+	return decision, err
+}
+
 // validateAsyncImageDispatch repeats read-only authorization after potentially
 // slow reference preparation. It checks the selected account, never acquires a
 // second execution slot or re-reserves the original hold.
@@ -343,7 +363,7 @@ func refreshImageRetryDecision(ctx context.Context, task *model.AsyncImageTask, 
 	if err := common.UnmarshalJsonStr(task.RetryPolicyState, &checkpoint); err != nil {
 		return checkpoint, false, err
 	}
-	if !checkpoint.Pending && !checkpoint.BuiltinPending {
+	if !checkpoint.Pending && !checkpoint.BuiltinPending || !canEvaluateImageRetryPolicy(checkpoint.Fact) {
 		return checkpoint, false, nil
 	}
 	checkpoint.State.Now, checkpoint.State.TotalLimit = time.Now().Unix(), cfg.TotalRetries
@@ -351,7 +371,11 @@ func refreshImageRetryDecision(ctx context.Context, task *model.AsyncImageTask, 
 	if checkpoint.ReservedRetry {
 		checkpoint.State.TotalUsed = max(0, task.RetryCount-1)
 	}
-	decision, err := EvaluateMediaRetry(ctx, checkpoint.Fact, checkpoint.State)
+	policy, err := GetMediaRetryPolicy(ctx)
+	if err != nil {
+		return checkpoint, false, fmt.Errorf("%w: %v", errImageRetryPolicyUnavailable, err)
+	}
+	decision, err := evaluateImageRetryPolicy(policy, checkpoint.Fact, checkpoint.State)
 	if err != nil {
 		return checkpoint, false, fmt.Errorf("%w: %v", errImageRetryPolicyUnavailable, err)
 	}

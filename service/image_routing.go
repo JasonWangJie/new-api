@@ -1110,6 +1110,7 @@ type ImageAccount struct {
 }
 
 var ErrImageCompatibleAccountsExhausted = errors.New("no other eligible image account supports the request")
+var errNoEligibleImageAccount = errors.New("no eligible image account in the selected pool")
 
 type ImageAccountRouting struct {
 	RetryFromChannelID      int
@@ -1233,7 +1234,7 @@ func eligibleImageChannels(ctx context.Context, policy model.ImageGroupPolicy, r
 		channels = available
 	}
 	if len(channels) == 0 {
-		return nil, ImageAccountRouting{}, errors.New("no eligible image account in the selected pool")
+		return nil, ImageAccountRouting{}, errNoEligibleImageAccount
 	}
 	// Prefer a channel with room before applying priority and weight. The worker
 	// still acquires its slot atomically, so this snapshot never authorizes a

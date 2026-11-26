@@ -194,4 +194,11 @@ test('Traditional Chinese translates scenarios, output options and polling while
       ]
     )
   ).toBeVisible()
+  expect(
+    screen.getByText(
+      zhTW.translation[
+        'If the service retries a confirmed image generation failure, the same task may return to queued or generating. Keep polling its original query_url until the task finishes.'
+      ]
+    )
+  ).toHaveTextContent('請繼續輪詢原本的 query_url')
 })

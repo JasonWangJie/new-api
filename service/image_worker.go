@@ -515,8 +515,16 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 	}
 	if replayFailure {
 		failure := &AsyncImageFailure{Code: checkpoint.FailureCode, InternalCode: checkpoint.FailureInternalCode, Message: checkpoint.Fact.Message, HTTPStatus: checkpoint.Fact.HTTPStatus, ProviderCode: checkpoint.Fact.ErrorCode, ExecutionUnknown: checkpoint.Fact.Unknown, UpstreamTerminal: checkpoint.Fact.Terminal}
+		if evidence := checkpoint.Fact.ImageEvidence; evidence != nil {
+			failure.UpstreamTerminal = evidence.UpstreamTerminal
+			failure.SubmissionRejected = evidence.SubmissionRejected
+			failure.SynchronousRetryableResponse = evidence.SynchronousRetryableResponse
+		}
 		source := *task
 		source.ChannelId, source.DispatchedAt, source.UpstreamTaskId = checkpoint.Fact.ChannelID, checkpoint.SourceDispatchedAt, checkpoint.SourceUpstreamTaskID
+		if checkpoint.Fact.Provider != "" {
+			source.Provider = checkpoint.Fact.Provider
+		}
 		return failAsyncImageInvocation(ctx, source, failure, cfg)
 	}
 	if task.RetryCount > 0 && !checkpoint.Pending && !knownUpstreamTask && !acceptedOutput && (checkpoint.FailureInternalCode == "upstream_transport_timeout" || checkpoint.FailureInternalCode == "execution_deadline") {
@@ -618,6 +626,14 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 		// the prior attempt's channel snapshot.
 		channel, account, err = PickImageChannel(ctx, policy, request, routing)
 		if err != nil {
+			if checkpoint.Pending && isHuahuoImageJobFailure(checkpoint.Fact) &&
+				(errors.Is(err, errNoEligibleImageAccount) || errors.Is(err, ErrImageCompatibleAccountsExhausted) || errors.Is(err, ErrImageTimeoutAccountsExhausted)) {
+				// The original channel is excluded from this rule. With no replacement,
+				// end the confirmed failure without spending an unsent retry.
+				checkpoint.Decision.Action, checkpoint.Decision.BlockedReason = mediaretry.Stop, "no_compatible_account"
+				checkpoint.ReservedRetry = false
+				return commitImagePolicyDecision(ctx, *task, &AsyncImageFailure{Message: checkpoint.Fact.Message}, cfg, checkpoint, map[string]any{"retry_count": checkpoint.State.TotalUsed})
+			}
 			if errors.Is(err, ErrImageCompatibleAccountsExhausted) {
 				failure := &AsyncImageFailure{Code: 603, InternalCode: "image_compatible_accounts_exhausted", Message: "No other eligible image account supports the requested size or resolution"}
 				for i := len(attempts) - 1; i >= 0; i-- {
@@ -905,7 +921,7 @@ func invokeAsyncImageTask(ctx context.Context, task *model.AsyncImageTask, cfg I
 				return errImageRetryPolicyChanged
 			}
 			if checkpoint.Pending || checkpoint.BuiltinPending {
-				current, err := EvaluateMediaRetry(attemptCtx, checkpoint.Fact, checkpoint.State)
+				current, err := evaluateImageRetryPolicy(policy, checkpoint.Fact, checkpoint.State)
 				if err != nil {
 					return fmt.Errorf("%w: %v", errImageRetryPolicyChanged, err)
 				}
@@ -1182,7 +1198,6 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 	}
 	deadlineFailover := false
 	huahuoDispatched := task.Provider == constant.HuahuoImagePluginKey && task.UpstreamTaskId != ""
-	huahuoRecovery := huahuoDispatched && !acceptedOutput
 	policyCheckpoint, policyErr := ImageRetryFailureContext(task, failure, replayRequest, cfg)
 	if policyErr != nil {
 		return imageFailurePlan{}, policyErr
@@ -1194,17 +1209,15 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 		updates["retry_count"] = task.RetryCount
 	}
 	livePolicy := mediaretry.Policy{}
-	if huahuoRecovery {
-		// Once dispatched, this task may query its original operation or end.
-		// A subsequent generation requires a new client task.
-		policyCheckpoint.Decision = mediaretry.Decision{}
-	} else if policyOverride == nil {
-		livePolicy, policyErr = GetMediaRetryPolicy(ctx)
-	} else {
-		livePolicy = *policyOverride
-	}
-	if !huahuoRecovery && policyErr == nil {
-		policyCheckpoint.Decision, policyErr = evaluateMediaRetryPolicy(livePolicy, policyCheckpoint.Fact, policyCheckpoint.State)
+	if canEvaluateImageRetryPolicy(policyCheckpoint.Fact) {
+		if policyOverride == nil {
+			livePolicy, policyErr = GetMediaRetryPolicy(ctx)
+		} else {
+			livePolicy = *policyOverride
+		}
+		if policyErr == nil {
+			policyCheckpoint.Decision, policyErr = evaluateImageRetryPolicy(livePolicy, policyCheckpoint.Fact, policyCheckpoint.State)
+		}
 	}
 	if policyErr != nil {
 		if !policyCheckpoint.Fact.HasOutput && !(policyCheckpoint.Fact.HasUpstreamTask && !policyCheckpoint.Fact.Terminal) {
@@ -1387,7 +1400,7 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 	} else if failure.ExecutionUnknown {
 		status = model.ImageTaskExecutionUnknown
 		updates["public_error_code"] = 608
-		if huahuoRecovery {
+		if isHuahuoImageJobFailure(policyCheckpoint.Fact) {
 			updates["reconciliation_status"] = "upstream_unconfirmed"
 		}
 	} else if task.UpstreamTaskId != "" && !failure.UpstreamTerminal && (failure.InternalCode == "execution_deadline" || task.StartedAt > 0 && time.Now().Unix() >= model.AsyncImageExecutionDeadline(task, cfg.ExecutionTimeout) || failure.Code != 605 && failure.Code != 606) {

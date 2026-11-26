@@ -388,7 +388,9 @@ func TestHuahuoImageCompletionRefreshAfterWorkerRestart(t *testing.T) {
 	require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&result).Error)
 	var object model.ImageStorageObject
 	require.NoError(t, db.Where("object_id = ?", result.ObjectId).Take(&object).Error)
-	stored, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(object.ObjectKey)))
+	storage, err := service.GetImageObjectStorage(ctx, object)
+	require.NoError(t, err)
+	stored, err := storage.Read(ctx, object.ObjectKey, 1<<20)
 	require.NoError(t, err)
 	assert.Equal(t, validImage.Data, stored)
 	assert.Empty(t, task.RequestCipher)

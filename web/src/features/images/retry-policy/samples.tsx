@@ -174,6 +174,11 @@ export function RetrySamples(props: {
       {samples.isPending && <p role='status'>{t('Loading...')}</p>}
       {samples.error && <p role='alert'>{samples.error.message}</p>}
       {event.error && <p role='alert'>{event.error.message}</p>}
+      <p className='text-muted-foreground text-sm'>
+        {t(
+          'Each row groups similar errors. Execution and later success counts include built-in policies.'
+        )}
+      </p>
       <StaticDataTable
         data={samples.data?.items ?? []}
         emptyContent={t('No error samples')}
@@ -209,7 +214,7 @@ export function RetrySamples(props: {
           },
           {
             id: 'rule',
-            header: t('Matched rule'),
+            header: t('Rule for latest event'),
             cell: (sample) => (
               <p className='max-w-40 wrap-anywhere whitespace-normal'>
                 {sample.rule_id || t('Unmatched')}
@@ -544,7 +549,10 @@ function RetrySampleEvents(props: {
             header: t('Matched rule'),
             cell: (record) => (
               <div className='whitespace-normal'>
-                <p>{record.rule_id || t('Unmatched')}</p>
+                <p>
+                  {record.rule_id ||
+                    t(record.executed ? 'Built-in policy' : 'Unmatched')}
+                </p>
                 <p>
                   {t('Version')}: {record.revision}
                 </p>

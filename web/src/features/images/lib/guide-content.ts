@@ -343,6 +343,9 @@ export function asyncImageGuide(
           'Poll query_url with the submitting API key. Stages are queued, generating, saving, completed and failed. Download data[].url after stage=completed and status=succeeded, provided result_expired is not true and data is available.'
         ),
         t(
+          'If the service retries a confirmed image generation failure, the same task may return to queued or generating. Keep polling its original query_url until the task finishes.'
+        ),
+        t(
           'Local image and video links use /v1/media/files/. Image results may instead use configured image-host links or eligible upstream links, selected independently for each image. Use each complete returned URL and allow redirects. Expired results may retain a successful task status while returning empty data.'
         ),
         t(
