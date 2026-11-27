@@ -36,6 +36,7 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 		c.Abort()
 		return true
 	}
+	retest, _ := c.Request.Context().Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
 	sourceModes := make(map[string]string)
 	sourceInputs := make(map[string][]jsplugin.VideoRetryInput)
 	for _, group := range groups {
@@ -56,6 +57,9 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 			return true
 		}
 		for _, channel := range channels {
+			if retest.channelID > 0 && channel.Id != retest.channelID {
+				continue
+			}
 			candidate, decodeErr := service.DecodeMixedVideoCandidate(c.Request.Context(), channel, route.Model, route.Operation, raw, capability.VideoOverrides, token.UserId, contentType)
 			if decodeErr != nil {
 				continue
@@ -107,6 +111,13 @@ func routeConditionalVideo(c *gin.Context, token model.Token, policy model.Image
 				AsyncImagePublicError(c, 403, "model_not_allowed", "Requested video model is not allowed")
 				c.Abort()
 				return true
+			}
+			if retest.channelID > 0 {
+				resolution, _ := routingFacts["resolution"].(string)
+				rule.Targets = slices.DeleteFunc(slices.Clone(rule.Targets), func(target model.VideoRoutingTarget) bool {
+					return target.ChannelID != retest.channelID || target.Model != route.Model ||
+						target.Resolution != "" && target.Resolution != service.NormalizeVideoResolution(resolution)
+				})
 			}
 			snapshot, candidate, dispatch, dispatchType, err := service.PlanVideoRouting(c.Request.Context(), config, rule, group, route.Model, route.Operation, raw, contentType, routingFacts, token.UserId, pinnedID, constraints.Filters, sourceInputs[group])
 			if err != nil {

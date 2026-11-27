@@ -24,15 +24,17 @@ func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
 	policies := []struct {
 		condition string
 		statuses  []string
+		bounds    []any
 		updates   map[string]any
 	}{
-		{"expires_at > 0 AND expires_at <= ? AND status IN ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}},
-		{"request_retain_until > 0 AND request_retain_until <= ? AND status IN ? AND request_cipher IS NOT NULL", []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, map[string]any{"request_cipher": nil}},
+		{"status IN ? AND expires_at > 0 AND expires_at <= ? AND (prompt_summary <> '' OR request_cipher IS NOT NULL OR reference_urls <> '')", []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, []any{now}, map[string]any{"prompt_summary": "", "request_cipher": nil, "reference_urls": ""}},
+		{"status IN ? AND ((request_retain_until > 0 AND request_retain_until <= ?) OR (finished_at > 0 AND finished_at <= ?)) AND request_cipher IS NOT NULL", []string{ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, []any{now, now - MediaReplayRetentionSeconds}, map[string]any{"request_cipher": nil}},
 	}
 	var failures []error
 	for _, policy := range policies {
 		var ids []int
-		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where(policy.condition, now, policy.statuses).Order("id").Limit(200).Pluck("id", &ids).Error; err != nil {
+		args := append([]any{policy.statuses}, policy.bounds...)
+		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where(policy.condition, args...).Order("id").Limit(200).Pluck("id", &ids).Error; err != nil {
 			failures = append(failures, err)
 			continue
 		}
@@ -41,7 +43,7 @@ func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
 		}
 		// Recheck retention and terminal state after selection so active recovery
 		// remains protected even when it races this bounded maintenance batch.
-		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where("id IN ?", ids).Where(policy.condition, now, policy.statuses).Updates(policy.updates).Error; err != nil {
+		if err := DB.WithContext(ctx).Model(&AsyncImageTask{}).Where("id IN ?", ids).Where(policy.condition, args...).Updates(policy.updates).Error; err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -50,7 +52,10 @@ func EraseExpiredAsyncImageTaskContent(ctx context.Context) error {
 
 // AcceptAsyncImageTask serializes admission on its user and Token and commits the task,
 // idempotency binding, input references, event and queue command together.
-func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash string, inputIds []string) (AsyncImageTask, bool, error) {
+func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash string, inputIds []string, replay ...*MediaReplaySnapshot) (AsyncImageTask, bool, error) {
+	if len(replay) > 1 {
+		return task, false, ErrImageConflict
+	}
 	if keyHash != "" {
 		var prior AsyncImageIdempotency
 		err := DB.WithContext(ctx).Where("token_id = ? AND key_hash = ?", task.TokenId, keyHash).Take(&prior).Error
@@ -72,6 +77,7 @@ func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash stri
 	task.CreatedAt = now
 	task.UpdatedAt = now
 	task.NextAttemptAt = now
+	task.HasReplaySnapshot = len(replay) == 1 && replay[0] != nil
 	reused := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user User
@@ -107,14 +113,13 @@ func AcceptAsyncImageTask(ctx context.Context, task AsyncImageTask, keyHash stri
 		if err := tx.Create(&task).Error; err != nil {
 			return err
 		}
-		for _, id := range inputIds {
-			var input ImageInputObject
-			if err := lockForUpdate(tx).Where("input_id = ? AND token_id = ? AND status = ? AND expires_at > ?", id, task.TokenId, "active", now).Take(&input).Error; err != nil {
+		if task.HasReplaySnapshot {
+			if err := createMediaReplaySnapshot(tx, MediaReplayImage, task.TaskId, replay[0]); err != nil {
 				return err
 			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ImageInputTaskReference{TaskId: task.TaskId, InputId: id}).Error; err != nil {
-				return err
-			}
+		}
+		if err := bindImageInputReferences(tx, task.TaskId, task.TokenId, inputIds, now); err != nil {
+			return err
 		}
 		event := AsyncImageEvent{TaskId: task.TaskId, EventKey: common.GetUUID(), EventType: "accepted", Status: task.Status, CreatedAt: now}
 		if err := tx.Create(&event).Error; err != nil {
@@ -401,6 +406,11 @@ func CompleteAsyncImageTask(ctx context.Context, task AsyncImageTask, autoArchiv
 		}
 		if updated.RowsAffected != 1 {
 			return ErrImageConflict
+		}
+		if task.HasReplaySnapshot {
+			if err := updateMediaReplaySnapshot(tx, MediaReplayImage, task.TaskId, ImageTaskSucceeded, now); err != nil {
+				return err
+			}
 		}
 		if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {
 			return err
@@ -712,9 +722,9 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 			}
 			if kind == "" {
 				updates["request_cipher"] = nil
-				if requestRetentionHours > 0 && len(task.RequestCipher) > 0 {
+				if !task.HasReplaySnapshot && requestRetentionHours > 0 && len(task.RequestCipher) > 0 {
 					updates["request_cipher"] = task.RequestCipher
-					updates["request_retain_until"] = now + int64(min(requestRetentionHours, 168))*3600
+					updates["request_retain_until"] = now + min(int64(requestRetentionHours)*3600, MediaReplayRetentionSeconds)
 				}
 			}
 			var decision ImageRetryDecision
@@ -749,6 +759,11 @@ func RecoverAsyncImageTasks(ctx context.Context, limit, timeout int, requestRete
 				}
 				if changed.RowsAffected != 1 {
 					return ErrImageConflict
+				}
+				if task.HasReplaySnapshot {
+					if err := updateMediaReplaySnapshot(tx, MediaReplayImage, task.TaskId, updates["status"].(string), now); err != nil {
+						return err
+					}
 				}
 				if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {
 					return err

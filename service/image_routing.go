@@ -1186,6 +1186,9 @@ func eligibleImageChannels(ctx context.Context, policy model.ImageGroupPolicy, r
 		return nil, ImageAccountRouting{}, err
 	}
 	channels = slices.DeleteFunc(channels, func(channel model.Channel) bool {
+		if request.RetestChannelID > 0 && channel.Id != request.RetestChannelID {
+			return true
+		}
 		capability := ImageChannelCapability(channel, request.Model)
 		if request.Provider != "" && capability.Provider != request.Provider {
 			return true
@@ -1732,6 +1735,26 @@ func ValidateAsyncImageEligibility(ctx context.Context, token model.Token, reque
 	channels, err := ImageCandidateChannels(ctx, policy, request.Model, resolution)
 	if err != nil {
 		return policy, model.ImageFundingSelection{}, err
+	}
+	if request.RetestChannelID > 0 {
+		index := slices.IndexFunc(channels, func(channel model.Channel) bool { return channel.Id == request.RetestChannelID })
+		if index < 0 {
+			return policy, model.ImageFundingSelection{}, errors.New("selected image channel is disabled or outside the authorized model and resolution pool")
+		}
+		channel := channels[index]
+		channels = channels[index : index+1]
+		channelCapability := ImageChannelCapability(channel, request.Model)
+		if !ImageCapabilitySupportsRequest(channelCapability, request) {
+			return invalid("selected image channel does not support this generation or edit operation")
+		}
+		if request.ReferenceImageCount() > channel.GetImageMaxReferenceImages() {
+			return invalid("number of reference images exceeds the selected channel limit")
+		}
+		if request.Dialect == "async" && ValidateMixedImageChannelRequestFunc != nil {
+			if err := ValidateMixedImageChannelRequestFunc(channel, request); err != nil {
+				return invalid(err.Error())
+			}
+		}
 	}
 	channels = slices.DeleteFunc(channels, func(ch model.Channel) bool {
 		capability := ImageChannelCapability(ch, request.Model)

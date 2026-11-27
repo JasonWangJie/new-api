@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	stdlog "log"
@@ -593,6 +594,66 @@ func imageUploadRequest(t *testing.T, engine *gin.Engine, data []byte, filename,
 	return recorder
 }
 
+func mediaRetestTestOperator(t *testing.T, engine *gin.Engine, suffix string) (model.Token, func(string, string, string) *httptest.ResponseRecorder) {
+	t.Helper()
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.AuditLog{}))
+	admin := model.User{Username: "retest-" + suffix, AffCode: "retest-" + suffix, Group: "default", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Quota: 10000000}
+	require.NoError(t, model.DB.Create(&admin).Error)
+	token := model.Token{UserId: admin.Id, Name: "Retest", Key: "operatorretest" + suffix, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: admin.Quota, Group: "default"}
+	require.NoError(t, model.DB.Create(&token).Error)
+	bundle, err := service.CreateLoginSession(admin.Id, "password", "127.0.0.1", "test")
+	require.NoError(t, err)
+	return token, func(method, path, body string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:32581"
+		req.Header.Set("Authorization", "Bearer "+bundle.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+		engine.ServeHTTP(response, req)
+		return response
+	}
+}
+
+func mediaRetestTestTaskID(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var result struct {
+		Data struct {
+			TaskID string `json:"task_id"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.NotEmpty(t, result.Data.TaskID)
+	return result.Data.TaskID
+}
+
+type mediaRetestTestModel struct {
+	Model         string `json:"model"`
+	UpstreamModel string `json:"upstream_model"`
+}
+
+type mediaRetestTestOptions struct {
+	OriginalChannelID   int                    `json:"original_channel_id"`
+	OriginalModel       string                 `json:"original_model"`
+	OriginalUnavailable string                 `json:"original_unavailable_reason"`
+	AutoModels          []mediaRetestTestModel `json:"auto_models"`
+	Channels            []struct {
+		ID     int                    `json:"id"`
+		Models []mediaRetestTestModel `json:"models"`
+	} `json:"channels"`
+}
+
+func mediaRetestOptionsResponse(t *testing.T, response *httptest.ResponseRecorder) mediaRetestTestOptions {
+	t.Helper()
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var result struct {
+		Data mediaRetestTestOptions `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	return result.Data
+}
+
 func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	oldEstimator := service.EstimateAsyncImageQuotaFunc
 	service.EstimateAsyncImageQuotaFunc = func(context.Context, model.Token, service.AsyncImageRequest, string) (int, error) { return 1, nil }
@@ -624,7 +685,7 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	require.NoError(t, err)
 	model.LOG_DB = imageLogs
 	common.MemoryCacheEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, true, true
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.QuotaData{}))
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.CanvasGrant{}, &model.Channel{}, &model.Ability{}, &model.Option{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.QuotaData{}, &model.MediaInputObject{}))
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	require.NoError(t, model.MigrateImageLogs(model.LOG_DB))
 	require.NoError(t, model.MigrateImageModels(model.DB))
@@ -873,6 +934,155 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 	editBody, err := common.Marshal(map[string]any{"model": "image-model", "prompt": "Edit the original", "images": []any{map[string]string{"image_url": uploaded.URL}}})
 	require.NoError(t, err)
 	assert.Equal(t, 202, request("POST", "/v1/images/edits_oa", string(editBody), "oa-edit", token.Key).Code)
+	t.Run("operator retests a failed image with the original reference", func(t *testing.T) {
+		operator, admin := mediaRetestTestOperator(t, engine, "image")
+		prompt := strings.Repeat("远山", 90) + "\nsecond line sk-" + strings.Repeat("A", 36)
+		original, err := common.Marshal(map[string]any{"model": "image-model", "prompt": prompt, "images": []map[string]string{{"image_url": uploaded.URL}}, "size": "1024x1024"})
+		require.NoError(t, err)
+		accepted := request(http.MethodPost, "/v1/images/edits_oa", string(original), "retest-source-image", token.Key)
+		require.Equal(t, http.StatusAccepted, accepted.Code, accepted.Body.String())
+		var sourceID struct {
+			TaskID string `json:"task_id"`
+		}
+		require.NoError(t, common.Unmarshal(accepted.Body.Bytes(), &sourceID))
+		var source model.AsyncImageTask
+		require.NoError(t, model.DB.Where("task_id = ?", sourceID.TaskID).Take(&source).Error)
+		actionPath := "/api/admin/media-tasks/" + source.TaskId + "/retest"
+		optionsBase := "/api/admin/media-tasks/" + source.TaskId + "/retest-options?token_id="
+		optionsPath := optionsBase + strconv.Itoa(operator.Id)
+		assert.Equal(t, http.StatusConflict, admin(http.MethodGet, optionsPath, "").Code)
+		require.NoError(t, model.TerminateAsyncImageTask(t.Context(), source))
+		require.NoError(t, model.DB.Model(&source).Update("channel_id", channel.Id).Error)
+		beforeDispatch := mediaRetestOptionsResponse(t, admin(http.MethodGet, optionsPath, ""))
+		assert.Equal(t, channel.Id, beforeDispatch.OriginalChannelID)
+		assert.Equal(t, "image-model", beforeDispatch.OriginalModel)
+		assert.Empty(t, beforeDispatch.OriginalUnavailable)
+
+		former := model.Channel{Name: "Previous image dispatch", Key: "former-upstream", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusManuallyDisabled, Models: "image-model", Group: "default"}
+		require.NoError(t, model.DB.Create(&former).Error)
+		attemptHistory, err := common.Marshal([]service.ImageChannelAttempt{{ChannelId: channel.Id, Dispatched: true}, {ChannelId: former.Id, Dispatched: true}, {ChannelId: channel.Id}})
+		require.NoError(t, err)
+		require.NoError(t, model.DB.Model(&source).Updates(map[string]any{"attempts": string(attemptHistory), "dispatched_at": time.Now().Unix()}).Error)
+
+		const selectedModel = "image-retest-alternate"
+		const unsupportedModel = "image-retest-text-only"
+		const upstreamModel = "image-engine-v2"
+		retestCatalog, err := common.Marshal([]service.ImageModelCapability{
+			{Id: "image-model", MaxOutputImages: 2, MaxReferenceImages: 3, Resolutions: []string{"1K", "2K", "4K"}},
+			{Id: selectedModel, MaxOutputImages: 2, MaxReferenceImages: 3, Resolutions: []string{"1K"}},
+			{Id: unsupportedModel, MaxOutputImages: 2, Resolutions: []string{"1K"}},
+		})
+		require.NoError(t, err)
+		require.NoError(t, model.DB.Model(&policy).Update("models", string(retestCatalog)).Error)
+		t.Cleanup(func() { require.NoError(t, model.DB.Model(&policy).Update("models", string(catalog)).Error) })
+		alternate := model.Channel{Name: "Alternate image dispatch", Key: "alternate-upstream", Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled, Models: selectedModel + "," + unsupportedModel, Group: "default", ModelMapping: common.GetPointer(`{"image-retest-alternate":"image-engine-v2"}`)}
+		require.NoError(t, model.DB.Create(&alternate).Error)
+		for _, name := range []string{selectedModel, unsupportedModel} {
+			require.NoError(t, model.DB.Create(&model.Ability{Group: "default", Model: name, ChannelId: alternate.Id, Enabled: true}).Error)
+		}
+		restricted := model.Token{UserId: operator.UserId, Name: "Restricted retest", Key: "restrictedimageretest", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000, Group: "default", ModelLimitsEnabled: true, ModelLimits: "image-model"}
+		require.NoError(t, model.DB.Create(&restricted).Error)
+		assert.Equal(t, http.StatusUnauthorized, request(http.MethodGet, optionsPath, "", "", token.Key).Code)
+		assert.Equal(t, http.StatusForbidden, admin(http.MethodGet, optionsBase+strconv.Itoa(token.Id), "").Code)
+		options := mediaRetestOptionsResponse(t, admin(http.MethodGet, optionsPath, ""))
+		assert.Equal(t, former.Id, options.OriginalChannelID)
+		assert.NotEmpty(t, options.OriginalUnavailable)
+		assert.Contains(t, options.AutoModels, mediaRetestTestModel{Model: "image-model"})
+		var alternateOptions []mediaRetestTestModel
+		for _, choice := range options.Channels {
+			assert.NotEqual(t, former.Id, choice.ID)
+			if choice.ID == alternate.Id {
+				alternateOptions = choice.Models
+			}
+		}
+		require.Equal(t, []mediaRetestTestModel{{Model: selectedModel, UpstreamModel: upstreamModel}}, alternateOptions)
+		restrictedOptions := mediaRetestOptionsResponse(t, admin(http.MethodGet, optionsBase+strconv.Itoa(restricted.Id), ""))
+		for _, choice := range restrictedOptions.Channels {
+			assert.NotEqual(t, alternate.Id, choice.ID)
+		}
+		var sourceBalance model.User
+		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&sourceBalance).Error)
+		detailPath := "/api/admin/async-image-tasks/" + source.TaskId + "/request"
+		retained := admin(http.MethodGet, detailPath, "")
+		require.Equal(t, http.StatusOK, retained.Code, retained.Body.String())
+		assert.Contains(t, retained.Body.String(), `\nsecond line`)
+		assert.NotContains(t, retained.Body.String(), strings.Repeat("A", 36))
+		assert.NotContains(t, retained.Body.String(), uploaded.URL)
+		assert.Equal(t, http.StatusUnauthorized, request(http.MethodGet, detailPath, "", "", token.Key).Code)
+		post := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-image","channel_id":%d,"model":%q}`, operator.Id, alternate.Id, selectedModel)
+		wrongKey := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-image"}`, token.Id)
+		assert.Equal(t, http.StatusForbidden, admin(http.MethodPost, actionPath, wrongKey).Code)
+		invalid := admin(http.MethodPost, actionPath, strings.Replace(post, selectedModel, unsupportedModel, 1))
+		assert.GreaterOrEqual(t, invalid.Code, http.StatusBadRequest, invalid.Body.String())
+		assert.Less(t, invalid.Code, http.StatusInternalServerError, invalid.Body.String())
+		assert.Contains(t, strings.ToLower(invalid.Body.String()), "reference")
+		newID := mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, post))
+		assert.NotEqual(t, source.TaskId, newID)
+		assert.Equal(t, newID, mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, post)))
+		auto := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-image","channel_id":0,"model":"image-model"}`, operator.Id)
+		changedSelection := admin(http.MethodPost, actionPath, auto)
+		assert.Equal(t, http.StatusConflict, changedSelection.Code, changedSelection.Body.String())
+		assert.Contains(t, changedSelection.Body.String(), "idempotency_conflict")
+		autoID := mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, strings.Replace(auto, "test-media-retest-image", "new-media-retest-image-auto", 1)))
+		var autoTask model.AsyncImageTask
+		require.NoError(t, model.DB.Where("task_id = ?", autoID).Take(&autoTask).Error)
+		assert.Equal(t, "image-model", autoTask.Model)
+		require.NoError(t, model.TerminateAsyncImageTask(t.Context(), autoTask))
+		var target model.AsyncImageTask
+		require.NoError(t, model.DB.Where("task_id = ?", newID).Take(&target).Error)
+		assert.Equal(t, operator.UserId, target.UserId)
+		assert.Equal(t, operator.Id, target.TokenId)
+		assert.Equal(t, selectedModel, target.Model)
+		var inputs []model.ImageInputTaskReference
+		require.NoError(t, model.DB.Where("task_id = ?", newID).Find(&inputs).Error)
+		require.Len(t, inputs, 1)
+		assert.NotEqual(t, input.InputId, inputs[0].InputId)
+		previousExecute := service.ExecuteAsyncImageFunc
+		t.Cleanup(func() { service.ExecuteAsyncImageFunc = previousExecute })
+		service.ExecuteAsyncImageFunc = func(ctx context.Context, task model.AsyncImageTask, received service.AsyncImageRequest, ch *model.Channel, _ service.ImageRuntimeConfig, dispatch func() error) (*service.AsyncImageOutput, model.AsyncImageBill, error) {
+			assert.Equal(t, prompt, received.Prompt)
+			assert.Equal(t, "1024x1024", received.Size)
+			assert.Equal(t, alternate.Id, ch.Id)
+			mapped, err := service.ResolveImageChannelUpstreamModel(*ch, selectedModel)
+			require.NoError(t, err)
+			assert.Equal(t, upstreamModel, mapped)
+			require.NoError(t, dispatch())
+			log, err := common.Marshal(model.Log{UserId: task.UserId, TokenId: task.TokenId, ChannelId: ch.Id, Quota: 50, Type: model.LogTypeConsume, RequestId: "async-image:" + task.TaskId, CreatedAt: time.Now().Unix()})
+			require.NoError(t, err)
+			return &service.AsyncImageOutput{Images: []service.ImageBytes{valid}}, model.AsyncImageBill{TaskId: task.TaskId, UserId: task.UserId, TokenId: task.TokenId, ChannelId: ch.Id, BillingRequestId: "async-image:" + task.TaskId, Fingerprint: "fixed-retest-image-bill", Quota: 50, FundingSource: "wallet", LogPayload: string(log)}, nil
+		}
+		require.NoError(t, service.RunAsyncImageTask(t.Context(), newID))
+		var wallet model.User
+		require.NoError(t, model.DB.Where("id = ?", operator.UserId).Take(&wallet).Error)
+		assert.Equal(t, 9999950, wallet.Quota)
+		wallet = model.User{}
+		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&wallet).Error)
+		assert.Equal(t, sourceBalance.Quota, wallet.Quota)
+		var sourceToken model.Token
+		require.NoError(t, model.DB.Where("id = ?", token.Id).Take(&sourceToken).Error)
+		assert.Equal(t, token.RemainQuota, sourceToken.RemainQuota)
+		var audit model.AuditLog
+		require.NoError(t, model.LOG_DB.Where("user_id = ? AND action = ?", operator.UserId, "media_task.retest").Take(&audit).Error)
+		assert.NotContains(t, audit.Content, prompt)
+		require.NotNil(t, audit.Other.Op)
+		var recordedSelection struct {
+			ChannelID int    `json:"channel_id"`
+			Model     string `json:"model"`
+		}
+		auditParams, err := common.Marshal(audit.Other.Op.Params)
+		require.NoError(t, err)
+		require.NoError(t, common.Unmarshal(auditParams, &recordedSelection))
+		assert.Equal(t, alternate.Id, recordedSelection.ChannelID)
+		assert.Equal(t, selectedModel, recordedSelection.Model)
+		snapshot, err := model.GetRetainedMediaReplaySnapshot(t.Context(), model.MediaReplayImage, source.TaskId, time.Now().Unix())
+		require.NoError(t, err)
+		assert.Equal(t, int64(86400), snapshot.RetainUntil-snapshot.FailedAt)
+		require.NoError(t, model.DB.Model(&snapshot).Update("retain_until", time.Now().Unix()-1).Error)
+		assert.Equal(t, http.StatusNotFound, admin(http.MethodGet, detailPath, "").Code)
+		assert.Equal(t, http.StatusGone, admin(http.MethodGet, optionsPath, "").Code)
+		assert.Equal(t, http.StatusGone, admin(http.MethodPost, actionPath, strings.Replace(post, "test-media-retest-image", "second-media-retest-image", 1)).Code)
+		assert.Equal(t, newID, mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, post)))
+	})
 	require.NoError(t, model.DB.Model(&model.ImageInputObject{}).Where("token_id = ?", token.Id).Update("expires_at", time.Now().Unix()-1).Error)
 	assert.Equal(t, 400, request("POST", "/v1/images/generations_sc", string(scBody), "sc-tombstone", token.Key).Code)
 	cfg.InputBytesPerKey = int64(len(valid.Data)) - 1
@@ -1019,9 +1229,14 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		require.NoError(t, model.DB.Where("task_id = ?", nativeTask.TaskId).Take(&task).Error)
 		assert.Equal(t, model.ImageTaskExecutionUnknown, task.Status)
 		assert.Zero(t, task.NextAttemptAt)
-		assert.True(t, task.FailedRequestRetainedAt(time.Now().Unix()))
-		_, retainedErr := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
-		require.NoError(t, retainedErr, "unknown execution retains encrypted diagnostics without enabling replay")
+		operator, admin := mediaRetestTestOperator(t, engine, "unknown")
+		retained := admin(http.MethodGet, "/api/admin/async-image-tasks/"+task.TaskId+"/request", "")
+		require.Equal(t, http.StatusOK, retained.Code, "unknown execution retains encrypted diagnostics")
+		assert.Contains(t, retained.Body.String(), "private image prompt")
+		post := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-unconfirmed"}`, operator.Id)
+		retest := admin(http.MethodPost, "/api/admin/media-tasks/"+task.TaskId+"/retest", post)
+		assert.Equal(t, http.StatusConflict, retest.Code)
+		assert.Contains(t, retest.Body.String(), "not_confirmed_failed")
 		assert.ErrorIs(t, service.RunAsyncImageTask(context.Background(), nativeTask.TaskId), model.ErrImageConflict)
 		assert.EqualValues(t, 2, calls.Load())
 		require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&user).Error)
@@ -1342,6 +1557,54 @@ func TestAsyncImagePublicAdmissionRecoveryAndIsolation(t *testing.T) {
 		}
 		var job model.AsyncMediaJob
 		require.NoError(t, model.DB.Where("task_id = ?", accepted.TaskId).Take(&job).Error)
+		t.Run("operator retests an original multipart video request", func(t *testing.T) {
+			operator, admin := mediaRetestTestOperator(t, engine, "video")
+			require.NoError(t, model.ChangeAsyncMediaJob(model.DB.WithContext(t.Context()).Model(&model.AsyncMediaJob{}).Where("task_id = ?", multipartTaskID), map[string]any{"status": "failed", "billing_status": "not_billable"}, ""))
+			actionPath := "/api/admin/media-tasks/" + multipartTaskID + "/retest"
+			optionsPath := fmt.Sprintf("/api/admin/media-tasks/%s/retest-options?token_id=%d", multipartTaskID, operator.Id)
+			options := mediaRetestOptionsResponse(t, admin(http.MethodGet, optionsPath, ""))
+			assert.Equal(t, "sora-2", options.OriginalModel)
+			assert.Empty(t, options.OriginalUnavailable)
+			assert.Contains(t, options.AutoModels, mediaRetestTestModel{Model: "sora-2"})
+			var videoOptions []mediaRetestTestModel
+			for _, choice := range options.Channels {
+				if choice.ID == videoChannel.Id {
+					videoOptions = choice.Models
+				}
+			}
+			require.Equal(t, []mediaRetestTestModel{{Model: "sora-2", UpstreamModel: "sora-2"}}, videoOptions)
+			legacy := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-video-legacy"}`, operator.Id)
+			legacyID := mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, legacy))
+			assert.Equal(t, legacyID, mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, legacy)))
+			post := fmt.Sprintf(`{"token_id":%d,"idempotency_key":"test-media-retest-video","channel_id":%d,"model":"sora-2"}`, operator.Id, videoChannel.Id)
+			newID := mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, post))
+			assert.Equal(t, newID, mediaRetestTestTaskID(t, admin(http.MethodPost, actionPath, post)))
+			assert.NotEqual(t, multipartTaskID, newID)
+			var target model.AsyncMediaJob
+			require.NoError(t, model.DB.Where("task_id = ?", newID).Take(&target).Error)
+			assert.Equal(t, operator.Id, target.TokenId)
+			assert.Equal(t, operator.UserId, target.UserId)
+			assert.Equal(t, "sora-2", target.Model)
+			var sourceBalance model.User
+			require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&sourceBalance).Error)
+			claimed, err := model.ClaimAsyncMediaJob(t.Context(), &target, common.GetUUID(), 30)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			require.NoError(t, service.ProcessAsyncMediaJob(t.Context(), target, mediaCfg))
+			assert.EqualValues(t, 1, submits.Load())
+			submits.Store(0)
+			var dispatched model.Task
+			require.NoError(t, model.DB.Where("task_id = ?", newID).Take(&dispatched).Error)
+			assert.Equal(t, operator.UserId, dispatched.UserId)
+			assert.Equal(t, videoChannel.Id, dispatched.ChannelId)
+			assert.Positive(t, dispatched.Quota)
+			var wallet model.User
+			require.NoError(t, model.DB.Where("id = ?", operator.UserId).Take(&wallet).Error)
+			assert.Equal(t, 10000000-dispatched.Quota, wallet.Quota)
+			wallet = model.User{}
+			require.NoError(t, model.DB.Where("id = ?", user.Id).Take(&wallet).Error)
+			assert.Equal(t, sourceBalance.Quota, wallet.Quota)
+		})
 		frozenRequest, err := service.DecryptImagePayload(job.RequestCipher, "media-request:"+job.TaskId)
 		require.NoError(t, err)
 		var frozen service.AsyncVideoRequest

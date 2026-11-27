@@ -85,6 +85,9 @@ func RefreshConditionalVideoAdmission(ctx context.Context, job *model.AsyncMedia
 	if selected == nil {
 		return errors.New("no frozen video routing target is available before dispatch")
 	}
+	if request.RetestChannelID > 0 && selected.Channel.Id != request.RetestChannelID {
+		return errors.New("conditional video target does not match the retest channel")
+	}
 	key, _, keyErr := selected.Channel.GetNextEnabledKey()
 	if keyErr != nil || key == "" {
 		return errors.New("conditional video target account is unavailable")

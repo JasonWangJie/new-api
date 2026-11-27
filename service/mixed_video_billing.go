@@ -81,7 +81,7 @@ func ValidateMixedVideoPricingResolved(ctx context.Context, db *gorm.DB, resolve
 			if err := billing_setting.ValidateMixedVideoBillingExpr(expression); err != nil {
 				return fmt.Errorf("mixed video model %s in group %s: %w", capability.Id, policy.Group, err)
 			}
-			profiles, err := mixedVideoModelProfilesDB(ctx, db, policy, capability.Id, capability.VideoOverrides, false)
+			profiles, err := mixedVideoModelProfilesDB(ctx, db, policy, capability.Id, capability.VideoOverrides, false, 0, nil)
 			if err == nil {
 				err = ValidateMixedVideoProfilePricing(expression, profiles)
 			}

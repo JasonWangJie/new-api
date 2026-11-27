@@ -105,6 +105,9 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 					resolvedValue, callErr := a.plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{pinned.Protocol, "decodeRequest"}, protocolContext.JSValue())
 					resolved, resolvedOK := resolvedValue.(map[string]any)
 					resolvedModel, modelOK := resolved["model"].(string)
+					if pinned.Protocol == "openai_video" && service.IsVideoReferenceResolutionError(callErr) {
+						return service.TaskErrorWrapperLocal(errors.New(service.VideoReferenceResolutionErrorMessage), "plugin_request_invalid", http.StatusBadRequest)
+					}
 					if callErr != nil || !resolvedOK || !modelOK || resolvedModel != pinned.Model {
 						return service.TaskErrorWrapperLocal(fmt.Errorf("final task plugin decoder rejected the pinned model"), "plugin_request_invalid", http.StatusBadRequest)
 					}
@@ -168,6 +171,9 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 		}
 	}
 	if _, err := a.buildSubmit(c, info); err != nil {
+		if service.IsVideoReferenceResolutionError(err) {
+			err = errors.New(service.VideoReferenceResolutionErrorMessage)
+		}
 		return service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
 	}
 	// The descriptor may rewrite the model. Validate profiled requests against

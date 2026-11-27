@@ -24,6 +24,7 @@ import { useTranslation } from 'react-i18next'
 
 import { ResponseImage } from '@/components/ai-elements/response-renderer-image'
 import { LoadingState } from '@/components/loading-state'
+import { ReferenceImageUrlsField } from '@/components/reference-image-urls-field'
 import { StatusBadge } from '@/components/status-badge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -103,6 +104,7 @@ export function InteractiveChannelTest(props: InteractiveChannelTestProps) {
   const [prompts, setPrompts] = useState<
     Partial<Record<InteractiveChannelTestMode, string>>
   >({})
+  const [referenceText, setReferenceText] = useState('')
 
   const options = useQuery({
     queryKey: ['channels', 'interactive-test-models', props.channelId],
@@ -197,9 +199,20 @@ export function InteractiveChannelTest(props: InteractiveChannelTestProps) {
       ? t('A friendly robot watering a tiny garden on the Moon.')
       : t('hi'))
   const promptTooLong = [...prompt.trim()].length > MAX_PROMPT_LENGTH
+  const imageUrls =
+    mode === 'image'
+      ? referenceText
+          .split(/\r?\n/)
+          .map((url) => url.trim())
+          .filter(Boolean)
+      : []
   const submittedPrompt = test.variables?.input.prompt
+  const submittedImageUrls = test.variables?.input.image_urls ?? []
   const retry =
-    (test.isError || test.isSuccess) && submittedPrompt === prompt.trim()
+    (test.isError || test.isSuccess) &&
+    submittedPrompt === prompt.trim() &&
+    imageUrls.length === submittedImageUrls.length &&
+    imageUrls.every((url, index) => url === submittedImageUrls[index])
   const failedResponse: unknown = test.error?.cause
   const failureTime =
     failedResponse &&
@@ -226,6 +239,7 @@ export function InteractiveChannelTest(props: InteractiveChannelTestProps) {
           mode,
           endpoint_type: endpoint,
           prompt: input,
+          ...(imageUrls.length > 0 ? { image_urls: imageUrls } : {}),
         },
         signal: controller.signal,
       },
@@ -326,6 +340,13 @@ export function InteractiveChannelTest(props: InteractiveChannelTestProps) {
             </p>
           )}
         </div>
+        {mode === 'image' && (
+          <ReferenceImageUrlsField
+            value={referenceText}
+            onChange={setReferenceText}
+            disabled={test.isPending}
+          />
+        )}
         <div className='flex justify-end'>
           <Button
             type='submit'

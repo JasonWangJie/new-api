@@ -263,7 +263,13 @@ func EndAsyncVideoPolicyExecution(ctx context.Context, task Task, job AsyncMedia
 		if billing != "settled" && billing != "refunded" && billing != "not_billable" && billing != "failed" {
 			billing = "unknown"
 		}
-		return tx.Model(&queued).Updates(map[string]any{"attempt_generation": generation, "status": jobStatus, "billing_status": billing, "reference_recovery_stage": stage, "error_message": fact.Message, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0}).Error
+		if err := tx.Model(&queued).Updates(map[string]any{"attempt_generation": generation, "status": jobStatus, "billing_status": billing, "reference_recovery_stage": stage, "error_message": fact.Message, "lease_token": "", "lease_expires_at": 0, "next_attempt_at": 0}).Error; err != nil {
+			return err
+		}
+		if queued.HasReplaySnapshot {
+			return updateMediaReplaySnapshot(tx, MediaReplayVideo, queued.TaskId, jobStatus, now)
+		}
+		return nil
 	})
 }
 

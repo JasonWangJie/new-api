@@ -249,6 +249,12 @@ func videoJobView(c *gin.Context, job model.AsyncMediaJob, admin, detail bool) (
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, err
 	}
+	if admin && detail {
+		confirmed := confirmedVideoRetestFailure(job) && (errors.Is(err, gorm.ErrRecordNotFound) || task.Status == model.TaskStatusFailure)
+		if err := addMediaRetestDetail(c.Request.Context(), view, model.MediaReplayVideo, job.TaskId, job.HasReplaySnapshot && job.Status != "succeeded", confirmed, now); err != nil {
+			return nil, nil, errors.New("Video retest availability could not be read")
+		}
+	}
 	routing := task.PrivateData.VideoRouting
 	hasExecutionRequest := false
 	if routing == nil && len(job.RequestCipher) > 0 {

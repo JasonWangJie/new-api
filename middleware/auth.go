@@ -304,6 +304,16 @@ func TokenOrUserAuth() func(c *gin.Context) {
 // 即使令牌已过期、已耗尽或已禁用，也允许访问。
 // 仍然检查用户是否被封禁。
 func TokenAuthReadOnly() func(c *gin.Context) {
+	return tokenAuthReadOnly(false)
+}
+
+// TokenAuthForMediaRetestProbe supplies the normal relay authorization context
+// without changing expired or exhausted token state during a read-only probe.
+func TokenAuthForMediaRetestProbe() func(c *gin.Context) {
+	return tokenAuthReadOnly(true)
+}
+
+func tokenAuthReadOnly(relayProbe bool) func(c *gin.Context) {
 	return func(c *gin.Context) {
 		canvasProof := c.GetHeader(service.CanvasClientProofHeader)
 		if len(c.Request.Header.Values(service.CanvasClientProofHeader)) != 1 {
@@ -362,6 +372,16 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 				"message": common.TranslateMessage(c, i18n.MsgTokenStatusUnavailable),
 			})
 			c.Abort()
+			return
+		}
+		if relayProbe {
+			if token.Status != common.TokenStatusEnabled || token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp() || !token.UnlimitedQuota && token.RemainQuota <= 0 {
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, common.TranslateMessage(c, i18n.MsgTokenInvalid))
+				return
+			}
+			if authorizeRelayToken(c, token, nil) {
+				c.Next()
+			}
 			return
 		}
 		if !authorizeTokenIP(c, token) {

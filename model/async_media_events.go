@@ -394,6 +394,19 @@ func recordAsyncMediaEventTx(tx *gorm.DB, job AsyncMediaJob, eventType, discrimi
 }
 
 func recordAsyncMediaTransitionTx(tx *gorm.DB, before, after AsyncMediaJob, keyIndex *int, referenceMode string) error {
+	if after.HasReplaySnapshot && (before.Status != after.Status || before.StorageStatus != after.StorageStatus || before.BillingStatus != after.BillingStatus) {
+		status := after.Status
+		if status != ImageTaskSucceeded && status != ImageTaskFailed && status != ImageTaskExpired && status != ImageTaskExecutionUnknown {
+			if after.StorageStatus == "failed" {
+				status = ImageTaskStorageFailed
+			} else if after.BillingStatus == "failed" {
+				status = ImageTaskBillingFailed
+			}
+		}
+		if err := updateMediaReplaySnapshot(tx.Session(&gorm.Session{NewDB: true}), MediaReplayVideo, after.TaskId, status, time.Now().Unix()); err != nil {
+			return err
+		}
+	}
 	if before.Status != after.Status || before.BillingStatus != after.BillingStatus || before.ReferenceRecoveryStage != after.ReferenceRecoveryStage {
 		if err := recordVideoTaskPerfSampleTx(tx, before, after); err != nil {
 			return err

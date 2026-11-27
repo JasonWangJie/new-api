@@ -121,7 +121,10 @@ func ImageCleanupCandidates(ctx context.Context, scope string, filters ImageClea
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageLibraryItem{}).Select("1").Joins("JOIN image_publications ON image_publications.asset_id = image_library_items.asset_id").Where("image_library_items.object_id = image_storage_objects.object_id AND image_publications.status IN ? AND (image_publications.expires_at = 0 OR image_publications.expires_at > ?)", []string{"pending_review", "published", "hidden"}, now))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.AsyncImageResult{}).Select("1").Where("async_image_results.object_id = image_storage_objects.object_id AND task_id IN (?)", protectedTasks))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Select("1").Where("image_input_objects.object_id = image_storage_objects.object_id AND status IN ? AND (expires_at > ? OR lease_expires_at > ?)", []string{"active", "reserved", "uploading"}, now, now))
-	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageInputObject{}).Select("1").Joins("JOIN image_input_task_references ON image_input_task_references.input_id = image_input_objects.input_id").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").Where("image_input_objects.object_id = image_storage_objects.object_id AND async_image_tasks.status NOT IN ?", []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}))
+	protectedInputs := model.ProtectedImageInputReferences(model.DB.WithContext(ctx), now).Select("1").
+		Joins("JOIN image_input_objects ON image_input_objects.input_id = image_input_task_references.input_id").
+		Where("image_input_objects.object_id = image_storage_objects.object_id")
+	query = query.Where("NOT EXISTS (?)", protectedInputs)
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("1").Where("image_upload_intents.profile_id = image_storage_objects.profile_id AND image_upload_intents.object_key = image_storage_objects.object_key AND (image_upload_intents.status IN ? OR image_upload_intents.lease_expires_at > ?)", []string{"pending", "uploading"}, now))
 	query = query.Where("NOT EXISTS (?)", model.DB.WithContext(ctx).Model(&model.ImageUploadIntent{}).Select("1").Where("image_upload_intents.profile_id = image_storage_objects.profile_id AND image_upload_intents.object_key = image_storage_objects.object_key AND task_id IN (?)", protectedTasks))
 	return query, nil
@@ -215,12 +218,15 @@ func ReapUnconfirmedImageIntents(ctx context.Context, cfg ImageRuntimeConfig) er
 func ReapImageInputIntents(ctx context.Context, cfg ImageRuntimeConfig) error {
 	now := time.Now().Unix()
 	var inputs []model.ImageInputObject
-	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND (expires_at <= ? OR status <> ?)", []string{"reserved", "failed", "active", "deleting"}, now, now, "active").Order("id").Limit(20).Find(&inputs).Error; err != nil {
+	protected := model.ProtectedImageInputReferences(model.DB.WithContext(ctx), now).Select("1").
+		Where("image_input_task_references.input_id = image_input_objects.input_id")
+	if err := model.DB.WithContext(ctx).Where("status IN ? AND lease_expires_at <= ? AND (expires_at <= ? OR status <> ?)", []string{"reserved", "failed", "active", "deleting"}, now, now, "active").
+		Where("NOT EXISTS (?)", protected).Order("id").Limit(20).Find(&inputs).Error; err != nil {
 		return err
 	}
 	for _, input := range inputs {
 		var references int64
-		if err := model.DB.WithContext(ctx).Model(&model.ImageInputTaskReference{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").Where("image_input_task_references.input_id = ? AND async_image_tasks.status NOT IN ?", input.InputId, []string{model.ImageTaskSucceeded, model.ImageTaskFailed, model.ImageTaskExpired, model.ImageTaskExecutionUnknown}).Count(&references).Error; err != nil {
+		if err := model.ProtectedImageInputReferences(model.DB.WithContext(ctx), now).Where("image_input_task_references.input_id = ?", input.InputId).Count(&references).Error; err != nil {
 			return err
 		}
 		if references > 0 {

@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -84,6 +85,11 @@ func asyncImagePublicAuth(auth gin.HandlerFunc) gin.HandlerFunc {
 
 func asyncImageTokenPermissions(readOnly bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !controller.MediaRetestOperatorMatches(c) {
+			controller.AsyncImagePublicError(c, 403, "access_denied", "The retest API key does not belong to the operator")
+			c.Abort()
+			return
+		}
 		var token model.Token
 		if err := model.DB.WithContext(c.Request.Context()).Select("tokens.*").Joins("JOIN users ON users.id = tokens.user_id").Where("tokens.id = ? AND tokens.user_id = ? AND users.status = ? AND users.deleted_at IS NULL", c.GetInt("token_id"), c.GetInt("id"), common.UserStatusEnabled).Take(&token).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -118,12 +124,7 @@ func SetAsyncImagePublicRouter(router *gin.Engine) {
 	api.GET("/images/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("image"))
 	api.GET("/videos/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("video"))
 	api.GET("/media/tasks_async/stats", middleware.AsyncTaskStatsAuth(), controller.QueryAsyncTaskStats("media"))
-	for _, path := range []string{"/images/generations_oa", "/images/edits_oa", "/chat/completions_gm", "/images/generations_sc", "/images/generations_async", "/images/edits_async"} {
-		api.POST(path, asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
-	}
-	api.POST("/videos/generations_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideo, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
-	api.POST("/videos/edits_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideoEdit, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
-	api.POST("/videos/extensions_async", asyncImagePublicAuth(middleware.TokenAuth()), asyncImageTokenPermissions(false), controller.PrepareAsyncVideoExtension, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	registerAsyncMediaSubmissions(api)
 	api.GET("/media/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncMedia)
 	api.GET("/media/objects/:object_id", controller.MediaObjectContent)
 	api.HEAD("/media/objects/:object_id", controller.MediaObjectContent)
@@ -132,4 +133,31 @@ func SetAsyncImagePublicRouter(router *gin.Engine) {
 	api.POST("/uploads/images_sc", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.UploadAsyncImageInput)
 	api.GET("/images/tasks_async/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
 	api.GET("/tasks_sc/:task_id", asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(true), controller.QueryAsyncImage)
+}
+
+func newMediaRetestAdmission() *gin.Engine {
+	engine := gin.New()
+	// ClientIP comes from the authenticated outer request, never forwarded headers.
+	_ = engine.SetTrustedProxies(nil)
+	engine.Use(gin.RecoveryWithWriter(io.Discard))
+	api := engine.Group("/v1", middleware.RouteTag("relay"))
+	registerAsyncMediaSubmissions(api)
+	return engine
+}
+
+func registerAsyncMediaSubmissions(api *gin.RouterGroup) {
+	for _, path := range []string{"/images/generations_oa", "/images/edits_oa", "/chat/completions_gm", "/images/generations_sc", "/images/generations_async", "/images/edits_async"} {
+		api.POST(path, asyncImagePublicAuth(middleware.TokenAuthReadOnly()), asyncImageTokenPermissions(false), controller.SubmitAsyncImage)
+	}
+	videoAuth, probeAuth := middleware.TokenAuth(), middleware.TokenAuthForMediaRetestProbe()
+	auth := asyncImagePublicAuth(func(c *gin.Context) {
+		if controller.IsMediaRetestRoutingProbe(c.Request.Context()) {
+			probeAuth(c)
+			return
+		}
+		videoAuth(c)
+	})
+	api.POST("/videos/generations_async", auth, asyncImageTokenPermissions(false), controller.PrepareAsyncVideo, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	api.POST("/videos/edits_async", auth, asyncImageTokenPermissions(false), controller.PrepareAsyncVideoEdit, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
+	api.POST("/videos/extensions_async", auth, asyncImageTokenPermissions(false), controller.PrepareAsyncVideoExtension, controller.PinAsyncVideoEndpoint(), controller.FilterAsyncVideoProvider, middleware.PrepareTaskPluginEndpoint(), controller.RouteAsyncVideo, middleware.Distribute(), controller.AcceptAsyncVideo)
 }

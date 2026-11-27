@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -332,6 +333,15 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 
 	adaptor.Init(info)
+	if interactive != nil && len(interactive.ImageURLs) > 0 {
+		if err := prepareInteractiveChannelTestReferences(c, info, adaptor, interactive); err != nil {
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed)}
+		}
+		if c.Request.MultipartForm != nil {
+			defer c.Request.MultipartForm.RemoveAll()
+			defer common.CleanupBodyStorage(c)
+		}
+	}
 
 	var convertedRequest any
 	// 根据 RelayMode 选择正确的转换函数
@@ -347,7 +357,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				newAPIError: types.NewError(errors.New("invalid embedding request type"), types.ErrorCodeConvertRequestFailed),
 			}
 		}
-	case relayconstant.RelayModeImagesGenerations:
+	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
 		// 图像生成请求 - request 已经是正确的类型
 		if imageReq, ok := request.(*dto.ImageRequest); ok {
 			convertedRequest, err = adaptor.ConvertImageRequest(c, info, *imageReq)
@@ -423,6 +433,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
 		}
 	}
+	if c.Request.MultipartForm != nil {
+		c.Request.Header.Set("Content-Type", "application/json")
+	}
 	jsonData, err := common.Marshal(convertedRequest)
 	if err != nil {
 		return testResult{
@@ -442,6 +455,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//}
 
 	if len(info.ParamOverride) > 0 {
+		beforeOverride := jsonData
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {
@@ -457,9 +471,20 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				newAPIError: types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid),
 			}
 		}
+		if interactive != nil && len(interactive.ImageURLs) > 0 {
+			if err := validateInteractiveChannelTestReferences(beforeOverride, jsonData, relayFormat, channel.Type); err != nil {
+				return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid)}
+			}
+		}
 	}
 
 	if interactive != nil && interactive.Mode == channelTestModeImage {
+		if channel.Type == constant.ChannelTypeVolcEngine && len(interactive.ImageURLs) > 0 {
+			jsonData, err = volcengine.PrepareImageSubmission(jsonData, info.UpstreamModelName, 1, true)
+			if err != nil {
+				return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed)}
+			}
+		}
 		if err := validateInteractiveChannelImageRequest(jsonData, relayFormat); err != nil {
 			return testResult{
 				context: c, localErr: err,
@@ -477,6 +502,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 
 	requestBody := bytes.NewBuffer(jsonData)
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
+	c.Request.ContentLength = int64(len(jsonData))
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return testResult{

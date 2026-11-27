@@ -34,6 +34,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const legacyDramaSiteVersion = "1.1.6-site20261031.1"
+
 func loadDramaVideoPlugin(t *testing.T) *jsplugin.LoadedPlugin {
 	t.Helper()
 	source, err := builtinplugins.Source("drama")
@@ -303,15 +305,10 @@ func TestConfiguredDramaYaliTabtabVideoModels(t *testing.T) {
 
 func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
-	aResolution := "4k"
-	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
-		aResolution = "1080p"
-	}
-	for _, tc := range []struct {
+	type routeCase struct {
 		model, resolution, path string
-	}{
-		{"seedance2.0-A", aResolution, "/v1/videos"},
-		{"seedance2.5-A", "720p", "/v1/videos"},
+	}
+	cases := []routeCase{
 		{"minimax-h3", "1080p", "/v1/videos"},
 		{"seedance2.0-E-720p", "720p", "/v1/video/generations"},
 		{"seedance2.0-E-1080p", "1080p", "/v1/video/generations"},
@@ -330,8 +327,21 @@ func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 		{"seedance2.0-fast-G", "720p", "/v1/videos"},
 		{"seedance2.0-mini-G", "480p", "/v1/videos"},
 		{"seedance2.5-G", "1080p", "/v1/videos"},
-	} {
-		t.Run(tc.model, func(t *testing.T) {
+	}
+	if plugin.Meta.Version == legacyDramaSiteVersion {
+		cases = append(cases,
+			routeCase{"seedance2.0-A", "1080p", "/v1/videos"},
+			routeCase{"seedance2.5-A", "720p", "/v1/videos"},
+		)
+	} else {
+		for _, model := range []string{"seedance2.0-A", "seedance2.5-A"} {
+			for _, resolution := range []string{"1080p", "2k", "4k"} {
+				cases = append(cases, routeCase{model, resolution, "/v1/videos"})
+			}
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.model+"/"+tc.resolution, func(t *testing.T) {
 			binding, found := jsplugin.DefaultRegistry.Generation().LookupEndpoint(http.MethodPost, "/v1/videos", tc.model)
 			require.True(t, found)
 			assert.Equal(t, "drama", binding.Plugin.Meta.Key)
@@ -341,7 +351,9 @@ func TestDramaVideoModelsAndUpstreamRoutes(t *testing.T) {
 			intent, err := decodeDramaVideoRequest(t, plugin, tc.model, "create", request)
 			require.NoError(t, err)
 			assert.Equal(t, "text_to_video", intent["action"])
-			require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", intent["requestBody"], nil))
+			configured, err := service.ApplyVideoModelOverrides(profile, service.VideoModelOverrides{Resolutions: []string{tc.resolution}})
+			require.NoError(t, err)
+			require.NoError(t, service.ValidateVideoProfileRequest(configured, "text_to_video", intent["requestBody"], nil))
 			value, err := plugin.Engine.Call(t.Context(), "buildSubmitRequest", map[string]any{
 				"model": tc.model, "requestBody": intent["requestBody"], "action": intent["action"], "baseUrl": "https://upstream.example", "apiKey": "upstream-test-key",
 			})
@@ -395,8 +407,13 @@ func TestDramaVideoPricingRowsPreserveGenerationLimits(t *testing.T) {
 			if modelName == "seedance2.0-F" {
 				expected = append(expected, "720px")
 			}
-			if modelName == "minimax-h3-2k" {
+			switch modelName {
+			case "minimax-h3-2k":
 				expected = append(expected, "2k")
+			case "seedance2.0-A", "seedance2.5-A":
+				if plugin.Meta.Version != legacyDramaSiteVersion {
+					expected = append(expected, "2k")
+				}
 			}
 			assert.Equal(t, expected, schema["resolution"].Enum,
 				"all video models retain four editable price rows and any provider-specific resolution")
@@ -418,17 +435,18 @@ func TestDramaVideoPricingRowsPreserveGenerationLimits(t *testing.T) {
 
 func TestDramaVideoSecondBilledProfiles(t *testing.T) {
 	plugin := loadDramaVideoPlugin(t)
-	aResolutions := []string{"480p", "720p", "1080p", "4k"}
-	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
-		aResolutions = aResolutions[:3]
+	aResolutions := []string{"480p", "720p", "1080p", "2k", "4k"}
+	a20Resolutions, a25Resolutions := aResolutions, aResolutions
+	if plugin.Meta.Version == legacyDramaSiteVersion {
+		a20Resolutions, a25Resolutions = aResolutions[:3], aResolutions[:2]
 	}
 	for _, tc := range []struct {
 		model       string
 		maxSeconds  int
 		resolutions []string
 	}{
-		{"seedance2.0-A", 15, aResolutions},
-		{"seedance2.5-A", 30, []string{"480p", "720p"}},
+		{"seedance2.0-A", 15, a20Resolutions},
+		{"seedance2.5-A", 30, a25Resolutions},
 		{"minimax-h3", 15, []string{"480p", "720p", "1080p"}},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
@@ -441,8 +459,11 @@ func TestDramaVideoSecondBilledProfiles(t *testing.T) {
 			profile, found := plugin.Meta.VideoProfileForModel(tc.model)
 			require.True(t, found)
 			require.NoError(t, service.ValidateVideoProfileRequest(profile, "text_to_video", request, nil))
-			assert.Equal(t, tc.maxSeconds, profile.Modes[0].Duration.Max)
-			assert.Equal(t, tc.resolutions, profile.Modes[0].Resolutions)
+			for _, mode := range profile.Modes {
+				require.NotNil(t, mode.Duration)
+				assert.Equal(t, tc.maxSeconds, mode.Duration.Max)
+				assert.Equal(t, tc.resolutions, mode.Resolutions)
+			}
 			schema, _ := plugin.Meta.UsageForModel(tc.model)
 			assert.Len(t, schema, 3)
 			assert.Contains(t, schema, "seconds")
@@ -671,7 +692,8 @@ func TestDramaVideoMediaAndOperations(t *testing.T) {
 		{"A conflicting frame aliases", "seedance2.0-A", "first_image conflicts", map[string]any{"image": "https://cdn.example/a.png", "first_image": "https://cdn.example/b.png"}},
 		{"A 2.5 rejects frames", "seedance2.5-A", "ordinary references", map[string]any{"references": []any{map[string]any{"type": "image", "role": "first_frame", "source": "https://cdn.example/a.png"}}}},
 		{"A 2.5 rejects Auto", "seedance2.5-A", "aspect_ratio is not supported", map[string]any{"aspect_ratio": "Auto"}},
-		{"A 2.5 rejects 1080p", "seedance2.5-A", "resolution is not supported", map[string]any{"resolution": "1080p"}},
+		{"A 2.0 rejects 8K", "seedance2.0-A", "resolution is not supported", map[string]any{"resolution": "8k"}},
+		{"A 2.5 rejects 8K", "seedance2.5-A", "resolution is not supported", map[string]any{"resolution": "8K"}},
 		{"A unsupported audio flag", "seedance2.0-A", "generate_audio is not supported", map[string]any{"generate_audio": false}},
 		{"A rejects HTTP", "seedance2.0-A", "not supported", map[string]any{"reference_images": []any{"http://cdn.example/a.png"}}},
 		{"A rejects asset", "seedance2.5-A", "not supported", map[string]any{"reference_images": []any{"asset://image-one"}}},
@@ -945,6 +967,28 @@ func TestDramaVideoHostDownloadAndFrozenBilling(t *testing.T) {
 		{"minimax-h3", `tier("seconds", u("seconds") * 0.1)`, map[string]any{"prompt": "a cat", "seconds": 8}, map[string]any{"status": "completed", "duration": 6.5}, 325000, 400000, true},
 		{"seedance2.0-E", `tier("video", u("requests") * 0.5)`, map[string]any{"prompt": "a cat", "seconds": 15}, map[string]any{"status": "completed"}, 250000, 250000, true},
 	}
+	if plugin.Meta.Version != legacyDramaSiteVersion {
+		const highResolutionExpr = `u("resolution") == "4k" ? tier("4k", u("seconds") * 0.4) : u("resolution") == "2k" ? tier("2k", u("seconds") * 0.3) : u("resolution") == "1080p" ? tier("1080p", u("seconds") * 0.2) : tier("base", u("seconds") * 0.1)`
+		for _, model := range []string{"seedance2.0-A", "seedance2.5-A"} {
+			for _, tier := range []struct {
+				resolution              string
+				wantQuota, wantPreQuota int
+			}{
+				{"1080p", 600000, 800000},
+				{"2K", 900000, 1200000},
+				{"4K", 1200000, 1600000},
+			} {
+				cases = append(cases, billingCase{
+					model:        model,
+					expression:   highResolutionExpr,
+					request:      map[string]any{"prompt": "a cat", "seconds": 8, "resolution": tier.resolution},
+					response:     map[string]any{"status": "completed", "seconds": 6},
+					wantQuota:    tier.wantQuota,
+					wantPreQuota: tier.wantPreQuota,
+				})
+			}
+		}
+	}
 	if slices.Contains(plugin.Meta.Models, "minimax-h3-2k") {
 		cases = append(cases,
 			billingCase{"minimax-h3-2k", requestReferenceExpr, map[string]any{"prompt": "a cat"}, map[string]any{"status": "completed", "seconds": 15}, 250000, 250000, false},
@@ -1020,6 +1064,15 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 	require.NoError(t, db.Create(&model.User{Id: 1, Username: "drama-polling", Quota: 1000}).Error)
 	for _, modelName := range []string{"seedance2.0-A", "seedance2.5-A", "minimax-h3", "seedance2.0-E-720p", "seedance2.5-F", "seedance2.5-G"} {
 		t.Run(modelName, func(t *testing.T) {
+			payload := map[string]any{"prompt": "a cat", "seconds": 5}
+			if plugin.Meta.Version != legacyDramaSiteVersion {
+				switch modelName {
+				case "seedance2.0-A":
+					payload["resolution"] = "2k"
+				case "seedance2.5-A":
+					payload["resolution"] = "4k"
+				}
+			}
 			var submits, polls, downloads atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				assert.Equal(t, "Bearer upstream-key", request.Header.Get("Authorization"))
@@ -1032,6 +1085,9 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 					}
 					assert.Equal(t, modelName, body["model"])
 					assert.Equal(t, float64(5), body["seconds"])
+					if resolution, requested := payload["resolution"]; requested {
+						assert.Equal(t, resolution, body["resolution"])
+					}
 					writer.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(writer, `{"id":"remote-task","status":"queued","progress":0}`)
 					return
@@ -1063,7 +1119,7 @@ func TestDramaVideoHTTPTaskLifecycle(t *testing.T) {
 				_, _ = io.WriteString(writer, `{"id":"remote-task","status":"completed","progress":100,"seconds":5,"usage":{"total_tokens":12345},"metadata":{"url":"/v1/videos/remote-task/content"}}`)
 			}))
 			t.Cleanup(upstream.Close)
-			intent, err := decodeDramaVideoRequest(t, plugin, modelName, "create", map[string]any{"prompt": "a cat", "seconds": 5})
+			intent, err := decodeDramaVideoRequest(t, plugin, modelName, "create", payload)
 			require.NoError(t, err)
 			info := &relaycommon.RelayInfo{OriginModelName: modelName, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: modelName, ChannelBaseUrl: upstream.URL, ApiKey: "upstream-key"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: intent["action"].(string)}}
 			adaptor := pluginadaptor.New(plugin)

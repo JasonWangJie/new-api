@@ -51,6 +51,7 @@ func AsyncImageIdempotencyKey(c *gin.Context) (string, error) {
 
 func SubmitAsyncImage(c *gin.Context) {
 	ctx := c.Request.Context()
+	routing, retest := ctx.Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
 	cfg, err := service.GetImageRuntimeConfig(ctx)
 	if err != nil {
 		AsyncImagePublicError(c, 503, "async_image_unavailable", "Async image configuration is unavailable")
@@ -74,12 +75,17 @@ func SubmitAsyncImage(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
 		return
 	}
+	if retest {
+		request.Provider = ""
+		request.RetestChannelID = routing.channelID
+	}
+	replayImageDetails := imageRetainedDetails(request)
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", c.GetInt("token_id"), c.GetInt("id")).Take(&token).Error; err != nil {
 		AsyncImagePublicError(c, 503, "database_unavailable", "Token lookup is unavailable")
 		return
 	}
-	fingerprint := service.AsyncImageRequestHash(request.Platform, request.Dialect, request.SourcePath, raw)
+	fingerprint := mediaRetestRequestHash(c, service.AsyncImageRequestHash(request.Platform, request.Dialect, request.SourcePath, raw))
 	if key != "" {
 		var binding model.AsyncImageIdempotency
 		err := model.DB.WithContext(ctx).Where("token_id = ? AND key_hash = ?", token.Id, key).Take(&binding).Error
@@ -119,16 +125,20 @@ func SubmitAsyncImage(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "async_image_queue_unavailable", "Redis scheduling is unavailable")
 		return
 	}
-	inputIds, err := service.AsyncImageInputReferences(ctx, token.Id, request)
-	if err != nil {
-		AsyncImagePublicError(c, 400, "invalid_reference_image", err.Error())
-		return
+	var inputIds []string
+	if !routing.dryRun {
+		inputIds, err = service.AsyncImageInputReferences(ctx, token.Id, request)
+		if err != nil {
+			AsyncImagePublicError(c, 400, "invalid_reference_image", err.Error())
+			return
+		}
 	}
 	task := model.AsyncImageTask{TaskId: "asyncimg_" + common.GetUUID(), UserId: token.UserId, TokenId: token.Id, Group: policy.Group, Platform: request.Platform, Dialect: request.Dialect, Model: request.Model, RequestType: request.Kind, SourcePath: request.SourcePath, RequestedSize: request.Size, RequestedResolution: request.Resolution, AspectRatio: request.AspectRatio, RequestHash: fingerprint, ExpiresAt: time.Now().Unix() + int64(cfg.TaskRetentionDays)*86400}
-	if request.Dialect == "async" {
+	if request.Dialect == "async" || retest {
 		request.PolicyPlatform = policy.Platform
 		request.ClientIP = c.ClientIP()
-		if service.FreezeAsyncImageBillingFunc == nil {
+		unified := request.Dialect == "async"
+		if unified && service.FreezeAsyncImageBillingFunc == nil {
 			AsyncImagePublicError(c, 503, "pricing_unavailable", "Image pricing is unavailable")
 			return
 		}
@@ -149,7 +159,7 @@ func SubmitAsyncImage(c *gin.Context) {
 		}
 		capability := service.ImageChannelCapability(*selected, request.Model)
 		task.Provider, task.ExecutionProtocol, task.ChannelId = capability.Provider, capability.Protocol, selected.Id
-		if request.MixedRouting == nil {
+		if unified && request.MixedRouting == nil {
 			request.Provider = capability.Provider
 			if capability.Protocol == "gemini_native" {
 				request.Platform = "gemini"
@@ -157,21 +167,32 @@ func SubmitAsyncImage(c *gin.Context) {
 				request.Platform = "openai"
 			}
 		}
-		channelData, err := common.Marshal(selected)
-		if err == nil {
-			task.SelectedChannelCipher, err = service.EncryptImagePayload(channelData, "image-channel:"+task.TaskId)
-		}
-		if err != nil {
-			AsyncImagePublicError(c, 503, "encryption_unavailable", "Image channel could not be frozen")
-			return
-		}
-		if request.Billing == nil {
+		if unified && request.Billing == nil {
 			billing, err := service.FreezeAsyncImageBillingFunc(ctx, token, request, task.Group, selected)
 			if err != nil {
 				AsyncImagePublicError(c, 400, "pricing_unavailable", err.Error())
 				return
 			}
 			request.Billing = &billing
+		}
+		if routing.dryRun {
+			upstream, err := service.ResolveImageChannelUpstreamModel(*selected, request.Model)
+			if err != nil {
+				AsyncImagePublicError(c, 400, "invalid_request", err.Error())
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"channel_id": selected.Id, "upstream_model": upstream})
+			return
+		}
+		if unified {
+			channelData, err := common.Marshal(selected)
+			if err == nil {
+				task.SelectedChannelCipher, err = service.EncryptImagePayload(channelData, "image-channel:"+task.TaskId)
+			}
+			if err != nil {
+				AsyncImagePublicError(c, 503, "encryption_unavailable", "Image channel could not be frozen")
+				return
+			}
 		}
 		task.Platform = request.Platform
 	}
@@ -197,7 +218,15 @@ func SubmitAsyncImage(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "async_image_encryption_unavailable", "Stable image payload encryption keys are required")
 		return
 	}
-	task, reused, err := model.AcceptAsyncImageTask(ctx, task, key, inputIds)
+	replay, err := encryptMediaReplaySnapshot(model.MediaReplayImage, task.TaskId, mediaReplayHeader{
+		MediaRetestRequest: service.MediaRetestRequest{Path: c.Request.URL.Path, ContentType: c.GetHeader("Content-Type"), Body: raw},
+		ImageDetails:       &replayImageDetails,
+	})
+	if err != nil {
+		AsyncImagePublicError(c, 503, "async_image_encryption_unavailable", "Image retest request could not be stored")
+		return
+	}
+	task, reused, err := model.AcceptAsyncImageTask(ctx, task, key, inputIds, replay)
 	if err != nil {
 		if errors.Is(err, model.ErrAsyncQueueFull) {
 			c.Header("Retry-After", "5")

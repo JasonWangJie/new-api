@@ -79,7 +79,7 @@ func ValidateMixedVideoOverridesStatic(overrides VideoModelOverrides) error {
 // relationships between duration, resolution and inputs. Pool filtering is used
 // for public capabilities, while configuration discovery also permits new pools.
 func MixedVideoModelProfiles(ctx context.Context, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, error) {
-	return mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool)
+	return mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool, 0, nil)
 }
 
 // VideoRoutingSourceProfile retains provider-owned material paths separately
@@ -89,19 +89,22 @@ type VideoRoutingSourceProfile struct {
 	Inputs  []jsplugin.VideoRetryInput
 }
 
-func MixedVideoModelRoutingProfiles(ctx context.Context, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool) ([]jsplugin.VideoProfile, []VideoRoutingSourceProfile, error) {
+func MixedVideoModelRoutingProfiles(ctx context.Context, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool, channelID int) ([]jsplugin.VideoProfile, []VideoRoutingSourceProfile, error) {
 	var sources []VideoRoutingSourceProfile
-	profiles, err := mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool, &sources)
+	profiles, err := mixedVideoModelProfilesDB(ctx, model.DB, policy, publicModel, overrides, requirePool, channelID, &sources)
 	return profiles, sources, err
 }
 
-func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool, routingSources ...*[]VideoRoutingSourceProfile) ([]jsplugin.VideoProfile, error) {
+func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.ImageGroupPolicy, publicModel string, overrides VideoModelOverrides, requirePool bool, channelID int, routingSources *[]VideoRoutingSourceProfile) ([]jsplugin.VideoProfile, error) {
 	if err := ValidateMixedVideoOverridesStatic(overrides); err != nil {
 		return nil, err
 	}
 	group := policy.Group
 	var abilities []model.Ability
 	query := db.WithContext(ctx).Where("enabled = ?", true).Where("model IN ?", []string{publicModel, ratio_setting.RoutingMatchModelName(publicModel)})
+	if channelID > 0 {
+		query = query.Where("channel_id = ?", channelID)
+	}
 	if group != "auto" || requirePool {
 		query = query.Where(map[string]any{"group": group})
 	}
@@ -186,9 +189,9 @@ func mixedVideoModelProfilesDB(ctx context.Context, db *gorm.DB, policy model.Im
 				if len(profile.Modes) == 0 {
 					continue
 				}
-				for _, sources := range routingSources {
+				if routingSources != nil {
 					inputs, _ := videoRetryInputSelectors(binding.Plugin)
-					*sources = append(*sources, VideoRoutingSourceProfile{Profile: profile, Inputs: slices.Clone(inputs)})
+					*routingSources = append(*routingSources, VideoRoutingSourceProfile{Profile: profile, Inputs: slices.Clone(inputs)})
 				}
 				encoded, err := common.Marshal(profile)
 				if err != nil {

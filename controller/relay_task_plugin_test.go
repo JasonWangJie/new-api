@@ -103,7 +103,7 @@ func TestMixedVideoAdmissionAndCrossPluginRecovery(t *testing.T) {
 		target := fmt.Sprintf("vendor-model-%d", index)
 		source := fmt.Sprintf(`
 export const meta = {apiVersion:1,key:%q,name:%q,version:"1.0.0",author:{name:"Test"},models:[%q],fetchMode:"per_task",protocols:["openai_video"],videoProfiles:[{models:[%q],modes:[{name:"text_to_video",duration:{values:[5,10],default:%d},resolutions:["720p"],defaultResolution:"720p"},{name:"image_to_video",duration:{values:[5,10],default:%d},resolutions:["720p"],defaultResolution:"720p",inputs:[{name:"image",kind:"image",sources:["upload"],maxItems:1,required:true}]}]}]};
-export const protocols={openai_video:{decodeRequest(ctx){if(ctx.upstreamModel!==%q)throw new Error("incorrect member mapping");let body=ctx.body.value;if(ctx.body.kind==="multipart"){body={};for(const key in ctx.body.fields)body[key]=ctx.body.fields[key][0];}if(body.prompt==="change-specs")body.seconds=10;return {kind:"submit",model:ctx.model,action:ctx.body.files&&ctx.body.files.length?"image_to_video":"text_to_video",requestBody:body};},render(ctx,task){return task;}}};
+	export const protocols={openai_video:{decodeRequest(ctx){if(ctx.upstreamModel!==%q)throw new Error("incorrect member mapping");let body=ctx.body.value;if(ctx.body.kind==="multipart"){body={};for(const key in ctx.body.fields)body[key]=ctx.body.fields[key][0];}if(body.prompt==="change-specs")body.seconds=10;if(body.prompt==="reject-reference")throw new Error(ctx.upstreamModel==="vendor-model-0"?"当前渠道该分辨率（1080p、4k）暂不支持参考视频模式":"Private vendor rejected channel 42");return {kind:"submit",model:ctx.model,action:ctx.body.files&&ctx.body.files.length?"image_to_video":"text_to_video",requestBody:body};},render(ctx,task){return task;}}};
 export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q,body:ctx.requestBody};}export function parseSubmitResponse(ctx,resp){if(resp.statusCode>=400)throw new Error("receipt is unknown");return {taskId:"accepted"};}export function buildQueryRequest(){return {method:"GET",url:"https://example.invalid/query"};}export function parseTaskResult(){return {status:"SUCCESS"};}export function listArtifacts(){return [];}export function buildContentRequest(){return {method:"GET",url:"https://example.invalid/content"};}
 `, key, key, target, target, 5+index*5, 5+index*5, target, fmt.Sprintf("/vendor-%d/generate", index))
 		plugin, err := pluginruntime.DefaultRegistry.RegisterFactory(source, pluginruntime.Options{Key: key})
@@ -166,6 +166,12 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 	engine.ServeHTTP(altered, alteredRequest)
 	assert.Equal(t, 400, altered.Code, "a decoder cannot change five billed seconds to ten even when both durations are supported")
 	assert.Contains(t, altered.Body.String(), "changed the public seconds")
+	rejected := httptest.NewRecorder()
+	rejectedRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"reject-reference"}`))
+	rejectedRequest.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(rejected, rejectedRequest)
+	require.Equal(t, http.StatusBadRequest, rejected.Code)
+	assert.JSONEq(t, `{"error":{"type":"invalid_request_error","code":"provider_unavailable","message":"当前渠道该分辨率（1080p、4k）暂不支持参考视频模式"}}`, rejected.Body.String())
 	require.NoError(t, db.Model(&policy).Update("enabled", false).Error)
 	recorder := httptest.NewRecorder()
 	requestHTTP := httptest.NewRequest(http.MethodPost, "/v1/videos/generations_async", strings.NewReader(`{"model":"shared-public-video","seconds":5,"resolution":"720p"}`))
@@ -260,12 +266,14 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 		action        string
 		paused        bool
 		retryAccepted bool
+		retest        bool
 	}{
 		{name: "unmatched retains hold", reserved: 100},
 		{name: "unmatched free request"},
 		{name: "accepted without retry", accepted: true},
 		{name: "refund retries", reserved: 100, refundFailure: true},
 		{name: "custom same channel", reserved: 100, action: mediaretry.SameChannel, retryAccepted: true},
+		{name: "retest stays on selected channel", reserved: 100, action: mediaretry.SameChannel, retryAccepted: true, retest: true},
 		{name: "custom free same channel", action: mediaretry.SameChannel, retryAccepted: true},
 		{name: "custom exhausted", reserved: 100, action: mediaretry.SameChannel},
 		{name: "custom paused", reserved: 100, action: mediaretry.SameChannel, paused: true},
@@ -289,6 +297,9 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 			var calls atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				call := calls.Add(1)
+				if tc.retest {
+					assert.Equal(t, "/vendor-0/generate", r.URL.Path)
+				}
 				w.Header().Set("Content-Type", "application/json")
 				if tc.accepted || tc.retryAccepted && call > 1 {
 					_, _ = w.Write([]byte(`{"id":"accepted"}`))
@@ -304,6 +315,9 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 			expression := fmt.Sprintf(`tier("public", u("requests") * %.12f)`, float64(reserved)/common.QuotaPerUnit)
 			snapshot := &billingexpr.BillingSnapshot{ModelName: publicModel, BillingMode: "tiered_expr", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), ExprVersion: 1, GroupRatio: 1, QuotaPerUnit: common.QuotaPerUnit, EstimatedQuotaBeforeGroup: float64(reserved), EstimatedQuotaAfterGroup: reserved, TaskUsageBilling: true, MixedVideoBilling: true, MixedVideoSchemaVersion: 1, UsageFacts: map[string]any{"requests": float64(1), "action": "generate", "seconds": float64(5), "resolution": "720p"}}
 			initial := service.AsyncVideoRequest{MixedRouting: route, Body: []byte(`{"model":"shared-public-video","seconds":5,"resolution":"720p","prompt":"unknown submit"}`), ContentType: "application/json", Operation: "create", ClientIP: "203.0.113.10", Channel: channel, PluginHash: plugins[0].Engine.SourceFingerprint(), Execution: &model.TaskExecutionSnapshot{TaskPlugin: &model.TaskPluginSnapshot{Key: plugins[0].Meta.Key, Version: "1.0.0"}}, Billing: service.MediaBillingSnapshot{Tiered: snapshot, Price: types.PriceData{Quota: reserved, QuotaToPreConsume: reserved, FreeModel: reserved == 0, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}}
+			if tc.retest {
+				initial.RetestChannelID = channel.Id
+			}
 			require.NoError(t, service.FreezeAsyncVideoReferenceRecovery(&initial, nil, now+600))
 			require.Equal(t, 2, initial.ReferenceRecoveryVersion)
 			initialJob := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), IdentityHash: common.GetUUID(), UserId: user.Id, TokenId: token.Id, ChannelId: channel.Id, Provider: plugins[0].Meta.Key, Model: publicModel, Group: "default", Status: "queued", BillingStatus: "pending", StorageStatus: "pending", LeaseToken: fmt.Sprintf("first-mixed-%d", reserved), LeaseExpiresAt: now + 120, CreatedAt: now, ExpiresAt: now + 600}
@@ -345,6 +359,13 @@ export function buildSubmitRequest(ctx){return {method:"POST",url:ctx.baseUrl+%q
 					assert.True(t, retained.InitialUnknownAttempts[0].MixedVideo)
 					require.NotNil(t, retained.InitialRetryState)
 					assert.Equal(t, 1, retained.InitialRetryState.TotalUsed)
+				}
+				if tc.retest {
+					var native model.Task
+					require.NoError(t, db.Where("task_id = ?", initialJob.TaskId).Take(&native).Error)
+					assert.Equal(t, channel.Id, native.ChannelId)
+					require.NotNil(t, native.PrivateData.CurrentAttempt)
+					assert.Equal(t, channel.Id, native.PrivateData.CurrentAttempt.ChannelID)
 				}
 				return
 			}
@@ -514,7 +535,7 @@ func TestConditionalVideoAdmissionWorkerPreservesSourcePrice(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			user, token := setupResponsesWSRequestTest(t)
 			db := setupVideoRetryTestDatabase(t, user, token)
-			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+			require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.ImageGroupPolicy{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.Option{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.MediaReplaySnapshot{}, &model.ImageInputTaskReference{}))
 			t.Setenv("ASYNC_IMAGE_PAYLOAD_KEYS", "conditional-test:"+base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)))
 			t.Setenv("ASYNC_IMAGE_ACTIVE_KEY_ID", "conditional-test")
 			previousRegistry, previousSubmit := pluginruntime.DefaultRegistry, service.SubmitAsyncVideoFunc
@@ -881,7 +902,7 @@ func TestMixedVideoResolutionMappingDispatch(t *testing.T) {
 	user, token := setupResponsesWSRequestTest(t)
 	dialect := cmp.Or(os.Getenv("RETRY_POLICY_TEST_DIALECT"), "sqlite")
 	db := modelManagementDB(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.MediaReplaySnapshot{}, &model.ImageInputTaskReference{}))
 	token.RemainQuota = 1000
 	require.NoError(t, db.Create(user).Error)
 	require.NoError(t, db.Create(token).Error)
@@ -1063,7 +1084,7 @@ func TestMixedVideoPricingAPIThroughSubmissionAndSettlement(t *testing.T) {
 		dialect = "sqlite"
 	}
 	db := modelManagementDB(t, dialect, os.Getenv("RETRY_POLICY_TEST_DSN"))
-	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}))
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.TokenImagePlatformMapping{}, &model.ImageChannelPool{}, &model.MediaRetryEvent{}, &model.UserSubscription{}, &model.AsyncImageUsageProjection{}, &model.AsyncImageLogReceipt{}, &model.CanvasGrant{}, &model.Log{}, &model.MediaRetryPolicyVersion{}, &model.MediaArtifactObject{}, &model.MediaInputObject{}, &model.MediaReplaySnapshot{}, &model.ImageInputTaskReference{}))
 	token.RemainQuota = 1000
 	require.NoError(t, db.Create(user).Error)
 	require.NoError(t, db.Create(token).Error)

@@ -122,6 +122,35 @@ export type ImageCapabilities = {
     group: string
   }[]
 }
+export type MediaTaskRetestResult = {
+  task_id: string
+  media_type: 'image' | 'video'
+}
+
+export type MediaTaskRetestModel = {
+  model: string
+  upstream_model?: string
+}
+
+export type MediaTaskRetestOptions = {
+  original_channel_id: number
+  original_channel_name?: string
+  original_model: string
+  original_unavailable_code?: string
+  original_unavailable_reason?: string
+  channels: {
+    id: number
+    name: string
+    models: MediaTaskRetestModel[]
+  }[]
+  auto_models: MediaTaskRetestModel[]
+}
+
+export type MediaTaskRetestSelection = {
+  channel_id: number
+  model: string
+}
+
 export type ImageTask = {
   media_retry_decision?: import('./retry-policy/types').RetryDecision
   failure_code?: number
@@ -144,6 +173,9 @@ export type ImageTask = {
   }
   retained_request_available?: boolean
   request_retain_until?: number
+  can_retest?: boolean
+  retest_unavailable_reason?: string
+  retest_retain_until?: number
   media_type?: 'image' | 'video'
   provider?: string
   stage?: string

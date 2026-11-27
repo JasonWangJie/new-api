@@ -33,6 +33,7 @@ type AsyncImageInputPart struct {
 }
 
 type AsyncImageRequest struct {
+	RetestChannelID          int                          `json:"retest_channel_id,omitempty"`
 	LocalReferencesRequested bool                         `json:"local_references_requested,omitempty"`
 	MixedRouting             *ImageMixedRouting           `json:"mixed_routing,omitempty"`
 	ReferenceTransportUsed   *string                      `json:"-"`

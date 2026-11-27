@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
 import { ArrowUpRight, Ban, Braces, ChevronDown } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { CopyButton } from '@/components/copy-button'
@@ -75,6 +75,7 @@ import {
 } from './image-badges'
 import { ImageResults } from './image-results'
 import { ImageTaskNotice } from './image-task-notice'
+import { MediaTaskRetest } from './media-task-retest'
 import { VideoResults } from './video-results'
 
 function TaskDetailFields(props: {
@@ -177,41 +178,72 @@ function RetryDecisionFields({ decision }: { decision: ImageRetryDecision }) {
   )
 }
 
-function RetainedImageRequest({
-  id,
-  until,
-  userId,
-}: {
+function RetainedImageRequestContent(props: { id: string; userId: number }) {
+  const { t } = useTranslation()
+  const request = useQuery({
+    queryKey: ['image-retained-request', props.userId, props.id],
+    queryFn: ({ signal }) => getImageRetainedRequest(props.id, signal),
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    meta: { errorToast: false },
+  })
+  if (request.isPending) {
+    return <LoadingState className='min-h-24' size='sm' />
+  }
+  if (request.isError) {
+    return (
+      <ErrorState
+        className='min-h-24'
+        description={request.error.message}
+        onRetry={() => void request.refetch()}
+      />
+    )
+  }
+  const { prompt, ...diagnostics } = request.data.request
+  return (
+    <>
+      <div className='flex items-center justify-between gap-2'>
+        <h4 className='text-sm font-medium'>{t('Full prompt')}</h4>
+        <CopyButton value={prompt} variant='outline' size='sm'>
+          {t('Copy')}
+        </CopyButton>
+      </div>
+      <pre
+        className='bg-muted max-h-80 overflow-auto rounded-md p-3 text-sm break-words whitespace-pre-wrap'
+        aria-label={t('Full prompt')}
+        tabIndex={0}
+      >
+        {prompt}
+      </pre>
+      <pre
+        className='bg-muted max-h-48 overflow-auto rounded-md p-3 text-xs break-words whitespace-pre-wrap'
+        aria-label={t('Retained request diagnostics')}
+      >
+        {JSON.stringify(diagnostics, null, 2)}
+      </pre>
+    </>
+  )
+}
+
+function RetainedImageRequest(props: {
   id: string
   until: number
   userId: number
+  expired: boolean
 }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
-  const [expired, setExpired] = useState(until * 1000 <= Date.now())
-  useEffect(() => {
-    const timer = window.setTimeout(
-      () => setExpired(true),
-      Math.max(0, until * 1000 - Date.now())
-    )
-    return () => window.clearTimeout(timer)
-  }, [until])
-  const request = useQuery({
-    queryKey: ['image-retained-request', userId, id],
-    queryFn: ({ signal }) => getImageRetainedRequest(id, signal),
-    enabled: open && !expired,
-    gcTime: 0,
-    staleTime: 0,
-    refetchOnWindowFocus: false,
-  })
+  const visible = open && !props.expired
   return (
     <Collapsible
-      open={open && !expired}
+      open={visible}
       onOpenChange={setOpen}
       className='overflow-hidden rounded-lg border'
     >
       <CollapsibleTrigger
-        disabled={expired}
+        disabled={props.expired}
         render={
           <Button
             variant='ghost'
@@ -220,45 +252,23 @@ function RetainedImageRequest({
         }
       >
         <ChevronDown className='size-4' aria-hidden />
-        {t('View retained request')}
+        {t('View full prompt')}
       </CollapsibleTrigger>
+      <CollapsibleContent>
+        {visible && (
+          <div className='space-y-3 border-t p-4'>
+            <RetainedImageRequestContent id={props.id} userId={props.userId} />
+          </div>
+        )}
+      </CollapsibleContent>
       <p className='text-muted-foreground px-4 pb-3 text-xs'>
-        {expired
+        {props.expired
           ? t('Retained request expired')
           : t(
               'Encrypted retention ends at {{time}}. The diagnostic view masks credentials and omits image data.',
-              { time: formatTimestampToDate(until) }
+              { time: formatTimestampToDate(props.until) }
             )}
       </p>
-      <CollapsibleContent>
-        <div className='space-y-3 border-t p-4'>
-          {request.isPending && <LoadingState className='min-h-24' size='sm' />}
-          {request.isError && (
-            <ErrorState
-              className='min-h-24'
-              description={request.error.message}
-              onRetry={() => void request.refetch()}
-            />
-          )}
-          {!request.isError && request.data && !expired && (
-            <>
-              <CopyButton
-                value={JSON.stringify(request.data.request, null, 2)}
-                variant='outline'
-                size='sm'
-              >
-                {t('Copy')}
-              </CopyButton>
-              <pre
-                className='bg-muted max-h-64 overflow-auto rounded-md p-3 text-xs break-words whitespace-pre-wrap'
-                aria-label={t('Retained request diagnostics')}
-              >
-                {JSON.stringify(request.data.request, null, 2)}
-              </pre>
-            </>
-          )}
-        </div>
-      </CollapsibleContent>
     </Collapsible>
   )
 }
@@ -268,6 +278,7 @@ export function ImageTaskDetails(props: {
   admin: boolean
   userId: number
   onClose: () => void
+  onRetestAccepted?: (taskId: string) => void
   canManage: boolean
   onManage: (
     action: 'resume' | 'terminate',
@@ -293,7 +304,10 @@ export function ImageTaskDetails(props: {
   })
   const data = task.data?.task
   const cost = data ? imageTaskCost(data) : null
-  const now = useMediaRetentionClock(data ? [data] : undefined)
+  const now = useMediaRetentionClock(data ? [data] : undefined, [
+    data?.request_retain_until,
+    data?.retest_retain_until,
+  ])
   const resultExpired = data ? imageTaskResultExpired(data, now) : false
   const results = task.data?.results || []
   const images = useQuery({
@@ -382,6 +396,12 @@ export function ImageTaskDetails(props: {
     (props.canManage ||
       (!props.admin && data.media_type === 'video' && !videoReconciliation))
   )
+  const showRetest =
+    props.admin &&
+    props.canManage &&
+    (data?.can_retest ||
+      data?.retest_unavailable_reason === 'request_expired' ||
+      data?.retest_unavailable_reason === 'request_unavailable')
   return (
     <Dialog
       open
@@ -428,8 +448,16 @@ export function ImageTaskDetails(props: {
                 )}
                 <ImageRequestTypeBadge requestType={data.request_type} />
               </div>
-              {(canResume || canTerminate) && (
+              {(canResume || canTerminate || showRetest) && (
                 <div className='flex flex-wrap gap-2'>
+                  {showRetest && props.onRetestAccepted && (
+                    <MediaTaskRetest
+                      task={data}
+                      userId={props.userId}
+                      now={now}
+                      onAccepted={props.onRetestAccepted}
+                    />
+                  )}
                   {canResume && (
                     <Button
                       size='sm'
@@ -542,6 +570,16 @@ export function ImageTaskDetails(props: {
                 {data.prompt_summary}
               </p>
             )}
+            {props.admin &&
+              data.retained_request_available &&
+              !!data.request_retain_until && (
+                <RetainedImageRequest
+                  id={props.id}
+                  until={data.request_retain_until}
+                  userId={props.userId}
+                  expired={data.request_retain_until <= now}
+                />
+              )}
             <ImageTaskNotice task={data} diagnostics />
             {references.length > 0 && (
               <div className='space-y-2'>
@@ -886,14 +924,6 @@ export function ImageTaskDetails(props: {
                 <p role='alert' className='text-muted-foreground text-xs'>
                   {t('Attempt history is unavailable for this task.')}
                 </p>
-              )}
-              {data.retained_request_available && data.request_retain_until && (
-                <RetainedImageRequest
-                  key={props.id}
-                  id={props.id}
-                  until={data.request_retain_until}
-                  userId={props.userId}
-                />
               )}
               {attempts.length > 0 && (
                 <Collapsible

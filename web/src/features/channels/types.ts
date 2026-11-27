@@ -283,6 +283,7 @@ export interface InteractiveChannelTestRequest {
   mode: InteractiveChannelTestMode
   prompt: string
   endpoint_type: string
+  image_urls?: string[]
 }
 
 export interface InteractiveChannelTestResult {

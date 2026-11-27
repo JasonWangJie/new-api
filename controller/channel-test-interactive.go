@@ -3,11 +3,15 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,6 +23,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -40,6 +46,7 @@ type channelTestInput struct {
 	Model        string                `json:"model"`
 	Mode         string                `json:"mode"`
 	Prompt       string                `json:"prompt"`
+	ImageURLs    []string              `json:"image_urls,omitempty"`
 	EndpointType constant.EndpointType `json:"endpoint_type"`
 	Stream       bool                  `json:"stream"`
 	requestID    string
@@ -214,6 +221,25 @@ func RunInteractiveChannelTest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Test prompt exceeds 4096 characters"})
 		return
 	}
+	if len(input.ImageURLs) > 0 {
+		references := input.ImageURLs[:0]
+		for index, raw := range input.ImageURLs {
+			reference := strings.TrimSpace(raw)
+			if reference == "" {
+				continue
+			}
+			if _, err := service.ValidateImageReferenceURL(reference); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": fmt.Sprintf("Reference image %d: %s", index+1, err)})
+				return
+			}
+			references = append(references, reference)
+		}
+		input.ImageURLs = references
+		if len(references) > 0 && input.Mode != channelTestModeImage {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Reference image URLs are only supported in image generation tests"})
+			return
+		}
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid channel ID"})
@@ -230,6 +256,13 @@ func RunInteractiveChannelTest(c *gin.Context) {
 	if !slices.ContainsFunc(channel.GetModels(), func(name string) bool { return strings.TrimSpace(name) == input.Model }) {
 		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Model is not configured on this channel"})
 		return
+	}
+	if len(input.ImageURLs) > 0 {
+		limit := min(service.DefaultImageRuntimeConfig().MaxReferences, channel.GetImageMaxReferenceImages())
+		if len(input.ImageURLs) > limit {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": fmt.Sprintf("The selected channel accepts up to %d reference image URLs", limit)})
+			return
+		}
 	}
 	options := interactiveChannelTestOptions(channel, input.Model)
 	endpoints := options.ChatEndpointTypes
@@ -335,6 +368,160 @@ func applyInteractiveChannelTestPrompt(request dto.Request, input *channelTestIn
 		request.Prompt = input.Prompt
 	default:
 		return errors.New("Unsupported channel test request")
+	}
+	return nil
+}
+
+func prepareInteractiveChannelTestReferences(c *gin.Context, info *relaycommon.RelayInfo, adaptor relaychannel.Adaptor, input *channelTestInput) error {
+	provider, ok := adaptor.(relaychannel.ImageCapabilityProvider)
+	if !ok {
+		return errors.New("The selected channel model does not support reference images")
+	}
+	capability := provider.ImageCapability(info.UpstreamModelName)
+	if info.ChannelType == constant.ChannelTypeTabTab {
+		capability = service.TabtabImageCapability(info.UpstreamModelName, info.ChannelOtherSettings.TabtabImageModelProfiles)
+	}
+	if !capability.Edit && capability.ReferenceField == "" {
+		return errors.New("The selected channel model does not support reference images")
+	}
+
+	cfg := service.DefaultImageRuntimeConfig()
+	remainingBytes := cfg.DownloadMaxBytes
+	if limit := info.ChannelSetting.ImageMaxReferenceBytes; limit != nil && *limit > 0 {
+		cfg.DownloadMaxBytes = min(cfg.DownloadMaxBytes, *limit)
+	}
+	switch request := info.Request.(type) {
+	case *dto.GeminiChatRequest:
+		for index, reference := range input.ImageURLs {
+			parsed, _ := service.ValidateImageReferenceURL(reference)
+			mimeType := mime.TypeByExtension(strings.ToLower(path.Ext(parsed.Path)))
+			if slices.Contains([]string{"image/jpeg", "image/png", "image/webp", "image/gif"}, mimeType) && info.ChannelSetting.ImageReferenceTransportMode != "local" {
+				request.Contents[0].Parts = append(request.Contents[0].Parts, dto.GeminiPart{FileData: &dto.GeminiFileData{MimeType: mimeType, FileUri: reference}})
+				continue
+			}
+			cfg.DownloadMaxBytes = min(cfg.DownloadMaxBytes, remainingBytes)
+			image, err := service.DownloadImageReference(c.Request.Context(), reference, cfg)
+			if err != nil {
+				return service.NewImageReferenceFailure(index+1, err)
+			}
+			remainingBytes -= int64(len(image.Data))
+			request.Contents[0].Parts = append(request.Contents[0].Parts, dto.GeminiPart{InlineData: &dto.GeminiInlineData{MimeType: image.ContentType, Data: base64.StdEncoding.EncodeToString(image.Data)}})
+		}
+	case *dto.ImageRequest:
+		references := input.ImageURLs
+		if info.ChannelSetting.ImageReferenceTransportMode == "local" && capability.EditFormat != "multipart" {
+			references = make([]string, 0, len(input.ImageURLs))
+			for index, reference := range input.ImageURLs {
+				cfg.DownloadMaxBytes = min(cfg.DownloadMaxBytes, remainingBytes)
+				image, err := service.DownloadImageReference(c.Request.Context(), reference, cfg)
+				if err != nil {
+					return service.NewImageReferenceFailure(index+1, err)
+				}
+				remainingBytes -= int64(len(image.Data))
+				references = append(references, image.DataURL())
+			}
+		}
+		switch capability.ReferenceField {
+		case "image":
+			var err error
+			request.Image, err = common.Marshal(references)
+			return err
+		case "images":
+			var err error
+			request.Images, err = common.Marshal(references)
+			return err
+		}
+		info.RelayMode = relayconstant.RelayModeImagesEdits
+		info.RequestURLPath = "/v1/images/edits"
+		c.Request.URL.Path = info.RequestURLPath
+		if info.ChannelOtherSettings.UpstreamAsync.HasMatch(dto.UpstreamAsyncMediaImage, info.UpstreamModelName, dto.UpstreamAsyncOperationEdit) {
+			return errors.New("The selected channel model requires an asynchronous image editing endpoint")
+		}
+		if capability.EditFormat == "multipart" {
+			if info.ChannelType == constant.ChannelTypeReplicate && len(input.ImageURLs) != 1 {
+				return errors.New("The selected channel model accepts one reference image")
+			}
+			return prepareInteractiveChannelTestImageForm(c, request, references, cfg, remainingBytes)
+		}
+		images := make([]map[string]string, 0, len(references))
+		for _, reference := range references {
+			images = append(images, map[string]string{"image_url": reference})
+		}
+		var err error
+		request.Images, err = common.Marshal(images)
+		return err
+	default:
+		return errors.New("The selected channel model does not support reference images")
+	}
+	return nil
+}
+
+func prepareInteractiveChannelTestImageForm(c *gin.Context, request *dto.ImageRequest, references []string, cfg service.ImageRuntimeConfig, remainingBytes int64) error {
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	for field, value := range map[string]string{"model": request.Model, "prompt": request.Prompt, "size": request.Size, "n": "1"} {
+		if err := form.WriteField(field, value); err != nil {
+			return err
+		}
+	}
+	for index, reference := range references {
+		cfg.DownloadMaxBytes = min(cfg.DownloadMaxBytes, remainingBytes)
+		image, err := service.DownloadImageReference(c.Request.Context(), reference, cfg)
+		if err != nil {
+			return service.NewImageReferenceFailure(index+1, err)
+		}
+		remainingBytes -= int64(len(image.Data))
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+			"name": "image[]", "filename": fmt.Sprintf("reference-%d.%s", index+1, strings.TrimPrefix(image.ContentType, "image/")),
+		}))
+		header.Set("Content-Type", image.ContentType)
+		part, err := form.CreatePart(header)
+		if err != nil {
+			return err
+		}
+		if _, err := part.Write(image.Data); err != nil {
+			return err
+		}
+	}
+	if err := form.Close(); err != nil {
+		return err
+	}
+	data := body.Bytes()
+	c.Request.Body = io.NopCloser(bytes.NewReader(data))
+	c.Request.ContentLength = int64(len(data))
+	c.Request.Header.Set("Content-Type", form.FormDataContentType())
+	_, err := c.MultipartForm()
+	c.Request.Body = io.NopCloser(bytes.NewReader(data))
+	return err
+}
+
+func validateInteractiveChannelTestReferences(before, after []byte, format types.RelayFormat, channelType int) error {
+	if format == types.RelayFormatOpenAIImage && constant.IsAdvancedCustomChannel(channelType) &&
+		!gjson.GetBytes(before, "image").Exists() && !gjson.GetBytes(after, "images").Exists() {
+		// Custom routes can translate the OpenAI edit body to a provider's URL list.
+		original := gjson.GetBytes(before, "images.#.image_url").Array()
+		native := gjson.GetBytes(after, "image")
+		if len(original) > 0 && native.IsArray() && slices.EqualFunc(original, native.Array(), func(a, b gjson.Result) bool {
+			return a.Type == gjson.String && b.Type == gjson.String && a.Str == b.Str
+		}) {
+			return nil
+		}
+	}
+	fields := []string{"image", "images"}
+	switch {
+	case format == types.RelayFormatGemini:
+		fields = []string{"contents.#.parts.#.fileData", "contents.#.parts.#.inlineData"}
+	case channelType == constant.ChannelTypeAli:
+		fields = []string{"input.images", "input.messages.#.content.#.image"}
+	case channelType == constant.ChannelTypeReplicate:
+		fields = []string{"input.image_prompt"}
+	}
+	for _, field := range fields {
+		original := gjson.GetBytes(before, field)
+		if original.Exists() && original.Raw != gjson.GetBytes(after, field).Raw {
+			return errors.New("Channel parameter overrides cannot replace or remove the test reference images")
+		}
 	}
 	return nil
 }

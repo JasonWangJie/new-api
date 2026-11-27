@@ -20,6 +20,7 @@ import { ArrowDown, ArrowUp, Link2, Plus, Trash2, Upload } from 'lucide-react'
 import type { Dispatch, SetStateAction } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ReferenceImageUrlsField } from '@/components/reference-image-urls-field'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -79,40 +80,19 @@ export function ImageReferenceInput(props: {
           }
         >
           {part.type === 'image_urls' && (
-            <div className='space-y-2'>
-              <Label
-                htmlFor='image-reference-urls'
-                className='text-muted-foreground text-xs'
-              >
-                {t('Reference image URLs')}
-              </Label>
-              <Textarea
-                id='image-reference-urls'
-                value={part.value}
-                onChange={(event) =>
-                  props.onChange((previous) =>
-                    previous.map((candidate) =>
-                      candidate.id === part.id
-                        ? { ...candidate, value: event.target.value }
-                        : candidate
-                    )
+            <ReferenceImageUrlsField
+              value={part.value}
+              onChange={(value) =>
+                props.onChange((previous) =>
+                  previous.map((candidate) =>
+                    candidate.id === part.id
+                      ? { ...candidate, value }
+                      : candidate
                   )
-                }
-                aria-describedby='image-reference-urls-hint'
-                placeholder={
-                  'https://example.com/reference-1.png\nhttps://example.com/reference-2.png'
-                }
-                className='bg-background/60 min-h-28 resize-y font-mono text-xs leading-relaxed md:text-xs'
-                disabled={props.disabled}
-                spellCheck={false}
-              />
-              <p
-                id='image-reference-urls-hint'
-                className='text-muted-foreground text-xs leading-relaxed'
-              >
-                {t('Paste one image URL per line. Blank lines are ignored.')}
-              </p>
-            </div>
+                )
+              }
+              disabled={props.disabled}
+            />
           )}
           {part.type === 'image' && (
             <img

@@ -125,6 +125,9 @@ it('opens interactive chat from the channel test dialog and keeps batch testing 
     name: 'Chat message',
   })
   expect(prompt).toHaveValue('hi')
+  expect(
+    within(dialog).queryByRole('textbox', { name: 'Reference image URLs' })
+  ).not.toBeInTheDocument()
   await user.clear(prompt)
   await user.type(prompt, 'Say hello')
   await user.click(within(dialog).getByRole('button', { name: 'Start test' }))
@@ -154,44 +157,69 @@ it('opens interactive chat from the channel test dialog and keeps batch testing 
   ).toBeVisible()
 })
 
-it('shows the returned image after running the image prompt', async () => {
-  const user = userEvent.setup()
-  const src = 'data:image/png;base64,iVBORw0KGgo='
-  vi.spyOn(api, 'get').mockResolvedValue({
-    data: { success: true, data: { models: [imageModel] } },
-  })
-  const post = vi.spyOn(api, 'post').mockResolvedValue({
-    data: {
-      success: true,
+it.each([
+  {
+    referenceText: ' \n  \n',
+    references: {},
+    scenario: 'with only blank reference lines',
+  },
+  {
+    referenceText:
+      ' https://example.com/first.png\r\n\r\nhttps://example.com/second.webp ',
+    references: {
+      image_urls: [
+        'https://example.com/first.png',
+        'https://example.com/second.webp',
+      ],
+    },
+    scenario: 'with multiple reference URLs',
+  },
+])(
+  'shows the returned image after running the image prompt $scenario',
+  async ({ referenceText, references }) => {
+    const user = userEvent.setup()
+    const src = 'data:image/png;base64,iVBORw0KGgo='
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: { models: [imageModel] } },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
       data: {
+        success: true,
+        data: {
+          model: 'image-model',
+          mode: 'image',
+          endpoint_type: 'image-generation',
+          image: { data_url: src, width: 1, height: 1 },
+        },
+      },
+    })
+    renderTestPanel()
+
+    const prompt = await screen.findByRole('textbox', { name: 'Image prompt' })
+    expect(prompt).not.toHaveValue('')
+    fireEvent.change(prompt, { target: { value: 'A red boat' } })
+    const referenceInput = screen.getByRole('textbox', {
+      name: 'Reference image URLs',
+    })
+    fireEvent.change(referenceInput, { target: { value: referenceText } })
+    await user.click(screen.getByRole('button', { name: 'Start test' }))
+
+    expect(
+      await screen.findByRole('img', { name: 'Generated image' })
+    ).toHaveAttribute('src', src)
+    expect(post).toHaveBeenCalledWith(
+      '/api/channel/test/42',
+      {
         model: 'image-model',
         mode: 'image',
         endpoint_type: 'image-generation',
-        image: { data_url: src, width: 1, height: 1 },
+        prompt: 'A red boat',
+        ...references,
       },
-    },
-  })
-  renderTestPanel()
-
-  const prompt = await screen.findByRole('textbox', { name: 'Image prompt' })
-  expect(prompt).not.toHaveValue('')
-  fireEvent.change(prompt, { target: { value: 'A red boat' } })
-  await user.click(screen.getByRole('button', { name: 'Start test' }))
-
-  expect(
-    await screen.findByRole('img', { name: 'Generated image' })
-  ).toHaveAttribute('src', src)
-  expect(post).toHaveBeenCalledWith(
-    '/api/channel/test/42',
-    {
-      model: 'image-model',
-      mode: 'image',
-      endpoint_type: 'image-generation',
-      prompt: 'A red boat',
-    },
-    expect.any(Object)
-  )
-})
+      expect.any(Object)
+    )
+  }
+)
 
 it('prevents oversized prompts and allows a deliberate retry after upstream failure', async () => {
   const user = userEvent.setup()

@@ -87,7 +87,10 @@ func GetExpiredMediaInputObjects(ctx context.Context, now int64, limit int) ([]M
 		return nil, nil
 	}
 	var objects []MediaInputObject
-	err := DB.WithContext(ctx).Where("expires_at <= ?", now).Order("expires_at").Order("id").Limit(limit).Find(&objects).Error
+	db := DB.WithContext(ctx)
+	retained := db.Model(&MediaReplaySnapshot{}).Select("1").Where("media_type = ? AND task_id = media_input_objects.task_id", MediaReplayVideo).
+		Where("failed_at = 0 OR retain_until > ?", now)
+	err := db.Where("expires_at <= ? AND NOT EXISTS (?)", now, retained).Order("expires_at").Order("id").Limit(limit).Find(&objects).Error
 	return objects, err
 }
 

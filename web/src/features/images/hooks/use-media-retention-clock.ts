@@ -21,9 +21,17 @@ import { useEffect, useState } from 'react'
 import { imageTaskResultExpired } from '../lib/task-presentation'
 import type { ImageTask } from '../types'
 
-export function useMediaRetentionClock(tasks?: readonly ImageTask[]): number {
+export function useMediaRetentionClock(
+  tasks?: readonly ImageTask[],
+  additionalExpiries?: readonly (number | undefined)[]
+): number {
   const [now, setNow] = useState(() => Date.now() / 1000)
   let nextExpiry = Infinity
+  for (const expiry of additionalExpiries || []) {
+    if (expiry !== undefined && Number.isFinite(expiry) && expiry > now) {
+      nextExpiry = Math.min(nextExpiry, expiry)
+    }
+  }
   for (const task of tasks || []) {
     if (
       !imageTaskResultExpired(task, now) &&

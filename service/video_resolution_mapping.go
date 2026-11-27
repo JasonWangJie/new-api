@@ -149,9 +149,13 @@ func mixedVideoMappingTier(body map[string]any) string {
 	return NormalizeVideoResolution(cmp.Or(top, nested))
 }
 
-func MixedVideoRequiresExplicitResolution(ctx context.Context, policy model.ImageGroupPolicy, groups []string, publicModel string, body map[string]any) (bool, error) {
+func MixedVideoRequiresExplicitResolution(ctx context.Context, policy model.ImageGroupPolicy, groups []string, publicModel string, body map[string]any, channelIDs ...int) (bool, error) {
 	if mixedVideoMappingTier(body) != "" {
 		return false, nil
+	}
+	channelID := 0
+	if len(channelIDs) > 0 {
+		channelID = channelIDs[0]
 	}
 	for _, group := range groups {
 		policy.Group = group
@@ -165,7 +169,7 @@ func MixedVideoRequiresExplicitResolution(ctx context.Context, policy model.Imag
 				return false, err
 			}
 			for _, channel := range channels {
-				if len(channel.GetSetting().VideoResolutionModelMapping[publicModel]) > 0 {
+				if (channelID == 0 || channel.Id == channelID) && len(channel.GetSetting().VideoResolutionModelMapping[publicModel]) > 0 {
 					return true, nil
 				}
 			}

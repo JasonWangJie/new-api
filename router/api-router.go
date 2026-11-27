@@ -100,6 +100,9 @@ func SetApiRouter(router *gin.Engine) {
 	adminMediaTasks.HEAD("/:task_id/results/:artifact_key/view", middleware.RequirePermission(authz.AsyncImageTaskRead), func(c *gin.Context) { controller.ViewMediaTaskResult(c, true) })
 	adminMediaTasks.POST("/:task_id/resume", middleware.RequirePermission(authz.AsyncImageTaskManage), func(c *gin.Context) { controller.ManageMediaTask(c, true, "resume") })
 	adminMediaTasks.POST("/:task_id/terminate", middleware.RequirePermission(authz.AsyncImageTaskManage), func(c *gin.Context) { controller.ManageMediaTask(c, true, "terminate") })
+	mediaRetestAdmission := newMediaRetestAdmission()
+	adminMediaTasks.GET("/:task_id/retest-options", middleware.RequirePermission(authz.AsyncImageTaskRead), middleware.RequirePermission(authz.AsyncImageTaskManage), middleware.UserCriticalRateLimit("media-task-retest-options"), controller.GetMediaRetestOptions(mediaRetestAdmission))
+	adminMediaTasks.POST("/:task_id/retest", middleware.RequirePermission(authz.AsyncImageTaskRead), middleware.RequirePermission(authz.AsyncImageTaskManage), middleware.UserCriticalRateLimit("media-task-retest"), controller.RetestMediaTask(mediaRetestAdmission))
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/setup", controller.GetSetup)

@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/jpeg"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,7 @@ import (
 func mediaInputFixture(t *testing.T) (model.AsyncMediaJob, MediaRuntimeConfig, ImageRuntimeConfig) {
 	t.Helper()
 	db, imageTask, _, imageCfg, _ := asyncImageWorkerFixture(t)
-	entities := []any{&model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaInputObject{}, &model.MediaArtifactObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}, &model.ImageStorageObject{}}
+	entities := []any{&model.Task{}, &model.TaskPerfSample{}, &model.AsyncMediaJob{}, &model.AsyncMediaEvent{}, &model.MediaInputObject{}, &model.MediaArtifactObject{}, &model.ImageInputAlias{}, &model.ImageInputObject{}, &model.ImageStorageObject{}, &model.MediaReplaySnapshot{}}
 	require.NoError(t, db.AutoMigrate(entities...))
 	t.Cleanup(func() { assert.NoError(t, db.Migrator().DropTable(entities...)) })
 	oldSecret, oldAddress, oldTaskAddress := common.CryptoSecret, system_setting.ServerAddress, system_setting.TaskPublicAddress
@@ -79,6 +80,208 @@ func mediaInputSaveFixture(t *testing.T, job model.AsyncMediaJob, cfg MediaRunti
 	object, err := model.SaveMediaInputObject(t.Context(), model.MediaInputObject{ObjectId: key, TaskId: job.TaskId, Slot: strconv.Itoa(input.Index), Kind: input.Kind, SourceHash: ImageIdentityHash(input.Source), UserId: job.UserId, TokenId: job.TokenId, RootPath: root, ObjectKey: key, MimeType: mime, ByteSize: int64(len(data)), Checksum: hex.EncodeToString(checksum[:]), Status: "active", CreatedAt: job.CreatedAt, ExpiresAt: job.ExpiresAt})
 	require.NoError(t, err)
 	return object
+}
+
+func TestMediaRetestReferencePreservation(t *testing.T) {
+	const source = "https://media.example.com/original.png"
+	const replacement = "https://media.example.com/operator.png"
+	const custom = "https://media.example.com/custom.mp4"
+	const customReplacement = "https://media.example.com/operator.mp4"
+	preparation := mediaRetestPreparation{
+		remaining: 1 << 20,
+		checked: map[mediaRetestReference]string{
+			{kind: "image", value: source}: replacement,
+			{kind: "video", value: custom}: customReplacement,
+		},
+		videoPaths: []jsplugin.VideoRetryInput{
+			{Path: "/metadata/custom_inputs/*/value", Kind: "video"},
+			{Path: "/metadata/untyped/*/value", Kind: "video"},
+		},
+	}
+	request := `{"model":"original-alias","prompt":"` + source + `","seed":9223372036854775807,"contents":[{"parts":[{"fileData":{"fileUri":"` + source + `","mimeType":"image/png"}},{"text":"` + source + `"}]}],"messages":[{"content":[{"type":"image","source":{"type":"url","url":"` + source + `"}}]}],"metadata":{"custom_inputs":[{"value":"` + custom + `"}],"untyped":{"0":{"value":"` + custom + `"}}}}`
+	updated, err := preparation.rewriteJSON(t.Context(), []byte(request), nil, "", "", 0)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"model":"original-alias","prompt":"`+source+`","seed":9223372036854775807,"contents":[{"parts":[{"fileData":{"fileUri":"`+replacement+`","mimeType":"image/png"}},{"text":"`+source+`"}]}],"messages":[{"content":[{"type":"image","source":{"type":"url","url":"`+replacement+`"}}]}],"metadata":{"custom_inputs":[{"value":"`+customReplacement+`"}],"untyped":{"0":{"value":"`+custom+`"}}}}`, string(updated))
+	assert.Contains(t, string(updated), `"seed":9223372036854775807`)
+	for _, request := range []string{
+		`{"image":"asset://original"}`, `{"references":[{"type":"video","file_id":"original"}]}`, `{"voice_id":"original"}`,
+	} {
+		_, err := preparation.rewriteJSON(t.Context(), []byte(request), nil, "", "", 0)
+		require.ErrorIs(t, err, ErrMediaRetestProviderAsset)
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("image[]", source))
+	require.NoError(t, writer.WriteField("image[]", "data:image/png;base64,AA=="))
+	require.NoError(t, writer.WriteField("prompt", source))
+	upload, err := writer.CreateFormFile("image[]", "original.png")
+	require.NoError(t, err)
+	_, err = upload.Write([]byte{0xff, 0xfe, 0x00})
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	updated, err = preparation.rewriteMultipart(t.Context(), body.Bytes(), writer.Boundary())
+	require.NoError(t, err)
+	reader := multipart.NewReader(bytes.NewReader(updated), writer.Boundary())
+	for _, expected := range []struct{ field, filename, data string }{
+		{"image[]", "", replacement}, {"image[]", "", "data:image/png;base64,AA=="}, {"prompt", "", source}, {"image[]", "original.png", "\xff\xfe\x00"},
+	} {
+		part, err := reader.NextPart()
+		require.NoError(t, err)
+		data, err := io.ReadAll(part)
+		require.NoError(t, err)
+		assert.Equal(t, expected.field, part.FormName())
+		assert.Equal(t, expected.filename, part.FileName())
+		assert.Equal(t, expected.data, string(data))
+	}
+	_, err = reader.NextPart()
+	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestMediaRetestCopiesTheOriginalOwnedReference(t *testing.T) {
+	job, cfg, imageCfg := mediaInputFixture(t)
+	now := time.Now().Unix()
+	original := "https://media-provider.invalid/reference.mp4"
+	data := mediaTestMP4()
+	input := mediaInputSaveFixture(t, job, cfg, AsyncVideoReferenceInput{Kind: "video", Source: original}, data)
+	require.NoError(t, model.DB.Model(&input).Update("expires_at", now-1).Error)
+	require.NoError(t, model.DB.Create(&model.MediaReplaySnapshot{TaskId: job.TaskId, MediaType: model.MediaReplayVideo, Payload: []byte("fixture"), FailedAt: now - 5, RetainUntil: now + 120}).Error)
+	expired, err := model.GetExpiredMediaInputObjects(t.Context(), now, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired)
+	operator := model.User{Username: "retest-operator", AffCode: "retest-aff", Status: common.UserStatusEnabled, Group: "default"}
+	require.NoError(t, model.DB.Create(&operator).Error)
+	target := model.Token{UserId: operator.Id, Key: "retest-operator-key", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&target).Error)
+	const sourceAlias = "https://storage.example.com/source-signed"
+	const otherAlias = "https://storage.example.com/foreign-signed"
+	const promptAlias = "https://storage.example.com/prompt-signed"
+	for _, entry := range []struct {
+		id, source string
+		tokenID    int
+	}{{"source-input", sourceAlias, job.TokenId}, {"foreign-input", otherAlias, target.Id}, {"prompt-input", promptAlias, job.TokenId}} {
+		row := model.ImageInputObject{InputId: entry.id, TokenId: entry.tokenID, KeyHash: ImageIdentityHash(entry.id), Status: "active", ExpiresAt: now + 120}
+		require.NoError(t, model.DB.Create(&row).Error)
+		require.NoError(t, model.DB.Create(&model.ImageInputAlias{InputId: entry.id, TokenId: entry.tokenID, UrlHash: ImageIdentityHash(entry.source)}).Error)
+	}
+	pins, err := CollectMediaRetestVideoInputPins(t.Context(), job.TokenId, MediaRetestRequest{
+		ContentType: "application/json",
+		Body:        []byte(`{"prompt":"` + promptAlias + `","image":"` + otherAlias + `","ignored_asset":{"file_id":"old"},"metadata":{"custom":[{"photo":"` + sourceAlias + `"}]}}`),
+		VideoReferencePaths: []jsplugin.VideoRetryInput{
+			{Path: "/metadata/custom/*/photo", Kind: "image"},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"source-input"}, pins)
+	preparation := mediaRetestPreparation{
+		source:      MediaRetestSource{TaskID: job.TaskId, UserID: job.UserId, TokenID: job.TokenId, MediaType: model.MediaReplayVideo},
+		target:      target,
+		retestKey:   "operator-action",
+		remaining:   cfg.MaxFileBytes,
+		imageConfig: imageCfg,
+		mediaConfig: cfg,
+		checked:     make(map[mediaRetestReference]string),
+	}
+	link, err := preparation.reference(t.Context(), "video", original)
+	require.NoError(t, err)
+	assert.NotEqual(t, original, link)
+	signed, err := url.Parse(link)
+	require.NoError(t, err)
+	copyID := strings.TrimSuffix(strings.TrimPrefix(signed.Path, "/api/media-inputs/"), "/content")
+	object, err := ReadMediaInputObject(t.Context(), copyID, signed.Query().Get("expires"), signed.Query().Get("access"))
+	require.NoError(t, err)
+	assert.Equal(t, target.Id, object.TokenId)
+	assert.Equal(t, target.UserId, object.UserId)
+	assert.Equal(t, input.Checksum, object.Checksum)
+	assert.Greater(t, object.ExpiresAt, now)
+	assert.LessOrEqual(t, object.ExpiresAt, object.CreatedAt+model.MediaRetestInputRetentionSeconds)
+	_, err = ReadMediaInputObject(t.Context(), copyID, signed.Query().Get("expires"), "invalid-signature")
+	require.ErrorIs(t, err, ErrMediaInputUnavailable)
+	copyReference := AsyncVideoReferenceInput{Kind: "video", Source: link}
+	local, err := verifiedLocalMediaReference(t.Context(), job, copyReference, now+60)
+	require.ErrorIs(t, err, ErrMediaInputUnavailable)
+	assert.True(t, local)
+	local, err = verifiedLocalMediaReference(t.Context(), model.AsyncMediaJob{UserId: operator.Id, TokenId: target.Id, CreatedAt: now}, copyReference, now+3*86400)
+	require.NoError(t, err)
+	assert.True(t, local)
+	stored, err := os.ReadFile(filepath.Join(object.RootPath, object.ObjectKey))
+	require.NoError(t, err)
+	assert.Equal(t, data, stored)
+	clear(preparation.checked)
+	again, err := preparation.reference(t.Context(), "video", original)
+	require.NoError(t, err)
+	assert.Equal(t, link, again)
+	const nextSource = "retested-video-that-also-failed"
+	require.NoError(t, model.DB.Create(&model.MediaReplaySnapshot{TaskId: nextSource, MediaType: model.MediaReplayVideo, Payload: []byte("fixture"), FailedAt: now - 2, RetainUntil: now + 120}).Error)
+	var nextTarget model.Token
+	require.NoError(t, model.DB.First(&nextTarget, job.TokenId).Error)
+	preparation.source = MediaRetestSource{TaskID: nextSource, UserID: operator.Id, TokenID: target.Id, MediaType: model.MediaReplayVideo}
+	preparation.target = nextTarget
+	preparation.retestKey = "another-operator-action"
+	clear(preparation.checked)
+	nextLink, err := preparation.reference(t.Context(), "video", link)
+	require.NoError(t, err)
+	assert.NotEqual(t, link, nextLink)
+	nextSigned, err := url.Parse(nextLink)
+	require.NoError(t, err)
+	nextCopyID := strings.TrimSuffix(strings.TrimPrefix(nextSigned.Path, "/api/media-inputs/"), "/content")
+	nextObject, err := ReadMediaInputObject(t.Context(), nextCopyID, nextSigned.Query().Get("expires"), nextSigned.Query().Get("access"))
+	require.NoError(t, err)
+	assert.Equal(t, nextTarget.Id, nextObject.TokenId)
+	assert.Equal(t, input.Checksum, nextObject.Checksum)
+	require.NoError(t, model.DB.Model(&model.MediaReplaySnapshot{}).Where("task_id = ?", job.TaskId).Update("retain_until", now-1).Error)
+	expired, err = model.GetExpiredMediaInputObjects(t.Context(), now, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, input.ObjectId, expired[0].ObjectId)
+}
+
+func TestMediaRetestOwnedSCReferenceOnPrivateServer(t *testing.T) {
+	job, cfg, imageCfg := mediaInputFixture(t)
+	ctx := t.Context()
+	entities := []any{&model.ImageUploadIntent{}, &model.ImageUploadAdmissionTicket{}, &model.ImageInputAdmission{}}
+	require.NoError(t, model.DB.AutoMigrate(entities...))
+	t.Cleanup(func() { assert.NoError(t, model.DB.Migrator().DropTable(entities...)) })
+	var networkRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		networkRequests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	system_setting.ServerAddress = server.URL
+	sourceImage := asyncImageBytesFixture(t)
+	now := time.Now().Unix()
+	intent := model.ImageUploadIntent{IntentKey: "private-source-fixture", Class: "temporary", UserId: job.UserId, TokenId: job.TokenId, ProfileId: "worker-local", ObjectKey: "inputs/source.png", ContentType: sourceImage.ContentType, ByteSize: int64(len(sourceImage.Data)), Checksum: sourceImage.Checksum, Status: "pending", CreatedAt: now}
+	object, err := StoreImageIntent(ctx, intent, sourceImage, now+3600)
+	require.NoError(t, err)
+	link, err := ImageObjectURL(ctx, object, server.URL, imageCfg.SignedURLExpiry)
+	require.NoError(t, err)
+	input := model.ImageInputObject{InputId: "sci_retest_private_source", TokenId: job.TokenId, KeyHash: ImageIdentityHash(intent.IntentKey), ObjectId: object.ObjectId, Filename: "source.png", ByteSize: object.ByteSize, Status: "active", ExpiresAt: object.ExpiresAt}
+	require.NoError(t, model.DB.Create(&input).Error)
+	require.NoError(t, model.DB.Create(&model.ImageInputAlias{InputId: input.InputId, TokenId: job.TokenId, UrlHash: ImageIdentityHash(link)}).Error)
+	operator := model.Token{UserId: job.UserId, Key: "retest-private-operator", Status: common.TokenStatusEnabled, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&operator).Error)
+	preparation := mediaRetestPreparation{
+		source:      MediaRetestSource{TaskID: job.TaskId, UserID: job.UserId, TokenID: job.TokenId, MediaType: model.MediaReplayImage},
+		target:      operator,
+		retestKey:   "private-site-retest",
+		remaining:   cfg.MaxFileBytes,
+		imageConfig: imageCfg,
+		mediaConfig: cfg,
+		checked:     make(map[mediaRetestReference]string),
+	}
+	copyLink, err := preparation.reference(ctx, "image", link)
+	require.NoError(t, err)
+	assert.NotEqual(t, link, copyLink)
+	copiedImage, bound, err := ResolveImageReference(ctx, operator.Id, copyLink, imageCfg)
+	require.NoError(t, err)
+	assert.True(t, bound)
+	assert.Equal(t, sourceImage.Data, copiedImage.Data)
+	_, bound, err = ResolveImageReference(ctx, job.TokenId, copyLink, imageCfg)
+	require.Error(t, err)
+	assert.True(t, bound)
+	_, err = preparation.reference(ctx, "image", server.URL+"/arbitrary-private-target.png")
+	require.ErrorIs(t, err, ErrMediaRetestReferenceUnavailable)
+	assert.Zero(t, networkRequests.Load())
 }
 
 func TestMediaInputDownloadLimitsAndRawStorage(t *testing.T) {

@@ -103,6 +103,7 @@ func GetImageRuntimeConfig(ctx context.Context) (ImageRuntimeConfig, error) {
 	if err := common.UnmarshalJsonStr(option.Value, &cfg); err != nil {
 		return cfg, err
 	}
+	cfg.FailedRequestRetentionHours = model.MediaReplayRetentionSeconds / 3600
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -165,6 +166,7 @@ func (cfg ImageRuntimeConfig) Validate() error {
 }
 
 func SaveImageRuntimeConfig(ctx context.Context, cfg ImageRuntimeConfig, expectedRevision ...int64) error {
+	cfg.FailedRequestRetentionHours = model.MediaReplayRetentionSeconds / 3600
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -345,6 +347,9 @@ func ResolveAsyncImagePolicy(ctx context.Context, token model.Token, request Asy
 				return policy, nil, err
 			}
 			for _, channel := range channels {
+				if request.RetestChannelID > 0 && channel.Id != request.RetestChannelID {
+					continue
+				}
 				capability := ImageChannelCapability(channel, request.Model)
 				if capability.Provider != provider || !ImageCapabilitySupportsRequest(capability, request) {
 					continue

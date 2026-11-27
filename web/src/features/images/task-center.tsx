@@ -1272,6 +1272,12 @@ function TaskCenterSession({
               userId={userId}
               onClose={() => setDetail('')}
               canManage={canManage}
+              onRetestAccepted={(id) => {
+                void queryClient.invalidateQueries({
+                  queryKey: ['image-task-center', userId, admin],
+                })
+                openTask(id)
+              }}
               onManage={(
                 action,
                 confirmUpstreamChecked,

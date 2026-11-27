@@ -1863,3 +1863,41 @@ func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareTaskPluginEndpointSharedVideoReturnsPublicReferenceError(t *testing.T) {
+	const message = "当前渠道该分辨率（1080p、4k）暂不支持参考视频模式"
+	const requestID = "video-reference-test"
+	for _, spec := range []struct{ key, message string }{
+		{key: "video-alpha-vendor", message: "Alpha Vendor rejected the input on channel 42"},
+		{key: "video-beta-vendor", message: message},
+	} {
+		decode := fmt.Sprintf("throw new Error(%q)", spec.message)
+		_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+			spec.key, "1.0.0", `["video-reference-shared-model"]`, "/v1/videos", decode,
+		), jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(spec.key)) })
+	}
+	require.Len(t, jsplugin.DefaultRegistry.Generation().LookupEndpointCandidates(http.MethodPost, "/v1/videos", "video-reference-shared-model"), 2)
+
+	router := gin.New()
+	router.POST("/v1/videos", func(c *gin.Context) {
+		c.Set(common.RequestIdKey, requestID)
+		c.Next()
+	}, PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"video-reference-shared-model","resolution":"1080p","reference_videos":["https://example.com/clip.mp4"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.Equal(t, message, strings.TrimSuffix(response.Error.Message, " (request id: "+requestID+")"))
+}

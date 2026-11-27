@@ -187,16 +187,20 @@ test('saves the image upstream polling interval from the runtime form', async ()
   )
 })
 
-test('saves disabled encrypted retention and bounded retry controls from the runtime form', async () => {
+test('keeps encrypted failed request retention fixed at 24 hours', async () => {
   vi.mocked(imageRequest).mockResolvedValue(undefined)
-  render(<ImageRuntimeForm initial={runtime} onSuccess={vi.fn()} />)
+  render(
+    <ImageRuntimeForm
+      initial={{ ...runtime, failed_request_retention_hours: 0 }}
+      onSuccess={vi.fn()}
+    />
+  )
   const user = userEvent.setup()
   const retention = screen.getByRole('spinbutton', {
     name: 'Failed request retention (hours)',
   })
-  expect(retention).toHaveAttribute('max', '168')
-  await user.clear(retention)
-  await user.type(retention, '0')
+  expect(retention).toHaveAttribute('readonly')
+  expect(retention).toHaveValue(24)
   expect(
     screen.getByRole('spinbutton', { name: 'Account cooldown (seconds)' })
   ).toHaveValue(60)
@@ -211,7 +215,7 @@ test('saves disabled encrypted retention and bounded retry controls from the run
     expect(imageRequest).toHaveBeenCalledWith(
       '/api/option/images/runtime',
       'PUT',
-      { ...runtime, failed_request_retention_hours: 0 }
+      runtime
     )
   )
 })

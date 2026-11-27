@@ -111,7 +111,7 @@ type ImageRetryPolicyState struct {
 }
 
 func (task AsyncImageTask) FailedRequestRetainedAt(now int64) bool {
-	return (task.Status == ImageTaskFailed || task.Status == ImageTaskExpired || task.Status == ImageTaskExecutionUnknown) && task.RequestRetainUntil > now && len(task.RequestCipher) > 0 && (task.ExpiresAt == 0 || task.ExpiresAt > now)
+	return (task.Status == ImageTaskFailed || task.Status == ImageTaskExpired || task.Status == ImageTaskExecutionUnknown) && task.RequestRetainUntil > now && len(task.RequestCipher) > 0 && (task.ExpiresAt == 0 || task.ExpiresAt > now) && (task.FinishedAt <= 0 || task.FinishedAt > now-MediaReplayRetentionSeconds)
 }
 
 type AsyncImageTask struct {
@@ -136,6 +136,7 @@ type AsyncImageTask struct {
 	Progress              int    `json:"progress"`
 	RequestCipher         []byte `json:"-"`
 	RequestRetainUntil    int64  `json:"-" gorm:"type:bigint;index:idx_image_request_retention"`
+	HasReplaySnapshot     bool   `json:"-"`
 	RetryDecision         string `json:"-" gorm:"type:text"`
 	RequestHash           string `json:"-" gorm:"size:64"`
 	PromptSummary         string `json:"prompt_summary" gorm:"type:text"`
@@ -520,7 +521,7 @@ type ImageModerationEvent struct {
 }
 
 func MigrateImageModels(db *gorm.DB) error {
-	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}); err != nil {
+	if err := db.AutoMigrate(&MediaRetryPolicyVersion{}, &MediaRetryEvent{}, &TaskPerfSample{}, &MediaReplaySnapshot{}); err != nil {
 		return err
 	}
 	if err := db.AutoMigrate(&ImageGroupPolicy{}, &TokenImagePlatformMapping{}, &ImageChannelPool{}, &AsyncImageTask{}, &AsyncImageIdempotency{}, &AsyncImageEvent{}, &ImageOutbox{}, &AsyncImageStagingObject{}, &ImageStorageProfile{}, &ImageStorageObject{}, &ImageUploadIntent{}, &AsyncImageResult{}, &AsyncImageBill{}, &AsyncImageUsageProjection{}, &ImageInputAdmission{}, &ImageUploadAdmissionTicket{}, &ImageInputObject{}, &ImageInputAlias{}, &ImageInputTaskReference{}, &ImageLibraryItem{}, &ImagePublication{}, &ImageSubmissionRequest{}, &ImageReport{}, &ImageCleanupJob{}, &ImageModerationEvent{}); err != nil {
@@ -575,6 +576,11 @@ func transitionImageTaskTx(tx *gorm.DB, task AsyncImageTask, updates map[string]
 	status := task.Status
 	if value, ok := updates["status"].(string); ok {
 		status = value
+	}
+	if task.HasReplaySnapshot && status != task.Status {
+		if err := updateMediaReplaySnapshot(tx, MediaReplayImage, task.TaskId, status, now); err != nil {
+			return err
+		}
 	}
 	if _, changesReconciliation := updates["reconciliation_status"]; status != task.Status || changesReconciliation {
 		if err := recordImageTaskPerfSampleTx(tx, task.TaskId, task.Status); err != nil {

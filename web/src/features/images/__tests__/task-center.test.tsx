@@ -30,6 +30,7 @@ import i18next from 'i18next'
 import { toast, Toaster } from 'sonner'
 import { afterEach, assert, beforeEach, expect, test, vi } from 'vitest'
 
+import { getApiKeys } from '@/features/keys/api'
 import { ImageDialog } from '@/features/usage-logs/components/dialogs/image-dialog'
 import en from '@/i18n/locales/en.json'
 import fr from '@/i18n/locales/fr.json'
@@ -46,6 +47,8 @@ import {
   getImageTask,
   getImageReliability,
   getImageRetainedRequest,
+  getMediaTaskRetestOptions,
+  retestMediaTask,
   getImageTasks,
   getMediaTaskPlatforms,
   imageBlob,
@@ -55,6 +58,7 @@ import {
 import { ImageResults } from '../components/image-results'
 import { ImageTaskDetails } from '../components/image-task-details'
 import { ImageTaskNotice } from '../components/image-task-notice'
+import { MediaTaskRetest } from '../components/media-task-retest'
 import {
   formatImageTaskElapsedTime,
   imageTaskCanResume,
@@ -83,8 +87,11 @@ vi.mock('../api', () => ({
   getImageTask: vi.fn(),
   getImageReliability: vi.fn(),
   getImageRetainedRequest: vi.fn(),
+  getMediaTaskRetestOptions: vi.fn(),
+  retestMediaTask: vi.fn(),
   imageRequest: vi.fn(),
 }))
+vi.mock('@/features/keys/api', () => ({ getApiKeys: vi.fn() }))
 vi.mock('@/lib/lobe-icon', () => ({
   getLobeIcon: () => null,
 }))
@@ -213,6 +220,7 @@ test.each([true, false])(
   'retained failure diagnostics require administrator expansion (admin=%s)',
   async (admin) => {
     const until = Math.floor(Date.now() / 1000) + 3600
+    const prompt = `${'x'.repeat(160)}\nFull prompt beyond the preview`
     vi.mocked(getImageTask).mockResolvedValue({
       ...detail,
       results: [],
@@ -221,6 +229,8 @@ test.each([true, false])(
         status: 'failed',
         retained_request_available: true,
         request_retain_until: until,
+        can_retest: true,
+        retest_retain_until: until,
         retry_decision: {
           version: 1,
           stage: 'submit',
@@ -242,9 +252,9 @@ test.each([true, false])(
         retain_until: until,
         request: {
           model: task.model,
-          prompt: 'A complete retained prompt',
-          prompt_characters: 26,
-          prompt_bytes: 26,
+          prompt,
+          prompt_characters: prompt.length,
+          prompt_bytes: prompt.length,
           prompt_truncated: false,
           platform: 'openai',
           kind: 'text_to_image',
@@ -263,34 +273,281 @@ test.each([true, false])(
         onClose={vi.fn()}
         canManage={false}
         onManage={vi.fn()}
+        onRetestAccepted={vi.fn()}
       />
     )
     expect(await screen.findByText('Invalid input parameters')).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Retest' })
+    ).not.toBeInTheDocument()
+    expect(getApiKeys).not.toHaveBeenCalled()
     expect(getImageRetainedRequest).not.toHaveBeenCalled()
     const toggle = screen.queryByRole('button', {
-      name: 'View retained request',
+      name: 'View full prompt',
     })
     if (!admin) {
       expect(toggle).not.toBeInTheDocument()
       return
     }
     const user = userEvent.setup()
-    await user.click(
-      screen.getByRole('button', { name: 'View retained request' })
-    )
+    await user.click(screen.getByRole('button', { name: 'View full prompt' }))
     expect(
       await screen.findByText('Retained request unavailable')
     ).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Retry' }))
+    expect((await screen.findByLabelText('Full prompt')).textContent).toBe(
+      prompt
+    )
     expect(
-      await screen.findByLabelText('Retained request diagnostics')
-    ).toHaveTextContent('A complete retained prompt')
+      screen.getByLabelText('Retained request diagnostics')
+    ).not.toHaveTextContent('Full prompt beyond the preview')
     expect(getImageRetainedRequest).toHaveBeenCalledWith(
       task.id,
       expect.any(AbortSignal)
     )
+    await user.click(screen.getByRole('button', { name: 'View full prompt' }))
+    expect(screen.queryByLabelText('Full prompt')).not.toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        clients.at(-1)?.getQueryData(['image-retained-request', 101, task.id])
+      ).toBeUndefined()
+    )
   }
 )
+
+const operatorKey = {
+  id: 456,
+  name: 'Operator key',
+  key: 'masked',
+  status: 1,
+  remain_quota: 500_000,
+  used_quota: 0,
+  unlimited_quota: false,
+  expired_time: -1,
+  created_time: 1,
+  accessed_time: 0,
+  group: '',
+  auto_groups: null,
+  cross_group_retry: false,
+  model_limits_enabled: false,
+  model_limits: '',
+  allow_ips: '',
+}
+
+test.each(['image', 'video'] as const)(
+  'submits a failed %s as a new task with the operating account key',
+  async (mediaType) => {
+    const failedTask: ImageTask = {
+      ...task,
+      media_type: mediaType,
+      status: 'failed',
+      can_terminate: false,
+      can_retest: true,
+      retest_retain_until: Math.floor(Date.now() / 1000) + 3600,
+    }
+    const newTaskId = 'task_new_retest'
+    const publicModel = mediaType === 'image' ? 'public-image' : 'public-video'
+    const upstreamModel =
+      mediaType === 'image' ? 'upstream-image' : 'upstream-video'
+    const originalChannel = { id: 97, name: 'Last dispatched channel' }
+    vi.mocked(getImageTask).mockImplementation(async (_admin, id) => ({
+      ...detail,
+      results: [],
+      task:
+        id === task.id
+          ? failedTask
+          : {
+              ...task,
+              id,
+              task_id: id,
+              media_type: mediaType,
+              status: 'queued',
+            },
+    }))
+    vi.mocked(getApiKeys).mockImplementation(async (params) => ({
+      success: true,
+      data: {
+        total: mediaType === 'image' ? 101 : 1,
+        page: params?.p || 1,
+        page_size: 100,
+        items:
+          mediaType === 'image' && params?.p === 1
+            ? [{ ...operatorKey, id: 123, name: 'Disabled key', status: 2 }]
+            : [operatorKey],
+      },
+    }))
+    vi.mocked(getMediaTaskRetestOptions).mockResolvedValue({
+      original_channel_id: originalChannel.id,
+      original_channel_name: originalChannel.name,
+      original_model: publicModel,
+      channels: [
+        {
+          ...originalChannel,
+          models: [{ model: publicModel, upstream_model: upstreamModel }],
+        },
+      ],
+      auto_models: [{ model: publicModel }],
+    })
+    vi.mocked(retestMediaTask).mockClear().mockResolvedValue({
+      task_id: newTaskId,
+      media_type: mediaType,
+    })
+    if (mediaType === 'image') {
+      vi.mocked(retestMediaTask).mockRejectedValueOnce(
+        new Error('source media error', {
+          cause: { code: 'reference_unavailable' },
+        })
+      )
+    }
+    const user = userEvent.setup()
+    mount(<ImageTaskCenter admin />)
+    await user.click(await screen.findByRole('button', { name: task.id }))
+    const details = await screen.findByRole('dialog', {
+      name: 'Media task details',
+    })
+    await user.click(
+      await within(details).findByRole('button', { name: 'Retest' })
+    )
+    const confirm = await screen.findByRole('alertdialog', {
+      name: 'Retest failed task',
+    })
+    expect(await within(confirm).findByText('Operator key')).toBeVisible()
+    expect(await within(confirm).findByLabelText('Channel')).toHaveValue(
+      originalChannel.name
+    )
+    expect(within(confirm).getByLabelText('Model')).toHaveValue(
+      `${publicModel} (${upstreamModel})`
+    )
+    expect(getMediaTaskRetestOptions).toHaveBeenCalledWith(
+      task.id,
+      operatorKey.id,
+      expect.any(AbortSignal)
+    )
+    expect(retestMediaTask).not.toHaveBeenCalled()
+    const submit = within(confirm).getByRole('button', { name: 'Retest' })
+    await user.click(submit)
+    if (mediaType === 'image') {
+      expect(await within(confirm).findByRole('alert')).toHaveTextContent(
+        'An original reference could not be retrieved for retest.'
+      )
+      await user.click(submit)
+      expect(vi.mocked(retestMediaTask).mock.calls[0]).toEqual(
+        vi.mocked(retestMediaTask).mock.calls[1]
+      )
+    }
+    expect(await screen.findByText(newTaskId)).toBeVisible()
+    expect(retestMediaTask).toHaveBeenLastCalledWith(
+      task.id,
+      456,
+      expect.any(String),
+      { channel_id: originalChannel.id, model: publicModel }
+    )
+  }
+)
+
+test('requires a compatible explicit choice when the original channel is disabled and refreshes after an API key change', async () => {
+  const failedTask: ImageTask = {
+    ...task,
+    status: 'failed',
+    can_retest: true,
+    retest_retain_until: Math.floor(Date.now() / 1000) + 3600,
+  }
+  const alternateKey = { ...operatorKey, id: 789, name: 'Restricted key' }
+  vi.mocked(getApiKeys).mockResolvedValue({
+    success: true,
+    data: {
+      total: 2,
+      page: 1,
+      page_size: 100,
+      items: [operatorKey, alternateKey],
+    },
+  })
+  vi.mocked(getMediaTaskRetestOptions).mockImplementation(
+    async (_id, tokenId) => ({
+      original_channel_id: 10,
+      original_channel_name: 'Retired channel',
+      original_model: 'public-image',
+      original_unavailable_code: 'channel_disabled',
+      channels: [
+        {
+          id: 11,
+          name: 'Backup channel',
+          models: [
+            {
+              model:
+                tokenId === operatorKey.id
+                  ? 'public-image'
+                  : 'replacement-image',
+            },
+          ],
+        },
+      ],
+      auto_models: [{ model: 'replacement-image' }],
+    })
+  )
+  vi.mocked(retestMediaTask).mockClear().mockResolvedValue({
+    task_id: 'asyncimg_retested',
+    media_type: 'image',
+  })
+  const accepted = vi.fn()
+  const user = userEvent.setup()
+  mount(
+    <MediaTaskRetest
+      task={failedTask}
+      userId={101}
+      now={0}
+      onAccepted={accepted}
+    />
+  )
+  await user.click(screen.getByRole('button', { name: 'Retest' }))
+  const dialog = within(await screen.findByRole('alertdialog'))
+  const submit = dialog.getByRole('button', { name: 'Retest' })
+  const key = dialog.getByLabelText('API Key')
+  await user.click(key)
+  await user.click(
+    await screen.findByRole('option', { name: operatorKey.name })
+  )
+  expect(
+    await dialog.findByText(/Retired channel, public-image/)
+  ).toHaveTextContent('Channel is disabled')
+  const channel = dialog.getByLabelText('Channel')
+  expect(channel).toHaveValue('')
+  expect(submit).toBeDisabled()
+  await user.type(channel, 'Back')
+  await user.keyboard('{ArrowDown}{Enter}')
+  expect(channel).toHaveValue('Backup channel')
+  const model = dialog.getByLabelText('Model')
+  expect(model).toHaveValue('public-image')
+  expect(submit).toBeEnabled()
+  await user.click(key)
+  await user.click(
+    await screen.findByRole('option', { name: alternateKey.name })
+  )
+  await waitFor(() => expect(model).toHaveValue(''))
+  expect(channel).toHaveValue('Backup channel')
+  expect(submit).toBeDisabled()
+  await user.type(channel, 'Automatic')
+  await user.click(
+    await screen.findByRole('option', { name: 'Automatic routing' })
+  )
+  expect(model).toHaveValue('')
+  await user.type(model, 'replacement')
+  await user.click(
+    await screen.findByRole('option', { name: 'replacement-image' })
+  )
+  await user.click(submit)
+  expect(accepted).toHaveBeenCalledWith('asyncimg_retested')
+  expect(retestMediaTask).toHaveBeenCalledWith(
+    task.id,
+    alternateKey.id,
+    expect.any(String),
+    {
+      channel_id: 0,
+      model: 'replacement-image',
+    }
+  )
+})
+
 function mount(content: React.ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },

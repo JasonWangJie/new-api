@@ -120,6 +120,7 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 	}
 	var selected *MixedVideoCandidate
 	var dispatch []byte
+	var referenceResolutionRejected bool
 	dispatchType := contentType
 	for index, target := range rule.Targets {
 		frozen := VideoRoutingFrozenTarget{Target: target}
@@ -142,6 +143,9 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 			body, ct, err = RewriteVideoRoutingRequest(body, ct, operation, publicModel, "")
 		}
 		if err != nil {
+			if IsVideoReferenceResolutionError(err) {
+				referenceResolutionRejected = true
+			}
 			frozen.Reason = SanitizeAsyncImageDiagnostic(err.Error(), 512)
 		} else if selected == nil {
 			selected, dispatch, dispatchType, snapshot.TargetIndex = &candidate, body, ct, index
@@ -151,6 +155,9 @@ func PlanVideoRouting(ctx context.Context, config model.VideoRoutingConfig, rule
 	if selected == nil {
 		snapshot.Fallback = rule.OnExhausted == "original"
 		if !snapshot.Fallback {
+			if referenceResolutionRejected {
+				return snapshot, nil, nil, "", errors.New(VideoReferenceResolutionErrorMessage)
+			}
 			return snapshot, nil, nil, "", errors.New("no compatible conditional video target is available")
 		}
 	}
@@ -313,6 +320,9 @@ func ConditionalVideoRetryCandidates(ctx context.Context, job model.AsyncMediaJo
 }
 
 func videoRoutingRetryAllowed(channel model.Channel, request AsyncVideoRequest, candidate MixedVideoCandidate) bool {
+	if request.RetestChannelID > 0 && channel.Id != request.RetestChannelID {
+		return false
+	}
 	decision := request.PendingDecision
 	other := decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel
 	if other && channel.Id == request.RetryFact.ChannelID || !other && channel.Id != request.RetryFact.ChannelID || slices.Contains(decision.ExcludedChannelIDs, channel.Id) || len(decision.AllowedChannelIDs) > 0 && !slices.Contains(decision.AllowedChannelIDs, channel.Id) {

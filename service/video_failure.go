@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -8,7 +9,17 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 )
+
+// VideoReferenceResolutionErrorMessage is the public text for this plugin validation failure.
+const VideoReferenceResolutionErrorMessage = "当前渠道该分辨率（1080p、4k）暂不支持参考视频模式"
+
+// IsVideoReferenceResolutionError recognizes the public message without exposing the hook diagnostic.
+func IsVideoReferenceResolutionError(err error) bool {
+	var hookError *jsplugin.HookError
+	return errors.As(err, &hookError) && hookError != nil && hookError.Message == VideoReferenceResolutionErrorMessage
+}
 
 var (
 	videoFailureURLPattern        = regexp.MustCompile(`(?i)\b(?:https?|ftp|s3|gs|file|blob|data):[^\s<>"']+`)

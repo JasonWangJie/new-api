@@ -1,10 +1,11 @@
 const RATIOS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"];
+const A_RESOLUTIONS = ["480p", "720p", "1080p", "2k", "4k"];
 const MODELS = {
   "seedance2.0-A": {
     series: "A",
     min: 4,
     max: 15,
-    resolutions: ["480p", "720p", "1080p", "4k"],
+    resolutions: A_RESOLUTIONS,
     defaultResolution: "480p",
     aspectRatios: [...RATIOS, "Auto"],
     images: 9,
@@ -16,7 +17,7 @@ const MODELS = {
     series: "A",
     min: 4,
     max: 30,
-    resolutions: ["480p", "720p"],
+    resolutions: A_RESOLUTIONS,
     defaultResolution: "480p",
     images: 30,
     videos: 10,
@@ -145,7 +146,7 @@ export const meta = {
   key: "drama",
   name: "Drama Video A / E / F / G / H3",
   icon: "text:DR",
-  version: "1.1.9",
+  version: "1.1.11",
   author: { name: "new-api contributors" },
   baseUrl: "https://drama.dafeiyangapi.top",
   website: "https://drama.dafeiyangapi.top/docs/drama",
@@ -425,6 +426,10 @@ function normalizeRequest(request, model, operation) {
       if (lastFrame) throw new Error("Only one last_frame is supported");
       lastFrame = reference.source;
     }
+  }
+  if ((model === "seedance2.0-A" || model === "seedance2.5-A") &&
+      (resolution === "1080p" || resolution === "4k") && counts.video > 0) {
+    throw new Error("当前渠道该分辨率（1080p、4k）暂不支持参考视频模式");
   }
   if (
     counts.image > config.images ||

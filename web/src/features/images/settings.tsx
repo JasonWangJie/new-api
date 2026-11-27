@@ -84,9 +84,12 @@ import type { ImageAdminConfiguration } from './types'
 import { VideoConfiguration } from './video-settings'
 
 type ImageConfiguration = ImageAdminConfiguration
+const FAILED_REQUEST_RETENTION_HOURS = 24
+
 type RuntimeField = {
   key: string
   label: string
+  fixedValue?: number
   min?: number
   max?: number
   defaultValue?: number
@@ -96,8 +99,7 @@ const RUNTIME_FIELDS: readonly RuntimeField[] = [
   {
     key: 'failed_request_retention_hours',
     label: 'Failed request retention (hours)',
-    min: 0,
-    max: 168,
+    fixedValue: FAILED_REQUEST_RETENTION_HOURS,
   },
   {
     key: 'account_cooldown_seconds',
@@ -182,7 +184,7 @@ const RUNTIME_FIELD_REFERENCES: readonly RuntimeFieldReference[] = [
   {
     key: 'failed_request_retention_hours',
     description:
-      'Hours to retain failed requests encrypted for administrator diagnostics. 0 disables retention.',
+      'Failed requests are retained encrypted for 24 hours for administrator diagnostics and retests.',
   },
   {
     key: 'account_cooldown_seconds',
@@ -556,6 +558,7 @@ export function ImageRuntimeForm({
   const [values, setValues] = useState<ImageConfiguration['runtime']>(() => ({
     mixed_timeout_retry_enabled: false,
     ...initial,
+    failed_request_retention_hours: FAILED_REQUEST_RETENTION_HOURS,
   }))
   const [advanced, setAdvanced] = useState('')
   const [busy, setBusy] = useState(false)
@@ -581,7 +584,11 @@ export function ImageRuntimeForm({
       const saved = await imageRequest<ImageConfiguration['runtime']>(
         '/api/option/images/runtime',
         'PUT',
-        { ...cfg, revision: values.revision }
+        {
+          ...cfg,
+          failed_request_retention_hours: FAILED_REQUEST_RETENTION_HOURS,
+          revision: values.revision,
+        }
       )
       if (saved) {
         setValues(saved)
@@ -657,8 +664,10 @@ export function ImageRuntimeForm({
         />
         <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
           {RUNTIME_FIELDS.map(
-            ({ key, label, min, max, defaultValue, required }) => {
-              const value = Number(values[key] ?? defaultValue ?? 0)
+            ({ key, label, min, max, defaultValue, fixedValue, required }) => {
+              const value = Number(
+                fixedValue ?? values[key] ?? defaultValue ?? 0
+              )
               return (
                 <div key={key} className='space-y-2'>
                   <Label htmlFor={key}>{t(label)}</Label>
@@ -668,6 +677,7 @@ export function ImageRuntimeForm({
                     min={min}
                     max={max}
                     required={required}
+                    readOnly={fixedValue !== undefined}
                     value={Number.isNaN(value) ? '' : value}
                     onChange={(event) => {
                       setValues((previous) => ({

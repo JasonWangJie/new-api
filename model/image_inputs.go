@@ -210,6 +210,31 @@ func ConfirmImageInput(ctx context.Context, input ImageInputObject, object Image
 	})
 }
 
+// bindImageInputReferences locks each owned input before admitting a task that
+// needs it, using the same row lock as physical input cleanup.
+func bindImageInputReferences(tx *gorm.DB, taskID string, tokenID int, inputIDs []string, now int64) error {
+	for _, id := range inputIDs {
+		var input ImageInputObject
+		if err := lockForUpdate(tx).Where("input_id = ? AND token_id = ? AND status = ? AND expires_at > ?", id, tokenID, "active", now).Take(&input).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ImageInputTaskReference{TaskId: taskID, InputId: id}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ProtectedImageInputReferences keeps source bytes available to live image
+// tasks and retained media replay snapshots without extending public aliases.
+func ProtectedImageInputReferences(tx *gorm.DB, now int64) *gorm.DB {
+	replay := tx.Session(&gorm.Session{NewDB: true}).Model(&MediaReplaySnapshot{}).Select("1").
+		Where("media_replay_snapshots.task_id = image_input_task_references.task_id AND media_type IN ? AND (failed_at = 0 OR retain_until > ?)", []string{MediaReplayImage, MediaReplayVideo}, now)
+	return tx.Session(&gorm.Session{NewDB: true}).Model(&ImageInputTaskReference{}).
+		Joins("LEFT JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").
+		Where("(async_image_tasks.status NOT IN ? OR EXISTS (?))", []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}, replay)
+}
+
 // ClaimImageInputDeletion shares the input row lock with task admission, so
 // no new task can bind an input after cleanup starts.
 func ClaimImageInputDeletion(ctx context.Context, input ImageInputObject, lease string, seconds int) (ImageUploadIntent, error) {
@@ -224,7 +249,7 @@ func ClaimImageInputDeletion(ctx context.Context, input ImageInputObject, lease 
 			return ErrImageConflict
 		}
 		var references int64
-		if err := tx.Model(&ImageInputTaskReference{}).Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").Where("image_input_task_references.input_id = ? AND async_image_tasks.status NOT IN ?", current.InputId, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&references).Error; err != nil {
+		if err := ProtectedImageInputReferences(tx, now).Where("image_input_task_references.input_id = ?", current.InputId).Count(&references).Error; err != nil {
 			return err
 		}
 		if references > 0 {

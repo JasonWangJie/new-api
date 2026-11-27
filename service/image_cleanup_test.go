@@ -25,7 +25,7 @@ import (
 func imageCleanupFixture(t *testing.T) (*gorm.DB, model.ImageStorageProfile) {
 	t.Helper()
 	db, _, _, _, _ := asyncImageWorkerFixture(t)
-	entities := []any{&model.ImageCleanupJob{}, &model.ImageCleanupRetry{}, &model.ImageCleanupSchedule{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.AsyncImageResult{}, &model.ImageLibraryItem{}, &model.ImagePublication{}, &model.ImageInputObject{}, &model.ImageInputTaskReference{}}
+	entities := []any{&model.ImageCleanupJob{}, &model.ImageCleanupRetry{}, &model.ImageCleanupSchedule{}, &model.ImageStorageObject{}, &model.ImageUploadIntent{}, &model.AsyncImageResult{}, &model.ImageLibraryItem{}, &model.ImagePublication{}, &model.ImageInputObject{}, &model.ImageInputTaskReference{}, &model.MediaReplaySnapshot{}}
 	require.NoError(t, db.AutoMigrate(entities...))
 	require.NoError(t, db.AutoMigrate(entities...))
 	require.NoError(t, model.MigrateImageStorageChannels(db))

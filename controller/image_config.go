@@ -250,6 +250,7 @@ func UpdateImageRuntime(c *gin.Context) {
 		return
 	}
 	cfg := input.ImageRuntimeConfig
+	cfg.FailedRequestRetentionHours = defaults.FailedRequestRetentionHours
 	if input.PollInterval == nil {
 		current, err := service.GetImageRuntimeConfig(c.Request.Context())
 		if err != nil {

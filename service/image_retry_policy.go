@@ -40,6 +40,9 @@ func evaluateImageRetryPolicy(policy mediaretry.Policy, fact mediaretry.Fact, st
 // slow reference preparation. It checks the selected account, never acquires a
 // second execution slot or re-reserves the original hold.
 func validateAsyncImageDispatch(ctx context.Context, task model.AsyncImageTask, request AsyncImageRequest, selected model.Channel, account ImageAccount, cfg ImageRuntimeConfig) error {
+	if request.RetestChannelID > 0 && selected.Id != request.RetestChannelID {
+		return errors.New("image dispatch does not match the retest channel")
+	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", task.TokenId, task.UserId).Take(&token).Error; err != nil {
 		return err
@@ -284,8 +287,8 @@ func buildImagePolicyDecision(ctx context.Context, task model.AsyncImageTask, fa
 	if checkpoint.Pending {
 		updates["finished_at"] = 0
 		updates["next_attempt_at"] = now + int64(max(1, decision.DelaySeconds))
-	} else if cfg.FailedRequestRetentionHours > 0 {
-		updates["request_retain_until"] = now + int64(cfg.FailedRequestRetentionHours)*3600
+	} else if !task.HasReplaySnapshot && cfg.FailedRequestRetentionHours > 0 {
+		updates["request_retain_until"] = now + min(int64(cfg.FailedRequestRetentionHours)*3600, model.MediaReplayRetentionSeconds)
 	} else if status == model.ImageTaskFailed || status == model.ImageTaskExpired || status == model.ImageTaskExecutionUnknown {
 		updates["request_cipher"], updates["request_retain_until"] = nil, 0
 	}

@@ -1588,6 +1588,82 @@ func TestAsyncImageFailedRequestRetentionDoesNotEraseActiveRecovery(t *testing.T
 
 }
 
+func TestMediaReplaySnapshotLifecycle(t *testing.T) {
+	db, original, _ := imageDatabaseFixture(t)
+	ctx := t.Context()
+	now := time.Now().Unix()
+	assert.True(t, db.Migrator().HasIndex(&MediaReplaySnapshot{}, "idx_media_replay_task"))
+	assert.True(t, db.Migrator().HasIndex(&MediaReplaySnapshot{}, "idx_media_replay_expiry"))
+	assert.False(t, LOG_DB.Migrator().HasTable(&MediaReplaySnapshot{}))
+
+	input := ImageInputObject{InputId: "replay-source-input", TokenId: original.TokenId, KeyHash: "replay-source", Status: "active", ExpiresAt: now + 300}
+	require.NoError(t, db.Create(&input).Error)
+	image, reused, err := AcceptAsyncImageTask(ctx, AsyncImageTask{TaskId: "replay-image", UserId: original.UserId, TokenId: original.TokenId, RequestHash: "original-image", RequestCipher: []byte("execution only")}, "image-idempotency", []string{input.InputId}, &MediaReplaySnapshot{Payload: []byte("frozen image request")})
+	require.NoError(t, err)
+	assert.False(t, reused)
+	assert.True(t, image.HasReplaySnapshot)
+	_, err = GetRetainedMediaReplaySnapshot(ctx, MediaReplayImage, image.TaskId, now)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	// An idempotent repeat must preserve the original accepted payload.
+	_, reused, err = AcceptAsyncImageTask(ctx, AsyncImageTask{TaskId: "replay-image-duplicate", UserId: original.UserId, TokenId: original.TokenId, RequestHash: image.RequestHash}, "image-idempotency", nil, &MediaReplaySnapshot{Payload: []byte("must not replace")})
+	require.NoError(t, err)
+	assert.True(t, reused)
+	require.NoError(t, TransitionImageTask(ctx, image, map[string]any{"status": ImageTaskStorageFailed}, "postprocessing_failed", "", ""))
+	snapshot, err := GetRetainedMediaReplaySnapshot(ctx, MediaReplayImage, image.TaskId, now)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("frozen image request"), snapshot.Payload)
+	assert.Equal(t, int64(MediaReplayRetentionSeconds), snapshot.RetainUntil-snapshot.FailedAt)
+	require.NoError(t, db.Where("task_id = ?", image.TaskId).Take(&image).Error)
+	require.NoError(t, TransitionImageTask(ctx, image, map[string]any{"status": ImageTaskFailed, "request_cipher": nil}, "terminated", "", ""))
+	retainedUntil, err := FindRetainedMediaReplayExpiry(ctx, MediaReplayImage, image.TaskId, snapshot.RetainUntil-1)
+	require.NoError(t, err)
+	assert.Equal(t, snapshot.RetainUntil, retainedUntil)
+	_, err = GetRetainedMediaReplaySnapshot(ctx, MediaReplayImage, image.TaskId, snapshot.RetainUntil)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	for _, bound := range []struct {
+		now   int64
+		count int64
+	}{{snapshot.RetainUntil - 1, 1}, {snapshot.RetainUntil, 0}} {
+		var count int64
+		require.NoError(t, ProtectedImageInputReferences(db, bound.now).Where("image_input_task_references.input_id = ?", input.InputId).Count(&count).Error)
+		assert.Equal(t, bound.count, count)
+	}
+
+	_, _, err = AcceptAsyncMediaJob(ctx, AsyncMediaJob{TaskId: "unowned-video-input", UserId: original.UserId, TokenId: original.TokenId, IdentityHash: "unowned-video-input"}, &MediaReplaySnapshot{Payload: []byte("unowned input"), InputIDs: []string{"unowned"}})
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, db.Where("task_id = ?", "unowned-video-input").Take(&AsyncMediaJob{}).Error, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, db.Where("task_id = ?", "unowned-video-input").Take(&MediaReplaySnapshot{}).Error, gorm.ErrRecordNotFound)
+	video, reused, err := AcceptAsyncMediaJob(ctx, AsyncMediaJob{TaskId: "replay-video", UserId: original.UserId, TokenId: original.TokenId, IdentityHash: "replay-video"}, &MediaReplaySnapshot{Payload: []byte("frozen video request"), InputIDs: []string{input.InputId}})
+	require.NoError(t, err)
+	assert.False(t, reused)
+	assert.True(t, video.HasReplaySnapshot)
+	require.NoError(t, ChangeAsyncMediaJob(db.Model(&AsyncMediaJob{}).Where("id = ?", video.ID), map[string]any{"status": "submitted", "storage_status": "failed"}, ""))
+	videoSnapshot, err := GetRetainedMediaReplaySnapshot(ctx, MediaReplayVideo, video.TaskId, now)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("frozen video request"), videoSnapshot.Payload)
+	var videoPins int64
+	require.NoError(t, ProtectedImageInputReferences(db, videoSnapshot.RetainUntil-1).Where("image_input_task_references.task_id = ?", video.TaskId).Count(&videoPins).Error)
+	assert.EqualValues(t, 1, videoPins)
+	require.NoError(t, ProtectedImageInputReferences(db, videoSnapshot.RetainUntil).Where("image_input_task_references.task_id = ?", video.TaskId).Count(&videoPins).Error)
+	assert.Zero(t, videoPins)
+	require.NoError(t, ChangeAsyncMediaJob(db.Model(&AsyncMediaJob{}).Where("id = ?", video.ID), map[string]any{"status": "succeeded", "storage_status": "succeeded"}, ""))
+	require.ErrorIs(t, db.Where("task_id = ?", video.TaskId).Take(&MediaReplaySnapshot{}).Error, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, db.Where("task_id = ?", video.TaskId).Take(&ImageInputTaskReference{}).Error, gorm.ErrRecordNotFound)
+	video, _, err = AcceptAsyncMediaJob(ctx, AsyncMediaJob{TaskId: "replay-video-expired", UserId: original.UserId, TokenId: original.TokenId, IdentityHash: "replay-video-expired"}, &MediaReplaySnapshot{Payload: []byte("failed video request"), InputIDs: []string{input.InputId}})
+	require.NoError(t, err)
+	require.NoError(t, ChangeAsyncMediaJob(db.Model(&AsyncMediaJob{}).Where("id = ?", video.ID), map[string]any{"status": "failed"}, ""))
+	videoSnapshot, err = GetRetainedMediaReplaySnapshot(ctx, MediaReplayVideo, video.TaskId, now)
+	require.NoError(t, err)
+
+	require.NoError(t, PruneExpiredMediaReplaySnapshots(ctx, snapshot.RetainUntil-1, 100))
+	require.NoError(t, db.Where("task_id = ?", image.TaskId).Take(&MediaReplaySnapshot{}).Error)
+	require.NoError(t, PruneExpiredMediaReplaySnapshots(ctx, snapshot.RetainUntil, 100))
+	require.ErrorIs(t, db.Where("task_id = ?", image.TaskId).Take(&MediaReplaySnapshot{}).Error, gorm.ErrRecordNotFound)
+	require.NoError(t, PruneExpiredMediaReplaySnapshots(ctx, videoSnapshot.RetainUntil, 100))
+	require.ErrorIs(t, db.Where("task_id = ?", video.TaskId).Take(&ImageInputTaskReference{}).Error, gorm.ErrRecordNotFound)
+}
+
 // Baseline schema from 9280757f5, before storage-channel and cleanup upgrades.
 type legacyStorageProfile20261114 struct {
 	Id               int    `json:"id"`

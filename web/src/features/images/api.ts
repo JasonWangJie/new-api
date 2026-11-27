@@ -28,6 +28,9 @@ import type {
   ImageTaskList,
   ImageRetainedRequest,
   ImageReliabilityReport,
+  MediaTaskRetestOptions,
+  MediaTaskRetestResult,
+  MediaTaskRetestSelection,
 } from './types'
 
 export async function imageRequest<T>(
@@ -94,6 +97,44 @@ export const getImageReliability = (
   )
 export const mediaTasksPath = (admin: boolean) =>
   `/api/${admin ? 'admin' : 'user'}/media-tasks`
+export async function getMediaTaskRetestOptions(
+  id: string,
+  tokenId: number,
+  signal?: AbortSignal
+): Promise<MediaTaskRetestOptions> {
+  const response = await api.get<{
+    success: boolean
+    code?: string
+    message: string
+    data: MediaTaskRetestOptions
+  }>(`${mediaTasksPath(true)}/${encodeURIComponent(id)}/retest-options`, {
+    params: { token_id: tokenId },
+    signal,
+    skipErrorHandler: true,
+    disableDuplicate: true,
+  })
+  return requireServerSuccess(response.data).data
+}
+
+export async function retestMediaTask(
+  id: string,
+  tokenId: number,
+  idempotencyKey: string,
+  selection: MediaTaskRetestSelection
+): Promise<MediaTaskRetestResult> {
+  const response = await api.post<{
+    success: boolean
+    code?: string
+    message: string
+    data: MediaTaskRetestResult
+  }>(
+    `${mediaTasksPath(true)}/${encodeURIComponent(id)}/retest`,
+    { token_id: tokenId, idempotency_key: idempotencyKey, ...selection },
+    { skipErrorHandler: true, disableDuplicate: true }
+  )
+  return requireServerSuccess(response.data).data
+}
+
 export const getMediaTaskPlatforms = (admin: boolean, signal?: AbortSignal) =>
   imageRequest<string[]>(
     `${mediaTasksPath(admin)}/platforms`,

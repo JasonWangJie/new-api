@@ -353,7 +353,7 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 			data["media_retry_decision"] = checkpoint.Decision
 		}
 		data["retained_request_available"] = task.FailedRequestRetainedAt(time.Now().Unix())
-		data["request_retain_until"] = task.RequestRetainUntil
+		data["request_retain_until"] = legacyImageRequestDeadline(task)
 		data["user_id"] = task.UserId
 		data["channel_id"] = task.ChannelId
 		data["attempts"] = ""
@@ -378,28 +378,70 @@ func imageTaskDTO(task model.AsyncImageTask, admin bool) gin.H {
 	return data
 }
 
+func legacyImageRequestDeadline(task model.AsyncImageTask) int64 {
+	until := task.RequestRetainUntil
+	if task.FinishedAt > 0 {
+		until = min(until, task.FinishedAt+model.MediaReplayRetentionSeconds)
+	}
+	if task.ExpiresAt > 0 {
+		until = min(until, task.ExpiresAt)
+	}
+	return until
+}
+
 // GetImageRetainedRequest exposes a diagnostic whitelist, never credentials,
 // billing snapshots, image bodies or usable signed reference URLs.
 func GetImageRetainedRequest(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
+	ctx, now := c.Request.Context(), time.Now().Unix()
 	var task model.AsyncImageTask
-	if err := model.DB.WithContext(c.Request.Context()).Where("task_id = ?", c.Param("task_id")).Take(&task).Error; err != nil || !task.FailedRequestRetainedAt(time.Now().Unix()) {
-		imageManagementError(c, 404, errors.New("Retained image request is unavailable or expired"))
+	if err := model.DB.WithContext(ctx).Where("task_id = ?", c.Param("task_id")).Take(&task).Error; err != nil {
+		imageManagementError(c, http.StatusNotFound, errors.New("Retained image request is unavailable or expired"))
 		return
 	}
-	data, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
-	if err != nil {
-		imageManagementError(c, 503, errors.New("Retained image request cannot be decrypted"))
-		return
+	var request retainedImageDetails
+	until := legacyImageRequestDeadline(task)
+	if task.HasReplaySnapshot {
+		if _, err := service.CanvasImageTaskManaged(ctx, task); err != nil {
+			imageManagementError(c, http.StatusNotFound, errors.New("Retained image request is unavailable"))
+			return
+		}
+		snapshot, err := model.GetRetainedMediaReplaySnapshot(ctx, model.MediaReplayImage, task.TaskId, now)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			imageManagementError(c, http.StatusNotFound, errors.New("Retained image request is unavailable or expired"))
+			return
+		}
+		if err != nil {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Retained image request cannot be read"))
+			return
+		}
+		replay, err := decodeMediaReplaySnapshot(snapshot)
+		if err != nil || replay.ImageDetails == nil {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Retained image request cannot be decoded"))
+			return
+		}
+		request = *replay.ImageDetails
+		until = snapshot.RetainUntil
+	} else {
+		if !task.FailedRequestRetainedAt(now) {
+			imageManagementError(c, http.StatusNotFound, errors.New("Retained image request is unavailable or expired"))
+			return
+		}
+		data, err := service.DecryptImagePayload(task.RequestCipher, "task:"+task.TaskId)
+		var legacy service.AsyncImageRequest
+		if err != nil || common.Unmarshal(data, &legacy) != nil {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Retained image request cannot be decoded"))
+			return
+		}
+		request = imageRetainedDetails(legacy)
 	}
-	var request service.AsyncImageRequest
-	if err := common.Unmarshal(data, &request); err != nil {
-		imageManagementError(c, 503, errors.New("Retained image request is invalid"))
+	if time.Now().Unix() >= until {
+		imageManagementError(c, http.StatusNotFound, errors.New("Retained image request is unavailable or expired"))
 		return
 	}
 	// Existing masking removes credential patterns and reference URL secrets.
 	const maxPromptRunes = 65536
-	imageManagementData(c, gin.H{"task_id": task.TaskId, "retain_until": task.RequestRetainUntil, "request": gin.H{
+	imageManagementData(c, gin.H{"task_id": task.TaskId, "retain_until": until, "request": gin.H{
 		"model":             service.SanitizeAsyncImageText(request.Model, 256),
 		"prompt":            service.SanitizeAsyncImageText(request.Prompt, maxPromptRunes),
 		"prompt_characters": utf8.RuneCountInString(request.Prompt),
@@ -411,7 +453,7 @@ func GetImageRetainedRequest(c *gin.Context) {
 		"size":              service.SanitizeAsyncImageText(request.Size, 128),
 		"resolution":        service.SanitizeAsyncImageText(request.Resolution, 64),
 		"aspect_ratio":      service.SanitizeAsyncImageText(request.AspectRatio, 64),
-		"reference_count":   request.ReferenceImageCount(),
+		"reference_count":   request.ReferenceCount,
 	}})
 }
 
@@ -486,6 +528,12 @@ func GetImageTask(c *gin.Context, admin bool) {
 	if err != nil {
 		imageManagementError(c, 503, err)
 		return
+	}
+	if admin {
+		if err := addMediaRetestDetail(c.Request.Context(), items[0], model.MediaReplayImage, task.TaskId, task.HasReplaySnapshot && task.Status != model.ImageTaskSucceeded, confirmedImageRetestFailure(task), time.Now().Unix()); err != nil {
+			imageManagementError(c, http.StatusServiceUnavailable, errors.New("Image retest availability could not be read"))
+			return
+		}
 	}
 	resultExpired, _ := items[0]["result_expired"].(bool)
 	var events []model.AsyncImageEvent

@@ -1357,7 +1357,7 @@ func TestAsyncImageSynchronousGatewayRetriesUseExistingHold(t *testing.T) {
 }
 
 func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
-	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "mixed completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "legacy compatibility rejection", "empty submission rejection", "resolution mapping changed before retry"} {
+	for _, condition := range []string{"reference account exhausted", "channel circuit open", "busy channel uses alternate", "namespaced busy channel uses alternate", "selected key disabled before first dispatch", "completed upstream rate limit", "mixed completed upstream rate limit", "HTTP 429 capacity rejection", "completed upstream transient rejection", "single healthy account retains transient retry", "retest transient retry stays on selected channel", "legacy compatibility rejection", "empty submission rejection", "resolution mapping changed before retry"} {
 		t.Run(condition, func(t *testing.T) {
 			db, task, request, cfg, alternate := asyncImageWorkerFixture(t)
 			wantChannelID, wantKey := alternate.Id, alternate.Key
@@ -1430,6 +1430,23 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				attempts[0].FinishedAt = time.Now().Unix()
 				require.NoError(t, db.Model(&alternate).Update("status", common.ChannelStatusManuallyDisabled).Error)
 				wantChannelID, wantKey = task.ChannelId, "upstream-key-a"
+			case "retest transient retry stays on selected channel":
+				attempts[0].FinishedAt = time.Now().Unix()
+				request.RetestChannelID = task.ChannelId
+				// This retry records an upstream receipt and does not store output.
+				// Use an in-memory storage client to exercise that path in sandboxes
+				// where Windows cannot resolve the local storage directory.
+				credentials, err := common.Marshal(ImageStorageCredentials{AccessKey: "test", SecretKey: "test"})
+				require.NoError(t, err)
+				cipher, err := EncryptImagePayload(credentials, "storage:worker-local")
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.ImageStorageProfile{}).Where("profile_id = ?", "worker-local").Updates(map[string]any{"backend": "s3", "bucket": "unused-retest-fixture", "region": "us-east-1", "credential_cipher": cipher}).Error)
+				data, err := common.Marshal(request)
+				require.NoError(t, err)
+				task.RequestCipher, err = EncryptImagePayload(data, "task:"+task.TaskId)
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&task).Update("request_cipher", task.RequestCipher).Error)
+				wantChannelID, wantKey = task.ChannelId, "upstream-key-a"
 			case "resolution mapping changed before retry":
 				attempts[0].FinishedAt = time.Now().Unix()
 				wantUpstreamModel = "image-model-2K-current"
@@ -1457,11 +1474,18 @@ func TestAsyncImageWorkerSafeRetryUsesLiveAccountAndFrozenPrice(t *testing.T) {
 				return nil, model.AsyncImageBill{}, &AsyncImagePending{}
 			}
 			require.NoError(t, invokeAsyncImageTask(t.Context(), &task, cfg))
-			assert.Equal(t, wantChannelID, selected.Id)
-			assert.Equal(t, wantKey, selected.Key)
 			var saved model.AsyncImageTask
 			require.NoError(t, db.Where("task_id = ?", task.TaskId).Take(&saved).Error)
+			assert.Equal(t, wantChannelID, selected.Id, "task status %s, error %s: %s", saved.Status, saved.ErrorCode, saved.ErrorMessage)
+			assert.Equal(t, wantKey, selected.Key)
 			assert.Equal(t, wantChannelID, saved.ChannelId)
+			if request.RetestChannelID > 0 {
+				var history []ImageChannelAttempt
+				require.NoError(t, common.UnmarshalJsonStr(saved.Attempts, &history))
+				require.Len(t, history, 2)
+				assert.True(t, history[1].Dispatched)
+				assert.Equal(t, request.RetestChannelID, history[1].ChannelId)
+			}
 			if condition == "mixed completed upstream rate limit" {
 				assert.Equal(t, "newapi", saved.Provider)
 				var history []ImageChannelAttempt

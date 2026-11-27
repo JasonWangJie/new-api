@@ -273,6 +273,9 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 	geminiImage := `{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"` +
 		imageBase64 + `"}}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}`
 	const prompt = "Type and verify this test prompt"
+	const firstReference = "https://images.example.com/first.png"
+	const secondReference = "https://images.example.com/second.webp"
+	references := []string{firstReference, secondReference}
 	const overrideCredential = "provider-opaque-override-credential"
 	const oauthAccessToken = "provider-opaque-oauth-access-token"
 	const unknownUpstreamErrorCode = "upstream-private-opaque-code"
@@ -284,6 +287,8 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 		requestPath                     string
 		expectedText                    string
 		expectedErrorCode               types.ErrorCode
+		imageURLs                       []string
+		referencePath                   string
 	}{
 		{
 			name: "chat", model: "unpriced-interactive-model", channelType: constant.ChannelTypeOpenAI,
@@ -310,17 +315,37 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 			name: "mapped OpenAI image", model: "custom-model-alias", channelType: constant.ChannelTypeOpenAI,
 			mode: channelTestModeImage, endpoint: constant.EndpointTypeImageGeneration, requestPath: "/v1/images/generations",
 			promptPath: "prompt", result: `{"data":[{"b64_json":"` + imageBase64 + `"}]}`,
+			imageURLs: []string{" ", "\t"},
+		},
+		{
+			name: "mapped OpenAI image with references", model: "custom-model-alias", channelType: constant.ChannelTypeOpenAI,
+			mode: channelTestModeImage, endpoint: constant.EndpointTypeImageGeneration, requestPath: "/v1/images/edits",
+			promptPath: "prompt", result: `{"data":[{"b64_json":"` + imageBase64 + `"}]}`,
+			imageURLs: []string{" " + firstReference + " ", "", secondReference}, referencePath: "images.#.image_url",
 		},
 		{
 			name: "native Gemini image", model: "gemini-3-pro-image-preview", channelType: constant.ChannelTypeGemini,
 			mode: channelTestModeImage, endpoint: constant.EndpointTypeGemini, requestPath: "/v1beta/models/gemini-3-pro-image-preview:generateContent",
 			promptPath: "contents.0.parts.0.text", result: geminiImage,
+			imageURLs: references, referencePath: "contents.0.parts.#.fileData.fileUri",
 		},
 		{
 			name: "Gemini alias manual image mode", model: "gemini-nano-banana-2.1", channelType: constant.ChannelTypeGemini,
 			mode: channelTestModeImage, defaultMode: channelTestModeChat, endpoint: constant.EndpointTypeGemini,
 			requestPath: "/v1beta/models/gemini-nano-banana-2.1:generateContent", promptPath: "contents.0.parts.0.text",
 			result: geminiImage,
+		},
+		{
+			name: "VolcEngine image with references", model: "doubao-seedream-5-0-lite-fixture", channelType: constant.ChannelTypeVolcEngine,
+			mode: channelTestModeImage, endpoint: constant.EndpointTypeImageGeneration, requestPath: "/api/v3/images/generations",
+			promptPath: "prompt", result: `{"data":[{"b64_json":"` + imageBase64 + `"}]}`,
+			imageURLs: references, referencePath: "image",
+		},
+		{
+			name: "Advanced Custom image translates ordered references", model: "seedream-5.5", channelType: constant.ChannelTypeAdvancedCustom,
+			mode: channelTestModeImage, endpoint: constant.EndpointTypeImageGeneration, requestPath: "/api/v3/images/generations",
+			promptPath: "prompt", result: `{"data":[{"b64_json":"` + imageBase64 + `"}]}`,
+			imageURLs: references, referencePath: "image",
 		},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
@@ -334,9 +359,29 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 				}
 				assert.Equal(t, scenario.requestPath, r.URL.Path)
 				assert.Equal(t, prompt, gjson.GetBytes(input, scenario.promptPath).String())
+				if scenario.referencePath != "" {
+					actual := gjson.GetBytes(input, scenario.referencePath).Array()
+					if assert.Len(t, actual, len(references)) {
+						for index, reference := range references {
+							assert.Equal(t, reference, actual[index].String())
+						}
+					}
+				} else if scenario.mode == channelTestModeImage {
+					assert.False(t, gjson.GetBytes(input, "images").Exists())
+				}
 				switch scenario.endpoint {
 				case constant.EndpointTypeImageGeneration:
-					assert.Equal(t, "gpt-image-2.5-flare", gjson.GetBytes(input, "model").String())
+					upstreamModel := scenario.model
+					switch scenario.channelType {
+					case constant.ChannelTypeOpenAI:
+						upstreamModel = "gpt-image-2.5-flare"
+					case constant.ChannelTypeAdvancedCustom:
+						upstreamModel = "Seedream 5.5"
+						assert.False(t, gjson.GetBytes(input, "images").Exists())
+						assert.True(t, gjson.GetBytes(input, "watermark").Exists())
+						assert.False(t, gjson.GetBytes(input, "watermark").Bool())
+					}
+					assert.Equal(t, upstreamModel, gjson.GetBytes(input, "model").String())
 					assert.EqualValues(t, 1, gjson.GetBytes(input, "n").Int())
 				case constant.EndpointTypeGemini:
 					assert.Equal(t, "IMAGE", gjson.GetBytes(input, "generationConfig.responseModalities.1").String())
@@ -358,8 +403,18 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 				Type: scenario.channelType, Models: scenario.model, BaseURL: &upstream.URL, Key: "fixture-credential",
 				TestTime: 700, ResponseTime: 800, Status: common.ChannelStatusEnabled,
 			}
-			if scenario.endpoint == constant.EndpointTypeImageGeneration {
+			if scenario.model == "custom-model-alias" {
 				channel.ModelMapping = lo.ToPtr(`{"custom-model-alias":"alias-hop","alias-hop":"gpt-image-2.5-flare"}`)
+			}
+			if scenario.channelType == constant.ChannelTypeAdvancedCustom {
+				channel.ModelMapping = lo.ToPtr(`{"seedream-5.5":"Seedream 5.5"}`)
+				channel.OtherSettings = `{"advanced_custom":{"advanced_routes":[` +
+					`{"incoming_path":"/v1/images/generations","upstream_path":"/api/v3/images/generations"},` +
+					`{"incoming_path":"/v1/images/edits","upstream_path":"/api/v3/images/generations"}]}}`
+				channel.ParamOverride = lo.ToPtr(`{"operations":[` +
+					`{"mode":"copy","from":"images.#.image_url","to":"image"},` +
+					`{"mode":"delete","path":"images"},` +
+					`{"mode":"set","path":"watermark","value":false}]}`)
 			}
 			if scenario.expectedErrorCode != "" {
 				channel.HeaderOverride = lo.ToPtr(`{"x-fixture":"` + overrideCredential + `"}`)
@@ -383,7 +438,7 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 			assert.Equal(t, defaultMode, gjson.GetBytes(options.Body.Bytes(), "data.models.0.default_mode").String())
 			assert.Equal(t, string(scenario.endpoint), gjson.GetBytes(options.Body.Bytes(), "data.models.0."+scenario.mode+"_endpoint_types.0").String())
 
-			testRequest := channelTestInput{Model: scenario.model, Mode: scenario.mode, Prompt: prompt}
+			testRequest := channelTestInput{Model: scenario.model, Mode: scenario.mode, Prompt: prompt, ImageURLs: scenario.imageURLs}
 			body, err := common.Marshal(testRequest)
 			require.NoError(t, err)
 			request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
@@ -421,6 +476,32 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 			rejected := httptest.NewRecorder()
 			router.ServeHTTP(rejected, invalid)
 			assert.Equal(t, http.StatusBadRequest, rejected.Code)
+			if scenario.referencePath != "" {
+				testRequest.ImageURLs = []string{"https://127.0.0.1/private.png"}
+				body, err := common.Marshal(testRequest)
+				require.NoError(t, err)
+				invalidURL := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+				invalidURL.Header.Set("Content-Type", "application/json")
+				rejected := httptest.NewRecorder()
+				router.ServeHTTP(rejected, invalidURL)
+				assert.Equal(t, http.StatusBadRequest, rejected.Code)
+				assert.NotContains(t, rejected.Body.String(), "127.0.0.1")
+			}
+			if scenario.requestPath == "/v1/images/edits" || scenario.channelType == constant.ChannelTypeAdvancedCustom {
+				override := `{"images":[]}`
+				if scenario.channelType == constant.ChannelTypeAdvancedCustom {
+					override = `{"operations":[{"mode":"delete","path":"images"},` +
+						`{"mode":"set","path":"image","value":["` + secondReference + `","` + firstReference + `"]}]}`
+				}
+				require.NoError(t, db.Model(&channel).Update("param_override", override).Error)
+				overrideRequest := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+				overrideRequest.Header.Set("Content-Type", "application/json")
+				blockedOverride := httptest.NewRecorder()
+				router.ServeHTTP(blockedOverride, overrideRequest)
+				assert.Equal(t, http.StatusOK, blockedOverride.Code)
+				assert.False(t, gjson.GetBytes(blockedOverride.Body.Bytes(), "success").Bool())
+				assert.Equal(t, string(types.ErrorCodeChannelParamOverrideInvalid), gjson.GetBytes(blockedOverride.Body.Bytes(), "error_code").String())
+			}
 			assert.EqualValues(t, 1, requests.Load())
 			var persisted model.Channel
 			require.NoError(t, db.First(&persisted, channel.Id).Error)
@@ -437,10 +518,11 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 			wantPolls          int32
 			firstPollError     bool
 			cancelAtPoll       bool
+			withReferences     bool
 			wantError          types.ErrorCode
 		}{
 			{name: "successful polled preview", submit: receipt, poll: success, wantPolls: 1},
-			{name: "successful terminal receipt", submit: success},
+			{name: "successful terminal receipt with references", submit: success, withReferences: true},
 			{name: "retry only status after a transient 503", submit: receipt, poll: success, wantPolls: 2, firstPollError: true},
 			{name: "terminal provider failure", submit: receipt, poll: failure, wantPolls: 1, wantError: channelTestImageFailedCode},
 			{name: "canceled accepted task remains pending", submit: receipt, poll: receipt, wantPolls: 1, cancelAtPoll: true, wantError: channelTestImagePendingCode},
@@ -459,7 +541,13 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 						assert.Equal(t, http.MethodPost, r.Method)
 						body, err := io.ReadAll(r.Body)
 						assert.NoError(t, err)
-						assert.JSONEq(t, `{"model":"seedream-5.5","args":{"prompt":"`+prompt+`","size":"1K","ratio":"1:1"}}`, string(body))
+						args := map[string]any{"prompt": prompt, "size": "1K", "ratio": "1:1"}
+						if scenario.withReferences {
+							args["images"] = references
+						}
+						expected, err := common.Marshal(map[string]any{"model": "seedream-5.5", "args": args})
+						assert.NoError(t, err)
+						assert.JSONEq(t, string(expected), string(body))
 						_, _ = io.WriteString(w, scenario.submit)
 					case "/api/task/status":
 						poll := polls.Add(1)
@@ -505,8 +593,13 @@ func TestInteractiveChannelTestReturnsSelectedModelOutputWithoutSiteBilling(t *t
 				assert.Equal(t, "image-generation", models[1].Get("image_endpoint_types.0").String())
 				assert.False(t, models[2].Get("image_endpoint_types").Exists())
 
-				body := strings.NewReader(`{"model":"seedream-5-pro","mode":"image","prompt":"` + prompt + `"}`)
-				request := httptest.NewRequestWithContext(ctx, http.MethodPost, path, body)
+				testRequest := channelTestInput{Model: "seedream-5-pro", Mode: channelTestModeImage, Prompt: prompt}
+				if scenario.withReferences {
+					testRequest.ImageURLs = references
+				}
+				body, err := common.Marshal(testRequest)
+				require.NoError(t, err)
+				request := httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
 				request.Header.Set("Content-Type", "application/json")
 				recorder := httptest.NewRecorder()
 				router.ServeHTTP(recorder, request)

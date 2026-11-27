@@ -349,7 +349,7 @@ func claimImageObjectDeletion(ctx context.Context, objectId, lease string, now i
 		if count > 0 {
 			return ErrImageConflict
 		}
-		if err := tx.Model(&ImageInputTaskReference{}).Joins("JOIN image_input_objects ON image_input_objects.input_id = image_input_task_references.input_id").Joins("JOIN async_image_tasks ON async_image_tasks.task_id = image_input_task_references.task_id").Where("image_input_objects.object_id = ? AND async_image_tasks.status NOT IN ?", objectId, []string{ImageTaskSucceeded, ImageTaskFailed, ImageTaskExpired, ImageTaskExecutionUnknown}).Count(&count).Error; err != nil {
+		if err := ProtectedImageInputReferences(tx, now).Joins("JOIN image_input_objects ON image_input_objects.input_id = image_input_task_references.input_id").Where("image_input_objects.object_id = ?", objectId).Count(&count).Error; err != nil {
 			return err
 		}
 		if count > 0 {

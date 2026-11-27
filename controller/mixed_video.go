@@ -27,6 +27,7 @@ var mixedVideoConfigurationMu sync.Mutex
 func PinAsyncVideoEndpoint() gin.HandlerFunc {
 	ordinary := middleware.PinTaskPluginEndpoint()
 	return func(c *gin.Context) {
+		retest, _ := c.Request.Context().Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
 		if c.GetString("async_media_provider") != "" {
 			ordinary(c)
 			return
@@ -56,6 +57,16 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		capability, matched := service.MixedVideoPolicyCapability(catalog, publicModel)
 		if !matched {
+			if retest.channelID > 0 {
+				var channel model.Channel
+				if err := model.DB.WithContext(c.Request.Context()).Where("id = ? AND status = ?", retest.channelID, common.ChannelStatusEnabled).Take(&channel).Error; err != nil {
+					AsyncImagePublicError(c, 403, "channel_unavailable", "The selected video channel is disabled or unavailable")
+					c.Abort()
+					return
+				}
+				pinVideoChannelEndpoint(c, channel, publicModel, c.GetString("async_media_operation"))
+				return
+			}
 			ordinary(c)
 			return
 		}
@@ -80,7 +91,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		for _, group := range groups {
 			poolPolicy := policy
 			poolPolicy.Group = group
-			variants, sourceVariants, err := service.MixedVideoModelRoutingProfiles(c.Request.Context(), poolPolicy, publicModel, capability.VideoOverrides, true)
+			variants, sourceVariants, err := service.MixedVideoModelRoutingProfiles(c.Request.Context(), poolPolicy, publicModel, capability.VideoOverrides, true, retest.channelID)
 			if err == nil {
 				profilesByGroup[group] = variants
 				routingSources[group] = sourceVariants
@@ -89,7 +100,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		var routingConfig model.VideoRoutingConfig
 		if operation == "" || operation == "create" {
-			requiresResolution, err := service.MixedVideoRequiresExplicitResolution(c.Request.Context(), policy, groups, publicModel, body)
+			requiresResolution, err := service.MixedVideoRequiresExplicitResolution(c.Request.Context(), policy, groups, publicModel, body, retest.channelID)
 			if err != nil {
 				AsyncImagePublicError(c, 503, "routing_unavailable", "Video routing configuration is unavailable")
 				c.Abort()
@@ -141,6 +152,7 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		candidateGroups := make([]string, 0)
 		weights := make([]int, 0)
 		var rejection error
+		var referenceResolutionRejected bool
 		for _, group := range groups {
 			if fallbackGroup := c.GetString("conditional_video_fallback_group"); fallbackGroup != "" && fallbackGroup != group {
 				continue
@@ -172,6 +184,9 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 					}
 				}
 				if err != nil {
+					if service.IsVideoReferenceResolutionError(err) {
+						referenceResolutionRejected = true
+					}
 					rejection = err
 					continue
 				}
@@ -185,7 +200,10 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 		}
 		if len(candidates) == 0 {
 			message := "No compatible video channel is available in the mixed pool"
-			if rejection != nil {
+			switch {
+			case referenceResolutionRejected:
+				message = service.VideoReferenceResolutionErrorMessage
+			case rejection != nil:
 				message = service.SanitizeAsyncImageDiagnostic(rejection.Error(), 512)
 			}
 			AsyncImagePublicError(c, 400, "provider_unavailable", message)
@@ -208,6 +226,21 @@ func PinAsyncVideoEndpoint() gin.HandlerFunc {
 	}
 }
 
+// pinVideoChannelEndpoint resolves a single channel's provider and alias while
+// leaving the ordinary video policy and billing pipeline in effect.
+func pinVideoChannelEndpoint(c *gin.Context, channel model.Channel, publicModel, operation string) {
+	binding, upstream, err := service.MixedVideoChannelBinding(channel, publicModel, operation)
+	if err != nil {
+		AsyncImagePublicError(c, 400, "unsupported_model", err.Error())
+		c.Abort()
+		return
+	}
+	generation := jsplugin.DefaultRegistry.Generation()
+	c.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{Generation: generation, Plugin: binding.Plugin, Protocol: binding.Protocol, Operation: binding.Operation, Model: publicModel, MappedModel: upstream, Candidates: []jsplugin.ProtocolBinding{binding}})
+	c.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Generation: generation, Plugin: binding.Plugin})
+	c.Next()
+}
+
 func pinMixedVideoCandidate(c *gin.Context, candidate service.MixedVideoCandidate, route *service.MixedVideoRouting, generation int64) {
 	binding := candidate.Binding
 	routing := jsplugin.DefaultRegistry.Generation()
@@ -226,6 +259,10 @@ func pinMixedVideoCandidate(c *gin.Context, candidate service.MixedVideoCandidat
 // random picker or lets a newly configured pool take over an old task.
 func pinAsyncVideoWorker(c *gin.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest) {
 	if request.MixedRouting == nil {
+		if request.RetestChannelID > 0 {
+			pinVideoChannelEndpoint(c, request.Channel, job.Model, request.Operation)
+			return
+		}
 		if kitdto.ChannelConfiguredTaskVideoPlugin(job.Provider) {
 			binding, err := service.FrozenTaskVideoBinding(&request.Channel, job.Model)
 			if err != nil {

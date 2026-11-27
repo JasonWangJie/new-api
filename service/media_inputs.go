@@ -366,17 +366,32 @@ func mediaInputDownloadFailure(ctx context.Context, err error) error {
 	return errors.New("reference media request or read failed")
 }
 
-func validateMediaInputURL(raw string) (*url.URL, error) {
+func parseMediaInputURL(raw string) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || len(raw) > 8192 || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" || strings.Contains(raw, "\\") || strings.ContainsFunc(raw, unicode.IsSpace) || strings.ContainsFunc(raw, unicode.IsControl) {
 		return nil, ErrMediaInputUnavailable
 	}
+	return parsed, nil
+}
+
+func validatePublicMediaInputURL(parsed *url.URL) error {
 	// Reuse the existing public-address validator without changing the image
 	// input contract: only this media-recovery downloader also accepts HTTP.
 	checked := *parsed
 	checked.Scheme = "https"
 	if _, err := ValidateImageReferenceURL(checked.String()); err != nil {
-		return nil, ErrMediaInputUnavailable
+		return ErrMediaInputUnavailable
+	}
+	return nil
+}
+
+func validateMediaInputURL(raw string) (*url.URL, error) {
+	parsed, err := parseMediaInputURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePublicMediaInputURL(parsed); err != nil {
+		return nil, err
 	}
 	return parsed, nil
 }
@@ -469,15 +484,23 @@ func ReadMediaInputObject(ctx context.Context, objectID, expires, access string)
 	if err != nil || decodeErr != nil || len(provided) != sha256.Size || deadline <= time.Now().Unix() || object.ExpiresAt <= time.Now().Unix() || deadline > object.CreatedAt+7*86400 || !hmac.Equal(provided, mediaInputSignature(object, expires)) {
 		return model.MediaInputObject{}, ErrMediaInputUnavailable
 	}
-	var job model.AsyncMediaJob
-	if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ? AND token_id = ? AND expires_at > ? AND status <> ?", object.TaskId, object.UserId, object.TokenId, time.Now().Unix(), "expired").Take(&job).Error; err != nil {
-		return model.MediaInputObject{}, ErrMediaInputUnavailable
+	// Retest copies are scoped to the operator's token before the new task
+	// exists. Ordinary recovery inputs keep their existing task ownership check.
+	retest := strings.HasPrefix(object.TaskId, model.MediaRetestInputTaskPrefix)
+	if !retest {
+		var job model.AsyncMediaJob
+		if err := model.DB.WithContext(ctx).Where("task_id = ? AND user_id = ? AND token_id = ? AND expires_at > ? AND status <> ?", object.TaskId, object.UserId, object.TokenId, time.Now().Unix(), "expired").Take(&job).Error; err != nil {
+			return model.MediaInputObject{}, ErrMediaInputUnavailable
+		}
 	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", object.TokenId, object.UserId).Take(&token).Error; err != nil || token.Status != common.TokenStatusEnabled && token.Status != common.TokenStatusExhausted || token.ExpiredTime != -1 && token.ExpiredTime <= time.Now().Unix() {
 		return model.MediaInputObject{}, ErrMediaInputUnavailable
 	}
 	if model.IsCanvasTokenKey(token.Key) {
+		if retest {
+			return model.MediaInputObject{}, ErrMediaInputUnavailable
+		}
 		if _, _, _, err := ValidateCanvasWorkerCredential(ctx, token.Id, object.UserId); err != nil {
 			return model.MediaInputObject{}, ErrMediaInputUnavailable
 		}
@@ -593,6 +616,11 @@ func verifiedLocalMediaReference(ctx context.Context, job model.AsyncMediaJob, i
 	}
 	object, err := ReadMediaInputObject(ctx, identity, parsed.Query().Get("expires"), parsed.Query().Get("access"))
 	deadline, _ := strconv.ParseInt(parsed.Query().Get("expires"), 10, 64)
+	if strings.HasPrefix(object.TaskId, model.MediaRetestInputTaskPrefix) && job.CreatedAt > 0 {
+		// The operator's copy covers this job's maximum unfinished age. A
+		// provider's longer retry URL window cannot extend its retention.
+		requiredExpiry = min(requiredExpiry, job.CreatedAt+model.AsyncMediaMaxTaskAgeSeconds)
+	}
 	if err != nil || object.UserId != job.UserId || object.TokenId != job.TokenId || object.Kind != input.Kind || object.ExpiresAt < requiredExpiry || deadline < requiredExpiry {
 		return true, ErrMediaInputUnavailable
 	}

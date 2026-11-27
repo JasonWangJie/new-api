@@ -33,6 +33,7 @@ type AsyncMediaJob struct {
 	Model                  string `json:"model" gorm:"size:255"`
 	Group                  string `json:"group" gorm:"size:64"`
 	RequestCipher          []byte `json:"-"`
+	HasReplaySnapshot      bool   `json:"-"`
 	ChannelCipher          []byte `json:"-"`
 	OutputRootPath         string `json:"-" gorm:"type:text"`
 	OutputObjectKey        string `json:"-" gorm:"size:128"`
@@ -115,7 +116,11 @@ func GetDueAsyncMediaJobsForPhase(ctx context.Context, now int64, limit int, pha
 	return jobs, err
 }
 
-func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob, bool, error) {
+func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob, replay ...*MediaReplaySnapshot) (AsyncMediaJob, bool, error) {
+	if len(replay) > 1 {
+		return job, false, ErrImageConflict
+	}
+	job.HasReplaySnapshot = len(replay) == 1 && replay[0] != nil
 	reused := false
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var user User
@@ -145,6 +150,14 @@ func AcceptAsyncMediaJob(ctx context.Context, job AsyncMediaJob) (AsyncMediaJob,
 		job.CreatedAt = time.Now().Unix()
 		if err := tx.Create(&job).Error; err != nil {
 			return err
+		}
+		if job.HasReplaySnapshot {
+			if err := createMediaReplaySnapshot(tx, MediaReplayVideo, job.TaskId, replay[0]); err != nil {
+				return err
+			}
+			if err := bindImageInputReferences(tx, job.TaskId, job.TokenId, replay[0].InputIDs, job.CreatedAt); err != nil {
+				return err
+			}
 		}
 		return recordAsyncMediaEventTx(tx, job, "accepted", "", nil, "")
 	})

@@ -31,6 +31,9 @@ type ModelRequest struct {
 	Group string `json:"group,omitempty"`
 }
 
+// ChannelSelectionPreviewKey is set by private admission previews.
+const ChannelSelectionPreviewKey = "channel_selection_preview"
+
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		var channel *model.Channel
@@ -218,7 +221,7 @@ func Distribute() func(c *gin.Context) {
 			return
 		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && !c.GetBool(ChannelSelectionPreviewKey) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -716,9 +719,20 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
+	var key string
+	var index int
+	if c.GetBool(ChannelSelectionPreviewKey) {
+		accounts := service.ImageChannelAccounts(*channel, service.ImageAccountRouting{})
+		if len(accounts) == 0 {
+			return types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
+		}
+		key, index = accounts[0].Key, accounts[0].Index
+	} else {
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)

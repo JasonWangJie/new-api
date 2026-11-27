@@ -39,6 +39,24 @@ import (
 	"gorm.io/gorm"
 )
 
+type mediaRetestRoutingContext struct{}
+
+type mediaRetestRouting struct {
+	channelID int
+	dryRun    bool
+}
+
+// WithMediaRetestRouting carries the administrator's selection inside the
+// private replay request. Public relay headers and bodies cannot set it.
+func WithMediaRetestRouting(ctx context.Context, channelID int, dryRun bool) context.Context {
+	return context.WithValue(ctx, mediaRetestRoutingContext{}, mediaRetestRouting{channelID: channelID, dryRun: dryRun})
+}
+
+func IsMediaRetestRoutingProbe(ctx context.Context) bool {
+	routing, _ := ctx.Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
+	return routing.dryRun
+}
+
 // PrepareAsyncVideo uses the existing /videos protocol pipeline after removing
 // the gateway-only provider field. Multipart parts and headers stay intact.
 func PrepareAsyncVideo(c *gin.Context) {
@@ -68,6 +86,7 @@ func asyncVideoInternalPath(operation string) (string, bool) {
 
 func prepareAsyncVideo(c *gin.Context, operation string) {
 	defer common.CleanupBodyStorage(c)
+	routing, retest := c.Request.Context().Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
 	raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 64<<20))
 	if err != nil {
 		AsyncImagePublicError(c, 413, "request_too_large", "Video request exceeds the byte limit")
@@ -168,9 +187,37 @@ func prepareAsyncVideo(c *gin.Context, operation string) {
 		c.Abort()
 		return
 	}
+	if retest {
+		var modelName string
+		switch mediaType {
+		case "application/json":
+			var fields struct{ Model string }
+			_ = common.Unmarshal(body, &fields)
+			modelName = fields.Model
+		case "multipart/form-data":
+			_, fields, _ := service.MixedVideoRequestContext(body, contentType, operation)
+			modelName, _ = fields["model"].(string)
+		}
+		if c.GetBool("token_model_limit_enabled") {
+			allowed, _ := c.Get("token_model_limit")
+			models, _ := allowed.(map[string]bool)
+			if !models[modelName] {
+				AsyncImagePublicError(c, 403, "model_not_allowed", "Requested video model is not allowed")
+				c.Abort()
+				return
+			}
+		}
+		provider = ""
+		if routing.channelID > 0 {
+			service.GetChannelConstraints(c).AddPin(gatewaydto.ChannelPin{ChannelId: routing.channelID, Source: "media_retest", Rank: gatewaydto.PinRankOriginTask, RetryMode: gatewaydto.PinRetrySameChannel})
+		}
+		if routing.dryRun {
+			c.Set(middleware.ChannelSelectionPreviewKey, true)
+		}
+	}
 	c.Set("async_media_provider", provider)
 	c.Set("async_media_operation", operation)
-	c.Set("async_media_request_hash", service.AsyncImageRequestHash("video", "openai_video", c.Request.URL.Path, hashBody))
+	c.Set("async_media_request_hash", mediaRetestRequestHash(c, service.AsyncImageRequestHash("video", "openai_video", c.Request.URL.Path, hashBody)))
 	key, err := AsyncImageIdempotencyKey(c)
 	if err != nil {
 		AsyncImagePublicError(c, 400, "invalid_idempotency_key", err.Error())
@@ -197,6 +244,9 @@ func prepareAsyncVideo(c *gin.Context, operation string) {
 			return
 		}
 	}
+	c.Set(videoMediaRetestRequestKey, service.MediaRetestRequest{
+		Path: c.Request.URL.Path, ContentType: c.GetHeader("Content-Type"), Body: raw,
+	})
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	c.Request.ContentLength = int64(len(body))
 	c.Request.Header.Set("Content-Type", contentType)
@@ -287,6 +337,15 @@ func asyncVideoCapabilityRequest(c *gin.Context) (map[string]any, []map[string]a
 // RouteAsyncVideo applies provider policy before freezing a channel. A provider
 // can inherit the Token group or override it through the existing mapping.
 func RouteAsyncVideo(c *gin.Context) {
+	constraints := service.GetChannelConstraints(c)
+	retest, _ := c.Request.Context().Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
+	if retest.channelID > 0 && slices.ContainsFunc(constraints.Pins, func(pin gatewaydto.ChannelPin) bool {
+		return pin.Source == gatewaydto.PinSourceOriginTask && pin.ChannelId != retest.channelID
+	}) {
+		AsyncImagePublicError(c, 400, "origin_task_channel_conflict", "The original video material belongs to a different channel")
+		c.Abort()
+		return
+	}
 	if c.GetBool("async_media_mixed_video") {
 		c.Next()
 		return
@@ -321,10 +380,10 @@ func RouteAsyncVideo(c *gin.Context) {
 		return
 	}
 	resolution := service.VideoPoolResolution(videoResolution)
-	constraints := service.GetChannelConstraints(c)
 	constraints.AddFilter(service.ConfiguredTaskVideoFilter(c))
 	forced, hasForced, _ := constraints.ResolvedPin()
 	var capabilityErr error
+	var referenceResolutionRejected bool
 	for _, binding := range pinned.Candidates {
 		if binding.Plugin == nil || binding.Protocol != "openai_video" {
 			continue
@@ -420,6 +479,9 @@ func RouteAsyncVideo(c *gin.Context) {
 					decoded, err := binding.Plugin.Engine.CallPath(context.WithoutCancel(c.Request.Context()), "protocols", []string{"openai_video", "decodeRequest"}, request.JSValue())
 					intent, valid := decoded.(map[string]any)
 					if err != nil || !valid {
+						if service.IsVideoReferenceResolutionError(err) {
+							referenceResolutionRejected = true
+						}
 						continue
 					}
 					action, _ := intent["action"].(string)
@@ -452,6 +514,11 @@ func RouteAsyncVideo(c *gin.Context) {
 		}
 	}
 	if len(choices) == 0 {
+		if referenceResolutionRejected {
+			AsyncImagePublicError(c, 400, "invalid_request", service.VideoReferenceResolutionErrorMessage)
+			c.Abort()
+			return
+		}
 		if capabilityErr != nil {
 			AsyncImagePublicError(c, 400, "invalid_request", capabilityErr.Error())
 			c.Abort()
@@ -491,6 +558,7 @@ func RouteAsyncVideo(c *gin.Context) {
 
 func AcceptAsyncVideo(c *gin.Context) {
 	ctx := c.Request.Context()
+	routing, _ := ctx.Value(mediaRetestRoutingContext{}).(mediaRetestRouting)
 	cfg, err := service.GetMediaRuntimeConfig(ctx)
 	if err != nil || !cfg.VideoAsyncEnabled || !service.ImageEncryptionAvailable() || common.CryptoSecret == "" || common.RDB == nil || !common.RedisEnabled {
 		AsyncImagePublicError(c, 503, "async_video_unavailable", "Async video service is disabled or unavailable")
@@ -506,6 +574,10 @@ func AcceptAsyncVideo(c *gin.Context) {
 		return
 	}
 	job := model.AsyncMediaJob{TaskId: model.GenerateTaskID(), TokenId: c.GetInt("token_id"), UserId: c.GetInt("id"), ChannelId: common.GetContextKeyInt(c, constant.ContextKeyChannelId), RequestHash: c.GetString("async_media_request_hash"), Model: c.GetString("original_model"), Group: common.GetContextKeyString(c, constant.ContextKeyUsingGroup), ExpiresAt: time.Now().Unix() + int64(cfg.RetentionDays)*86400}
+	if routing.channelID > 0 && routing.channelID != job.ChannelId {
+		AsyncImagePublicError(c, 403, "channel_unavailable", "The selected video channel is unavailable")
+		return
+	}
 	job.IdentityHash = service.ImageIdentityHash("async-video-idempotency", strconv.Itoa(job.TokenId), key)
 	if key == "" {
 		job.IdentityHash = service.ImageIdentityHash("async-video-task", job.TaskId)
@@ -544,14 +616,6 @@ func AcceptAsyncVideo(c *gin.Context) {
 		channel = *selected
 	}
 	channel.Key, channel.Keys, channel.ChannelInfo = common.GetContextKeyString(c, constant.ContextKeyChannelKey), nil, model.ChannelInfo{}
-	channelData, err := common.Marshal(channel)
-	if err == nil {
-		job.ChannelCipher, err = service.EncryptImagePayload(channelData, "media-channel:"+job.TaskId)
-	}
-	if err != nil {
-		AsyncImagePublicError(c, 503, "encryption_unavailable", "Video channel could not be frozen")
-		return
-	}
 	execution := service.TaskExecutionSnapshotFromContext(c)
 	if execution == nil || execution.TaskPlugin == nil {
 		AsyncImagePublicError(c, 400, "unsupported_provider", "Video provider must support the task plugin protocol")
@@ -580,7 +644,7 @@ func AcceptAsyncVideo(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", "Video body is unavailable")
 		return
 	}
-	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
+	request := service.AsyncVideoRequest{Body: body, ContentType: c.GetHeader("Content-Type"), ClientIP: c.ClientIP(), Operation: c.GetString("async_media_operation"), Channel: channel, Execution: execution, RetestChannelID: routing.channelID, Billing: service.MediaBillingSnapshot{Price: info.PriceData, Ratios: info.PriceData.OtherRatios(), Tiered: info.TieredBillingSnapshot, Clamp: info.QuotaClamp}}
 	if value, exists := c.Get("async_media_mixed_routing"); exists {
 		request.MixedRouting, _ = value.(*service.MixedVideoRouting)
 		request.InitialExecution = execution
@@ -595,12 +659,27 @@ func AcceptAsyncVideo(c *gin.Context) {
 		AsyncImagePublicError(c, 400, "invalid_request", err.Error())
 		return
 	}
+	if routing.dryRun {
+		c.JSON(http.StatusOK, gin.H{"channel_id": job.ChannelId, "upstream_model": info.UpstreamModelName})
+		return
+	}
+	channelData, err := common.Marshal(channel)
+	if err == nil {
+		job.ChannelCipher, err = service.EncryptImagePayload(channelData, "media-channel:"+job.TaskId)
+	}
+	if err != nil {
+		AsyncImagePublicError(c, 503, "encryption_unavailable", "Video channel could not be frozen")
+		return
+	}
 	if provider := c.GetString("async_media_provider"); provider != "" && request.Details != nil {
 		request.Details.RequestParameters["provider"] = provider
 	}
+	replayRequest, _ := c.Get(videoMediaRetestRequestKey)
+	replayInput, hasReplayInput := replayRequest.(service.MediaRetestRequest)
 	if value, ok := c.Get(pluginruntime.ContextKeyPinnedPlugin); ok {
 		if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
 			request.PluginHash = pinned.Plugin.Engine.SourceFingerprint()
+			replayInput.VideoReferencePaths = service.MediaRetestVideoReferencePaths(pinned.Plugin)
 		}
 	}
 	if request.PluginHash == "" {
@@ -615,7 +694,21 @@ func AcceptAsyncVideo(c *gin.Context) {
 		AsyncImagePublicError(c, 503, "encryption_unavailable", "Video request encryption is unavailable")
 		return
 	}
-	job, reused, err := model.AcceptAsyncMediaJob(ctx, job)
+	var replay *model.MediaReplaySnapshot
+	if hasReplayInput {
+		inputIDs, err := service.CollectMediaRetestVideoInputPins(ctx, job.TokenId, replayInput)
+		if err != nil {
+			AsyncImagePublicError(c, 503, "reference_snapshot_unavailable", "Video reference retention could not be prepared")
+			return
+		}
+		replay, err = encryptMediaReplaySnapshot(model.MediaReplayVideo, job.TaskId, mediaReplayHeader{MediaRetestRequest: replayInput})
+		if err != nil {
+			AsyncImagePublicError(c, 503, "encryption_unavailable", "Video retest request could not be stored")
+			return
+		}
+		replay.InputIDs = inputIDs
+	}
+	job, reused, err := model.AcceptAsyncMediaJob(ctx, job, replay)
 	if err != nil {
 		if errors.Is(err, model.ErrAsyncQueueFull) {
 			c.Header("Retry-After", "5")
@@ -656,6 +749,9 @@ func ExecuteAsyncVideoReferenceRetry(ctx context.Context, job model.AsyncMediaJo
 }
 
 func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, request service.AsyncVideoRequest, retryTask *model.Task) error {
+	if request.RetestChannelID > 0 && (job.ChannelId != request.RetestChannelID || request.Channel.Id != request.RetestChannelID) {
+		return errors.New("video dispatch does not match the retest channel")
+	}
 	var executionErr error
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
@@ -729,7 +825,7 @@ func executeAsyncVideoAttempt(ctx context.Context, job model.AsyncMediaJob, requ
 			executionErr = errors.New("selected video channel capability changed")
 			return
 		}
-		if retryTask != nil {
+		if retryTask != nil || request.RetestChannelID > 0 {
 			keyIndex := slices.Index(liveChannel.GetKeys(), request.Channel.Key)
 			if keyIndex < 0 || liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != 0 && liveChannel.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusEnabled {
 				executionErr = errors.New("original video account is unavailable")
@@ -1287,6 +1383,9 @@ func (retry *asyncVideoSubmissionRetry) decision(ctx context.Context) (mediaretr
 func (retry *asyncVideoSubmissionRetry) dispatch(c *gin.Context, info *relaycommon.RelayInfo) error {
 	ctx := c.Request.Context()
 	request, job := retry.request, retry.job
+	if request.RetestChannelID > 0 && info.ChannelId != request.RetestChannelID {
+		return errors.New("video dispatch does not match the retest channel")
+	}
 	nextState := *request.InitialRetryState
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {

@@ -169,6 +169,9 @@ func videoRetryCandidateChannels(ctx context.Context, job model.AsyncMediaJob, r
 	if job.Provider == constant.TaskPlatformHuahuoVideo || job.Provider == "wolong" || request.RetryFact.Provider == constant.TaskPlatformHuahuoVideo || request.RetryFact.Provider == "wolong" {
 		return nil, "", errors.New("idempotent video submission cannot be replayed")
 	}
+	if request.RetestChannelID > 0 && (job.ChannelId != request.RetestChannelID || request.RetryFact.ChannelID != request.RetestChannelID || decision.Action == mediaretry.OtherChannel || decision.Action == mediaretry.LocalOtherChannel) {
+		return nil, "", errors.New("video recovery cannot leave the retest channel")
+	}
 	var token model.Token
 	if err := model.DB.WithContext(ctx).Where("id = ? AND user_id = ?", job.TokenId, job.UserId).Take(&token).Error; err != nil {
 		return nil, "", err

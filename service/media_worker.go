@@ -30,6 +30,7 @@ type MediaBillingSnapshot struct {
 }
 
 type AsyncVideoRequest struct {
+	RetestChannelID                  int                          `json:"retest_channel_id,omitempty"`
 	ConditionalRouting               *VideoRoutingSnapshot        `json:"conditional_routing,omitempty"`
 	MixedRouting                     *MixedVideoRouting           `json:"mixed_routing,omitempty"`
 	ResolutionMapping                *MixedVideoResolutionMapping `json:"video_resolution_mapping,omitempty"`
@@ -99,10 +100,9 @@ func recordAsyncVideoPreConsumeFailure(c *gin.Context, info *relaycommon.RelayIn
 	if outcome == billingPreConsumeRollbackFailed {
 		status = "failed"
 	}
-	err := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
-		Where("task_id = ? AND user_id = ? AND token_id = ? AND lease_token = ? AND attempt_generation = ? AND COALESCE(dispatched_at, 0) = ? AND quota = ? AND billing_status = ?", info.PublicTaskID, info.UserId, info.TokenId, leaseToken, 0, 0, 0, "reserving").
-		Update("billing_status", status).Error
-	if err != nil {
+	query := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
+		Where("task_id = ? AND user_id = ? AND token_id = ? AND lease_token = ? AND attempt_generation = ? AND COALESCE(dispatched_at, 0) = ? AND quota = ? AND billing_status = ?", info.PublicTaskID, info.UserId, info.TokenId, leaseToken, 0, 0, 0, "reserving")
+	if err := model.ChangeAsyncMediaJob(query, map[string]any{"billing_status": status}, ""); err != nil && !errors.Is(err, model.ErrImageConflict) {
 		logger.LogError(c, "video pre-consumption outcome "+info.PublicTaskID+": "+err.Error())
 	}
 }
@@ -142,11 +142,10 @@ func RecordAsyncVideoReservationFailure(c *gin.Context, info *relaycommon.RelayI
 	logger.LogWarn(c, fmt.Sprintf("video reservation requires reconciliation task=%s funding=%s funding_quota=%d token_quota=%d paired_quota=%d attempted_quota=%d uncertain=%t stage=%s",
 		info.PublicTaskID, failure.FundingSource, failure.ConfirmedFundingQuota, failure.ConfirmedTokenQuota,
 		failure.PairedQuota, failure.AttemptedQuota, failure.Uncertain, failure.Stage))
-	err := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
+	query := model.DB.WithContext(context.WithoutCancel(c.Request.Context())).Model(&model.AsyncMediaJob{}).
 		Where("task_id = ? AND user_id = ? AND token_id = ? AND lease_token = ? AND attempt_generation = ?", info.PublicTaskID, info.UserId, info.TokenId, leaseToken, 0).
-		Where("billing_status IN ?", []string{"reserving", "reserved", "unknown", "failed"}).
-		Updates(updates).Error
-	if err != nil {
+		Where("billing_status IN ?", []string{"reserving", "reserved", "unknown", "failed"})
+	if err := model.ChangeAsyncMediaJob(query, updates, ""); err != nil && !errors.Is(err, model.ErrImageConflict) {
 		logger.LogError(c, "video reservation reconciliation "+info.PublicTaskID+": "+err.Error())
 	}
 }
@@ -221,11 +220,11 @@ func StartAsyncMediaWorkers(parent context.Context) context.CancelFunc {
 			}
 			if now := time.Now(); !now.Before(nextRetryEventCleanup) {
 				cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
-				cleanupErr := model.PruneExpiredMediaRetryEvents(cleanupCtx, now, 1000)
+				cleanupErr := errors.Join(model.PruneExpiredMediaReplaySnapshots(cleanupCtx, now.Unix(), 1000), model.PruneExpiredMediaRetryEvents(cleanupCtx, now, 1000))
 				cleanupCancel()
 				nextRetryEventCleanup = now.Add(time.Minute)
 				if cleanupErr != nil {
-					common.SysError("media recovery event cleanup: " + cleanupErr.Error())
+					common.SysError("media replay and recovery cleanup: " + cleanupErr.Error())
 				}
 			}
 			cfg, err := GetMediaRuntimeConfig(ctx)

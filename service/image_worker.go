@@ -1506,9 +1506,9 @@ func buildImageFailurePlan(ctx context.Context, task model.AsyncImageTask, failu
 			updates["attempts"] = string(encoded)
 		}
 	}
-	if (status == model.ImageTaskFailed || status == model.ImageTaskExpired || status == model.ImageTaskExecutionUnknown) && cfg.FailedRequestRetentionHours > 0 && len(task.RequestCipher) > 0 {
+	if !task.HasReplaySnapshot && (status == model.ImageTaskFailed || status == model.ImageTaskExpired || status == model.ImageTaskExecutionUnknown) && cfg.FailedRequestRetentionHours > 0 && len(task.RequestCipher) > 0 {
 		updates["request_cipher"] = task.RequestCipher
-		updates["request_retain_until"] = time.Now().Unix() + int64(cfg.FailedRequestRetentionHours)*3600
+		updates["request_retain_until"] = time.Now().Unix() + min(int64(cfg.FailedRequestRetentionHours)*3600, model.MediaReplayRetentionSeconds)
 	}
 	policyCheckpoint.Decision.Action = decision.Action
 	policyCheckpoint.BuiltinPending = kind != ""

@@ -611,6 +611,7 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		accepted := make([]pluginruntime.ProtocolBinding, 0, len(candidates))
 		var resolved map[string]any
 		var failures []string
+		var referenceResolutionRejected bool
 		rejectedPlugins := make(map[string][]string)
 		for _, candidate := range candidates {
 			candidateContext := protocolContext
@@ -627,6 +628,9 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			reason := ""
 			if callErr != nil {
 				reason = "hook_failed"
+				if candidate.Protocol == "openai_video" && service.IsVideoReferenceResolutionError(callErr) {
+					referenceResolutionRejected = true
+				}
 				detail = taskPluginHookDetail(callErr)
 				if detail == "" {
 					detail = "Invalid task protocol request"
@@ -660,6 +664,12 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			}
 		}
 		if len(accepted) == 0 {
+			if referenceResolutionRejected {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{
+					"type": "new_api_error", "code": "", "message": service.VideoReferenceResolutionErrorMessage,
+				}})
+				return
+			}
 			if len(candidates) > 1 {
 				for index, detail := range failures {
 					failures[index] = strings.Join(rejectedPlugins[detail], ", ") + ": " + detail
